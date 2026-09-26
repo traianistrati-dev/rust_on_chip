@@ -22,7 +22,8 @@ ron              = "0.12"
 notify           = "8"
 serialport = "4"
 rusb = "0.9"
-ureq = "2"
+# Only ever through `crate::net::agent`: ureq 3 sets no timeout of its own.
+ureq = "3"
 roxmltree = "0.21.1"
 # Format-PRESERVING TOML: the publish dialog writes fields into the user's own
 # Cargo.toml, so comments, ordering and line endings have to survive. Already in
@@ -39,8 +40,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 # Parsing a Virtual Module note's link the way the browser launcher will, so a
 # link that does not parse is refused here rather than opened as a local file
-# (see `notes::openable_link`). Already in Cargo.lock through ureq and
-# webbrowser, so this adds no crate.
+# (see `notes::openable_link`), and percent-encoding the Gemini model name into
+# its endpoint URL. Already in Cargo.lock through webbrowser, so this adds no
+# crate.
 url = "2"
 
 # Parsing the user's own Rust into a control-flow chart (the Flow tab). `syn` 2

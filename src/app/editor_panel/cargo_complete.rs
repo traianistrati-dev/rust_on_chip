@@ -1402,10 +1402,14 @@ fn sparse_index_path(name: &str) -> String {
 /// worse than not checking at all.
 ///
 /// Short timeout on purpose: this runs on the UI thread during an import, and a
-/// user with no network must wait seconds, not minutes. [`crate::net::agent`]
-/// is what makes the 4 s hold for DNS and the connect too.
+/// user with no network must wait seconds, not minutes. The request's own
+/// budget covers DNS, the connect and the body, but not a TLS handshake that
+/// trickles in, so the UI stops waiting on its own at the same 4 s.
 pub(crate) fn known_features(name: &str, version_req: &str) -> Option<Vec<String>> {
-    let data = fetch_versions_with_timeout(name, std::time::Duration::from_secs(4)).ok()?;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+    let owned = name.to_owned();
+    let data =
+        crate::net::within(BUDGET, move || fetch_versions_with_timeout(&owned, BUDGET))?.ok()?;
     let version = pick_version(&data.versions, Some(version_req))?;
     data.features.get(version).cloned()
 }
@@ -1449,7 +1453,7 @@ fn fetch_versions_with_timeout(
     let url = format!("https://index.crates.io/{}", sparse_index_path(name));
     let body = crate::net::agent(timeout)
         .get(&url)
-        .set(
+        .header(
             "User-Agent",
             concat!(
                 env!("CARGO_PKG_NAME"),
@@ -1459,13 +1463,20 @@ fn fetch_versions_with_timeout(
             ),
         )
         .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(404, _) => CRATE_NOT_FOUND.to_string(),
-            other => other.to_string(),
-        })?
-        .into_string()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| index_error(&url, &e))?
+        .into_body()
+        .read_to_string()
+        .map_err(|e| index_error(&url, &e))?;
     Ok(parse_index(&body))
+}
+
+/// How a failed sparse-index fetch reads: a 404 is [`CRATE_NOT_FOUND`], which
+/// [`fetch_versions`] acts on, anything else a failure.
+fn index_error(url: &str, e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::StatusCode(404) => CRATE_NOT_FOUND.to_string(),
+        other => crate::net::describe(url, other),
+    }
 }
 
 /// Parse a sparse-index body (newline-delimited JSON): non-yanked versions,
@@ -2253,6 +2264,21 @@ mod tests {
             Some("Async, sy…")
         );
         assert_eq!(fit_detail("Async driver for a sensor", 5), None);
+    }
+
+    /// "No such crate" is what sends a lookup on to the published spelling,
+    /// so a 404 must not read as just another failure.
+    #[test]
+    fn an_index_404_reads_as_crate_not_found() {
+        let url = "https://index.crates.io/hm/md/hmmd-mmwave-sensor-async";
+        assert_eq!(
+            index_error(url, &ureq::Error::StatusCode(404)),
+            CRATE_NOT_FOUND
+        );
+        assert_ne!(
+            index_error(url, &ureq::Error::StatusCode(500)),
+            CRATE_NOT_FOUND
+        );
     }
 
     /// What "Add dependency" leans on, against the real index: the dash guess

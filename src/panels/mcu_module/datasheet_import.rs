@@ -137,10 +137,17 @@ impl Provider {
     fn endpoint(self, model: &str) -> String {
         match self {
             Provider::Anthropic => "https://api.anthropic.com/v1/messages".to_string(),
-            Provider::Gemini => format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-                model.trim()
-            ),
+            Provider::Gemini => {
+                let raw = format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                    model.trim()
+                );
+                // The model is typed by the user and lands in the PATH. The
+                // URI check under ureq 3 is strict - a space fails before
+                // anything is sent, as a "network error" - so percent-encode
+                // it the way ureq 2 did, by going through `url`.
+                url::Url::parse(&raw).map_or(raw, String::from)
+            }
             Provider::OpenAi => "https://api.openai.com/v1/responses".to_string(),
         }
     }
@@ -1951,34 +1958,65 @@ fn post_and_parse(
     model: &str,
     body: &str,
 ) -> Result<String, String> {
-    let req = crate::net::agent(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .post(&provider.endpoint(model))
-        .set("content-type", "application/json");
+    let agent = crate::net::agent(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS));
+    let text = post(&agent, provider, &provider.endpoint(model), api_key, body)?;
+    parse_api_envelope(provider, &text)
+}
+
+/// The transport half of [`post_and_parse`]: the body of a reply below 400,
+/// or the provider's own reason for a 4xx/5xx. The agent and `url` are
+/// parameters so the tests can aim at a local server, past any proxy.
+fn post(
+    agent: &crate::net::Agent,
+    provider: Provider,
+    url: &str,
+    api_key: &str,
+    body: &str,
+) -> Result<String, String> {
+    let api_key = api_key.trim();
+    // A key pasted with a line break or a stray character inside cannot go in
+    // a header. Say so here - and without the key, which ureq 2's error text
+    // used to repeat on screen.
+    if !api_key.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(concat!(
+            "the API key contains a character that cannot be sent ",
+            "(a line break, a control or non-ASCII character) - copy it again"
+        )
+        .to_owned());
+    }
+    let req = agent
+        .post(url)
+        .config()
+        // Left on, a 4xx/5xx comes back as a bare `StatusCode` with its body
+        // DROPPED - and the provider's reason is in that body.
+        .http_status_as_error(false)
+        .build()
+        .header("content-type", "application/json");
     let req = match provider {
         Provider::Anthropic => req
-            .set("x-api-key", api_key.trim())
-            .set("anthropic-version", "2023-06-01"),
-        Provider::Gemini => req.set("x-goog-api-key", api_key.trim()),
-        Provider::OpenAi => req.set("authorization", &format!("Bearer {}", api_key.trim())),
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+        Provider::Gemini => req.header("x-goog-api-key", api_key),
+        Provider::OpenAi => req.header("authorization", &format!("Bearer {api_key}")),
     };
-    let text = match req.send_string(body) {
-        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
-        Err(ureq::Error::Status(code, r)) => {
-            let raw = r.into_string().unwrap_or_default();
-            let msg = serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| format!("HTTP {code}"));
-            return Err(format!("API error (HTTP {code}): {msg}"));
-        }
-        Err(e) => return Err(format!("network error: {e}")),
-    };
-    parse_api_envelope(provider, &text)
+    let reply = req
+        .send(body)
+        .map_err(|e| format!("network error: {}", crate::net::describe(url, &e)))?;
+    let code = reply.status().as_u16();
+    let text = reply.into_body().read_to_string();
+    if code < 400 {
+        return text.map_err(|e| crate::net::describe(url, &e));
+    }
+    let msg = serde_json::from_str::<serde_json::Value>(&text.unwrap_or_default())
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("HTTP {code}"));
+    Err(format!("API error (HTTP {code}): {msg}"))
 }
 
 /// A clock-tree extraction result plus whether it came from the cache.
@@ -3027,6 +3065,194 @@ mod tests {
         );
         assert!(Provider::Anthropic.endpoint("x").ends_with("/v1/messages"));
         assert!(Provider::OpenAi.endpoint("x").ends_with("/v1/responses"));
+    }
+
+    /// The model name is free text: a space or a pasted en dash is sent
+    /// percent-encoded, so Gemini answers with its own "model not found"
+    /// instead of the request failing here as a network error.
+    #[test]
+    fn a_typed_gemini_model_is_percent_encoded_into_the_path() {
+        assert!(
+            Provider::Gemini
+                .endpoint(" gemini 3.5 flash ")
+                .ends_with("/models/gemini%203.5%20flash:generateContent")
+        );
+        assert!(
+            Provider::Gemini
+                .endpoint("gemini\u{2013}pro")
+                .ends_with("/models/gemini%E2%80%93pro:generateContent")
+        );
+    }
+
+    /// What reached [`one_reply_server`]: the request line, the headers
+    /// (names lower-cased) and the body.
+    struct Received {
+        request_line: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl Received {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// One HTTP exchange on 127.0.0.1: read a whole request, answer `status`
+    /// with `body`. Returns the URL to aim at and what arrives there.
+    fn one_reply_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<Received>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+                }
+            }
+            let length = headers
+                .iter()
+                .find(|(n, _)| n == "content-length")
+                .map_or(0, |(_, v)| v.parse().unwrap());
+            // Read ALL of it before answering: a socket closed with bytes
+            // still unread is reset on Windows, and the client sees that
+            // instead of the reply.
+            let mut request_body = vec![0; length];
+            reader.read_exact(&mut request_body).unwrap();
+            let mut stream = reader.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let _ = tx.send(Received {
+                request_line: request_line.trim_end().to_owned(),
+                headers,
+                body: String::from_utf8(request_body).unwrap(),
+            });
+        });
+        (format!("http://127.0.0.1:{port}/v1/messages"), rx)
+    }
+
+    /// `post` to a local server, past any proxy the environment names.
+    fn post_locally(provider: Provider, url: &str, key: &str) -> Result<String, String> {
+        let agent = crate::net::agent_without_proxy(std::time::Duration::from_secs(10));
+        post(&agent, provider, url, key, r#"{"model":"m"}"#)
+    }
+
+    #[test]
+    fn a_reply_below_400_comes_back_whole() {
+        let (url, _) = one_reply_server("200 OK", r#"{"content":[]}"#);
+        assert_eq!(
+            post_locally(Provider::Anthropic, &url, "not-a-key"),
+            Ok(r#"{"content":[]}"#.to_owned())
+        );
+    }
+
+    /// The provider says WHY in the body - a bad key, an unknown model, a
+    /// quota. ureq 3 drops that body unless told otherwise, leaving a bare
+    /// "HTTP 401".
+    #[test]
+    fn a_provider_error_keeps_the_providers_own_reason() {
+        let (url, _) = one_reply_server(
+            "401 Unauthorized",
+            r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+        );
+        assert_eq!(
+            post_locally(Provider::Anthropic, &url, "not-a-key"),
+            Err("API error (HTTP 401): invalid x-api-key".to_owned())
+        );
+    }
+
+    /// 400 is where the providers put most of their refusals - Anthropic's
+    /// invalid request, Gemini's bad key - so it is an error, not a reply.
+    #[test]
+    fn a_400_is_an_error_with_its_reason() {
+        let (url, _) = one_reply_server(
+            "400 Bad Request",
+            r#"{"error":{"code":400,"message":"API key not valid"}}"#,
+        );
+        assert_eq!(
+            post_locally(Provider::Gemini, &url, "not-a-key"),
+            Err("API error (HTTP 400): API key not valid".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_error_without_a_reason_reads_as_its_code() {
+        let (url, _) = one_reply_server("529 Overloaded", "overloaded");
+        assert_eq!(
+            post_locally(Provider::Gemini, &url, "not-a-key"),
+            Err("API error (HTTP 529): HTTP 529".to_owned())
+        );
+    }
+
+    /// Each provider gets its own auth header, the key trimmed, and the body
+    /// as given.
+    #[test]
+    fn each_provider_is_sent_its_own_headers_and_the_body() {
+        for (provider, expected) in [
+            (
+                Provider::Anthropic,
+                [("x-api-key", "k-1"), ("anthropic-version", "2023-06-01")],
+            ),
+            (Provider::Gemini, [("x-goog-api-key", "k-1"), ("", "")]),
+            (
+                Provider::OpenAi,
+                [("authorization", "Bearer k-1"), ("", "")],
+            ),
+        ] {
+            let (url, received) = one_reply_server("200 OK", "{}");
+            post_locally(provider, &url, "  k-1\n").unwrap();
+            let got = received.recv().unwrap();
+            assert_eq!(
+                got.request_line, "POST /v1/messages HTTP/1.1",
+                "{provider:?}"
+            );
+            assert_eq!(got.header("content-type"), Some("application/json"));
+            for (name, value) in expected.iter().filter(|(n, _)| !n.is_empty()) {
+                assert_eq!(got.header(name), Some(*value), "{provider:?} {name}");
+            }
+            assert_eq!(got.body, r#"{"model":"m"}"#);
+        }
+    }
+
+    /// A key with a break or a stray character in the middle is refused
+    /// before anything is sent - and the message never repeats the key.
+    #[test]
+    fn a_key_a_header_cannot_carry_is_refused_without_repeating_it() {
+        for key in [
+            "abc\ndef-SECRET",
+            "abc\u{7f}SECRET",
+            "k\u{e9}y-SECRET",
+            "two words-SECRET",
+        ] {
+            let said = post_locally(Provider::OpenAi, "http://127.0.0.1:9/", key).unwrap_err();
+            assert!(
+                said.starts_with("the API key contains a character"),
+                "{said}"
+            );
+            assert!(!said.contains("SECRET"), "{said}");
+        }
     }
 
     #[test]

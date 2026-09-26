@@ -219,11 +219,12 @@ fn fetch_page(query: &str, sort: &str) -> Result<Answer, String> {
     let url = format!("https://crates.io/api/v1/crates?q={query}&per_page={PER_PAGE}&sort={sort}");
     let body = crate::net::agent(Duration::from_secs(10))
         .get(&url)
-        .set("User-Agent", USER_AGENT)
+        .header("User-Agent", USER_AGENT)
         .call()
-        .map_err(|e| e.to_string())?
-        .into_string()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::net::describe(&url, &e))?
+        .into_body()
+        .read_to_string()
+        .map_err(|e| crate::net::describe(&url, &e))?;
     parse_search(&body)
 }
 
@@ -296,12 +297,15 @@ pub(crate) fn canonical_name(name: &str) -> Result<Option<String>, String> {
     let url = format!("https://crates.io/api/v1/crates/{name}");
     let resp = crate::net::agent(Duration::from_secs(10))
         .get(&url)
-        .set("User-Agent", USER_AGENT)
+        .header("User-Agent", USER_AGENT)
         .call();
     let body = match resp {
-        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+        Ok(r) => r
+            .into_body()
+            .read_to_string()
+            .map_err(|e| crate::net::describe(&url, &e))?,
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        Err(e) => return Err(crate::net::describe(&url, &e)),
     };
     let unexpected = || "unexpected answer from crates.io".to_owned();
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|_| unexpected())?;

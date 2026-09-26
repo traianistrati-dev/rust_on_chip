@@ -43,10 +43,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # webbrowser, so this adds no crate.
 url = "2"
 
-# Parsing the user's own Rust into a control-flow chart (the Flow tab). `syn`
-# was ALREADY in the tree (serde_derive pulls 2.0.117), so this adds no crate —
-# it only turns on `full`, which is what makes expressions (if / match / loop /
-# await) parseable instead of just item signatures.
+# Parsing the user's own Rust into a control-flow chart (the Flow tab). `syn` 2
+# was ALREADY in the tree on every target (enumn and zerocopy-derive pull it;
+# serde_derive moved to syn 3 in 1.0.229), so this adds no crate — it only
+# turns on `full`, which is what makes expressions (if / match / loop / await)
+# parseable instead of just item signatures.
 #
 # `span-locations` is NOT optional here despite looking like a nicety:
 # `Span::start()` does not exist without it (the method is cfg'd out, not

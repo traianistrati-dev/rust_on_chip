@@ -290,7 +290,7 @@ pub(crate) fn edit_nodes(
             FontId::proportional(9.0),
             LABEL_C,
         );
-        if resp.dragged() {
+        if resp.dragged() && crate::panels::drag_decided(ui) {
             let d = resp.drag_delta();
             // Keep the diagram in positive space — `ClockLayout::bounds` measures
             // the far edge, so anything dragged past the origin would be clipped.
@@ -436,7 +436,7 @@ pub(crate) fn interactive_graph(
                 ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
                     if ui
                         .add(
-                            egui::DragValue::new(&mut mhz)
+                            crate::panels::drag_value(ui, &mut mhz)
                                 .range(*min_mhz as f64..=*max_mhz as f64)
                                 .speed(0.1)
                                 .suffix(" MHz"),

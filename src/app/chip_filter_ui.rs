@@ -147,7 +147,7 @@ fn count_cell(ui: &mut egui::Ui, f: &mut ChipFilter, facet: &CountFacet) {
     ui.horizontal(|ui| {
         let on = n > 0;
         ui.add(
-            egui::DragValue::new(&mut n)
+            crate::panels::drag_value(ui, &mut n)
                 .range(0..=facet.max)
                 .speed(0.05)
                 .prefix(">="),

@@ -147,7 +147,7 @@ impl Mcu {
                 )
                 .on_hover_cursor(egui::CursorIcon::Grab)
                 .on_hover_text("Click to select the whole device - drag to move every part of it");
-            if resp.dragged() {
+            if resp.dragged() && crate::panels::drag_decided(ui) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 let d = resp.drag_delta();
                 if d != egui::Vec2::ZERO {

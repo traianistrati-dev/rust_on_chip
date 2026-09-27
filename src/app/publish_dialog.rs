@@ -521,8 +521,8 @@ impl AppIde {
         // Centred on open but deliberately NOT anchored: an anchor re-pins the
         // window every frame, and Preview would be worth nothing if the
         // manifest it opens in the editor sat under a window that cannot be
-        // dragged off it.
-        let size = egui::vec2(620.0, 520.0);
+        // dragged off it. 620 x 520 is the content's size, not the window's.
+        let size = super::helpers::window_size::outer_size(ui.ctx(), egui::vec2(620.0, 520.0));
         let centre = ui.ctx().content_rect().center() - 0.5 * size;
         egui::Window::new(format!("Publish {dir}"))
             .id(egui::Id::new("publish_dialog"))

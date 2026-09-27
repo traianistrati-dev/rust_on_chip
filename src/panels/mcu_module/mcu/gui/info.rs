@@ -31,7 +31,8 @@ pub fn draw_info_popup(
     egui::Window::new(format!("{}", func.label()))
         .open(&mut open)
         .resizable(true)
-        .default_width(340.0)
+        // 340 is the content's width; egui takes the window's.
+        .default_width(340.0 + crate::app::helpers::window_size::chrome(ui.ctx()).x)
         .default_pos(popup_pos)
         .show(ui.ctx(), |ui| {
             // Description

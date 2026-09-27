@@ -418,7 +418,7 @@ pub fn draw_io_arrows(
         if resp.clicked() {
             click_request = Some(it.num);
         }
-        if resp.dragged() {
+        if resp.dragged() && crate::panels::drag_decided(ui) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             let off = (field_center + resp.drag_delta()) - chip_center;
             drag_updates.push((it.num, (off.x, off.y)));

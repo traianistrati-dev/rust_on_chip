@@ -80,6 +80,23 @@ pub(crate) fn drawn_recently(drawn_pass: u64, now_pass: u64) -> bool {
     now_pass <= drawn_pass.saturating_add(2)
 }
 
+/// Should a reader that just appended to a stream wake the UI for it?
+///
+/// Only while its view was [`drawn_recently`] AND the window is not minimized.
+/// A minimized window runs no egui pass (eframe 0.36 calls only `App::logic`,
+/// through `Context::run_logic`), so the pass counter stands still and the view
+/// that was on screen when the window went down stays "recent": every burst
+/// woke the event loop for a logic tick with nothing to show. The window state
+/// is the one input `run_logic` keeps fresh. Restoring is a frame of its own,
+/// and it draws whatever arrived meanwhile.
+pub(crate) fn stream_wants_repaint(ctx: &egui::Context, drawn_pass: u64) -> bool {
+    let root = egui::ViewportId::ROOT;
+    let minimized = ctx.input_for(root, |i| {
+        i.raw.viewports.get(&root).and_then(|v| v.minimized)
+    });
+    minimized != Some(true) && drawn_recently(drawn_pass, ctx.cumulative_pass_nr_for(root))
+}
+
 /// Stamp `state` as on screen this pass — see [`drawn_recently`].
 ///
 /// Every view of a stream calls it, INCLUDING its empty placeholder ("Nothing
@@ -502,8 +519,7 @@ pub(crate) fn spawn_reader(
                     // Asked with the state lock released. EOF below repaints
                     // unconditionally: a finished command changes what the
                     // rest of the UI shows.
-                    let now_pass = ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
-                    if !drawn_recently(drawn_pass, now_pass) {
+                    if !stream_wants_repaint(&ctx, drawn_pass) {
                         // Nobody is looking; the lines are in the buffer.
                     } else if last_repaint.elapsed() >= REPAINT_EVERY {
                         ctx.request_repaint();
@@ -629,6 +645,138 @@ mod tests {
         // Never drawn this session (the default 0), app long past startup.
         assert!(!drawn_recently(0, 500));
         assert!(drawn_recently(u64::MAX, u64::MAX), "no overflow");
+    }
+
+    /// The root window as eframe reports it to egui: shown, or minimized.
+    fn window(minimized: bool) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .minimized = Some(minimized);
+        input
+    }
+
+    fn wait_until(what: impl Fn() -> bool, patience: Duration) -> bool {
+        let t0 = Instant::now();
+        while !what() {
+            if t0.elapsed() > patience {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
+    #[test]
+    fn a_minimized_window_wants_no_stream_repaint() {
+        let ctx = egui::Context::default();
+        // No window state yet (startup, a bare context): counts as shown.
+        assert!(stream_wants_repaint(&ctx, 0));
+
+        let state = Mutex::new(TerminalState::default());
+        crate::headless::run_ui(&ctx, window(false), |ui| mark_drawn(&state, ui.ctx()));
+        let drawn = state.lock().unwrap().drawn_pass;
+        assert!(stream_wants_repaint(&ctx, drawn), "shown and just drawn");
+
+        // What eframe runs while the window is down: logic only, no pass.
+        let _ = ctx.run_logic(&window(true), |_| {});
+        assert!(drawn_recently(
+            drawn,
+            ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT)
+        ));
+        assert!(!stream_wants_repaint(&ctx, drawn), "minimized");
+
+        // The restore frame.
+        crate::headless::run_ui(&ctx, window(false), |_| {});
+        assert!(stream_wants_repaint(&ctx, drawn), "restored");
+
+        // Shown, but another tab has been drawing since.
+        for _ in 0..2 {
+            crate::headless::run_ui(&ctx, window(false), |_| {});
+        }
+        assert!(!stream_wants_repaint(&ctx, drawn), "view not drawn lately");
+    }
+
+    /// A minimized window runs no egui pass on eframe 0.36, only `App::logic`
+    /// through `Context::run_logic`. The pass counter stood still, so the
+    /// Terminal drawn just before the minimize stayed "recent" and every line
+    /// of a running command woke the event loop (the repaint callback IS
+    /// eframe's wake-up) for as long as the window was down.
+    #[test]
+    fn a_stream_does_not_wake_a_minimized_window() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+
+        let ctx = egui::Context::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let state = Arc::new(Mutex::new(TerminalState::default()));
+        let (stdout, mut child) = std::io::pipe().unwrap();
+        let done = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_reader(
+            stdout,
+            LineKind::Stdout,
+            Arc::clone(&state),
+            stop,
+            ctx.clone(),
+            Arc::clone(&done),
+        );
+
+        // The Terminal tab on screen, drawn by its own renderer.
+        let shown_frame = || {
+            crate::headless::run_ui(&ctx, window(false), |ui| {
+                crate::app::tabs::terminal_tab::render_scrollback(ui, &state, "term", 200.0);
+            });
+        };
+        shown_frame();
+
+        // One line from the child, and the wake-ups it caused. Two logic-only
+        // ticks first, as eframe runs them between wake-ups: they settle any
+        // request still outstanding, so the reader's own reaches the callback.
+        let mut sent = 0;
+        let mut line = |minimized: bool, patience: Duration| {
+            for _ in 0..2 {
+                let _ = ctx.run_logic(&window(minimized), |_| {});
+            }
+            wakes.store(0, Ordering::SeqCst);
+            sent += 1;
+            writeln!(child, "line {sent}").unwrap();
+            let taken = || state.lock().unwrap().lines.len() == sent;
+            assert!(wait_until(taken, Duration::from_secs(10)), "reader stalled");
+            // The request follows the push, with the lock released.
+            wait_until(|| wakes.load(Ordering::SeqCst) > 0, patience);
+            wakes.load(Ordering::SeqCst)
+        };
+
+        let while_minimized: Vec<usize> = (0..3)
+            .map(|_| line(true, Duration::from_millis(200)))
+            .collect();
+        assert_eq!(
+            while_minimized,
+            [0, 0, 0],
+            "wake-ups per line while minimized"
+        );
+
+        // Restored: the lines that came meanwhile are there for its first
+        // frame, and the stream wakes the UI again.
+        shown_frame();
+        assert_eq!(state.lock().unwrap().lines.len(), 3);
+        assert!(
+            line(false, Duration::from_secs(10)) > 0,
+            "restored Terminal not repainted"
+        );
+
+        drop(child);
+        assert!(wait_until(
+            || done.load(Ordering::SeqCst) == 1,
+            Duration::from_secs(10)
+        ));
     }
 
     /// `stamp_from` prefixes each line with the time since the session attached,

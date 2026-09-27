@@ -1167,7 +1167,7 @@ fn fields_panel(
                                 let fixed = (hi - lo).abs() < f64::EPSILON;
                                 let resp = ui.add_enabled(
                                     !fixed,
-                                    egui::DragValue::new(&mut mhz)
+                                    crate::panels::drag_value(ui, &mut mhz)
                                         .range(lo..=hi.max(lo))
                                         .speed(0.1)
                                         .suffix(" MHz"),
@@ -1424,11 +1424,19 @@ fn properties_panel(
             ui.horizontal(|ui| {
                 ui.label("min");
                 params_edited |= ui
-                    .add(egui::DragValue::new(&mut lo).speed(0.1).suffix(" MHz"))
+                    .add(
+                        crate::panels::drag_value(ui, &mut lo)
+                            .speed(0.1)
+                            .suffix(" MHz"),
+                    )
                     .changed();
                 ui.label("max");
                 params_edited |= ui
-                    .add(egui::DragValue::new(&mut hi).speed(0.1).suffix(" MHz"))
+                    .add(
+                        crate::panels::drag_value(ui, &mut hi)
+                            .speed(0.1)
+                            .suffix(" MHz"),
+                    )
                     .changed();
             });
             params_edited |= ui.checkbox(gated, "can be switched off").changed();
@@ -1438,21 +1446,29 @@ fn properties_panel(
         NodeKind::Mux { inputs } => {
             ui.horizontal(|ui| {
                 ui.label("inputs");
-                params_edited |= ui.add(egui::DragValue::new(inputs).range(1..=12)).changed();
+                params_edited |= ui
+                    .add(crate::panels::drag_value(ui, inputs).range(1..=12))
+                    .changed();
             });
         }
         NodeKind::FixedDiv { by } => {
             ui.horizontal(|ui| {
                 ui.label("divide by");
-                params_edited |= ui.add(egui::DragValue::new(by).range(1..=4096)).changed();
+                params_edited |= ui
+                    .add(crate::panels::drag_value(ui, by).range(1..=4096))
+                    .changed();
             });
         }
         NodeKind::Multiplier { min, max } => {
             ui.horizontal(|ui| {
                 ui.label("×");
-                params_edited |= ui.add(egui::DragValue::new(min).range(1..=1024)).changed();
+                params_edited |= ui
+                    .add(crate::panels::drag_value(ui, min).range(1..=1024))
+                    .changed();
                 ui.label("…");
-                params_edited |= ui.add(egui::DragValue::new(max).range(1..=1024)).changed();
+                params_edited |= ui
+                    .add(crate::panels::drag_value(ui, max).range(1..=1024))
+                    .changed();
             });
         }
         NodeKind::Divider { .. } | NodeKind::Choice { .. } => {
@@ -1541,7 +1557,11 @@ fn properties_panel(
                     .color(egui::Color32::GRAY),
             );
         } else if ui
-            .add(egui::DragValue::new(&mut mhz).speed(1.0).suffix(" MHz"))
+            .add(
+                crate::panels::drag_value(ui, &mut mhz)
+                    .speed(1.0)
+                    .suffix(" MHz"),
+            )
             .changed()
         {
             node.limit = if mhz > 0.0 {
@@ -2382,5 +2402,226 @@ mod tests {
         assert_ne!(empty, one);
         p.insert("ahb".into(), (10.0, 21.0));
         assert_ne!(one, positions_signature(&p), "a moved node must register");
+    }
+
+    /// The Clock tab in edit mode, frame by frame.
+    struct EditTab {
+        ctx: egui::Context,
+        gc: GraphClock,
+        state: ClockUiState,
+        pass: u64,
+    }
+
+    impl EditTab {
+        fn new() -> Self {
+            let mut tab = Self {
+                ctx: egui::Context::default(),
+                gc: sample(),
+                state: ClockUiState::default(),
+                pass: 0,
+            };
+            // The Scene is fitted to the diagram a frame late.
+            for _ in 0..4 {
+                tab.step(vec![]);
+            }
+            tab
+        }
+
+        fn step(&mut self, events: Vec<egui::Event>) {
+            self.pass += 1;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                time: Some(self.pass as f64 / 30.0),
+                predicted_dt: 1.0 / 30.0,
+                events,
+                ..Default::default()
+            };
+            let (gc, state, first) = (&mut self.gc, &mut self.state, self.pass == 1);
+            let _ = crate::headless::run_ui(&self.ctx, input, |ui| {
+                if first {
+                    start_editing(ui);
+                }
+                let mut manual = false;
+                let limits = ClockLimits::default();
+                draw_graph_clock(ui, gc, &limits, &[], None, "stm32g0", state, &mut manual);
+            });
+        }
+
+        /// Node `id`'s plate on the screen, and the canvas zoom.
+        fn node(&self, id: &str) -> (egui::Rect, f32) {
+            let w = self
+                .ctx
+                .viewport_for(egui::ViewportId::ROOT, |vp| {
+                    let id = egui::Id::new(("clock_node_drag", id));
+                    vp.prev_pass.widgets.get(id).copied()
+                })
+                .expect("the editor drew the node");
+            let to_screen = self
+                .ctx
+                .layer_transform_to_global(w.layer_id)
+                .unwrap_or_default();
+            (to_screen * w.interact_rect, to_screen.scaling)
+        }
+
+        /// Hover `at`, press there, move the pointer by `by` in `steps`
+        /// frames, release where it ended, and let a frame pass.
+        fn gesture(&mut self, at: egui::Pos2, by: egui::Vec2, steps: usize) {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.step(vec![egui::Event::PointerMoved(at)]);
+            self.step(vec![button(at, true)]);
+            let mut p = at;
+            for _ in 0..steps {
+                p += by / steps as f32;
+                self.step(vec![egui::Event::PointerMoved(p)]);
+            }
+            self.step(vec![button(p, false)]);
+            self.step(vec![]);
+        }
+    }
+
+    /// A click on a node's edge whose hand drifts 3 px off it neither moves
+    /// the node nor records a position for it; a real drag still does both.
+    /// egui 0.36 starts the drag the moment the pointer leaves the node, well
+    /// before the click distance.
+    #[test]
+    fn an_edited_node_moves_only_on_a_real_drag() {
+        let mut tab = EditTab::new();
+        let start = box_of(&tab.gc, "ahb");
+        let (plate, _) = tab.node("ahb");
+
+        tab.gesture(
+            egui::pos2(plate.center().x, plate.top() + 1.0),
+            egui::vec2(0.0, -3.0),
+            2,
+        );
+        assert_eq!(box_of(&tab.gc, "ahb"), start, "a slipped click moved it");
+        assert!(tab.state.positions.is_empty(), "{:?}", tab.state.positions);
+
+        let (plate, zoom) = tab.node("ahb");
+        tab.gesture(plate.center(), egui::vec2(0.0, 30.0), 3);
+        let went = (box_of(&tab.gc, "ahb").1 - start.1) * zoom;
+        assert!(
+            (went - 30.0).abs() < 1.0,
+            "it followed the 30 px drag: {went}"
+        );
+        assert!(tab.state.positions.contains_key("ahb"), "and is recorded");
+    }
+
+    /// The crystal's MHz field on the canvas: a click whose hand drifts 3 px
+    /// off it leaves the frequency alone, a real drag still changes it. Before
+    /// `drag_value`, egui 0.36 took the drift as a drag and 8 MHz became
+    /// 8.3 MHz, which regenerates main.rs.
+    #[test]
+    fn a_slipped_click_on_a_frequency_leaves_it_alone() {
+        fn press_move_release(by: egui::Vec2) -> (u32, u32) {
+            let mut gc = sample();
+            {
+                let n = gc.graph.nodes.iter_mut().find(|n| n.id == "hsi").unwrap();
+                n.kind = NodeKind::Source {
+                    min_hz: 4_000_000,
+                    max_hz: 26_000_000,
+                    gated: false,
+                };
+                n.state = NodeState::Source {
+                    enabled: true,
+                    hz: 8_000_000,
+                };
+            }
+            gc.layout = auto_layout(&gc.graph);
+            let ctx = egui::Context::default();
+            let mut state = ClockUiState::default();
+            let mut pass = 0u64;
+            let mut step =
+                |gc: &mut GraphClock, state: &mut ClockUiState, events: Vec<egui::Event>| {
+                    pass += 1;
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1600.0, 900.0),
+                        )),
+                        time: Some(pass as f64 / 30.0),
+                        predicted_dt: 1.0 / 30.0,
+                        events,
+                        ..Default::default()
+                    };
+                    let _ = crate::headless::run_ui(&ctx, input, |ui| {
+                        let mut manual = false;
+                        let limits = ClockLimits::default();
+                        draw_graph_clock(ui, gc, &limits, &[], None, "stm32g0", state, &mut manual);
+                    });
+                };
+            for _ in 0..4 {
+                step(&mut gc, &mut state, vec![]);
+            }
+            let hz = |gc: &GraphClock| match gc
+                .graph
+                .nodes
+                .iter()
+                .find(|n| n.id == "hsi")
+                .unwrap()
+                .state
+            {
+                NodeState::Source { hz, .. } => hz,
+                _ => 0,
+            };
+            // The click-and-drag widgets on screen: the Scene background is
+            // the largest, and the smallest one inside it is the MHz field.
+            let rects: Vec<egui::Rect> = ctx
+                .viewport_for(egui::ViewportId::ROOT, |vp| {
+                    vp.prev_pass
+                        .widgets
+                        .layers()
+                        .flat_map(|(_, ws)| ws.iter())
+                        .filter(|w| w.sense.senses_click() && w.sense.senses_drag())
+                        .map(|w| (w.layer_id, w.interact_rect))
+                        .collect::<Vec<_>>()
+                })
+                .into_iter()
+                .map(|(l, r)| ctx.layer_transform_to_global(l).unwrap_or_default() * r)
+                .collect();
+            let canvas = rects
+                .iter()
+                .copied()
+                .max_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("the canvas");
+            let field = rects
+                .iter()
+                .copied()
+                .filter(|r| *r != canvas && canvas.contains_rect(*r))
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("the MHz field");
+            let before = hz(&gc);
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let at = egui::pos2(field.center().x, field.top() + 1.0);
+            step(&mut gc, &mut state, vec![egui::Event::PointerMoved(at)]);
+            step(&mut gc, &mut state, vec![button(at, true)]);
+            let mut p = at;
+            for _ in 0..2 {
+                p += by / 2.0;
+                step(&mut gc, &mut state, vec![egui::Event::PointerMoved(p)]);
+            }
+            step(&mut gc, &mut state, vec![button(p, false)]);
+            step(&mut gc, &mut state, vec![]);
+            (before, hz(&gc))
+        }
+
+        let (before, after) = press_move_release(egui::vec2(0.0, -3.0));
+        assert_eq!(before, 8_000_000);
+        assert_eq!(after, before, "a slipped click changed the crystal");
+        let (before, after) = press_move_release(egui::vec2(30.0, 0.0));
+        assert!(after > before, "a 30 px drag right raised it: {after}");
     }
 }

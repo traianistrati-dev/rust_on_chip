@@ -169,7 +169,7 @@ pub fn baud_picker(
             });
         if custom {
             ui.add(
-                egui::DragValue::new(baud)
+                crate::panels::drag_value(ui, baud)
                     .range(range)
                     .clamp_existing_to_range(false)
                     .update_while_editing(false)
@@ -816,10 +816,10 @@ fn spawn_reader(
                     let drawn_pass = s.drawn_pass;
                     drop(s);
                     // Coalesce repaints: at most one ~every 33 ms while streaming,
-                    // and none while the Serial tab is not on screen. Errors
-                    // below still repaint unconditionally.
-                    let now_pass = ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
-                    if !crate::terminal::drawn_recently(drawn_pass, now_pass) {
+                    // and none while the Serial tab is not on screen or the
+                    // window is minimized. Errors below still repaint
+                    // unconditionally.
+                    if !crate::terminal::stream_wants_repaint(&ctx, drawn_pass) {
                         // Hidden: the bytes wait in `rx` / `log`.
                     } else if last_repaint.elapsed() >= REPAINT_EVERY {
                         ctx.request_repaint();
@@ -883,8 +883,7 @@ fn spawn_bridge_reader(
                         }
                         s.drawn_pass
                     };
-                    let now_pass = ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
-                    if !crate::terminal::drawn_recently(drawn_pass, now_pass) {
+                    if !crate::terminal::stream_wants_repaint(&ctx, drawn_pass) {
                         // Hidden: the relay goes on, only the redraw waits.
                     } else if last_repaint.elapsed() >= REPAINT_EVERY {
                         ctx.request_repaint();

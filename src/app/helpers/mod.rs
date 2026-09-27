@@ -7,7 +7,9 @@ pub mod panel;
 pub mod scene;
 pub mod scroll_id;
 pub mod spinner;
+pub mod text_field;
 pub mod theme;
+pub mod window_size;
 pub mod window_title;
 
 pub use theme::apply_dark_theme;

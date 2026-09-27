@@ -935,7 +935,7 @@ impl AppIde {
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let enter = crate::app::helpers::text_field::ended_with_enter(ui, &resp);
                     if ui
                         .add_enabled(err.is_none(), egui::Button::new("Rename"))
                         .clicked()

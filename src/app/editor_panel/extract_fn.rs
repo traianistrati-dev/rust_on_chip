@@ -417,20 +417,20 @@ impl AppIde {
                         name.request_focus();
                         self.ed.extract.focus = false;
                     }
-                    enter |= name.lost_focus();
+                    enter |= crate::app::helpers::text_field::ended_with_enter(ui, &name);
                     let params = ui.add(
                         egui::TextEdit::singleline(&mut self.ed.extract.params)
                             .desired_width(300.0)
                             .hint_text("parameters, e.g.  x: u8, buf: &mut [u8]"),
                     );
-                    enter |= params.lost_focus();
+                    enter |= crate::app::helpers::text_field::ended_with_enter(ui, &params);
                     let ret = ui.add(
                         egui::TextEdit::singleline(&mut self.ed.extract.ret)
                             .desired_width(300.0)
                             .hint_text("return type (empty for none)"),
                     );
-                    enter |= ret.lost_focus();
-                    if enter && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    enter |= crate::app::helpers::text_field::ended_with_enter(ui, &ret);
+                    if enter {
                         submit = true;
                     }
                     for w in &warnings {

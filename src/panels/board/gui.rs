@@ -275,7 +275,7 @@ fn interact(ui: &egui::Ui, f: &Frame<'_>, rect: Rect, events: &mut Vec<Event>) {
     );
     // The left button only: a middle or right drag (the canvas's pan button,
     // the menu button) must not carry a frame off.
-    if resp.dragged_by(egui::PointerButton::Primary) {
+    if resp.dragged_by(egui::PointerButton::Primary) && crate::panels::drag_decided(ui) {
         let to = rect.min + resp.drag_delta();
         events.push(Event::Moved {
             dir: dir.clone(),
@@ -611,6 +611,34 @@ mod tests {
                 "{b:?}: {events:?}"
             );
         }
+    }
+
+    /// A click whose hand slips a few points off a frame, onto the frame
+    /// beside it, carries nothing along: egui 0.36 starts the drag the moment
+    /// the pointer leaves the frame, well before the click distance.
+    #[test]
+    fn a_click_that_slips_onto_the_next_frame_moves_nothing() {
+        let (left, right) = (
+            ChipView::broken("stm32_main", "gone"),
+            ChipView::broken("esp32_radio", "gone"),
+        );
+        let first = Frame::plain(&left, egui::pos2(100.0, 100.0), false);
+        let edge = first.pos.x + first.layout.size.x;
+        let frames = [first, Frame::plain(&right, egui::pos2(edge, 100.0), false)];
+        let ctx = egui::Context::default();
+        let at = egui::pos2(edge - 1.0, 120.0);
+        let mut events = run(&ctx, 0, vec![egui::Event::PointerMoved(at)], &frames);
+        events.extend(run(&ctx, 1, vec![button(at, true)], &frames));
+        for (pass, dx) in [(2, 1.5), (3, 3.0)] {
+            let p = at + egui::vec2(dx, 0.0);
+            events.extend(run(&ctx, pass, vec![egui::Event::PointerMoved(p)], &frames));
+        }
+        let end = at + egui::vec2(3.0, 0.0);
+        events.extend(run(&ctx, 4, vec![button(end, false)], &frames));
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Moved { .. })),
+            "{events:?}"
+        );
     }
 
     /// Double-clicking opens a chip - but not the one already open.

@@ -2613,7 +2613,7 @@ pub fn draw_modules(
                 }
             }
         }
-        if resp.dragged() {
+        if resp.dragged() && crate::panels::drag_decided(ui) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             // drag_delta is already in scene coords (the Scene layer transform is
             // applied by egui), so it's correct at any zoom.
@@ -3890,7 +3890,7 @@ pub fn module_config_ui(
 
                     out.field("Threshold", docs::TOUCH_THRESHOLD);
                     ui.label("Threshold");
-                    ui.add(egui::DragValue::new(&mut cfg.threshold).range(1..=65535))
+                    ui.add(crate::panels::drag_value(ui, &mut cfg.threshold).range(1..=65535))
                         .on_hover_text(
                             "There is no right number here: read your own pad untouched, \
                              then take a margin off it. One value for every pad - the \
@@ -3902,7 +3902,7 @@ pub fn module_config_ui(
                     ui.label("Measurement")
                         .on_hover_text("Cycles of the 8 MHz touch clock, per measurement.");
                     ui.add(
-                        egui::DragValue::new(&mut cfg.measurement_duration).range(1..=0x7fff),
+                        crate::panels::drag_value(ui, &mut cfg.measurement_duration).range(1..=0x7fff),
                     );
                     ui.end_row();
 
@@ -3915,7 +3915,7 @@ pub fn module_config_ui(
                         out.field("Sleep cycles", docs::TOUCH_SLEEP_CYCLES);
                         ui.label("Sleep cycles")
                             .on_hover_text("Idle time between background measurements.");
-                        ui.add(egui::DragValue::new(&mut cfg.sleep_cycles).range(1..=0xffff));
+                        ui.add(crate::panels::drag_value(ui, &mut cfg.sleep_cycles).range(1..=0xffff));
                         ui.end_row();
                     }
                     out.all_fields_documented();
@@ -3986,7 +3986,7 @@ pub fn module_config_ui(
                     ui.horizontal(|ui| {
                         ui.add_enabled(
                             !slave_cam,
-                            egui::DragValue::new(&mut cfg.clock_hz)
+                            crate::panels::drag_value(ui, &mut cfg.clock_hz)
                                 .range(100_000..=80_000_000)
                                 .speed(100_000.0)
                                 .custom_formatter(|v, _| hz_label(v as u32))
@@ -4021,9 +4021,9 @@ pub fn module_config_ui(
                         out.field("Active area", docs::LCDCAM_ACTIVE_AREA);
                         ui.label("Active area");
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut cfg.h_active).range(1..=4095));
+                            ui.add(crate::panels::drag_value(ui, &mut cfg.h_active).range(1..=4095));
                             ui.label("x");
-                            ui.add(egui::DragValue::new(&mut cfg.v_active).range(1..=4095));
+                            ui.add(crate::panels::drag_value(ui, &mut cfg.v_active).range(1..=4095));
                             ui.label(
                                 egui::RichText::new("px").size(11.0).color(egui::Color32::GRAY),
                             );
@@ -4034,27 +4034,27 @@ pub fn module_config_ui(
                         ui.label("Total")
                             .on_hover_text("Active area plus blanking - from the panel datasheet.");
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut cfg.h_total).range(1..=4095));
+                            ui.add(crate::panels::drag_value(ui, &mut cfg.h_total).range(1..=4095));
                             ui.label("x");
-                            ui.add(egui::DragValue::new(&mut cfg.v_total).range(1..=4095));
+                            ui.add(crate::panels::drag_value(ui, &mut cfg.v_total).range(1..=4095));
                         });
                         ui.end_row();
 
                         out.field("Front porch", docs::LCDCAM_FRONT_PORCH);
                         ui.label("Front porch");
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut cfg.h_front_porch).range(0..=1023));
+                            ui.add(crate::panels::drag_value(ui, &mut cfg.h_front_porch).range(0..=1023));
                             ui.label("x");
-                            ui.add(egui::DragValue::new(&mut cfg.v_front_porch).range(0..=1023));
+                            ui.add(crate::panels::drag_value(ui, &mut cfg.v_front_porch).range(0..=1023));
                         });
                         ui.end_row();
 
                         out.field("Sync width", docs::LCDCAM_SYNC_WIDTH);
                         ui.label("Sync width");
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut cfg.hsync_width).range(1..=1023));
+                            ui.add(crate::panels::drag_value(ui, &mut cfg.hsync_width).range(1..=1023));
                             ui.label("x");
-                            ui.add(egui::DragValue::new(&mut cfg.vsync_width).range(1..=1023));
+                            ui.add(crate::panels::drag_value(ui, &mut cfg.vsync_width).range(1..=1023));
                         });
                         ui.end_row();
                     }
@@ -4125,7 +4125,7 @@ pub fn module_config_ui(
                     ui.label("Clock");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(&mut cfg.freq_hz)
+                            crate::panels::drag_value(ui, &mut cfg.freq_hz)
                                 .range(1_000..=40_000_000)
                                 .suffix(" Hz")
                                 .speed(1000.0),
@@ -4167,7 +4167,7 @@ pub fn module_config_ui(
                     out.field("DMA buffer", docs::PARLIO_DMA_BUFFER);
                     ui.label("DMA buffer");
                     ui.add(
-                        egui::DragValue::new(&mut cfg.buffer_bytes)
+                        crate::panels::drag_value(ui, &mut cfg.buffer_bytes)
                             .range(64..=32_768)
                             .suffix(" bytes"),
                     )
@@ -4249,7 +4249,7 @@ pub fn module_config_ui(
                         let mut set: Option<u32> = None;
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::DragValue::new(freq)
+                                crate::panels::drag_value(ui, freq)
                                     .range(1..=1_000_000)
                                     .suffix(" Hz")
                                     .speed(100.0),
@@ -4282,7 +4282,7 @@ pub fn module_config_ui(
                         let steps = u32::from(*period) + 1;
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::DragValue::new(period)
+                                crate::panels::drag_value(ui, period)
                                     .range(1..=65_534)
                                     .prefix("period "),
                             );
@@ -4308,7 +4308,7 @@ pub fn module_config_ui(
                         let steps = u32::from(cfg.timer_period(cfg.timer_of(op))) + 1;
                         if ui
                             .add(
-                                egui::DragValue::new(&mut pct)
+                                crate::panels::drag_value(ui, &mut pct)
                                     .range(0.0..=100.0)
                                     .suffix(" %")
                                     .speed(0.5),
@@ -4441,12 +4441,12 @@ pub fn module_config_ui(
                     ui.label("Limits");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(&mut cfg.low_limit)
+                            crate::panels::drag_value(ui, &mut cfg.low_limit)
                                 .range(-32_767..=0)
                                 .prefix("low "),
                         );
                         ui.add(
-                            egui::DragValue::new(&mut cfg.high_limit)
+                            crate::panels::drag_value(ui, &mut cfg.high_limit)
                                 .range(0..=32_767)
                                 .prefix("high "),
                         );
@@ -4463,7 +4463,7 @@ pub fn module_config_ui(
                     ui.label("Glitch filter");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(&mut cfg.filter)
+                            crate::panels::drag_value(ui, &mut cfg.filter)
                                 .range(0..=1023)
                                 .suffix(" APB clocks"),
                         );
@@ -4518,7 +4518,7 @@ pub fn module_config_ui(
                     ui.label("Clock divider");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(&mut cfg.clk_divider)
+                            crate::panels::drag_value(ui, &mut cfg.clk_divider)
                                 .range(1..=255)
                                 .prefix("/"),
                         );
@@ -4556,7 +4556,7 @@ pub fn module_config_ui(
                         out.field("Idle threshold", docs::RMT_IDLE_THRESHOLD);
                         ui.label("Idle threshold");
                         ui.add(
-                            egui::DragValue::new(&mut cfg.idle_threshold)
+                            crate::panels::drag_value(ui, &mut cfg.idle_threshold)
                                 .range(1..=65535)
                                 .suffix(" ticks"),
                         )
@@ -4573,7 +4573,7 @@ pub fn module_config_ui(
                         ui.checkbox(&mut cfg.carrier, "");
                         ui.add_enabled_ui(cfg.carrier, |ui| {
                             ui.add(
-                                egui::DragValue::new(&mut cfg.carrier_hz)
+                                crate::panels::drag_value(ui, &mut cfg.carrier_hz)
                                     .range(1_000..=1_000_000)
                                     .suffix(" Hz")
                                     .speed(100.0),
@@ -4651,7 +4651,7 @@ pub fn module_config_ui(
                             // list of powers of two would only pretend to know
                             // it. Clamped to what the generated code can hold.
                             ui.add(
-                                egui::DragValue::new(&mut cfg.buf_len)
+                                crate::panels::drag_value(ui, &mut cfg.buf_len)
                                     .speed(16.0)
                                     .range(16..=65_536)
                                     .suffix(" B"),
@@ -5041,7 +5041,7 @@ pub fn module_config_ui(
                     ui.label("Frequency");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(&mut cfg.freq_hz)
+                            crate::panels::drag_value(ui, &mut cfg.freq_hz)
                                 .range(1..=1_000_000)
                                 .suffix(" Hz")
                                 .speed(10.0),
@@ -5272,7 +5272,7 @@ pub fn module_config_ui(
                             out.field("Dead time", docs::TIMER_DEAD_TIME);
                             ui.label("Dead time");
                             ui.add(
-                                egui::DragValue::new(&mut cfg.dead_time)
+                                crate::panels::drag_value(ui, &mut cfg.dead_time)
                                     .range(0..=u16::MAX)
                                     .suffix(" ticks"),
                             )
@@ -5508,7 +5508,7 @@ pub fn module_config_ui(
                                 }
                             });
                         ui.add(
-                            egui::DragValue::new(&mut cfg.prescaler)
+                            crate::panels::drag_value(ui, &mut cfg.prescaler)
                                 .range(0..=255)
                                 .prefix("clk / "),
                         );
@@ -5607,7 +5607,7 @@ pub fn module_config_ui(
                                 }
                             });
                         ui.add(
-                            egui::DragValue::new(&mut cfg.prescaler)
+                            crate::panels::drag_value(ui, &mut cfg.prescaler)
                                 .range(0..=255)
                                 .prefix("clk / "),
                         );
@@ -5749,7 +5749,7 @@ pub fn module_config_ui(
                                  altogether.",
                             );
                         ui.add(
-                            egui::DragValue::new(&mut cfg.prescaler)
+                            crate::panels::drag_value(ui, &mut cfg.prescaler)
                                 .range(0..=255)
                                 .prefix("clk / "),
                         );
@@ -5873,7 +5873,7 @@ pub fn module_config_ui(
                                  16 MiB; bigger flash needs 32.",
                             );
                         ui.add(
-                            egui::DragValue::new(&mut cfg.prescaler)
+                            crate::panels::drag_value(ui, &mut cfg.prescaler)
                                 .range(0..=255)
                                 .prefix("clk / "),
                         )
@@ -5945,7 +5945,7 @@ pub fn module_config_ui(
                     out.field("Data timeout", docs::SDMMC_DATA_TIMEOUT);
                     ui.label("Data timeout");
                     ui.add(
-                        egui::DragValue::new(&mut cfg.data_timeout)
+                        crate::panels::drag_value(ui, &mut cfg.data_timeout)
                             .range(1_000..=100_000_000)
                             .speed(10_000.0),
                     )
@@ -6053,12 +6053,12 @@ pub fn module_config_ui(
                                     }
                                 });
                             ui.add(
-                                egui::DragValue::new(&mut blk.slot_count)
+                                crate::panels::drag_value(ui, &mut blk.slot_count)
                                     .range(1..=16)
                                     .prefix("slots "),
                             );
                             ui.add(
-                                egui::DragValue::new(&mut blk.frame_length)
+                                crate::panels::drag_value(ui, &mut blk.frame_length)
                                     .range(8..=256)
                                     .suffix(" bit"),
                             )
@@ -6067,7 +6067,7 @@ pub fn module_config_ui(
                                  stereo frame.",
                             );
                             ui.add(
-                                egui::DragValue::new(&mut blk.buffer_len)
+                                crate::panels::drag_value(ui, &mut blk.buffer_len)
                                     .range(32..=8192)
                                     .prefix("buf "),
                             );
@@ -6228,7 +6228,7 @@ pub fn module_config_ui(
                     ui.label("Sample rate");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(&mut cfg.sample_rate_hz)
+                            crate::panels::drag_value(ui, &mut cfg.sample_rate_hz)
                                 .range(8_000..=192_000)
                                 .suffix(" Hz")
                                 .speed(100.0),
@@ -6326,7 +6326,7 @@ pub fn module_config_ui(
                     out.field("Ring buffer", docs::I2S_BUFFER);
                     ui.label("Ring buffer");
                     ui.add(
-                        egui::DragValue::new(&mut cfg.buffer_len)
+                        crate::panels::drag_value(ui, &mut cfg.buffer_len)
                             .range(32..=8192)
                             .suffix(" samples"),
                     )
@@ -6406,7 +6406,7 @@ pub fn module_config_ui(
                         ui.label("Timeout");
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::DragValue::new(&mut cfg.timeout_ms)
+                                crate::panels::drag_value(ui, &mut cfg.timeout_ms)
                                     .speed(10.0)
                                     .range(0..=60_000)
                                     .suffix(" ms"),
@@ -6430,7 +6430,7 @@ pub fn module_config_ui(
                     out.field("Address (7-bit)", docs::I2C_ADDRESS);
                     ui.label("Address (7-bit)");
                     ui.add(
-                        egui::DragValue::new(&mut cfg.address)
+                        crate::panels::drag_value(ui, &mut cfg.address)
                             .range(0..=127)
                             .hexadecimal(2, false, true),
                     );
@@ -6610,11 +6610,11 @@ pub fn module_config_ui(
                     ui.end_row();
                     out.field("Vendor ID", docs::USB_VID);
                     ui.label("Vendor ID");
-                    ui.add(egui::DragValue::new(&mut cfg.vid).hexadecimal(4, false, true));
+                    ui.add(crate::panels::drag_value(ui, &mut cfg.vid).hexadecimal(4, false, true));
                     ui.end_row();
                     out.field("Product ID", docs::USB_PID);
                     ui.label("Product ID");
-                    ui.add(egui::DragValue::new(&mut cfg.pid).hexadecimal(4, false, true));
+                    ui.add(crate::panels::drag_value(ui, &mut cfg.pid).hexadecimal(4, false, true));
                     ui.end_row();
                     if cfg.role.is_otg() {
                         out.field("Stack", docs::USB_STACK);

@@ -207,16 +207,16 @@ pub fn show_matrix(
         }
         ui.separator();
         ui.label(egui::RichText::new("Rows:").size(10.5).color(egui::Color32::GRAY));
-        ui.add(egui::DragValue::new(&mut m.rows).range(1..=512).speed(0.2))
+        ui.add(crate::panels::drag_value(ui, &mut m.rows).range(1..=512).speed(0.2))
             .on_hover_text("Matrix height, in value rows (min 1)");
         ui.label(egui::RichText::new("Row values:").size(10.5).color(egui::Color32::GRAY));
-        ui.add(egui::DragValue::new(&mut m.cols).range(1..=128).speed(0.2))
+        ui.add(crate::panels::drag_value(ui, &mut m.cols).range(1..=128).speed(0.2))
             .on_hover_text("Values per row (min 1)");
         ui.label(egui::RichText::new("Value bytes:").size(10.5).color(egui::Color32::GRAY));
-        ui.add(egui::DragValue::new(&mut m.value_bytes).range(1..=8).speed(0.1))
+        ui.add(crate::panels::drag_value(ui, &mut m.value_bytes).range(1..=8).speed(0.1))
             .on_hover_text("Bytes per value: 1 = u8, 2 = u16, 4 = u32, 8 = u64");
         ui.label(egui::RichText::new("Ignore first:").size(10.5).color(egui::Color32::GRAY));
-        ui.add(egui::DragValue::new(&mut m.skip_bytes).range(0..=65535).speed(0.2))
+        ui.add(crate::panels::drag_value(ui, &mut m.skip_bytes).range(0..=65535).speed(0.2))
             .on_hover_text(
                 "Payload bytes skipped before the first matrix value (min 0) — \
                  for status/length fields that precede the data.",
@@ -239,7 +239,7 @@ pub fn show_matrix(
                     .size(10.5)
                     .color(egui::Color32::GRAY),
             );
-            ui.add(egui::DragValue::new(&mut m.change_pct).range(0..=1000000).speed(0.5))
+            ui.add(crate::panels::drag_value(ui, &mut m.change_pct).range(0..=1000000).speed(0.5))
                 .on_hover_text(
                     "0 = colour by MAGNITUDE (value vs the frame's max — big \
                      values always glow).\n\

@@ -25,6 +25,8 @@ use helpers::apply_dark_theme;
 
 mod add_module_dialog;
 mod board_tab;
+#[cfg(test)]
+mod canvas_drag_tests;
 mod chip_filter_ui;
 mod chip_search_ui;
 mod clock_import_dialog;
@@ -38,6 +40,8 @@ mod mcu_form_dialog;
 mod module_notes_ui;
 #[cfg(test)]
 mod tab_smoke_tests;
+#[cfg(test)]
+mod window_size_tests;
 
 mod diag_panel;
 

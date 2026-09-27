@@ -62,6 +62,8 @@ mod let_annotation;
 mod move_lines;
 pub(crate) mod multi_cursor;
 mod rename;
+#[cfg(test)]
+mod replace_enter_tests;
 mod snippet;
 mod toggle_case;
 mod toolbar;

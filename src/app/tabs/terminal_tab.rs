@@ -126,7 +126,7 @@ pub fn show_terminal_tab(ui: &mut egui::Ui, term: &mut TerminalConsole, ctx: &eg
                 term.history_next();
             }
         }
-        if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if crate::app::helpers::text_field::ended_with_enter(ui, &edit) {
             term.run(ctx);
             ui.memory_mut(|m| m.request_focus(edit.id)); // keep typing
         }

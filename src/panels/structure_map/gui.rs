@@ -56,6 +56,11 @@ pub struct StructureView {
     /// diagram overflows the fixed-size canvas). Clamped so the diagram can
     /// never be dragged out of sight; Ctrl+0 re-centers. Session-only.
     pub pan: egui::Vec2,
+    /// Whether the node being dragged has actually moved in this drag, which
+    /// is what pins it where it ends. How egui classifies the release cannot
+    /// say: a slipped right or middle click reports no `clicked()`, and Escape
+    /// or a still hold ends a drag that moved nothing.
+    pub drag_moved: bool,
 }
 
 /// Call-edge route shapes offered to the router.
@@ -109,6 +114,7 @@ impl Default for StructureView {
             search: String::new(),
             pan: egui::Vec2::ZERO,
             expanded: std::collections::BTreeSet::new(),
+            drag_moved: false,
         }
     }
 }
@@ -681,12 +687,20 @@ fn show_canvas(
                 view.expanded.insert(i);
             }
         }
-        if drag_resp.dragged() {
+        if drag_resp.drag_started() {
+            view.drag_moved = false;
+        }
+        if drag_resp.dragged() && crate::panels::drag_decided(ui) {
             let d = drag_resp.drag_delta() / scale;
+            let was = (lay.pos[i].x, lay.pos[i].y);
             lay.pos[i].x = (lay.pos[i].x + d.x).max(MARGIN);
             lay.pos[i].y = (lay.pos[i].y + d.y).max(MARGIN);
+            view.drag_moved |= (lay.pos[i].x, lay.pos[i].y) != was;
         }
-        if drag_resp.drag_stopped() {
+        // Only a drag that moved the node pins it. A click that slipped off
+        // the header ends a drag too, one that moved nothing - with any
+        // button, and also when Escape or a still hold ends it.
+        if drag_resp.drag_stopped() && std::mem::take(&mut view.drag_moved) {
             recompute_bounds(lay);
             result.moved = Some(i);
         }
@@ -2066,5 +2080,231 @@ mod tests {
         assert_eq!(clamp_rel(-100.0, 300.0, 800.0), -100.0);
         // A non-finite bound returns a usable offset instead of panicking.
         assert!(clamp_rel(0.0, f32::NAN, 100.0).is_finite());
+    }
+
+    /// The diagram of a two-module crate, frame by frame.
+    struct Diagram {
+        ctx: eframe::egui::Context,
+        graph: crate::panels::structure_map::parse::ModuleGraph,
+        lay: crate::panels::structure_map::layout::GraphLayout,
+        view: super::StructureView,
+        pass: u64,
+        /// Every node a frame reported a finished drag on - the ones the
+        /// Structure tab pins.
+        pinned: Vec<usize>,
+    }
+
+    impl Diagram {
+        fn new() -> Self {
+            use crate::panels::structure_map::{layout, parse};
+            let files = [("net.rs".to_owned(), "pub fn send() {}".to_owned())];
+            let graph = parse::build_graph("mod net;\nfn main() { net::send(); }", &files);
+            let lay = layout::layout(&graph);
+            let mut d = Self {
+                ctx: eframe::egui::Context::default(),
+                graph,
+                lay,
+                view: super::StructureView::default(),
+                pass: 0,
+                pinned: Vec::new(),
+            };
+            for _ in 0..3 {
+                d.step(vec![]);
+            }
+            d
+        }
+
+        fn step(&mut self, events: Vec<eframe::egui::Event>) {
+            self.pass += 1;
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0))),
+                time: Some(self.pass as f64 / 30.0),
+                predicted_dt: 1.0 / 30.0,
+                events,
+                ..Default::default()
+            };
+            let (graph, lay, view) = (&self.graph, &mut self.lay, &mut self.view);
+            let errors = vec![false; graph.nodes.len()];
+            let (refs, pairs) = (Default::default(), Default::default());
+            let mut moved = None;
+            let _ = crate::headless::run_ui(&self.ctx, input, |ui| {
+                let r = super::show(
+                    ui,
+                    graph,
+                    lay,
+                    view,
+                    &[],
+                    &[],
+                    "",
+                    0,
+                    &errors,
+                    &refs,
+                    &pairs,
+                );
+                moved = r.moved;
+            });
+            self.pinned.extend(moved);
+        }
+
+        /// Node `i`'s drag handle on the screen.
+        fn handle(&self, i: usize) -> Rect {
+            self.ctx
+                .viewport_for(eframe::egui::ViewportId::ROOT, |vp| {
+                    vp.prev_pass
+                        .widgets
+                        .layers()
+                        .flat_map(|(_, ws)| ws.iter())
+                        .find(|w| w.id == w.parent_id.with(("structure_drag", i)))
+                        .map(|w| w.interact_rect)
+                })
+                .expect("the diagram drew the node")
+        }
+
+        /// Hover `at`, press there, move the pointer by `by` in `steps`
+        /// frames, release where it ended, and let a frame pass.
+        fn gesture(&mut self, at: Pos2, by: eframe::egui::Vec2, steps: usize) {
+            self.gesture_with(eframe::egui::PointerButton::Primary, at, by, steps);
+        }
+
+        /// [`Self::gesture`] with any mouse button.
+        fn gesture_with(
+            &mut self,
+            which: eframe::egui::PointerButton,
+            at: Pos2,
+            by: eframe::egui::Vec2,
+            steps: usize,
+        ) {
+            let button = |pos, pressed| eframe::egui::Event::PointerButton {
+                pos,
+                button: which,
+                pressed,
+                modifiers: eframe::egui::Modifiers::NONE,
+            };
+            self.step(vec![eframe::egui::Event::PointerMoved(at)]);
+            self.step(vec![button(at, true)]);
+            let mut p = at;
+            for _ in 0..steps {
+                p += by / steps as f32;
+                self.step(vec![eframe::egui::Event::PointerMoved(p)]);
+            }
+            self.step(vec![button(p, false)]);
+            self.step(vec![]);
+        }
+    }
+
+    /// A click on a node's header whose hand drifts 3 px off it neither moves
+    /// the node nor pins it; a real drag still does both. egui 0.36 starts the
+    /// drag the moment the pointer leaves the header, well before the click
+    /// distance - and ends it on release like any other.
+    #[test]
+    fn a_node_moves_only_on_a_real_drag() {
+        let mut d = Diagram::new();
+        // `main`, not `net`: the used module is laid out on the top margin,
+        // where a slip upwards could not move it anyway.
+        let i = d
+            .graph
+            .nodes
+            .iter()
+            .position(|n| n.name == "main")
+            .expect("the crate root is a node");
+        let start = d.lay.pos[i].y;
+        let header = d.handle(i);
+
+        d.gesture(
+            pos2(header.center().x, header.top() + 1.0),
+            vec2(0.0, -3.0),
+            2,
+        );
+        assert_eq!(d.lay.pos[i].y, start, "a slipped click moved the node");
+        assert!(d.pinned.is_empty(), "…and pinned it: {:?}", d.pinned);
+
+        let scale = d.view.last_scale;
+        d.gesture(d.handle(i).center(), vec2(0.0, 30.0), 3);
+        let went = (d.lay.pos[i].y - start) * scale;
+        assert!(
+            (went - 30.0).abs() < 1.0,
+            "it followed the 30 px drag: {went}"
+        );
+        assert_eq!(d.pinned, vec![i], "and is pinned once, where it ended");
+    }
+
+    /// A slow nudge - the button held past the click time, the hand moved
+    /// less than the click distance - is a real drag: it moves the node AND
+    /// pins it there, or the node would jump back at the next relayout.
+    #[test]
+    fn a_slow_short_nudge_moves_the_node_and_pins_it() {
+        let mut d = Diagram::new();
+        let i = d
+            .graph
+            .nodes
+            .iter()
+            .position(|n| n.name == "main")
+            .expect("the crate root is a node");
+        let start = d.lay.pos[i].y;
+        let at = d.handle(i).center();
+        let button = |pos, pressed| eframe::egui::Event::PointerButton {
+            pos,
+            button: eframe::egui::PointerButton::Primary,
+            pressed,
+            modifiers: eframe::egui::Modifiers::NONE,
+        };
+        d.step(vec![eframe::egui::Event::PointerMoved(at)]);
+        d.step(vec![button(at, true)]);
+        // A second at 30 frames a second: past egui's 0.8 s click time.
+        for _ in 0..30 {
+            d.step(vec![]);
+        }
+        let to = at + vec2(0.0, 4.0);
+        d.step(vec![eframe::egui::Event::PointerMoved(at + vec2(0.0, 2.0))]);
+        d.step(vec![eframe::egui::Event::PointerMoved(to)]);
+        d.step(vec![button(to, false)]);
+        d.step(vec![]);
+        assert!(d.lay.pos[i].y > start, "the nudge moved the node");
+        assert_eq!(d.pinned, vec![i], "and pinned it where it ended");
+    }
+
+    /// Only a drag that MOVED the node pins it: not a right or middle click
+    /// that slips off the header (egui's `clicked()` only knows the primary
+    /// button), and not a press held still past the click time.
+    #[test]
+    fn a_node_that_did_not_move_is_not_pinned() {
+        let mut d = Diagram::new();
+        let i = d
+            .graph
+            .nodes
+            .iter()
+            .position(|n| n.name == "main")
+            .expect("the crate root is a node");
+        let start = d.lay.pos[i].y;
+        let header = d.handle(i);
+        let edge = pos2(header.center().x, header.top() + 1.0);
+        for which in [
+            eframe::egui::PointerButton::Secondary,
+            eframe::egui::PointerButton::Middle,
+        ] {
+            d.gesture_with(which, edge, vec2(0.0, -3.0), 2);
+            assert!(d.pinned.is_empty(), "a slipped {which:?} click pinned it");
+        }
+
+        let at = d.handle(i).center();
+        let button = |pos, pressed| eframe::egui::Event::PointerButton {
+            pos,
+            button: eframe::egui::PointerButton::Primary,
+            pressed,
+            modifiers: eframe::egui::Modifiers::NONE,
+        };
+        d.step(vec![eframe::egui::Event::PointerMoved(at)]);
+        d.step(vec![button(at, true)]);
+        for _ in 0..30 {
+            d.step(vec![]);
+        }
+        d.step(vec![button(at, false)]);
+        d.step(vec![]);
+        assert_eq!(d.lay.pos[i].y, start);
+        assert!(
+            d.pinned.is_empty(),
+            "a still hold pinned it: {:?}",
+            d.pinned
+        );
     }
 }

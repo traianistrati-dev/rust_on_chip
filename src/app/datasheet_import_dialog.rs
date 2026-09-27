@@ -130,6 +130,10 @@ fn section_header(
 /// Maximized → the window is pinned to (almost) the whole screen via
 /// `fixed_rect`. Restored → the caller's normal size + centre anchor. The only
 /// window control is the custom maximize/restore button — no collapse triangle.
+///
+/// `default_w × default_h` is what the CONTENT gets (see
+/// [`window_size`](super::helpers::window_size)); the maximized rect is the
+/// whole window, frame and title bar included, so it stays on the screen.
 pub(super) fn window_frame(
     ctx: &egui::Context,
     title: impl Into<egui::WidgetText>,
@@ -148,17 +152,17 @@ pub(super) fn window_frame(
     // `collapsible(false)` — no collapse triangle (the user removed it); the
     // custom maximize/restore button is the only window control.
     let win = egui::Window::new(title).collapsible(false).resizable(true);
+    let size = super::helpers::window_size::outer_size(ctx, egui::vec2(default_w, default_h));
     if maximized {
         // fixed_rect also fixes position, so don't add an anchor here.
         win.fixed_rect(ctx.content_rect().shrink(12.0))
     } else if force_default_size {
         let screen = ctx.content_rect();
-        let size = egui::vec2(default_w, default_h);
         let centre = screen.center() + egui::vec2(0.0, anchor_y);
         win.fixed_rect(egui::Rect::from_center_size(centre, size))
     } else {
-        win.default_width(default_w)
-            .default_height(default_h)
+        win.default_width(size.x)
+            .default_height(size.y)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, anchor_y])
     }
 }

@@ -220,7 +220,7 @@ fn duration_row(ui: &mut egui::Ui, label: &str, value: &mut u32, range: (u32, u3
     ui.horizontal(|ui| {
         ui.label(label);
         ui.add(
-            egui::DragValue::new(value)
+            crate::panels::drag_value(ui, value)
                 // Dragging and typing are clamped to what the chip can express,
                 // so an edit cannot produce an invalid value.
                 .range(range.0..=range.1)

@@ -281,7 +281,7 @@ pub fn show_plot(ui: &mut egui::Ui, plot: &mut PlotState, height: f32) {
                 .color(egui::Color32::GRAY),
         );
         ui.add(
-            egui::DragValue::new(&mut plot.window)
+            crate::panels::drag_value(ui, &mut plot.window)
                 .range(50..=CAP)
                 .speed(5.0)
                 .suffix(" pts"),

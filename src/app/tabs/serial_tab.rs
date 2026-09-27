@@ -251,14 +251,14 @@ pub fn show_serial_tab(
                 ui.add_enabled_ui(serial.hex, |ui| {
                     ui.label("Seq:");
                     ui.add(
-                        egui::DragValue::new(&mut serial.seq_len)
+                        crate::panels::drag_value(ui, &mut serial.seq_len)
                             .range(1..=16)
                             .speed(0.1),
                     )
                     .on_hover_text("Bytes per repeating sequence: each group of N bytes\nis coloured as a unit (same sequence -> same colour).");
                     ui.label("Row:");
                     ui.add(
-                        egui::DragValue::new(&mut serial.row_bytes)
+                        crate::panels::drag_value(ui, &mut serial.row_bytes)
                             .range(1..=64)
                             .speed(0.2),
                     )
@@ -551,7 +551,7 @@ fn show_bridge_log(ui: &mut egui::Ui, serial: &mut SerialMonitor, height: f32) {
         let mut gap = serial.block_gap_ms();
         ui.label("Gap:");
         let resp = ui.add(
-            egui::DragValue::new(&mut gap)
+            crate::panels::drag_value(ui, &mut gap)
                 .range(1..=2000)
                 .speed(1.0)
                 .suffix(" ms"),
@@ -644,7 +644,7 @@ fn show_frames_view(ui: &mut egui::Ui, serial: &mut SerialMonitor, rx_height: f3
         if serial.frame_spec.mode == FrameMode::Length {
             ui.label("len@");
             ui.add(
-                egui::DragValue::new(&mut serial.frame_spec.len_offset)
+                crate::panels::drag_value(ui, &mut serial.frame_spec.len_offset)
                     .range(0..=64)
                     .speed(0.1),
             )
@@ -653,7 +653,7 @@ fn show_frames_view(ui: &mut egui::Ui, serial: &mut SerialMonitor, rx_height: f3
             );
             ui.label("width");
             ui.add(
-                egui::DragValue::new(&mut serial.frame_spec.len_width)
+                crate::panels::drag_value(ui, &mut serial.frame_spec.len_width)
                     .range(1..=4)
                     .speed(0.05),
             )
@@ -662,7 +662,7 @@ fn show_frames_view(ui: &mut egui::Ui, serial: &mut SerialMonitor, rx_height: f3
                 .on_hover_text("Little-endian length field (off = big-endian).");
             ui.label("tail");
             ui.add(
-                egui::DragValue::new(&mut serial.frame_spec.tail_len)
+                crate::panels::drag_value(ui, &mut serial.frame_spec.tail_len)
                     .range(0..=64)
                     .speed(0.1),
             )
@@ -1026,7 +1026,7 @@ fn show_tx_area(ui: &mut egui::Ui, serial: &mut SerialMonitor, ctx: &egui::Conte
         // Per-line pause (ms) for multi-line command sequences that need the
         // device to settle before the next one. 0 = send back-to-back.
         ui.add(
-            egui::DragValue::new(&mut serial.line_delay_ms)
+            crate::panels::drag_value(ui, &mut serial.line_delay_ms)
                 .range(0..=60_000)
                 .speed(10.0)
                 .suffix(" ms"),

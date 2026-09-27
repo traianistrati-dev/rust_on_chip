@@ -296,6 +296,24 @@ impl AppIde {
         let mut query_changed = false;
         let mut close = false;
         let mut clicked_result: Option<usize> = None;
+        // Enter runs Replace All only on a FIRST press. The find field takes
+        // the focus back after Enter, so a held Enter's key repeats reach it
+        // again, and a replacement that contains the query (`value` →
+        // `value2`) would grow at the repeat rate. Find still steps on repeats,
+        // as F3 does.
+        let enter_first_press = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    }
+                )
+            })
+        });
 
         let frame = egui::Frame::new()
             .fill(egui::Color32::from_rgb(40, 40, 47))
@@ -324,7 +342,7 @@ impl AppIde {
                 }
                 self.ed.find.had_focus |= q.has_focus();
                 query_changed = q.changed();
-                let enter = q.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let enter = crate::app::helpers::text_field::ended_with_enter(ui, &q);
 
                 if !mode.is_replace() && !mode.is_project() {
                     if ui
@@ -351,7 +369,9 @@ impl AppIde {
                     match mode {
                         FindMode::FindFile => do_next = true,
                         FindMode::FindProject => do_search = true,
-                        FindMode::ReplaceFile | FindMode::ReplaceProject => do_replace_all = true,
+                        FindMode::ReplaceFile | FindMode::ReplaceProject => {
+                            do_replace_all = enter_first_press
+                        }
                     }
                     self.ed.find.focus_query = true; // keep focus for repeated Enter
                 }
@@ -388,7 +408,7 @@ impl AppIde {
                         self.ed.find.focus_replace = false;
                     }
                     self.ed.find.had_focus |= r.has_focus();
-                    let renter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let renter = crate::app::helpers::text_field::ended_with_enter(ui, &r);
                     if ui.button("Replace All").clicked() || renter {
                         do_replace_all = true;
                     }

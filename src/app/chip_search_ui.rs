@@ -54,17 +54,13 @@ pub(super) const DIALOG_W: f32 = 480.0;
 
 /// The New Project window's OUTER width: [`DIALOG_W`] plus the window frame.
 ///
-/// egui reads a `Window`'s min/max width as its outer size, frame margins
-/// included (since 0.35), while [`DIALOG_W`] is what the content gets - the
-/// Filters rows and the in-dialog results box are sized to it. The pin and the
-/// "does the column fit beside it" check both come from here, so they cannot
-/// drift apart again.
+/// egui reads a `Window`'s min/max width as its outer size (see
+/// [`window_size`](super::helpers::window_size)), while [`DIALOG_W`] is what
+/// the content gets - the Filters rows and the in-dialog results box are sized
+/// to it. The pin and the "does the column fit beside it" check both come from
+/// here, so they cannot drift apart again.
 pub(super) fn dialog_outer_w(ctx: &egui::Context) -> f32 {
-    DIALOG_W
-        + egui::Frame::window(&ctx.global_style())
-            .total_margin()
-            .sum()
-            .x
+    DIALOG_W + super::helpers::window_size::chrome(ctx).x
 }
 /// Between the results column and the dialog.
 const LIST_GAP: f32 = 6.0;

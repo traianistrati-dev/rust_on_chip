@@ -727,8 +727,7 @@ pub fn show_debug_tab(
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY),
             );
-            if r.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            if crate::app::helpers::text_field::ended_with_enter(ui, &r)
                 && !dbg.watch_draft.trim().is_empty()
             {
                 watch_add = Some(std::mem::take(&mut dbg.watch_draft));

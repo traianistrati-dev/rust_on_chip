@@ -1941,7 +1941,7 @@ fn interface_rows(ui: &mut egui::Ui, iface: &mut parts::Interface, mut remove: i
                 // Not clamped as it is drawn: a rate of 0 (none stated)
                 // would become 1 and be saved.
                 ui.add(
-                    egui::DragValue::new(&mut iface.rate)
+                    crate::panels::drag_value(ui, &mut iface.rate)
                         .range(0..=100_000_000)
                         .clamp_existing_to_range(false),
                 );

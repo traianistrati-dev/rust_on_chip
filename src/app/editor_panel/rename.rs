@@ -278,7 +278,7 @@ impl AppIde {
                         resp.request_focus();
                         self.ed.rename_focus = false;
                     }
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if crate::app::helpers::text_field::ended_with_enter(ui, &resp) {
                         submit = true;
                     }
                     ui.add_space(2.0);

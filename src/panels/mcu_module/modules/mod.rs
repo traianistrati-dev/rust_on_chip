@@ -13,19 +13,20 @@ pub mod notes;
 pub mod persist;
 
 pub use model::{
-    ApiStyle, AsyncBusMode, BREAK_FILTERS, BreakInputConfig, BreakPolarity, CanMode,
+    AddressIssue, ApiStyle, AsyncBusMode, BREAK_FILTERS, BreakInputConfig, BreakPolarity, CanMode,
     CanModuleConfig, Connection, DacModuleConfig, HspiMode, HspiModuleConfig, I2cDevice,
-    I2cModuleConfig, I2sClockPolarity, I2sDirection, I2sFormat, I2sMode, I2sModuleConfig,
-    I2sStandard, LcdCamMode, LcdCamModuleConfig, McpwmModuleConfig, ModuleConfig, ModuleKind,
-    ModuleSignal, OspiMemoryType, OspiMode, OspiModuleConfig, Parity, ParlIoBitOrder,
-    ParlIoDirection, ParlIoModuleConfig, ParlIoWidth, PcntChannelCfg, PcntCtrlMode, PcntEdgeMode,
-    PcntModuleConfig, PwmChannelConfig, PwmCounting, PwmMode, PwmOutput, PwmPolarity,
-    QSPI_MEMORY_SIZES, QspiAddressSize, QspiModuleConfig, RmtDirection, RmtModuleConfig,
-    SaiBlockConfig, SaiDataSize, SaiMode, SaiModuleConfig, SaiStereoMono, SaiTxRx,
-    SdmmcModuleConfig, SpiBitOrder, SpiModuleConfig, SpiRole, StopBits, TimerModuleConfig,
-    TouchModuleConfig, TouchScan, TouchThreshold, UsartDirection, UsartFlow, UsartMode,
-    UsartModuleConfig, UsbModuleConfig, UsbRole, VirtualModule, XspiMemoryType, XspiMode,
-    XspiModuleConfig, module_signal_of, usart_data_bits,
+    I2cDeviceEdit, I2cDeviceKey, I2cModuleConfig, I2cRow, I2sClockPolarity, I2sDirection,
+    I2sFormat, I2sMode, I2sModuleConfig, I2sStandard, LcdCamMode, LcdCamModuleConfig,
+    McpwmModuleConfig, ModuleConfig, ModuleKind, ModuleSignal, OspiMemoryType, OspiMode,
+    OspiModuleConfig, Parity, ParlIoBitOrder, ParlIoDirection, ParlIoModuleConfig, ParlIoWidth,
+    PcntChannelCfg, PcntCtrlMode, PcntEdgeMode, PcntModuleConfig, PwmChannelConfig, PwmCounting,
+    PwmMode, PwmOutput, PwmPolarity, QSPI_MEMORY_SIZES, QspiAddressSize, QspiModuleConfig,
+    RmtDirection, RmtModuleConfig, SaiBlockConfig, SaiDataSize, SaiMode, SaiModuleConfig,
+    SaiStereoMono, SaiTxRx, SdmmcModuleConfig, SpiBitOrder, SpiModuleConfig, SpiRole, StopBits,
+    TimerModuleConfig, TouchModuleConfig, TouchScan, TouchThreshold, UsartDirection, UsartFlow,
+    UsartMode, UsartModuleConfig, UsbModuleConfig, UsbRole, VirtualModule, XspiMemoryType,
+    XspiMode, XspiModuleConfig, address_issue, format_i2c_address, module_signal_of,
+    parse_i2c_address, usart_data_bits,
 };
 
 pub use notes::{ModuleNotes, NotesKey};
@@ -380,6 +381,348 @@ mod tests {
         mcu.push_module_undo("x".into());
         mcu.discard_last_module_undo();
         assert!(!mcu.can_undo_modules());
+    }
+
+    /// A bus on F103 I2C1 with its pads in "sensors" and two devices.
+    fn grouped_bus() -> (crate::panels::mcu_module::mcu::Mcu, u8, Vec<I2cDeviceKey>) {
+        use super::I2cDeviceEdit as E;
+        let mut mcu = create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let bus = mcu.modules[0].clone();
+        let inst = bus.instance();
+        mcu.join_group_module(&bus, "sensors");
+        mcu.edit_i2c_device(inst, E::Add);
+        mcu.edit_i2c_device(inst, E::Add);
+        let keys = i2c_keys(&mcu);
+        (mcu, inst, keys)
+    }
+
+    fn i2c_keys(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Vec<I2cDeviceKey> {
+        match &mcu.modules[0].config {
+            ModuleConfig::I2c(c) => c.rows().iter().map(|r| r.key).collect(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn device_of(
+        mcu: &crate::panels::mcu_module::mcu::Mcu,
+        inst: u8,
+        k: I2cDeviceKey,
+    ) -> Option<String> {
+        mcu.group_of_i2c_device(inst, k).map(|g| g.name.clone())
+    }
+
+    /// A device of a bus is in its bus's Device until it is put in another -
+    /// and an empty name sends it back. The Device made for it alone is gone
+    /// once it leaves.
+    #[test]
+    fn an_i2c_device_follows_its_bus_until_put_elsewhere() {
+        let (mut mcu, inst, k) = grouped_bus();
+        assert_eq!(device_of(&mcu, inst, k[0]).as_deref(), Some("sensors"));
+        assert!(mcu.join_group_i2c(inst, k[1], "display"));
+        assert_eq!(device_of(&mcu, inst, k[1]).as_deref(), Some("display"));
+        assert_eq!(
+            device_of(&mcu, inst, k[0]).as_deref(),
+            Some("sensors"),
+            "its sibling stays"
+        );
+        assert!(
+            !mcu.join_group_i2c(inst, k[1], "display"),
+            "already there: no change"
+        );
+        assert!(mcu.join_group_i2c(inst, k[1], ""));
+        assert_eq!(device_of(&mcu, inst, k[1]).as_deref(), Some("sensors"));
+        assert!(
+            !mcu.groups.iter().any(|g| g.name == "display"),
+            "the emptied Device is finished"
+        );
+    }
+
+    /// A Device that still holds an I2C device is not finished when its last
+    /// PAD leaves - and a rename onto a taken name carries its I2C devices.
+    #[test]
+    fn a_device_holding_an_i2c_device_survives_its_pads() {
+        let (mut mcu, inst, k) = grouped_bus();
+        let free = mcu
+            .iter_all_pins()
+            .find(|p| {
+                !p.reserved
+                    && !mcu.modules[0]
+                        .connections
+                        .iter()
+                        .any(|c| c.mcu_pin == p.number)
+            })
+            .map(|p| p.number)
+            .unwrap();
+        mcu.join_group(free, "display");
+        assert!(mcu.join_group_i2c(inst, k[0], "display"));
+        mcu.join_group(free, "");
+        assert!(
+            mcu.groups.iter().any(|g| g.name == "display"),
+            "dropped with an I2C device in it"
+        );
+
+        let at = mcu.groups.iter().position(|g| g.name == "display").unwrap();
+        mcu.rename_group(at, "sensors");
+        let sensors = mcu.groups.iter().find(|g| g.name == "sensors").unwrap();
+        assert!(!sensors.i2c.is_empty(), "the merge lost the I2C device");
+    }
+
+    /// An undone Add rolls the bus's uids back, and the Device the removed
+    /// device was in still holds its uid: the next device must NOT walk into
+    /// that Device.
+    #[test]
+    fn an_undone_add_hands_nobody_its_device() {
+        use super::I2cDeviceEdit as E;
+        let (mut mcu, inst, _) = grouped_bus();
+        assert!(mcu.edit_i2c_device(inst, E::Add));
+        let k = *i2c_keys(&mcu).last().unwrap();
+        assert!(mcu.join_group_i2c(inst, k, "display"));
+        mcu.undo_modules();
+        assert_eq!(i2c_keys(&mcu).len(), 2, "the add is undone");
+        assert!(mcu.edit_i2c_device(inst, E::Add));
+        let fresh = *i2c_keys(&mcu).last().unwrap();
+        assert_ne!(fresh, k, "the uid was handed out again");
+        assert_eq!(device_of(&mcu, inst, fresh).as_deref(), Some("sensors"));
+    }
+
+    /// The legacy single address has no entry to hold a uid: grouping it mints
+    /// one, and nothing it generates changes.
+    #[test]
+    fn grouping_the_legacy_device_mints_it() {
+        let mut mcu = create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let inst = mcu.modules[0].instance();
+        if let ModuleConfig::I2c(c) = &mut mcu.modules[0].config {
+            c.address = 0x3C;
+        }
+        assert_eq!(i2c_keys(&mcu), vec![I2cDeviceKey::Implicit]);
+        assert!(mcu.join_group_i2c(inst, I2cDeviceKey::Implicit, "oled"));
+        let k = i2c_keys(&mcu);
+        assert!(matches!(k[..], [I2cDeviceKey::Uid(_)]), "{k:?}");
+        assert_eq!(device_of(&mcu, inst, k[0]).as_deref(), Some("oled"));
+        if let ModuleConfig::I2c(c) = &mcu.modules[0].config {
+            assert_eq!(c.primary_address(), 0x3C);
+        }
+    }
+
+    /// A legacy bus (one address, no list) with that device grouped from the
+    /// roster.
+    fn legacy_bus_with_a_module_added() -> (crate::panels::mcu_module::mcu::Mcu, u8) {
+        let mut mcu = create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let inst = mcu.modules[0].instance();
+        if let ModuleConfig::I2c(c) = &mut mcu.modules[0].config {
+            c.address = 0x3C;
+        }
+        mcu.push_module_undo("Add USART".into());
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceUsart));
+        (mcu, inst)
+    }
+
+    fn bus_keys(mcu: &crate::panels::mcu_module::mcu::Mcu, inst: u8) -> Vec<I2cDeviceKey> {
+        mcu.i2c_bus(inst)
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r.key)
+            .collect()
+    }
+
+    /// Grouping a legacy device mints its bus - in the undo history too, so
+    /// undoing an EARLIER module action does not take the device out of the
+    /// Device it was put in afterwards.
+    #[test]
+    fn undoing_past_the_mint_keeps_the_device_in_its_device() {
+        let (mut mcu, inst) = legacy_bus_with_a_module_added();
+        assert!(mcu.join_group_i2c(inst, I2cDeviceKey::Implicit, "display"));
+        mcu.undo_modules();
+        let k = bus_keys(&mcu, inst);
+        assert!(
+            matches!(k[..], [I2cDeviceKey::Uid(_)]),
+            "unminted again: {k:?}"
+        );
+        assert_eq!(device_of(&mcu, inst, k[0]).as_deref(), Some("display"));
+    }
+
+    /// The same through the device's own first edit: undoing the rename
+    /// undoes the name, not the Device it was put in after.
+    #[test]
+    fn undoing_a_first_rename_keeps_the_device_in_its_device() {
+        use super::I2cDeviceEdit as E;
+        let (mut mcu, inst) = legacy_bus_with_a_module_added();
+        assert!(mcu.edit_i2c_device(inst, E::Name(I2cDeviceKey::Implicit, "oled".into())));
+        let k = bus_keys(&mcu, inst)[0];
+        assert!(mcu.join_group_i2c(inst, k, "display"));
+        mcu.undo_modules();
+        let k = bus_keys(&mcu, inst)[0];
+        assert_eq!(device_of(&mcu, inst, k).as_deref(), Some("display"));
+        assert_eq!(
+            mcu.i2c_bus(inst).unwrap().device(k).unwrap().0,
+            "",
+            "the name is undone"
+        );
+    }
+
+    /// A removed device's uid is not handed to the next one while an undo can
+    /// still bring the removed one back - or the undo would put it in the new
+    /// one's Device.
+    #[test]
+    fn an_undone_remove_does_not_inherit_a_newer_devices_device() {
+        use super::I2cDeviceEdit as E;
+        let (mut mcu, inst, k) = grouped_bus();
+        assert!(mcu.edit_i2c_device(inst, E::Remove(k[1])));
+        assert!(mcu.edit_i2c_device(inst, E::Add));
+        let fresh = *bus_keys(&mcu, inst).last().unwrap();
+        assert_ne!(fresh, k[1], "the removed device's uid was handed out again");
+        assert!(mcu.join_group_i2c(inst, fresh, "clock"));
+        mcu.undo_modules();
+        mcu.undo_modules();
+        assert_eq!(device_of(&mcu, inst, k[1]).as_deref(), Some("sensors"));
+    }
+
+    /// A removal nobody can answer is retired: its bus went, or a mint
+    /// re-keyed the device it named.
+    #[test]
+    fn a_removal_of_a_device_that_is_gone_is_retired() {
+        use super::I2cDeviceEdit as E;
+        let (mut mcu, inst, k) = grouped_bus();
+        mcu.i2c_remove_confirm = Some((inst, k[1]));
+        mcu.reconcile_modules();
+        assert!(mcu.i2c_remove_confirm.is_some(), "a live one stays");
+        let id = mcu.modules[0].id.clone();
+        mcu.remove_module(&id);
+        mcu.reconcile_modules();
+        assert_eq!(mcu.i2c_remove_confirm, None);
+
+        let mut mcu = create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let inst = mcu.modules[0].instance();
+        if let ModuleConfig::I2c(c) = &mut mcu.modules[0].config {
+            c.address = 0x3C;
+        }
+        mcu.i2c_remove_confirm = Some((inst, I2cDeviceKey::Implicit));
+        assert!(
+            mcu.edit_i2c_device(inst, E::Add),
+            "mints, re-keying the device"
+        );
+        mcu.reconcile_modules();
+        assert_eq!(mcu.i2c_remove_confirm, None);
+    }
+
+    /// The panel's edit and the canvas's arrive in one batch: a first edit
+    /// that mints the bus does not strand the next one's positional key.
+    #[test]
+    fn one_batch_pins_every_key_before_the_first_mint() {
+        use super::{I2cDevice, I2cDeviceEdit as E};
+        use crate::panels::mcu_module::mcu::gui::i2c_devices::{I2cAct, apply_acts};
+        let mut mcu = create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let inst = mcu.modules[0].instance();
+        if let ModuleConfig::I2c(c) = &mut mcu.modules[0].config {
+            c.devices = vec![
+                I2cDevice {
+                    name: "a".into(),
+                    address: 0x10,
+                    uid: 0,
+                },
+                I2cDevice {
+                    name: "b".into(),
+                    address: 0x11,
+                    uid: 0,
+                },
+            ];
+        }
+        apply_acts(
+            &mut mcu,
+            vec![
+                (inst, I2cAct::Edit(E::Remove(I2cDeviceKey::Unminted(0)))),
+                (
+                    inst,
+                    I2cAct::Edit(E::Address(I2cDeviceKey::Unminted(1), 0x50)),
+                ),
+            ],
+        );
+        let c = mcu.i2c_bus(inst).unwrap();
+        assert_eq!(c.devices.len(), 1);
+        assert_eq!(
+            (c.devices[0].name.as_str(), c.devices[0].address),
+            ("b", 0x50)
+        );
+
+        // A legacy device named on the canvas while "+ device" is clicked in
+        // the panel, in the same frame.
+        let mut mcu = create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        if let ModuleConfig::I2c(c) = &mut mcu.modules[0].config {
+            c.address = 0x3C;
+        }
+        apply_acts(
+            &mut mcu,
+            vec![
+                (inst, I2cAct::Edit(E::Add)),
+                (
+                    inst,
+                    I2cAct::Edit(E::Name(I2cDeviceKey::Implicit, "oled".into())),
+                ),
+            ],
+        );
+        let names: Vec<&str> = mcu
+            .i2c_bus(inst)
+            .unwrap()
+            .devices
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["oled", ""]);
+    }
+
+    /// A device picked on the canvas speaks for ITS Device, not its bus's.
+    #[test]
+    fn a_picked_i2c_device_lights_its_own_device() {
+        let (mut mcu, inst, k) = grouped_bus();
+        mcu.join_group_i2c(inst, k[1], "display");
+        let id = mcu.modules[0].id.clone();
+        mcu.selected_module = Some(id.clone());
+        assert_eq!(mcu.active_device(), Some("sensors"));
+        mcu.selected_i2c_child = Some((id, k[1]));
+        assert_eq!(mcu.active_device(), Some("display"));
+        mcu.clear_canvas_selection();
+        assert_eq!(mcu.selected_i2c_child(), None);
+    }
+
+    /// An I2C bus's device edits go through one door that snapshots them for
+    /// Ctrl+Z - a real change only, so a field left unchanged, or an edit of a
+    /// device that is gone, does not push an entry that undoes nothing.
+    #[test]
+    fn an_i2c_device_edit_is_undoable_and_a_no_op_is_not() {
+        use super::{I2cDeviceEdit as E, I2cDeviceKey as K};
+        let mut mcu = create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let inst = mcu.modules[0].instance();
+        let devices = |mcu: &crate::panels::mcu_module::mcu::Mcu| match &mcu.modules[0].config {
+            ModuleConfig::I2c(c) => c.devices.clone(),
+            _ => unreachable!(),
+        };
+
+        assert!(mcu.edit_i2c_device(inst, E::Add));
+        assert_eq!(mcu.last_module_undo_label(), Some("Add I2C device"));
+        let uid = devices(&mcu)[0].uid;
+        assert!(mcu.edit_i2c_device(inst, E::Name(K::Uid(uid), "oled".into())));
+        let depth = mcu.module_undo.len();
+        assert!(!mcu.edit_i2c_device(inst, E::Name(K::Uid(uid), "oled".into())));
+        assert!(!mcu.edit_i2c_device(inst, E::Address(K::Uid(uid + 9), 0x3C)));
+        assert!(!mcu.edit_i2c_device(inst + 1, E::Add), "no such bus");
+        assert_eq!(mcu.module_undo.len(), depth, "no-ops push nothing");
+
+        mcu.i2c_remove_confirm = Some((inst, K::Uid(uid)));
+        assert!(mcu.edit_i2c_device(inst, E::Remove(K::Uid(uid))));
+        assert_eq!(mcu.i2c_remove_confirm, None, "the confirm is spent");
+        assert!(devices(&mcu).is_empty());
+        mcu.undo_modules();
+        assert_eq!(devices(&mcu)[0].name, "oled", "the remove is undone");
+        mcu.undo_modules();
+        assert_eq!(devices(&mcu)[0].name, "", "and so is the rename");
     }
 
     /// The config constants live in `src/pins/configs/usart1.rs` and track the

@@ -2208,10 +2208,12 @@ mod tests {
                         I2cDevice {
                             name: "display".into(),
                             address: 0x3C,
+                            ..Default::default()
                         },
                         I2cDevice {
                             name: "imu".into(),
                             address: 0x68,
+                            ..Default::default()
                         },
                     ];
                 }

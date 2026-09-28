@@ -12,7 +12,7 @@ use crate::panels::mcu_module::codegen::sanitize_label;
 use crate::panels::mcu_module::modules::model::BlockingDma;
 use crate::panels::mcu_module::modules::model::hz_label;
 use crate::panels::mcu_module::modules::{
-    ApiStyle, AsyncBusMode, BREAK_FILTERS, BreakPolarity, CanMode, HspiMode, I2cDevice,
+    ApiStyle, AsyncBusMode, BREAK_FILTERS, BreakPolarity, CanMode, HspiMode, I2cDeviceEdit,
     I2sClockPolarity, I2sDirection, I2sFormat, I2sMode, I2sStandard, LcdCamMode, ModuleConfig,
     ModuleKind, ModuleSignal, OspiMemoryType, OspiMode, Parity, ParlIoBitOrder, ParlIoDirection,
     ParlIoWidth, PcntCtrlMode, PcntEdgeMode, PwmCounting, PwmMode, PwmOutput, PwmPolarity,
@@ -414,7 +414,7 @@ pub const MARGIN_Y: f32 = PIN_HEIGHT + PIN_GAP + BOX_H_MAX + 24.0;
 
 /// Which side of the chip a pin sits on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Side {
+pub(super) enum Side {
     Right,
     Left,
     Top,
@@ -514,7 +514,7 @@ fn side_from_outward(v: egui::Vec2) -> Side {
 
 /// Wire/terminal colour for a module signal — the **same colour as the MCU pin**
 /// it connects to (so the schematic matches the pin colours on the chip).
-fn signal_color(sig: ModuleSignal, instance: u8) -> egui::Color32 {
+pub(super) fn signal_color(sig: ModuleSignal, instance: u8) -> egui::Color32 {
     sig.pin_function(instance).color()
 }
 
@@ -587,12 +587,17 @@ pub fn module_color(kind: ModuleKind, instance: u8) -> egui::Color32 {
 /// the side axis) but **nudged forward** past `cursor` so same-side boxes never
 /// overlap. `cursor` tracks the trailing edge of the previously placed box on
 /// this side and is advanced here. Call with boxes pre-sorted by `along`.
+///
+/// `tail`: how far past the box's far end something that belongs to it still
+/// runs - the column of an I2C bus's devices on a left/right bus
+/// (`i2c_children::tail`) - so the next box starts after THAT.
 fn packed_rect(
     chip_rect: egui::Rect,
     side: Side,
     along: f32,
     cursor: &mut f32,
     h: f32,
+    tail: f32,
 ) -> egui::Rect {
     match side {
         Side::Right | Side::Left => {
@@ -601,7 +606,7 @@ fn packed_rect(
             if cy - half < *cursor + BOX_GAP {
                 cy = *cursor + BOX_GAP + half;
             }
-            *cursor = cy + half;
+            *cursor = cy + half + tail;
             let x = if side == Side::Right {
                 chip_rect.right() + PIN_HEIGHT + PIN_GAP
             } else {
@@ -985,7 +990,7 @@ pub fn custom_struct_name(m: &VirtualModule) -> String {
 /// Not `Color32::lerp` — egui has none — and deliberately not blending the
 /// alpha: both ends are opaque here and a premultiplied blend would darken the
 /// result instead of colouring it.
-fn tint(base: egui::Color32, towards: egui::Color32, t: f32) -> egui::Color32 {
+pub(super) fn tint(base: egui::Color32, towards: egui::Color32, t: f32) -> egui::Color32 {
     let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
     egui::Color32::from_rgb(
         mix(base.r(), towards.r()),
@@ -2287,7 +2292,7 @@ fn signal_legend(ui: &mut egui::Ui, kind: ModuleKind) {
 /// Font multiplier for a module box's texts: 1 normally, `SELECTED_TEXT_SCALE`
 /// while the box is selected. Shared by the box painter and the (separate)
 /// mutable pass that puts the rename fields, so the two never drift apart.
-fn text_scale(selected: bool) -> f32 {
+pub(super) fn text_scale(selected: bool) -> f32 {
     if selected {
         crate::panels::mcu_module::pins::gui::draw::SELECTED_TEXT_SCALE
     } else {
@@ -2385,12 +2390,15 @@ pub fn draw_modules(
         group.sort_by(|a, b| a.along.total_cmp(&b.along));
         let mut cursor = f32::MIN;
         for e in group {
+            let h = box_h(&mcu.modules[e.idx]);
+            let n = super::i2c_children::device_count(&mcu.modules[e.idx].config);
             let rect = packed_rect(
                 chip_rect,
                 e.side,
                 e.along,
                 &mut cursor,
-                box_h(&mcu.modules[e.idx]),
+                h,
+                super::i2c_children::tail(e.side, h, n),
             );
             boxes.push((e.idx, rect, e.conns.clone(), e.side, true, false));
         }
@@ -2433,6 +2441,54 @@ pub fn draw_modules(
         boxes.push((i, rect, conns, facing(rect), connected, true));
     }
 
+    // ── 2b. The devices of each I2C bus, beside its box ────────────────────────
+    // Laid out from the box's FINAL rect, so they follow a dragged bus too, and
+    // before the obstacle list below so the wires of the pads avoid them.
+    // (index in `boxes`, the bus).
+    let mut buses: Vec<(usize, super::i2c_children::BusDraw)> = Vec::new();
+    let mut add_buttons: Vec<(u8, egui::Rect)> = Vec::new();
+    for (bi, (i, rect, _, side, ..)) in boxes.iter().enumerate() {
+        let m = &mcu.modules[*i];
+        let ModuleConfig::I2c(cfg) = &m.config else {
+            continue;
+        };
+        let inst = m.instance();
+        add_buttons.push((inst, *rect));
+        let rows = cfg.rows();
+        if rows.is_empty() {
+            continue;
+        }
+        // Each device's Device: the one it was put in, else its bus's.
+        let bus_group = mcu.group_of_module(m).map(|g| g.name.trim().to_owned());
+        let mut devices: Vec<(usize, _, Option<String>)> = rows
+            .iter()
+            .enumerate()
+            .map(|(n, r)| {
+                let g = mcu
+                    .group_of_i2c_device(inst, r.key)
+                    .map(|g| g.name.trim().to_owned());
+                (n + 1, r.key, g)
+            })
+            .collect();
+        // The ones in ANOTHER Device go to the far end of the column: between
+        // two of the bus's own, one of them would split the bus's mat in two.
+        // And each other Device's devices kept together, for the same reason.
+        devices.sort_by_key(|(_, _, g)| (*g != bus_group, g.clone()));
+        buses.push((
+            bi,
+            super::i2c_children::BusDraw {
+                module: *i,
+                module_id: m.id.clone(),
+                instance: inst,
+                group: bus_group,
+                bus: super::i2c_children::layout(*rect, *side, devices.len()),
+                keys: devices.iter().map(|(_, k, _)| *k).collect(),
+                numbers: devices.iter().map(|(n, ..)| *n).collect(),
+                child_groups: devices.into_iter().map(|(.., g)| g).collect(),
+            },
+        ));
+    }
+
     // ── 3. Draw boxes + wires; detect a header click to expand the list entry. ─
     // Native runtime → the handle preview shows the split (Tx, Rx) for USART.
     let native_forced = mcu.is_native();
@@ -2464,7 +2520,18 @@ pub fn draw_modules(
     // Every box, as an obstacle. A wire drawn across a box reads as though it
     // connects to it, which is the one thing a schematic line may never suggest
     // wrongly.
-    let box_rects: Vec<egui::Rect> = boxes.iter().map(|(_, r, ..)| *r).collect();
+    //
+    // The devices of the I2C buses come AFTER the modules, so a module's
+    // `own` index into this list is still its index in `boxes`.
+    let box_rects: Vec<egui::Rect> = boxes
+        .iter()
+        .map(|(_, r, ..)| *r)
+        .chain(
+            buses
+                .iter()
+                .flat_map(|(_, b)| b.bus.children.iter().copied()),
+        )
+        .collect();
     // ONE slot for every wire on the canvas, reserved before the boxes are
     // drawn and filled after. Wires used to be painted per box, inside the loop,
     // so a box packed later covered the wires of a box packed earlier - and a
@@ -2492,6 +2559,19 @@ pub fn draw_modules(
             covers: conns.iter().map(|(_, _, n)| *n).collect(),
         }
     }));
+    // A bus's devices are parts of the device its box is in: a mat that covers
+    // the bus covers them. Pushed even when the bus is in none, so another
+    // device's mat treats them as something it may not draw over. They speak
+    // for no pad - the bus box already speaks for SCL and SDA.
+    for (_, b) in &buses {
+        members.extend(b.bus.children.iter().zip(&b.child_groups).map(|(c, g)| {
+            super::device_frame::Member {
+                group: g.clone(),
+                rect: *c,
+                covers: Vec::new(),
+            }
+        }));
+    }
     // A device being dragged moves every one of its parts. Seeded here, BEFORE
     // the box loop, so a box-header drag pushed later into the same vec still
     // wins for that box under last-write-wins - dragging one box out of a device
@@ -2648,8 +2728,35 @@ pub fn draw_modules(
         }
         field_pass.push((*i, *rect));
     }
+    // The devices of the I2C buses, after every module box so none is drawn
+    // over them; their wires join the slot with everyone else's.
+    let bus_draws: Vec<super::i2c_children::BusDraw> = buses.into_iter().map(|(_, b)| b).collect();
+    let bus_out = super::i2c_children::paint(
+        painter,
+        ui,
+        mcu,
+        &bus_draws,
+        &add_buttons,
+        active.as_deref(),
+        bus_blink(mcu, ui),
+        &mut wire_halos,
+        &mut wire_lines,
+    );
     wire_halos.append(&mut wire_lines);
     painter.set(wire_slot, egui::Shape::Vec(wire_halos));
+    // How far they reached, for the canvas size next frame (see `bus_reach`).
+    let reach = bus_draws.iter().fold(egui::Vec2::ZERO, |acc, b| {
+        let r = b.bus.bounds();
+        let far = (r.min - chip_center).abs().max((r.max - chip_center).abs());
+        acc.max(far)
+    });
+    // Within half a pixel is the same reach - the canvas keeps a 16 px margin
+    // past it anyway, and an exact compare of floats rebuilt from the canvas
+    // centre each frame is one rounding away from repainting forever.
+    if (reach.x - mcu.bus_reach.0).abs() > 0.5 || (reach.y - mcu.bus_reach.1).abs() > 0.5 {
+        mcu.bus_reach = (reach.x, reach.y);
+        ui.ctx().request_repaint();
+    }
 
     // Apply drag / reset now that the box borrow of `mcu.modules` has ended.
     for (i, off) in drag_updates {
@@ -2727,6 +2834,15 @@ pub fn draw_modules(
         }
     }
 
+    // What the user did on the devices of a bus: through the one write path.
+    // With the panel's, held since it drew: ONE batch, after both editors
+    // have drawn, so neither re-keys a device under the other's field.
+    let mut acts = std::mem::take(&mut mcu.pending_i2c_acts);
+    acts.extend(bus_out.acts);
+    if !acts.is_empty() {
+        super::i2c_devices::apply_acts(mcu, acts);
+    }
+
     if let Some(id) = clicked_id {
         // One click does three things: select the box (click again to deselect,
         // like a pin), expand the module's entry in the list below, and light up
@@ -2736,9 +2852,29 @@ pub fn draw_modules(
         } else {
             Some(id.clone())
         };
+        mcu.selected_i2c_child = None;
         mcu.expand_module = Some(id.clone());
         mcu.module_goto = Some(id);
+    } else if let Some((id, key)) = bus_out.picked {
+        // A device of a bus SELECTS its bus - never toggles it off, or a second
+        // device clicked on the same bus would close the config the first one
+        // opened - and opens the bus's config, where its row is. No jump in
+        // the editor: the device's name and ID are right there on the box.
+        mcu.selected_module = Some(id.clone());
+        mcu.selected_i2c_child = Some((id.clone(), key));
+        mcu.expand_module = Some(id);
     }
+}
+
+/// The pulse of a pending I2C device removal, 0..1 - and a repaint to keep it
+/// going, only while one is pending.
+fn bus_blink(mcu: &Mcu, ui: &egui::Ui) -> f32 {
+    if mcu.i2c_remove_confirm.is_none() {
+        return 0.0;
+    }
+    ui.ctx().request_repaint();
+    let phase = (ui.input(|i| i.time) * std::f64::consts::TAU * 1.8).sin();
+    0.5 + 0.5 * phase as f32
 }
 
 fn dominant_side(conns: &[(ModuleSignal, egui::Pos2, Side, usize)]) -> Side {
@@ -3227,6 +3363,11 @@ pub fn module_config_ui(
     // What the chip's UART does with a baud rate at the CURRENT clock. Read by
     // the caller before `mcu.modules` is borrowed, like `dma`.
     baud_chip: &crate::panels::mcu_module::uart_baud::Chip,
+    // An I2C bus's device rows: the armed removal in, what the user did out.
+    // Out rather than written in place, because a device edit is snapshotted
+    // for Ctrl+Z first and that needs the whole `Mcu`, which the caller holds
+    // borrowed through `m`.
+    i2c: &mut super::i2c_devices::I2cIo,
 ) {
     // Read what we need off `m` BEFORE `m.config` is borrowed mutably below.
     let is_custom = m.kind.is_custom();
@@ -6427,82 +6568,86 @@ pub fn module_config_ui(
                         );
                         ui.end_row();
                     }
-                    // One device is one row, as it always was. Several is a
-                    // list — and the switch is the user's, never inferred: a
-                    // project that has only ever had one address keeps the
-                    // simpler panel AND the simpler generated output.
-                    if cfg.devices.is_empty() {
-                        out.field("Address (7-bit)", docs::I2C_ADDRESS);
-                        ui.label("Address (7-bit)");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                crate::panels::drag_value(ui, &mut cfg.address)
-                                    .range(0..=127)
-                                    .hexadecimal(2, false, true),
+                    // One row per device - the same rows the canvas draws as
+                    // boxes under the bus, through the same fields and the same
+                    // write path (`i2c_devices`), so the two cannot disagree.
+                    // Nothing is written here: every edit is handed back in
+                    // `i2c.acts` and applied once `mcu.modules` is free.
+                    out.field("Devices", docs::I2C_DEVICES);
+                    ui.label("Devices");
+                    ui.vertical(|ui| {
+                        let rows = cfg.rows();
+                        let issues = cfg.address_issues();
+                        if rows.is_empty() {
+                            ui.label(
+                                egui::RichText::new("none yet")
+                                    .size(10.5)
+                                    .color(egui::Color32::from_gray(130)),
                             );
-                            if ui
-                                .small_button("+ device")
-                                .on_hover_text(docs::I2C_DEVICES)
-                                .clicked()
-                            {
-                                // The address already set IS the first device.
-                                // Starting the list without it would read as the
-                                // setting having been thrown away.
-                                cfg.devices = vec![
-                                    I2cDevice {
-                                        name: String::new(),
-                                        address: cfg.address,
-                                    },
-                                    I2cDevice::default(),
-                                ];
-                            }
-                        });
-                        ui.end_row();
-                    } else {
-                        out.field("Devices", docs::I2C_DEVICES);
-                        ui.label("Devices");
-                        let mut remove: Option<usize> = None;
-                        let mut add = false;
-                        ui.vertical(|ui| {
-                            for (i, d) in cfg.devices.iter_mut().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut d.name)
-                                            .desired_width(110.0)
-                                            .hint_text(format!("device {}", i + 1)),
+                        }
+                        for (i, (row, issue)) in rows.iter().zip(&issues).enumerate() {
+                            ui.horizontal(|ui| {
+                                let name_id = ui.id().with(("i2c_dev_name", row.key));
+                                if let Some(act) = super::i2c_devices::name_field(
+                                    ui, name_id, row, i + 1, None, 110.0, None,
+                                ) {
+                                    i2c.acts.push((m_inst, act));
+                                }
+                                let id_id = ui.id().with(("i2c_dev_id", row.key));
+                                if let Some(act) = super::i2c_devices::id_field(
+                                    ui, id_id, row, *issue, None, 44.0, None,
+                                ) {
+                                    i2c.acts.push((m_inst, act));
+                                }
+                                if ui
+                                    .small_button("x")
+                                    .on_hover_text("Remove this device")
+                                    .clicked()
+                                {
+                                    i2c.acts.push((
+                                        m_inst,
+                                        super::i2c_devices::I2cAct::ArmRemove(row.key),
+                                    ));
+                                }
+                            });
+                            if i2c.confirm == Some((m_inst, row.key)) {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(super::i2c_devices::remove_question(
+                                            row.name,
+                                            i + 1,
+                                            rows.len(),
+                                        ))
+                                        .size(10.5)
+                                        .color(egui::Color32::from_rgb(225, 175, 70)),
                                     );
-                                    ui.add(
-                                        crate::panels::drag_value(ui, &mut d.address)
-                                            .range(0..=127)
-                                            .hexadecimal(2, false, true),
-                                    );
-                                    if ui
-                                        .small_button("x")
-                                        .on_hover_text("Remove this device")
-                                        .clicked()
-                                    {
-                                        remove = Some(i);
+                                    if ui.small_button("Remove").clicked() {
+                                        i2c.acts.push((
+                                            m_inst,
+                                            super::i2c_devices::I2cAct::Edit(
+                                                I2cDeviceEdit::Remove(row.key),
+                                            ),
+                                        ));
+                                    }
+                                    if ui.small_button("Cancel").clicked() {
+                                        i2c.acts
+                                            .push((m_inst, super::i2c_devices::I2cAct::CancelRemove));
                                     }
                                 });
                             }
-                            add = ui.small_button("+ device").clicked();
-                        });
-                        if add {
-                            cfg.devices.push(I2cDevice::default());
                         }
-                        if let Some(i) = remove {
-                            cfg.devices.remove(i);
+                        if ui
+                            .small_button("+ device")
+                            .on_hover_text(docs::I2C_DEVICES)
+                            .clicked()
+                        {
+                            i2c.acts.push((
+                                m_inst,
+                                super::i2c_devices::I2cAct::Edit(I2cDeviceEdit::Add),
+                            ));
                         }
-                        // Back down to one device is the single-address case, so
-                        // collapse to it: a one-row list means exactly what the
-                        // Address row means, and leaving it would keep emitting a
-                        // per-device file for a bus that no longer needs one.
-                        if cfg.devices.len() == 1 {
-                            cfg.address = cfg.devices[0].address;
-                            cfg.devices.clear();
-                        }
-                        ui.end_row();
-                    }
+                    });
+                    ui.end_row();
                     if is_async && rp_i2c {
                         out.note(RP_I2C_NOTE);
                     } else if is_async && nrf_i2c {
@@ -7315,6 +7460,7 @@ mod tests {
                         crate::panels::mcu_module::mcu::Runtime::Blocking
                     },
                 ),
+                &mut super::super::i2c_devices::I2cIo::default(),
             );
         });
         out
@@ -7498,19 +7644,20 @@ mod tests {
             c.scan = TouchScan::Continuous;
             out.push(ModuleConfig::Touch(c));
         }
-        // An I2C bus carrying several devices draws a list where one device draws
-        // a single Address row. Without this variant the list is a row the roster
-        // never sees, so it could not be documented without the guard calling it
-        // a row nothing draws.
+        // An I2C bus carrying devices. Every bus draws the same Devices row now,
+        // however many it holds, but the rows INSIDE it (name, ID, remove) only
+        // exist with devices - so a bus with some is driven too.
         if let ModuleConfig::I2c(mut c) = kind.default_config(1) {
             c.devices = vec![
                 I2cDevice {
                     name: "display".into(),
                     address: 0x3C,
+                    ..Default::default()
                 },
                 I2cDevice {
                     name: "imu".into(),
                     address: 0x68,
+                    ..Default::default()
                 },
             ];
             out.push(ModuleConfig::I2c(c));
@@ -8964,6 +9111,7 @@ mod wire_tests {
         mcu.groups = vec![crate::panels::mcu_module::mcu_config::PinGroup {
             name: "radar ".into(),
             pins: [7].into_iter().collect(),
+            ..Default::default()
         }];
         assert_eq!(wire_lit(Some("radar"), &mcu, 7), Some("radar"));
     }
@@ -10050,5 +10198,20 @@ mod the_note_glyph {
         assert!(!inside_convex(&sq, egui::pos2(11.0, 5.0)));
         let rev: Vec<_> = sq.iter().rev().copied().collect();
         assert!(inside_convex(&rev, egui::pos2(5.0, 5.0)), "either winding");
+    }
+
+    /// A box on a left/right side that owns a column running past it (an I2C
+    /// bus's devices) pushes the next box on that side past the column, not
+    /// just past itself.
+    #[test]
+    fn the_next_box_starts_after_the_tail_of_the_one_before() {
+        let chip = egui::Rect::from_center_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let mut cursor = f32::MIN;
+        let a = super::packed_rect(chip, super::Side::Right, -50.0, &mut cursor, 98.0, 120.0);
+        let b = super::packed_rect(chip, super::Side::Right, -40.0, &mut cursor, 98.0, 0.0);
+        assert!(
+            b.top() >= a.bottom() + 120.0 + super::BOX_GAP - 0.01,
+            "{a:?} then {b:?}"
+        );
     }
 }

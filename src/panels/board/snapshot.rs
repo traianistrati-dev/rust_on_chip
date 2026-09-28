@@ -168,10 +168,18 @@ impl ChipView {
             .filter(|g| g.is_live())
             .map(|g| DeviceItem {
                 name: g.name.trim().to_owned(),
+                // A device on an I2C bus has no pad of its own; a Device
+                // holding one hangs on that bus.
                 modules: items
                     .iter()
                     .enumerate()
-                    .filter(|(_, m)| !m.pins.is_disjoint(&g.pins))
+                    .filter(|(_, m)| {
+                        !m.pins.is_disjoint(&g.pins)
+                            || matches!(&m.config, ModuleConfig::I2c(c)
+                                if m.kind == ModuleKind::GenericInterfaceI2c
+                                    && g.i2c.iter().any(|(inst, uid)| *inst == m.instance
+                                        && c.has(crate::panels::mcu_module::modules::I2cDeviceKey::Uid(*uid))))
+                    })
                     .map(|(i, _)| i)
                     .collect(),
             })
@@ -313,6 +321,7 @@ mod tests {
         PinGroup {
             name: name.to_owned(),
             pins: pins.iter().copied().collect(),
+            ..Default::default()
         }
     }
 
@@ -349,6 +358,49 @@ mod tests {
         );
         assert_eq!(v.module(ModuleKind::GenericInterfaceUsart, 2), Some(1));
         assert_eq!(v.module(ModuleKind::GenericInterfaceSpi, 1), None);
+    }
+
+    /// A device on an I2C bus has no pad of its own: a Device holding one hangs
+    /// off that bus - and off no other bus of the same kind.
+    #[test]
+    fn a_device_holding_an_i2c_device_hangs_off_its_bus() {
+        use crate::panels::mcu_module::modules::I2cModuleConfig;
+        let i2c = |instance: u8, scl: usize, sda: usize| VirtualModule {
+            id: format!("_i2c_{instance}"),
+            kind: ModuleKind::GenericInterfaceI2c,
+            name: format!("_I2C{instance}"),
+            pos: (0.0, 0.0),
+            config: ModuleConfig::I2c(I2cModuleConfig::new(instance)),
+            connections: vec![
+                Connection {
+                    signal: ModuleSignal::Scl,
+                    mcu_pin: scl,
+                },
+                Connection {
+                    signal: ModuleSignal::Sda,
+                    mcu_pin: sda,
+                },
+            ],
+        };
+        let mut mods = [i2c(1, 42, 43), i2c(2, 21, 22)];
+        // I2C2 carries a device (uid 1); I2C1 carries none.
+        if let ModuleConfig::I2c(c) = &mut mods[1].config {
+            c.apply(&crate::panels::mcu_module::modules::I2cDeviceEdit::Add, 0);
+        }
+        let mut display = group("display", &[]);
+        display.i2c = [(2, 1)].into();
+        // A key whose device is gone hangs off nothing: the part is not there.
+        let mut gone = group("gone", &[]);
+        gone.i2c = [(2, 99)].into();
+        let v = ChipView::from_parts("c", "STM32F103C8", None, &mods, &[display, gone], |_| None);
+        let i2c2 = v.module(ModuleKind::GenericInterfaceI2c, 2).expect("I2C2");
+        assert_eq!(v.devices.len(), 2);
+        assert_eq!(v.devices[0].modules, vec![i2c2]);
+        assert!(
+            v.devices[1].modules.is_empty(),
+            "{:?}",
+            v.devices[1].modules
+        );
     }
 
     #[test]

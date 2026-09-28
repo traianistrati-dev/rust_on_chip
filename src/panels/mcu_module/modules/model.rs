@@ -2512,9 +2512,131 @@ pub struct I2cDevice {
     /// What the user calls it. It becomes the suffix of this device's config
     /// file name, so every path and identifier built from it is sanitised
     /// first - the name itself stays exactly as typed.
+    #[serde(default)]
     pub name: String,
-    /// 7-bit address.
+    /// 7-bit address - the "ID" the canvas shows on the device's box.
+    #[serde(default)]
     pub address: u8,
+    /// Which device this is, for everything that has to point at ONE of them
+    /// and keep pointing at it: a Device (group) it was put in, its box on the
+    /// canvas, a pending remove. Invisible to the user.
+    ///
+    /// Neither the name nor the address can do it - names are empty or
+    /// repeated, and every device the IDE adds starts at 0x00 - and a position
+    /// shifts the moment a device above it is removed.
+    ///
+    /// `0` = not minted yet: a file written before uids existed. Minted by the
+    /// first edit of the bus ([`I2cModuleConfig::apply`]), not at load, so
+    /// opening a project never changes it. Kept off the file while `0`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub uid: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// Which device of a bus a row, an edit or a box on the canvas means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum I2cDeviceKey {
+    /// A bus written before device lists existed: its one device is the
+    /// legacy `address`, and there is no entry to carry a key.
+    Implicit,
+    /// A listed device whose `uid` is still `0`. Only a bus nobody has edited
+    /// since it was loaded can hold one - every edit mints the whole bus
+    /// first - so the position it names cannot have shifted.
+    Unminted(usize),
+    Uid(u32),
+}
+
+/// One device of a bus as the panel and the canvas draw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct I2cRow<'a> {
+    pub key: I2cDeviceKey,
+    pub name: &'a str,
+    pub address: u8,
+}
+
+/// One change to a bus's device list, from whichever editor made it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum I2cDeviceEdit {
+    Add,
+    Remove(I2cDeviceKey),
+    Name(I2cDeviceKey, String),
+    Address(I2cDeviceKey, u8),
+}
+
+/// What is wrong with a device's address, worst first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressIssue {
+    /// Above 0x7F: not a 7-bit address at all. Only a hand-edited file can
+    /// hold one; codegen would emit it as it is.
+    NotSevenBit,
+    /// Another device on the same bus answers on it too - both would answer
+    /// every transaction.
+    Duplicate,
+    /// 0x00, which is what every new device starts at and what codegen reads
+    /// as "not set".
+    Unset,
+    /// 0x01-0x07 or 0x78-0x7F: kept by the I2C spec for general call, CBUS,
+    /// high-speed mode and 10-bit addressing. A real part can still sit there,
+    /// so this is a warning.
+    Reserved,
+}
+
+impl AddressIssue {
+    /// Red rather than amber: two devices, or no valid address, cannot work.
+    pub fn is_error(self) -> bool {
+        matches!(self, AddressIssue::NotSevenBit | AddressIssue::Duplicate)
+    }
+
+    pub fn text(self) -> &'static str {
+        match self {
+            AddressIssue::NotSevenBit => "not a 7-bit address - I2C addresses end at 0x7F",
+            AddressIssue::Duplicate => {
+                "another device on this bus has the same address - both would answer"
+            }
+            AddressIssue::Unset => "not set yet - 0x00 is the general-call address",
+            AddressIssue::Reserved => {
+                "reserved by the I2C spec (0x00-0x07 and 0x78-0x7F) - fine only if the part's datasheet says so"
+            }
+        }
+    }
+}
+
+/// The issue of `addr`, given every address on its bus (itself included).
+pub fn address_issue(addr: u8, bus: &[u8]) -> Option<AddressIssue> {
+    if addr > 0x7F {
+        Some(AddressIssue::NotSevenBit)
+    } else if addr != 0 && bus.iter().filter(|a| **a == addr).count() > 1 {
+        Some(AddressIssue::Duplicate)
+    } else if addr == 0 {
+        Some(AddressIssue::Unset)
+    } else if addr <= 0x07 || addr >= 0x78 {
+        Some(AddressIssue::Reserved)
+    } else {
+        None
+    }
+}
+
+/// An address as typed in an ID field: `3C`, `3c`, `0x3C` - hex, because that
+/// is how every datasheet writes it. `None` for anything else, including a
+/// value past 0x7F.
+pub fn parse_i2c_address(text: &str) -> Option<u8> {
+    let t = text.trim();
+    let digits = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    if digits.is_empty() || digits.len() > 2 {
+        return None;
+    }
+    u8::from_str_radix(digits, 16).ok().filter(|a| *a <= 0x7F)
+}
+
+/// How an address is shown in an ID field.
+pub fn format_i2c_address(addr: u8) -> String {
+    format!("0x{addr:02X}")
 }
 
 /// I2C device settings + data model.
@@ -2525,22 +2647,21 @@ pub struct I2cModuleConfig {
     pub clock_hz: u32,
     /// 7-bit device address — the LEGACY single-device field.
     ///
-    /// Read by one thing now: the migration in [`Self::migrate_devices`], which
-    /// folds it into [`Self::devices`]. Everything else asks
-    /// [`Self::primary_address`], so the bus file and the per-device files
-    /// cannot end up naming different devices as "the" one.
-    ///
-    /// Still serialised, and refreshed from the device list on load, so a
-    /// project saved here and reopened in a build without `devices` shows a
-    /// sensible address rather than a stale one. It is as of the last LOAD, not
-    /// the last edit — the honest cost of not having two writers for one value.
+    /// With an empty [`Self::devices`] it IS the bus's one device (0 = no
+    /// device at all); [`Self::rows`] shows it as such. Otherwise nothing
+    /// reads it but [`Self::primary_address`]'s fallback: every edit through
+    /// [`Self::apply`] keeps it equal to the first device, and
+    /// [`Self::sync_legacy_address`] does so on load, so a project reopened in
+    /// a build without `devices` still shows a sensible address.
     pub address: u8,
     /// Every device on this bus.
     ///
-    /// Empty is the normal case and means "just `address`": every project
-    /// written before this field existed, and every bus with a single device on
-    /// it. Their generated output does not move at all, which is the point of
-    /// `serde(default)` plus `skip_serializing_if`.
+    /// Empty means "just `address`": every project written before this field
+    /// existed, and every bus whose one device was never edited. Their
+    /// generated output does not move, which is the point of `serde(default)`
+    /// plus `skip_serializing_if`. The first edit of a device turns it into a
+    /// list, one entry per device - a one-entry list generates exactly what
+    /// the scalar does (no per-device file below two devices).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<I2cDevice>,
     pub rx_model: String,
@@ -2623,12 +2744,181 @@ impl I2cModuleConfig {
     /// into the multi-device view to say what the single Address row already
     /// said, and would rewrite output that should not move.
     ///
-    /// A list only ever appears because the user asked for a second device, and
-    /// from then on it is the truth. All this does is keep the scalar equal to
-    /// the first entry, so a file written here still reads sensibly in a build
-    /// that has never heard of `devices`. Idempotent.
+    /// A list only ever appears because the user edited a device, and from then
+    /// on it is the truth. All this does is keep the scalar equal to the first
+    /// entry, so a file written here still reads sensibly in a build that has
+    /// never heard of `devices`. Idempotent.
     pub fn sync_legacy_address(&mut self) {
         self.address = self.primary_address();
+    }
+
+    /// Every device on the bus, as both editors draw it: the listed ones, or
+    /// the legacy address as one device, or none for a bus that has neither.
+    pub fn rows(&self) -> Vec<I2cRow<'_>> {
+        if self.devices.is_empty() {
+            return if self.address == 0 {
+                Vec::new()
+            } else {
+                vec![I2cRow {
+                    key: I2cDeviceKey::Implicit,
+                    name: "",
+                    address: self.address,
+                }]
+            };
+        }
+        self.devices
+            .iter()
+            .enumerate()
+            .map(|(i, d)| I2cRow {
+                key: if d.uid == 0 {
+                    I2cDeviceKey::Unminted(i)
+                } else {
+                    I2cDeviceKey::Uid(d.uid)
+                },
+                name: &d.name,
+                address: d.address,
+            })
+            .collect()
+    }
+
+    /// What is wrong with each row's address, in [`Self::rows`] order.
+    pub fn address_issues(&self) -> Vec<Option<AddressIssue>> {
+        let rows = self.rows();
+        let all: Vec<u8> = rows.iter().map(|r| r.address).collect();
+        all.iter().map(|a| address_issue(*a, &all)).collect()
+    }
+
+    /// Where `key` sits in [`Self::devices`] - `None` for the implicit device,
+    /// which has no entry, and for a key that names nothing any more.
+    pub fn position(&self, key: I2cDeviceKey) -> Option<usize> {
+        match key {
+            I2cDeviceKey::Implicit => None,
+            I2cDeviceKey::Unminted(i) => self.devices.get(i).filter(|d| d.uid == 0).map(|_| i),
+            I2cDeviceKey::Uid(u) => self.devices.iter().position(|d| d.uid == u),
+        }
+    }
+
+    /// Whether `key` still names a device of this bus.
+    pub fn has(&self, key: I2cDeviceKey) -> bool {
+        match key {
+            I2cDeviceKey::Implicit => self.devices.is_empty() && self.address != 0,
+            other => self.position(other).is_some(),
+        }
+    }
+
+    /// The name and address of the device `key` names.
+    pub fn device(&self, key: I2cDeviceKey) -> Option<(&str, u8)> {
+        if !self.has(key) {
+            return None;
+        }
+        match self.position(key) {
+            Some(i) => Some((self.devices[i].name.as_str(), self.devices[i].address)),
+            None => Some(("", self.address)),
+        }
+    }
+
+    /// The ONE write path for a device list - the panel's rows and the boxes on
+    /// the canvas both go through it, so neither editor carries rules of its
+    /// own. Returns whether anything changed; a no-op (a name set to what it
+    /// already is, a key that names nothing any more) leaves `self` untouched.
+    ///
+    /// Every real edit first turns the legacy address into a one-entry list and
+    /// mints a uid for every device still at `0`, so from then on every device
+    /// has a key that survives the edit. `floor` is the highest uid anything
+    /// outside this config still points at (a Device holding a device that was
+    /// removed since): new uids go above it, so a new device never inherits a
+    /// membership that belonged to an old one - `uid`s are not stored anywhere
+    /// the undo stack cannot roll back, so this is what keeps them unique.
+    pub fn apply(&mut self, edit: &I2cDeviceEdit, floor: u32) -> bool {
+        let key = match edit {
+            I2cDeviceEdit::Add => None,
+            I2cDeviceEdit::Remove(k) | I2cDeviceEdit::Name(k, _) | I2cDeviceEdit::Address(k, _) => {
+                Some(*k)
+            }
+        };
+        if let Some(k) = key {
+            if !self.has(k) {
+                return false;
+            }
+            let (name, address) = self.device(k).expect("checked by has");
+            let unchanged = match edit {
+                I2cDeviceEdit::Name(_, n) => n == name,
+                I2cDeviceEdit::Address(_, a) => (*a).min(0x7F) == address,
+                _ => false,
+            };
+            if unchanged {
+                return false;
+            }
+        }
+        // The position the key names, read BEFORE minting changes what an
+        // `Unminted` key would resolve to.
+        let at = key.map(|k| self.position(k).unwrap_or(0));
+        self.mint(floor);
+        let next = self.next_uid(floor);
+        match edit {
+            I2cDeviceEdit::Add => self.devices.push(I2cDevice {
+                name: String::new(),
+                address: 0,
+                uid: next,
+            }),
+            I2cDeviceEdit::Remove(_) => {
+                self.devices.remove(at.expect("a key"));
+            }
+            I2cDeviceEdit::Name(_, n) => self.devices[at.expect("a key")].name = n.clone(),
+            I2cDeviceEdit::Address(_, a) => {
+                self.devices[at.expect("a key")].address = (*a).min(0x7F)
+            }
+        }
+        if self.devices.is_empty() {
+            // The legacy scalar would otherwise bring the removed device back as
+            // the implicit one.
+            self.address = 0;
+        } else {
+            self.sync_legacy_address();
+        }
+        true
+    }
+
+    /// Give every device a uid: the legacy address becomes a one-entry list,
+    /// and every device still at `0` gets the next free uid, in order, above
+    /// `floor`. Nothing a device generates changes. Returns whether anything
+    /// did - which is also what tells the caller the saved file will.
+    pub fn mint(&mut self, floor: u32) -> bool {
+        let mut changed = false;
+        if self.devices.is_empty() && self.address != 0 {
+            self.devices.push(I2cDevice {
+                name: String::new(),
+                address: self.address,
+                uid: 0,
+            });
+            changed = true;
+        }
+        let first = self.next_uid(floor);
+        for (uid, d) in (first..).zip(self.devices.iter_mut().filter(|d| d.uid == 0)) {
+            d.uid = uid;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The uid the next device minted on this bus gets.
+    fn next_uid(&self, floor: u32) -> u32 {
+        self.devices
+            .iter()
+            .map(|d| d.uid)
+            .max()
+            .unwrap_or(0)
+            .max(floor)
+            + 1
+    }
+
+    /// The uid `key` names once the bus is minted - what a Device (group) holds
+    /// it by. `None` for a key that names nothing.
+    pub fn uid_of(&self, key: I2cDeviceKey) -> Option<u32> {
+        match key {
+            I2cDeviceKey::Uid(u) => self.position(key).map(|_| u),
+            _ => None,
+        }
     }
 }
 
@@ -5939,13 +6229,12 @@ mod blocking_dma_compat_tests {
 mod i2c_device_tests {
     use super::{I2cDevice, I2cModuleConfig};
 
-    /// A project written before `devices` existed is LEFT ALONE.
+    /// A project written before `devices` existed is LEFT ALONE by a load.
     ///
     /// Its address is in the legacy scalar, `primary_address` already answers
-    /// with it, and the panel shows the single Address row it always showed.
-    /// Turning it into a one-entry device list would move every such project
-    /// into the multi-device view for no reason the user asked for, and rewrite
-    /// generated output that should not move.
+    /// with it, and `rows` shows it as the bus's one device. Turning it into a
+    /// one-entry list at load would change the saved file of every such project
+    /// the moment it is opened; the first EDIT of that device does it instead.
     #[test]
     fn a_legacy_project_keeps_its_single_address_and_gains_no_list() {
         let mut c = I2cModuleConfig {
@@ -5990,18 +6279,198 @@ mod i2c_device_tests {
             devices: vec![
                 I2cDevice {
                     name: "display".into(),
-                    address: 0x78,
+                    address: 0x3D,
+                    ..Default::default()
                 },
                 I2cDevice {
                     name: "imu".into(),
                     address: 0x68,
+                    ..Default::default()
                 },
             ],
             ..I2cModuleConfig::new(1)
         };
         c.sync_legacy_address();
         assert_eq!(c.devices.len(), 2, "the list is untouched");
-        assert_eq!(c.primary_address(), 0x78);
-        assert_eq!(c.address, 0x78, "the legacy field follows the list");
+        assert_eq!(c.primary_address(), 0x3D);
+        assert_eq!(c.address, 0x3D, "the legacy field follows the list");
+    }
+
+    use super::{
+        AddressIssue, I2cDeviceEdit as E, I2cDeviceKey as K, address_issue, parse_i2c_address,
+    };
+
+    fn dev(name: &str, address: u8, uid: u32) -> I2cDevice {
+        I2cDevice {
+            name: name.into(),
+            address,
+            uid,
+        }
+    }
+
+    fn bus(devices: Vec<I2cDevice>, address: u8) -> I2cModuleConfig {
+        I2cModuleConfig {
+            address,
+            devices,
+            ..I2cModuleConfig::new(0)
+        }
+    }
+
+    /// What both editors draw: nothing for an untouched bus, the legacy address
+    /// as one device, and one row per listed device, keyed by uid once minted.
+    #[test]
+    fn the_rows_are_the_devices_the_bus_really_has() {
+        assert!(I2cModuleConfig::new(0).rows().is_empty());
+        let legacy = bus(Vec::new(), 0x3C);
+        let rows = legacy.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].key, rows[0].address), (K::Implicit, 0x3C));
+        let listed = bus(vec![dev("oled", 0x3C, 0), dev("imu", 0x68, 7)], 0x3C);
+        let keys: Vec<K> = listed.rows().iter().map(|r| r.key).collect();
+        assert_eq!(keys, vec![K::Unminted(0), K::Uid(7)]);
+    }
+
+    /// Naming the legacy device turns it into a one-entry list - same address,
+    /// so the same generated output - and gives it a uid.
+    #[test]
+    fn editing_the_legacy_device_makes_it_a_listed_one() {
+        let mut c = bus(Vec::new(), 0x3C);
+        assert!(c.apply(&E::Name(K::Implicit, "oled".into()), 0));
+        assert_eq!(c.devices, vec![dev("oled", 0x3C, 1)]);
+        assert_eq!(c.primary_address(), 0x3C);
+        assert_eq!(c.address, 0x3C);
+    }
+
+    /// A no-op changes nothing at all, so the caller pushes no undo entry and
+    /// the file is not rewritten: the same name, the same address, a key that
+    /// names nothing any more. Minting included - nothing is minted for it.
+    #[test]
+    fn a_no_op_leaves_the_bus_untouched() {
+        let c0 = bus(vec![dev("oled", 0x3C, 0), dev("imu", 0x68, 0)], 0x3C);
+        for e in [
+            E::Name(K::Unminted(0), "oled".into()),
+            E::Address(K::Unminted(1), 0x68),
+            E::Name(K::Uid(9), "x".into()),
+            E::Remove(K::Unminted(5)),
+            E::Name(K::Implicit, "x".into()),
+        ] {
+            let mut c = c0.clone();
+            assert!(!c.apply(&e, 0), "{e:?}");
+            assert_eq!(c, c0, "{e:?}");
+        }
+    }
+
+    /// The first edit of a bus mints every device still at 0, in order and
+    /// above `floor` - so a Device still pointing at an old uid never gets a
+    /// new device - and positions stop mattering from then on.
+    #[test]
+    fn an_edit_mints_the_whole_bus_above_the_floor() {
+        let mut c = bus(vec![dev("a", 0x10, 0), dev("b", 0x11, 0)], 0x10);
+        assert!(c.apply(&E::Address(K::Unminted(1), 0x12), 4));
+        let uids: Vec<u32> = c.devices.iter().map(|d| d.uid).collect();
+        assert_eq!(uids, vec![5, 6]);
+        assert_eq!(
+            c.devices[1].address, 0x12,
+            "the edit hit the device it named"
+        );
+        assert!(
+            !c.has(K::Unminted(1)),
+            "a positional key is gone once minted"
+        );
+        assert!(c.apply(&E::Add, 4));
+        assert_eq!(c.devices[2].uid, 7);
+    }
+
+    /// Add: an untouched bus gets its first device; a legacy one keeps its
+    /// address as the first and gets a second. New devices start unset.
+    #[test]
+    fn add_keeps_what_the_bus_already_had() {
+        let mut fresh = I2cModuleConfig::new(0);
+        assert!(fresh.apply(&E::Add, 0));
+        assert_eq!(fresh.devices, vec![dev("", 0, 1)]);
+        let mut legacy = bus(Vec::new(), 0x3C);
+        assert!(legacy.apply(&E::Add, 0));
+        assert_eq!(legacy.devices, vec![dev("", 0x3C, 1), dev("", 0, 2)]);
+        assert_eq!(legacy.primary_address(), 0x3C);
+    }
+
+    /// Down to one device, the survivor keeps its name - the old panel folded
+    /// it back into the bare address and threw the name away. Down to none,
+    /// the bus has no device, and the legacy address does not bring the
+    /// removed one back.
+    #[test]
+    fn removing_keeps_the_survivor_and_the_last_one_leaves_nothing() {
+        let mut c = bus(vec![dev("oled", 0x3C, 1), dev("imu", 0x68, 2)], 0x3C);
+        assert!(c.apply(&E::Remove(K::Uid(1)), 0));
+        assert_eq!(c.devices, vec![dev("imu", 0x68, 2)]);
+        assert_eq!(c.address, 0x68, "the legacy field follows the first device");
+        assert!(c.apply(&E::Remove(K::Uid(2)), 0));
+        assert!(c.devices.is_empty());
+        assert_eq!(c.address, 0);
+        assert!(c.rows().is_empty());
+    }
+
+    /// An address past 0x7F is clamped, and one equal after clamping is a no-op.
+    #[test]
+    fn an_address_is_kept_seven_bit() {
+        let mut c = bus(vec![dev("a", 0x7F, 1)], 0x7F);
+        assert!(!c.apply(&E::Address(K::Uid(1), 0xFF), 0));
+        assert!(c.apply(&E::Address(K::Uid(1), 0x42), 0));
+        assert_eq!(c.devices[0].address, 0x42);
+    }
+
+    #[test]
+    fn each_address_problem_is_named() {
+        let bus = [0x3C, 0x3C, 0x00, 0x00, 0x05, 0x7A, 0x90, 0x68];
+        let issue = |a: u8| address_issue(a, &bus);
+        assert_eq!(issue(0x3C), Some(AddressIssue::Duplicate));
+        assert_eq!(
+            issue(0x00),
+            Some(AddressIssue::Unset),
+            "two unset are not a clash"
+        );
+        assert_eq!(issue(0x05), Some(AddressIssue::Reserved));
+        assert_eq!(issue(0x7A), Some(AddressIssue::Reserved));
+        assert_eq!(issue(0x90), Some(AddressIssue::NotSevenBit));
+        assert_eq!(issue(0x68), None);
+        assert!(AddressIssue::Duplicate.is_error() && AddressIssue::NotSevenBit.is_error());
+        assert!(!AddressIssue::Unset.is_error() && !AddressIssue::Reserved.is_error());
+        let c = I2cModuleConfig {
+            devices: vec![dev("a", 0x3C, 1), dev("b", 0x3C, 2), dev("c", 0x50, 3)],
+            ..I2cModuleConfig::new(0)
+        };
+        assert_eq!(
+            c.address_issues(),
+            vec![
+                Some(AddressIssue::Duplicate),
+                Some(AddressIssue::Duplicate),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn an_address_is_read_as_hex_however_it_is_written() {
+        for t in ["3C", "3c", "0x3C", "0X3c", " 3c "] {
+            assert_eq!(parse_i2c_address(t), Some(0x3C), "{t:?}");
+        }
+        for t in ["", "0x", "zz", "80", "0x80", "123", "-1"] {
+            assert_eq!(parse_i2c_address(t), None, "{t:?}");
+        }
+        assert_eq!(parse_i2c_address("7f"), Some(0x7F));
+    }
+
+    /// A uid still at 0 stays off the file, so a project from before uids is
+    /// saved byte for byte as it was until its bus is edited; a minted one
+    /// round-trips; and a file without the field reads as 0.
+    #[test]
+    fn a_uid_is_written_only_once_minted() {
+        let text = ron::to_string(&dev("oled", 0x3C, 0)).unwrap();
+        assert!(!text.contains("uid"), "{text}");
+        let back: I2cDevice =
+            ron::from_str(&ron::to_string(&dev("oled", 0x3C, 4)).unwrap()).unwrap();
+        assert_eq!(back.uid, 4);
+        let old: I2cDevice = ron::from_str("(name:\"imu\",address:104)").unwrap();
+        assert_eq!(old, dev("imu", 0x68, 0));
     }
 }

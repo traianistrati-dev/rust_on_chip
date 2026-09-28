@@ -58,7 +58,7 @@ use eframe::egui;
 /// * `< 2*(PIN_WIDTH + PIN_SPACING) - TIP` (40), or a device holding pads 3 and
 ///   5 would be eager to reach across pad 4 — the guard would still refuse it,
 ///   but a threshold that has to be rescued is a threshold set wrong.
-const JOIN: f32 = 24.0;
+pub(super) const JOIN: f32 = 24.0;
 
 /// The tinted rim a mat adds around its outermost part.
 ///
@@ -502,7 +502,22 @@ pub fn frames(
         // `Painter::set` re-applies the setting painter's opacity to the whole
         // slot and would fade every device at once.
         let lit = match (&hits, mcu.groups.iter().find(|g| g.name.trim() == name)) {
-            (Some(h), Some(g)) => g.pins.iter().any(|p| h.contains(p)),
+            // An I2C device has no pad of its own: the search lights it through
+            // its bus's SCL and SDA.
+            (Some(h), Some(g)) => {
+                g.pins.iter().any(|p| h.contains(p))
+                    || g.i2c.iter().any(|(inst, _)| {
+                        mcu.modules
+                            .iter()
+                            .filter(|m| {
+                                m.kind
+                                    == crate::panels::mcu_module::modules::ModuleKind::GenericInterfaceI2c
+                                    && m.instance() == *inst
+                            })
+                            .flat_map(|m| m.connections.iter())
+                            .any(|c| h.contains(&c.mcu_pin))
+                    })
+            }
             (Some(_), None) => false,
             (None, _) => true,
         };
@@ -593,6 +608,7 @@ mod tests {
                 |(n, pins)| crate::panels::mcu_module::mcu_config::PinGroup {
                     name: (*n).to_owned(),
                     pins: pins.iter().copied().collect(),
+                    ..Default::default()
                 },
             )
             .collect();

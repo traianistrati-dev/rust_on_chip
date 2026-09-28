@@ -142,9 +142,13 @@ impl Mcu {
             expand_module: None,
             module_undo: Vec::new(),
             module_remove_confirm: None,
+            i2c_remove_confirm: None,
+            pending_i2c_acts: Vec::new(),
             pin_goto: None,
             module_goto: None,
             selected_module: None,
+            selected_i2c_child: None,
+            bus_reach: (0.0, 0.0),
             selected_device: None,
             device_remove_confirm: None,
             device_tabs: Vec::new(),
@@ -517,6 +521,15 @@ impl Mcu {
         {
             return Some(g.name.trim());
         }
+        // A device of an I2C bus picked on the canvas speaks for its OWN
+        // Device, which need not be its bus's.
+        if let Some((id, key)) = self.selected_i2c_child()
+            && let Some(m) = self.modules.iter().find(|m| m.id == id)
+        {
+            return self
+                .group_of_i2c_device(m.instance(), key)
+                .map(|g| g.name.trim());
+        }
         if let Some(id) = self.selected_module.as_deref()
             && let Some(m) = self.modules.iter().find(|m| m.id == id)
             && let Some(g) = self.group_of_module(m)
@@ -558,6 +571,25 @@ impl Mcu {
     pub fn all_configs_collapsed(&mut self) {
         self.collapse_modules = true;
         self.selected_module = None;
+        self.selected_i2c_child = None;
+    }
+
+    /// The I2C device picked on the canvas - `None` unless its bus is still the
+    /// selected module and the device still exists. Checked here rather than
+    /// cleared everywhere: a stale pick simply stops counting.
+    pub fn selected_i2c_child(
+        &self,
+    ) -> Option<(&str, crate::panels::mcu_module::modules::I2cDeviceKey)> {
+        use crate::panels::mcu_module::modules::ModuleConfig;
+        let (id, key) = self.selected_i2c_child.as_ref()?;
+        if self.selected_module.as_deref() != Some(id.as_str()) {
+            return None;
+        }
+        let m = self.modules.iter().find(|m| &m.id == id)?;
+        let ModuleConfig::I2c(c) = &m.config else {
+            return None;
+        };
+        c.has(*key).then_some((id.as_str(), *key))
     }
 
     /// The one place the canvas drops what it is pointing at.
@@ -636,7 +668,7 @@ impl Mcu {
         // group something else would be indistinguishable from a bug.
         let mut emptied: Vec<usize> = Vec::new();
         for (i, g) in self.groups.iter_mut().enumerate() {
-            if g.pins.remove(&pin) && g.pins.is_empty() {
+            if g.pins.remove(&pin) && g.is_empty() {
                 emptied.push(i);
             }
         }
@@ -662,13 +694,14 @@ impl Mcu {
                     .push(crate::panels::mcu_module::mcu_config::PinGroup {
                         name: name.to_owned(),
                         pins: std::iter::once(pin).collect(),
+                        ..Default::default()
                     }),
             }
         }
         for i in emptied.into_iter().rev() {
             // Still empty: moving a pad WITHIN its own group empties it here and
             // fills it again above, and that group must survive.
-            if self.groups[i].pins.is_empty() {
+            if self.groups[i].is_empty() {
                 self.groups.remove(i);
             }
         }
@@ -684,6 +717,7 @@ impl Mcu {
             .push(crate::panels::mcu_module::mcu_config::PinGroup {
                 name,
                 pins: Default::default(),
+                ..Default::default()
             });
     }
 
@@ -743,6 +777,8 @@ impl Mcu {
             Some(other) => {
                 let moved = std::mem::take(&mut self.groups[idx].pins);
                 self.groups[other].pins.extend(moved);
+                let moved = std::mem::take(&mut self.groups[idx].i2c);
+                self.groups[other].i2c.extend(moved);
                 self.groups.remove(idx);
             }
             None => {
@@ -838,7 +874,7 @@ impl Mcu {
         if let Some(mine) = self.groups.iter().position(|g| g.pins.contains(&from)) {
             let mut emptied: Vec<usize> = Vec::new();
             for (k, g) in self.groups.iter_mut().enumerate() {
-                if g.pins.remove(&to) && g.pins.is_empty() && k != mine {
+                if g.pins.remove(&to) && g.is_empty() && k != mine {
                     emptied.push(k);
                 }
             }
@@ -847,7 +883,7 @@ impl Mcu {
             // Only a device this move emptied disappears, the same rule
             // `join_group` follows.
             for k in emptied.into_iter().rev() {
-                if self.groups[k].pins.is_empty() {
+                if self.groups[k].is_empty() {
                     self.groups.remove(k);
                 }
             }
@@ -923,7 +959,296 @@ impl Mcu {
         }
         self.modules = snap.modules;
         self.module_remove_confirm = None;
+        self.i2c_remove_confirm = None;
         Some(snap.label)
+    }
+
+    // ── I2C devices on a bus ──────────────────────────────────────────────────
+
+    /// Apply one change to the device list of I2C bus `instance` - the ONE door
+    /// both the panel and the canvas use. A real change is snapshotted for
+    /// Ctrl+Z first; a no-op pushes nothing. Returns whether anything changed.
+    /// The config of I2C bus `instance`, if the chip has that bus.
+    pub fn i2c_bus(
+        &self,
+        instance: u8,
+    ) -> Option<&crate::panels::mcu_module::modules::I2cModuleConfig> {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        self.modules.iter().find_map(|m| match &m.config {
+            ModuleConfig::I2c(c)
+                if m.kind == ModuleKind::GenericInterfaceI2c && m.instance() == instance =>
+            {
+                Some(c)
+            }
+            _ => None,
+        })
+    }
+
+    /// Retire a device removal nobody can answer any more: its bus is gone, or
+    /// a mint re-keyed the device. Left armed, the canvas would repaint every
+    /// frame for it, and a later device that happened to get the same key
+    /// would come up already asking to be removed.
+    pub fn retire_i2c_confirm(&mut self) {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        if let Some((inst, key)) = self.i2c_remove_confirm {
+            let alive = self.modules.iter().any(|m| {
+                m.kind == ModuleKind::GenericInterfaceI2c
+                    && m.instance() == inst
+                    && matches!(&m.config, ModuleConfig::I2c(c) if c.has(key))
+            });
+            if !alive {
+                self.i2c_remove_confirm = None;
+            }
+        }
+    }
+
+    pub fn edit_i2c_device(
+        &mut self,
+        instance: u8,
+        edit: crate::panels::mcu_module::modules::I2cDeviceEdit,
+    ) -> bool {
+        use crate::panels::mcu_module::modules::{I2cDeviceEdit, ModuleConfig, ModuleKind};
+        // Minted FIRST, undo history included: the snapshot pushed below must
+        // carry the uids a Device may hold from now on, or undoing this edit
+        // would take the device out of its Device (see `mint_i2c_bus`).
+        let edit = self.pin_i2c_key(instance, edit);
+        let floor = self.i2c_uid_floor(instance);
+        let Some(pos) = self
+            .modules
+            .iter()
+            .position(|m| m.kind == ModuleKind::GenericInterfaceI2c && m.instance() == instance)
+        else {
+            return false;
+        };
+        let ModuleConfig::I2c(cfg) = &self.modules[pos].config else {
+            return false;
+        };
+        let mut next = cfg.clone();
+        let label = match &edit {
+            I2cDeviceEdit::Add => "Add I2C device".to_owned(),
+            I2cDeviceEdit::Remove(k) => match cfg.device(*k) {
+                Some((name, _)) if !name.is_empty() => format!("Remove I2C device {name}"),
+                _ => "Remove I2C device".to_owned(),
+            },
+            I2cDeviceEdit::Name(..) => "Rename I2C device".to_owned(),
+            I2cDeviceEdit::Address(..) => "Change I2C device address".to_owned(),
+        };
+        if !next.apply(&edit, floor) {
+            return false;
+        }
+        self.push_module_undo(label);
+        self.modules[pos].config = ModuleConfig::I2c(next);
+        if matches!(edit, I2cDeviceEdit::Remove(_)) {
+            self.i2c_remove_confirm = None;
+        }
+        true
+    }
+
+    /// The highest device uid of bus `instance` that anything outside the bus's
+    /// own config still points at - a Device holding it, maybe for a device
+    /// removed since. New uids are minted above it (see
+    /// `I2cModuleConfig::apply`), so a new device never walks into a Device
+    /// that held an old one.
+    ///
+    /// And every uid the undo stack still holds for it: an undo can bring a
+    /// removed device back, and a uid handed to a newer device meanwhile would
+    /// give the old one the newer one's Device.
+    pub fn i2c_uid_floor(&self, instance: u8) -> u32 {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        let held = self
+            .groups
+            .iter()
+            .flat_map(|g| g.i2c.iter())
+            .filter(|(i, _)| *i == instance)
+            .map(|(_, u)| *u);
+        let undoable = self
+            .module_undo
+            .iter()
+            .flat_map(|snap| snap.modules.iter())
+            .filter(|m| m.kind == ModuleKind::GenericInterfaceI2c && m.instance() == instance)
+            .flat_map(|m| match &m.config {
+                ModuleConfig::I2c(c) => c.devices.iter().map(|d| d.uid).collect(),
+                _ => Vec::new(),
+            });
+        held.chain(undoable).max().unwrap_or(0)
+    }
+
+    /// Mint bus `instance` - its legacy address becomes a one-entry list and
+    /// every device gets a uid - in the live config AND in every undo snapshot
+    /// that holds the same, still unminted, bus. Returns whether it minted.
+    ///
+    /// The snapshots are the point. A Device holds a device by its uid, and a
+    /// snapshot taken before the mint has none: undoing past the mint (a
+    /// module added earlier, the device's own first rename) would restore a
+    /// device no Device can name, and its membership would be gone for good.
+    /// A snapshot can only hold the bus unminted while no device edit has run
+    /// since it was loaded - every edit mints first - so it holds the same
+    /// devices in the same order, and minting it with the same floor hands out
+    /// the same uids. It is still checked, device by device.
+    pub fn mint_i2c_bus(&mut self, instance: u8) -> bool {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        let floor = self.i2c_uid_floor(instance);
+        let is_bus = |m: &crate::panels::mcu_module::modules::VirtualModule| {
+            m.kind == ModuleKind::GenericInterfaceI2c && m.instance() == instance
+        };
+        let Some(ModuleConfig::I2c(cfg)) = self
+            .modules
+            .iter_mut()
+            .find(|m| is_bus(m))
+            .map(|m| &mut m.config)
+        else {
+            return false;
+        };
+        let before = (cfg.address, cfg.devices.clone());
+        if !cfg.mint(floor) {
+            return false;
+        }
+        let minted = cfg.clone();
+        for snap in &mut self.module_undo {
+            for m in snap.modules.iter_mut().filter(|m| is_bus(m)) {
+                if let ModuleConfig::I2c(c) = &mut m.config
+                    && (c.address, &c.devices) == (before.0, &before.1)
+                {
+                    c.devices = minted.devices.clone();
+                    c.address = minted.address;
+                }
+            }
+        }
+        true
+    }
+
+    /// `edit` with a key that survives minting: an `Implicit` or `Unminted`
+    /// key names a POSITION, which the mint keeps but renames - so the bus is
+    /// minted here and the key rewritten to the uid now at that position.
+    /// Anything that queues several edits (the panel and the canvas in one
+    /// frame) runs each through this, or the second one would name a key the
+    /// first one's mint retired.
+    pub fn pin_i2c_key(
+        &mut self,
+        instance: u8,
+        edit: crate::panels::mcu_module::modules::I2cDeviceEdit,
+    ) -> crate::panels::mcu_module::modules::I2cDeviceEdit {
+        use crate::panels::mcu_module::modules::I2cDeviceEdit as E;
+        let key = match &edit {
+            E::Add => return edit,
+            E::Remove(k) | E::Name(k, _) | E::Address(k, _) => *k,
+        };
+        match self.ensure_i2c_uid(instance, key) {
+            Some(uid) => {
+                let k = crate::panels::mcu_module::modules::I2cDeviceKey::Uid(uid);
+                match edit {
+                    E::Remove(_) => E::Remove(k),
+                    E::Name(_, n) => E::Name(k, n),
+                    E::Address(_, a) => E::Address(k, a),
+                    E::Add => E::Add,
+                }
+            }
+            None => edit,
+        }
+    }
+
+    /// The uid of device `key` on bus `instance`, minting the bus first if it
+    /// has none yet (a legacy address, a file from before uids) - what a Device
+    /// has to hold a device by. The mint changes nothing the device generates,
+    /// so it is not an undo step of its own.
+    pub fn ensure_i2c_uid(
+        &mut self,
+        instance: u8,
+        key: crate::panels::mcu_module::modules::I2cDeviceKey,
+    ) -> Option<u32> {
+        use crate::panels::mcu_module::modules::{I2cDeviceKey, ModuleConfig, ModuleKind};
+        let bus = |mcu: &Self| {
+            mcu.modules.iter().find_map(|m| match &m.config {
+                ModuleConfig::I2c(c)
+                    if m.kind == ModuleKind::GenericInterfaceI2c && m.instance() == instance =>
+                {
+                    Some(c.clone())
+                }
+                _ => None,
+            })
+        };
+        let cfg = bus(self)?;
+        if !cfg.has(key) {
+            return None;
+        }
+        if let I2cDeviceKey::Uid(u) = key {
+            return Some(u);
+        }
+        // Where the key points, before minting renames it.
+        let at = cfg.position(key).unwrap_or(0);
+        self.mint_i2c_bus(instance);
+        bus(self)?.devices.get(at).map(|d| d.uid)
+    }
+
+    /// The Device an I2C device is in: the one it was put in by hand, else its
+    /// bus's (the one holding its pads) - derived, like a module's.
+    pub fn group_of_i2c_device(
+        &self,
+        instance: u8,
+        key: crate::panels::mcu_module::modules::I2cDeviceKey,
+    ) -> Option<&crate::panels::mcu_module::mcu_config::PinGroup> {
+        use crate::panels::mcu_module::modules::{I2cDeviceKey, ModuleKind};
+        if let I2cDeviceKey::Uid(u) = key
+            && let Some(g) = self
+                .groups
+                .iter()
+                .find(|g| g.is_live() && g.i2c.contains(&(instance, u)))
+        {
+            return Some(g);
+        }
+        let bus = self
+            .modules
+            .iter()
+            .find(|m| m.kind == ModuleKind::GenericInterfaceI2c && m.instance() == instance)?;
+        self.group_of_module(bus)
+    }
+
+    /// Put I2C device `key` of bus `instance` in the Device called `name`,
+    /// creating it if it is new - or, with an empty name, take it out of the
+    /// one it was put in, back to its bus's. The same rules as
+    /// [`Self::join_group`]: one Device at a time, and a Device this took its
+    /// last member from is finished. Returns whether anything changed.
+    pub fn join_group_i2c(
+        &mut self,
+        instance: u8,
+        key: crate::panels::mcu_module::modules::I2cDeviceKey,
+        name: &str,
+    ) -> bool {
+        let Some(uid) = self.ensure_i2c_uid(instance, key) else {
+            return false;
+        };
+        let dev = (instance, uid);
+        let before = self.groups.clone();
+        let mut emptied: Vec<usize> = Vec::new();
+        for (i, g) in self.groups.iter_mut().enumerate() {
+            if g.i2c.remove(&dev) && g.is_empty() {
+                emptied.push(i);
+            }
+        }
+        if !name.trim().is_empty() {
+            match self
+                .groups
+                .iter_mut()
+                .find(|g| g.name.trim() == name.trim())
+            {
+                Some(g) => {
+                    g.i2c.insert(dev);
+                }
+                None => self
+                    .groups
+                    .push(crate::panels::mcu_module::mcu_config::PinGroup {
+                        name: name.to_owned(),
+                        i2c: std::iter::once(dev).collect(),
+                        ..Default::default()
+                    }),
+            }
+        }
+        for i in emptied.into_iter().rev() {
+            if self.groups[i].is_empty() {
+                self.groups.remove(i);
+            }
+        }
+        self.groups != before
     }
 
     pub fn can_undo_modules(&self) -> bool {
@@ -1860,6 +2185,8 @@ impl Mcu {
         if drop_selected {
             self.selected_module = None;
         }
+        // The same for a device of an I2C bus whose removal is armed.
+        self.retire_i2c_confirm();
 
         // A custom module's wires mirror its own pin list (which the config
         // panel edits), so rebuild them here — the canvas then draws them with
@@ -4009,6 +4336,7 @@ mod device_groups {
             vec![PinGroup {
                 name: "mw radar".into(),
                 pins: [7, 8].into_iter().collect(),
+                ..Default::default()
             }]
         );
     }

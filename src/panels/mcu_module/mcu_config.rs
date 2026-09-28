@@ -38,6 +38,7 @@ const IOPINS_HEADER: &str = "@iopins";
 const IRQ_HEADER: &str = "@irq";
 const IOMODE_HEADER: &str = "@iomode";
 const GROUPS_HEADER: &str = "@groups";
+const GROUP_I2C_HEADER: &str = "@groupi2c";
 const WATCHDOG_HEADER: &str = "@watchdog";
 const COMP_HEADER: &str = "@comp";
 const LABELS_HEADER: &str = "@labels";
@@ -390,6 +391,19 @@ pub fn iopins_section(pos: &std::collections::BTreeMap<usize, (f32, f32)>) -> St
 pub struct PinGroup {
     pub name: String,
     pub pins: std::collections::BTreeSet<usize>,
+    /// Devices on an I2C bus put in this group by hand: `(bus instance, device
+    /// uid)`. They have no pad of their own - every device of a bus shares its
+    /// SCL and SDA, and a pad is in one group at most - so they cannot be
+    /// members the way a pad is.
+    ///
+    /// A device NOT listed in any group is in its bus's group (the one holding
+    /// its pads), derived like a module's; being listed here moves it to
+    /// another. Keyed by the uid, never by position, name or address (see
+    /// `I2cDevice::uid`). A key whose device is gone stays - the way a pad
+    /// keeps its group when its function goes - so an undo brings the device
+    /// back into it; new uids are minted above every key a group still holds
+    /// (`Mcu::i2c_uid_floor`), so no new device inherits one.
+    pub i2c: std::collections::BTreeSet<(u8, u32)>,
 }
 
 impl PinGroup {
@@ -405,8 +419,26 @@ impl PinGroup {
     /// A group the roster is still filling in is not yet a device; it stays on
     /// the roster and nowhere else.
     pub fn is_live(&self) -> bool {
-        !self.name.trim().is_empty() && !self.pins.is_empty()
+        !self.name.trim().is_empty() && !self.is_empty()
     }
+
+    /// Holds nothing at all - no pad and no I2C device. What decides that a
+    /// group a gesture just took its last member from is finished.
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty() && self.i2c.is_empty()
+    }
+}
+
+/// An I2C device's token in `@groupi2c`: `i2c<instance>/<uid>`. No `,` or `=`
+/// in it, it never starts with `@`, and it never parses as a pad number.
+fn i2c_token(instance: u8, uid: u32) -> String {
+    format!("i2c{instance}/{uid}")
+}
+
+fn parse_i2c_token(t: &str) -> Option<(u8, u32)> {
+    let (inst, uid) = t.trim().strip_prefix("i2c")?.split_once('/')?;
+    let uid: u32 = uid.parse().ok()?;
+    (uid != 0).then_some((inst.parse().ok()?, uid))
 }
 
 /// The `@groups` section - one `pin,pin,pin=name` per device - or "" when
@@ -421,6 +453,15 @@ impl PinGroup {
 ///   [`section_body`] ends a section at the first line that does. A device
 ///   named "@radar" on the other layout would truncate the section and take
 ///   every group after it with it.
+///
+/// A group's I2C devices go in a section of their own, `@groupi2c` - one
+/// `i2c1/3,i2c1/4=name` per group that holds any. Mixed into the `@groups`
+/// line, a token an older build cannot read as a pad number would make it drop
+/// the WHOLE line, pads included; on its own line an older build drops only
+/// what it cannot know about. A group holding only I2C devices still writes a
+/// `=name` line in `@groups`, so its place in the order - which is the order of
+/// the generated comment and of the roster - survives a save; older builds drop
+/// that line, as they would the group anyway.
 pub fn groups_section(groups: &[PinGroup]) -> String {
     let live: Vec<&PinGroup> = groups.iter().filter(|g| g.is_live()).collect();
     if live.is_empty() {
@@ -428,41 +469,89 @@ pub fn groups_section(groups: &[PinGroup]) -> String {
     }
     let mut s = String::from(GROUPS_HEADER);
     s.push('\n');
-    for g in live {
+    for g in &live {
         let pins: Vec<String> = g.pins.iter().map(usize::to_string).collect();
         s.push_str(&format!("{}={}\n", pins.join(","), g.name.trim()));
+    }
+    if live.iter().any(|g| !g.i2c.is_empty()) {
+        s.push_str(GROUP_I2C_HEADER);
+        s.push('\n');
+        for g in live.iter().filter(|g| !g.i2c.is_empty()) {
+            let devs: Vec<String> = g.i2c.iter().map(|(i, u)| i2c_token(*i, *u)).collect();
+            s.push_str(&format!("{}={}\n", devs.join(","), g.name.trim()));
+        }
     }
     s
 }
 
-/// Read `@groups` back. A line whose pins do not parse is dropped rather than
-/// guessed at - a half-read group would claim pads it was never given.
+/// Read `@groups` and `@groupi2c` back - the one reader, which the Board's
+/// rebuild of a closed chip uses too. A line whose pins do not parse is dropped
+/// rather than guessed at - a half-read group would claim pads it was never
+/// given. An I2C device claimed by two groups (a hand-edited file) stays in the
+/// first.
 pub fn parse_groups(text: &str) -> Vec<PinGroup> {
-    let mut out = Vec::new();
-    let Some(body) = section_body(text, GROUPS_HEADER) else {
-        return out;
-    };
-    for line in body.lines() {
-        let Some((rest, name)) = line.split_once('=') else {
-            continue;
-        };
-        // Only the padding a panel field allows is trimmed off the name; its
-        // interior is whatever the user typed.
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
+    let mut out: Vec<PinGroup> = Vec::new();
+    // The I2C devices first: they decide whether a `=name` line is a group.
+    let mut i2c: Vec<(String, std::collections::BTreeSet<(u8, u32)>)> = Vec::new();
+    let mut claimed = std::collections::BTreeSet::new();
+    if let Some(body) = section_body(text, GROUP_I2C_HEADER) {
+        for line in body.lines() {
+            let Some((rest, name)) = line.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let devs: Option<std::collections::BTreeSet<(u8, u32)>> = rest
+                .split(',')
+                .filter(|t| !t.trim().is_empty())
+                .map(parse_i2c_token)
+                .collect();
+            let Some(devs) = devs else { continue };
+            let devs: std::collections::BTreeSet<(u8, u32)> =
+                devs.into_iter().filter(|d| claimed.insert(*d)).collect();
+            if !devs.is_empty() {
+                i2c.push((name.to_owned(), devs));
+            }
         }
-        let pins: Option<std::collections::BTreeSet<usize>> = rest
-            .split(',')
-            .filter(|p| !p.trim().is_empty())
-            .map(|p| p.trim().parse::<usize>().ok())
-            .collect();
-        match pins {
-            Some(pins) if !pins.is_empty() => out.push(PinGroup {
-                name: name.to_owned(),
-                pins,
+    }
+    if let Some(body) = section_body(text, GROUPS_HEADER) {
+        for line in body.lines() {
+            let Some((rest, name)) = line.split_once('=') else {
+                continue;
+            };
+            // Only the padding a panel field allows is trimmed off the name; its
+            // interior is whatever the user typed.
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let pins: Option<std::collections::BTreeSet<usize>> = rest
+                .split(',')
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| p.trim().parse::<usize>().ok())
+                .collect();
+            let holds_i2c = i2c.iter().any(|(n, _)| n == name);
+            match pins {
+                Some(pins) if !pins.is_empty() || holds_i2c => out.push(PinGroup {
+                    name: name.to_owned(),
+                    pins,
+                    ..Default::default()
+                }),
+                _ => continue,
+            }
+        }
+    }
+    for (name, devs) in i2c {
+        match out.iter_mut().find(|g| g.name.trim() == name) {
+            Some(g) => g.i2c.extend(devs),
+            // A file whose `@groups` has no line for it: still a group.
+            None => out.push(PinGroup {
+                name,
+                i2c: devs,
+                ..Default::default()
             }),
-            _ => continue,
         }
     }
     out
@@ -1552,6 +1641,7 @@ mod group_tests {
         PinGroup {
             name: name.to_owned(),
             pins: pins.iter().copied().collect(),
+            ..Default::default()
         }
     }
 
@@ -1616,6 +1706,87 @@ mod group_tests {
     fn a_name_starting_with_an_at_does_not_end_the_section() {
         let groups = vec![g("@radar", &[4, 5]), g("display", &[10])];
         assert_eq!(parse_groups(&groups_section(&groups)), groups);
+    }
+
+    fn with_i2c(mut group: PinGroup, devs: &[(u8, u32)]) -> PinGroup {
+        group.i2c = devs.iter().copied().collect();
+        group
+    }
+
+    /// Devices of an I2C bus round-trip, in a group with pads and in a group of
+    /// their own - which keeps its place in the order, the order of the
+    /// generated comment and of the roster.
+    #[test]
+    fn i2c_devices_in_a_group_round_trip_in_order() {
+        let groups = vec![
+            with_i2c(g("sensors", &[4]), &[(1, 2)]),
+            with_i2c(g("display", &[]), &[(1, 1), (0, 5)]),
+            g("radar", &[9]),
+        ];
+        let text = groups_section(&groups);
+        assert!(
+            text.contains("\n=display\n"),
+            "the order placeholder: {text}"
+        );
+        assert!(
+            text.contains("@groupi2c\ni2c1/2=sensors\ni2c0/5,i2c1/1=display\n"),
+            "{text}"
+        );
+        assert_eq!(parse_groups(&text), groups);
+    }
+
+    /// What a build that has never heard of `@groupi2c` reads: every pad group
+    /// whole - `@groups` ends at the next section, and the placeholder of a
+    /// group holding only I2C devices is a line it already drops.
+    #[test]
+    fn an_older_reader_keeps_every_pad_group() {
+        let groups = vec![
+            with_i2c(g("sensors", &[4]), &[(1, 2)]),
+            with_i2c(g("display", &[]), &[(1, 1)]),
+        ];
+        let text = groups_section(&groups);
+        let old_body: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .take_while(|l| !l.starts_with('@'))
+            .collect();
+        assert_eq!(old_body, vec!["4=sensors", "=display"]);
+    }
+
+    /// A placeholder with nothing behind it is still no group; a device claimed
+    /// twice (a hand edit) stays in the first; a token that is not one drops
+    /// its line; refs for a name `@groups` never mentioned still make a group.
+    #[test]
+    fn the_i2c_section_is_read_strictly() {
+        assert!(parse_groups("@groups\n=display\n").is_empty());
+        assert_eq!(
+            parse_groups("@groups\n=a\n=b\n@groupi2c\ni2c1/1=a\ni2c1/1,i2c1/2=b\n"),
+            vec![
+                with_i2c(g("a", &[]), &[(1, 1)]),
+                with_i2c(g("b", &[]), &[(1, 2)])
+            ]
+        );
+        assert_eq!(
+            parse_groups("@groups\n4=a\n@groupi2c\ni2c1/x=a\n"),
+            vec![g("a", &[4])]
+        );
+        assert!(
+            parse_groups("@groupi2c\ni2c1/0=a\n").is_empty(),
+            "uid 0 is never minted"
+        );
+        assert_eq!(
+            parse_groups("@groupi2c\ni2c2/7=late\n"),
+            vec![with_i2c(g("late", &[]), &[(2, 7)])]
+        );
+    }
+
+    /// Liveness counts an I2C device as a member: a group holding only one is a
+    /// device, written and drawn; one holding nothing is not.
+    #[test]
+    fn a_group_of_i2c_devices_only_is_live() {
+        assert!(with_i2c(g("display", &[]), &[(1, 1)]).is_live());
+        assert!(!g("display", &[]).is_live());
+        assert!(!with_i2c(g("  ", &[]), &[(1, 1)]).is_live());
     }
 }
 

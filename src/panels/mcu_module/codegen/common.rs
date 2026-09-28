@@ -36,7 +36,7 @@ pub fn device_comment(mcu: &Mcu) -> String {
     if live.is_empty() {
         return String::new();
     }
-    let mut o = String::from("// ── Devices on this board ──\n");
+    let mut lines = String::new();
     for g in live {
         let pads: Vec<String> = g
             .pins
@@ -51,14 +51,65 @@ pub fn device_comment(mcu: &Mcu) -> String {
                 }
             })
             .collect();
-        if !pads.is_empty() {
+        // The devices of an I2C bus put in this Device BY HAND - only those:
+        // one that is in it because its bus is was never stored anywhere, and
+        // listing it would change the file of every project that grouped a
+        // bus the moment it was reopened.
+        let devices: Vec<String> = g
+            .i2c
+            .iter()
+            .filter_map(|(inst, uid)| i2c_device_label(mcu, *inst, *uid))
+            .collect();
+        let parts: Vec<String> = pads.into_iter().chain(devices).collect();
+        if !parts.is_empty() {
             // Trimmed, like `mcu.config` writes it - otherwise a name the user
             // left a space on reads "// radar : GP0" here and "radar" there.
-            o.push_str(&format!("// {}: {}\n", g.name.trim(), pads.join(", ")));
+            lines.push_str(&format!("// {}: {}\n", g.name.trim(), parts.join(", ")));
         }
     }
-    o.push('\n');
-    o
+    // A Device can be live with nothing to list: its only member a device of
+    // an I2C bus that was removed since (kept so an undo brings it back). A
+    // header over no line would say nothing.
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("// ── Devices on this board ──\n{lines}\n")
+}
+
+/// How an I2C device reads in the device comment: `I2C1 oled @ 0x3C` - the bus
+/// named the way this family names it (`TWIM0` on an nRF, like its address
+/// consts), the device by its name or its place in the list. `None` for a
+/// device that is gone.
+fn i2c_device_label(mcu: &Mcu, instance: u8, uid: u32) -> Option<String> {
+    use crate::panels::mcu_module::modules::{I2cDeviceKey, ModuleConfig, ModuleKind};
+    let cfg = mcu.modules.iter().find_map(|m| match &m.config {
+        ModuleConfig::I2c(c)
+            if m.kind == ModuleKind::GenericInterfaceI2c && c.instance == instance =>
+        {
+            Some(c)
+        }
+        _ => None,
+    })?;
+    let at = cfg.position(I2cDeviceKey::Uid(uid))?;
+    let d = &cfg.devices[at];
+    let bus = if super::nrf::is_nrf(&mcu.family) {
+        format!("TWIM{instance}")
+    } else {
+        format!("I2C{instance}")
+    };
+    // A name is typed text: nothing in it may end the comment line early.
+    let name: String = d
+        .name
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let name = if name.is_empty() {
+        format!("device {}", at + 1)
+    } else {
+        name
+    };
+    Some(format!("{bus} {name} @ 0x{:02X}", d.address))
 }
 
 /// Put [`device_comment`] just inside the generated block.
@@ -523,16 +574,18 @@ mod device_address_tests {
 
     /// A bus with ONE device emits no device file at all.
     ///
-    /// This is the case every existing project is in - the migration folds the
-    /// legacy `address` into a single device - so anything emitted here would
-    /// rewrite the output of every project that ever configured an I2C address,
-    /// to say a second time what the bus file already says.
+    /// This is the case every existing project reaches the moment its one device
+    /// is edited - the edit turns the legacy `address` into a one-entry list - so
+    /// anything emitted here would rewrite the output of every project that ever
+    /// configured an I2C address, to say a second time what the bus file already
+    /// says.
     #[test]
     fn one_device_adds_no_file() {
         let mut c = I2cModuleConfig::new(1);
         c.devices = vec![I2cDevice {
             name: "imu".into(),
             address: 0x68,
+            ..Default::default()
         }];
         assert!(super::i2c_device_stems("i2c1", &c).is_empty());
         assert!(super::i2c_device_config_files("i2c1", Some(&c)).is_empty());
@@ -549,10 +602,12 @@ mod device_address_tests {
             I2cDevice {
                 name: "SSD1306 display".into(),
                 address: 0x3C,
+                ..Default::default()
             },
             I2cDevice {
                 name: "imu".into(),
                 address: 0x68,
+                ..Default::default()
             },
         ];
         let files = super::i2c_device_config_files("i2c1", Some(&c));
@@ -590,14 +645,17 @@ mod device_address_tests {
             I2cDevice {
                 name: "sensor".into(),
                 address: 0x40,
+                ..Default::default()
             },
             I2cDevice {
                 name: "sensor".into(),
                 address: 0x41,
+                ..Default::default()
             },
             I2cDevice {
                 name: "Sensor!".into(),
                 address: 0x42,
+                ..Default::default()
             },
         ];
         let files = super::i2c_device_config_files("i2c1", Some(&c));
@@ -618,10 +676,12 @@ mod device_address_tests {
             I2cDevice {
                 name: String::new(),
                 address: 0x40,
+                ..Default::default()
             },
             I2cDevice {
                 name: String::new(),
                 address: 0x41,
+                ..Default::default()
             },
         ];
         let files = super::i2c_device_config_files("twim0", Some(&c));
@@ -1884,6 +1944,85 @@ mod device_comment_tests {
         mcu.join_group_module(&m, "mw radar");
         mcu.join_group(spare, "mw radar");
         (mcu, tx, rx, spare)
+    }
+
+    /// A bus whose pads are in "sensors", with two devices: `oled` put in
+    /// "display" by hand, `imu` left with its bus.
+    fn two_i2c_devices(mcu: &mut Mcu) -> u8 {
+        use crate::panels::mcu_module::modules::{I2cDeviceEdit as E, I2cDeviceKey as K};
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let bus = mcu
+            .modules
+            .iter()
+            .find(|m| m.kind == ModuleKind::GenericInterfaceI2c)
+            .cloned()
+            .expect("the bus");
+        let inst = bus.instance();
+        mcu.join_group_module(&bus, "sensors");
+        assert!(mcu.edit_i2c_device(inst, E::Add));
+        assert!(mcu.edit_i2c_device(inst, E::Add));
+        let keys: Vec<K> = match &mcu.modules.iter().find(|m| m.id == bus.id).unwrap().config {
+            crate::panels::mcu_module::modules::ModuleConfig::I2c(c) => {
+                c.rows().iter().map(|r| r.key).collect()
+            }
+            _ => unreachable!(),
+        };
+        mcu.edit_i2c_device(inst, E::Name(keys[0], "oled".into()));
+        mcu.edit_i2c_device(inst, E::Address(keys[0], 0x3C));
+        mcu.edit_i2c_device(inst, E::Name(keys[1], "imu".into()));
+        assert!(mcu.join_group_i2c(inst, keys[0], "display"));
+        inst
+    }
+
+    /// Only a device put in a Device BY HAND is listed: one that is there
+    /// because its bus is was never stored, and listing it would rewrite the
+    /// file of every project that grouped a bus the moment it was reopened.
+    #[test]
+    fn only_an_i2c_device_grouped_by_hand_is_listed() {
+        let mut mcu = pico();
+        let inst = two_i2c_devices(&mut mcu);
+        let text = device_comment(&mcu);
+        let display = text
+            .lines()
+            .find(|l| l.starts_with("// display:"))
+            .unwrap_or_else(|| panic!("a Device of I2C devices only still has a line: {text}"));
+        assert!(
+            display.contains(&format!("I2C{inst} oled @ 0x3C")),
+            "{display}"
+        );
+        assert!(
+            !text.contains("imu"),
+            "a device with its bus is not listed: {text}"
+        );
+    }
+
+    /// A Device whose only member is a device that was removed since stays
+    /// live (an undo brings it back) but has nothing to list: no empty header.
+    #[test]
+    fn a_device_with_nothing_left_to_list_writes_nothing() {
+        let mut mcu = pico();
+        let mut g = crate::panels::mcu_module::mcu_config::PinGroup {
+            name: "display".into(),
+            ..Default::default()
+        };
+        g.i2c = [(0, 42)].into();
+        mcu.groups = vec![g];
+        assert!(mcu.groups[0].is_live());
+        assert_eq!(device_comment(&mcu), "");
+    }
+
+    /// The bus is named the way the family names it - an nRF's is a TWIM.
+    #[test]
+    fn an_nrf_bus_is_a_twim_in_the_comment() {
+        let mut mcu = builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == "nrf52833_microbit_v2")
+            .expect("built-in micro:bit")
+            .build_mcu();
+        let inst = two_i2c_devices(&mut mcu);
+        let text = device_comment(&mcu);
+        assert!(text.contains(&format!("TWIM{inst} oled @ 0x3C")), "{text}");
+        assert!(!text.contains(&format!("I2C{inst} oled")), "{text}");
     }
 
     /// Nothing grouped, nothing written. Every existing project is in this case,

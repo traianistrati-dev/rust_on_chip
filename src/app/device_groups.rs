@@ -15,7 +15,9 @@
 //! rewrite names in code the user had already written against.
 //!
 //! Membership is by PAD NUMBER, never by module id — see
-//! [`PinGroup`](crate::panels::mcu_module::mcu_config::PinGroup) for why. This
+//! [`PinGroup`](crate::panels::mcu_module::mcu_config::PinGroup) for why - plus
+//! the devices of an I2C bus, which have no pad of their own, by their uid. A
+//! device of a bus is in its bus's Device until it is put in another. This
 //! panel is the only place a group is created, renamed, filled or dissolved.
 //!
 //! The roster draws the rows; the `Devices:` label and the `+ Device` button
@@ -43,6 +45,69 @@ enum Act {
     AddPin(usize, usize),
     /// Take one pad out of whatever device holds it.
     Drop(usize),
+    /// Put one device of an I2C bus in the device: (row, bus instance, which).
+    AddI2c(usize, u8, crate::panels::mcu_module::modules::I2cDeviceKey),
+    /// Take a device of an I2C bus out of the device it was put in, back to
+    /// its bus's: (bus instance, uid).
+    DropI2c(u8, u32),
+}
+
+/// One device of an I2C bus, as the roster offers and lists it.
+struct BusDevice {
+    instance: u8,
+    key: crate::panels::mcu_module::modules::I2cDeviceKey,
+    /// `I2C1 · oled (0x3C)`.
+    label: String,
+    color: egui::Color32,
+    /// The uid a Device holds it by, once it has one.
+    uid: Option<u32>,
+    /// Put in a Device by hand - else it is in its bus's.
+    explicit: bool,
+    /// The Device it is in, either way (trimmed).
+    group: Option<String>,
+}
+
+/// Every device on every I2C bus of the chip.
+fn bus_devices(mcu: &Mcu) -> Vec<BusDevice> {
+    use crate::panels::mcu_module::modules::{I2cDeviceKey, ModuleConfig};
+    let mut out = Vec::new();
+    for m in &mcu.modules {
+        let ModuleConfig::I2c(cfg) = &m.config else {
+            continue;
+        };
+        let inst = m.instance();
+        for (n, row) in cfg.rows().iter().enumerate() {
+            let name = if row.name.trim().is_empty() {
+                format!("device {}", n + 1)
+            } else {
+                row.name.trim().to_owned()
+            };
+            let uid = match row.key {
+                I2cDeviceKey::Uid(u) => Some(u),
+                _ => None,
+            };
+            out.push(BusDevice {
+                instance: inst,
+                key: row.key,
+                label: format!(
+                    "{} · {name} (0x{:02X})",
+                    mod_gui::module_base_name(m),
+                    row.address
+                ),
+                color: mod_gui::module_color(m.kind, inst),
+                uid,
+                explicit: uid.is_some_and(|u| {
+                    mcu.groups
+                        .iter()
+                        .any(|g| g.is_live() && g.i2c.contains(&(inst, u)))
+                }),
+                group: mcu
+                    .group_of_i2c_device(inst, row.key)
+                    .map(|g| g.name.trim().to_owned()),
+            });
+        }
+    }
+    out
 }
 
 /// A pad that can be added to a device on its own — one the user configured by
@@ -261,6 +326,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
         .map(|g| g.pins.iter().copied().collect())
         .collect();
     let loose = loose_pins(mcu);
+    let bus_devs = bus_devices(mcu);
     let modules: Vec<(String, String, egui::Color32)> = mcu
         .modules
         .iter()
@@ -483,7 +549,31 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                                     ui.close();
                                 }
                             }
-                            if !any && loose.is_empty() {
+                            // The devices of an I2C bus share its pads, so
+                            // they are offered one by one: one may belong to a
+                            // board part the rest of its bus does not. Not the
+                            // ones already in THIS device, either way.
+                            let here = name.trim();
+                            let offer: Vec<&BusDevice> = bus_devs
+                                .iter()
+                                .filter(|d| d.group.as_deref() != Some(here))
+                                .collect();
+                            if (any || !loose.is_empty()) && !offer.is_empty() {
+                                ui.separator();
+                            }
+                            for d in &offer {
+                                if ui
+                                    .button(egui::RichText::new(&d.label).size(11.0).color(d.color))
+                                    .on_hover_text(
+                                        "Put this device of the bus in the device. The rest of the bus stays where it is.",
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(Act::AddI2c(gi, d.instance, d.key));
+                                    ui.close();
+                                }
+                            }
+                            if !any && loose.is_empty() && offer.is_empty() {
                                 ui.label(
                                     egui::RichText::new("Nothing configured to add yet.")
                                         .size(10.0)
@@ -492,7 +582,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                             }
                         })
                         .response
-                        .on_hover_text("Add a module's pads, or one configured pin.");
+                        .on_hover_text("Add a module's pads, one configured pin, or one device of an I2C bus.");
                     });
                 });
                 if asking {
@@ -521,6 +611,45 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                                 act = Some(Act::Drop(*pin));
                             }
                         });
+                    });
+                }
+                // Its devices of I2C buses: the ones put here by hand, with an X
+                // that sends them back to their bus's device; and, dimmer, the
+                // ones here BECAUSE their bus is - no X, the bus decides those.
+                let here = names_before[gi].trim();
+                for d in bus_devs.iter().filter(|_| open) {
+                    if d.group.as_deref() != Some(here) {
+                        continue;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add_space(13.0);
+                        if d.explicit {
+                            ui.label(egui::RichText::new(&d.label).size(10.0).color(d.color));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button(egui::RichText::new(ph::X).size(9.0))
+                                        .on_hover_text(
+                                            "Take this device out - back to the device its bus is in.",
+                                        )
+                                        .clicked()
+                                        && let Some(u) = d.uid
+                                    {
+                                        act = Some(Act::DropI2c(d.instance, u));
+                                    }
+                                },
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("{}  - with its bus", d.label))
+                                    .size(10.0)
+                                    .color(egui::Color32::from_gray(130)),
+                            )
+                            .on_hover_text(
+                                "In this device because its bus is. Put it in another device to move it on its own.",
+                            );
+                        }
                     });
                 }
             });
@@ -687,6 +816,21 @@ fn apply_act(mcu: &mut Mcu, act: Option<Act>) -> bool {
             }
         }
         Some(Act::Drop(pin)) => mcu.join_group(pin, ""),
+        // The same nameless-row guard as a pad: joining "" is how a device of
+        // a bus LEAVES its device, which from a row with no name would take it
+        // out of somebody else's.
+        Some(Act::AddI2c(gi, inst, key)) => {
+            if let Some(name) = mcu.groups.get(gi).map(|g| g.name.clone()).filter(named) {
+                mcu.join_group_i2c(inst, key, &name);
+            }
+        }
+        Some(Act::DropI2c(inst, uid)) => {
+            mcu.join_group_i2c(
+                inst,
+                crate::panels::mcu_module::modules::I2cDeviceKey::Uid(uid),
+                "",
+            );
+        }
         None => {}
     }
     was_new
@@ -700,6 +844,7 @@ mod tests {
         PinGroup {
             name: name.to_owned(),
             pins: pins.iter().copied().collect(),
+            ..Default::default()
         }
     }
 
@@ -1097,6 +1242,46 @@ mod tests {
             named(&mcu, "display"),
             Some(vec![15]),
             "the pad never left the device that held it"
+        );
+    }
+
+    /// A device of an I2C bus through the roster: a named row takes it, a
+    /// nameless row takes it from nobody, and its X sends it back to its bus's
+    /// device.
+    #[test]
+    fn an_i2c_device_joins_a_named_row_and_its_x_sends_it_back() {
+        use crate::panels::mcu_module::modules::{I2cDeviceEdit, I2cDeviceKey, ModuleKind};
+        let mut mcu = crate::panels::mcu_module::mock_mcu::create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let inst = mcu.modules[0].instance();
+        mcu.edit_i2c_device(inst, I2cDeviceEdit::Add);
+        let uid = match &mcu.modules[0].config {
+            crate::panels::mcu_module::modules::ModuleConfig::I2c(c) => c.devices[0].uid,
+            _ => unreachable!(),
+        };
+        let key = I2cDeviceKey::Uid(uid);
+        mcu.groups = vec![group("display", &[]), group("", &[])];
+        mcu.groups[0].i2c = [(inst, uid)].into();
+
+        super::apply_act(&mut mcu, Some(super::Act::AddI2c(1, inst, key)));
+        assert!(
+            mcu.groups[0].i2c.contains(&(inst, uid)),
+            "a nameless row took it"
+        );
+
+        mcu.groups[1].name = "oled".into();
+        super::apply_act(&mut mcu, Some(super::Act::AddI2c(1, inst, key)));
+        assert_eq!(
+            mcu.group_of_i2c_device(inst, key).map(|g| g.name.as_str()),
+            Some("oled")
+        );
+        assert!(named(&mcu, "display").is_none(), "it held only that device");
+
+        super::apply_act(&mut mcu, Some(super::Act::DropI2c(inst, uid)));
+        assert_eq!(
+            mcu.group_of_i2c_device(inst, key),
+            None,
+            "back with its bus, in none"
         );
     }
 

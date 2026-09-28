@@ -346,6 +346,18 @@ pub struct Mcu {
     /// Transient: id of the module whose "Remove" button is armed and awaiting
     /// an inline confirmation (delete resets its pins, so it's confirmed first).
     pub module_remove_confirm: Option<String>,
+    /// Transient: the I2C device - (bus instance, which device) - whose removal
+    /// is armed, from the panel's row or its box on the canvas. Confirmed
+    /// first because the device's config file goes with it, and the user's
+    /// code below its markers too. One slot, like `module_remove_confirm`: a
+    /// key that no longer names a device simply stops counting.
+    pub i2c_remove_confirm: Option<(u8, crate::panels::mcu_module::modules::I2cDeviceKey)>,
+    /// Transient: what the Virtual-modules panel's device rows did this frame,
+    /// held until the CANVAS has drawn too and applied with what it did, as one
+    /// batch. The panel is drawn first; applied there, a first edit that mints
+    /// a bus re-keys its devices before the canvas draws them, and a canvas
+    /// field still holding typed text is drawn under a new id and loses it.
+    pub pending_i2c_acts: Vec<(u8, crate::panels::mcu_module::mcu::gui::i2c_devices::I2cAct)>,
     /// Transient: number of a pin the user just clicked, requesting a jump to the
     /// line that defines its variable in the generated code. Consumed + cleared
     /// by the panel (`AppIde`), which owns the editor. Not part of project state.
@@ -357,6 +369,18 @@ pub struct Mcu {
     /// and double-bordered, the module counterpart of [`Mcu::selected_pin`].
     /// Clicking it again clears it. View state only; not persisted.
     pub selected_module: Option<String>,
+    /// The device of an I2C bus picked on the canvas: (the bus module's id,
+    /// which device). Counts only while `selected_module` is that bus - read it
+    /// through [`Mcu::selected_i2c_child`], which says so - so every place that
+    /// clears the module selection clears this one too, without having to know
+    /// it exists. View state only; not persisted.
+    pub selected_i2c_child: Option<(String, crate::panels::mcu_module::modules::I2cDeviceKey)>,
+    /// How far from the chip centre the I2C device boxes and their SCL/SDA wires
+    /// reached LAST frame, `(x, y)`. Their place is only known once the modules
+    /// are packed, which is after the canvas has been sized; `Mcu::draw` grows
+    /// the canvas to this (one frame late, with a repaint) so the Scene's
+    /// auto-fit does not clip them. View state only; not persisted.
+    pub bus_reach: (f32, f32),
     /// Name of the device the canvas is pointing at, when the user said so
     /// OUTRIGHT — by clicking its tab. Most of the time nothing is here and
     /// [`Mcu::active_device`] derives the answer from the selected pin or module

@@ -36,6 +36,8 @@ mod datasheet_import_dialog;
 mod device_groups;
 mod dialogs;
 mod extract_crate_dialog;
+#[cfg(test)]
+mod i2c_canvas_tests;
 mod mcu_form_dialog;
 mod module_notes_ui;
 #[cfg(test)]

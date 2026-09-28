@@ -58,6 +58,7 @@ impl Bench {
             mcu.groups.push(PinGroup {
                 name: "Led".into(),
                 pins: [pin(&mcu, "PC13")].into(),
+                ..Default::default()
             });
         }
         app.mcu = Some(mcu);

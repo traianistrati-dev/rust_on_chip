@@ -1061,6 +1061,7 @@ impl AppIde {
                                 );
                             }
                             let Some(mcu) = &mut self.mcu else { return };
+                            use crate::panels::mcu_module::mcu::gui::i2c_devices as mod_gui_i2c;
                             use crate::panels::mcu_module::mcu::gui::modules as mod_gui;
                             use crate::panels::mcu_module::modules::ModuleKind;
 
@@ -1368,15 +1369,17 @@ impl AppIde {
                                     // `ModuleUndo` holds `modules` and `pins`
                                     // only, and no roster gesture pushes a
                                     // snapshot — so pressing this after creating
-                                    // a device silently reverts the last MODULE
+                                    // a Device silently reverts the last MODULE
                                     // action instead, taking its pin assignments
-                                    // with it. Extending the stack to devices is
+                                    // with it. Extending the stack to Devices is
                                     // a real change (every roster gesture would
                                     // have to snapshot, or an Undo would clobber
                                     // the edits made since), not a line here.
+                                    // An I2C bus's devices ARE on it: they live
+                                    // in the module's config, and every edit of
+                                    // them snapshots first (`edit_i2c_device`).
                                     let hover = format!(
-                                        "Undo: {}  (Ctrl+Z)\n\nModules only — adding, renaming or \
-                                         dissolving a device is not on this stack.",
+                                        "Undo: {}  (Ctrl+Z)\n\nModules and the devices on an I2C bus. Adding, renaming or dissolving a Device (a group, above) is not on this stack.",
                                         mcu.last_module_undo_label().unwrap_or("last change")
                                     );
                                     if ui
@@ -1571,6 +1574,12 @@ impl AppIde {
                                 // applied after the loop.
                                 let confirm_id = mcu.module_remove_confirm.clone();
                                 let mut remove_id: Option<String> = None; // confirmed → remove
+                                // An I2C bus's device rows: they only collect,
+                                // applied after the loop like the signals above.
+                                let mut i2c_io = mod_gui_i2c::I2cIo {
+                                    confirm: mcu.i2c_remove_confirm,
+                                    acts: Vec::new(),
+                                };
                                 // A pin the details pane wants shown in the
                                 // editor. `request_pin_goto` is the existing,
                                 // deferred path — `AppIde` consumes it after the
@@ -2051,7 +2060,7 @@ impl AppIde {
                                                         &family, pending, chip_dma.as_ref(),
                                                         usart_line_extras,
                                                         block_partner.get(&m.id).map(String::as_str),
-                                                        &mut my_out, &baud_chip,
+                                                        &mut my_out, &baud_chip, &mut i2c_io,
                                                     );
                                                 });
                                                 if !my_out.is_empty() {
@@ -2254,6 +2263,10 @@ impl AppIde {
                                         }
                                     }
                                 }
+                                // I2C device edits: handed to the canvas, which
+                                // applies them with its own once it has drawn
+                                // (see `Mcu::pending_i2c_acts`).
+                                mcu.pending_i2c_acts.append(&mut i2c_io.acts);
                                 // Apply the inline remove-confirm signals.
                                 if let Some(id) = arm_confirm {
                                     mcu.module_remove_confirm = Some(id);

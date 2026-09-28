@@ -10,6 +10,8 @@ pub mod chip;
 pub mod clock;
 pub mod device_frame;
 pub mod geometry;
+pub mod i2c_children;
+pub mod i2c_devices;
 pub mod info;
 pub mod io_arrows;
 pub mod layout;
@@ -92,7 +94,12 @@ impl Mcu {
         // Grow the painter to cover modules dragged far from the chip, so the
         // Scene's auto-fit encompasses them instead of clipping at the panel
         // edge. The chip stays centred; the extra span is just empty canvas.
-        let drag_ext = modules::dragged_half_extent(self).max(io_arrows::dragged_half_extent(self));
+        // The devices of the I2C buses sit past their bus's box, where no fixed
+        // margin reaches - and where they go is only known once the modules
+        // are packed, below. So last frame's reach is used (see `bus_reach`).
+        let drag_ext = modules::dragged_half_extent(self)
+            .max(io_arrows::dragged_half_extent(self))
+            .max(egui::vec2(self.bus_reach.0, self.bus_reach.1));
         let halo = if has_groups { device_frame::HALO } else { 0.0 };
         let half_w = (canvas_w / 2.0 + mx).max(drag_ext.x + 16.0 + halo);
         let half_h = (canvas_h / 2.0 + my).max(drag_ext.y + 16.0 + halo);
@@ -139,14 +146,30 @@ impl Mcu {
         let mut tab_reset: Option<String> = None;
         for h in self.device_tabs.clone() {
             let manual = self.device_is_manual(&h.name);
-            let resp = ui
-                .interact(
-                    h.off.translate(center.to_vec2()),
-                    ui.id().with(("device_tab", &h.name, h.cluster)),
-                    egui::Sense::click_and_drag(),
+            // A device made only of devices on an I2C bus has nothing a drag
+            // could move: they sit beside their bus and move with it.
+            let movable = self
+                .groups
+                .iter()
+                .any(|g| g.name.trim() == h.name.trim() && !g.pins.is_empty());
+            let resp = ui.interact(
+                h.off.translate(center.to_vec2()),
+                ui.id().with(("device_tab", &h.name, h.cluster)),
+                if movable {
+                    egui::Sense::click_and_drag()
+                } else {
+                    egui::Sense::click()
+                },
+            );
+            let resp = if movable {
+                resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(
+                    "Click to select the whole device - drag to move every part of it",
                 )
-                .on_hover_cursor(egui::CursorIcon::Grab)
-                .on_hover_text("Click to select the whole device - drag to move every part of it");
+            } else {
+                resp.on_hover_text(
+                    "Click to select the whole device - its I2C devices sit beside their bus and move with it",
+                )
+            };
             if resp.dragged() && crate::panels::drag_decided(ui) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 let d = resp.drag_delta();
@@ -214,6 +237,9 @@ impl Mcu {
                 ui,
                 &mut members,
             );
+        } else {
+            // No bus left to apply them to.
+            self.pending_i2c_acts.clear();
         }
 
         // ── In/out arrows + rename fields for GPIO In/Out/PWM pins ────────────

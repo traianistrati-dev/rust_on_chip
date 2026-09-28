@@ -2528,8 +2528,10 @@ fn handle_incoming(
             // token is whatever RA chose, and this server sends numeric ones —
             // so the flag never flipped, every gate on it fell back to its
             // timeout, and a deferred Go-to-definition waited for a condition
-            // that could not arrive. `is_indexing` (a rust-prefixed or numeric
-            // load token) ending is the signal that actually exists here.
+            // that could not arrive. `is_indexing` widens it to a rust-prefixed
+            // token, but a NUMERIC token still matches neither test here; for
+            // those the `experimental/serverStatus` handler above sets
+            // `indexed` when the server reports `quiescent`.
             if kind == "end" && (is_indexing || token.to_ascii_lowercase().contains("index")) {
                 s.indexed = true;
                 ctx.request_repaint();

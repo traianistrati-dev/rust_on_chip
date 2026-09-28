@@ -2270,6 +2270,11 @@ impl AppIde {
         // Areas only. Panel widths, collapsing headers and scroll offsets live in
         // egui's `data` map and survive, which is why persistence stays on: turned
         // off, every resizable panel would reset to its default width on launch.
+        // They survive only while the build stays the same, though: egui keys
+        // each record by its Rust type's `TypeId`, which changes with the egui
+        // version, the compiler, any version or feature change in egui's own
+        // dependencies, and between debug and release. A rebuild like that
+        // starts them from defaults once; the old records stay in `app.ron`.
         cc.egui_ctx.memory_mut(|m| m.reset_areas());
 
         // ── Load persisted project state ─────────────────────────────────────
@@ -4378,12 +4383,6 @@ impl AppIde {
         }
     }
 
-    /// Single point where rust-analyzer is asked to re-verify: writes main.rs +
-    /// every user source file to the LSP workspace (so cargo-check/flycheck sees
-    /// them), pushes `didChange` (RA's in-memory analysis) for the files that
-    /// actually changed and `didSave` (RA's flycheck) when anything did.
-    /// Called **only on a Project Save** — never while typing.
-    ///
     /// Delete the temp check-workspace's `Cargo.lock` so the next `cargo check`
     /// re-resolves dependencies. Called ONLY when a New Project starts (the deps
     /// differ then, and there is no lock of its own to take); saves keep the

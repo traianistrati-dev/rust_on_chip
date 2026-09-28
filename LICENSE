@@ -36,14 +36,37 @@ are covered by their own terms instead, and those terms travel with them:
       assets/cyw43-firmware/LICENSE-permissive-binary-license-1.0.txt.
       That license permits redistribution in binary form WITHOUT
       modification, provided the copyright notice and disclaimer are
-      reproduced, and it prohibits reverse engineering.
+      reproduced, and it prohibits reverse engineering. The IDE binary
+      embeds these blobs to write them into Pico W projects, so a binary
+      distribution of the IDE must reproduce that notice as well.
 
-Building this application also links Rust crates under their own permissive
-licenses, chiefly MIT and Apache-2.0. Two are worth naming:
+  * assets/fpga-gateware/pico2-ice/pico2_ice.pcf
+      tinyVision.ai's pin catalogue for the pico2-ice, from pico-ice-sdk,
+      under the MIT license in LICENSE-tinyvision-MIT.txt beside it. The IDE
+      binary embeds it and copies it into every pico2-ice project.
+
+  * src/panels/mcu_module/testdata/rgb_blink.bin
+      tinyVision.ai's factory blink bitstream, used only by tests, under the
+      MIT license in LICENSE-tinyvision-MIT.txt beside it.
+
+Building this application also links Rust crates and, through libusb1-sys,
+the C library libusb, under their own licenses, chiefly MIT and Apache-2.0.
+Three are worth naming:
 
   * serialport is MPL-2.0. That is file-level copyleft: modifications to its
     own source files must be shared under MPL-2.0, but distributing it as
-    part of a larger work under different terms is expressly permitted.
+    part of a larger work under different terms is expressly permitted. A
+    binary distribution must say where its source can be obtained.
 
-  * epaint_default_fonts bundles fonts under OFL-1.1 and the Ubuntu Font
-    License 1.0. Their notices must be preserved in binary distributions.
+  * libusb1-sys (pulled in by rusb) declares MIT, but when no libusb is found
+    through vcpkg or pkg-config it compiles its bundled libusb 1.0.27
+    (LGPL-2.1-or-later) and links it statically, which is the usual case on
+    Windows. A binary distribution must include the LGPL-2.1 text and a
+    notice that it contains libusb, provide libusb's source with it (or from
+    the same place), and allow relinking against a modified libusb.
+
+  * epaint_default_fonts bundles fonts under MIT + Bitstream Vera (Hack),
+    OFL-1.1 (Noto Emoji) and the Ubuntu Font License 1.0; egui-phosphor
+    embeds the Phosphor icons (MIT, under their own copyright); on Linux,
+    sctk-adwaita also embeds Cantarell under OFL-1.1. Their notices must be
+    preserved in binary distributions.

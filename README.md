@@ -652,30 +652,65 @@ Licensed under either of **[Apache License 2.0](LICENSE-APACHE)** or the
 SPDX-License-Identifier: MIT OR Apache-2.0
 ```
 
-That is the Rust ecosystem's own default. Every one of the 492 crates in the
-dependency graph permits it, it is what `eframe`, `egui`, `serde` and the HALs
-themselves use, and the Apache half carries an explicit patent grant — which
-matters for a project that generates code against vendor silicon. It also leaves
-no doubt about the firmware the IDE *generates* for you: that is your code, under
-whatever terms you like.
+That is the Rust ecosystem's own default. It is what `eframe`, `egui`, `serde`
+and the HALs themselves use, and the Apache half carries an explicit patent
+grant — which matters for a project that generates code against vendor silicon.
+It also leaves no doubt about the firmware the IDE *generates* for you: that is
+your code, under whatever terms you like.
 
 Unless you state otherwise, any contribution you submit for inclusion in this
 work is dual licensed as above, with no additional terms.
 
-Two dependency licenses are worth knowing about, neither of them a problem:
+### What the dependencies bring
+
+`Cargo.lock` pins 470 crates: the IDE plus 469 dependencies, every platform
+included. A build compiles fewer of them — 226 for Windows
+(`cargo tree -e normal,build --target x86_64-pc-windows-msvc --prefix none
+--no-dedupe | sort -u | wc -l`); Linux and macOS swap in their own windowing
+crates.
+
+About two thirds are MIT OR Apache-2.0 themselves. The rest are not, but every
+one of them allows being built into an MIT OR Apache-2.0 program. Nearly all
+are plain permissive licenses: MIT or Apache-2.0 alone, BSD, ISC, Zlib,
+BSL-1.0, CC0, Unicode-3.0 (the ICU tables behind `url`) and
+CDLA-Permissive-2.0 (the root certificates in `webpki-roots`). `self_cell`
+offers GPL or Apache-2.0; the permissive side applies.
+
+None of this touches the source. It matters when you **redistribute a built
+binary**: the license texts and copyright lines of what is inside go with it.
+No compiled crate ships an Apache `NOTICE` file, so those texts are the whole
+job — except in three cases that ask a little more:
 
 - **`serialport` is MPL-2.0.** That is *file-level* copyleft: modify its files
-  and you must share those files. Linking it into a permissively licensed
-  application is explicitly allowed, so this constrains nothing here.
-- **`epaint_default_fonts` carries OFL-1.1 and Ubuntu-font-1.0** for the fonts
-  bundled into the binary. Every egui app inherits this; keep the notices.
+  and you must share those files. Building it into a permissively licensed
+  application is explicitly allowed; a binary must also say where serialport's
+  source can be had (its crates.io page does).
+- **libusb is LGPL-2.1-or-later, and it hides.** `rusb` pulls in
+  `libusb1-sys`, which says MIT — but when it finds no libusb through vcpkg or
+  pkg-config, it compiles the libusb 1.0.27 C source it bundles and links it
+  **statically**. On Windows that is the usual case; on Linux and macOS only
+  when no libusb is installed. LGPL allows it. A binary must carry the LGPL-2.1
+  text and a notice that it contains libusb, and ship libusb's source with it
+  (or offer it from the same download place); this repository's own source
+  then lets users rebuild against their own libusb.
+- **Fonts and icons.** `epaint_default_fonts` bundles Hack (MIT + Bitstream
+  Vera), Noto Emoji (OFL-1.1) and Ubuntu Light (Ubuntu Font License 1.0); every
+  egui app inherits them. `egui-phosphor` embeds the Phosphor icons, MIT under
+  their own copyright. On Linux, the window title bar (`sctk-adwaita`, which
+  says MIT) also embeds Cantarell under OFL-1.1. Keep their notices.
 
-And two things the dual license above does **not** cover:
+And three things the dual license above does **not** cover:
 
 - **`assets/cyw43-firmware/`** ships Infineon binary blobs under the *Permissive
   Binary License 1.0*, which travels with them. It allows redistribution
   **without modification** provided the notice is reproduced, and it asks that an
   SDK redistribution include the accompanying `DEPENDENCIES` file — which is
-  **not currently in the repo** and should be added from upstream.
+  **not currently in the repo** and should be added from upstream. The IDE
+  binary itself embeds these blobs to write them into Pico W projects, so a
+  binary release must reproduce that notice too.
+- **tinyVision's `pico2_ice.pcf`** (`assets/fpga-gateware/pico2-ice/`, built
+  into the IDE and copied into every pico2-ice project) and the test bitstream
+  `src/panels/mcu_module/testdata/rgb_blink.bin` are MIT, each with its
+  license file beside it.
 - **OpenOCD is GPL**, but the IDE only *invokes* it as a subprocess. Invoking is
   not linking, so no GPL obligation reaches this code.

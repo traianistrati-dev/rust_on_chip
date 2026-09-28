@@ -1850,8 +1850,9 @@ pub fn write_project(
 
     // NOTE: Cargo.lock is intentionally NOT deleted here. Re-resolving the
     // dependency graph on every save made saving slow (cargo re-solves the
-    // version graph before each check). The lock is reset only when the
-    // chip/toolchain changes — see `AppIde::reset_workspace_lock`.
+    // version graph before each check). The lock is reset only when a New
+    // Project starts, and an opened project seeds it from its own - see
+    // `AppIde::reset_workspace_lock` and `project_io::seed_workspace_lock`.
 
     // Files common to all toolchains. Written ONLY when changed (see
     // `write_if_changed`) so unchanged files keep their mtimes and neither

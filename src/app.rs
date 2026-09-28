@@ -67,6 +67,8 @@ pub(crate) mod editor_state;
 
 mod project_io;
 
+mod fs_events;
+
 mod loading_overlay;
 
 mod startup_picker;
@@ -2152,6 +2154,9 @@ pub struct AppIde {
     fs_watched: Option<std::path::PathBuf>,
     /// When `sync_fs_watch` next looks at the disk.
     fs_watch_next_check: std::time::Instant,
+    /// Half of a rename carried to the next frame: notify reports one in two
+    /// events on Windows, and a drain can fall between them.
+    fs_pairer: fs_events::FsEventPairer,
 
     /// A project chosen from "Open Recent", waiting for the unsaved-changes
     /// gate. Consumed by `pick_and_open_project`, which opens the folder picker
@@ -2602,6 +2607,7 @@ impl AppIde {
             _fs_watcher: watcher.ok(),
             fs_watched,
             fs_watch_next_check: std::time::Instant::now(),
+            fs_pairer: Default::default(),
             pending_open_dir: None,
             startup_picker: None,
             workspace_write_requested: false,

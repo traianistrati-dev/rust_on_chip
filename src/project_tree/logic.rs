@@ -208,39 +208,120 @@ impl ProjectTreeState {
     /// Handle filesystem events: Create, Remove, and Rename operations.
     pub fn handle_fs_events(&mut self, events: Vec<(String, FsEventKind)>) {
         for (rel, kind) in events {
-            match kind {
-                FsEventKind::Create => {
-                    if !self.user_src_files.iter().any(|(p, _)| p == &rel) {
-                        let content = String::new();
-                        self.user_src_files.push((rel, content));
-                    }
-                }
-                FsEventKind::Remove => {
-                    self.user_src_files.retain(|(p, _)| p != &rel);
-                    let dir_rel = rel.trim_end_matches('/').to_string();
-                    self.user_src_folders.retain(|f| f != &dir_rel);
-                }
-                FsEventKind::Rename { old_rel, new_rel } => {
-                    // File rename
-                    if let Some((p, _)) =
-                        self.user_src_files.iter_mut().find(|(p, _)| p == &old_rel)
-                    {
-                        *p = new_rel.clone();
-                    }
-                    // Folder rename — update folder list + all child paths
-                    if let Some(f) = self.user_src_folders.iter_mut().find(|f| **f == old_rel) {
-                        *f = new_rel.clone();
-                    }
-                    let old_prefix = format!("{old_rel}/");
-                    let new_prefix = format!("{new_rel}/");
-                    for (path, _) in &mut self.user_src_files {
-                        if path.starts_with(&old_prefix) {
-                            *path = format!("{new_prefix}{}", &path[old_prefix.len()..]);
-                        }
-                    }
+            self.apply_fs_event(&rel, kind, &mut None);
+        }
+    }
+
+    /// Apply ONE filesystem event. `selected` is an index into
+    /// `user_src_files` (the file open in the editor, which refers to it by
+    /// index) and follows it across every index this shifts; it becomes `None`
+    /// when that file is gone.
+    ///
+    /// Returns `false` for a Rename whose source the tree does not know - a
+    /// temp file renamed into place, or the watcher's echo of a rename the IDE
+    /// already applied. The destination has then simply appeared, which only
+    /// the caller can read from disk.
+    pub fn apply_fs_event(
+        &mut self,
+        rel: &str,
+        kind: FsEventKind,
+        selected: &mut Option<usize>,
+    ) -> bool {
+        match kind {
+            FsEventKind::Create => {
+                if !self.user_src_files.iter().any(|(p, _)| p == rel) {
+                    let content = String::new();
+                    self.user_src_files.push((rel.to_owned(), content));
                 }
             }
+            FsEventKind::Remove => {
+                // A folder's contents go with it. A folder moved out of the
+                // watched tree is ONE event: nothing is reported for what was
+                // inside, which used to stay behind as ghost files.
+                let dir_rel = rel.trim_end_matches('/');
+                let prefix = format!("{dir_rel}/");
+                self.remove_files_where(|p| p == rel || p.starts_with(&prefix), selected);
+                self.user_src_folders
+                    .retain(|f| f != dir_rel && !f.starts_with(&prefix));
+            }
+            FsEventKind::Rename { old_rel, new_rel } => {
+                let mut known = false;
+                // File rename, in place: the entry keeps its index and its
+                // in-memory content, so the editor stays on it.
+                if let Some(i) = self.user_src_files.iter().position(|(p, _)| *p == old_rel) {
+                    known = true;
+                    match self.user_src_files.iter().position(|(p, _)| *p == new_rel) {
+                        // Onto a file the tree has (an atomic save): the
+                        // destination keeps its slot and takes the moved
+                        // file's content, and the source's slot goes.
+                        Some(j) if j != i => {
+                            let content = std::mem::take(&mut self.user_src_files[i].1);
+                            self.user_src_files[j].1 = content;
+                            if *selected == Some(i) {
+                                *selected = Some(j);
+                            }
+                            self.user_src_files.remove(i);
+                            *selected = selected.map(|s| if s > i { s - 1 } else { s });
+                        }
+                        _ => self.user_src_files[i].0 = new_rel.clone(),
+                    }
+                }
+                // Folder rename - the folder, every folder under it and every
+                // file under it.
+                let old_prefix = format!("{old_rel}/");
+                let mut moved_folder = false;
+                for f in &mut self.user_src_folders {
+                    if *f == old_rel {
+                        *f = new_rel.clone();
+                    } else if let Some(rest) = f.strip_prefix(&old_prefix) {
+                        *f = format!("{new_rel}/{rest}");
+                    } else {
+                        continue;
+                    }
+                    moved_folder = true;
+                }
+                if moved_folder {
+                    known = true;
+                    // Renamed onto a folder the tree already listed.
+                    let mut seen = std::collections::HashSet::new();
+                    self.user_src_folders.retain(|f| seen.insert(f.clone()));
+                }
+                for (path, _) in &mut self.user_src_files {
+                    if let Some(rest) = path.strip_prefix(&old_prefix) {
+                        *path = format!("{new_rel}/{rest}");
+                        known = true;
+                    }
+                }
+                return known;
+            }
         }
+        true
+    }
+
+    /// Drop every file whose path matches, carrying `selected` across the
+    /// shift (`None` when its own file is dropped).
+    fn remove_files_where(&mut self, drop: impl Fn(&str) -> bool, selected: &mut Option<usize>) {
+        let sel = *selected;
+        let mut idx = 0;
+        let mut dropped_before = 0;
+        let mut sel_dropped = false;
+        self.user_src_files.retain(|(p, _)| {
+            let gone = drop(p);
+            if gone {
+                match sel {
+                    Some(s) if s == idx => sel_dropped = true,
+                    Some(s) if idx < s => dropped_before += 1,
+                    _ => {}
+                }
+            }
+            idx += 1;
+            !gone
+        });
+        *selected = if sel_dropped {
+            None
+        } else {
+            sel.map(|s| s - dropped_before)
+        };
     }
 
     /// Keep the `src/pins/` scaffold in step with the pin configuration:
@@ -918,8 +999,9 @@ mod tests {
         state.handle_fs_events(vec![("src/helpers".to_string(), FsEventKind::Remove)]);
 
         assert!(!state.user_src_folders.contains(&"src/helpers".to_string()));
-        // Note: child files are not automatically removed by the current implementation
-        // In practice, they are removed by individual Remove events from filesystem watcher
+        // Its files go with it: a folder moved OUT of the watched tree is one
+        // Remove on every backend, with no event for anything inside.
+        assert_file_not_exists(&state, "src/helpers/math.rs");
         assert_file_exists(&state, "src/utils.rs");
     }
 

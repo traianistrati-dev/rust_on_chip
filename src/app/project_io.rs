@@ -416,19 +416,19 @@ impl AppIde {
     }
 
     // ── Filesystem watcher polling ────────────────────────────────────────────
-    /// Drains the notify channel and applies any relevant Create / Remove /
-    /// Rename events to `project_tree`.
+    /// Drains the notify channel and applies the Create / Remove / Rename
+    /// changes it carries to `project_tree`, in the order they happened.
     ///
     /// Rules:
     /// - Only files inside `workspace/src/` are tracked.
     /// - `src/main.rs` is always excluded (it is the generated file).
     /// - Create: add if not already present (avoids duplicates from our own writes).
     /// - Remove: drop from the list (IDE-initiated removes are already gone).
-    /// - Rename: atomically update the stored path.
+    /// - Rename: update the stored path in place. notify reports one in two
+    ///   halves on Windows (and the halves can land in different frames), so
+    ///   [`super::fs_events::FsEventPairer`] pairs them first.
     pub(super) fn poll_fs_events(&mut self) {
-        use crate::project_tree::logic::FsEventKind;
-        use notify::EventKind::*;
-        use notify::event::{ModifyKind, RenameMode};
+        use super::fs_events::{RENAME_PAIR_WAIT, apply_fs_changes};
 
         // Paths are made relative to the workspace ROOT (tree paths are
         // project-root-relative). The WATCH itself still covers only `src/`:
@@ -443,8 +443,8 @@ impl AppIde {
             return;
         };
 
-        let mut events = Vec::new();
-        let mut src_root_removed = false;
+        let now = std::time::Instant::now();
+        let mut changes = Vec::new();
         let mut drained = 0usize;
 
         // Bounded: a burst larger than this finishes on the next frames instead
@@ -454,84 +454,29 @@ impl AppIde {
             let Ok(event) = event else {
                 continue;
             };
-            match event.kind {
-                Create(_) => {
-                    for abs in &event.paths {
-                        let Ok(rel) = abs.strip_prefix(&workspace_root) else {
-                            continue;
-                        };
-                        let rel = rel.to_string_lossy().replace('\\', "/");
-                        if rel == "src/main.rs" {
-                            continue;
-                        }
-                        // Directories must be tracked as FOLDERS, and unreadable
-                        // paths skipped — the old unconditional push-as-file made
-                        // a fresh folder land in `user_src_files` as a phantom
-                        // ("folder1", "") entry that then OVERWROTE the folder's
-                        // node in `build_tree` (same map key), rendering the
-                        // whole folder as one extension-less "file" until the
-                        // project was reopened.
-                        let is_dir = abs.is_dir();
-                        apply_fs_create(
-                            &mut self.project_tree.user_src_files,
-                            &mut self.project_tree.user_src_folders,
-                            &rel,
-                            is_dir,
-                            // LF-normalized (phantom-gutter rule).
-                            || {
-                                std::fs::read_to_string(abs)
-                                    .ok()
-                                    .map(|s| s.replace("\r\n", "\n"))
-                            },
-                        );
-                    }
-                }
-                Remove(_) => {
-                    for abs in &event.paths {
-                        if *abs == workspace_src {
-                            src_root_removed = true;
-                        }
-                        let Ok(rel) = abs.strip_prefix(&workspace_root) else {
-                            continue;
-                        };
-                        let rel = rel.to_string_lossy().replace('\\', "/");
-                        // Windows reports one change as several records; the
-                        // same removal twice in a row is one removal.
-                        if events
-                            .last()
-                            .is_some_and(|(p, k)| p == &rel && matches!(k, FsEventKind::Remove))
-                        {
-                            continue;
-                        }
-                        events.push((rel, FsEventKind::Remove));
-                    }
-                }
-                Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() == 2 => {
-                    let old = &event.paths[0];
-                    let new = &event.paths[1];
-                    let Ok(old_rel) = old.strip_prefix(&workspace_root) else {
-                        continue;
-                    };
-                    let Ok(new_rel) = new.strip_prefix(&workspace_root) else {
-                        continue;
-                    };
-                    let old_rel = old_rel.to_string_lossy().replace('\\', "/");
-                    let new_rel = new_rel.to_string_lossy().replace('\\', "/");
-                    events.push((
-                        old_rel.clone(),
-                        FsEventKind::Rename {
-                            old_rel: old_rel.clone(),
-                            new_rel,
-                        },
-                    ));
-                }
-                _ => {}
-            }
+            self.fs_pairer
+                .push(&event, now, |p| p.exists(), &mut changes);
+        }
+        self.fs_pairer.expire(now, &mut changes);
+        if self.fs_pairer.is_waiting() {
+            // Half a rename is held: come back for the rest, or to give up on
+            // it, even if nothing else wakes the UI.
+            self.egui_ctx.request_repaint_after(RENAME_PAIR_WAIT);
         }
 
-        // Delegate Remove and Rename events to ProjectTreeState
-        if !events.is_empty() {
-            self.project_tree.handle_fs_events(events);
+        // The editor names its file by index, which a removal shifts.
+        let mut selected = match self.selected_file {
+            ProjectFileId::UserFile(i) => Some(i),
+            _ => None,
+        };
+        let src_root_removed = apply_fs_changes(
+            &mut self.project_tree,
+            &workspace_root,
+            changes,
+            &mut selected,
+        );
+        if let ProjectFileId::UserFile(_) = self.selected_file {
+            self.selected_file = selected.map_or(ProjectFileId::MainRs, ProjectFileId::UserFile);
         }
 
         if drained == FS_EVENTS_PER_FRAME {
@@ -2308,6 +2253,184 @@ mod fs_watch_tests {
             events <= 10,
             "{events} events from one write: the watch was re-added per check"
         );
+    }
+}
+
+/// External renames through `poll_fs_events`, the way the frame loop drives it.
+#[cfg(test)]
+mod fs_rename_poll_tests {
+    use super::super::{AppIde, ProjectFileId};
+    use eframe::egui;
+    use notify::event::{ModifyKind, RemoveKind, RenameMode};
+    use notify::{Event, EventKind};
+    use std::path::PathBuf;
+    use std::sync::mpsc::Sender;
+
+    fn file(path: &str, content: &str) -> (String, String) {
+        (path.to_owned(), content.to_owned())
+    }
+
+    /// An app whose watcher channel the test feeds itself. The real watch on
+    /// the IDE's workspace is dropped; nothing here reads or writes that disk.
+    fn app(
+        files: &[(&str, &str)],
+        folders: &[&str],
+        selected: usize,
+    ) -> (AppIde, Sender<notify::Result<Event>>) {
+        let ctx = egui::Context::default();
+        let mut app = AppIde::new(&eframe::CreationContext::_new_kittest(ctx), None, None);
+        app._fs_watcher = None;
+        app.fs_watched = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fs_rx = Some(rx);
+        app.project_tree.user_src_files = files.iter().map(|(p, c)| file(p, c)).collect();
+        app.project_tree.user_src_folders = folders.iter().map(|f| (*f).to_owned()).collect();
+        app.selected_file = ProjectFileId::UserFile(selected);
+        (app, tx)
+    }
+
+    fn ws(rel: &str) -> PathBuf {
+        crate::workspace::dir().join(rel)
+    }
+
+    fn name(mode: RenameMode, rel: &str) -> notify::Result<Event> {
+        Ok(Event::new(EventKind::Modify(ModifyKind::Name(mode))).add_path(ws(rel)))
+    }
+
+    /// The reported bug: Windows says `From` + `To`, and only `Both` was
+    /// handled - the tree kept the old name and never showed the new one.
+    #[test]
+    fn a_windows_rename_reaches_the_tree() {
+        let (mut app, tx) = app(
+            &[("src/keep.rs", "k"), ("src/a.rs", "unsaved edit")],
+            &[],
+            1,
+        );
+        tx.send(name(RenameMode::From, "src/a.rs")).unwrap();
+        tx.send(name(RenameMode::To, "src/b.rs")).unwrap();
+        app.poll_fs_events();
+        assert_eq!(
+            app.project_tree.user_src_files,
+            vec![file("src/keep.rs", "k"), file("src/b.rs", "unsaved edit")]
+        );
+        assert_eq!(app.selected_file, ProjectFileId::UserFile(1));
+    }
+
+    /// The halves are two channel sends, so one frame can drain the `From`
+    /// and the next the `To`.
+    #[test]
+    fn a_rename_split_across_two_frames_is_one_rename() {
+        let (mut app, tx) = app(&[("src/a.rs", "unsaved edit"), ("src/z.rs", "z")], &[], 0);
+        tx.send(name(RenameMode::From, "src/a.rs")).unwrap();
+        app.poll_fs_events();
+        assert_eq!(app.project_tree.user_src_files[0].0, "src/a.rs");
+        tx.send(name(RenameMode::To, "src/b.rs")).unwrap();
+        app.poll_fs_events();
+        assert_eq!(
+            app.project_tree.user_src_files,
+            vec![file("src/b.rs", "unsaved edit"), file("src/z.rs", "z")]
+        );
+        assert_eq!(app.selected_file, ProjectFileId::UserFile(0));
+    }
+
+    /// A file deleted ABOVE the open one shifts its index; the editor must stay
+    /// on its own file rather than slide onto the next.
+    #[test]
+    fn a_removal_above_the_open_file_keeps_it_open() {
+        let (mut app, tx) = app(
+            &[("src/a.rs", "a"), ("src/b.rs", "b"), ("src/c.rs", "c")],
+            &[],
+            1,
+        );
+        tx.send(Ok(
+            Event::new(EventKind::Remove(RemoveKind::Any)).add_path(ws("src/a.rs"))
+        ))
+        .unwrap();
+        // A removal can be the destination of a rename that follows, so the
+        // last one of a drain waits for the next event or the pairing window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        app.poll_fs_events();
+        while app.project_tree.user_src_files.len() == 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            app.poll_fs_events();
+        }
+        assert_eq!(
+            app.project_tree.user_src_files,
+            vec![file("src/b.rs", "b"), file("src/c.rs", "c")]
+        );
+        assert_eq!(app.selected_file, ProjectFileId::UserFile(0));
+    }
+
+    /// The real Windows backend: a file, a case-only and a folder rename in a
+    /// watched temp dir. The recorded events are re-rooted onto the IDE's
+    /// workspace path for `poll_fs_events`, which never touches that disk for
+    /// a rename of a file the tree already has.
+    #[cfg(windows)]
+    #[test]
+    fn real_windows_renames_move_the_tree() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("fold/inner")).unwrap();
+        for f in ["a.rs", "c.rs", "fold/x.rs", "fold/inner/y.rs"] {
+            std::fs::write(src.join(f), "on disk").unwrap();
+        }
+        let (wtx, wrx) = std::sync::mpsc::channel();
+        let mut w = notify::recommended_watcher(move |ev| {
+            let _ = wtx.send(ev);
+        })
+        .unwrap();
+        notify::Watcher::watch(&mut w, &src, notify::RecursiveMode::Recursive).unwrap();
+
+        std::fs::rename(src.join("a.rs"), src.join("b.rs")).unwrap();
+        std::fs::rename(src.join("c.rs"), src.join("C.rs")).unwrap();
+        std::fs::rename(src.join("fold"), src.join("fold2")).unwrap();
+
+        let mut events = vec![
+            wrx.recv_timeout(Duration::from_secs(5))
+                .expect("the watch delivers"),
+        ];
+        while let Ok(ev) = wrx.recv_timeout(Duration::from_millis(300)) {
+            events.push(ev);
+        }
+        drop(w);
+
+        let (mut app, tx) = app(
+            &[
+                ("src/a.rs", "a edited"),
+                ("src/c.rs", "c edited"),
+                ("src/fold/x.rs", "x"),
+                ("src/fold/inner/y.rs", "y"),
+            ],
+            &["src/fold", "src/fold/inner"],
+            1,
+        );
+        let root = crate::workspace::dir();
+        for ev in events {
+            let ev = ev.unwrap();
+            let paths = ev
+                .paths
+                .iter()
+                .map(|p| root.join(p.strip_prefix(dir.path()).unwrap()))
+                .collect();
+            tx.send(Ok(Event { paths, ..ev })).unwrap();
+        }
+        app.poll_fs_events();
+
+        assert_eq!(
+            app.project_tree.user_src_files,
+            vec![
+                file("src/b.rs", "a edited"),
+                file("src/C.rs", "c edited"),
+                file("src/fold2/x.rs", "x"),
+                file("src/fold2/inner/y.rs", "y"),
+            ]
+        );
+        assert_eq!(
+            app.project_tree.user_src_folders,
+            vec!["src/fold2", "src/fold2/inner"]
+        );
+        assert_eq!(app.selected_file, ProjectFileId::UserFile(1));
     }
 }
 

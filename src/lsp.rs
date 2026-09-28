@@ -3120,6 +3120,17 @@ pub fn ra_links_detached(linked: &[String], dir: &str) -> bool {
         .any(|p| p.replace('\\', "/").ends_with(&want))
 }
 
+/// What a launch would put in `LspState::linked_projects` right now - the
+/// set `AppIde::recheck_linked_projects` compares against the running one.
+///
+/// `None` is for "cannot tell right now", which a manifest that does not parse
+/// should be: rust-analyzer cannot load it either, so a restart then only
+/// swaps a working analyzer for one that loads nothing. Not yet - a broken
+/// manifest still answers (`a_broken_root_manifest_is_no_answer`).
+pub fn linked_projects_now(workspace_dir: &Path) -> Option<Vec<String>> {
+    Some(linked_projects(workspace_dir).unwrap_or_default())
+}
+
 /// The `linkedProjects` rust-analyzer should load for the project in
 /// `workspace_dir`: the firmware's manifest FIRST, then every detached library
 /// cargo can load. `None` when there is no such library.
@@ -3129,15 +3140,9 @@ pub fn ra_links_detached(linked: &[String], dir: &str) -> bool {
 /// from that copy (it once did, so this found nothing). A library cargo would
 /// refuse is left out on purpose: handing it to RA only buys a "Failed to load
 /// workspaces" message and not one reference.
-/// What a launch would put in `LspState::linked_projects` right now - the
-/// set `AppIde::recheck_linked_projects` compares against the running one.
-pub fn linked_projects_now(workspace_dir: &Path) -> Vec<String> {
-    linked_projects(workspace_dir).unwrap_or_default()
-}
-
 fn linked_projects(workspace_dir: &Path) -> Option<Vec<String>> {
     let root = std::fs::read_to_string(workspace_dir.join("Cargo.toml")).ok()?;
-    let members = crate::panels::mcu_module::project_gen::workspace_members(&root);
+    let members = crate::project_tree::extract_crate::built_lib_dirs(&root);
     let mut libs = Vec::new();
     for entry in std::fs::read_dir(workspace_dir).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -4781,7 +4786,7 @@ mod initialization_options_guard {
 mod linked_projects_tests {
     use super::{
         cargo_can_load_detached, initialization_options, initialization_options_for,
-        linked_projects, ra_links_detached,
+        linked_projects, linked_projects_now, ra_links_detached,
     };
 
     const LIB: &str = "[package]\nname = \"mylib\"\nversion = \"0.1.0\"\n";
@@ -4906,6 +4911,85 @@ mod linked_projects_tests {
             linked_projects(&d),
             None,
             "a member is already in the workspace"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Found by review: with no `[workspace]` in the root - the IDE's own
+    /// templates - a library reached through a `path` dependency is already
+    /// part of the firmware's own load. Linking it again hands rust-analyzer
+    /// the same crate twice.
+    #[test]
+    fn a_path_dependency_is_not_linked_twice() {
+        let d = scratch(
+            "pathdep",
+            "[package]\nname = \"fw\"\n\n[dependencies]\nmylib = { path = \"mylib\" }\n",
+        );
+        assert_eq!(linked_projects(&d), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Found by review: a root manifest that does not parse read as "no
+    /// `[workspace]`", which ADDS a library cargo refuses - so a typo restarted
+    /// the analyzer into one that cannot load the root at all, and fixing the
+    /// typo restarted it again. The Detach state is where it flips.
+    #[test]
+    fn a_broken_root_manifest_is_no_answer() {
+        let d = scratch("broken_root", "[package]\nname = \"fw\"\n");
+        for broken in [
+            "[package]\nname = \"fw\"\n\n[workspace]\nmembers = []\n\n[dependencies]\nx = { version = \"1\"\n",
+            "",
+            "   \n",
+        ] {
+            std::fs::write(d.join("Cargo.toml"), broken).unwrap();
+            assert_eq!(linked_projects_now(&d), None, "{broken:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same for a library whose own `[workspace]` table is what lets cargo
+    /// load it: half-typed, it dropped out of the set, and back in once fixed.
+    #[test]
+    fn a_broken_library_manifest_is_no_answer() {
+        let d = scratch(
+            "broken_lib",
+            "[package]\nname = \"fw\"\n\n[workspace]\nmembers = []\n",
+        );
+        for broken in [format!("{LIB}\n[workspace\n"), String::new()] {
+            std::fs::write(d.join("mylib/Cargo.toml"), &broken).unwrap();
+            assert_eq!(linked_projects_now(&d), None, "{broken:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// What must keep answering: a readable manifest, a typo that is still
+    /// TOML, and a library whose manifest is gone.
+    #[test]
+    fn a_readable_manifest_still_answers() {
+        let detach_state = "[package]\nname = \"fw\"\n\n[workspace]\nmembers = []\n";
+        let d = scratch("readable", detach_state);
+        assert_eq!(linked_projects_now(&d), Some(vec![]));
+        std::fs::write(
+            d.join("Cargo.toml"),
+            format!("{detach_state}\n[dependencies]\nx = {{ vesion = \"1\" }}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            linked_projects_now(&d),
+            Some(vec![]),
+            "a typo that is still TOML"
+        );
+        std::fs::write(d.join("mylib/Cargo.toml"), format!("{LIB}\n[workspace]\n")).unwrap();
+        assert_eq!(
+            linked_projects_now(&d).map(|v| v.len()),
+            Some(2),
+            "its own [workspace] admits it"
+        );
+        std::fs::remove_file(d.join("mylib/Cargo.toml")).unwrap();
+        assert_eq!(
+            linked_projects_now(&d),
+            Some(vec![]),
+            "a library that is gone"
         );
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -2229,7 +2229,7 @@ impl AppIde {
         cli_error: Option<String>,
     ) -> Self {
         // Always start maximized. `with_maximized(true)` on the viewport plus
-        // `forget_window_geometry` in `main` normally settle this before the
+        // `tidy_storage_file` in `main` normally settle this before the
         // window is ever shown; this is the belt-and-braces for the case where
         // the storage file could not be parsed, and costs one frame at the old
         // size instead of a session at it.
@@ -2279,7 +2279,8 @@ impl AppIde {
         // each record by its Rust type's `TypeId`, which changes with the egui
         // version, the compiler, any version or feature change in egui's own
         // dependencies, and between debug and release. A rebuild like that
-        // starts them from defaults once; the old records stay in `app.ron`.
+        // starts them from defaults once; the old records stay in `app.ron`
+        // until `egui_memory_prune` drops them, 50 launches later.
         cc.egui_ctx.memory_mut(|m| m.reset_areas());
 
         // ── Load persisted project state ─────────────────────────────────────

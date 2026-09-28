@@ -3115,8 +3115,16 @@ mod fpga_load_waveform {
         }
     }
 
-    /// Runs the loader exactly as the generated code calls it.
+    /// Runs the loader exactly as the generated code calls it, on a `delay`
+    /// that spins three cycles per count - cortex-m 0.7.9 on the M33.
     fn replay(image: &[u8], cdone_after: Option<usize>) -> (bool, Bus) {
+        replay_with(image, cdone_after, |n| 3 * u64::from(n))
+    }
+
+    /// [`replay`] on a `cortex_m::asm::delay(n)` that spins `delay(n)` CPU
+    /// cycles. The waits are the generated closures: `fpga_wait` is
+    /// `delay(cycles / 3)`.
+    fn replay_with(image: &[u8], cdone_after: Option<usize>, delay: fn(u32) -> u64) -> (bool, Bus) {
         let bus = Rc::new(RefCell::new(Bus {
             cdone_after,
             ..Default::default()
@@ -3133,7 +3141,7 @@ mod fpga_load_waveform {
         let sys_hz = MHZ * 1_000_000;
         let (mhz, half) = (sys_hz / 1_000_000, (sys_hz / (2 * 4_000_000)).max(1));
         let clock = bus.clone();
-        let mut wait = |cycles: u32| clock.borrow_mut().now += u64::from(cycles);
+        let mut wait = |cycles: u32| clock.borrow_mut().now += delay(cycles / 3);
         cram.ice40_sleep_flash(&mut so, mhz, half, &mut wait);
         // The generated code releases GP7 here: from now on nothing drives it.
         drop(so);
@@ -3256,6 +3264,46 @@ mod fpga_load_waveform {
     #[test]
     fn sck_never_outruns_the_fpga() {
         let (_, bus) = replay(&IMAGE, Some(20));
+        let edges: Vec<u64> = bus
+            .events
+            .iter()
+            .filter(|(_, l, _)| *l == Line::Sck)
+            .map(|(t, _, _)| *t)
+            .collect();
+        let tightest = edges.windows(2).map(|w| w[1] - w[0]).min().unwrap();
+        assert!(tightest >= 3, "{tightest} cycles between SCK edges");
+    }
+
+    /// All `cortex_m::asm::delay(n)` promises: at least `n` CPU cycles. How
+    /// many loop turns it runs changed in 0.7.8 - 0.7.7, still a legal lock
+    /// for `cortex-m = "0.7"`, runs half as many - and how long a turn takes
+    /// is the core's.
+    fn delay_floor(n: u32) -> u64 {
+        u64::from(n)
+    }
+
+    /// Found by review: the 1300 us clear time went through the same
+    /// `delay(cycles / 3)` as the SCK half-periods, which on cortex-m 0.7.7 is
+    /// about 650 us - under the FPGA's 1200 us. Replayed at what `delay`
+    /// guarantees, not at what one version of it happens to do.
+    #[test]
+    fn the_clear_time_holds_at_the_delays_floor() {
+        let (_, bus) = replay_with(&IMAGE, Some(20), delay_floor);
+        let rise = creset_rise(&bus);
+        let first = bus.rises(Line::Sck).find(|t| *t > rise).expect("a clock");
+        assert!(
+            first - rise >= 1200 * u64::from(MHZ),
+            "{} us",
+            (first - rise) / u64::from(MHZ)
+        );
+    }
+
+    /// At that floor the SCK half-periods run short - they only set how fast
+    /// the image goes in - but never past the FPGA's 25 MHz.
+    #[test]
+    fn sck_holds_at_the_delays_floor() {
+        let (ok, bus) = replay_with(&IMAGE, Some(20), delay_floor);
+        assert!(ok);
         let edges: Vec<u64> = bus
             .events
             .iter()

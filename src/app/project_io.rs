@@ -125,37 +125,7 @@ impl AppIde {
         // below since the diagram is chip-agnostic. Missing file/section →
         // automatic layout. `load` falls back to `mcu.config`, where this state
         // lived before it got its own file.
-        {
-            use crate::panels::mcu_module::structure_config;
-            let (positions, view, clock, clock_view, flow) = structure_config::load(root);
-            self.structure_overrides = positions;
-            // Clock-diagram node positions — applied by the Clock tab over the
-            // generated layout (unknown ids, e.g. after a chip change, are
-            // simply ignored).
-            self.clock_ui.positions = clock;
-            self.clock_ui.fields = clock_view;
-            // View options (Calls / depth / path style / externals) — absent
-            // section (older projects) keeps the defaults.
-            if let Some((show_calls, depth, style, externals)) = view {
-                self.structure_view.show_calls = show_calls;
-                self.structure_view.call_depth = depth;
-                self.structure_view.path_style =
-                    crate::panels::structure_map::gui::PathStyle::from_u8(style);
-                self.structure_view.show_externals = externals;
-            }
-            // Flow-tab reading position - restored only onto its own file (see
-            // `FlowViewPersist`); an absent section leaves it empty and the tab
-            // opens on the file's entry point. The mode ("All — whole file")
-            // is per project too, and an absent section is the default.
-            self.flow_selected = flow.selected;
-            self.flow_view.set_mode_bits(flow.mode);
-            // Force the next Structure-tab frame to rebuild + re-apply them
-            // even when the content hash happens to match the cached graph.
-            self.structure_cache = None;
-            // Same for the Flow tab: a new project's files are different text
-            // even when a content hash happens to collide.
-            self.flow_cache = None;
-        }
+        self.restore_view_state(root);
 
         // ── Virtual Module notes ─────────────────────────────────────────────
         // On EVERY open, outside the main.rs branch below: a project with no
@@ -298,6 +268,45 @@ impl AppIde {
 
         // A chip of a system brings its system to the Board tab.
         self.board_follow_project(root);
+    }
+
+    /// The per-project VIEW state - diagram positions, the Structure tab's
+    /// options, the Flow tab's reading position - from `root`'s
+    /// `project_structure.config`.
+    ///
+    /// Only what the file holds is applied, so whatever it leaves out still
+    /// carries the previous project's value
+    /// (`opening_a_project_forgets_the_last_ones_structure_view`).
+    pub(super) fn restore_view_state(&mut self, root: &std::path::Path) {
+        use crate::panels::mcu_module::structure_config;
+        let (positions, view, clock, clock_view, flow) = structure_config::load(root);
+        self.structure_overrides = positions;
+        // Clock-diagram node positions — applied by the Clock tab over the
+        // generated layout (unknown ids, e.g. after a chip change, are
+        // simply ignored).
+        self.clock_ui.positions = clock;
+        self.clock_ui.fields = clock_view;
+        // View options (Calls / depth / path style / externals) — absent
+        // section (older projects) keeps the defaults.
+        if let Some((show_calls, depth, style, externals)) = view {
+            self.structure_view.show_calls = show_calls;
+            self.structure_view.call_depth = depth;
+            self.structure_view.path_style =
+                crate::panels::structure_map::gui::PathStyle::from_u8(style);
+            self.structure_view.show_externals = externals;
+        }
+        // Flow-tab reading position - restored only onto its own file (see
+        // `FlowViewPersist`); an absent section leaves it empty and the tab
+        // opens on the file's entry point. The mode ("All — whole file")
+        // is per project too, and an absent section is the default.
+        self.flow_selected = flow.selected;
+        self.flow_view.set_mode_bits(flow.mode);
+        // Force the next Structure-tab frame to rebuild + re-apply them
+        // even when the content hash happens to match the cached graph.
+        self.structure_cache = None;
+        // Same for the Flow tab: a new project's files are different text
+        // even when a content hash happens to collide.
+        self.flow_cache = None;
     }
 
     // ── Project-folder claim ──────────────────────────────────────────────────
@@ -1029,7 +1038,10 @@ impl AppIde {
             return;
         }
         self.linked_check_at = Some(std::time::Instant::now());
-        let now = crate::lsp::linked_projects_now(&crate::workspace::dir());
+        // `None`: the manifests cannot say right now - keep what is running.
+        let Some(now) = crate::lsp::linked_projects_now(&crate::workspace::dir()) else {
+            return;
+        };
         if now != self.lsp_state.lock().unwrap().linked_projects {
             self.restart_lsp();
         }
@@ -2778,5 +2790,134 @@ mod seed_lock_tests {
             .unwrap();
         seed_workspace_lock(project.path(), workspace.path());
         assert_eq!(std::fs::metadata(&dest).unwrap().modified().unwrap(), old);
+    }
+}
+
+/// Found by review: opening a project applied only what its
+/// `project_structure.config` held, and the Structure and Flow views kept the
+/// rest from the project open before.
+#[cfg(test)]
+mod view_state_tests {
+    use super::super::AppIde;
+    use crate::panels::mcu_module::structure_config::{self, FlowPersist};
+    use eframe::egui;
+
+    fn app() -> AppIde {
+        let ctx = egui::Context::default();
+        let mut app = AppIde::new(&eframe::CreationContext::_new_kittest(ctx), None, None);
+        app._fs_watcher = None;
+        app.fs_watched = None;
+        app
+    }
+
+    /// A project folder whose `project_structure.config` holds this view.
+    fn project(
+        view: structure_config::StructureViewPersist,
+        flow: FlowPersist,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let text = structure_config::serialize(
+            &Default::default(),
+            &view,
+            &Default::default(),
+            &structure_config::CLOCK_VIEW_DEFAULT,
+            &flow,
+        );
+        std::fs::write(dir.path().join(structure_config::FILE_NAME), text).unwrap();
+        dir
+    }
+
+    fn default_view() -> structure_config::StructureViewPersist {
+        let d = crate::panels::structure_map::gui::StructureView::default();
+        (
+            d.show_calls,
+            d.call_depth,
+            d.path_style.to_u8(),
+            d.show_externals,
+        )
+    }
+
+    /// The last project's open chart is a KEY both files can have (`main`),
+    /// and the Flow tab keeps an open key over the saved one - so B opened on
+    /// A's `main`, not its own `blink`, and its next Save lost `blink`.
+    #[test]
+    fn opening_a_project_forgets_the_last_ones_flow_position() {
+        let mut app = app();
+        app.flow_view.selected = "main".to_owned();
+        app.flow_view.all = true;
+        let b = project(
+            default_view(),
+            FlowPersist {
+                selected: ("src/main.rs".to_owned(), "blink".to_owned()),
+                mode: 0,
+            },
+        );
+        app.restore_view_state(b.path());
+        assert_eq!(
+            app.flow_selected,
+            ("src/main.rs".to_owned(), "blink".to_owned())
+        );
+        assert!(!app.flow_view.all, "B saved no whole-file mode");
+        let Ok(model) = crate::panels::flow_map::parse::parse_file(
+            "fn blink() {}\n\nfn main() {\n    blink();\n}\n",
+        ) else {
+            panic!("the file parses");
+        };
+        assert_eq!(
+            crate::panels::flow_map::choose_selection(
+                &model,
+                &app.flow_view.selected,
+                Some("blink")
+            ),
+            "blink",
+            "the Flow tab opens B on its own saved chart"
+        );
+    }
+
+    /// A default Structure view writes no section, so every project that uses
+    /// it inherited the last one's options - and wrote them into its own file
+    /// on the next Save - plus its open nodes (indices into ANOTHER graph),
+    /// its search, zoom and pan.
+    #[test]
+    fn opening_a_project_forgets_the_last_ones_structure_view() {
+        let mut app = app();
+        app.structure_view.show_calls = false;
+        app.structure_view.call_depth = Some(3);
+        app.structure_view.show_externals = true;
+        app.structure_view.expanded.insert(0);
+        app.structure_view.search = "uart".to_owned();
+        app.structure_view.zoom = 2.0;
+        let b = project(default_view(), FlowPersist::default());
+        app.restore_view_state(b.path());
+        let v = &app.structure_view;
+        let (calls, depth, _, externals) = default_view();
+        assert_eq!(
+            (v.show_calls, v.call_depth, v.show_externals),
+            (calls, depth, externals)
+        );
+        assert!(v.expanded.is_empty(), "{:?}", v.expanded);
+        assert!(v.search.is_empty(), "{:?}", v.search);
+        assert_eq!(v.zoom, 1.0);
+    }
+
+    /// What a project DOES save still wins over the defaults.
+    #[test]
+    fn a_saved_view_is_restored() {
+        let mut app = app();
+        let b = project(
+            (false, Some(2), 0, true),
+            FlowPersist {
+                selected: ("src/main.rs".to_owned(), "blink".to_owned()),
+                mode: 1,
+            },
+        );
+        app.restore_view_state(b.path());
+        let v = &app.structure_view;
+        assert_eq!(
+            (v.show_calls, v.call_depth, v.show_externals),
+            (false, Some(2), true)
+        );
+        assert_eq!(app.flow_selected.1, "blink");
+        assert!(app.flow_view.all);
     }
 }

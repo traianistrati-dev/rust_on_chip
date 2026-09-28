@@ -60,8 +60,7 @@ impl AppIde {
             }
             // The LIBRARIES panel's own predicate, so the amber means the same
             // thing in both places.
-            let members =
-                crate::panels::mcu_module::project_gen::workspace_members(&self.cargo_toml);
+            let members = crate::project_tree::extract_crate::built_lib_dirs(&self.cargo_toml);
             let ra_linked = self.lsp_state.lock().unwrap().linked_projects.clone();
             let detached: Vec<parse::DetachedLib> =
                 crate::project_tree::extract_crate::detached_libs(files, &members)

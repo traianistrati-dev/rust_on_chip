@@ -344,6 +344,18 @@ pub fn detached_libs(user_files: &[(String, String)], members: &[String]) -> Vec
     dirs
 }
 
+/// The library folders cargo loads together with the firmware, for everything
+/// that tells the user whether a library is part of it: the Structure tab's
+/// detached verdict, the LIBRARIES panel and rust-analyzer's `linkedProjects`.
+/// Pass it to [`detached_libs`] as `members`.
+///
+/// Still the explicit `[workspace] members` only, so a library the root
+/// reaches through a `path` dependency is called detached although cargo
+/// builds it (`a_path_dependency_is_never_detached`).
+pub fn built_lib_dirs(root_manifest: &str) -> Vec<String> {
+    crate::panels::mcu_module::project_gen::workspace_members(root_manifest)
+}
+
 /// Build the plan for extracting `folder` (a path relative to the PROJECT
 /// ROOT, e.g. `src/mw_radar`, no trailing slash) into a crate from `meta`.
 ///
@@ -889,6 +901,63 @@ mod tests {
         assert_eq!(detached_libs(&files, &members), vec!["mmwave".to_owned()]);
         // Once promoted, it stops being detached.
         assert!(detached_libs(&files, &["mw_radar".to_owned(), "mmwave".to_owned()]).is_empty());
+    }
+
+    /// Found by review: cargo builds a library the root reaches through a
+    /// `path` dependency - as an implicit member when the root has a
+    /// `[workspace]` table, as a plain dependency when it has none - yet the
+    /// Structure tab called it detached, said the firmware does not build it
+    /// and advised `exclude`. Measured with cargo 1.98.
+    #[test]
+    fn a_path_dependency_is_never_detached() {
+        let lib = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n");
+        let files = vec![
+            ("mylib/Cargo.toml".to_owned(), lib("mylib")),
+            ("mylib/src/lib.rs".to_owned(), String::new()),
+            ("other/Cargo.toml".to_owned(), lib("other")),
+            ("src/main.rs".to_owned(), String::new()),
+        ];
+        let fw = "[package]\nname = \"fw\"\nversion = \"0.1.0\"\n";
+        let mut roots = vec![
+            // What Extract + Detach leave, with the dependency written inline.
+            format!(
+                "{fw}\n[workspace]\nmembers = []\n\n[dependencies]\nmylib = {{ path = \"mylib\" }}\n"
+            ),
+            // The IDE's own templates: no `[workspace]` at all.
+            format!("{fw}\n[dependencies]\nmylib = {{ path = \"./mylib/\" }}\n"),
+            format!("{fw}\n[workspace]\nmembers = []\n\n[dependencies.mylib]\npath = \"mylib\"\n"),
+            format!(
+                "{fw}\n[target.'cfg(target_os = \"none\")'.dependencies]\nmylib = {{ path = \"mylib\" }}\n"
+            ),
+            format!("{fw}\n[dev-dependencies]\nmylib = {{ path = \"mylib\" }}\n"),
+            format!(
+                "{fw}\n[workspace]\nmembers = []\n\n[workspace.dependencies]\nmylib = {{ path = \"mylib\" }}\n\n[dependencies]\nmylib = {{ workspace = true }}\n"
+            ),
+        ];
+        if cfg!(windows) {
+            roots.push(format!(
+                "{fw}\n[dependencies]\nmylib = {{ path = 'mylib\\' }}\n"
+            ));
+        }
+        for root in &roots {
+            assert_eq!(
+                detached_libs(&files, &built_lib_dirs(root)),
+                vec!["other".to_owned()],
+                "{root}"
+            );
+        }
+        // Controls: no dependency, or one that leaves the project - both
+        // folders stay detached.
+        for root in [
+            format!("{fw}\n[workspace]\nmembers = []\n"),
+            format!("{fw}\n[dependencies]\nmylib = {{ path = \"../elsewhere/mylib\" }}\n"),
+        ] {
+            assert_eq!(
+                detached_libs(&files, &built_lib_dirs(&root)),
+                vec!["mylib".to_owned(), "other".to_owned()],
+                "{root}"
+            );
+        }
     }
 
     #[test]

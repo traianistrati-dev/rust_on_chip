@@ -11,7 +11,8 @@
 #![windows_subsystem = "windows"]
 
 use eframe::egui;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 pub mod activity;
 pub mod app;
 use app::AppIde;
@@ -20,13 +21,13 @@ pub mod build;
 pub mod debugger;
 pub mod dfu;
 pub mod editor;
+pub mod egui_memory_prune;
 pub mod esp_monitor;
 pub mod espflash;
 pub mod failure_hint;
 pub mod flamegraph;
 pub mod flash_stop;
 pub mod git;
-#[cfg(test)]
 pub mod headless;
 pub mod lsp;
 pub mod msvc;
@@ -248,34 +249,60 @@ mod glyph_guard {
     }
 }
 
-/// Strip eframe's saved window geometry out of a storage file's RON text.
+/// A storage file's new text, from [`tidied_storage`].
+struct TidiedStorage {
+    text: String,
+    /// Widget-state records dropped from the `"egui"` entry; 0 when only the
+    /// window geometry went.
+    pruned: usize,
+}
+
+/// Tidy a storage file's RON text: strip eframe's saved window geometry, and
+/// drop the widget-state records no build will read again
+/// (`egui_memory_prune`).
 ///
-/// `None` means "leave the file alone": nothing stored, or the text did not
+/// `None` means "leave the file alone": nothing to change, or the text did not
 /// survive a parse → serialize → parse round-trip. That check is the point — the
 /// file holds the ENTIRE persisted state (over a megabyte here), and a
 /// replacement eframe could not read would lose all of it, so the only
 /// acceptable way to touch it is to prove the replacement first. (Our `ron` and
 /// eframe's are the same major since 2026-09; the check does not rely on it.)
-fn without_window_key(text: &str) -> Option<String> {
+/// Every other entry comes back as the same string, byte for byte.
+fn tidied_storage(
+    text: &str,
+    live_types: impl FnOnce() -> Option<HashSet<u64>>,
+) -> Option<TidiedStorage> {
     use std::collections::HashMap;
-    // eframe's `STORAGE_WINDOW_KEY`, private to it — hence the literal.
+    // eframe's `STORAGE_WINDOW_KEY` and `STORAGE_EGUI_MEMORY_KEY`, private to
+    // it — hence the literals.
     const WINDOW_KEY: &str = "window";
+    const EGUI_KEY: &str = "egui";
 
-    // Cheap gate first: after one cleanup the key never comes back (nothing
-    // writes it any more), and parsing a megabyte on every launch to learn
-    // there is nothing to do is a poor trade.
-    if !text.contains("\"window\":") {
+    // No cheap gate any more: whether a record is dead is only known by
+    // reading them all. Measured in the dev profile on the real slot-1 file:
+    // ~17 ms to parse and scan the 1.5 MB it held, ~100 ms for the one launch
+    // that pruned it (probe, copy and write included), 4-5 ms a launch for
+    // the 397 KB left.
+    let mut kv: HashMap<String, String> = ron::from_str(text).ok()?;
+    let window = kv.remove(WINDOW_KEY).is_some();
+    let pruned = kv
+        .get(EGUI_KEY)
+        .and_then(|memory| egui_memory_prune::prune(memory, live_types));
+    if !window && pruned.is_none() {
         return None;
     }
-    let mut kv: HashMap<String, String> = ron::from_str(text).ok()?;
-    kv.remove(WINDOW_KEY)?;
+    let pruned = pruned.map_or(0, |p| {
+        kv.insert(EGUI_KEY.to_owned(), p.memory);
+        p.removed
+    });
     let out = ron::ser::to_string_pretty(&kv, ron::ser::PrettyConfig::default()).ok()?;
-    (ron::from_str::<HashMap<String, String>>(&out).ok()? == kv).then_some(out)
+    (ron::from_str::<HashMap<String, String>>(&out).ok()? == kv)
+        .then_some(TidiedStorage { text: out, pruned })
 }
 
-/// Forget the window geometry a previous run saved, so this one can open
-/// maximized like it asks to.
+/// Tidy eframe's storage file before eframe reads it — see [`tidied_storage`].
 ///
+/// The window geometry goes so this run can open maximized like it asks to.
 /// `with_maximized(true)` on the viewport does NOT win on its own: a restored
 /// geometry is applied after it (`WindowSettings::initialize_viewport_builder`
 /// ends with `.with_maximized(self.maximized)`), so one session left small
@@ -283,30 +310,77 @@ fn without_window_key(text: &str) -> Option<String> {
 /// eframe LOADS that entry regardless of the flag — an entry already on disk
 /// would keep winning. This removes it, once.
 ///
+/// The dead widget state goes because eframe never drops it and rewrites all
+/// of it on every autosave: see `egui_memory_prune`.
+///
 /// Best-effort from end to end: a storage file we cannot read, parse or replace
 /// is not worth failing a launch over, and the worst case is the old behaviour
 /// (which the viewport command in `AppIde::new` then corrects a frame later).
 /// The replace goes through a temp file and a rename so a crash mid-write
 /// cannot truncate the user's state.
-fn forget_window_geometry(app_name: &str) {
-    let Some(path) = eframe::storage_dir(app_name).map(|d| d.join("app.ron")) else {
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Some(out) = without_window_key(&text) else {
-        return;
-    };
-    let tmp = path.with_extension("ron.tmp");
-    if std::fs::write(&tmp, out).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+fn tidy_storage_file(app_name: &str) {
+    if let Some(path) = eframe::storage_dir(app_name).map(|d| d.join("app.ron")) {
+        tidy_storage_file_at(&path, egui_memory_prune::live_type_ids);
     }
+}
+
+/// [`tidy_storage_file`] on a path; `true` when the file was replaced.
+///
+/// The first rewrite that drops any records keeps the file it started from as
+/// `app.ron.pre-prune` (see [`keep_pre_prune_copy`]), and when that copy cannot
+/// be written nothing is.
+fn tidy_storage_file_at(path: &Path, live_types: impl FnOnce() -> Option<HashSet<u64>>) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(tidied) = tidied_storage(&text, live_types) else {
+        return false;
+    };
+    if tidied.pruned > 0 && !keep_pre_prune_copy(path, &text) {
+        return false;
+    }
+    replace_through(&path.with_extension("ron.tmp"), &tidied.text, path)
+}
+
+/// Write `text` to `tmp`, then rename it over `dest`. A failed write or rename
+/// takes its temp file with it, so no half-written copy lingers beside the
+/// user's state until the next launch.
+fn replace_through(tmp: &Path, text: &str, dest: &Path) -> bool {
+    let done = std::fs::write(tmp, text).is_ok() && std::fs::rename(tmp, dest).is_ok();
+    if !done {
+        let _ = std::fs::remove_file(tmp);
+    }
+    done
+}
+
+/// Keep `app.ron.pre-prune`: the storage file exactly as it was before the
+/// FIRST prune that removed anything. `false` only when it is missing and
+/// cannot be written.
+///
+/// The prune removes most of a megabyte on its first run, from a file that
+/// also holds the project pointer, and it goes by a rule; if the rule ever
+/// takes a record a build still wanted, this is the way back (close the IDE,
+/// copy it over `app.ron`). One copy, never refreshed: later prunes each drop
+/// a little, and a rolling backup would only ever hold yesterday's layout. It
+/// goes through a temp file, so a half-written copy never counts as the backup.
+fn keep_pre_prune_copy(path: &Path, text: &str) -> bool {
+    let backup = path.with_extension("ron.pre-prune");
+    if backup.exists() {
+        return true;
+    }
+    replace_through(&path.with_extension("ron.pre-prune.tmp"), text, &backup)
 }
 
 #[cfg(test)]
 mod window_geometry_tests {
-    use super::without_window_key;
+    use super::tidied_storage;
+
+    /// The window-only cases: no record list in these values, so the prune
+    /// never gets as far as asking for the live types.
+    fn without_window_key(text: &str) -> Option<String> {
+        let probe = || panic!("nothing here to prune");
+        tidied_storage(text, probe).map(|t| t.text)
+    }
 
     /// Shaped like eframe's real file: a map of strings whose VALUES are
     /// themselves RON, quotes and all — the part a naive text edit would break.
@@ -346,6 +420,177 @@ mod window_geometry_tests {
         // Refusing to touch it is the whole safety story: the alternative is
         // truncating the user's state over a cosmetic startup detail.
         assert_eq!(without_window_key(r#"{"window": "(maxim"#), None);
+    }
+}
+
+#[cfg(test)]
+mod storage_tidy_tests {
+    use super::{tidied_storage, tidy_storage_file_at};
+    use crate::egui_memory_prune::live_type_ids;
+    use eframe::egui;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    const PROJECT_V1: &str = r#"(user_src_files:[("src/app.rs","fn main() {}")])"#;
+    const PROJECT_V2: &str = r#"(root:Some("F:\\work\\blinky"))"#;
+
+    /// The `"egui"` value of a session that showed a resizable panel and a
+    /// collapsing header, as eframe saves it.
+    fn live_memory() -> String {
+        let ctx = egui::Context::default();
+        crate::headless::run_ui(&ctx, egui::RawInput::default(), |ui| {
+            egui::Panel::left("code_editor")
+                .resizable(true)
+                .show(ui, |_| {});
+            egui::CollapsingHeader::new("src").show(ui, |_| {});
+        });
+        ctx.memory(ron::ser::to_string).unwrap()
+    }
+
+    /// `memory` with three records of a build that last ran `age` launches
+    /// ago spliced in front.
+    fn with_dead(memory: &str, type_id: u64, age: usize) -> String {
+        let dead: Vec<String> = (0..3)
+            .map(|k| {
+                let generation = age + 1 + k;
+                format!("({k},(type_id:({type_id}),ron:\"(open:true)\",generation:{generation}))")
+            })
+            .collect();
+        memory.replacen("data:([", &format!("data:([{},", dead.join(",")), 1)
+    }
+
+    /// A storage file in eframe's shape: `save_to_disk` writes the map with
+    /// `to_io_writer_pretty` and the default config.
+    fn storage(egui: &str) -> String {
+        let kv = HashMap::from([
+            ("egui".to_owned(), egui.to_owned()),
+            ("embedded_ide_project_v1".to_owned(), PROJECT_V1.to_owned()),
+            ("embedded_ide_project_v2".to_owned(), PROJECT_V2.to_owned()),
+        ]);
+        ron::Options::default()
+            .to_string_pretty(&kv, ron::ser::PrettyConfig::default())
+            .unwrap()
+    }
+
+    fn entries(text: &str) -> HashMap<String, String> {
+        ron::from_str(text).unwrap()
+    }
+
+    /// A fresh scratch folder holding only an `app.ron`.
+    fn scratch(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("eide_tidy_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.ron");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn files_beside(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn dead_records_go_and_every_other_entry_is_the_same_string() {
+        let live = live_memory();
+        let before = storage(&with_dead(&live, 0xDEAD_0001, 57));
+        let tidied = tidied_storage(&before, live_type_ids).expect("a dead build to drop");
+        assert_eq!(tidied.pruned, 3);
+        let kv = entries(&tidied.text);
+        assert_eq!(kv.len(), 3);
+        assert_eq!(kv["egui"], live, "the live Memory, byte for byte");
+        assert_eq!(kv["embedded_ide_project_v1"], PROJECT_V1);
+        assert_eq!(kv["embedded_ide_project_v2"], PROJECT_V2);
+    }
+
+    #[test]
+    fn the_first_prune_keeps_the_file_it_started_from_and_only_that() {
+        let live = live_memory();
+        let first = storage(&with_dead(&live, 0xDEAD_0001, 57));
+        let path = scratch("backup", first.as_bytes());
+        assert!(tidy_storage_file_at(&path, live_type_ids));
+        let backup = path.with_extension("ron.pre-prune");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), first);
+        assert_eq!(
+            entries(&std::fs::read_to_string(&path).unwrap())["egui"],
+            live
+        );
+
+        // A later prune leaves that copy as it was.
+        std::fs::write(&path, storage(&with_dead(&live, 0xDEAD_0002, 300))).unwrap();
+        assert!(tidy_storage_file_at(&path, live_type_ids));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), first);
+        assert_eq!(
+            files_beside(&path),
+            ["app.ron", "app.ron.pre-prune"],
+            "no temp file left"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_second_run_changes_nothing() {
+        let live = live_memory();
+        let path = scratch(
+            "twice",
+            storage(&with_dead(&live, 0xDEAD_0001, 57)).as_bytes(),
+        );
+        assert!(tidy_storage_file_at(&path, live_type_ids));
+        let once = std::fs::read(&path).unwrap();
+        assert!(!tidy_storage_file_at(&path, live_type_ids));
+        assert_eq!(std::fs::read(&path).unwrap(), once);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_it_cannot_read_is_left_untouched() {
+        let live = live_memory();
+        let whole = storage(&with_dead(&live, 0xDEAD_0001, 57));
+        // A valid storage map whose Memory lost one closing parenthesis.
+        let bad_memory = whole.replacen(",generation:58))", ",generation:58)", 1);
+        assert_ne!(bad_memory, whole);
+        for (name, bytes) in [
+            ("garbage", b"garbage \xff\xfe not ron".to_vec()),
+            ("truncated", whole.as_bytes()[..whole.len() / 2].to_vec()),
+            ("bad_memory", bad_memory.into_bytes()),
+        ] {
+            let path = scratch(name, &bytes);
+            assert!(!tidy_storage_file_at(&path, live_type_ids), "{name}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+            assert_eq!(
+                files_beside(&path),
+                ["app.ron"],
+                "{name}: no copy, no temp file"
+            );
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn without_its_copy_the_prune_does_not_happen() {
+        let live = live_memory();
+        let before = storage(&with_dead(&live, 0xDEAD_0001, 57));
+        let path = scratch("nocopy", before.as_bytes());
+        // A folder where the copy's temp file goes: the copy cannot be written.
+        let blocker = path.with_extension("ron.pre-prune.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(!tidy_storage_file_at(&path, live_type_ids));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // The control: the same file, once the copy can be written, is pruned
+        // - and the copy is the file as it was.
+        std::fs::remove_dir(&blocker).unwrap();
+        assert!(tidy_storage_file_at(&path, live_type_ids));
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("ron.pre-prune")).unwrap(),
+            before
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
 
@@ -489,8 +734,10 @@ fn main() -> eframe::Result<()> {
     };
 
     // Drop any geometry an earlier session stored, or it would override the
-    // `with_maximized(true)` below — see `forget_window_geometry`.
-    forget_window_geometry(&app_name);
+    // `with_maximized(true)` below, and the widget state no build will read
+    // again — see `tidy_storage_file`. After `workspace::init`: this slot's
+    // file is ours alone from here on.
+    tidy_storage_file(&app_name);
 
     let options = eframe::NativeOptions {
         // The window opens maximized every time, so there is nothing worth

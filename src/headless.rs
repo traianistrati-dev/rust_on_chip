@@ -1,4 +1,5 @@
-//! Headless egui frames for unit tests.
+//! Headless egui frames for unit tests — and for the one frame the app lays
+//! out itself, before eframe starts (`egui_memory_prune::live_type_ids`).
 //!
 //! Every test that lays real widgets out runs its frames through [`run_ui`]
 //! instead of calling `Context::run_ui` itself.
@@ -12,7 +13,8 @@ use eframe::egui;
 /// upload them. The first frame of every `Context` carries the whole font
 /// atlas, so a test that dropped its `FullOutput` (`let _ = ctx.run_ui(..)`,
 /// or `.shapes` taken off the temporary) panics before it asserts anything.
-/// A test has no GPU to upload to, so this is the one place that says so.
+/// A test (or the prune's probe) has no GPU to upload to, so this is the one
+/// place that says so.
 ///
 /// Everything a test reads is returned untouched: `shapes`,
 /// `platform_output`, `viewport_output`, `pixels_per_point`.
@@ -45,8 +47,9 @@ mod tests {
     /// The guard that keeps it the ONE place: a test calling
     /// `Context::run_ui` (or `end_pass`, which also hands back a `FullOutput`)
     /// directly compiles, passes on egui 0.34, and panics on 0.36 as soon as
-    /// it drops the output. The app itself never calls either - eframe does -
-    /// so any hit is a test that bypassed the helper.
+    /// it drops the output. The app itself never calls either - eframe does,
+    /// and the prune's probe goes through the helper - so any hit is a test
+    /// that bypassed it.
     #[test]
     fn no_test_calls_context_run_ui_directly() {
         fn scan(dir: &std::path::Path, out: &mut Vec<String>) {

@@ -392,7 +392,7 @@ impl AppIde {
                     // action (guarded by a cargo-metadata pre-check).
                     let detached = crate::project_tree::extract_crate::detached_libs(
                         &self.project_tree.user_src_files,
-                        &lib_crates,
+                        &crate::project_tree::extract_crate::built_lib_dirs(&self.cargo_toml),
                     );
                     // Which detached lib has a pre-check running (spinner in the row).
                     let ws_add_pending = self.workspace_add.as_ref().map(|w| w.dir.clone());

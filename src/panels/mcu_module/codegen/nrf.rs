@@ -1024,7 +1024,7 @@ impl FamilyBackend for NrfBackend {
                     let frame = (kind == "uarte").then(|| ucfgs.get(&i)).flatten();
                     let spi_mode = scfgs.get(&i).map_or(0, |c| c.mode);
                     let addr = if kind == "twim" {
-                        icfgs.get(&i).map_or(0, |c| c.address)
+                        icfgs.get(&i).map_or(0, |c| c.primary_address())
                     } else {
                         0
                     };
@@ -1040,6 +1040,12 @@ impl FamilyBackend for NrfBackend {
                             addr,
                         ),
                     ));
+                    if kind == "twim" {
+                        out.extend(super::common::i2c_device_config_files(
+                            &format!("twim{i}"),
+                            icfgs.get(&i),
+                        ));
+                    }
                 }
             }
         }
@@ -1470,10 +1476,23 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         let var = format!("twim{i}");
         // Past every gate above, so this bus really is built: the const and the
         // driver appear together or not at all.
-        items.push_str(&super::common::device_address_const(
-            Some(&format!("TWIM{i}")),
-            icfgs.get(&i).map_or(0, |c| c.address),
-        ));
+        let icfg = icfgs.get(&i);
+        let stems = icfg.map_or_else(Vec::new, |c| {
+            super::common::i2c_device_stems(&format!("twim{i}"), c)
+        });
+        if stems.is_empty() {
+            items.push_str(&super::common::device_address_const(
+                Some(&format!("TWIM{i}")),
+                icfg.map_or(0, |c| c.primary_address()),
+            ));
+        } else {
+            for (stem, addr, _) in stems {
+                items.push_str(&super::common::device_address_const(
+                    Some(&stem.to_ascii_uppercase()),
+                    addr,
+                ));
+            }
+        }
         let hz = bus_speed(mcu, "twim", i);
         let (got, variant) = twim_frequency(hz);
         if got != hz {

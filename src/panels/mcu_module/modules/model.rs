@@ -2493,14 +2493,56 @@ impl SpiModuleConfig {
     }
 }
 
+/// One device on an I2C bus: what it is called, and the 7-bit address it
+/// answers on.
+///
+/// A bus is shared BY DESIGN - a display, a sensor and an EEPROM on the same two
+/// pads - and the address is the only thing that tells them apart. That is why a
+/// device is this small. Everything else about the bus (its clock, its timeout,
+/// its DMA channels, which API it is built through) belongs to the ONE driver
+/// the peripheral can produce, and a copy of those per device would be fields
+/// the UI then had to keep equal to each other.
+///
+/// No notes field, deliberately. `module.config` is hashed to decide whether the
+/// project is modified, while `Mcu::module_notes` is left out of that hash on
+/// purpose - so a datasheet link typed in here would mark the project dirty on
+/// every keystroke. Notes stay on the bus module.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct I2cDevice {
+    /// What the user calls it. It becomes the suffix of this device's config
+    /// file name, so every path and identifier built from it is sanitised
+    /// first - the name itself stays exactly as typed.
+    pub name: String,
+    /// 7-bit address.
+    pub address: u8,
+}
+
 /// I2C device settings + data model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct I2cModuleConfig {
     pub instance: u8,
     /// Bus clock in Hz (100 kHz standard / 400 kHz fast).
     pub clock_hz: u32,
-    /// 7-bit device address.
+    /// 7-bit device address — the LEGACY single-device field.
+    ///
+    /// Read by one thing now: the migration in [`Self::migrate_devices`], which
+    /// folds it into [`Self::devices`]. Everything else asks
+    /// [`Self::primary_address`], so the bus file and the per-device files
+    /// cannot end up naming different devices as "the" one.
+    ///
+    /// Still serialised, and refreshed from the device list on load, so a
+    /// project saved here and reopened in a build without `devices` shows a
+    /// sensible address rather than a stale one. It is as of the last LOAD, not
+    /// the last edit — the honest cost of not having two writers for one value.
     pub address: u8,
+    /// Every device on this bus.
+    ///
+    /// Empty is the normal case and means "just `address`": every project
+    /// written before this field existed, and every bus with a single device on
+    /// it. Their generated output does not move at all, which is the point of
+    /// `serde(default)` plus `skip_serializing_if`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<I2cDevice>,
     pub rx_model: String,
     pub tx_model: String,
     /// User label appended to the generated `_i2cN` handle (e.g. `_i2c1_imu`).
@@ -2549,6 +2591,7 @@ impl I2cModuleConfig {
             instance,
             clock_hz: 100_000,
             address: 0x00,
+            devices: Vec::new(),
             rx_model: String::new(),
             tx_model: String::new(),
             custom_label: String::new(),
@@ -2558,6 +2601,34 @@ impl I2cModuleConfig {
             dma_tx: String::new(),
             dma_rx: String::new(),
         }
+    }
+
+    /// The address the BUS file's own `DEVICE_ADDRESS` carries: the first
+    /// device's, or the legacy scalar when there is no device list.
+    ///
+    /// ONE reader for every emitter. The bus file names a device and so does
+    /// each per-device file; deciding "which is the first one" in two places is
+    /// how they come to disagree.
+    pub fn primary_address(&self) -> u8 {
+        self.devices.first().map_or(self.address, |d| d.address)
+    }
+
+    /// Bring the legacy `address` back into line with the device list.
+    ///
+    /// It does NOT invent a device out of a legacy address, and that is the
+    /// whole design. A project written before `devices` existed has its address
+    /// in the scalar and an empty list, which [`Self::primary_address`] already
+    /// answers correctly — so codegen is right and the panel looks exactly as it
+    /// did. Creating a one-entry list for it would move every existing project
+    /// into the multi-device view to say what the single Address row already
+    /// said, and would rewrite output that should not move.
+    ///
+    /// A list only ever appears because the user asked for a second device, and
+    /// from then on it is the truth. All this does is keep the scalar equal to
+    /// the first entry, so a file written here still reads sensibly in a build
+    /// that has never heard of `devices`. Idempotent.
+    pub fn sync_legacy_address(&mut self) {
+        self.address = self.primary_address();
     }
 }
 
@@ -5861,5 +5932,76 @@ mod blocking_dma_compat_tests {
             let back: UsartModuleConfig = ron::from_str(&text).expect("parses back");
             assert_eq!(back.blocking_dma, d, "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod i2c_device_tests {
+    use super::{I2cDevice, I2cModuleConfig};
+
+    /// A project written before `devices` existed is LEFT ALONE.
+    ///
+    /// Its address is in the legacy scalar, `primary_address` already answers
+    /// with it, and the panel shows the single Address row it always showed.
+    /// Turning it into a one-entry device list would move every such project
+    /// into the multi-device view for no reason the user asked for, and rewrite
+    /// generated output that should not move.
+    #[test]
+    fn a_legacy_project_keeps_its_single_address_and_gains_no_list() {
+        let mut c = I2cModuleConfig {
+            address: 0x3C,
+            ..I2cModuleConfig::new(1)
+        };
+        c.sync_legacy_address();
+        assert!(c.devices.is_empty(), "no list invented: {:?}", c.devices);
+        assert_eq!(c.primary_address(), 0x3C);
+    }
+
+    /// Idempotent, because the normalizer runs on EVERY load — including the
+    /// ones that follow a save by this version.
+    #[test]
+    fn syncing_twice_changes_nothing() {
+        let mut c = I2cModuleConfig {
+            address: 0x68,
+            ..I2cModuleConfig::new(1)
+        };
+        c.sync_legacy_address();
+        let once = c.clone();
+        c.sync_legacy_address();
+        assert_eq!(c, once);
+    }
+
+    /// An untouched module holds 0x00, the general-call address, and stays that
+    /// way.
+    #[test]
+    fn an_untouched_module_gets_no_phantom_device() {
+        let mut c = I2cModuleConfig::new(1);
+        c.sync_legacy_address();
+        assert!(c.devices.is_empty(), "{:?}", c.devices);
+        assert_eq!(c.primary_address(), 0);
+    }
+
+    /// A real list wins over the legacy field, and the legacy field is brought
+    /// back into line with it so anything still reading it agrees.
+    #[test]
+    fn the_list_outranks_the_legacy_scalar() {
+        let mut c = I2cModuleConfig {
+            address: 0x3C,
+            devices: vec![
+                I2cDevice {
+                    name: "display".into(),
+                    address: 0x78,
+                },
+                I2cDevice {
+                    name: "imu".into(),
+                    address: 0x68,
+                },
+            ],
+            ..I2cModuleConfig::new(1)
+        };
+        c.sync_legacy_address();
+        assert_eq!(c.devices.len(), 2, "the list is untouched");
+        assert_eq!(c.primary_address(), 0x78);
+        assert_eq!(c.address, 0x78, "the legacy field follows the list");
     }
 }

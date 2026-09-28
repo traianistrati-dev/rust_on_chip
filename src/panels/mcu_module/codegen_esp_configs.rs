@@ -2861,7 +2861,7 @@ fn i2c_file(n: u8, sigs: &[&str], cfg: Option<&I2cModuleConfig>, rt: EspRuntime)
     let consts = format!(
         "pub const FREQUENCY_HZ: u32 = {};\n{}",
         cfg.map_or(100_000, |c| c.clock_hz),
-        super::codegen::common::device_address_const(None, cfg.map_or(0, |c| c.address)),
+        super::codegen::common::device_address_const(None, cfg.map_or(0, |c| c.primary_address())),
     );
     let bound = "impl PeripheralInput<'d> + PeripheralOutput<'d>";
     let params = format!(
@@ -3382,6 +3382,10 @@ pub fn config_files(
     }
     for (n, sigs) in i2c {
         out.push((format!("i2c{n}.rs"), i2c_file(*n, sigs, i2c_cfg.get(n), rt)));
+        out.extend(super::codegen::common::i2c_device_config_files(
+            &format!("i2c{n}"),
+            i2c_cfg.get(n),
+        ));
     }
     for (n, sigs) in i2s {
         out.push((

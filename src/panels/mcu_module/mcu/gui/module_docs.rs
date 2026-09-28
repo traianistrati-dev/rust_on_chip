@@ -187,6 +187,7 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("SPI_TRANSFERS_SLAVE", SPI_TRANSFERS_SLAVE),
     ("I2C_ADDRESS", I2C_ADDRESS),
     ("I2C_CLOCK", I2C_CLOCK),
+    ("I2C_DEVICES", I2C_DEVICES),
     ("I2C_TIMEOUT", I2C_TIMEOUT),
     ("I2S_SAMPLE_RATE", I2S_SAMPLE_RATE),
     ("I2S_DIRECTION", I2S_DIRECTION),
@@ -447,6 +448,7 @@ pub const ROSTER: &[KindRoster] = &[
             ("Address (7-bit)", Some(I2C_ADDRESS)),
             ("Async init", Some(ASYNC_INIT)),
             ("Clock", Some(I2C_CLOCK)),
+            ("Devices", Some(I2C_DEVICES)),
             ("Init API", None),
             ("Timeout", Some(I2C_TIMEOUT)),
         ],
@@ -715,6 +717,13 @@ pub const I2C_ADDRESS: &str = "The 7-bit address of the device this bus talks to
                                read/write bit - a datasheet's 0xD0 is 0x68 here. A master sends \
                                it at the start of every transaction rather than once at setup, \
                                so it is kept for your code to use; wrong, and nothing answers.";
+
+pub const I2C_DEVICES: &str = "Every device sharing these two pads. An I2C bus is meant to be \
+                                shared, and the address is the ONLY thing that tells its devices \
+                                apart - the bus driver itself is built once, whatever is on it. \
+                                Each device here gets its own file under `pins/configs/`, carrying \
+                                its address for your code to use. Drop back to one device and the \
+                                list collapses to the single Address row again.";
 
 pub const I2C_CLOCK: &str = "How fast SCL is driven. 100 kHz is what every I2C device supports; \
                              400 kHz needs the whole bus to agree - every device on it, and \

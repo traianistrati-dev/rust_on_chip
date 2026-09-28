@@ -819,9 +819,13 @@ pub fn serialize(
 /// section yields an empty module list / `None` clock. (Runtime is read
 /// separately via [`parse_runtime`].)
 pub fn parse(text: &str) -> (Vec<VirtualModule>, Option<Stm32f1Clock>) {
-    let modules = section_body(text, MODULES_HEADER)
+    // Through `normalize`, not straight out of RON: this is the door every
+    // project the IDE saves comes back through, and the field migrations used to
+    // run only on the legacy `main.rs` marker path.
+    let mut modules = section_body(text, MODULES_HEADER)
         .and_then(|body| ron::from_str::<Vec<VirtualModule>>(body.trim()).ok())
         .unwrap_or_default();
+    super::modules::persist::normalize(&mut modules);
     let clock = section_body(text, CLOCK_HEADER).map(|b| clock_persist::from_config_block(&b));
     (modules, clock)
 }
@@ -1002,6 +1006,53 @@ mod tests {
         let (m2, c2) = parse(&text);
         assert_eq!(m2, modules, "modules round-trip");
         assert_eq!(c2, Some(clock), "clock round-trip");
+    }
+
+    /// The live door runs the field migrations.
+    ///
+    /// `mcu.config` is what every project the IDE saves comes back through, and
+    /// its module section was a bare `ron::from_str` with no migration hook at
+    /// all. The hook lived on the legacy `// @modules` marker path in `main.rs`,
+    /// which only a project WITHOUT an `mcu.config` ever takes — so a field shape
+    /// brought forward there was brought forward for nobody, and had not run for
+    /// a real project in a long time. `dedupe_ids` was in the same position.
+    ///
+    /// Tested through the PWM duty migration because that one has a visible
+    /// consequence: a pre-hundredths project's duty is in `duty`, and a reader of
+    /// `duty_x100` sees 0 % until something folds it forward. `duty` is
+    /// `skip_serializing_if`, so writing a config with only the legacy map
+    /// produces a file shaped exactly like the old ones.
+    #[test]
+    fn the_live_door_runs_the_field_migrations() {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind, TimerModuleConfig};
+
+        let mut legacy_cfg = TimerModuleConfig::new(1);
+        legacy_cfg.duty_x100.clear();
+        legacy_cfg.duty.insert(1, 42);
+        let legacy = VirtualModule {
+            id: "timer_1".into(),
+            kind: ModuleKind::GenericInterfaceTimer,
+            name: "TIM1".into(),
+            pos: (0.0, 0.0),
+            config: ModuleConfig::Timer(legacy_cfg),
+            connections: Vec::new(),
+        };
+
+        let text = serialize(&[legacy], None, Runtime::Blocking, ApiStyle::Portable);
+        assert!(
+            text.contains("duty:"),
+            "the legacy map must reach the file, or this proves nothing:\n{text}"
+        );
+
+        let (back, _) = parse(&text);
+        let ModuleConfig::Timer(c) = &back[0].config else {
+            panic!("a Timer module came back as something else");
+        };
+        assert_eq!(
+            c.duty_x100.get(&1),
+            Some(&4200),
+            "the legacy whole-percent duty was never folded forward"
+        );
     }
 
     #[test]

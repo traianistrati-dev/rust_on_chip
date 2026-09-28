@@ -376,7 +376,7 @@ pub fn strict_config_exemption(body: String, strict: bool) -> String {
 
 // ── Virtual-module data models ────────────────────────────────────────────────
 
-use super::super::modules::VirtualModule;
+use super::super::modules::{I2cModuleConfig, VirtualModule};
 
 fn indent_block(s: &str) -> String {
     s.lines()
@@ -484,6 +484,7 @@ pub fn device_address_const(peri: Option<&str>, address: u8) -> String {
 
 #[cfg(test)]
 mod device_address_tests {
+    use super::super::super::modules::{I2cDevice, I2cModuleConfig};
     use super::device_address_const;
 
     /// Inside a config file the module path already names the bus, so the const
@@ -520,6 +521,115 @@ mod device_address_tests {
         assert!(!set.contains("Not set in the IDE yet"), "{set}");
     }
 
+    /// A bus with ONE device emits no device file at all.
+    ///
+    /// This is the case every existing project is in - the migration folds the
+    /// legacy `address` into a single device - so anything emitted here would
+    /// rewrite the output of every project that ever configured an I2C address,
+    /// to say a second time what the bus file already says.
+    #[test]
+    fn one_device_adds_no_file() {
+        let mut c = I2cModuleConfig::new(1);
+        c.devices = vec![I2cDevice {
+            name: "imu".into(),
+            address: 0x68,
+        }];
+        assert!(super::i2c_device_stems("i2c1", &c).is_empty());
+        assert!(super::i2c_device_config_files("i2c1", Some(&c)).is_empty());
+        // And no config at all behaves the same, so a backend never has to ask.
+        assert!(super::i2c_device_config_files("i2c1", None).is_empty());
+    }
+
+    /// Two devices: a file each, named after the bus and the device, carrying
+    /// that device's address and no other.
+    #[test]
+    fn each_device_gets_its_own_file_under_the_bus_name() {
+        let mut c = I2cModuleConfig::new(1);
+        c.devices = vec![
+            I2cDevice {
+                name: "SSD1306 display".into(),
+                address: 0x3C,
+            },
+            I2cDevice {
+                name: "imu".into(),
+                address: 0x68,
+            },
+        ];
+        let files = super::i2c_device_config_files("i2c1", Some(&c));
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["i2c1_ssd1306_display.rs", "i2c1_imu.rs"]);
+        assert!(
+            files[0].1.contains("pub const DEVICE_ADDRESS: u8 = 0x3C;"),
+            "{}",
+            files[0].1
+        );
+        assert!(
+            files[1].1.contains("pub const DEVICE_ADDRESS: u8 = 0x68;"),
+            "{}",
+            files[1].1
+        );
+        // Each file points at the ONE bus driver rather than implying its own.
+        assert!(files[1].1.contains("built ONCE"), "{}", files[1].1);
+        assert!(
+            !files[1].1.contains("0x3C"),
+            "a device must not carry its neighbour's address"
+        );
+    }
+
+    /// Two devices the user named the same thing must not produce two files with
+    /// one stem.
+    ///
+    /// `sync_config_files` maps its file list to module stems with no dedup and
+    /// writes one `pub mod <stem>;` per entry, so a repeat is a
+    /// duplicate-definition error in the generated crate - from two panel rows
+    /// that look perfectly reasonable.
+    #[test]
+    fn two_devices_with_one_name_still_get_distinct_files() {
+        let mut c = I2cModuleConfig::new(1);
+        c.devices = vec![
+            I2cDevice {
+                name: "sensor".into(),
+                address: 0x40,
+            },
+            I2cDevice {
+                name: "sensor".into(),
+                address: 0x41,
+            },
+            I2cDevice {
+                name: "Sensor!".into(),
+                address: 0x42,
+            },
+        ];
+        let files = super::i2c_device_config_files("i2c1", Some(&c));
+        let mut names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), before, "stems collided: {names:?}");
+    }
+
+    /// An unnamed device is still a device. It falls back to its position, so it
+    /// gets a file rather than being silently dropped - which is the difference
+    /// between the panel telling the truth and not.
+    #[test]
+    fn an_unnamed_device_falls_back_to_its_position() {
+        let mut c = I2cModuleConfig::new(1);
+        c.devices = vec![
+            I2cDevice {
+                name: String::new(),
+                address: 0x40,
+            },
+            I2cDevice {
+                name: String::new(),
+                address: 0x41,
+            },
+        ];
+        let files = super::i2c_device_config_files("twim0", Some(&c));
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["twim0_device1.rs", "twim0_device2.rs"]);
+        assert!(files[0].1.contains("device 1"), "{}", files[0].1);
+    }
+
     /// The comment is the half that stops a reader hunting for an `init`
     /// parameter that does not exist: every HAL here takes the address per
     /// transaction.
@@ -529,6 +639,113 @@ mod device_address_tests {
         assert!(out.contains("per transaction"), "{out}");
         assert!(out.contains("not for `init`"), "{out}");
     }
+}
+
+/// Every device on one I2C bus, as `(file stem, address, name as typed)`.
+///
+/// EMPTY unless the bus carries two or more devices. One device is what every
+/// project has had since the module existed and its address is already in the bus
+/// file, so emitting a file for it would rewrite the output of every existing
+/// project to say the same thing twice. Two is where the bus file stops being
+/// able to answer "which address" on its own, and that is exactly where the
+/// per-device files start.
+///
+/// `bus_stem` is the bus file's own stem (`i2c1`, or `twim0` on Nordic, which
+/// calls the peripheral a TWIM everywhere else in its generated code). Sharing
+/// the prefix keeps a device file sorted beside its bus and stops the two being
+/// read as different peripherals.
+///
+/// An unnamed device falls back to its position, and a name that collides with an
+/// earlier one gets a number. That is not tidiness: `sync_config_files` builds
+/// its module list with a plain `map` and no dedup of its own, then writes one
+/// `pub mod <stem>;` per entry — so two devices agreeing on a stem is a
+/// duplicate-definition error in the generated crate, from two rows of a panel
+/// that look perfectly reasonable.
+pub fn i2c_device_stems(bus_stem: &str, cfg: &I2cModuleConfig) -> Vec<(String, u8, String)> {
+    if cfg.devices.len() < 2 {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, u8, String)> = Vec::new();
+    for (i, d) in cfg.devices.iter().enumerate() {
+        let mut slug = sanitize_label(&d.name);
+        if slug.is_empty() {
+            slug = format!("device{}", i + 1);
+        }
+        let mut stem = format!("{bus_stem}_{slug}");
+        let mut n = 2;
+        while out.iter().any(|(s, _, _)| *s == stem) {
+            stem = format!("{bus_stem}_{slug}_{n}");
+            n += 1;
+        }
+        let shown = if d.name.trim().is_empty() {
+            format!("device {}", i + 1)
+        } else {
+            d.name.clone()
+        };
+        out.push((stem, d.address, shown));
+    }
+    out
+}
+
+/// The per-device config files for one bus, ready to extend a backend's list.
+///
+/// One call per backend, because there are five of them and a five-way copy of
+/// "which devices, what stem, what body" is five chances for one family to drift.
+/// `None` and a short list both give an empty vec, so a backend never has to ask
+/// whether this bus has devices before calling.
+pub fn i2c_device_config_files(
+    bus_stem: &str,
+    cfg: Option<&I2cModuleConfig>,
+) -> Vec<(String, String)> {
+    let Some(c) = cfg else {
+        return Vec::new();
+    };
+    i2c_device_stems(bus_stem, c)
+        .into_iter()
+        .map(|(stem, addr, shown)| {
+            (
+                format!("{stem}.rs"),
+                i2c_device_file(bus_stem, &shown, addr),
+            )
+        })
+        .collect()
+}
+
+/// One device's config file: its address, and a place to put the code that talks
+/// to it.
+///
+/// The BUS is not built here and cannot be. An I2C peripheral produces exactly
+/// one driver, `main.rs` owns it, and every master on every HAL in this project
+/// takes the address per transaction — so a device is an address plus whatever
+/// the user writes around it, never a second driver. That is the whole reason
+/// several devices on one pair of pads is expressible at all.
+pub fn i2c_device_file(bus: &str, shown: &str, address: u8) -> String {
+    let mut s = String::new();
+    s.push_str("// <<< GENERATED>>>\n");
+    s.push_str("// Device config (from the Virtual Module) — auto-updated; edit in the module.\n");
+    s.push_str(&device_address_const(None, address));
+    s.push_str("// <<< GENERATED END >>>\n\n");
+    s.push_str("// Everything below is editable — your changes are preserved on regeneration.\n");
+    s.push_str("//\n");
+    s.push_str(&format!(
+        "// `{shown}` is one of the devices sharing the {bus} bus. The bus driver is\n"
+    ));
+    s.push_str(&format!(
+        "// built ONCE — see `{bus}` — and `main.rs` owns the handle; this file only says\n"
+    ));
+    s.push_str("// which address on it is yours. Write the device's own routines here and\n");
+    s.push_str("// take the bus as an argument:\n");
+    s.push_str("//\n");
+    s.push_str("//     pub fn read_id<I: embedded_hal::i2c::I2c>(bus: &mut I) -> Option<u8> {\n");
+    s.push_str("//         let mut rx = [0u8; 1];\n");
+    s.push_str("//         bus.write_read(DEVICE_ADDRESS, &[0x00], &mut rx).ok()?;\n");
+    s.push_str("//         Some(rx[0])\n");
+    s.push_str("//     }\n");
+    s.push_str("//\n");
+    s.push_str("// Renaming this device in the panel renames this file, and the old one is\n");
+    s.push_str("// removed with whatever was below its markers. Move anything you want to\n");
+    s.push_str("// keep before you rename.\n");
+    s
 }
 
 // ── Edge hooks — the user's handler for an armed input ───────────────────────

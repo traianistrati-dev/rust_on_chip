@@ -1808,6 +1808,10 @@ pub fn async_peripherals(
             ));
         }
         files.push((format!("i2c{n}.rs"), i2c_config_file(n, cfg)));
+        files.extend(super::common::i2c_device_config_files(
+            &format!("i2c{n}"),
+            cfg,
+        ));
     }
 
     // ── Comparators ────────────────────────────────────────────────────
@@ -4612,7 +4616,7 @@ pub fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>) -> String {
         .replace("{CLK}", &clk.to_string())
         .replace(
             "{ADDR}",
-            &device_address_const(None, cfg.map(|c| c.address).unwrap_or(0)),
+            &device_address_const(None, cfg.map_or(0, |c| c.primary_address())),
         )
 }
 

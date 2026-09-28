@@ -26,17 +26,38 @@ pub fn parse_from_source(source: &str) -> Vec<VirtualModule> {
         .find_map(|l| {
             let rest = l.trim_start().strip_prefix(MODULES_TAG)?;
             let mut modules = ron::from_str::<Vec<VirtualModule>>(rest.trim_start()).ok()?;
-            // The one place a saved project re-enters the model, so the one
-            // place old field shapes are brought forward.
-            for m in &mut modules {
-                if let ModuleConfig::Timer(cfg) = &mut m.config {
-                    cfg.migrate_duty();
-                }
-            }
-            dedupe_ids(&mut modules);
+            normalize(&mut modules);
             Some(modules)
         })
         .unwrap_or_default()
+}
+
+/// Bring a freshly deserialised module list up to date, whichever file it came
+/// out of.
+///
+/// This used to live inline in [`parse_from_source`], under a comment calling
+/// that "the one place a saved project re-enters the model". It was not, and had
+/// not been for a while: `mcu_config::parse` reads the `@modules` section of
+/// `mcu.config` with a bare `ron::from_str` and is the door EVERY project the
+/// IDE saves today comes back through — [`parse_from_source`] is the fallback
+/// for older projects that only have the `// @modules` marker in `main.rs`.
+///
+/// So both migrations below were dead for every current project: a pre-hundredths
+/// PWM duty was never folded forward, and a duplicate module id was never
+/// repaired. Nothing had noticed, because both are invisible until the
+/// particular old file shows up.
+///
+/// One function, called by both doors. A third door would be a bug, not a
+/// second copy of this.
+pub fn normalize(modules: &mut Vec<VirtualModule>) {
+    for m in modules.iter_mut() {
+        match &mut m.config {
+            ModuleConfig::Timer(cfg) => cfg.migrate_duty(),
+            ModuleConfig::I2c(cfg) => cfg.sync_legacy_address(),
+            _ => {}
+        }
+    }
+    dedupe_ids(modules);
 }
 
 /// Give every module its own id, for projects saved with two that shared one.

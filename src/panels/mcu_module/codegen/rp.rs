@@ -1040,7 +1040,7 @@ impl FamilyBackend for RpBackend {
                 if pads.len() == roles.len() {
                     let frame = (kind == "uart").then(|| ucfgs.get(&i)).flatten();
                     let addr = if kind == "i2c" {
-                        icfgs.get(&i).map_or(0, |c| c.address)
+                        icfgs.get(&i).map_or(0, |c| c.primary_address())
                     } else {
                         0
                     };
@@ -1048,6 +1048,12 @@ impl FamilyBackend for RpBackend {
                         format!("{kind}{i}.rs"),
                         bus_config_file(hal, kind, i, &pads, bus_speed(mcu, kind, i), frame, addr),
                     ));
+                    if kind == "i2c" {
+                        out.extend(super::common::i2c_device_config_files(
+                            &format!("i2c{i}"),
+                            icfgs.get(&i),
+                        ));
+                    }
                 }
             }
         }
@@ -3869,10 +3875,26 @@ fn async_i2c_address_consts(mcu: &Mcu) -> String {
         if role_of(&pins, i, "sda").is_none() || role_of(&pins, i, "scl").is_none() {
             continue;
         }
-        o.push_str(&super::common::device_address_const(
-            Some(&format!("I2C{i}")),
-            cfgs.get(&i).map_or(0, |c| c.address),
-        ));
+        let cfg = cfgs.get(&i);
+        let stems = cfg.map_or_else(Vec::new, |c| {
+            super::common::i2c_device_stems(&format!("i2c{i}"), c)
+        });
+        if stems.is_empty() {
+            o.push_str(&super::common::device_address_const(
+                Some(&format!("I2C{i}")),
+                cfg.map_or(0, |c| c.primary_address()),
+            ));
+        } else {
+            // Several devices on the bus: one const each, named after the file
+            // the runtimes WITH a `pins/configs/` would have given it, so the
+            // two spellings of the same project read the same way.
+            for (stem, addr, _) in stems {
+                o.push_str(&super::common::device_address_const(
+                    Some(&stem.to_ascii_uppercase()),
+                    addr,
+                ));
+            }
+        }
     }
     o
 }

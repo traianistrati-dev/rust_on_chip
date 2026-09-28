@@ -2116,25 +2116,16 @@ mod tests {
         }
     }
 
-    /// The 7-bit address the panel collects reaches the generated code on
-    /// EVERY family and runtime that builds an I2C bus.
+    /// Every family + runtime pair that actually BUILDS an I2C bus.
     ///
-    /// It used to reach exactly ONE of them. `I2cModuleConfig.address` had a
-    /// single non-UI reader in the whole tree - the ESP config file - so on
-    /// every other family the user set an address, saved, and nothing in the
-    /// output mentioned it again. The Address row was not gated and gave no
-    /// reason, which is this project's rule backwards: the UI offered what
-    /// codegen would not write.
+    /// Shared by both I2C address guards on purpose: a family added to one and
+    /// forgotten in the other is a family silently unguarded, which is how the
+    /// original hole - one emitter written, four not - lasted as long as it did.
     ///
-    /// Where it lands differs, and has to. A family with a `pins/configs/`
-    /// file puts it there, beside the clock; the runtimes that build every bus
-    /// inline in `main.rs` have no such file, so it goes to module scope above
-    /// the entry point - which is also why the name carries the peripheral
-    /// there and not in a config file.
-    #[test]
-    fn the_i2c_address_reaches_every_family_that_builds_a_bus() {
-        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
-
+    /// Generic STM32 embassy blocking and WBA are deliberately absent. They emit
+    /// no I2C constructor anywhere in the tree, so there is no bus for an address
+    /// to belong to; that is a gap in those backends, not in this test.
+    fn i2c_bus_cases() -> Vec<(&'static str, Mcu, Runtime)> {
         let by_id = |id: &str| {
             crate::panels::mcu_module::builtins::builtin_definitions()
                 .into_iter()
@@ -2149,8 +2140,7 @@ mod tests {
             def.id = id.into();
             def.build_mcu()
         };
-
-        let cases: Vec<(&str, Mcu, Runtime)> = vec![
+        vec![
             (
                 "stm32f1 blocking",
                 stm32("stm32f1", "stm32f103c8t6"),
@@ -2183,9 +2173,81 @@ mod tests {
                 by_id("nrf52833_microbit_v2"),
                 Runtime::Async,
             ),
-        ];
+        ]
+    }
 
-        for (what, mut mcu, runtime) in cases {
+    /// main.rs and every config file, concatenated. Which of the two holds a
+    /// const is the backend's business; these guards are about the value getting
+    /// out at all.
+    fn whole_output(mcu: &Mcu) -> String {
+        let mut all = mcu.fresh_main_rs();
+        for (name, body) in mcu.config_files() {
+            all.push_str(&format!("// ==== {name}\n"));
+            all.push_str(&body);
+        }
+        all
+    }
+
+    /// Several devices on ONE bus: every address reaches the generated code.
+    ///
+    /// A bus is shared by design and the address is the only thing telling its
+    /// devices apart, so a model carrying one address per bus cannot describe a
+    /// display and a sensor on the same two pads. The give-away for a half-done
+    /// job is the SECOND device: the first works by accident, being exactly what
+    /// the old single-address field already emitted.
+    #[test]
+    fn several_devices_on_one_bus_all_reach_the_generated_code() {
+        use crate::panels::mcu_module::modules::{I2cDevice, ModuleConfig, ModuleKind};
+
+        for (what, mut mcu, runtime) in i2c_bus_cases() {
+            mcu.runtime = runtime;
+            mcu.add_module(ModuleKind::GenericInterfaceI2c);
+            for md in &mut mcu.modules {
+                if let ModuleConfig::I2c(c) = &mut md.config {
+                    c.devices = vec![
+                        I2cDevice {
+                            name: "display".into(),
+                            address: 0x3C,
+                        },
+                        I2cDevice {
+                            name: "imu".into(),
+                            address: 0x68,
+                        },
+                    ];
+                }
+            }
+            let all = whole_output(&mcu);
+            assert!(
+                all.contains("0x3C;"),
+                "{what}: the first device's address is missing:\n{all}"
+            );
+            assert!(
+                all.contains("0x68;"),
+                "{what}: the SECOND device's address never reaches the generated code:\n{all}"
+            );
+        }
+    }
+
+    /// The 7-bit address the panel collects reaches the generated code on
+    /// EVERY family and runtime that builds an I2C bus.
+    ///
+    /// It used to reach exactly ONE of them. `I2cModuleConfig.address` had a
+    /// single non-UI reader in the whole tree - the ESP config file - so on
+    /// every other family the user set an address, saved, and nothing in the
+    /// output mentioned it again. The Address row was not gated and gave no
+    /// reason, which is this project's rule backwards: the UI offered what
+    /// codegen would not write.
+    ///
+    /// Where it lands differs, and has to. A family with a `pins/configs/`
+    /// file puts it there, beside the clock; the runtimes that build every bus
+    /// inline in `main.rs` have no such file, so it goes to module scope above
+    /// the entry point - which is also why the name carries the peripheral
+    /// there and not in a config file.
+    #[test]
+    fn the_i2c_address_reaches_every_family_that_builds_a_bus() {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+
+        for (what, mut mcu, runtime) in i2c_bus_cases() {
             mcu.runtime = runtime;
             mcu.add_module(ModuleKind::GenericInterfaceI2c);
             let mut wired = false;
@@ -2197,14 +2259,7 @@ mod tests {
             }
             assert!(wired, "{what}: no I2C module to configure");
 
-            // main.rs AND the config files: which of the two holds the const is
-            // the backend's business, and this test is about the value getting
-            // out at all.
-            let mut all = mcu.fresh_main_rs();
-            for (name, body) in mcu.config_files() {
-                all.push_str(&format!("// ==== {name}\n"));
-                all.push_str(&body);
-            }
+            let all = whole_output(&mcu);
             assert!(
                 all.contains("DEVICE_ADDRESS: u8 = 0x3C;"),
                 "{what}: the configured address never reaches the generated code:\n{all}"

@@ -12,13 +12,13 @@ use crate::panels::mcu_module::codegen::sanitize_label;
 use crate::panels::mcu_module::modules::model::BlockingDma;
 use crate::panels::mcu_module::modules::model::hz_label;
 use crate::panels::mcu_module::modules::{
-    ApiStyle, AsyncBusMode, BREAK_FILTERS, BreakPolarity, CanMode, HspiMode, I2sClockPolarity,
-    I2sDirection, I2sFormat, I2sMode, I2sStandard, LcdCamMode, ModuleConfig, ModuleKind,
-    ModuleSignal, OspiMemoryType, OspiMode, Parity, ParlIoBitOrder, ParlIoDirection, ParlIoWidth,
-    PcntCtrlMode, PcntEdgeMode, PwmCounting, PwmMode, PwmOutput, PwmPolarity, QSPI_MEMORY_SIZES,
-    QspiAddressSize, RmtDirection, SaiDataSize, SaiMode, SaiStereoMono, SaiTxRx, SpiBitOrder,
-    SpiRole, StopBits, TouchScan, TouchThreshold, UsartDirection, UsartFlow, UsartMode,
-    UsartModuleConfig, UsbRole, VirtualModule, XspiMemoryType, XspiMode,
+    ApiStyle, AsyncBusMode, BREAK_FILTERS, BreakPolarity, CanMode, HspiMode, I2cDevice,
+    I2sClockPolarity, I2sDirection, I2sFormat, I2sMode, I2sStandard, LcdCamMode, ModuleConfig,
+    ModuleKind, ModuleSignal, OspiMemoryType, OspiMode, Parity, ParlIoBitOrder, ParlIoDirection,
+    ParlIoWidth, PcntCtrlMode, PcntEdgeMode, PwmCounting, PwmMode, PwmOutput, PwmPolarity,
+    QSPI_MEMORY_SIZES, QspiAddressSize, RmtDirection, SaiDataSize, SaiMode, SaiStereoMono, SaiTxRx,
+    SpiBitOrder, SpiRole, StopBits, TouchScan, TouchThreshold, UsartDirection, UsartFlow,
+    UsartMode, UsartModuleConfig, UsbRole, VirtualModule, XspiMemoryType, XspiMode,
 };
 use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
 use eframe::egui;
@@ -6427,14 +6427,82 @@ pub fn module_config_ui(
                         );
                         ui.end_row();
                     }
-                    out.field("Address (7-bit)", docs::I2C_ADDRESS);
-                    ui.label("Address (7-bit)");
-                    ui.add(
-                        crate::panels::drag_value(ui, &mut cfg.address)
-                            .range(0..=127)
-                            .hexadecimal(2, false, true),
-                    );
-                    ui.end_row();
+                    // One device is one row, as it always was. Several is a
+                    // list — and the switch is the user's, never inferred: a
+                    // project that has only ever had one address keeps the
+                    // simpler panel AND the simpler generated output.
+                    if cfg.devices.is_empty() {
+                        out.field("Address (7-bit)", docs::I2C_ADDRESS);
+                        ui.label("Address (7-bit)");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                crate::panels::drag_value(ui, &mut cfg.address)
+                                    .range(0..=127)
+                                    .hexadecimal(2, false, true),
+                            );
+                            if ui
+                                .small_button("+ device")
+                                .on_hover_text(docs::I2C_DEVICES)
+                                .clicked()
+                            {
+                                // The address already set IS the first device.
+                                // Starting the list without it would read as the
+                                // setting having been thrown away.
+                                cfg.devices = vec![
+                                    I2cDevice {
+                                        name: String::new(),
+                                        address: cfg.address,
+                                    },
+                                    I2cDevice::default(),
+                                ];
+                            }
+                        });
+                        ui.end_row();
+                    } else {
+                        out.field("Devices", docs::I2C_DEVICES);
+                        ui.label("Devices");
+                        let mut remove: Option<usize> = None;
+                        let mut add = false;
+                        ui.vertical(|ui| {
+                            for (i, d) in cfg.devices.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut d.name)
+                                            .desired_width(110.0)
+                                            .hint_text(format!("device {}", i + 1)),
+                                    );
+                                    ui.add(
+                                        crate::panels::drag_value(ui, &mut d.address)
+                                            .range(0..=127)
+                                            .hexadecimal(2, false, true),
+                                    );
+                                    if ui
+                                        .small_button("x")
+                                        .on_hover_text("Remove this device")
+                                        .clicked()
+                                    {
+                                        remove = Some(i);
+                                    }
+                                });
+                            }
+                            add = ui.small_button("+ device").clicked();
+                        });
+                        if add {
+                            cfg.devices.push(I2cDevice::default());
+                        }
+                        if let Some(i) = remove {
+                            cfg.devices.remove(i);
+                        }
+                        // Back down to one device is the single-address case, so
+                        // collapse to it: a one-row list means exactly what the
+                        // Address row means, and leaving it would keep emitting a
+                        // per-device file for a bus that no longer needs one.
+                        if cfg.devices.len() == 1 {
+                            cfg.address = cfg.devices[0].address;
+                            cfg.devices.clear();
+                        }
+                        ui.end_row();
+                    }
                     if is_async && rp_i2c {
                         out.note(RP_I2C_NOTE);
                     } else if is_async && nrf_i2c {
@@ -7424,11 +7492,28 @@ mod tests {
     /// them, so it cannot tell "this row is gated" from "this row does not
     /// exist", which is exactly what the skip tests below have to distinguish.
     fn config_variants(kind: ModuleKind) -> Vec<crate::panels::mcu_module::modules::ModuleConfig> {
-        use crate::panels::mcu_module::modules::{ModuleConfig, TouchScan};
+        use crate::panels::mcu_module::modules::{I2cDevice, ModuleConfig, TouchScan};
         let mut out = vec![kind.default_config(1)];
         if let ModuleConfig::Touch(mut c) = kind.default_config(1) {
             c.scan = TouchScan::Continuous;
             out.push(ModuleConfig::Touch(c));
+        }
+        // An I2C bus carrying several devices draws a list where one device draws
+        // a single Address row. Without this variant the list is a row the roster
+        // never sees, so it could not be documented without the guard calling it
+        // a row nothing draws.
+        if let ModuleConfig::I2c(mut c) = kind.default_config(1) {
+            c.devices = vec![
+                I2cDevice {
+                    name: "display".into(),
+                    address: 0x3C,
+                },
+                I2cDevice {
+                    name: "imu".into(),
+                    address: 0x68,
+                },
+            ];
+            out.push(ModuleConfig::I2c(c));
         }
         out
     }

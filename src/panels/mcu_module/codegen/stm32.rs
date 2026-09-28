@@ -1194,6 +1194,10 @@ pub fn config_files(
                 format!("i2c{n}.rs"),
                 i2c_config_file(n, i2c.get(&n), &i2c_pin_tys(n, all_pins)),
             ));
+            out.extend(super::common::i2c_device_config_files(
+                &format!("i2c{n}"),
+                i2c.get(&n),
+            ));
         }
     }
     // CAN — single instance on STM32F1; the bit-timing register depends on the
@@ -2948,7 +2952,7 @@ fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>, pins: &str) -> String {
         .replace("{AFIO_ARG}", afio_arg)
         .replace(
             "{ADDR}",
-            &super::common::device_address_const(None, cfg.map(|c| c.address).unwrap_or(0)),
+            &super::common::device_address_const(None, cfg.map_or(0, |c| c.primary_address())),
         )
 }
 

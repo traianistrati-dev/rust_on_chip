@@ -16,7 +16,7 @@
 //! [`Runtime::Async`]: crate::panels::mcu_module::mcu::Runtime
 
 use super::common::{ASYNC_USER_TAIL, retarget_pristine_tail};
-use super::common::{duty_percent_str, pin_binding, sanitize_label};
+use super::common::{device_address_const, duty_percent_str, pin_binding, sanitize_label};
 use super::dma_map;
 use super::embassy_common::{NO_PINS_PLACEHOLDER, gpio_bindings_exti};
 use super::nvic;
@@ -4473,7 +4473,7 @@ pub fn init<'d>(
 const ASYNC_I2C_TMPL_BLOCKING: &str = r#"// <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const CLOCK_HZ: u32 = {CLK};
-// <<< GENERATED END >>>
+{ADDR}// <<< GENERATED END >>>
 
 // Everything below is editable — your changes are preserved on regeneration.
 //
@@ -4507,9 +4507,8 @@ pub fn init<'d>(
 //
 //     use embedded_hal::i2c::I2c;
 //
-//     const ADDR: u8 = 0x3C;
 //     let mut rx = [0u8; 2];
-//     {HANDLE}.write_read(ADDR, &[0x10], &mut rx).ok();
+//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).ok();
 
 "#;
 
@@ -4519,7 +4518,7 @@ pub fn init<'d>(
 const ASYNC_I2C_TMPL_DMA: &str = r#"// <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const CLOCK_HZ: u32 = {CLK};
-// <<< GENERATED END >>>
+{ADDR}// <<< GENERATED END >>>
 
 // Everything below is editable — your changes are preserved on regeneration.
 //
@@ -4573,13 +4572,11 @@ pub fn init<'d, TxD: TxDma<peripherals::I2C{N}>, RxD: RxDma<peripherals::I2C{N}>
 //
 //     use embedded_hal_async::i2c::I2c;
 //
-//     const ADDR: u8 = 0x3C;
-//
-//     {HANDLE}.write(ADDR, &[0x10, 0x42]).await.ok();
+//     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).await.ok();
 //
 //     let mut rx = [0u8; 2];
-//     {HANDLE}.read(ADDR, &mut rx).await.ok();
-//     {HANDLE}.write_read(ADDR, &[0x10], &mut rx).await.ok();
+//     {HANDLE}.read(DEVICE_ADDRESS, &mut rx).await.ok();
+//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).await.ok();
 
 "#;
 
@@ -4613,6 +4610,10 @@ pub fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>) -> String {
         .replace("{N}", &n.to_string())
         .replace("{EXTRA_CFG}", &extra)
         .replace("{CLK}", &clk.to_string())
+        .replace(
+            "{ADDR}",
+            &device_address_const(None, cfg.map(|c| c.address).unwrap_or(0)),
+        )
 }
 
 #[cfg(test)]
@@ -8043,6 +8044,41 @@ mod spi_i2c_option_tests {
         assert!(!spi.contains("bit_order"), "{spi}");
         let i2c = i2c_config_file(1, Some(&I2cModuleConfig::new(1)));
         assert!(!i2c.contains("timeout"), "{i2c}");
+    }
+
+    /// The address reaches BOTH I2C templates, and the usage example stops
+    /// inventing one of its own.
+    ///
+    /// Each example used to open with `const ADDR: u8 = 0x3C;` - a literal that
+    /// ignored whatever the user had set two panels away, so following the
+    /// example talked to the wrong device.
+    #[test]
+    fn the_address_reaches_both_i2c_templates_and_their_examples() {
+        for mode in [AsyncBusMode::Blocking, AsyncBusMode::AsyncDma] {
+            let c = I2cModuleConfig {
+                address: 0x68,
+                async_mode: mode,
+                ..I2cModuleConfig::new(1)
+            };
+            let f = i2c_config_file(1, Some(&c));
+            assert!(f.contains("pub const DEVICE_ADDRESS: u8 = 0x68;"), "{f}");
+            assert!(!f.contains("const ADDR: u8"), "{f}");
+            assert!(f.contains("DEVICE_ADDRESS, &[0x10]"), "{f}");
+        }
+    }
+
+    /// The const sits INSIDE the generated markers, beside the clock: it
+    /// follows the Virtual Module, and everything below the markers is the
+    /// user's to edit.
+    #[test]
+    fn the_address_is_in_the_regenerated_half() {
+        let f = i2c_config_file(1, Some(&I2cModuleConfig::new(1)));
+        let gen_end = f.find("<<< GENERATED END >>>").expect("markers");
+        let addr = f.find("pub const DEVICE_ADDRESS").expect("the const");
+        assert!(
+            addr < gen_end,
+            "the address must precede the END marker:\n{f}"
+        );
     }
 
     /// LSB first reaches the config, fully qualified so no template needs a

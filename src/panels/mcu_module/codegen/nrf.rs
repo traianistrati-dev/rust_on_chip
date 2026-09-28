@@ -730,6 +730,9 @@ fn bus_config_file(
     hz: u32,
     frame: Option<&UsartModuleConfig>,
     spi_mode: u8,
+    // The I2C module's 7-bit address, 0 for the other two kinds. Resolved by the
+    // caller the way `hz` and `spi_mode` are, so this stays a pure formatter.
+    i2c_addr: u8,
 ) -> String {
     use crate::panels::mcu_module::modules::{Parity, StopBits};
     let mut o = String::new();
@@ -793,6 +796,7 @@ fn bus_config_file(
             o.push_str(&format!(
                 "pub const FREQUENCY: {hal}::twim::Frequency = {hal}::twim::Frequency::{variant};\n"
             ));
+            o.push_str(&super::common::device_address_const(None, i2c_addr));
         }
     }
     o.push_str("// <<< GENERATED END >>>\n\n");
@@ -1006,6 +1010,8 @@ impl FamilyBackend for NrfBackend {
         let hal = hal_crate(&mcu.family);
         let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
         let scfgs = crate::panels::mcu_module::modules::spi_configs(&mcu.modules);
+        // The I2C modules, so each twim file can carry its own device address.
+        let icfgs = crate::panels::mcu_module::modules::i2c_configs(&mcu.modules);
         // Only a bus `main.rs` can construct gets a file - the same rule
         // `bus_lines` applies, so a file never exists without its `init` call.
         for (kind, required, pins) in [
@@ -1017,9 +1023,22 @@ impl FamilyBackend for NrfBackend {
                 if required.iter().all(|r| role_of(&pins, i, r).is_some()) {
                     let frame = (kind == "uarte").then(|| ucfgs.get(&i)).flatten();
                     let spi_mode = scfgs.get(&i).map_or(0, |c| c.mode);
+                    let addr = if kind == "twim" {
+                        icfgs.get(&i).map_or(0, |c| c.address)
+                    } else {
+                        0
+                    };
                     out.push((
                         format!("{kind}{i}.rs"),
-                        bus_config_file(&hal, kind, i, bus_speed(mcu, kind, i), frame, spi_mode),
+                        bus_config_file(
+                            &hal,
+                            kind,
+                            i,
+                            bus_speed(mcu, kind, i),
+                            frame,
+                            spi_mode,
+                            addr,
+                        ),
                     ));
                 }
             }
@@ -1262,6 +1281,17 @@ struct AsyncBuses {
     irqs: Vec<String>,
     /// The lines inside `main`.
     body: String,
+    /// Items that must sit at MODULE scope, above the entry point - today the
+    /// I2C device-address consts.
+    ///
+    /// Not folded into `body`: that goes inside `async fn main`, and a const
+    /// declared in a function body is private to it, which rustc then reports
+    /// as dead code until the user's own code happens to name it. And not
+    /// rebuilt by a second pass over the pins either, because which buses get
+    /// built here is not a property of the pins alone - `clash` drops a TWIM
+    /// whose block a SPIM already took - so the only place that knows is this
+    /// loop.
+    items: String,
     /// Whether `body` names `static_cell` (a TWIM's RAM buffer).
     static_cell: bool,
 }
@@ -1277,6 +1307,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     };
     let mut irqs: Vec<String> = Vec::new();
     let mut o = ambiguity_notes(mcu);
+    let mut items = String::new();
     let mut static_cell = false;
     let mut taken: Vec<(String, String)> = Vec::new();
     let clash = |taken: &[(String, String)], peri: &str, me: &str| {
@@ -1423,6 +1454,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     }
 
     let i2c = i2c_pins(mcu);
+    let icfgs = modules::i2c_configs(&mcu.modules);
     for i in instances(&i2c) {
         let (Some(scl), Some(sda)) = (role_of(&i2c, i, "scl"), role_of(&i2c, i, "sda")) else {
             o.push_str(&format!(
@@ -1436,6 +1468,12 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             continue;
         }
         let var = format!("twim{i}");
+        // Past every gate above, so this bus really is built: the const and the
+        // driver appear together or not at all.
+        items.push_str(&super::common::device_address_const(
+            Some(&format!("TWIM{i}")),
+            icfgs.get(&i).map_or(0, |c| c.address),
+        ));
         let hz = bus_speed(mcu, "twim", i);
         let (got, variant) = twim_frequency(hz);
         if got != hz {
@@ -1595,6 +1633,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     AsyncBuses {
         irqs,
         body: o,
+        items,
         static_cell,
     }
 }
@@ -1673,6 +1712,7 @@ fn async_section(mcu: &Mcu) -> String {
             buses.irqs.join("\n")
         ));
     }
+    o.push_str(&buses.items);
     o.push_str(&tasks);
     o.push_str("#[embassy_executor::main]\n");
     o.push_str(&format!(

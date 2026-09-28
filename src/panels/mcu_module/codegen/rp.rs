@@ -734,6 +734,9 @@ fn bus_config_file(
     pads: &[(&str, u8)],
     hz: u32,
     frame: Option<&UsartModuleConfig>,
+    // The I2C module's 7-bit address, 0 for the other two kinds. Resolved by the
+    // caller the way `hz` is, so this function stays a pure formatter.
+    i2c_addr: u8,
 ) -> String {
     let mut o = String::new();
     o.push_str("// <<< GENERATED>>>\n");
@@ -751,7 +754,10 @@ fn bus_config_file(
             ));
         }
         "spi" => o.push_str(&format!("pub const SPI_HZ: u32 = {hz};\n")),
-        _ => o.push_str(&format!("pub const I2C_HZ: u32 = {hz};\n")),
+        _ => {
+            o.push_str(&format!("pub const I2C_HZ: u32 = {hz};\n"));
+            o.push_str(&super::common::device_address_const(None, i2c_addr));
+        }
     }
     o.push_str("// <<< GENERATED END >>>\n\n");
     o.push_str("// Everything below is editable — your changes are preserved on regeneration.\n");
@@ -1019,6 +1025,8 @@ impl FamilyBackend for RpBackend {
         let hal = hal_crate(&mcu.family);
         // The USART modules, so each uart file can carry its own wire frame.
         let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
+        // The I2C modules, so each i2c file can carry its own device address.
+        let icfgs = crate::panels::mcu_module::modules::i2c_configs(&mcu.modules);
         for (kind, roles, pins) in [
             ("uart", &["tx", "rx"][..], uart_pins(mcu)),
             ("spi", &["sck", "mosi", "miso"][..], spi_pins(mcu)),
@@ -1031,9 +1039,14 @@ impl FamilyBackend for RpBackend {
                     .collect();
                 if pads.len() == roles.len() {
                     let frame = (kind == "uart").then(|| ucfgs.get(&i)).flatten();
+                    let addr = if kind == "i2c" {
+                        icfgs.get(&i).map_or(0, |c| c.address)
+                    } else {
+                        0
+                    };
                     out.push((
                         format!("{kind}{i}.rs"),
-                        bus_config_file(hal, kind, i, &pads, bus_speed(mcu, kind, i), frame),
+                        bus_config_file(hal, kind, i, &pads, bus_speed(mcu, kind, i), frame, addr),
                     ));
                 }
             }
@@ -3833,6 +3846,37 @@ pub fn dma_uses(mcu: &Mcu) -> Vec<super::dma_map::DmaUse> {
     async_bus_lines(mcu).3
 }
 
+/// The device-address consts for the I2C buses this runtime builds INLINE.
+///
+/// The blocking runtime puts the address in `pins/configs/i2c{n}.rs` beside the
+/// clock; this one has no such file — `config_files` here returns watchdogs
+/// only, because every bus is constructed in `main.rs` — so the const goes where
+/// the bus goes. Without this the address a user set in the panel reached the
+/// generated code on the blocking runtime and vanished on the async one, which
+/// is the same setting behaving differently for no reason the user can see.
+///
+/// Module scope, above the entry point, and `pub`: at the crate root that is
+/// what keeps an as-yet-unused const out of `dead_code` (a private one warns —
+/// checked against rustc, not assumed).
+///
+/// Half a bus is skipped: `async_bus_lines` builds no driver for it, so there
+/// would be nothing to address.
+fn async_i2c_address_consts(mcu: &Mcu) -> String {
+    let pins = i2c_pins(mcu);
+    let cfgs = crate::panels::mcu_module::modules::i2c_configs(&mcu.modules);
+    let mut o = String::new();
+    for i in instances(&pins) {
+        if role_of(&pins, i, "sda").is_none() || role_of(&pins, i, "scl").is_none() {
+            continue;
+        }
+        o.push_str(&super::common::device_address_const(
+            Some(&format!("I2C{i}")),
+            cfgs.get(&i).map_or(0, |c| c.address),
+        ));
+    }
+    o
+}
+
 /// How many DMA channels this chip has — 12 on the RP2040, 16 on the RP2350.
 pub fn dma_channels(family: &str) -> usize {
     if family == "rp235x" { 16 } else { 12 }
@@ -4159,6 +4203,7 @@ fn async_section(mcu: &Mcu) -> String {
     // and a second copy made `.start_block` hold two. memory.x places the one
     // that remains.
     o.push_str(&irq_binding);
+    o.push_str(&async_i2c_address_consts(mcu));
     o.push_str(&radio_task);
     o.push_str(&gpio_tasks);
     let fpga = fpga_loader(mcu);

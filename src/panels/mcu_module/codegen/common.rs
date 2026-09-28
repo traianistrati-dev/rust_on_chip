@@ -434,6 +434,103 @@ pub fn ensure_module_models(mut file: String, modules: &[VirtualModule]) -> Stri
     file
 }
 
+// ── I2C device address ────────────────────────────────────────────────────────
+
+/// The module's 7-bit device address, as the `pub const` an I2C config file
+/// carries. Ends in a newline; empty string for a family that generates no bus.
+///
+/// One emitter for every backend, because this is the setting that reached only
+/// ONE of them. The panel has collected an address since the I2C module existed,
+/// and `I2cModuleConfig.address` had a single non-UI reader in the whole tree —
+/// the ESP file — so on every other family the user set an address, saved, and
+/// the generated code never mentioned it again. That is the house rule
+/// backwards: the UI offered what codegen would not write.
+///
+/// The comment carries as much weight as the value. Every HAL here takes the
+/// address PER TRANSACTION (`write_read(addr, …)`) and none takes it at `init`,
+/// so a reader who assumes it is a constructor argument goes hunting for a
+/// parameter that does not exist. Each generated example used to invent its own
+/// `const ADDR: u8 = 0x3C;` two lines below `init` rather than name the real
+/// one — which meant the example ignored the address the user had just set.
+///
+/// Sits INSIDE the GENERATED markers: it follows the Virtual Module, while the
+/// editable half below them stays the user's.
+///
+/// `peri` is `None` in a per-peripheral config file, whose module path
+/// (`pins::configs::i2c1`) already says which bus this is. It is the peripheral's
+/// name in `main.rs`, where the families that build their buses inline put it:
+/// one namespace holds every instance at once, so the name has to carry the bus
+/// or two of them would collide on it. The CALLER spells the peripheral, because
+/// the families do not agree on it — Nordic's I2C is `TWIM0`, and a const called
+/// `I2C0_…` beside a `Twim::new` would name a peripheral that chip has not got.
+pub fn device_address_const(peri: Option<&str>, address: u8) -> String {
+    let name = match peri {
+        None => "DEVICE_ADDRESS".to_owned(),
+        Some(p) => format!("{p}_DEVICE_ADDRESS"),
+    };
+    let mut s = String::new();
+    s.push_str("// 7-bit address of the device on this bus — for YOUR code, not for `init`:\n");
+    s.push_str("// an I2C master takes the address per transaction.\n");
+    // 0x00 is the general-call address, not a device — and it is what an
+    // untouched module still holds (`I2cModuleConfig::new`). Saying so beats
+    // emitting it as though someone had chosen it: the const stays, so user
+    // code referring to it keeps compiling once the address IS set.
+    if address == 0 {
+        s.push_str("// Not set in the IDE yet: 0x00 is the general-call address, not a device.\n");
+    }
+    s.push_str(&format!("pub const {name}: u8 = 0x{address:02X};\n"));
+    s
+}
+
+#[cfg(test)]
+mod device_address_tests {
+    use super::device_address_const;
+
+    /// Inside a config file the module path already names the bus, so the const
+    /// is the bare name every family spells the same way. In `main.rs` it is
+    /// not: one namespace holds every instance, and the families do not even
+    /// agree on what the peripheral is called.
+    #[test]
+    fn the_name_carries_the_bus_only_where_one_namespace_holds_them_all() {
+        assert!(device_address_const(None, 0x3C).contains("pub const DEVICE_ADDRESS: u8 = 0x3C;"));
+        assert!(
+            device_address_const(Some("I2C0"), 0x3C)
+                .contains("pub const I2C0_DEVICE_ADDRESS: u8 = 0x3C;")
+        );
+        // Nordic's I2C peripheral is a TWIM, and the const sits beside a
+        // `Twim::new`. An `I2C0_` there would name a block the chip has not got.
+        assert!(
+            device_address_const(Some("TWIM0"), 0x3C)
+                .contains("pub const TWIM0_DEVICE_ADDRESS: u8 = 0x3C;")
+        );
+    }
+
+    /// An untouched module still holds 0x00, which is the general-call address
+    /// and not a device. The const is emitted anyway - user code naming it must
+    /// keep compiling once the address IS set - but it says what it is.
+    #[test]
+    fn an_unset_address_says_so_rather_than_passing_for_a_choice() {
+        let unset = device_address_const(None, 0);
+        assert!(
+            unset.contains("pub const DEVICE_ADDRESS: u8 = 0x00;"),
+            "{unset}"
+        );
+        assert!(unset.contains("Not set in the IDE yet"), "{unset}");
+        let set = device_address_const(None, 0x3C);
+        assert!(!set.contains("Not set in the IDE yet"), "{set}");
+    }
+
+    /// The comment is the half that stops a reader hunting for an `init`
+    /// parameter that does not exist: every HAL here takes the address per
+    /// transaction.
+    #[test]
+    fn the_const_explains_that_it_is_not_an_init_argument() {
+        let out = device_address_const(None, 0x3C);
+        assert!(out.contains("per transaction"), "{out}");
+        assert!(out.contains("not for `init`"), "{out}");
+    }
+}
+
 // ── Edge hooks — the user's handler for an armed input ───────────────────────
 //
 // The task (or interrupt handler) an armed input generates sits INSIDE the

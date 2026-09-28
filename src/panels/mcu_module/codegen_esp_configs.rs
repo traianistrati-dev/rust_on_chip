@@ -2853,13 +2853,15 @@ fn rmt_file(n: u8, cfg: Option<&RmtModuleConfig>, rt: EspRuntime, source_hz: u32
 // ── I2C ──────────────────────────────────────────────────────────────────────
 
 fn i2c_file(n: u8, sigs: &[&str], cfg: Option<&I2cModuleConfig>, rt: EspRuntime) -> String {
+    // The address line now comes from the shared emitter rather than being
+    // spelled out here: this file was the ONLY one that wrote it, so the text
+    // that explains it had nowhere to be reused from and the other families
+    // dropped the setting entirely. Wording moved with it — "an I2C master",
+    // not "an esp-hal I2C master", because it is true of every HAL here.
     let consts = format!(
-        "pub const FREQUENCY_HZ: u32 = {};\n\
-         // 7-bit address of the device on this bus — for YOUR code, not for `init`:\n\
-         // an esp-hal I2C master takes the address per transaction.\n\
-         pub const DEVICE_ADDRESS: u8 = 0x{:02X};\n",
+        "pub const FREQUENCY_HZ: u32 = {};\n{}",
         cfg.map_or(100_000, |c| c.clock_hz),
-        cfg.map_or(0, |c| c.address),
+        super::codegen::common::device_address_const(None, cfg.map_or(0, |c| c.address)),
     );
     let bound = "impl PeripheralInput<'d> + PeripheralOutput<'d>";
     let params = format!(

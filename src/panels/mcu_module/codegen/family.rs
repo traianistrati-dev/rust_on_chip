@@ -2099,7 +2099,10 @@ mod tests {
 
             for (name, body) in &files {
                 assert!(
-                    !body.contains("{HANDLE}") && !body.contains("{TX}") && !body.contains("{RX}"),
+                    !body.contains("{HANDLE}")
+                        && !body.contains("{TX}")
+                        && !body.contains("{RX}")
+                        && !body.contains("{ADDR}"),
                     "{what}/{name}: unsubstituted placeholder:\n{body}"
                 );
                 for h in handles_in(body) {
@@ -2110,6 +2113,102 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The 7-bit address the panel collects reaches the generated code on
+    /// EVERY family and runtime that builds an I2C bus.
+    ///
+    /// It used to reach exactly ONE of them. `I2cModuleConfig.address` had a
+    /// single non-UI reader in the whole tree - the ESP config file - so on
+    /// every other family the user set an address, saved, and nothing in the
+    /// output mentioned it again. The Address row was not gated and gave no
+    /// reason, which is this project's rule backwards: the UI offered what
+    /// codegen would not write.
+    ///
+    /// Where it lands differs, and has to. A family with a `pins/configs/`
+    /// file puts it there, beside the clock; the runtimes that build every bus
+    /// inline in `main.rs` have no such file, so it goes to module scope above
+    /// the entry point - which is also why the name carries the peripheral
+    /// there and not in a config file.
+    #[test]
+    fn the_i2c_address_reaches_every_family_that_builds_a_bus() {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+
+        let by_id = |id: &str| {
+            crate::panels::mcu_module::builtins::builtin_definitions()
+                .into_iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("built-in {id}"))
+                .build_mcu()
+        };
+        let stm32 = |family: &str, id: &str| {
+            let mut def =
+                crate::panels::mcu_module::builtins::builtin_for("stm32f103c8t6").unwrap();
+            def.family = family.into();
+            def.id = id.into();
+            def.build_mcu()
+        };
+
+        let cases: Vec<(&str, Mcu, Runtime)> = vec![
+            (
+                "stm32f1 blocking",
+                stm32("stm32f1", "stm32f103c8t6"),
+                Runtime::Blocking,
+            ),
+            (
+                "stm32f4 async",
+                stm32("stm32f4", "stm32f411re"),
+                Runtime::Async,
+            ),
+            (
+                "esp32c3 blocking",
+                crate::panels::mcu_module::mock_esp32c3::create_esp32c3(),
+                Runtime::Blocking,
+            ),
+            (
+                "esp32c3 async",
+                crate::panels::mcu_module::mock_esp32c3::create_esp32c3(),
+                Runtime::Async,
+            ),
+            ("rp2040 blocking", by_id("rp2040_pico"), Runtime::Blocking),
+            ("rp2040 async", by_id("rp2040_pico"), Runtime::Async),
+            (
+                "nrf52833 blocking",
+                by_id("nrf52833_microbit_v2"),
+                Runtime::Blocking,
+            ),
+            (
+                "nrf52833 async",
+                by_id("nrf52833_microbit_v2"),
+                Runtime::Async,
+            ),
+        ];
+
+        for (what, mut mcu, runtime) in cases {
+            mcu.runtime = runtime;
+            mcu.add_module(ModuleKind::GenericInterfaceI2c);
+            let mut wired = false;
+            for md in &mut mcu.modules {
+                if let ModuleConfig::I2c(c) = &mut md.config {
+                    c.address = 0x3C;
+                    wired = true;
+                }
+            }
+            assert!(wired, "{what}: no I2C module to configure");
+
+            // main.rs AND the config files: which of the two holds the const is
+            // the backend's business, and this test is about the value getting
+            // out at all.
+            let mut all = mcu.fresh_main_rs();
+            for (name, body) in mcu.config_files() {
+                all.push_str(&format!("// ==== {name}\n"));
+                all.push_str(&body);
+            }
+            assert!(
+                all.contains("DEVICE_ADDRESS: u8 = 0x3C;"),
+                "{what}: the configured address never reaches the generated code:\n{all}"
+            );
         }
     }
 

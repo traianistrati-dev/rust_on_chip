@@ -2801,6 +2801,7 @@ pub fn init(
 const I2C_TMPL: &str = r#"// <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const CLOCK_KHZ: u32 = {KHZ}; // <=100 Standard, >100 Fast
+{ADDR}
 
 // The wired pins, straight from the MCU Configurator's pin map. They live in
 // this block because re-wiring the peripheral has to update them; the `use` is
@@ -2915,18 +2916,16 @@ pub fn init(
 //
 //     use embedded_hal::i2c::I2c;
 //
-//     const ADDR: u8 = 0x3C; // 7-bit device address
-//
 //     // Write to a register
-//     {HANDLE}.write(ADDR, &[0x10, 0x42]).ok();
+//     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();
 //
 //     // Read bytes
 //     let mut rx = [0u8; 2];
-//     {HANDLE}.read(ADDR, &mut rx).ok();
+//     {HANDLE}.read(DEVICE_ADDRESS, &mut rx).ok();
 //
 //     // Register read: write the address, then read WITHOUT releasing the bus
 //     // (repeated START) — what most sensors expect.
-//     {HANDLE}.write_read(ADDR, &[0x10], &mut rx).ok();
+//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).ok();
 
 "#;
 
@@ -2947,12 +2946,17 @@ fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>, pins: &str) -> String {
         .replace("{PINS}", pins)
         .replace("{AFIO_PARAM}", afio_param)
         .replace("{AFIO_ARG}", afio_arg)
+        .replace(
+            "{ADDR}",
+            &super::common::device_address_const(None, cfg.map(|c| c.address).unwrap_or(0)),
+        )
 }
 
 /// Native `stm32f1xx-hal` I2C init (no eh-1.0 bridge). Returns `BlockingI2c<…>`.
 const I2C_TMPL_NATIVE: &str = r#"// <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const CLOCK_KHZ: u32 = {KHZ}; // <=100 Standard, >100 Fast
+{ADDR}
 
 // The wired pins, straight from the MCU Configurator's pin map. They live in
 // this block because re-wiring the peripheral has to update them; the `use` is
@@ -3015,13 +3019,11 @@ pub fn init(
 //
 //     use embedded_hal_0_2::blocking::i2c::{Read, Write, WriteRead};
 //
-//     const ADDR: u8 = 0x3C; // 7-bit device address
-//
-//     {HANDLE}.write(ADDR, &[0x10, 0x42]).ok();
+//     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();
 //
 //     let mut rx = [0u8; 2];
-//     {HANDLE}.read(ADDR, &mut rx).ok();
-//     {HANDLE}.write_read(ADDR, &[0x10], &mut rx).ok();
+//     {HANDLE}.read(DEVICE_ADDRESS, &mut rx).ok();
+//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).ok();
 
 "#;
 

@@ -1849,6 +1849,9 @@ pub struct AppIde {
     lsp_indexing_since: Option<std::time::Instant>,
     /// When `recheck_linked_projects` last looked - it runs at most every 2 s.
     linked_check_at: Option<std::time::Instant>,
+    /// `(hash of the Cargo.toml buffer, its library folders)` - see
+    /// `AppIde::built_lib_dirs`.
+    built_libs_memo: Option<(u64, Vec<String>)>,
     // ── Inline type hints (inferred type on the cursor's `let` line) ──────────
     /// Master switch for the cursor-line inferred-type ghost hint + its Tab
     /// accept; toggled from the editor toolbar ("Types" button). `true` default.
@@ -2491,6 +2494,7 @@ impl AppIde {
             last_workspace_change: None,
             lsp_indexing_since: None,
             linked_check_at: None,
+            built_libs_memo: None,
             lsp_flush_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inlay_types_enabled: true,
             clippy_rename_pending: false,

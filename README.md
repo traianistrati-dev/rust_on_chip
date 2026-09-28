@@ -12,8 +12,9 @@ safe across regenerations.
 
 ![A tour of RustOnChip](docs/rust_on_chip_tour.gif)
 
-> Status: early development (`v0.2.4`). **Fifteen chips ship built in** — one
-> STM32, nine ESP32, all four Raspberry Pi Pico boards and the BBC micro:bit v2 —
+> Status: early development (`v0.2.4`). **Sixteen chips ship built in** — one
+> STM32, nine ESP32, five RP2040/RP2350 boards (the four Raspberry Pi Picos and
+> tinyVision's pico2-ice) and the BBC micro:bit v2 —
 > and the rest of the STM32 catalogue is reachable by importing a part from ST's
 > own database. A new chip inside a supported family is plain data, no rebuild.
 > Renamed from `embedded_ide` on 2026-09-20. The old URL still redirects — update your
@@ -133,8 +134,10 @@ it is the one people expect async to give them and it does not.
 
 ### Raspberry Pi Pico
 
-All four boards ship built in. These are **boards, not chips**: the pin map is
-the 40-pin header, and the on-board hardware is part of the definition.
+All four Raspberry Pi boards ship built in, and so does tinyVision's pico2-ice.
+These are **boards, not chips**: the pin map is the board's headers (the Pico's
+40-pin one, the pico2-ice's two, J2 and J3), and the on-board hardware is part
+of the definition.
 
 | Board | Chip | Core | Max clock | Target |
 |-------|------|------|-----------|--------|
@@ -142,8 +145,16 @@ the 40-pin header, and the on-board hardware is part of the definition.
 | **Raspberry Pi Pico W** | RP2040 | Cortex-M0+ ×2 | 133 MHz | `thumbv6m-none-eabi` |
 | **Raspberry Pi Pico 2** | RP2350 | Cortex-M33 ×2 | 150 MHz | `thumbv8m.main-none-eabihf` |
 | **Raspberry Pi Pico 2 W** | RP2350 | Cortex-M33 ×2 | 150 MHz | `thumbv8m.main-none-eabihf` |
+| **tinyVision pico2-ice** | RP2350B + iCE40UP5K FPGA | Cortex-M33 ×2 | 150 MHz | `thumbv8m.main-none-eabihf` |
 
 Blocking builds on `rp2040-hal` / `rp235x-hal`; async on `embassy-rp`.
+
+> **The pico2-ice carries an FPGA.** Set its CRESET pad to GPIO Output and the
+> generated firmware, on either runtime, loads `fpga/top.bin` into the
+> iCE40UP5K's configuration RAM at every boot. The IDE puts a default design
+> there, with its Verilog source and tinyVision's pin file: it writes any of
+> those files that is missing and never overwrites one, so replace `top.bin`
+> with your own.
 
 > **The W boards' LED is not on the chip.** It hangs off GPIO 0 of the CYW43
 > radio, reached through PIO — so it is **async only**, and it needs three
@@ -598,7 +609,7 @@ flash) builds `--release` and parses the ELF itself into Flash/RAM bars against
   - STM32 (M4/M7/M33): `thumbv7em-none-eabihf` · `thumbv8m.main-none-eabihf`
   - ESP32 RISC-V: `riscv32imc-unknown-none-elf` · `riscv32imac-unknown-none-elf`
   - ESP32 Xtensa: the `esp` toolchain from [espup](https://github.com/esp-rs/espup)
-  - Pico: `thumbv6m-none-eabi` · Pico 2: `thumbv8m.main-none-eabihf`
+  - Pico: `thumbv6m-none-eabi` · Pico 2 / pico2-ice: `thumbv8m.main-none-eabihf`
   - micro:bit v2: `thumbv7em-none-eabihf`
 - Flashing tools as needed: [`probe-rs`](https://probe.rs/),
   [OpenOCD](https://openocd.org/),
@@ -709,7 +720,8 @@ And three things the dual license above does **not** cover:
   binary itself embeds these blobs to write them into Pico W projects, so a
   binary release must reproduce that notice too.
 - **tinyVision's `pico2_ice.pcf`** (`assets/fpga-gateware/pico2-ice/`, built
-  into the IDE and copied into every pico2-ice project) and the test bitstream
+  into the IDE and copied into every pico2-ice project that loads the FPGA) and
+  the test bitstream
   `src/panels/mcu_module/testdata/rgb_blink.bin` are MIT, each with its
   license file beside it.
 - **OpenOCD is GPL**, but the IDE only *invokes* it as a subprocess. Invoking is

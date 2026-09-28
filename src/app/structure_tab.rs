@@ -49,6 +49,9 @@ impl AppIde {
                 }
         };
         if self.structure_cache.as_ref().map(|(h, _, _)| *h) != Some(hash) {
+            // The LIBRARIES panel's own predicate, so the amber means the same
+            // thing in both places.
+            let members = self.built_lib_dirs();
             let files = &self.project_tree.user_src_files;
             // Read from the manifests, not guessed from folder names: a
             // detached library named like a crates.io dependency is neither
@@ -58,9 +61,6 @@ impl AppIde {
             if self.structure_view.show_externals {
                 parse::add_external_nodes_with(&mut graph, &self.generated_code, files, &links);
             }
-            // The LIBRARIES panel's own predicate, so the amber means the same
-            // thing in both places.
-            let members = crate::project_tree::extract_crate::built_lib_dirs(&self.cargo_toml);
             let ra_linked = self.lsp_state.lock().unwrap().linked_projects.clone();
             let detached: Vec<parse::DetachedLib> =
                 crate::project_tree::extract_crate::detached_libs(files, &members)

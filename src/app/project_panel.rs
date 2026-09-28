@@ -387,12 +387,22 @@ impl AppIde {
                     // top-level folder must not be presented as one.
                     let lib_crates =
                         crate::panels::mcu_module::project_gen::workspace_members(&self.cargo_toml);
+                    // Every folder cargo loads with the firmware: the members, plus
+                    // any the root reaches through a `path` dependency. Those are
+                    // loaded too, so they are no "NOT IN WORKSPACE" library - but
+                    // their dependency line is the user's, not the IDE's to edit.
+                    let built = self.built_lib_dirs();
+                    let path_dep_libs: Vec<String> = built
+                        .iter()
+                        .filter(|d| !lib_crates.contains(d))
+                        .cloned()
+                        .collect();
                     // Cloned libraries not (yet) promoted into the workspace — shown
                     // in their own LIBRARIES subsection with an "Add to workspace"
                     // action (guarded by a cargo-metadata pre-check).
                     let detached = crate::project_tree::extract_crate::detached_libs(
                         &self.project_tree.user_src_files,
-                        &crate::project_tree::extract_crate::built_lib_dirs(&self.cargo_toml),
+                        &built,
                     );
                     // Which detached lib has a pre-check running (spinner in the row).
                     let ws_add_pending = self.workspace_add.as_ref().map(|w| w.dir.clone());
@@ -433,6 +443,7 @@ impl AppIde {
                                 save_project_needed,
                                 &mut extract_folder,
                                 &lib_crates,
+                                &path_dep_libs,
                                 &detached,
                                 ws_add_pending.as_deref(),
                                 &mut self.tree_split_ratio,

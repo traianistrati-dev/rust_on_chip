@@ -55,26 +55,27 @@ where
     /// the load: from then on it is the FPGA's `SPI_SO`, which the FPGA drives
     /// itself once configured.
     ///
-    /// `cycles_per_us` is the CPU clock in MHz and `half` half an SCK period in
-    /// CPU cycles; `wait` never returns early.
+    /// `half` is half an SCK period in CPU cycles, paced by `wait`, which only
+    /// sets how fast the clock runs. `settle_us` never returns early: it
+    /// carries the FPGA's hard minimums, in microseconds.
     fn ice40_sleep_flash(
         &mut self,
         so: &mut impl embedded_hal::digital::OutputPin,
-        cycles_per_us: u32,
         half: u32,
         wait: &mut impl FnMut(u32),
+        settle_us: &mut impl FnMut(u32),
     ) {
         let _ = self.creset.set_low();
         let _ = self.ss.set_high();
         let _ = self.sck.set_high();
         let _ = self.si.set_low();
         let _ = so.set_low();
-        wait(cycles_per_us.saturating_mul(2));
+        settle_us(2);
         let _ = self.ss.set_low();
         ice40_shift(&mut self.sck, so, 0xB9, half, wait);
         let _ = so.set_low();
         let _ = self.ss.set_high();
-        wait(cycles_per_us.saturating_mul(5));
+        settle_us(5);
     }
 
     /// Loads `image` and says whether the FPGA took it (CDONE high). Call
@@ -84,17 +85,17 @@ where
     /// FPGA stays in reset rather than half-configured.
     fn ice40_load(
         &mut self,
-        cycles_per_us: u32,
         half: u32,
         wait: &mut impl FnMut(u32),
+        settle_us: &mut impl FnMut(u32),
         image: &[u8],
     ) -> bool {
         // SS low while CRESET rises is what selects SLAVE mode; then the FPGA
         // clears its configuration memory for at least 1200 us.
         let _ = self.ss.set_low();
-        wait(cycles_per_us.saturating_mul(2));
+        settle_us(2);
         let _ = self.creset.set_high();
-        wait(cycles_per_us.saturating_mul(1300));
+        settle_us(1300);
 
         // Eight dummy clocks with SS high, then the image with SS low.
         let _ = self.ss.set_high();

@@ -3067,7 +3067,7 @@ fn initialization_options_for(workspace_dir: &Path) -> serde_json::Value {
 /// dropped. `..` is kept as a LITERAL component, because cargo's
 /// `Path::starts_with` does not resolve it either - so `x/../mylib` excludes
 /// nothing, exactly as in cargo.
-fn cargo_components(path: &str) -> Vec<String> {
+pub(crate) fn cargo_components(path: &str) -> Vec<String> {
     let path = if cfg!(windows) {
         path.replace('\\', "/")
     } else {
@@ -3121,14 +3121,34 @@ pub fn ra_links_detached(linked: &[String], dir: &str) -> bool {
 }
 
 /// What a launch would put in `LspState::linked_projects` right now - the
-/// set `AppIde::recheck_linked_projects` compares against the running one.
+/// set `AppIde::recheck_linked_projects` compares against `running`, the one
+/// the running analyzer was started with.
 ///
-/// `None` is for "cannot tell right now", which a manifest that does not parse
-/// should be: rust-analyzer cannot load it either, so a restart then only
-/// swaps a working analyzer for one that loads nothing. Not yet - a broken
-/// manifest still answers (`a_broken_root_manifest_is_no_answer`).
-pub fn linked_projects_now(workspace_dir: &Path) -> Option<Vec<String>> {
-    Some(linked_projects(workspace_dir).unwrap_or_default())
+/// A manifest that is empty or not TOML - a half-typed file - decides
+/// nothing. Read as "no `[workspace]`", a broken root ADDED a library cargo
+/// refuses, so a typo restarted rust-analyzer into one that cannot load the
+/// root at all, and fixing the typo restarted it again. So an unreadable root
+/// gives `None` ("cannot tell"), and an unreadable library manifest keeps
+/// the linkage `running` has for that one library: a folder whose manifest
+/// STAYS unreadable - a template, a file New File left as `// New file` -
+/// must not hide every other library's change. A library whose manifest is
+/// GONE is an answer: the library left.
+pub fn linked_projects_now(workspace_dir: &Path, running: &[String]) -> Option<Vec<String>> {
+    let root = std::fs::read_to_string(workspace_dir.join("Cargo.toml")).ok()?;
+    let readable = |m: &str| !m.trim().is_empty() && crate::publish::manifest_parses(m);
+    if !readable(&root) {
+        return None;
+    }
+    let libs = detached_candidates(workspace_dir, &root)
+        .into_iter()
+        .filter(|(name, _, text)| match text.as_deref() {
+            None => false,
+            Some(t) if readable(t) => cargo_can_load_detached(&root, name, t),
+            Some(_) => ra_links_detached(running, name),
+        })
+        .map(|(_, manifest, _)| manifest.display().to_string())
+        .collect();
+    Some(with_firmware_first(workspace_dir, libs).unwrap_or_default())
 }
 
 /// The `linkedProjects` rust-analyzer should load for the project in
@@ -3142,21 +3162,45 @@ pub fn linked_projects_now(workspace_dir: &Path) -> Option<Vec<String>> {
 /// workspaces" message and not one reference.
 fn linked_projects(workspace_dir: &Path) -> Option<Vec<String>> {
     let root = std::fs::read_to_string(workspace_dir.join("Cargo.toml")).ok()?;
-    let members = crate::project_tree::extract_crate::built_lib_dirs(&root);
-    let mut libs = Vec::new();
-    for entry in std::fs::read_dir(workspace_dir).ok()?.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name == "src" || name == "target" || members.contains(&name) {
-            continue;
-        }
-        let manifest = entry.path().join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
-            continue;
-        };
-        if cargo_can_load_detached(&root, &name, &text) {
-            libs.push(manifest.display().to_string());
-        }
-    }
+    let libs = detached_candidates(workspace_dir, &root)
+        .into_iter()
+        .filter(|(name, _, text)| {
+            text.as_deref()
+                .is_some_and(|t| cargo_can_load_detached(&root, name, t))
+        })
+        .map(|(_, manifest, _)| manifest.display().to_string())
+        .collect();
+    with_firmware_first(workspace_dir, libs)
+}
+
+/// A folder of the workspace that may hold a detached library: its name, its
+/// manifest's path, and that manifest's text (`None`: it has none).
+type DetachedCandidate = (String, std::path::PathBuf, Option<String>);
+
+/// Every folder of the workspace that may hold a detached library - not
+/// hidden, not `src` or `target`, and not one the root builds.
+fn detached_candidates(workspace_dir: &Path, root: &str) -> Vec<DetachedCandidate> {
+    let built = crate::project_tree::extract_crate::built_lib_dirs(root);
+    let Ok(entries) = std::fs::read_dir(workspace_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == "src" || name == "target" || built.contains(&name) {
+                return None;
+            }
+            let manifest = entry.path().join("Cargo.toml");
+            let text = std::fs::read_to_string(&manifest).ok();
+            Some((name, manifest, text))
+        })
+        .collect()
+}
+
+/// The firmware's manifest, then the libraries' sorted - `None` when there
+/// is no library.
+fn with_firmware_first(workspace_dir: &Path, mut libs: Vec<String>) -> Option<Vec<String>> {
     if libs.is_empty() {
         return None;
     }
@@ -4929,6 +4973,33 @@ mod linked_projects_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Found by the second review: without a `[workspace]` table cargo does
+    /// not load a path dependency nothing turns on, or one gated to another
+    /// target - so the firmware's load does not carry it, and it must stay a
+    /// linked project, or rust-analyzer indexes it nowhere.
+    #[test]
+    fn a_gated_path_dependency_is_still_linked() {
+        for (tag, root) in [
+            (
+                "optional",
+                "[package]\nname = \"fw\"\n\n[dependencies]\nmylib = { path = \"mylib\", optional = true }\n",
+            ),
+            (
+                "cfg",
+                "[package]\nname = \"fw\"\n\n[target.'cfg(target_os = \"linux\")'.dependencies]\nmylib = { path = \"mylib\" }\n",
+            ),
+            // Excluded, a `[workspace]` does not make it a member either.
+            (
+                "excluded",
+                "[package]\nname = \"fw\"\n\n[workspace]\nmembers = []\nexclude = [\"mylib\"]\n\n[dependencies]\nmylib = { path = \"mylib\", optional = true }\n",
+            ),
+        ] {
+            let d = scratch(tag, root);
+            assert_eq!(linked_projects(&d).map(|v| v.len()), Some(2), "{tag}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
     /// Found by review: a root manifest that does not parse read as "no
     /// `[workspace]`", which ADDS a library cargo refuses - so a typo restarted
     /// the analyzer into one that cannot load the root at all, and fixing the
@@ -4942,23 +5013,59 @@ mod linked_projects_tests {
             "   \n",
         ] {
             std::fs::write(d.join("Cargo.toml"), broken).unwrap();
-            assert_eq!(linked_projects_now(&d), None, "{broken:?}");
+            assert_eq!(linked_projects_now(&d, &[]), None, "{broken:?}");
         }
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The same for a library whose own `[workspace]` table is what lets cargo
-    /// load it: half-typed, it dropped out of the set, and back in once fixed.
+    /// A library whose own `[workspace]` table is what lets cargo load it
+    /// dropped out of the set while its manifest was half-typed, and came back
+    /// once fixed - two restarts. It keeps the linkage it has instead, either way.
     #[test]
-    fn a_broken_library_manifest_is_no_answer() {
+    fn a_broken_library_manifest_keeps_its_linkage() {
         let d = scratch(
             "broken_lib",
             "[package]\nname = \"fw\"\n\n[workspace]\nmembers = []\n",
         );
-        for broken in [format!("{LIB}\n[workspace\n"), String::new()] {
+        std::fs::write(d.join("mylib/Cargo.toml"), format!("{LIB}\n[workspace]\n")).unwrap();
+        let running = linked_projects_now(&d, &[]).expect("readable");
+        assert_eq!(running.len(), 2, "its own [workspace] admits it");
+        for broken in [
+            format!("{LIB}\n[workspace\n"),
+            String::new(),
+            "// New file\n".to_owned(),
+        ] {
             std::fs::write(d.join("mylib/Cargo.toml"), &broken).unwrap();
-            assert_eq!(linked_projects_now(&d), None, "{broken:?}");
+            assert_eq!(
+                linked_projects_now(&d, &running),
+                Some(running.clone()),
+                "{broken:?}"
+            );
+            assert_eq!(linked_projects_now(&d, &[]), Some(vec![]), "{broken:?}");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Found by the second review: one folder whose Cargo.toml STAYS
+    /// unreadable made every answer "cannot tell", so no later linkage change
+    /// restarted the analyzer - the frozen state the recheck exists to undo.
+    #[test]
+    fn an_unrelated_broken_manifest_does_not_hide_a_real_change() {
+        let d = scratch(
+            "unrelated",
+            "[package]\nname = \"fw\"\n\n[workspace]\nmembers = []\nexclude = [\"mylib\"]\n",
+        );
+        std::fs::create_dir_all(d.join("tmpl")).unwrap();
+        std::fs::write(d.join("tmpl/Cargo.toml"), "// New file\n").unwrap();
+        let running = linked_projects_now(&d, &[]).expect("readable root");
+        assert_eq!(running.len(), 2, "{running:?}");
+        // The `exclude` line goes: cargo refuses mylib now, and the set says so.
+        std::fs::write(
+            d.join("Cargo.toml"),
+            "[package]\nname = \"fw\"\n\n[workspace]\nmembers = []\n",
+        )
+        .unwrap();
+        assert_eq!(linked_projects_now(&d, &running), Some(vec![]));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -4968,26 +5075,24 @@ mod linked_projects_tests {
     fn a_readable_manifest_still_answers() {
         let detach_state = "[package]\nname = \"fw\"\n\n[workspace]\nmembers = []\n";
         let d = scratch("readable", detach_state);
-        assert_eq!(linked_projects_now(&d), Some(vec![]));
+        assert_eq!(linked_projects_now(&d, &[]), Some(vec![]));
         std::fs::write(
             d.join("Cargo.toml"),
             format!("{detach_state}\n[dependencies]\nx = {{ vesion = \"1\" }}\n"),
         )
         .unwrap();
         assert_eq!(
-            linked_projects_now(&d),
+            linked_projects_now(&d, &[]),
             Some(vec![]),
             "a typo that is still TOML"
         );
         std::fs::write(d.join("mylib/Cargo.toml"), format!("{LIB}\n[workspace]\n")).unwrap();
-        assert_eq!(
-            linked_projects_now(&d).map(|v| v.len()),
-            Some(2),
-            "its own [workspace] admits it"
-        );
+        let running = linked_projects_now(&d, &[]).expect("readable");
+        assert_eq!(running.len(), 2, "its own [workspace] admits it");
+        // Gone is not unreadable: it leaves although the analyzer has it.
         std::fs::remove_file(d.join("mylib/Cargo.toml")).unwrap();
         assert_eq!(
-            linked_projects_now(&d),
+            linked_projects_now(&d, &running),
             Some(vec![]),
             "a library that is gone"
         );

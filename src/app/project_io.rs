@@ -36,6 +36,9 @@ impl AppIde {
         self.lsp_settle_recheck_done = false;
         // A new project gets its own automatic restart after a crash mid-load.
         self.lsp_auto_restarted = false;
+        // The last parsed manifest's library folders belong to the project
+        // being left.
+        self.built_libs_memo = None;
         self.last_workspace_change = Some(std::time::Instant::now());
 
         self.selected_file = ProjectFileId::MainRs;
@@ -274,12 +277,17 @@ impl AppIde {
     /// options, the Flow tab's reading position - from `root`'s
     /// `project_structure.config`.
     ///
-    /// Only what the file holds is applied, so whatever it leaves out still
-    /// carries the previous project's value
-    /// (`opening_a_project_forgets_the_last_ones_structure_view`).
+    /// Everything the file leaves out starts at its default, never at the
+    /// previous project's value: a default Structure view writes no section,
+    /// and the Flow tab keeps an open chart key over the saved one - so a
+    /// project inherited both, and wrote them into its own file on Save.
     pub(super) fn restore_view_state(&mut self, root: &std::path::Path) {
         use crate::panels::mcu_module::structure_config;
         let (positions, view, clock, clock_view, flow) = structure_config::load(root);
+        // The session-only parts go too: open nodes are indices into the graph
+        // of the project being left, and its search, zoom and pan with them.
+        self.structure_view = Default::default();
+        self.flow_view = Default::default();
         self.structure_overrides = positions;
         // Clock-diagram node positions — applied by the Clock tab over the
         // generated layout (unknown ids, e.g. after a chip change, are
@@ -307,6 +315,31 @@ impl AppIde {
         // Same for the Flow tab: a new project's files are different text
         // even when a content hash happens to collide.
         self.flow_cache = None;
+    }
+
+    /// [`crate::project_tree::extract_crate::built_lib_dirs`] of the live
+    /// `Cargo.toml` buffer - kept from the last text that parsed while the
+    /// buffer does not. A half-typed dependency line otherwise flipped a
+    /// path-dependency library into "NOT IN WORKSPACE", with the Rename and
+    /// Delete it must not offer, and the Structure tab's amber, then back, on
+    /// every keystroke. Worked out again only when the text changes: the
+    /// LIBRARIES panel asks every frame.
+    pub(super) fn built_lib_dirs(&mut self) -> Vec<String> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        self.cargo_toml.hash(&mut h);
+        let hash = h.finish();
+        if let Some((at, dirs)) = &self.built_libs_memo
+            && *at == hash
+        {
+            return dirs.clone();
+        }
+        let dirs = match &self.built_libs_memo {
+            Some((_, last)) if !crate::publish::manifest_parses(&self.cargo_toml) => last.clone(),
+            _ => crate::project_tree::extract_crate::built_lib_dirs(&self.cargo_toml),
+        };
+        self.built_libs_memo = Some((hash, dirs.clone()));
+        dirs
     }
 
     // ── Project-folder claim ──────────────────────────────────────────────────
@@ -1038,11 +1071,13 @@ impl AppIde {
             return;
         }
         self.linked_check_at = Some(std::time::Instant::now());
-        // `None`: the manifests cannot say right now - keep what is running.
-        let Some(now) = crate::lsp::linked_projects_now(&crate::workspace::dir()) else {
+        // `None`: the root manifest cannot say right now - keep what is
+        // running. A library's unreadable manifest keeps its own linkage.
+        let running = self.lsp_state.lock().unwrap().linked_projects.clone();
+        let Some(now) = crate::lsp::linked_projects_now(&crate::workspace::dir(), &running) else {
             return;
         };
-        if now != self.lsp_state.lock().unwrap().linked_projects {
+        if now != running {
             self.restart_lsp();
         }
     }

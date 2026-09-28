@@ -349,11 +349,74 @@ pub fn detached_libs(user_files: &[(String, String)], members: &[String]) -> Vec
 /// detached verdict, the LIBRARIES panel and rust-analyzer's `linkedProjects`.
 /// Pass it to [`detached_libs`] as `members`.
 ///
-/// Still the explicit `[workspace] members` only, so a library the root
-/// reaches through a `path` dependency is called detached although cargo
-/// builds it (`a_path_dependency_is_never_detached`).
+/// The explicit `[workspace] members`, plus the folders the root reaches
+/// through a `path` dependency - in any dependency table, per-target ones
+/// included, or inherited from `[workspace.dependencies]` (measured with
+/// cargo 1.98):
+/// - with a `[workspace]` table, every one its `exclude` does not cover:
+///   cargo makes each an implicit member, optional or `cfg`-gated alike;
+/// - otherwise - no `[workspace]` (the IDE's own templates), or the folder
+///   excluded - only what cargo resolves for the firmware: nothing optional
+///   the default features leave out, and nothing under `[target.<spec>]`,
+///   whose spec this cannot evaluate. A gated one left out stays detached, so
+///   rust-analyzer still gets it as a linked project instead of indexing it
+///   nowhere.
+///
+/// `[patch]` is left out: it builds its folder only when the registry crate it
+/// replaces is in the graph. A root that does not parse yields its members
+/// alone, read as text.
 pub fn built_lib_dirs(root_manifest: &str) -> Vec<String> {
-    crate::panels::mcu_module::project_gen::workspace_members(root_manifest)
+    let mut dirs = crate::panels::mcu_module::project_gen::workspace_members(root_manifest);
+    let workspace = crate::publish::has_workspace_table(root_manifest);
+    // Matched the way cargo matches `exclude`: by path component.
+    let exclude: Vec<Vec<String>> = crate::publish::workspace_array(root_manifest, "exclude")
+        .iter()
+        .map(|e| crate::lsp::cargo_components(e))
+        .collect();
+    for dep in crate::publish::path_dep_uses(root_manifest) {
+        let Some(dir) = project_folder(&dep.path) else {
+            continue;
+        };
+        let gated = dep.per_target
+            || (dep.optional && !crate::publish::enabled_by_default(root_manifest, &dep.name));
+        let implicit_member = workspace
+            && !exclude
+                .iter()
+                .any(|e| crate::lsp::cargo_components(&dir).starts_with(e));
+        if gated && !implicit_member {
+            continue;
+        }
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// A `path` from the root manifest as the project folder it names, resolved
+/// the way cargo resolves a path dependency: `\` a separator on Windows, `.`
+/// dropped, `..` applied. `None` for the project itself, anywhere outside it,
+/// or an absolute path.
+fn project_folder(path: &str) -> Option<String> {
+    let path = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+    if path.starts_with('/') || path.contains(':') {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// Build the plan for extracting `folder` (a path relative to the PROJECT
@@ -903,7 +966,7 @@ mod tests {
         assert!(detached_libs(&files, &["mw_radar".to_owned(), "mmwave".to_owned()]).is_empty());
     }
 
-    /// Found by review: cargo builds a library the root reaches through a
+    /// Found by review: cargo loads a library the root reaches through a
     /// `path` dependency - as an implicit member when the root has a
     /// `[workspace]` table, as a plain dependency when it has none - yet the
     /// Structure tab called it detached, said the firmware does not build it
@@ -926,8 +989,31 @@ mod tests {
             // The IDE's own templates: no `[workspace]` at all.
             format!("{fw}\n[dependencies]\nmylib = {{ path = \"./mylib/\" }}\n"),
             format!("{fw}\n[workspace]\nmembers = []\n\n[dependencies.mylib]\npath = \"mylib\"\n"),
+            // Gated, but a `[workspace]` makes it an implicit member anyway.
             format!(
-                "{fw}\n[target.'cfg(target_os = \"none\")'.dependencies]\nmylib = {{ path = \"mylib\" }}\n"
+                "{fw}\n[workspace]\n\n[target.'cfg(target_os = \"linux\")'.dependencies]\nmylib = {{ path = \"mylib\" }}\n"
+            ),
+            format!(
+                "{fw}\n[workspace]\n\n[dependencies]\nmylib = {{ path = \"mylib\", optional = true }}\n"
+            ),
+            // Optional, and the default feature turns it on - one way or another.
+            format!(
+                "{fw}\n[dependencies]\nmylib = {{ path = \"mylib\", optional = true }}\n\n[features]\ndefault = [\"mylib\"]\n"
+            ),
+            format!(
+                "{fw}\n[dependencies]\nmylib = {{ path = \"mylib\", optional = true }}\n\n[features]\ndefault = [\"radar\"]\nradar = [\"dep:mylib\"]\n"
+            ),
+            format!(
+                "{fw}\n[dependencies]\nmylib = {{ path = \"mylib\", optional = true }}\n\n[features]\ndefault = [\"mylib/fast\"]\n"
+            ),
+            // A weak `?/` too: cargo resolves it, though the build compiles
+            // nothing of it (measured).
+            format!(
+                "{fw}\n[dependencies]\nmylib = {{ path = \"mylib\", optional = true }}\n\n[features]\ndefault = [\"mylib?/fast\"]\n"
+            ),
+            // Excluded, but a plain dependency still loads it (measured).
+            format!(
+                "{fw}\n[workspace]\nmembers = []\nexclude = [\"mylib\"]\n\n[dependencies]\nmylib = {{ path = \"mylib\" }}\n"
             ),
             format!("{fw}\n[dev-dependencies]\nmylib = {{ path = \"mylib\" }}\n"),
             format!(
@@ -946,11 +1032,29 @@ mod tests {
                 "{root}"
             );
         }
-        // Controls: no dependency, or one that leaves the project - both
-        // folders stay detached.
+        // Controls, where both folders stay detached: no dependency, one that
+        // leaves the project, and - found by the reviews - one cargo does not
+        // load for the firmware (measured with `cargo metadata
+        // --filter-platform <target>`, as rust-analyzer runs it): with no
+        // `[workspace]`, or with the folder excluded from it, an optional one
+        // the default features leave out, or one gated to another target. It
+        // must stay a linked project.
         for root in [
             format!("{fw}\n[workspace]\nmembers = []\n"),
             format!("{fw}\n[dependencies]\nmylib = {{ path = \"../elsewhere/mylib\" }}\n"),
+            format!("{fw}\n[dependencies]\nmylib = {{ path = \"mylib\", optional = true }}\n"),
+            format!(
+                "{fw}\n[workspace]\nmembers = []\nexclude = [\"mylib\"]\n\n[dependencies]\nmylib = {{ path = \"mylib\", optional = true }}\n"
+            ),
+            format!(
+                "{fw}\n[workspace]\nmembers = []\nexclude = [\"mylib\"]\n\n[target.'cfg(target_os = \"linux\")'.dependencies]\nmylib = {{ path = \"mylib\" }}\n"
+            ),
+            format!(
+                "{fw}\n[dependencies]\nmylib = {{ path = \"mylib\", optional = true }}\n\n[features]\ndefault = []\nmylib = [\"dep:mylib\"]\n"
+            ),
+            format!(
+                "{fw}\n[target.'cfg(target_os = \"linux\")'.dependencies]\nmylib = {{ path = \"mylib\" }}\n"
+            ),
         ] {
             assert_eq!(
                 detached_libs(&files, &built_lib_dirs(&root)),

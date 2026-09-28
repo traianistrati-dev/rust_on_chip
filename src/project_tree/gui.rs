@@ -1034,6 +1034,11 @@ pub fn show_project_tree(
     // Directory names of the `[workspace] members` — the extracted library
     // crates, each rendered as its own collapsible section below the project.
     lib_crates: &[String],
+    // Libraries the root builds through a `path` dependency without listing
+    // them as members: drawn with the members, but without Rename, Detach or
+    // Delete - those edit the members list and the IDE's own
+    // `[dependencies.<dir>]` table, and this dependency line is the user's.
+    path_dep_libs: &[String],
     // Cloned libraries NOT yet in the workspace (own a Cargo.toml, not members);
     // shown in a DETACHED subsection with an "Add to workspace" action.
     detached_libs: &[String],
@@ -1123,7 +1128,7 @@ pub fn show_project_tree(
 
     // ── Split: project above, LIBRARIES below ────────────────────────────────
     let has_libs = !detached_libs.is_empty()
-        || lib_crates.iter().any(|c| {
+        || lib_crates.iter().chain(path_dep_libs).any(|c| {
             user_src_files
                 .iter()
                 .any(|(p, _)| p.starts_with(&format!("{c}/")))
@@ -1458,6 +1463,7 @@ pub fn show_project_tree(
     // work — because no generated-path guard can match a path outside `src/`.
     let libs: Vec<String> = lib_crates
         .iter()
+        .chain(path_dep_libs)
         .filter(|c| full_tree.contains_key(c.as_str()))
         .cloned()
         .collect();
@@ -1510,6 +1516,7 @@ pub fn show_project_tree(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for lib in &libs {
+                let via_path = path_dep_libs.contains(lib);
                 let id = ui.make_persistent_id(("lib_crate_section", lib.as_str()));
                 let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                     ui.ctx(),
@@ -1544,6 +1551,18 @@ pub fn show_project_tree(
                         .selectable(false)
                         .sense(egui::Sense::click()),
                     );
+                    if via_path {
+                        ui.label(
+                            egui::RichText::new("path dependency")
+                                .size(9.0)
+                                .color(egui::Color32::from_gray(120)),
+                        )
+                        .on_hover_text(
+                            "Loaded with the firmware through a `path` dependency in \
+                             Cargo.toml, not a `[workspace] members` entry. To take it \
+                             out, delete that dependency line.",
+                        );
+                    }
                     // Only the expand/collapse caret stays inline — every action (rename,
                     // detach, delete, open folder) lives in the right-click menu below.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1678,6 +1697,16 @@ pub fn show_project_tree(
                         ui.close();
                     }
                     ui.separator();
+                    if via_path {
+                        ui.label(
+                            egui::RichText::new(
+                                "Loaded through a path dependency.\n\
+                                 Delete that line in Cargo.toml to detach it.",
+                            )
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(140)),
+                        );
+                    } else {
                     if ui
                         .button(menu_label(ph::PENCIL_SIMPLE, "Rename library…", ICON_EDIT))
                         .clicked()
@@ -1710,6 +1739,7 @@ pub fn show_project_tree(
                     {
                         *library_action = Some((lib.clone(), false));
                         ui.close();
+                    }
                     }
                     ui.separator();
                     reveal_menu_items(ui, project_dir, lib);

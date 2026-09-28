@@ -2876,17 +2876,27 @@ mod fpga_loader_codegen {
         assert!(code.contains("fpga_si.into_floating_input()"), "{code}");
     }
 
-    /// `cortex_m::asm::delay` counts loop TURNS, three cycles each on the M33;
-    /// passed cycles straight through, every wait was three times too long and
-    /// the configuration clock fell to about 1 MHz.
+    /// The two waits `fpga_load_waveform` replays, pinned as generated.
+    ///
+    /// `fpga_wait` paces SCK with a third of its count: `delay` counts loop
+    /// TURNS, about three cycles each on the M33, and cycles passed straight
+    /// through made the configuration clock fall to about 1 MHz. `fpga_settle`
+    /// carries the FPGA's minimums and hands `delay` the whole count: "at least
+    /// `n` cycles" is all every cortex-m 0.7 promises, and 0.7.7 runs half the
+    /// turns 0.7.9 does.
     #[test]
-    fn the_wait_counts_turns_not_cycles() {
+    fn the_waits_are_the_ones_the_replay_models() {
         for runtime in [Runtime::Blocking, Runtime::Async] {
             let code = ice(runtime, true).fresh_main_rs();
-            assert!(
-                code.contains("cortex_m::asm::delay(cycles / 3)"),
-                "{runtime:?}:\n{code}"
-            );
+            for needle in [
+                "let fpga_mhz = fpga_sys_hz.div_ceil(1_000_000);",
+                "let mut fpga_wait = |cycles: u32| cortex_m::asm::delay(cycles / 3);",
+                "let mut fpga_settle = |us: u32| cortex_m::asm::delay(us.saturating_mul(fpga_mhz));",
+                "fpga_cram.ice40_sleep_flash(&mut fpga_so, fpga_half, &mut fpga_wait, &mut fpga_settle);",
+                "fpga_cram.ice40_load(fpga_half, &mut fpga_wait, &mut fpga_settle, FPGA_BITSTREAM);",
+            ] {
+                assert!(code.contains(needle), "{runtime:?} lacks {needle}:\n{code}");
+            }
         }
     }
 
@@ -3123,7 +3133,8 @@ mod fpga_load_waveform {
 
     /// [`replay`] on a `cortex_m::asm::delay(n)` that spins `delay(n)` CPU
     /// cycles. The waits are the generated closures: `fpga_wait` is
-    /// `delay(cycles / 3)`.
+    /// `delay(cycles / 3)` and `fpga_settle` is `delay(us * MHz)`
+    /// (`the_waits_are_the_ones_the_replay_models`).
     fn replay_with(image: &[u8], cdone_after: Option<usize>, delay: fn(u32) -> u64) -> (bool, Bus) {
         let bus = Rc::new(RefCell::new(Bus {
             cdone_after,
@@ -3139,13 +3150,17 @@ mod fpga_load_waveform {
         };
         let mut so = pin(Line::So);
         let sys_hz = MHZ * 1_000_000;
-        let (mhz, half) = (sys_hz / 1_000_000, (sys_hz / (2 * 4_000_000)).max(1));
+        let (mhz, half) = (
+            sys_hz.div_ceil(1_000_000),
+            (sys_hz / (2 * 4_000_000)).max(1),
+        );
         let clock = bus.clone();
         let mut wait = |cycles: u32| clock.borrow_mut().now += delay(cycles / 3);
-        cram.ice40_sleep_flash(&mut so, mhz, half, &mut wait);
+        let mut settle = |us: u32| clock.borrow_mut().now += delay(us.saturating_mul(mhz));
+        cram.ice40_sleep_flash(&mut so, half, &mut wait, &mut settle);
         // The generated code releases GP7 here: from now on nothing drives it.
         drop(so);
-        let ok = cram.ice40_load(mhz, half, &mut wait, image);
+        let ok = cram.ice40_load(half, &mut wait, &mut settle, image);
         let _ = cram.ice40_release();
         drop(clock);
         let bus = Rc::try_unwrap(bus).ok().expect("sole owner").into_inner();
@@ -4123,8 +4138,9 @@ fn fpga_items() -> String {
         "static FPGA_BITSTREAM: &[u8] = {};\n\n",
         crate::panels::mcu_module::project_gen::FPGA_BITSTREAM_INCLUDE
     ));
-    o.push_str("/// Upper bound for the bit-banged configuration clock. The FPGA takes up to\n");
-    o.push_str("/// 25 MHz; the pin writes between edges keep the real clock below this.\n");
+    o.push_str("/// The configuration clock the loader aims for. The FPGA takes up to 25 MHz,\n");
+    o.push_str("/// so a `delay` that runs short - cortex-m 0.7.7 spins about half as long -\n");
+    o.push_str("/// stays far inside it.\n");
     o.push_str("const FPGA_SPI_HZ: u32 = 4_000_000;\n\n");
     o.push_str(FPGA_LOADER);
     o.push('\n');
@@ -4165,23 +4181,27 @@ const ASYNC_FPGA_BODY: &str =
         cdone: embassy_rp::gpio::Input::new(p.PIN_40, embassy_rp::gpio::Pull::None),
     };
     let fpga_sys_hz = embassy_rp::clocks::clk_sys_freq();
-    let fpga_mhz = fpga_sys_hz / 1_000_000;
+    let fpga_mhz = fpga_sys_hz.div_ceil(1_000_000);
     let fpga_half = (fpga_sys_hz / (2 * FPGA_SPI_HZ)).max(1);
-    // `delay` spins three cycles per turn on the M33, so a count of cycles is
-    // a third as many turns.
+    // Paces SCK only: `delay` spins about three cycles per turn on the M33, so
+    // a count of cycles is a third as many turns.
     let mut fpga_wait = |cycles: u32| cortex_m::asm::delay(cycles / 3);
+    // The FPGA's hard minimums, in microseconds. `delay(n)` promises at least
+    // `n` cycles and nothing more - how many turns it counts changed between
+    // cortex-m versions - so these hand it the whole count.
+    let mut fpga_settle = |us: u32| cortex_m::asm::delay(us.saturating_mul(fpga_mhz));
     // The FPGA's flash first: asleep, it ignores the load. GP7, its data in,
     // then stops being driven - it is the FPGA's own SPI_SO from here on.
     let mut fpga_so = embassy_rp::gpio::Flex::new(p.PIN_7);
     fpga_so.set_low();
     fpga_so.set_as_output();
-    fpga_cram.ice40_sleep_flash(&mut fpga_so, fpga_mhz, fpga_half, &mut fpga_wait);
+    fpga_cram.ice40_sleep_flash(&mut fpga_so, fpga_half, &mut fpga_wait, &mut fpga_settle);
     fpga_so.set_as_input();
     fpga_so.set_pull(embassy_rp::gpio::Pull::Down);
     // Whether the FPGA took the image (CDONE high). On failure CRESET is
     // already back LOW, holding the FPGA in reset.
     #[allow(unused_variables)]
-    let fpga_ok = fpga_cram.ice40_load(fpga_mhz, fpga_half, &mut fpga_wait, FPGA_BITSTREAM);
+    let fpga_ok = fpga_cram.ice40_load(fpga_half, &mut fpga_wait, &mut fpga_settle, FPGA_BITSTREAM);
     // SCK, SI and SO go back to no function. SS becomes a pulled-up input, so
     // the flash stays deselected. `fpga_reset` driven LOW stops the FPGA.
     #[allow(unused_variables)]
@@ -4221,25 +4241,31 @@ fn blocking_fpga_body(hal: &str, usb_mhz: u32) -> String {
     o.push_str("        cdone: pins.gpio40.into_floating_input(),\n");
     o.push_str("    };\n");
     o.push_str("    let fpga_sys_hz = clocks.system_clock.freq().to_Hz();\n");
-    o.push_str("    let fpga_mhz = fpga_sys_hz / 1_000_000;\n");
+    o.push_str("    let fpga_mhz = fpga_sys_hz.div_ceil(1_000_000);\n");
     o.push_str("    let fpga_half = (fpga_sys_hz / (2 * FPGA_SPI_HZ)).max(1);\n");
-    o.push_str("    // `delay` spins three cycles per turn on the M33, so a count of cycles is\n");
-    o.push_str("    // a third as many turns.\n");
+    o.push_str("    // Paces SCK only: `delay` spins about three cycles per turn on the M33, so\n");
+    o.push_str("    // a count of cycles is a third as many turns.\n");
     o.push_str("    let mut fpga_wait = |cycles: u32| cortex_m::asm::delay(cycles / 3);\n");
+    o.push_str("    // The FPGA's hard minimums, in microseconds. `delay(n)` promises at least\n");
+    o.push_str("    // `n` cycles and nothing more - how many turns it counts changed between\n");
+    o.push_str("    // cortex-m versions - so these hand it the whole count.\n");
+    o.push_str(
+        "    let mut fpga_settle = |us: u32| cortex_m::asm::delay(us.saturating_mul(fpga_mhz));\n",
+    );
     o.push_str("    // The FPGA's flash first: asleep, it ignores the load. GP7, its data in,\n");
     o.push_str("    // then stops being driven - it is the FPGA's own SPI_SO from here on.\n");
     o.push_str(&format!(
         "    let mut fpga_so = pins.gpio7.into_push_pull_output_in_state({hal}::gpio::PinState::Low);\n"
     ));
     o.push_str(
-        "    fpga_cram.ice40_sleep_flash(&mut fpga_so, fpga_mhz, fpga_half, &mut fpga_wait);\n",
+        "    fpga_cram.ice40_sleep_flash(&mut fpga_so, fpga_half, &mut fpga_wait, &mut fpga_settle);\n",
     );
     o.push_str("    let fpga_so = fpga_so.into_pull_down_input();\n");
     o.push_str("    // Whether the FPGA took the image (CDONE high). On failure CRESET is\n");
     o.push_str("    // already back LOW, holding the FPGA in reset.\n");
     o.push_str("    #[allow(unused_variables)]\n");
     o.push_str(
-        "    let fpga_ok = fpga_cram.ice40_load(fpga_mhz, fpga_half, &mut fpga_wait, FPGA_BITSTREAM);\n",
+        "    let fpga_ok = fpga_cram.ice40_load(fpga_half, &mut fpga_wait, &mut fpga_settle, FPGA_BITSTREAM);\n",
     );
     o.push_str("    // SCK, SI and SO become plain inputs, so the RP no longer drives them. SS\n");
     o.push_str("    // is pulled up, so the flash stays deselected. `fpga_reset` driven LOW\n");

@@ -347,6 +347,112 @@ pub fn path_deps(manifest: &str) -> Vec<PathDep> {
     out
 }
 
+/// A `path` dependency with what decides whether cargo resolves it for the
+/// package: `optional`, and whether it sits under a `[target.<spec>]` table.
+/// One inherited with `{ workspace = true }` carries the path of its
+/// `[workspace.dependencies]` entry.
+pub struct PathDepUse {
+    pub name: String,
+    /// As written - relative to the manifest's own folder.
+    pub path: String,
+    pub optional: bool,
+    pub per_target: bool,
+}
+
+/// Every `path` dependency of `manifest`, in all three dependency tables and
+/// the per-target ones, direct or inherited from `[workspace.dependencies]`.
+pub fn path_dep_uses(manifest: &str) -> Vec<PathDepUse> {
+    let Some(doc) = doc(manifest) else {
+        return Vec::new();
+    };
+    let inheritable = path_entries(doc.get("workspace").and_then(|w| w.get("dependencies")));
+    let mut out = Vec::new();
+    let mut collect = |table: &toml_edit::Item, per_target: bool| {
+        let Some(t) = table.as_table_like() else {
+            return;
+        };
+        for (name, item) in t.iter() {
+            let path = if let Some(p) = item.get("path").and_then(|p| p.as_str()) {
+                p.to_owned()
+            } else if is_inherited(item)
+                && let Some((_, p)) = inheritable.iter().find(|(n, _)| n == name)
+            {
+                p.clone()
+            } else {
+                continue;
+            };
+            out.push(PathDepUse {
+                name: name.to_owned(),
+                path,
+                optional: item
+                    .get("optional")
+                    .and_then(|o| o.as_bool())
+                    .unwrap_or(false),
+                per_target,
+            });
+        }
+    };
+    const TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    for name in TABLES {
+        if let Some(t) = doc.get(name) {
+            collect(t, false);
+        }
+    }
+    if let Some(targets) = doc.get("target").and_then(|t| t.as_table_like()) {
+        for (_, per_target) in targets.iter() {
+            for name in TABLES {
+                if let Some(t) = per_target.get(name) {
+                    collect(t, true);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether resolving `manifest` with its default features takes in the
+/// optional dependency `dep`: through `dep`, `dep:dep`, `dep/<feature>` or
+/// `dep?/<feature>`, directly or in a feature `default` enables. A weak
+/// `dep?/<feature>` counts: cargo's dependency resolver - so `cargo metadata`,
+/// Cargo.lock and rust-analyzer - takes the dependency in, although the build
+/// then compiles nothing of it (measured with cargo 1.98). A feature of the
+/// same name shadows the dependency's implicit one.
+pub fn enabled_by_default(manifest: &str, dep: &str) -> bool {
+    let Some(doc) = doc(manifest) else {
+        return false;
+    };
+    let Some(features) = doc.get("features").and_then(|f| f.as_table_like()) else {
+        return false;
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut todo = vec!["default".to_owned()];
+    while let Some(feature) = todo.pop() {
+        if seen.contains(&feature) {
+            continue;
+        }
+        seen.push(feature.clone());
+        let Some(list) = features.get(&feature).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for entry in list.iter().filter_map(|v| v.as_str()) {
+            if let Some(name) = entry.strip_prefix("dep:") {
+                if name == dep {
+                    return true;
+                }
+            } else if let Some((name, _)) = entry.split_once('/') {
+                if name.strip_suffix('?').unwrap_or(name) == dep {
+                    return true;
+                }
+            } else if features.contains_key(entry) {
+                todo.push(entry.to_owned());
+            } else if entry == dep {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Check a library's manifest for everything that would stop a publish.
 ///
 /// `sibling_published` answers whether a path dependency is already available

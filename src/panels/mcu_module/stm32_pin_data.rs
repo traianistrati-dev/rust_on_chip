@@ -1147,13 +1147,87 @@ pub fn hal_dep_for_name(family: &str, name: &str) -> String {
     if family == "stm32f1" {
         return match f1_line_from_name(name) {
             Some(line) => hal_dep_for(family, &line, name),
-            // An F1 family with a name we can't pin to a device feature — leave
-            // an editable TODO rather than an empty `features = ["", "rt"]`.
-            None => format!("# TODO: set the stm32f1xx-hal device feature for {name}"),
+            // An F1 family with a name we can't pin to a device feature — a
+            // real line with the feature left out and a TODO beside it, rather
+            // than an empty `features = ["", "rt"]`.
+            None => f1_blocking_hal_dep_todo(name),
         };
     }
     // `line` is unused outside the F1 branch of `hal_dep_for`.
     hal_dep_for(family, "", name)
+}
+
+/// The `embassy-stm32` line an STM32F1 builds with on the Async runtime, or
+/// `None` when neither name is a recognisable F1 part number.
+///
+/// F1 is the one STM32 family with two HALs: `stm32f1xx-hal` on Blocking,
+/// Native and RTIC, embassy-stm32 on Async. The line is DERIVED rather than
+/// stored because the `.ron` files already on disk - the built-in and every F1
+/// part imported before this existed - carry only the blocking line. Every F1
+/// feature embassy-stm32 0.6 publishes is the part number's first eleven
+/// characters (`stm32f103c8`): all 95 of them, counted in its Cargo.toml.
+/// `probe_chip` comes first because it is the bare part number
+/// (`STM32F103C8`), with `pkg_name` (`stm32f103c8t6`) as the fallback.
+///
+/// Both trailing letters are checked against what the F1 parts use, the pin
+/// count (`c` 48, `r` 64, `t` 36, `v` 100, `z` 144) and the flash size (`4` to
+/// `8`, `b` to `g`), so a generic name such as `STM32F103xB` is refused rather
+/// than turned into a feature cargo has never heard of.
+pub fn f1_embassy_hal_dep(probe_chip: &str, pkg_name: &str) -> Option<String> {
+    [probe_chip, pkg_name].into_iter().find_map(|name| {
+        let slug = slugify(name); // lower-case a-z0-9 only, so byte-indexable
+        let b = slug.as_bytes();
+        let ok = slug.len() >= 11
+            && slug.starts_with("stm32f1")
+            && b[7].is_ascii_digit()
+            && b[8].is_ascii_digit()
+            && b"crtvz".contains(&b[9])
+            && b"468bcdefg".contains(&b[10]);
+        ok.then(|| {
+            format!(
+                "{EMBASSY_CRATE} = {{ version = \"{EMBASSY_VERSION}\", features = [\"{}\"] }}",
+                &slug[..11]
+            )
+        })
+    })
+}
+
+/// The blocking line for an F1 whose part number names no `stm32f1xx-hal`
+/// device feature: the crate without one, and a TODO saying which to add.
+///
+/// A dependency line, not a bare `# TODO` comment. A comment names no crate,
+/// so after an Async round trip `project_gen::refresh_hal_dependency` had
+/// nothing to swap back to, and the manifest kept embassy-stm32 under
+/// stm32f1xx-hal code. Without a device feature the crate refuses to build
+/// with its own "no device selected" error, which is the right place to learn.
+pub fn f1_blocking_hal_dep_todo(name: &str) -> String {
+    format!(
+        concat!(
+            "stm32f1xx-hal = {{ version = \"0.10\", features = [\"rt\"] }} ",
+            "# TODO: add the device feature for {name}, such as \"stm32f103\""
+        ),
+        name = name,
+    )
+}
+
+/// The async line for an F1 whose part number [`f1_embassy_hal_dep`] cannot
+/// read. Still an `embassy-stm32` line, so the runtime switch swaps the crate
+/// and the manifest matches the embassy code - with the feature to fill in
+/// named where cargo will point. A bare `# TODO` comment would leave the
+/// blocking HAL in place, since a comment names no crate to swap to.
+pub fn f1_embassy_hal_dep_todo(name: &str) -> String {
+    // `concat!`, not a `\`-continued literal: rustfmt rejoins those and leaves
+    // the indentation inside the manifest line.
+    format!(
+        concat!(
+            "{krate} = {{ version = \"{version}\", features = [\"stm32f1xxxx\"] }} ",
+            "# TODO: the chip feature for {name} - its part number's first 11 ",
+            "characters, such as stm32f103c8"
+        ),
+        krate = EMBASSY_CRATE,
+        version = EMBASSY_VERSION,
+        name = name,
+    )
 }
 
 /// The `stm32f1xx-hal` device feature (`stm32f103`) implied by an STM32F1 part
@@ -1891,6 +1965,10 @@ mod tests {
         // An F1 family with an unusable name → editable TODO, never `["", "rt"]`.
         let bad = hal_dep_for_name("stm32f1", "STM32");
         assert!(bad.contains("TODO") && !bad.contains("\"\""), "{bad}");
+        // Still a dependency line naming the crate, so a runtime switch has a
+        // crate to swap back to.
+        assert!(bad.starts_with("stm32f1xx-hal = {"), "{bad}");
+        assert!(!bad.contains("  "), "a joined continuation: {bad}");
     }
 
     #[test]
@@ -1925,6 +2003,73 @@ mod gpio_mode_tests {
             gpio_mode_tokens(Some("Input, output , ANALOG")).as_deref(),
             Some("analog")
         );
+    }
+}
+
+#[cfg(test)]
+mod f1_async_line_tests {
+    use super::{EMBASSY_VERSION, f1_embassy_hal_dep};
+
+    /// The F1's async line is its part number's first eleven characters, from
+    /// either name a definition carries - the probe name first.
+    #[test]
+    fn the_f1_async_line_is_the_part_number() {
+        let want = format!(
+            "embassy-stm32 = {{ version = \"{EMBASSY_VERSION}\", features = [\"stm32f103c8\"] }}"
+        );
+        for (probe, pkg) in [
+            ("STM32F103C8", "stm32f103c8t6"),
+            ("STM32F103C8Tx", ""),
+            ("", "stm32f103c8t6"),
+            ("not a part", "stm32f103c8t6"),
+        ] {
+            assert_eq!(
+                f1_embassy_hal_dep(probe, pkg).as_deref(),
+                Some(want.as_str()),
+                "{probe} / {pkg}"
+            );
+        }
+        let cb = f1_embassy_hal_dep("STM32F103CBTx", "").expect("an F1 part");
+        assert!(cb.contains("[\"stm32f103cb\"]"), "{cb}");
+    }
+
+    /// Neither a truncated F1 name, a generic one, nor another family's part
+    /// yields a line.
+    #[test]
+    fn anything_else_is_no_line() {
+        for bad in [
+            "",
+            "STM32F103",
+            "STM32F411RE",
+            "STM32F1",
+            "ESP32C3",
+            "STM32F103xB",  // CMSIS's density name, not a part
+            "STM32F103C9",  // no such flash size
+            "STM32F103KBU", // no such pin count
+        ] {
+            assert_eq!(f1_embassy_hal_dep(bad, bad), None, "{bad}");
+        }
+        // Every pin count and flash size the F1 parts use is accepted.
+        for good in ["STM32F100RB", "STM32F101T4", "STM32F105VC", "STM32F103ZG"] {
+            assert!(f1_embassy_hal_dep(good, "").is_some(), "{good}");
+        }
+    }
+
+    /// The fallback is still an embassy-stm32 line - so a runtime switch swaps
+    /// the crate - naming the part and what to fill in.
+    #[test]
+    fn an_unreadable_f1_gets_an_embassy_line_to_finish() {
+        let line = super::f1_embassy_hal_dep_todo("STM32F103xB");
+        assert!(line.starts_with("embassy-stm32 = {"), "{line}");
+        assert!(
+            line.contains(&format!("version = \"{EMBASSY_VERSION}\"")),
+            "{line}"
+        );
+        assert!(
+            line.contains("# TODO: the chip feature for STM32F103xB"),
+            "{line}"
+        );
+        assert!(!line.contains("  "), "a joined continuation: {line}");
     }
 }
 

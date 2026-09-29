@@ -243,6 +243,12 @@ pub fn graph_clock_block_for(
         _ => None,
     };
     let graph = graph.as_deref();
+    // The F1 reaches this function only on the Async runtime - Blocking, Native
+    // and RTIC write stm32f1xx-hal's `rcc.cfgr` chain instead. Its tree goes
+    // through the F1's own reader, the one that chain uses.
+    if family == "stm32f1" {
+        return wrap(f1_embassy_block(chip, &f1_embassy_clock(clock)), manual);
+    }
     // N6 before either: it has its own emitter because four PLLs, twenty IC
     // dividers and a separate CPU clock do not fit the single-PLL descriptor,
     // and the generic recipe cannot read its tree at all (no `sw`, no `ahb`).
@@ -300,6 +306,140 @@ pub fn graph_clock_block_for(
         },
         manual,
     )
+}
+
+/// The F1's clock on embassy-stm32, from the typed F1 clock.
+///
+/// Read with the F1's own reader rather than a [`ReadSpec`], because the PLL
+/// input is TWO nodes - the PLLSRC mux and the PLLXTPRE divider - and the HSI
+/// branch is always halved: embassy panics at init on an HSI PLL whose `prediv`
+/// is not `DIV2`. Emitted in the [`RccDescriptor::f013`] shape, compiled against
+/// embassy-stm32 0.6 on an STM32F103C8. PLLXTPRE /2, which stm32f1xx-hal cannot
+/// express, is just `prediv: DIV2` here.
+///
+/// Not written: the USB prescaler, which embassy picks from the PLL output
+/// itself (/1 at 48 MHz, /1.5 at 72), and the ADC prescaler at embassy's own
+/// default of /6 - so the default tree's block is exactly the verified one.
+///
+/// `chip` matters for one fact: the connectivity line (F105/F107, metapac's
+/// `rcc_f1cl`) has a `PllMul` of only MUL4..MUL9, where the rest of the F1 goes
+/// to MUL16. A multiplier outside that window is flagged in the block.
+fn f1_embassy_block(chip: &str, c: &super::super::clock::model::Stm32f1Clock) -> String {
+    use super::super::clock::model::{PllSrc, SysclkSrc};
+    const HSI_HZ: u32 = 8_000_000;
+    let sys = match c.sysclk_src {
+        SysclkSrc::Hsi => SysSource::Hsi,
+        SysclkSrc::Hse => SysSource::Hse,
+        SysclkSrc::Pll => SysSource::Pll,
+    };
+    let pll_src_hse = c.pll_src != PllSrc::HsiDiv2;
+    let pll_m = if c.pll_src == PllSrc::Hse { 1 } else { 2 };
+    let pll_n = u32::from(c.pll_mul);
+    let sysclk_hz = match sys {
+        SysSource::Hsi => HSI_HZ,
+        SysSource::Hse => c.hse_hz,
+        SysSource::Pll => (if pll_src_hse { c.hse_hz } else { HSI_HZ }) / pll_m * pll_n,
+    };
+    let values = RccValues {
+        sys,
+        hse_on: c.hse_enabled || sys == SysSource::Hse || (sys == SysSource::Pll && pll_src_hse),
+        hse_hz: c.hse_hz,
+        pll_src_hse,
+        pll_m,
+        pll_n,
+        pll_out: 1,
+        ahb: u32::from(c.ahb_pre),
+        sysclk_hz,
+        apb: vec![
+            ("apb1_pre", u32::from(c.apb1_pre)),
+            ("apb2_pre", u32::from(c.apb2_pre)),
+        ],
+    };
+    let desc = match super::rcc_mux::rcc_version(chip) {
+        Some("f1cl") => RccDescriptor::f013().with_pll_n((4, 9)),
+        _ => RccDescriptor::f013(),
+    };
+    let mut block = emit_rcc_block(&desc, &values);
+    if c.adc_pre != 6 {
+        let tail = "    }\n    let p = embassy_stm32::init(config);\n";
+        if let Some(cut) = block.rfind(tail) {
+            block.insert_str(
+                cut,
+                &format!(
+                    "        config.rcc.adc_pre = rcc::ADCPrescaler::DIV{};\n",
+                    c.adc_pre
+                ),
+            );
+        }
+    }
+    block
+}
+
+/// The typed F1 clock the Async block is emitted from - the same reading
+/// [`graph_clock_block_for`] does, so a check on it is a check on the code.
+pub fn f1_embassy_clock(clock: &ClockConfig) -> super::super::clock::model::Stm32f1Clock {
+    match clock {
+        ClockConfig::Graph(gc) => super::super::clock::graph::graph_to_stm32f1(&gc.for_codegen()),
+        _ => Default::default(),
+    }
+}
+
+/// Would embassy-stm32 0.6's F1 clock init accept what [`f1_embassy_block`]
+/// emits from `c`? Its `rcc_assert!`s are real asserts (the crate's
+/// `unchecked-overclocking` feature is never enabled here), so `false` means
+/// `embassy_stm32::init` panics at boot, before any peripheral exists.
+///
+/// The limits are `rcc/f013.rs`'s `max` module for the F1: HCLK 72, PCLK1 36,
+/// PCLK2 72 and ADC 14 MHz, plus - only when SYSCLK is the PLL, the one case
+/// the block configures it - PLL input 1..=25 and output 16..=72 MHz. The HSE
+/// is taken as the block writes it, switched on whenever the PLL needs it. Two
+/// asserts cannot fire from this block and are not repeated: the HSI PLL is
+/// always `DIV2`, and the Clock tab keeps the crystal in 4..=16 MHz.
+pub fn f1_embassy_clock_ok(c: &super::super::clock::model::Stm32f1Clock) -> bool {
+    use super::super::clock::model::{PllSrc, SysclkSrc};
+    const MHZ: u32 = 1_000_000;
+    const HSI_HZ: u32 = 8 * MHZ;
+    let pll_in = match c.pll_src {
+        PllSrc::HsiDiv2 => HSI_HZ / 2,
+        PllSrc::Hse => c.hse_hz,
+        PllSrc::HseDiv2 => c.hse_hz / 2,
+    };
+    let pll_out = pll_in.saturating_mul(u32::from(c.pll_mul));
+    let (sys, pll_ok) = match c.sysclk_src {
+        SysclkSrc::Hsi => (HSI_HZ, true),
+        SysclkSrc::Hse => (c.hse_hz, true),
+        SysclkSrc::Pll => (
+            pll_out,
+            (MHZ..=25 * MHZ).contains(&pll_in) && (16 * MHZ..=72 * MHZ).contains(&pll_out),
+        ),
+    };
+    let hclk = sys / u32::from(c.ahb_pre.max(1));
+    let pclk1 = hclk / u32::from(c.apb1_pre.max(1));
+    let pclk2 = hclk / u32::from(c.apb2_pre.max(1));
+    let adc = pclk2 / u32::from(c.adc_pre.max(1));
+    pll_ok && hclk <= 72 * MHZ && pclk1 <= 36 * MHZ && pclk2 <= 72 * MHZ && adc <= 14 * MHZ
+}
+
+/// Release the JTAG-only pads on an F1 clock block: PA15, PB3 and PB4 come out
+/// of reset as the JTAG port, and embassy leaves them there unless told
+/// otherwise - so a project that wires one compiles and the pad does nothing.
+/// `SwdOnly` keeps the SWD pins a probe needs. The line goes before the
+/// `init(config)` that consumes the config, and only when one of the three is
+/// in use, as on Blocking (`disable_jtag`).
+pub fn with_swd_only(block: &str) -> String {
+    let init = "    let p = embassy_stm32::init(config);\n";
+    match block.rfind(init) {
+        Some(cut) => {
+            let mut out = block.to_owned();
+            out.insert_str(
+                cut,
+                "    // PA15, PB3 and PB4 are JTAG at reset; free them, keep SWD.\n    \
+                 config.swj = embassy_stm32::gpio::SwjCfg::SwdOnly;\n",
+            );
+            out
+        }
+        None => block.to_owned(),
+    }
 }
 
 /// The header on a block emitted from [`generic_recipe`]. It says the one thing
@@ -1039,12 +1179,23 @@ pub fn emit_rcc_block(desc: &RccDescriptor, v: &RccValues) -> String {
                  embassy's PllMul has no MUL{} for it.\n",
                 v.pll_n, lo, hi, v.pll_n
             ));
-            b.push_str(&format!(
-                "            // !! Raise PLLM until N lands in range: the same \
-                 SYSCLK usually has a legal (M, N) pair (e.g. /{} x{}).\n",
-                v.pll_m * 2,
-                v.pll_n * 2
-            ));
+            // The way out depends on the side: a raised PLLM only helps an N
+            // that is too SMALL. Above the window (the F105/F107's MUL9) the
+            // input has to get faster instead.
+            if v.pll_n < lo {
+                b.push_str(&format!(
+                    "            // !! Raise PLLM until N lands in range: the same \
+                     SYSCLK usually has a legal (M, N) pair (e.g. /{} x{}).\n",
+                    v.pll_m * 2,
+                    v.pll_n * 2
+                ));
+            } else {
+                b.push_str(
+                    "            // !! Feed the PLL a faster input (a smaller \
+                     divider or a faster crystal) so a smaller N reaches the \
+                     same SYSCLK.\n",
+                );
+            }
         }
         b.push_str(&format!("            mul: rcc::PllMul::MUL{},\n", v.pll_n));
         // Three outputs; the one this family uses gets the value, the rest None.
@@ -1975,5 +2126,131 @@ mod tests {
         assert!(s.contains("config.rcc.sys = rcc::Sysclk::HSE;"));
         assert!(!s.contains("config.rcc.pll1"));
         assert!(s.contains("VoltageScale::RANGE1"));
+    }
+
+    /// The F1 on the Async runtime, read from the typed clock. The default tree
+    /// is the block compiled on the F103C8; an HSI PLL is always halved, since
+    /// embassy panics on any other `prediv` there; the ADC prescaler is written
+    /// only off embassy's own /6.
+    #[test]
+    fn the_f1_embassy_block_follows_the_typed_clock() {
+        use super::super::super::clock::model::{PllSrc, Stm32f1Clock};
+        let blue_pill = f1_embassy_block("STM32F103C8T6", &Stm32f1Clock::default());
+        for line in [
+            "src: rcc::PllSource::HSE,",
+            "prediv: rcc::PllPreDiv::DIV1,",
+            "mul: rcc::PllMul::MUL9,",
+            "config.rcc.sys = rcc::Sysclk::PLL1_P;",
+        ] {
+            assert!(blue_pill.contains(line), "{line}\n\n{blue_pill}");
+        }
+        assert!(!blue_pill.contains("adc_pre"), "{blue_pill}");
+        assert!(!blue_pill.contains("!!"), "{blue_pill}");
+
+        let hsi = Stm32f1Clock {
+            pll_src: PllSrc::HsiDiv2,
+            pll_mul: 16,
+            adc_pre: 8,
+            ..Stm32f1Clock::default()
+        };
+        let hsi = f1_embassy_block("STM32F103C8T6", &hsi);
+        assert!(hsi.contains("src: rcc::PllSource::HSI,"), "{hsi}");
+        assert!(hsi.contains("prediv: rcc::PllPreDiv::DIV2,"), "{hsi}");
+        assert!(
+            hsi.contains("config.rcc.adc_pre = rcc::ADCPrescaler::DIV8;"),
+            "{hsi}"
+        );
+        // MUL16 is legal on the F103.
+        assert!(!hsi.contains("!!"), "{hsi}");
+    }
+
+    /// The connectivity line (F105/F107) stops at MUL9, so the F103's MUL16 is
+    /// flagged there - with the advice for a TOO BIG N, not the F2's "raise
+    /// PLLM", which would only make it bigger.
+    #[test]
+    fn the_connectivity_line_flags_a_multiplier_above_nine() {
+        use super::super::super::clock::model::{PllSrc, Stm32f1Clock};
+        let x16 = Stm32f1Clock {
+            pll_src: PllSrc::HsiDiv2,
+            pll_mul: 16,
+            ..Stm32f1Clock::default()
+        };
+        for chip in ["STM32F105RCT6", "STM32F107VCT6"] {
+            let out = f1_embassy_block(chip, &x16);
+            assert!(out.contains("mul: rcc::PllMul::MUL16,"), "{out}");
+            assert!(out.contains("outside this chip's range 4..=9"), "{out}");
+            assert!(out.contains("faster input"), "{out}");
+            assert!(!out.contains("Raise PLLM"), "{out}");
+            // x9 is the Blue Pill's own multiplier and legal on both lines.
+            let x9 = f1_embassy_block(chip, &Stm32f1Clock::default());
+            assert!(!x9.contains("!!"), "{chip}\n\n{x9}");
+        }
+    }
+
+    /// embassy's F1 init asserts, mirrored on the emitted config: the default
+    /// tree boots, a bus over its ceiling does not, and a PLL no one selects is
+    /// not configured - so it cannot trip anything.
+    #[test]
+    fn embassy_accepts_the_f1_clocks_its_init_does_not_assert_on() {
+        use super::super::super::clock::model::{PllSrc, Stm32f1Clock, SysclkSrc};
+        let ok = |c: Stm32f1Clock| f1_embassy_clock_ok(&c);
+        assert!(ok(Stm32f1Clock::default()));
+        let base = Stm32f1Clock::default;
+        assert!(
+            !ok(Stm32f1Clock {
+                apb1_pre: 1,
+                ..base()
+            }),
+            "PCLK1 72 > 36"
+        );
+        assert!(
+            !ok(Stm32f1Clock {
+                adc_pre: 2,
+                ..base()
+            }),
+            "ADC 36 > 14"
+        );
+        assert!(
+            !ok(Stm32f1Clock {
+                pll_mul: 10,
+                ..base()
+            }),
+            "PLL 80 > 72"
+        );
+        assert!(
+            !ok(Stm32f1Clock {
+                pll_src: PllSrc::HsiDiv2,
+                pll_mul: 2,
+                ..base()
+            }),
+            "PLL 8 < 16"
+        );
+        // The same over-fast PLL, left unselected: the block writes no PLL.
+        assert!(ok(Stm32f1Clock {
+            pll_mul: 10,
+            sysclk_src: SysclkSrc::Hse,
+            ..base()
+        }));
+        // The HSE feeds the PLL even with the tab's HSE switch off: the block
+        // turns it on, so the input is still 8 MHz.
+        assert!(ok(Stm32f1Clock {
+            hse_enabled: false,
+            ..base()
+        }));
+    }
+
+    /// `SwdOnly` lands between the RCC scope and the `init` that consumes the
+    /// config, and a block with no such `init` is left alone.
+    #[test]
+    fn swd_only_goes_before_the_init() {
+        use super::super::super::clock::model::Stm32f1Clock;
+        let block = f1_embassy_block("STM32F103C8T6", &Stm32f1Clock::default());
+        let out = with_swd_only(&block);
+        let swj = out.find("config.swj = embassy_stm32::gpio::SwjCfg::SwdOnly;");
+        let init = out.find("let p = embassy_stm32::init(config);");
+        assert!(matches!((swj, init), (Some(s), Some(i)) if s < i), "{out}");
+        assert_eq!(out.matches("SwdOnly").count(), 1, "{out}");
+        let untouched = "let p = embassy_stm32::init(Default::default());\n";
+        assert_eq!(with_swd_only(untouched), untouched);
     }
 }

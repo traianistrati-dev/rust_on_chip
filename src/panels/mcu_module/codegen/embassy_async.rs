@@ -124,7 +124,15 @@ pub fn splice_section(existing: &str, new_section: &str, mcu_name: &str, mcu_id:
         // A Blocking project switched to Async keeps its tail — including,
         // while it is still untouched, the seed that has no `.await` warning
         // in it. Exchange that one; anything the user wrote is left alone.
-        let after = retarget_pristine_tail(existing[end..].trim_start_matches('\n'), true);
+        //
+        // An RTIC file's tail closes nothing (`mod app` is all generated), so
+        // leaving RTIC it gets a seed that closes `async fn main` first.
+        let after = existing[end..].trim_start_matches('\n');
+        let after = if super::common::section_is_rtic(existing) {
+            super::common::tail_leaving_rtic(after, ASYNC_USER_TAIL)
+        } else {
+            retarget_pristine_tail(after, true)
+        };
         // Preserve only the user code AFTER the markers; the header above them is
         // regenerated so a runtime switch updates the imports + entry.
         let _ = begin; // header replaces everything before the markers
@@ -892,6 +900,26 @@ pub fn serial_handle(peri: &str, n: u8, sfx: &str) -> String {
     format!("{prefix}{n}{sfx}")
 }
 
+/// The peripheral word of serial instance `n`: the loop's own (`USART`,
+/// `LPUART`), except for a USART-loop instance this chip names `UART{n}`.
+///
+/// A USART and a UART share the pin function (`UsartTx(4)` either way), the
+/// config module (`usart4.rs`) and embassy's driver - but not the singleton:
+/// an STM32F103RC has `p.UART4`, and `p.USART4` is E0609. Read from the vector
+/// list where the chip carries one (a G0's `USART3_4_LPUART1` keeps USART4 a
+/// USART); without one, only the F1's UART4/5 are known to be UARTs.
+fn serial_word(word: &'static str, family: &str, irqs: &[String], n: u8) -> &'static str {
+    if word != "USART" {
+        return word;
+    }
+    let uart = if irqs.is_empty() {
+        family == "stm32f1" && n >= 4
+    } else {
+        nvic::vector_for(irqs, "USART", n).is_none() && nvic::vector_for(irqs, "UART", n).is_some()
+    };
+    if uart { "UART" } else { "USART" }
+}
+
 /// The `bind_interrupts!` key for `USART{n}` on this chip.
 ///
 /// Usually `USART{n}`, but an STM32G0 routes USART3, USART4 and LPUART1 through
@@ -924,10 +952,13 @@ fn dma_irqs_block(
     // controller is the first: it brings its own interrupt into the same
     // `Irqs`, because its `init` takes one value for that and the channel both.
     extra_binds: &[(String, String)],
+    // Whether some `init` below was left with the `DMA_TODO` placeholder: the
+    // header asks for channels exactly then - not merely because none were
+    // bound, which is also the state of a project with nothing on DMA at all
+    // (a buffered USART, an armed input).
+    unresolved_dma: bool,
 ) -> String {
-    // The header only asks for work when there IS work: with every channel
-    // resolved (see `dma_map`) the block is complete as generated.
-    let head = if binds.is_empty() {
+    let head = if unresolved_dma {
         r#"use embassy_stm32::{bind_interrupts, peripherals};
 
 // Interrupt bindings for the DMA-backed peripherals below.
@@ -1079,7 +1110,22 @@ pub fn async_peripherals(
     // adds its vector to the same `Irqs` the DMA peripherals use. The handler is
     // generic over the interrupt, not over a peripheral — unlike every other
     // entry in that block.
-    let (exti, exti_notes) = exti_plan(pins, chip.irq_vectors);
+    //
+    // A chip with no vector list of its own - the built-in F103, and any F1
+    // imported without vendor data - still has the F1's seven EXTI vectors,
+    // the same set the Blocking and RTIC paths bind (`rtic::exti_vector`).
+    let f1_vectors: Vec<String>;
+    let vectors: &[String] = if chip.irq_vectors.is_empty() && family == "stm32f1" {
+        f1_vectors = (0..=15u8)
+            .map(|line| super::rtic::exti_vector(line).to_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        &f1_vectors
+    } else {
+        chip.irq_vectors
+    };
+    let (exti, exti_notes) = exti_plan(pins, vectors);
     for e in &exti {
         extra_binds.push((
             e.vector.clone(),
@@ -1138,6 +1184,9 @@ pub fn async_peripherals(
     ] {
         for w in wires {
             let n = w.instance;
+            // `USART4` or `UART4`: the pin function is the same, the singleton
+            // embassy generates is not.
+            let peri = serial_word(peri, family, chip.irq_vectors, n);
             let cfg = cfgs.get(&n);
             let dir = cfg.map(|c| c.direction).unwrap_or_default();
             let flow = cfg.map(|c| c.flow).unwrap_or_default();
@@ -1224,7 +1273,7 @@ pub fn async_peripherals(
             } else {
                 serial_instances.push((peri, n, true));
                 calls.push_str(&format!(
-                    "    let mut {handle} =                  pins::configs::{stem}{n}::init(p.{peri}{n}{pin_args}, Irqs);
+                    "    let mut {handle} = pins::configs::{stem}{n}::init(p.{peri}{n}{pin_args}, Irqs);
 "
                 ));
             }
@@ -1245,7 +1294,20 @@ pub fn async_peripherals(
     // One config module per TIMER, taking exactly the channels wired on the
     // canvas. No interrupts and no DMA: `SimplePwm` writes the compare
     // registers directly, so there is nothing to bind.
+    let time_driver = time_driver_timer(pins);
     for (n, mut wiring) in pwm_wires(pins) {
+        // embassy-time runs on a timer of its own, and the one it takes is no
+        // longer a field of `Peripherals`: `p.TIM4` on an STM32F103C8 is E0609.
+        // Its pads stay bound raw, and main.rs says why.
+        if Some(n) == time_driver {
+            calls.push_str(&format!(
+                "    // TIM{n} is NOT initialised: embassy-time runs on it. The \"time-driver-any\"
+    // feature takes TIM{n} on this chip, so `p.TIM{n}` does not exist. Move the PWM
+    // to another timer.
+"
+            ));
+            continue;
+        }
         // A timer with pads but no module entry generates at the module's own
         // defaults, so the defaults live in exactly one place.
         let cfg = timer
@@ -1253,6 +1315,60 @@ pub fn async_peripherals(
             .cloned()
             .unwrap_or_else(|| TimerModuleConfig::new(n));
         let handle = format!("_pwm{n}{}", label_sfx(&cfg.custom_label));
+
+        // The F1's timer pads have no alternate-function number - AFIO remaps
+        // them in groups - and a pad can sit in two groups at once (TIM3 CH3 is
+        // PB0 unremapped AND partly remapped), so the remap has to be NAMED:
+        // rustc does not infer one from pads that fit two (E0283).
+        let f1_remap = if family == "stm32f1" {
+            if !wiring.comp.is_empty() || !wiring.breaks.is_empty() {
+                calls.push_str(&format!(
+                    "    // TIM{n}'s complementary and break pads are left unconfigured: on the F1
+    // they are remapped in groups of their own, which Async does not generate yet.
+    // The plain channels below are unaffected.
+"
+                ));
+                wiring.comp.clear();
+                wiring.breaks.clear();
+            }
+            if wiring.chans.is_empty() {
+                // Only complementary or break pads: the note above covers them.
+                continue;
+            }
+            let pads: Vec<(u8, &str)> = wiring
+                .chans
+                .iter()
+                .map(|(c, pin)| (*c, pin.as_str()))
+                .collect();
+            let remap = match n {
+                // No AFIO field for these two: embassy types their pads
+                // `AfioRemapNotApplicable` (compiled on an STM32F103RE).
+                5 | 8 => Some("AfioRemapNotApplicable"),
+                1..=4 => super::stm32::pwm_remap(n, &pads).and_then(embassy_afio_remap),
+                _ => {
+                    calls.push_str(&format!(
+                        "    // TIM{n} is NOT initialised: its F1 remap lives in AFIO_MAPR2, which the
+    // Async runtime does not generate yet. The pads are bound raw.
+"
+                    ));
+                    continue;
+                }
+            };
+            match remap {
+                Some(remap) => Some(remap),
+                None => {
+                    calls.push_str(&format!(
+                        "    // TIM{n} is NOT initialised: its pads are not one AFIO remap set, and the
+    // F1 remaps a timer's channels together. Keep them on one row of the
+    // reference manual's TIM{n} remap table.
+"
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         // Complementary outputs reach embassy through `ComplementaryPwm`, whose
         // bound is `AdvancedInstance4Channel` — the advanced-control timers. A
@@ -1303,10 +1419,12 @@ pub fn async_peripherals(
             "    {lhs} = pins::configs::pwm{n}::init(p.TIM{n}{args});
 "
         ));
-        files.push((
-            format!("pwm{n}.rs"),
-            pwm_config_file(n, &cfg, &wiring, &handle),
-        ));
+        let body = pwm_config_file(n, &cfg, &wiring, &handle);
+        let body = match f1_remap {
+            Some(remap) => with_timer_remap(&body, n, remap),
+            None => body,
+        };
+        files.push((format!("pwm{n}.rs"), body));
     }
 
     // ── HSPI ─────────────────────────────────────────────────────────────
@@ -1541,6 +1659,18 @@ pub fn async_peripherals(
             .unwrap_or_else(|| SdmmcModuleConfig::new(n));
         let peri = sdmmc_peri(n);
         let handle = format!("_sd{n}{}", label_sfx(&cfg.custom_label));
+
+        // The F1's SDIO is the older controller, which takes a DMA channel -
+        // and embassy-stm32 0.6 routes none to it on the F1 (no `SdmmcDma`
+        // impl in its F103 build), so no call could ever be completed.
+        if family == "stm32f1" {
+            calls.push_str(&format!(
+                "    // {peri} is NOT initialised: embassy-stm32 gives the F1's SDIO no DMA
+    // channel, and its driver needs one. The pads are bound raw.
+"
+            ));
+            continue;
+        }
 
         let Some(width) = sd_bus_width(&w.lanes) else {
             calls.push_str(&format!(
@@ -1858,10 +1988,34 @@ pub fn async_peripherals(
             chip.irq_vectors,
             &comp_binds,
             &extra_binds,
+            calls.contains("DMA_TX_TODO"),
         )
     } else {
         String::new()
     };
+    // An F1 project switched to Async keeps its USB and CAN modules on the
+    // canvas, but no async template exists for either: their pads are bound
+    // raw below, and this says so rather than letting them vanish.
+    if family == "stm32f1" {
+        let wired = |fs: [PinFunction; 2]| {
+            pins.iter()
+                .any(|p| !p.reserved && fs.contains(&p.selected_function))
+        };
+        if wired([PinFunction::UsbDm, PinFunction::UsbDp]) {
+            calls.push_str(
+                "    // USB is NOT initialised: the Async runtime has no USB template for the F1
+    // yet (embassy-stm32 has the driver). The Blocking runtime generates it.
+",
+            );
+        }
+        if wired([PinFunction::CanRx, PinFunction::CanTx]) {
+            calls.push_str(
+                "    // CAN is NOT initialised: the Async runtime has no CAN template for the F1
+    // yet (embassy-stm32 has bxCAN). The Blocking runtime generates it.
+",
+            );
+        }
+    }
     let init_calls = if calls.is_empty() {
         String::new()
     } else {
@@ -1870,6 +2024,13 @@ pub fn async_peripherals(
     // Said where the pin is, not swallowed: an armed input that could not be
     // given an EXTI is a wiring problem, and the canvas is where it is fixed.
     let init_calls = format!("{init_calls}{exti_notes}");
+    // The F1's pin traits carry its AFIO remap as one more parameter; see
+    // `with_afio_remap`. The PWM files already got theirs in the loop above.
+    if family == "stm32f1" {
+        for (_, body) in files.iter_mut() {
+            *body = with_afio_remap(body);
+        }
+    }
     AsyncPeriphs {
         consumed_pins: consumed,
         init_calls,
@@ -4178,6 +4339,122 @@ pub fn i2s_config_file(n: u8, cfg: &I2sModuleConfig, w: &I2sWiring, handle: &str
         .replace("{N}", &n.to_string())
 }
 
+/// The timer `time-driver-any` hands embassy-time on this chip, among the
+/// timers its pads offer - `None` when it has none of the candidates.
+///
+/// embassy's own order (`build.rs`): two-channel timers, then two-channel with
+/// complementary outputs, then 16-bit general purpose, 32-bit, advanced; the
+/// larger number first inside each. On an STM32F103C8 that is TIM4, which is
+/// why `p.TIM4` does not exist in an async F103 project.
+fn time_driver_timer(pins: &[&Pin]) -> Option<u8> {
+    const ORDER: [u8; 15] = [22, 21, 12, 9, 15, 19, 4, 3, 24, 23, 5, 2, 20, 8, 1];
+    let present: std::collections::BTreeSet<u8> = pins
+        .iter()
+        .flat_map(|p| p.available_functions.iter())
+        .filter_map(|f| match f {
+            PinFunction::TimerPwm { timer, .. }
+            | PinFunction::TimerPwmN { timer, .. }
+            | PinFunction::TimerBreak { timer, .. } => Some(*timer),
+            _ => None,
+        })
+        .collect();
+    ORDER.into_iter().find(|t| present.contains(t))
+}
+
+/// The pin traits of the USART, SPI, I2C and I2S config files, whose bounds
+/// carry the F1's AFIO remap as a second parameter (`pin_trait!(.., @A)` in
+/// embassy-stm32 0.6). `CkPin` is also the SD host's clock trait, which does
+/// NOT take one - see [`with_afio_remap`].
+const AFIO_BUS_PIN_TRAITS: [&str; 14] = [
+    "RxPin", "TxPin", "CtsPin", "RtsPin", "CkPin", "DePin", "SckPin", "MosiPin", "MisoPin",
+    "SclPin", "SdaPin", "I2sSdPin", "WsPin", "MckPin",
+];
+
+/// A bus config file as an STM32F1 needs it on embassy-stm32: every pin trait
+/// takes the AFIO remap as one more parameter (`RxPin<USART1, A>`), and embassy
+/// writes AFIO_MAPR itself from it.
+///
+/// `init` gets a generic `A` that the pins decide at the call site: each bus
+/// pad belongs to one remap set, so rustc infers it, and a pair from two sets
+/// does not type-check (E0277) - the rule the F1's remap groups keep in the UI
+/// anyway. Compiled on an STM32F103C8 with default and remapped pads, main.rs
+/// unchanged. A pass over the text rather than a flag through every template,
+/// so no other family's file can change; a file with no such bound is
+/// returned as it came.
+fn with_afio_remap(body: &str) -> String {
+    let mut out = body.to_owned();
+    let mut bounds = 0;
+    for tr in AFIO_BUS_PIN_TRAITS {
+        let needle = format!("impl {tr}<peripherals::");
+        let mut s = String::with_capacity(out.len() + 16);
+        let mut rest = out.as_str();
+        while let Some(at) = rest.find(&needle) {
+            let start = at + needle.len();
+            // The SD host's `CkPin` has no remap parameter: leave it as it is.
+            if tr == "CkPin"
+                && (rest[start..].starts_with("SDIO") || rest[start..].starts_with("SDMMC"))
+            {
+                s.push_str(&rest[..start]);
+                rest = &rest[start..];
+                continue;
+            }
+            let Some(close) = rest[start..].find('>') else {
+                break;
+            };
+            s.push_str(&rest[..start + close]);
+            s.push_str(", A");
+            rest = &rest[start + close..];
+            bounds += 1;
+        }
+        s.push_str(rest);
+        out = s;
+    }
+    if bounds == 0 {
+        return body.to_owned();
+    }
+    // `<'d, ` before `<'d>(`, or the first would match the second's result.
+    out.replace("pub fn init<'d, ", "pub fn init<'d, A, ")
+        .replace("pub fn init<'d>(", "pub fn init<'d, A>(")
+}
+
+/// embassy's AFIO remap type for one of stm32f1xx-hal's timer remap
+/// type-states - the rows [`super::stm32::pwm_remap`] picks from. The numbers
+/// are the TIMx_REMAP field values: TIM1 has no partial row here because its
+/// CH1..4 pads are the same in both, TIM4's field is a single bit.
+fn embassy_afio_remap(hal_ty: &str) -> Option<&'static str> {
+    Some(match hal_ty {
+        "Tim1NoRemap" | "Tim2NoRemap" | "Tim3NoRemap" => "AfioRemap<0>",
+        "Tim2PartialRemap1" => "AfioRemap<1>",
+        "Tim2PartialRemap2" | "Tim3PartialRemap" => "AfioRemap<2>",
+        "Tim1FullRemap" | "Tim2FullRemap" | "Tim3FullRemap" => "AfioRemap<3>",
+        "Tim4NoRemap" => "AfioRemapBool<false>",
+        "Tim4Remap" => "AfioRemapBool<true>",
+        _ => return None,
+    })
+}
+
+/// An F1 PWM file with its remap NAMED: a `Remap` alias in the generated block,
+/// re-spliced when the wiring moves, and every `TimerPin` bound taking it.
+fn with_timer_remap(body: &str, n: u8, remap: &str) -> String {
+    let alias = format!(
+        "// The AFIO remap these pads are on - named, because a timer pad can sit in two.\n\
+         pub type Remap = embassy_stm32::gpio::{remap};\n"
+    );
+    let end = "// <<< GENERATED END >>>";
+    let body = match body.find(end) {
+        Some(at) => format!("{}{alias}{}", &body[..at], &body[at..]),
+        None => body.to_owned(),
+    };
+    let mut out = body;
+    for ch in 1..=4u8 {
+        out = out.replace(
+            &format!("impl TimerPin<peripherals::TIM{n}, Ch{ch}>>"),
+            &format!("impl TimerPin<peripherals::TIM{n}, Ch{ch}, Remap>>"),
+        );
+    }
+    out
+}
+
 /// The timers with at least one PWM pad wired, plain or complementary.
 fn pwm_wires(pins: &[&Pin]) -> Vec<(u8, PwmWiring)> {
     let mut by_timer: BTreeMap<u8, PwmWiring> = BTreeMap::new();
@@ -4638,7 +4915,7 @@ mod irq_key_tests {
             ("DMA1_CHANNEL2_3".to_owned(), "DMA1_CH2".to_owned()),
             ("DMA1_CHANNEL2_3".to_owned(), "DMA1_CH3".to_owned()),
         ];
-        let out = dma_irqs_block(&[1], &[("USART", 3, false)], &binds, &irqs, &[], &[]);
+        let out = dma_irqs_block(&[1], &[("USART", 3, false)], &binds, &irqs, &[], &[], false);
         assert!(
             out.contains(
                 "    I2C1 => embassy_stm32::i2c::EventInterruptHandler<peripherals::I2C1>, embassy_stm32::i2c::ErrorInterruptHandler<peripherals::I2C1>;"
@@ -4679,7 +4956,7 @@ mod irq_key_tests {
     #[test]
     fn a_chip_with_split_vectors_or_no_list_keeps_ev_and_er() {
         for irqs in [v(&["I2C1_EV", "I2C1_ER", "USART1"]), Vec::new()] {
-            let out = dma_irqs_block(&[1], &[("USART", 1, false)], &[], &irqs, &[], &[]);
+            let out = dma_irqs_block(&[1], &[("USART", 1, false)], &[], &irqs, &[], &[], false);
             assert!(
                 out.contains(
                     "    I2C1_EV => embassy_stm32::i2c::EventInterruptHandler<peripherals::I2C1>;"
@@ -4718,6 +4995,7 @@ mod irq_key_tests {
             &["USART3_4_LPUART1".into()],
             &[],
             &[],
+            false,
         );
         assert!(
             out.contains(
@@ -8268,5 +8546,232 @@ mod async_tail_on_switch {
     fn a_rebuilt_file_gets_the_async_tail() {
         let out = splice_section("not our file", "SECTION", "STM32G431", "g431");
         assert!(out.ends_with(ASYNC_USER_TAIL), "{out}");
+    }
+}
+
+/// The STM32F1 on embassy-stm32: the AFIO remap every pin trait carries, the
+/// peripherals embassy gives the F1 nothing for, and the timer the time driver
+/// takes.
+#[cfg(test)]
+mod f1_async_tests {
+    use super::*;
+    use crate::panels::mcu_module::pins::logic::pin::Pin;
+
+    fn mk(name: &str, f: PinFunction) -> Pin {
+        let mut p = Pin::new(1, name);
+        p.selected_function = f;
+        p
+    }
+
+    fn run(family: &str, pins: &[Pin]) -> AsyncPeriphs {
+        run_with(family, &[], pins)
+    }
+
+    fn run_with(family: &str, irq_vectors: &[String], pins: &[Pin]) -> AsyncPeriphs {
+        let refs: Vec<&Pin> = pins.iter().collect();
+        async_peripherals(
+            family,
+            ChipData {
+                dma: None,
+                irq_vectors,
+                usart_ip: Some("sci2_v1_2_Cube"),
+                sdmmc_ip: None,
+            },
+            CompInputs {
+                settings: &Default::default(),
+                instances: &[],
+                pins: &[],
+            },
+            &refs,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    fn file<'a>(out: &'a AsyncPeriphs, name: &str) -> &'a str {
+        out.config_files
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.as_str())
+            .unwrap_or_else(|| panic!("no {name}: {:?}", out.config_files))
+    }
+
+    /// I2S runs on an SPI block, and on the F1 its pads carry the remap too -
+    /// the master clock's included. `init` takes the `A` ahead of its DMA.
+    #[test]
+    fn an_f1_i2s_file_takes_the_remap_on_every_pad() {
+        let pins = [
+            mk("PB13", PinFunction::I2sCk(2)),
+            mk("PB12", PinFunction::I2sWs(2)),
+            mk("PB15", PinFunction::I2sSd(2)),
+            mk("PC6", PinFunction::I2sMck(2)),
+        ];
+        let out = run("stm32f1", &pins);
+        let body = file(&out, "i2s2.rs");
+        for bound in [
+            "impl I2sSdPin<peripherals::SPI2, A>",
+            "impl WsPin<peripherals::SPI2, A>",
+            "impl CkPin<peripherals::SPI2, A>",
+            "impl MckPin<peripherals::SPI2, A>",
+        ] {
+            assert!(body.contains(bound), "{bound}\n\n{body}");
+        }
+        assert!(body.contains("pub fn init<'d, A, D: "), "{body}");
+        // Another family's file is untouched by the pass.
+        let g4 = run("stm32g4", &pins);
+        let g4 = file(&g4, "i2s2.rs");
+        assert!(!g4.contains(", A>"), "{g4}");
+    }
+
+    /// The SD host's `CkPin` is the one bound WITHOUT a remap parameter, so a
+    /// text pass must step over it - and on the F1 the SDIO is not generated at
+    /// all: embassy-stm32 gives it no DMA channel.
+    #[test]
+    fn the_sdio_clock_takes_no_remap_and_the_f1_sdio_is_a_note() {
+        let sd = "pub fn init<'d>(\n    ck: Peri<'d, impl CkPin<peripherals::SDIO>>,\n";
+        assert_eq!(with_afio_remap(sd), sd, "a file with only the SD clock");
+        let mixed = format!("{sd}    ck2: Peri<'d, impl CkPin<peripherals::USART1>>,\n");
+        let out = with_afio_remap(&mixed);
+        assert!(out.contains("impl CkPin<peripherals::SDIO>>"), "{out}");
+        assert!(out.contains("impl CkPin<peripherals::USART1, A>>"), "{out}");
+        assert!(out.starts_with("pub fn init<'d, A>("), "{out}");
+
+        let mut pins = vec![
+            mk("PC12", PinFunction::SdmmcCk { unit: 0 }),
+            mk("PD2", PinFunction::SdmmcCmd { unit: 0 }),
+        ];
+        for lane in 0..4 {
+            pins.push(mk(
+                &format!("PC{}", 8 + lane),
+                PinFunction::SdmmcD { unit: 0, lane },
+            ));
+        }
+        let out = run("stm32f1", &pins);
+        assert!(
+            !out.config_files.iter().any(|(n, _)| n.starts_with("sdio")),
+            "{:?}",
+            out.config_files
+        );
+        assert!(
+            out.init_calls.contains("SDIO is NOT initialised"),
+            "{}",
+            out.init_calls
+        );
+    }
+
+    /// TIM5 and TIM8 have no AFIO remap field on the F1, but their pads still
+    /// carry the parameter - as `AfioRemapNotApplicable`.
+    #[test]
+    fn tim8_on_the_f1_names_no_remap() {
+        let pins = [mk(
+            "PC6",
+            PinFunction::TimerPwm {
+                timer: 8,
+                channel: 1,
+            },
+        )];
+        let out = run("stm32f1", &pins);
+        let body = file(&out, "pwm8.rs");
+        assert!(
+            body.contains("pub type Remap = embassy_stm32::gpio::AfioRemapNotApplicable;"),
+            "{body}"
+        );
+        assert!(
+            body.contains("impl TimerPin<peripherals::TIM8, Ch1, Remap>>"),
+            "{body}"
+        );
+    }
+
+    /// `time-driver-any` takes a timer out of `Peripherals` - TIM4 on an F103C8
+    /// - so PWM on it is refused with a note, on the F1 and elsewhere alike.
+    #[test]
+    fn the_time_driver_timer_is_not_offered_to_pwm() {
+        let mut tim4 = mk(
+            "PB8",
+            PinFunction::TimerPwm {
+                timer: 4,
+                channel: 3,
+            },
+        );
+        let mut tim3 = mk(
+            "PA6",
+            PinFunction::TimerPwm {
+                timer: 3,
+                channel: 1,
+            },
+        );
+        tim4.available_functions = vec![tim4.selected_function.clone()];
+        tim3.available_functions = vec![tim3.selected_function.clone()];
+        let pins = [tim4, tim3];
+        let refs: Vec<&Pin> = pins.iter().collect();
+        // Embassy's order puts TIM4 before TIM3.
+        assert_eq!(time_driver_timer(&refs), Some(4));
+        let out = run("stm32f1", &pins);
+        assert!(
+            out.init_calls
+                .contains("TIM4 is NOT initialised: embassy-time runs on it"),
+            "{}",
+            out.init_calls
+        );
+        assert!(!out.config_files.iter().any(|(n, _)| n == "pwm4.rs"));
+        assert!(out.config_files.iter().any(|(n, _)| n == "pwm3.rs"));
+    }
+
+    /// The F1's fourth and fifth serial ports are UARTs, and embassy's
+    /// singleton says so: `p.UART4`, never `p.USART4` (E0609). The pin function
+    /// and the config module keep the USART spelling.
+    #[test]
+    fn an_f1_uart4_is_named_uart_in_everything_it_generates() {
+        let pins = [
+            mk("PC10", PinFunction::UsartTx(4)),
+            mk("PC11", PinFunction::UsartRx(4)),
+        ];
+        // An F103RC-style vector list, and none at all: both name UART4.
+        let vectors = vec!["USART1".to_owned(), "UART4".to_owned(), "UART5".to_owned()];
+        for out in [run_with("stm32f1", &vectors, &pins), run("stm32f1", &pins)] {
+            let body = file(&out, "usart4.rs");
+            let all = format!("{}{}{body}", out.init_calls, out.dma_irqs);
+            assert!(
+                out.init_calls.contains("usart4::init(p.UART4"),
+                "{}",
+                out.init_calls
+            );
+            assert!(body.contains("peripherals::UART4"), "{body}");
+            assert!(out.dma_irqs.contains("UART4 =>"), "{}", out.dma_irqs);
+            // (The template's own comment names the G0's `USART3_4_LPUART1`
+            // as an example; only CODE must not say USART4.)
+            for code in ["p.USART4", "peripherals::USART4", "USART4 =>"] {
+                assert!(!all.contains(code), "{code}\n\n{all}");
+            }
+        }
+        // A chip whose USART4 IS a USART keeps it: a G0 routes it through
+        // `USART3_4_LPUART1`.
+        let g0 = run_with("stm32g0", &["USART3_4_LPUART1".to_owned()], &pins);
+        assert!(g0.init_calls.contains("p.USART4"), "{}", g0.init_calls);
+        // And USART1..3 stay USARTs on the F1.
+        assert_eq!(serial_word("USART", "stm32f1", &[], 3), "USART");
+        assert_eq!(serial_word("LPUART", "stm32f1", &[], 4), "LPUART");
+    }
+
+    /// An F1 carries no vector list, so the EXTI plan falls back to the F1's
+    /// fixed vectors: lines 5..9 share `EXTI9_5`, 10..15 `EXTI15_10`.
+    #[test]
+    fn an_armed_f1_input_finds_its_shared_vector() {
+        let mut pb5 = mk("PB5", PinFunction::GpioInput);
+        pb5.irq = Some(Edge::Both);
+        let out = run("stm32f1", &[pb5]);
+        assert_eq!(out.exti.len(), 1, "{:?}", out.exti);
+        assert_eq!(out.exti[0].vector, "EXTI9_5");
     }
 }

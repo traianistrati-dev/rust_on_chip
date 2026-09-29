@@ -11,7 +11,7 @@ use super::super::pins::logic::pin::{GpioMode, Pin};
 use super::super::pins::logic::pin_function::PinFunction;
 use super::common::AUTOGEN_BANNER;
 use super::common::duty_percent_str;
-use super::common::retarget_pristine_tail;
+use super::common::{refit_header, retarget_pristine_tail, section_is_rtic, tail_leaving_rtic};
 use super::{GEN_BEGIN, GEN_END, USER_TAIL, mcu_id_marker_line, pin_binding, sanitize_label};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,7 +43,14 @@ pub fn splice_section(existing: &str, new_section: &str, mcu_name: &str, mcu_id:
         // Strip ALL leading newlines after GEN_END, then re-add exactly one
         // blank line.  This makes splice idempotent: running it N times always
         // produces the same result instead of accumulating newlines.
-        let after = retarget_pristine_tail(existing[end..].trim_start_matches('\n'), false);
+        let after = existing[end..].trim_start_matches('\n');
+        // Leaving RTIC, the tail closes nothing, and `fn main` needs closing.
+        let leaving_rtic = section_is_rtic(existing);
+        let after = if leaving_rtic {
+            tail_leaving_rtic(after, USER_TAIL)
+        } else {
+            retarget_pristine_tail(after, false)
+        };
 
         // Detect old format (had fn custom_config / fn loop_code after GEN_END).
         // Rebuild from scratch so the user tail is the new flat loop{} style.
@@ -56,9 +63,24 @@ pub fn splice_section(existing: &str, new_section: &str, mcu_name: &str, mcu_id:
             );
         }
 
+        // The header above the markers stays as the user left it - unless the
+        // Async runtime wrote it. Its `Spawner` import and missing `entry` do
+        // not compile on stm32f1xx-hal, so switching an F1 project back from
+        // Async rebuilds it. Leaving RTIC only the label and the `entry` import
+        // change (`refit_header`); on any other splice - a pin edit, a save,
+        // an open - the header is not touched at all.
+        let head = &existing[..begin];
+        let own = invariant_header(mcu_name, mcu_id);
+        let head = if head.contains("embassy_executor") {
+            own
+        } else if leaving_rtic {
+            refit_header(head, &own)
+        } else {
+            head.to_owned()
+        };
         // new_section already ends with "// <<< GENERATED END >>>\n"
         // + one more "\n" gives a single blank line before the user tail.
-        format!("{}{}\n{}", &existing[..begin], new_section, after)
+        format!("{head}{new_section}\n{after}")
     } else {
         // Markers not found — rebuild from scratch.
         format!(
@@ -1234,7 +1256,7 @@ pub fn config_files(
 
 /// The pins the JTAG port holds at reset. `disable_jtag` frees exactly these
 /// three, together — the order is the one its signature takes.
-const JTAG_PINS: [&str; 3] = ["PA15", "PB3", "PB4"];
+pub(super) const JTAG_PINS: [&str; 3] = ["PA15", "PB3", "PB4"];
 
 /// The `let (…) = afio.mapr.disable_jtag(…)` line, with the pins the project
 /// does not use underscored so they don't read as forgotten bindings.
@@ -3283,7 +3305,7 @@ fn is_comment_expr(expr: &str) -> bool {
 ///
 /// TIM4's rows exist only behind the HAL's `medium` feature; they are listed
 /// here because a chip that has TIM4 is a chip built with that feature.
-fn pwm_remap(timer: u8, pads: &[(u8, &str)]) -> Option<&'static str> {
+pub(super) fn pwm_remap(timer: u8, pads: &[(u8, &str)]) -> Option<&'static str> {
     let rows: &[(&str, [&str; 4])] = match timer {
         1 => &[
             ("Tim1NoRemap", ["PA8", "PA9", "PA10", "PA11"]),

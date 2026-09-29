@@ -61,6 +61,7 @@ impl Mcu {
             crate::panels::mcu_module::codegen::watchdog_gen::init_lines(
                 &self.watchdog,
                 &self.family,
+                self.runtime,
             ),
             self.custom_module_inits(),
         )
@@ -212,6 +213,22 @@ impl Mcu {
     ) -> Option<&'static str> {
         use crate::panels::mcu_module::modules::ModuleKind;
         match kind {
+            // The F1's USB, CAN and SDIO on the Async runtime: the silicon is
+            // there, the generated code is not. Only where the pads ARE there,
+            // though - a value-line F100 has none of the three, and a disabled
+            // row would claim it had.
+            ModuleKind::GenericInterfaceUsb
+            | ModuleKind::GenericInterfaceCan
+            | ModuleKind::GenericInterfaceSdmmc => {
+                crate::panels::mcu_module::codegen::family::f1_async_module_gap(
+                    &self.family,
+                    self.runtime,
+                    kind,
+                )
+                .filter(|_| {
+                    autowire::any_wiring_static(self, &Default::default(), kind.signals().0)
+                })
+            }
             // The S2 and S3 carry the touch sensors — their pads are in
             // Espressif's own pin tables — but esp-hal builds `touch` only for
             // the original ESP32, and does not even expose `peripherals::TOUCH`
@@ -243,6 +260,18 @@ impl Mcu {
         // two stray dependencies. Only the family can answer that.
         if kind == crate::panels::mcu_module::modules::ModuleKind::GenericInterfaceUsb
             && !crate::panels::mcu_module::codegen::family::usb_supported(&self.family)
+        {
+            return false;
+        }
+        // An F1 on Async generates nothing for USB, CAN or SDIO;
+        // `hardware_only_reason` keeps them in the palette, disabled, with the
+        // reason.
+        if crate::panels::mcu_module::codegen::family::f1_async_module_gap(
+            &self.family,
+            self.runtime,
+            kind,
+        )
+        .is_some()
         {
             return false;
         }
@@ -1825,21 +1854,46 @@ impl Mcu {
             .map(|l| format!("• {l}"))
             .collect();
 
-        // 2. Entry-point change (only when async-ness flips; Blocking↔Native
-        //    share `#[entry] fn main() -> !`).
-        if self.pending_is_async() != self.is_async() {
+        // 2. Entry-point change. Blocking and Native share `#[entry] fn main()
+        //    -> !`; Async and RTIC each write their own.
+        {
+            use super::model::Runtime;
+            use crate::panels::mcu_module::codegen::family;
             // ESP spells both ends differently: esp-rtos drives the executor and
             // the blocking entry is esp-hal's, not cortex-m-rt's.
-            let esp = crate::panels::mcu_module::codegen::family::async_is_esp(&self.family);
-            let entry = match (self.pending_is_async(), esp) {
-                (true, true) => "#[esp_rtos::main] async fn main(Spawner)",
-                (true, false) => "#[embassy_executor::main] async fn main(Spawner)",
-                (false, true) => "#[esp_hal::main] fn main() -> !",
-                (false, false) => "#[entry] fn main() -> !",
+            let esp = family::async_is_esp(&self.family);
+            let entry_of = |rt: Runtime| match rt {
+                Runtime::Async if family::async_supported(&self.family) => {
+                    if esp {
+                        "#[esp_rtos::main] async fn main(Spawner)"
+                    } else {
+                        "#[embassy_executor::main] async fn main(Spawner)"
+                    }
+                }
+                Runtime::Rtic if family::rtic_supported(&self.family) => {
+                    "#[rtic::app] (init/idle, tasks bound to IRQs)"
+                }
+                _ if esp => "#[esp_hal::main] fn main() -> !",
+                _ => "#[entry] fn main() -> !",
             };
-            out.push(format!("main.rs entry -> {entry}"));
-        } else {
-            out.push("~ main.rs regenerated (pin bindings)".to_string());
+            let (was, will) = (entry_of(self.runtime), entry_of(self.pending_runtime));
+            if was != will {
+                out.push(format!("main.rs entry -> {will}"));
+                // Every other runtime closes its `fn main` in the tail below the
+                // markers, and RTIC generates its idle loop - so that loop goes.
+                // What follows `main` is kept (`rtic::splice_rtic_section`).
+                if will.starts_with("#[rtic::app]") {
+                    out.push(
+                        concat!(
+                            "! main.rs: the loop below the markers is replaced - ",
+                            "RTIC generates its own idle task; code after fn main is kept"
+                        )
+                        .to_string(),
+                    );
+                }
+            } else {
+                out.push("~ main.rs regenerated (pin bindings)".to_string());
+            }
         }
 
         // 3. Config-file adds / removes / regenerations — a dry-run of the regen.
@@ -1868,6 +1922,32 @@ impl Mcu {
 
         // 4. Cargo.toml deps follow the choices (embassy / embedded-io / nb / …);
         //    the exact set is applied by `init_frame` after Apply.
+        //
+        //    On an F1 the HAL crate ITSELF changes with Async, which a line about
+        //    "dependencies" does not say - nor that USB, CAN and SDIO are not
+        //    generated there, which would otherwise surface only in main.rs.
+        if self.family == "stm32f1" && self.pending_is_async() != self.is_async() {
+            out.push(
+                if self.pending_is_async() {
+                    "~ Cargo.toml: stm32f1xx-hal -> embassy-stm32 (the HAL itself changes)"
+                } else {
+                    "~ Cargo.toml: embassy-stm32 -> stm32f1xx-hal (the HAL itself changes)"
+                }
+                .to_string(),
+            );
+            if self.pending_is_async() {
+                use super::model::Runtime;
+                use crate::panels::mcu_module::codegen::family::f1_async_module_gap;
+                for m in &self.modules {
+                    if f1_async_module_gap(&self.family, Runtime::Async, m.kind).is_some() {
+                        out.push(format!(
+                            "! {}: not generated on the Async runtime - its pads bind raw",
+                            m.name
+                        ));
+                    }
+                }
+            }
+        }
         out.push("~ Cargo.toml dependencies updated to match".to_string());
         out
     }

@@ -3453,15 +3453,16 @@ mod async_hal_line {
             );
         }
 
-        // And a family that does NOT swap is untouched, whichever runtime.
-        let f1 = builtins::builtin_definitions()
+        // And a family that does NOT swap is untouched, whichever runtime. (Not
+        // the F103 any more: on Async it swaps stm32f1xx-hal for embassy-stm32.)
+        let esp = builtins::builtin_definitions()
             .into_iter()
-            .find(|d| d.id == "stm32f103c8t6")
-            .expect("built-in F103");
+            .find(|d| d.id == "esp32c3")
+            .expect("built-in ESP32-C3");
         assert_eq!(
-            f1.project.for_async(true).hal_dep,
-            f1.project.hal_dep,
-            "STM32 keeps one HAL for both runtimes"
+            esp.project.for_async(true).hal_dep,
+            esp.project.hal_dep,
+            "the ESP keeps one HAL for both runtimes"
         );
     }
 }

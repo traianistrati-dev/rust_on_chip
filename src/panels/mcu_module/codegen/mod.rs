@@ -73,7 +73,8 @@ impl Mcu {
     /// Whether code generation for this MCU is on the async (embassy) path — the
     /// project [`Runtime`](crate::panels::mcu_module::mcu::Runtime) is Async AND
     /// the family supports it. Drives the embassy async deps + the System-tab
-    /// toggle's effective state (Async selected on `stm32f1`/ESP is inert).
+    /// toggle's effective state (Async selected on a family with no async
+    /// backend is inert).
     pub fn is_async(&self) -> bool {
         self.runtime == Runtime::Async && family::async_supported(&self.family)
     }
@@ -81,7 +82,7 @@ impl Mcu {
     /// Whether code generation for this MCU is on the RTIC path — the project
     /// Runtime is Rtic AND the family supports it. Drives the RTIC deps and the
     /// System-tab card's effective state (Rtic selected elsewhere is inert, the
-    /// same way Async is on stm32f1/ESP).
+    /// same way Async is on a family with no async backend).
     pub fn is_rtic(&self) -> bool {
         self.runtime == Runtime::Rtic && family::rtic_supported(&self.family)
     }
@@ -2101,6 +2102,56 @@ mod tests {
             list.iter().any(|l| l.contains("main.rs")),
             "main.rs note: {list:?}"
         );
+    }
+
+    /// The entry line names the entry the STAGED runtime writes - RTIC's app
+    /// included, which is neither async nor `#[entry]` - and moving into RTIC
+    /// says the loop below the markers goes.
+    #[test]
+    fn the_apply_list_names_each_runtimes_entry() {
+        use super::super::mcu::Runtime;
+        use super::super::mock_mcu;
+
+        let entry = |from: Runtime, to: Runtime| {
+            let mut mcu = mock_mcu::create_stm32f103c8tx();
+            mcu.runtime = from;
+            mcu.sync_pending_style();
+            mcu.pending_runtime = to;
+            mcu.apply_change_list()
+        };
+        let has = |list: &[String], s: &str| list.iter().any(|l| l.contains(s));
+
+        let into_rtic = entry(Runtime::Async, Runtime::Rtic);
+        assert!(
+            has(&into_rtic, "main.rs entry -> #[rtic::app]"),
+            "{into_rtic:?}"
+        );
+        assert!(
+            has(&into_rtic, "RTIC generates its own idle task"),
+            "{into_rtic:?}"
+        );
+        let into_rtic = entry(Runtime::Blocking, Runtime::Rtic);
+        assert!(
+            has(&into_rtic, "main.rs entry -> #[rtic::app]"),
+            "{into_rtic:?}"
+        );
+
+        let out_of_rtic = entry(Runtime::Rtic, Runtime::Async);
+        assert!(
+            has(&out_of_rtic, "#[embassy_executor::main]"),
+            "{out_of_rtic:?}"
+        );
+        assert!(!has(&out_of_rtic, "idle task"), "{out_of_rtic:?}");
+        let out_of_rtic = entry(Runtime::Rtic, Runtime::Blocking);
+        assert!(
+            has(&out_of_rtic, "main.rs entry -> #[entry]"),
+            "{out_of_rtic:?}"
+        );
+
+        // Blocking and Native share `#[entry]`: nothing to announce.
+        let same = entry(Runtime::Blocking, Runtime::Native);
+        assert!(!has(&same, "main.rs entry"), "{same:?}");
+        assert!(has(&same, "main.rs regenerated"), "{same:?}");
     }
 
     /// A `<pin>_<type>` binding still round-trips back through `parse_main_rs`.

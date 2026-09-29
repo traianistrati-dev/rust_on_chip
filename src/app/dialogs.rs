@@ -1814,7 +1814,8 @@ pub(super) fn definitions_from_file(
 /// Does this family's codegen actually allocate from the definition's DMA table?
 ///
 /// Only the embassy backends do. STM32F1 takes its channel from the HAL, which
-/// fixes it in the TYPE, and ESP32 gets its own from esp-hal — so an empty
+/// fixes it in the TYPE (on Async, from its family table in `dma_map`), and
+/// ESP32 gets its own from esp-hal — so an empty
 /// `DmaDef` there means nothing at all, and reporting it as a gap is a false
 /// alarm on the two families most likely to be installed.
 ///
@@ -1875,20 +1876,17 @@ impl AppIde {
     /// Start the off-thread HAL-feature lookup for the selected chip.
     ///
     /// Does nothing when the chip's HAL line carries no `embassy-stm32` feature
-    /// (STM32F1 uses `stm32f1xx-hal`, ESP32 its own): there is nothing to look
-    /// up, and an empty slot would read as "still loading" forever.
+    /// (an STM32F1 off Async uses `stm32f1xx-hal`, ESP32 its own): there is
+    /// nothing to look up, and an empty slot would read as "still loading"
+    /// forever. The line checked is the one the project BUILDS with - an F1 on
+    /// Async gets its embassy line from `build_cfg`, not from the definition.
     pub(super) fn start_hal_check(&mut self) {
         self.hal_check = None;
-        let Some(mcu) = &self.mcu else { return };
-        let Some(def) = self.mcu_registry.iter().find(|d| d.id == mcu.id) else {
+        let Some(feat) = self.hal_feature_now() else {
             return;
         };
-        let Some(feat) = stm32_pin_data::embassy_feature_in(&def.project.hal_dep) else {
-            return;
-        };
-        let feat = feat.to_owned();
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-        self.hal_check = Some((mcu.id.clone(), slot.clone()));
+        self.hal_check = Some((feat.clone(), slot.clone()));
         std::thread::spawn(move || {
             let known = crate::app::editor_panel::cargo_complete::known_features(
                 stm32_pin_data::EMBASSY_CRATE,
@@ -1933,22 +1931,53 @@ impl AppIde {
             .unwrap_or(&[])
     }
 
-    /// The verdict, if it has landed AND belongs to the chip on screen.
+    /// The verdict, if it has landed AND is about the feature the project on
+    /// screen builds with.
     ///
-    /// The chip check is not paranoia: pick a chip, pick another before the
-    /// lookup returns, and without it the second chip would wear the first
-    /// one's answer.
+    /// The check is not paranoia: pick a chip, pick another before the lookup
+    /// returns, and without it the second chip would wear the first one's
+    /// answer.
     pub(super) fn hal_verdict_now(&self) -> Option<FeatureVerdict> {
-        let (id, slot) = self.hal_check.as_ref()?;
-        verdict_for(&self.mcu.as_ref()?.id, id, *slot.lock().ok()?)
+        let (feat, slot) = self.hal_check.as_ref()?;
+        verdict_for(&self.hal_feature_now()?, feat, *slot.lock().ok()?)
+    }
+
+    /// The `embassy-stm32` feature of the line the project BUILDS with, if any.
+    fn hal_feature_now(&self) -> Option<String> {
+        let mcu = self.mcu.as_ref()?;
+        let def = self.mcu_registry.iter().find(|d| d.id == mcu.id)?;
+        let line = crate::panels::mcu_module::mcu_def::build_cfg(def, Some(mcu)).hal_dep;
+        stm32_pin_data::embassy_feature_in(&line).map(str::to_owned)
+    }
+
+    /// Ask again when the feature the project builds with is not the one asked
+    /// about, and stop asking when there is none.
+    ///
+    /// The line moves with the RUNTIME - an F1 swaps `stm32f1xx-hal` for
+    /// `embassy-stm32` on Async - and neither a runtime Apply nor the
+    /// `@runtime` restore on open passes through the chip picker, which is
+    /// where [`start_hal_check`](Self::start_hal_check) used to be the only
+    /// caller. Clearing a stale check also stops the System tab's
+    /// "still loading" repaint.
+    pub(super) fn refresh_hal_check(&mut self) {
+        let want = self.hal_feature_now();
+        if want.as_deref() == self.hal_check.as_ref().map(|(f, _)| f.as_str()) {
+            return;
+        }
+        match want {
+            Some(_) => self.start_hal_check(),
+            None => self.hal_check = None,
+        }
     }
 }
 
-/// A verdict is only shown when it belongs to the chip currently on screen.
+/// A verdict is only shown when it is about the feature on screen now.
 ///
 /// Not paranoia — a real race: pick a chip, pick another before the index
 /// answers, and the second chip wears the first one's verdict. A wrong verdict
-/// is worse than none, because it is exactly as confident.
+/// is worse than none, because it is exactly as confident. Keyed on the
+/// FEATURE rather than the chip, so an F1 switching runtime - one chip, two
+/// HAL lines - does not keep the other line's answer either.
 pub(super) fn verdict_for(
     on_screen: &str,
     was_checked: &str,

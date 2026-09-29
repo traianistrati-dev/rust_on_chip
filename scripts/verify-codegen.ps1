@@ -250,7 +250,12 @@ $ALL_CASES = @(
     @{ n = "F1 USB, D+ only";              t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_USB = "dp" };        q = $false; fam = "f1" }
     @{ n = "F1 USB D- + GPIO on its pad";  t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_USB = "dm-gpio" };   q = $true; fam = "f1" }
     @{ n = "F1 every bus half-wired";      t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "both"; EIDE_USART_HALF = "rx"; EIDE_SPI_TXONLY = "1"; EIDE_I2C_HALF = "scl" }; q = $true; w = 3; fam = "f1" }
-    @{ n = "F1 Async (inert, = blocking)"; t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_F1_RUNTIME = "async" }; q = $true; fam = "f1" }
+    # The F1 on embassy-stm32: every bus pin carries the AFIO remap, the timer
+    # names its own, and the manifest is swapped by the same chain `app.rs`
+    # runs. Linked, because 64 KiB of flash is the F103C8's real limit.
+    @{ n = "F1 Async, default pads";       t = "emit_f1_async_project";  e = @{};                       q = $true; fam = "f1"; lk = $true; hk = $true }
+    @{ n = "F1 Async, remapped, all DMA";  t = "emit_f1_async_project";  e = @{ EIDE_F1_ASYNC_REMAP = "1"; EIDE_F1_ASYNC_DMA = "1" }; q = $true; fam = "f1"; lk = $true }
+    @{ n = "F1 Async -> Blocking switch";  t = "emit_f1_async_project";  e = @{ EIDE_F1_SWITCH = "back" }; q = $false; fam = "f1" }
     @{ n = "F1 RTIC";                      t = "emit_f1_rtic_project";   e = @{};                       q = $true; fam = "f1" }
     @{ n = "F1 Native";                    t = "emit_f1_native_project"; e = @{};                       q = $true; fam = "f1" }
 
@@ -426,7 +431,8 @@ $ALL_CASES = @(
 # `write_esp_dma_project` and `emit_esp_periph_project` in codegen/family.rs
 # read it, and a stale value there would pick the wrong runtime just as quietly.
 $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
-           "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_RUNTIME", "ESP_ASYNC_RUNTIME",
+           "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
+           "EIDE_F1_SWITCH", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG")
 

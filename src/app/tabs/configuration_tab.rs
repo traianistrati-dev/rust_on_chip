@@ -48,7 +48,7 @@ impl AppIde {
     pub(in crate::app) fn show_configuration_tab(&mut self, ui: &mut egui::Ui) {
         let Some(mcu) = &mut self.mcu else { return };
         let family = mcu.family.clone();
-        let limits = wdg::limits_for(&family);
+        let limits = wdg::limits_for(&family, mcu.runtime);
         // The WWDG's whole range is relative to PCLK1, so the Clock tab feeds
         // this one. 0 = no clock model → the range is unknowable, and the tab
         // says so rather than inventing one.
@@ -208,7 +208,7 @@ impl AppIde {
             } else {
                 iwdg_card(ui, &mut mcu.watchdog.iwdg, &limits);
                 ui.add_space(12.0);
-                wwdg_card(ui, &mut mcu.watchdog.wwdg, &limits, pclk1, &family);
+                wwdg_card(ui, &mut mcu.watchdog.wwdg, &limits, pclk1);
             }
             ui.add_space(10.0);
         });
@@ -274,17 +274,11 @@ fn iwdg_card(ui: &mut egui::Ui, cfg: &mut Option<IwdgConfig>, l: &WatchdogLimits
     });
 }
 
-fn wwdg_card(
-    ui: &mut egui::Ui,
-    cfg: &mut Option<WwdgConfig>,
-    l: &WatchdogLimits,
-    pclk1: u32,
-    family: &str,
-) {
+fn wwdg_card(ui: &mut egui::Ui, cfg: &mut Option<WwdgConfig>, l: &WatchdogLimits, pclk1: u32) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         // Shown disabled rather than hidden: a control that vanishes on one chip
         // is harder to understand than one that says why it cannot be used.
-        if !wdg::wwdg_supported(family) {
+        if !l.wwdg_available {
             ui.horizontal(|ui| {
                 ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
                 ui.label(
@@ -294,10 +288,11 @@ fn wwdg_card(
                 );
                 ui.label(dim("window watchdog"));
             });
-            ui.label(dim(
-                "Not available on this chip: the STM32F1 HAL (stm32f1xx-hal) implements \
-                 only the independent watchdog. Every embassy family has both.",
-            ));
+            ui.label(dim(concat!(
+                "Not available on this runtime: the STM32F1's HAL off Async (stm32f1xx-hal) ",
+                "implements only the independent watchdog. On the Async runtime the F1 is on ",
+                "embassy-stm32, which has both, as every embassy family does."
+            )));
             return;
         }
         let range = wdg::wwdg_range_us(l, pclk1);

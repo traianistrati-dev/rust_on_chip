@@ -6801,7 +6801,9 @@ pub fn module_config_ui(
                         ui.end_row();
                     }
                     // Third pair on this family — see the USART and I2C above.
-                    if family == "stm32f1" {
+                    // On Async the F1 generates no CAN at all (the palette says
+                    // why), so a note about stm32f1xx-hal's pair would be moot.
+                    if family == "stm32f1" && !is_async {
                         f1_half_bus_note(
                             ui,
                             "CAN",
@@ -6910,8 +6912,8 @@ pub fn module_config_ui(
                     }
                     // Not a HAL constraint like the four above — the USB init
                     // takes PA11/PA12 directly, so one pad would spend the other
-                    // uninvited.
-                    if family == "stm32f1" {
+                    // uninvited. Blocking only: on Async the F1 generates no USB.
+                    if family == "stm32f1" && !is_async {
                         f1_half_bus_note(
                             ui,
                             "USB",

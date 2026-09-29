@@ -202,6 +202,7 @@ impl FamilyBackend for Stm32f1Backend {
         files.extend(super::watchdog_gen::config_files(
             &mcu.watchdog,
             &mcu.family,
+            mcu.runtime,
         ));
         files
     }
@@ -363,7 +364,7 @@ fn esp_fresh_main_rs(mcu: &Mcu, runtime: EspRuntime) -> String {
         // NOT `watchdog_and_custom_inits()`, which the STM32 backends use: on
         // an ESP the two land in different places in `main`, so they travel as
         // two arguments.
-        &super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family),
+        &super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family, mcu.runtime),
         // On an ESP the family key IS the chip - `esp32h2`, not a series.
         &mcu.family,
         runtime,
@@ -378,7 +379,7 @@ fn esp_fresh_main_rs(mcu: &Mcu, runtime: EspRuntime) -> String {
 fn esp_config_files(mcu: &Mcu, runtime: EspRuntime) -> Vec<(String, String)> {
     // The watchdogs come from a TAB, not from the Pins canvas, so they are
     // collected here rather than threaded through the pin-driven builder.
-    let mut out = super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family);
+    let mut out = super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family, mcu.runtime);
     let all = pins_of(mcu);
     let configured: Vec<&Pin> = all
         .iter()
@@ -541,7 +542,7 @@ fn esp_update_main_rs(mcu: &Mcu, existing: &str, runtime: EspRuntime) -> String 
         // NOT `watchdog_and_custom_inits()`, which the STM32 backends use: on
         // an ESP the two land in different places in `main`, so they travel as
         // two arguments.
-        &super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family),
+        &super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family, mcu.runtime),
         // On an ESP the family key IS the chip - `esp32h2`, not a series.
         &mcu.family,
         runtime,
@@ -648,7 +649,7 @@ impl FamilyBackend for WbaBackend {
         // Like the generic embassy backend: bus inits stay inline in
         // main.rs, so `pins/configs/` here holds only the pin-less
         // peripherals the Configuration tab owns.
-        super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family)
+        super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family, mcu.runtime)
     }
     // No per-peripheral config files yet — bus init is documented inline (v1).
 }
@@ -730,7 +731,7 @@ impl FamilyBackend for StmEmbassyBackend {
         // Only the watchdogs: this backend keeps every bus init inline in
         // main.rs, so `pins/configs/` exists here purely for the tab-driven,
         // pin-less peripherals.
-        super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family)
+        super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family, mcu.runtime)
     }
 }
 // ── Async STM32 (embassy-stm32 + embassy-executor) ──────────────────────────
@@ -738,9 +739,11 @@ impl FamilyBackend for StmEmbassyBackend {
 // embassy-stm32 GPIO codegen, but the entry point is `#[embassy_executor::main]
 // async fn main(Spawner)` driven by the executor instead of `#[entry] fn main()
 // -> !`. Selected by [`backend_for_runtime`] — never listed in [`BACKENDS`],
-// since it is chosen by runtime, not family. Handles every STM32 family that
-// runs on embassy-stm32; `stm32f1` (on stm32f1xx-hal) has no async path yet, so
-// it is excluded and the System-tab toggle is disabled for it.
+// since it is chosen by runtime, not family. Handles every STM32 family,
+// `stm32f1` included: on Blocking, Native and RTIC the F1 is on stm32f1xx-hal,
+// and on Async it swaps that crate for the embassy-stm32 the others use (its
+// line is derived in `ProjectDef::for_async`), with its AFIO remap threaded
+// through the pin bounds (`embassy_async::with_afio_remap`).
 struct AsyncEmbassyBackend;
 
 impl FamilyBackend for AsyncEmbassyBackend {
@@ -760,7 +763,7 @@ impl FamilyBackend for AsyncEmbassyBackend {
     }
 
     fn handles(&self, family: &str) -> bool {
-        family.starts_with("stm32") && family != "stm32f1"
+        family.starts_with("stm32")
     }
 
     fn fresh_main_rs(&self, mcu: &Mcu) -> String {
@@ -782,7 +785,14 @@ impl FamilyBackend for AsyncEmbassyBackend {
         // Async bus peripherals: USART (BufferedUart → embedded-io-async), SPI +
         // I2C (blocking `embedded-hal` 1.0 or async-DMA `embedded-hal-async`, per
         // the module's AsyncBusMode). GPIO stays inline in main.rs (no io.rs).
-        async_periphs(mcu).config_files
+        // Plus the watchdogs, whose `init` calls `async_section` writes.
+        let mut files = async_periphs(mcu).config_files;
+        files.extend(super::watchdog_gen::config_files(
+            &mcu.watchdog,
+            &mcu.family,
+            mcu.runtime,
+        ));
+        files
     }
 }
 
@@ -855,10 +865,22 @@ fn async_section(mcu: &Mcu) -> String {
         .copied()
         .filter(|p| !periphs.consumed_pins.iter().any(|c| c == p.gpio()))
         .collect();
+    let mut clock = rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, mcu.clock_manual);
+    // PA15, PB3 and PB4 stay the JTAG port on an F1 unless released - and a
+    // project that wires one compiles either way, with a pad that does nothing.
+    if mcu.family == "stm32f1"
+        && all.iter().any(|p| {
+            !p.reserved
+                && p.selected_function != PinFunction::Unset
+                && super::stm32::JTAG_PINS.contains(&p.gpio())
+        })
+    {
+        clock = rcc::with_swd_only(&clock);
+    }
     embassy_async::make_generated_section(
         &mcu.name,
         &gpio_pins,
-        &rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, mcu.clock_manual),
+        &clock,
         &periphs.init_calls,
         &periphs.dma_irqs,
         &mcu.watchdog_and_custom_inits(),
@@ -1069,11 +1091,11 @@ const STM32_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "Cargo.toml:",
-            "Adds embassy-executor 0.9 + embassy-time and toggles time-driver-any on embassy-stm32. An async USART adds embedded-io-async + static_cell; SPI/I2C add embedded-hal (Blocking) or embedded-hal-async (Async-DMA). Leaving Async removes them again.",
+            "Adds embassy-executor 0.9 + embassy-time and toggles time-driver-any on embassy-stm32; on an F1 it first swaps stm32f1xx-hal for embassy-stm32. An async USART adds embedded-io-async + static_cell; SPI/I2C add embedded-hal (Blocking) or embedded-hal-async (Async-DMA). Leaving Async removes them again.",
         ),
         (
             "Applies to:",
-            "Every STM32 on embassy-stm32, which is every STM32 here but the F1 (on stm32f1xx-hal). The Pico, the micro:bit and the ESP parts have panes of their own.",
+            "Every STM32. The F1 is on stm32f1xx-hal on every other runtime, so for it Async is also a HAL swap: USB, CAN and SDIO are not generated there, and embassy-time takes one timer (TIM4 on an F103C8) that PWM can no longer use. The Pico, the micro:bit and the ESP parts have panes of their own.",
         ),
     ],
     // `Irqs` last: the config file takes the binding rather than declaring
@@ -1409,28 +1431,64 @@ pub fn dma_uses(mcu: &Mcu) -> Vec<super::dma_map::DmaUse> {
 /// Why the **Async** runtime is unavailable on `family`, or `None` when it is
 /// available. Phrased for the System tab, next to the card it explains.
 ///
-/// Like [`rtic_unavailable_reason`] and unlike [`native_unavailable_reason`],
-/// this is missing WORK rather than a choice with no object: `embassy-stm32`
-/// does publish chip features for the F1 (`stm32f103c8` among 95 of them), so
-/// the family is eligible. What is in the way is that F1 is the one STM32 this
-/// IDE routes to `stm32f1xx-hal` — the backend that gives it USB, the GPIO
-/// Portable/Native bridge and RTIC, none of which the embassy path emits.
-///
-/// Worth saying out loud in the UI, because the consequence is not obvious: the
-/// DMA choices (a USART's Buffered/DMA transport, a SPI/I2C bus' Async-DMA mode,
-/// and the per-module channel pickers) all live on the Async runtime, so an F1
-/// shows none of them.
+/// Every STM32 has it now, the F1 included, so the only answer left is a
+/// family with no async backend at all.
 pub fn async_unavailable_reason(family: &str) -> Option<String> {
     if async_supported(family) {
         return None;
     }
-    Some(if family == "stm32f1" {
-        "Not written for `stm32f1` yet: it is the one STM32 family this IDE builds on stm32f1xx-hal (which is what gives it USB, the GPIO bridge and RTIC), while the async runtime is embassy-stm32 throughout — and embassy-stm32 does support the F1, so this is work, not a limit of the chip. The DMA transport and channel pickers live on this runtime, so they are hidden here too."
-            .to_owned()
-    } else {
-        format!(
-            "No async backend for `{family}`: the async runtimes here cover the STM32, ESP, Pico and nRF52 families."
-        )
+    Some(format!(
+        "No async backend for `{family}`: the async runtimes here cover the STM32, ESP, Pico and nRF52 families."
+    ))
+}
+
+/// Whether the project runs `stm32f1xx-hal` - an STM32F1 on any runtime but
+/// Async, where it is on embassy-stm32 instead.
+///
+/// The one predicate for every fact that is about that CRATE rather than the
+/// silicon: the io.rs GPIO bridge, the USB and CAN templates, milliseconds on
+/// the IWDG, no window watchdog. Silicon facts - the AFIO remap groups, the
+/// 40 kHz LSI - stay keyed on the family alone, because they hold on both.
+pub fn uses_stm32f1xx_hal(family: &str, runtime: Runtime) -> bool {
+    family == "stm32f1" && runtime != Runtime::Async
+}
+
+/// Why a module of `kind` is not offered on an F1 on the Async runtime, or
+/// `None` when it is.
+///
+/// USB and CAN are real on that path - embassy-stm32 has a USB device driver
+/// and bxCAN for the F103 - but no async template is written for either, on
+/// any STM32, so the module would produce nothing. Blocking generates both.
+/// The SDIO is the other way round: embassy-stm32 0.6 gives the F1's SDIO no
+/// DMA channel, and its driver takes one.
+///
+/// `concat!` rather than `\`-continued literals: these are read in a hover,
+/// and rustfmt rejoins a continuation with its indentation inside.
+pub fn f1_async_module_gap(
+    family: &str,
+    runtime: Runtime,
+    kind: crate::panels::mcu_module::modules::ModuleKind,
+) -> Option<&'static str> {
+    use crate::panels::mcu_module::modules::ModuleKind;
+    if family != "stm32f1" || runtime != Runtime::Async {
+        return None;
+    }
+    Some(match kind {
+        ModuleKind::GenericInterfaceUsb => concat!(
+            "Not generated on the Async runtime yet: embassy-stm32 has the F1's USB device ",
+            "driver, but no async USB template is written here. The Blocking runtime ",
+            "generates the CDC serial device."
+        ),
+        ModuleKind::GenericInterfaceCan => concat!(
+            "Not generated on the Async runtime yet: embassy-stm32 has the F1's bxCAN ",
+            "driver, but no async CAN template is written here. The Blocking runtime ",
+            "generates it."
+        ),
+        ModuleKind::GenericInterfaceSdmmc => concat!(
+            "Not generated on the Async runtime: embassy-stm32 gives the F1's SDIO no DMA ",
+            "channel, and its driver needs one."
+        ),
+        _ => return None,
     })
 }
 
@@ -1602,6 +1660,7 @@ mod blocking_note_tests {
     /// `main.rs` against their HAL crate.
     const ASYNC_FAMILIES: &[(&str, &str)] = &[
         ("stm32f4", "pins::configs::"),
+        ("stm32f1", "pins::configs::"),
         ("rp2040", "embassy_rp::"),
         ("rp235x", "embassy_rp::"),
         ("nrf52833", "embassy_nrf::"),
@@ -1686,41 +1745,95 @@ mod blocking_note_tests {
         }
     }
 
-    /// Async is greyed on exactly one family, and that card has to say why —
-    /// the DMA choices hang off this runtime, so "no DMA option" is the visible
-    /// symptom of a card the user cannot click.
+    /// Async is greyed only where no async backend exists - since the F1 got
+    /// its path, that is no family this IDE ships - and the card says why.
     #[test]
-    fn the_async_card_explains_the_one_family_it_is_greyed_on() {
+    fn the_async_card_is_greyed_only_without_a_backend() {
         use super::async_unavailable_reason;
         // Every family with a backend: nothing to explain.
         for family in [
-            "stm32f2", "stm32f4", "stm32g0", "stm32h5", "stm32wba", "esp32c3", "rp2040", "nrf52833",
+            "stm32f1", "stm32f2", "stm32f4", "stm32g0", "stm32h5", "stm32wba", "esp32c3", "rp2040",
+            "nrf52833",
         ] {
             assert!(
                 async_unavailable_reason(family).is_none(),
                 "{family} has an async backend"
             );
         }
-        let f1 = async_unavailable_reason("stm32f1").expect("greyed means it must explain itself");
-        // Missing work, not a limit of the chip - the same category as RTIC,
-        // and it must not read as impossible.
-        assert!(
-            f1.contains("yet"),
-            "say it is not done, not that it cannot be: {f1}"
-        );
-        assert!(
-            f1.contains("stm32f1xx-hal") && f1.contains("embassy-stm32"),
-            "name both HALs, because the trade-off IS the reason: {f1}"
-        );
-        assert!(
-            f1.contains("DMA"),
-            "the user arrives here asking why DMA is missing: {f1}"
-        );
-        // A family with no backend at all gets the generic answer, not the F1 one.
+        // A family with no backend at all gets the generic answer.
         let other = async_unavailable_reason("stm8").expect("no backend, no async");
+        assert!(other.contains("stm8"), "{other}");
+    }
+
+    /// USB, CAN and SDIO on an F1 on Async: kept out of the palette but still
+    /// in sight, with a reason that says what is missing - never the chip.
+    #[test]
+    fn f1_async_names_the_modules_it_cannot_generate() {
+        use super::{f1_async_module_gap, uses_stm32f1xx_hal};
+        use crate::panels::mcu_module::mcu::Runtime;
+        use crate::panels::mcu_module::modules::ModuleKind;
+        for kind in [
+            ModuleKind::GenericInterfaceUsb,
+            ModuleKind::GenericInterfaceCan,
+            ModuleKind::GenericInterfaceSdmmc,
+        ] {
+            let why = f1_async_module_gap("stm32f1", Runtime::Async, kind).expect("a gap");
+            assert!(why.contains("Async runtime"), "{why}");
+            assert!(!why.contains("  "), "a joined continuation: {why}");
+            for rt in [Runtime::Blocking, Runtime::Native, Runtime::Rtic] {
+                assert!(f1_async_module_gap("stm32f1", rt, kind).is_none(), "{rt:?}");
+            }
+            assert!(f1_async_module_gap("stm32f4", Runtime::Async, kind).is_none());
+        }
+        // USB and CAN name the runtime that does generate them.
+        for kind in [
+            ModuleKind::GenericInterfaceUsb,
+            ModuleKind::GenericInterfaceCan,
+        ] {
+            let why = f1_async_module_gap("stm32f1", Runtime::Async, kind).unwrap_or("");
+            assert!(why.contains("yet") && why.contains("Blocking"), "{why}");
+        }
         assert!(
-            other.contains("stm8") && !other.contains("stm32f1xx-hal"),
-            "{other}"
+            f1_async_module_gap("stm32f1", Runtime::Async, ModuleKind::GenericInterfaceSpi)
+                .is_none()
+        );
+        assert!(uses_stm32f1xx_hal("stm32f1", Runtime::Blocking));
+        assert!(uses_stm32f1xx_hal("stm32f1", Runtime::Rtic));
+        assert!(!uses_stm32f1xx_hal("stm32f1", Runtime::Async));
+        assert!(!uses_stm32f1xx_hal("stm32f4", Runtime::Blocking));
+    }
+
+    /// The palette's disabled row with the reason is for a peripheral the chip
+    /// HAS. An F1 without CAN pads (the value line) gets no CAN row at all.
+    #[test]
+    fn the_palette_explains_only_the_f1_modules_the_chip_has() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::mcu::Runtime;
+        use crate::panels::mcu_module::modules::ModuleKind;
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+
+        let mut mcu = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        mcu.runtime = Runtime::Async;
+        for kind in [
+            ModuleKind::GenericInterfaceUsb,
+            ModuleKind::GenericInterfaceCan,
+        ] {
+            assert!(!mcu.supports_module(kind), "{kind:?}");
+            assert!(mcu.hardware_only_reason(kind).is_some(), "{kind:?}");
+        }
+        for p in mcu.iter_all_pins_mut() {
+            p.available_functions
+                .retain(|f| !matches!(f, PinFunction::CanRx | PinFunction::CanTx));
+        }
+        assert!(
+            mcu.hardware_only_reason(ModuleKind::GenericInterfaceCan)
+                .is_none()
+        );
+        assert!(
+            mcu.hardware_only_reason(ModuleKind::GenericInterfaceUsb)
+                .is_some()
         );
     }
 
@@ -1841,15 +1954,15 @@ mod tests {
         assert!(code.contains(crate::panels::mcu_module::codegen::GEN_BEGIN));
     }
 
-    /// The Async runtime re-targets embassy-capable STM32 families to the async
-    /// backend, while Blocking (and F1/ESP under Async) keep their default one.
+    /// The Async runtime re-targets every STM32 family - the F1 included - to
+    /// the async backend, while Blocking keeps each family's default one.
     #[test]
     fn async_runtime_dispatch() {
-        // Async supported for embassy STM32 families, not F1/ESP/unknown.
+        // Async supported on every STM32 and on the ESP parts.
         assert!(async_supported("stm32f4"));
         assert!(async_supported("stm32g0"));
         assert!(async_supported("stm32wba"));
-        assert!(!async_supported("stm32f1"));
+        assert!(async_supported("stm32f1"));
         assert!(async_supported("esp32c3")); // esp-rtos
         assert!(!async_is_esp("stm32f4"));
         assert!(async_is_esp("esp32c3"));
@@ -1907,19 +2020,24 @@ mod tests {
                 .family_id(),
             "stm32-async"
         );
-        // Async on F1 is inert — it stays on the F1 (stm32f1xx-hal) backend.
+        // Async on an F1 is embassy too: stm32f1xx-hal is its HAL on every
+        // other runtime, and Async swaps it out. (It used to be INERT here - the
+        // blocking code under an Async label - until F1 got its async path.)
         assert_eq!(
             backend_for_runtime("stm32f1", Runtime::Async)
                 .unwrap()
                 .family_id(),
-            "stm32f1"
+            "stm32-async"
         );
-        // …and "inert" has to mean IDENTICAL, not merely "same backend".
-        // `mcu.config` is a file the user can edit, so `@runtime Async` on an F1
-        // project is reachable without the (disabled) System-tab card. If the
-        // fallback were partial — the blocking sources but the async dependency
-        // set, which `AppIde::save` keys on `Mcu::is_async` — the project would
-        // reference `embedded-io` / `nb` that Cargo.toml no longer carries.
+        for rt in [Runtime::Blocking, Runtime::Native, Runtime::Rtic] {
+            assert_eq!(
+                backend_for_runtime("stm32f1", rt).unwrap().family_id(),
+                "stm32f1",
+                "{rt:?} stays on stm32f1xx-hal"
+            );
+        }
+        // ...and it really is embassy: the executor's entry, embassy's init, a
+        // USART file whose pins carry the AFIO remap, no stm32f1xx-hal anywhere.
         {
             use crate::panels::mcu_module::builtins::builtin_for;
             use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
@@ -1942,19 +2060,28 @@ mod tests {
             }
             mcu.reconcile_modules();
 
-            mcu.runtime = Runtime::Blocking;
-            let (blocking_main, blocking_cfgs) = (mcu.fresh_main_rs(), mcu.config_files());
             mcu.runtime = Runtime::Async;
-            assert!(!mcu.is_async(), "async is not supported on stm32f1");
-            assert_eq!(
-                mcu.fresh_main_rs(),
-                blocking_main,
-                "main.rs must not differ"
-            );
-            assert_eq!(mcu.config_files(), blocking_cfgs, "configs must not differ");
+            assert!(mcu.is_async(), "the F1 has an async path");
             // The two flags `AppIde::save` reads to pick the dependency set.
             assert!(!mcu.is_rtic());
             assert!(!mcu.is_native());
+            let main = mcu.fresh_main_rs();
+            assert!(main.contains("#[embassy_executor::main]"), "{main}");
+            assert!(main.contains("embassy_stm32::init(config)"), "{main}");
+            assert!(!main.contains("stm32f1xx_hal"), "{main}");
+            let cfgs = mcu.config_files();
+            let usart = &cfgs
+                .iter()
+                .find(|(n, _)| n == "usart1.rs")
+                .unwrap_or_else(|| panic!("usart1.rs: {cfgs:?}"))
+                .1;
+            assert!(usart.contains("BufferedUart"), "{usart}");
+            assert!(usart.contains("pub fn init<'d, A>("), "{usart}");
+            assert!(
+                usart.contains("impl RxPin<peripherals::USART1, A>"),
+                "{usart}"
+            );
+            assert!(!usart.contains("stm32f1xx_hal"), "{usart}");
         }
         // ESP32-C3 async is a DIFFERENT backend (esp-rtos), not the embassy one.
         assert_eq!(
@@ -1975,6 +2102,190 @@ mod tests {
                 backend_for_runtime("esp32c3", rt).unwrap().family_id(),
                 "esp32c3"
             );
+        }
+    }
+
+    /// Every runtime switch on the F1 re-splices an EXISTING `main.rs`, and four
+    /// runtimes write three shapes: Blocking/Native close `fn main` in the user
+    /// tail, Async closes `async fn main` there too, RTIC closes nothing (the
+    /// whole `mod app` is generated). A still-pristine file must come out exactly
+    /// as a fresh one would, from any runtime to any other.
+    #[test]
+    fn every_f1_runtime_switch_rewrites_a_pristine_main_rs_whole() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        let at = |rt: Runtime| {
+            let mut mcu = builtin_for("stm32f103c8t6")
+                .expect("built-in F103")
+                .build_mcu();
+            mcu.runtime = rt;
+            mcu.pending_runtime = rt;
+            mcu
+        };
+        let all = [
+            Runtime::Blocking,
+            Runtime::Native,
+            Runtime::Rtic,
+            Runtime::Async,
+        ];
+        let mut wrong = Vec::new();
+        for from in all {
+            for to in all {
+                let switched = at(to).update_main_rs(&at(from).fresh_main_rs());
+                if switched != at(to).fresh_main_rs() {
+                    wrong.push(format!("{from:?} -> {to:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The same switches over a tail the user has WRITTEN in. It is theirs, so
+    /// it stays - but the entry the new runtime opens still has to close. RTIC's
+    /// tail holds helpers at module level and closes nothing; the others close
+    /// their `fn main`. And whatever wrote the header, it is this runtime's
+    /// afterwards: no executor import outside Async.
+    #[test]
+    fn a_user_tail_survives_an_f1_runtime_switch_and_still_closes_main() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::codegen::{GEN_BEGIN, GEN_END};
+        let at = |rt: Runtime| {
+            let mut mcu = builtin_for("stm32f103c8t6")
+                .expect("built-in F103")
+                .build_mcu();
+            mcu.runtime = rt;
+            mcu.pending_runtime = rt;
+            mcu
+        };
+        let balance = |s: &str| s.matches('{').count() as i64 - s.matches('}').count() as i64;
+        // The user's own code: a line in the loop, where there is one, and a
+        // module-level `fn` after `main` (RTIC: after its seed comment). The
+        // loop line holds a `'}'`, a `"{"` and a commented `{}`: braces the
+        // cut must not count, and that net to zero for `balance` below.
+        let edited = |rt: Runtime| {
+            let fresh = at(rt).fresh_main_rs();
+            let cut = fresh.find(GEN_END).expect("markers") + GEN_END.len();
+            let (head, tail) = fresh.split_at(cut);
+            let mine = if rt == Runtime::Rtic {
+                format!("{tail}\nfn module_helper() {{}}\n")
+            } else {
+                let looped =
+                    tail.replacen("loop {", "loop {\n        loop_line('}', \"{\"); // {}", 1);
+                format!("{looped}\nfn module_helper() {{}}\n")
+            };
+            let head = head.replacen("pub mod pins;\n", "pub mod pins;\nmod my_mod;\n", 1);
+            format!("{head}{mine}")
+        };
+        let all = [Runtime::Blocking, Runtime::Rtic, Runtime::Async];
+        let mut wrong = Vec::new();
+        for from in all {
+            for to in all {
+                let old = edited(from);
+                let switched = at(to).update_main_rs(&old);
+                let pair = format!("{from:?} -> {to:?}");
+                // Into RTIC, the loop that closed `fn main` goes
+                // (`rtic::splice_rtic_section`): it has no place in an app
+                // whose idle task is generated. Everything after `main` stays.
+                // (An RTIC file has no loop line to begin with.)
+                let loop_kept = from != Runtime::Rtic && to != Runtime::Rtic;
+                if switched.contains("loop_line(") != loop_kept {
+                    wrong.push(format!("{pair}: the loop line kept = {}", !loop_kept));
+                }
+                if !switched.contains("fn module_helper()") {
+                    wrong.push(format!("{pair}: the fn after main is gone"));
+                }
+                if balance(&switched) != balance(&at(to).fresh_main_rs()) {
+                    wrong.push(format!("{pair}: the braces no longer close"));
+                }
+                let head = &switched[..switched.find(GEN_BEGIN).unwrap_or(0)];
+                if head.contains("embassy_executor") != (to == Runtime::Async)
+                    || head.contains("use cortex_m_rt::entry;") != (to == Runtime::Blocking)
+                {
+                    wrong.push(format!("{pair}: the header is another runtime's"));
+                }
+                // A `mod` the user declared up there survives a refit; the
+                // Async header is rebuilt whole, on the way in and out.
+                let refitted = from != Runtime::Async && to != Runtime::Async;
+                if head.contains("mod my_mod;") != refitted {
+                    wrong.push(format!(
+                        "{pair}: the user's header line kept = {}",
+                        !refitted
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// RTIC -> X -> RTIC hands back the RTIC tail it started with: leaving
+    /// RTIC puts a fresh seed IN FRONT of the helpers, and coming back cuts
+    /// exactly that seed off again. Through Async the header is rebuilt, so only
+    /// the tail is compared there.
+    #[test]
+    fn an_rtic_tail_survives_a_round_trip_through_every_runtime() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::codegen::GEN_END;
+        let at = |rt: Runtime| {
+            let mut mcu = builtin_for("stm32f103c8t6")
+                .expect("built-in F103")
+                .build_mcu();
+            mcu.runtime = rt;
+            mcu.pending_runtime = rt;
+            mcu
+        };
+        let fresh = at(Runtime::Rtic).fresh_main_rs();
+        let rtic = format!(
+            "{fresh}\nfn module_helper() -> u32 {{\n    if true {{ 1 }} else {{ 2 }}\n}}\n"
+        );
+        let tail = |s: &str| s[s.find(GEN_END).expect("markers")..].to_owned();
+        for middle in [Runtime::Blocking, Runtime::Native, Runtime::Async] {
+            let away = at(middle).update_main_rs(&rtic);
+            let back = at(Runtime::Rtic).update_main_rs(&away);
+            if middle == Runtime::Async {
+                assert_eq!(tail(&back), tail(&rtic), "via {middle:?}");
+            } else {
+                assert_eq!(back, rtic, "via {middle:?}");
+            }
+        }
+    }
+
+    /// A header the user wrote the `entry` import into their own way - with a
+    /// fault handler beside it, or a comment after it - is left alone on every
+    /// splice, and gets no second import on the way back from RTIC (E0252).
+    #[test]
+    fn a_user_written_entry_import_is_never_doubled() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::codegen::GEN_BEGIN;
+        let at = |rt: Runtime| {
+            let mut mcu = builtin_for("stm32f103c8t6")
+                .expect("built-in F103")
+                .build_mcu();
+            mcu.runtime = rt;
+            mcu.pending_runtime = rt;
+            mcu
+        };
+        let imports = |s: &str| {
+            s[..s.find(GEN_BEGIN).unwrap_or(0)]
+                .lines()
+                .filter(|l| l.contains("cortex_m_rt::"))
+                .count()
+        };
+        for mine in [
+            "use cortex_m_rt::{entry, exception, ExceptionFrame};",
+            "use cortex_m_rt::entry; // reset vector",
+            "use cortex_m_rt::{\n    entry,\n    exception,\n};",
+        ] {
+            let blocking =
+                at(Runtime::Blocking)
+                    .fresh_main_rs()
+                    .replacen("use cortex_m_rt::entry;", mine, 1);
+            // A plain regeneration keeps the header byte for byte.
+            let again = at(Runtime::Blocking).update_main_rs(&blocking);
+            assert_eq!(again, blocking, "{mine}");
+            // Through RTIC and back: still one import.
+            let rtic = at(Runtime::Rtic).update_main_rs(&blocking);
+            let back = at(Runtime::Blocking).update_main_rs(&rtic);
+            assert_eq!(imports(&back), 1, "{mine}\n\n{back}");
+            assert!(back.contains(mine), "{mine}\n\n{back}");
         }
     }
 
@@ -3296,6 +3607,41 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Found while planning F1 on Async: the async STM32 backend wrote the
+    /// watchdogs' `init` calls into main.rs but never their files, so any
+    /// async STM32 project with a watchdog named a module that did not exist.
+    #[test]
+    fn an_async_stm32_writes_the_watchdogs_it_starts() {
+        use crate::panels::mcu_module::mcu::Runtime;
+        use crate::panels::mcu_module::watchdog::{IwdgConfig, WwdgConfig};
+
+        let mut def = crate::panels::mcu_module::builtins::builtin_for("stm32f103c8t6").unwrap();
+        def.family = "stm32f4".into();
+        def.id = "stm32f411re".into();
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Async;
+        mcu.watchdog.iwdg = Some(IwdgConfig {
+            timeout_us: 2_000_000,
+        });
+        mcu.watchdog.wwdg = Some(WwdgConfig {
+            timeout_us: 20_000,
+            window_us: 0,
+        });
+
+        let code = mcu.fresh_main_rs();
+        let names: Vec<String> = mcu.config_files().into_iter().map(|(n, _)| n).collect();
+        for (call, file) in [
+            ("pins::configs::iwdg::init(p.IWDG)", "iwdg.rs"),
+            ("pins::configs::wwdg::init(p.WWDG)", "wwdg.rs"),
+        ] {
+            assert!(code.contains(call), "main.rs lacks {call}:\n{code}");
+            assert!(
+                names.iter().any(|n| n == file),
+                "main.rs calls {call} but {file} is not written: {names:?}"
+            );
+        }
     }
 
     /// An async USART (both TX+RX wired) emits a `usart{n}.rs` config file with

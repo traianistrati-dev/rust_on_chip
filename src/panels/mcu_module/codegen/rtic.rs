@@ -347,19 +347,112 @@ pub fn invariant_header(mcu_name: &str, mcu_id: &str) -> String {
 
 pub const RTIC_USER_TAIL: &str = "// Add helpers, `impl`s and `use`s for your tasks here.\n     // Task bodies live inside the `mod app` block above.\n";
 
-/// Does this trailing text close a block that the GEN section opened?
+/// Where a tail stops closing the entry fn the GEN section used to open: the
+/// byte just after the `}` that takes the brace depth below zero, or `None`
+/// when no brace does - the tail is already RTIC-shaped.
 ///
-/// The switch that matters: turning an EXISTING bare-metal project into an RTIC
-/// one leaves the old `loop { ... }\n}` behind the markers, and splicing keeps
-/// whatever follows them. A tail with more `}` than `{` was closing a `fn main`
-/// that no longer exists, so it has to go.
-fn tail_closes_a_missing_block(tail: &str) -> bool {
-    let opens = tail.matches('{').count();
-    let closes = tail.matches('}').count();
-    closes > opens
+/// The switch that matters: turning an EXISTING bare-metal or Async project
+/// into an RTIC one leaves the old `loop { ... }\n}` behind the markers. That
+/// much closed a `fn main` that no longer exists, so it goes; whatever the user
+/// wrote AFTER it - helpers, `impl`s, and on a round trip the RTIC tail itself
+/// - is module-level code and stays.
+///
+/// Braces inside comments, strings and char literals do not count, so a `'}'`
+/// or a `"{"` in the user's loop cannot move the cut into their own code.
+fn entry_close(tail: &str) -> Option<usize> {
+    let b = tail.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut depth = 0i64;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i = tail[i..].find('\n').map_or(b.len(), |n| i + n);
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                // Rust's block comments nest.
+                let mut nest = 1;
+                i += 2;
+                while i < b.len() && nest > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        nest += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        nest -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            // A raw string, `r"..."` / `r#"..."#` (also after a `b`).
+            b'r' if matches!(b.get(i + 1), Some(b'"' | b'#'))
+                && (i == 0
+                    || !ident(b[i - 1])
+                    || (b[i - 1] == b'b' && (i < 2 || !ident(b[i - 2])))) =>
+            {
+                let mut j = i + 1;
+                while b.get(j) == Some(&b'#') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'"') {
+                    let close = format!("\"{}", "#".repeat(j - i - 1));
+                    i = tail[j + 1..]
+                        .find(&close)
+                        .map_or(b.len(), |n| j + 1 + n + close.len());
+                } else {
+                    i += 1; // `r#ident`, a raw identifier
+                }
+                continue;
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                continue;
+            }
+            b'\'' => {
+                // A char literal ('{', '\'', '\u{7d}') or a lifetime ('a).
+                if b.get(i + 1) == Some(&b'\\') {
+                    // Past the quote, the backslash and the escaped char.
+                    let from = (i + 3).min(b.len());
+                    i = tail[from..].find('\'').map_or(b.len(), |n| from + n + 1);
+                    continue;
+                }
+                let c = tail[i + 1..].chars().next().map_or(1, char::len_utf8);
+                if tail[i + 1..].get(c..).is_some_and(|r| r.starts_with('\'')) {
+                    i += c + 2;
+                    continue;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Re-splice an RTIC GEN block, replacing an inherited bare-metal tail.
+///
+/// Coming from another runtime the header is refitted to RTIC (its label, no
+/// dead `entry` import) - or rebuilt, when the Async runtime wrote it: an RTIC
+/// project has no `embassy_executor` to import. Between two RTIC splices it is
+/// kept verbatim.
+///
+/// The tail loses only what closed the old `fn main` ([`entry_close`]); what
+/// follows it is kept, under RTIC's own seed comment unless it already starts
+/// with it - so RTIC -> Blocking -> RTIC gives back the tail it started with.
 pub fn splice_rtic_section(
     existing: &str,
     new_section: &str,
@@ -370,11 +463,28 @@ pub fn splice_rtic_section(
     let (Some(begin), Some(end_start)) = (existing.find(GEN_BEGIN), existing.find(GEN_END)) else {
         return format!("{header}{new_section}\n{RTIC_USER_TAIL}");
     };
+    let head = &existing[..begin];
+    let head = if head.contains("embassy_executor") {
+        header
+    } else if super::common::section_is_rtic(existing) {
+        head.to_owned()
+    } else {
+        super::common::refit_header(head, &header)
+    };
     let after = existing[end_start + GEN_END.len()..].trim_start_matches('\n');
-    if tail_closes_a_missing_block(after) {
-        return format!("{}{new_section}\n{RTIC_USER_TAIL}", &existing[..begin]);
-    }
-    format!("{}{new_section}\n{after}", &existing[..begin])
+    let Some(cut) = entry_close(after) else {
+        return format!("{head}{new_section}\n{after}");
+    };
+    let rest = after[cut..].trim_start_matches('\n');
+    let seed_head = RTIC_USER_TAIL.lines().next().unwrap_or_default();
+    let tail = if rest.trim().is_empty() {
+        RTIC_USER_TAIL.to_owned()
+    } else if rest.starts_with(seed_head) {
+        rest.to_owned()
+    } else {
+        format!("{RTIC_USER_TAIL}\n{rest}")
+    };
+    format!("{head}{new_section}\n{tail}")
 }
 
 /// The full `main.rs` GEN block for an RTIC project.

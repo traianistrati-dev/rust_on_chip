@@ -59,9 +59,16 @@ pub(super) fn gpio_bindings_exti(pins: &[&Pin], exti: &[(String, u8)]) -> (Strin
     let any_output = configured
         .iter()
         .any(|p| p.selected_function == PinFunction::GpioOutput);
+    // An input armed on an EXTI line binds as `ExtiInput`, not `Input` - counted
+    // as a plain one, a project whose only input was armed imported `Input` for
+    // nothing (`unused import`). It still takes a `Pull`.
+    let armed = |p: &Pin| exti.iter().any(|(g, _)| g == p.gpio());
     let any_input = configured
         .iter()
-        .any(|p| p.selected_function == PinFunction::GpioInput);
+        .any(|p| p.selected_function == PinFunction::GpioInput && !armed(p));
+    let any_armed = configured
+        .iter()
+        .any(|p| p.selected_function == PinFunction::GpioInput && armed(p));
 
     // Only import the gpio types actually used (no unused-import warnings).
     // A pin wired as a raw alternate function needs Flex + AfType, and the
@@ -83,7 +90,7 @@ pub(super) fn gpio_bindings_exti(pins: &[&Pin], exti: &[(String, u8)]) -> (Strin
         .any(|p| matches!(p.io_mode, Some(GpioMode::PushPull | GpioMode::OpenDrain)));
 
     let mut imports = Vec::new();
-    if any_input || af_input {
+    if any_input || any_armed || af_input {
         imports.push("Pull");
     }
     if any_input {
@@ -841,7 +848,7 @@ mod emit_for_manual_compile {
                 IwdgConfig, WatchdogSettings, WwdgConfig, iwdg_range_us, limits_for, wwdg_range_us,
             };
             let mut w = def.build_mcu();
-            let l = limits_for(&w.family);
+            let l = limits_for(&w.family, w.runtime);
             // The default the Reset button restores, i.e. the value the tab
             // hands out unedited - so the harness proves exactly what a user
             // gets by switching both on and touching nothing.
@@ -921,7 +928,7 @@ mod emit_for_manual_compile {
             wdef.project.probe_chip = "STM32WBA55CGUx".into();
             wdef.project.hal_dep = stm32_pin_data::hal_dep_for_name("stm32wba", "STM32WBA55CGUx");
             let mut w = wdef.build_mcu();
-            let l = limits_for(&w.family);
+            let l = limits_for(&w.family, w.runtime);
             let pclk1 = 100_000_000;
             w.watchdog = WatchdogSettings {
                 iwdg: Some(IwdgConfig {
@@ -1000,7 +1007,7 @@ mod emit_for_manual_compile {
                     // The Reset default: the longest period this HAL accepts.
                     // Its own arithmetic, not embassy's - 42 ms shorter, and
                     // every millisecond of that gap panics.
-                    timeout_us: iwdg_range_us(&limits_for(&m1.family)).1,
+                    timeout_us: iwdg_range_us(&limits_for(&m1.family, m1.runtime)).1,
                 }),
                 ..Default::default()
             };
@@ -1255,16 +1262,6 @@ mod emit_for_manual_compile {
 
         let f1 = builtin_for("stm32f103c8t6").expect("built-in F103");
         let mut mcu = f1.build_mcu();
-        // `EIDE_F1_RUNTIME=async` writes `@runtime Async` on a family that has
-        // no async backend — reachable by hand-editing `mcu.config`, since the
-        // System-tab card cannot be clicked there. Everything below must come
-        // out byte-identical to Blocking: same sources, same dependency set.
-        if std::env::var("EIDE_F1_RUNTIME").as_deref() == Ok("async") {
-            use crate::panels::mcu_module::mcu::model::Runtime;
-            mcu.runtime = Runtime::Async;
-            mcu.pending_runtime = Runtime::Async;
-            assert!(!mcu.is_async(), "stm32f1 has no async backend");
-        }
         // `EIDE_USB` takes PA11/PA12 away from the CAN and gives them to the USB
         // — the two peripherals share those pads (and the SRAM behind them).
         //
@@ -1594,6 +1591,287 @@ mod emit_for_manual_compile {
             .expect("write f1 dma project");
         println!("wrote {}", dir.display());
         println!("target: {}", f1.project.target);
+    }
+
+    /// The F103 on the Async runtime - embassy-stm32 instead of stm32f1xx-hal -
+    /// written the way the application writes it: `main.rs` and `Cargo.toml`
+    /// both come through a runtime SWITCH from the blocking project, and the
+    /// manifest through the same `refresh_hal_dependency` + `ensure_*` chain
+    /// `app.rs` runs. What only a compiler settles: the AFIO remap generic on
+    /// every bus pin, the concrete remap on a timer, the F1 clock block, the
+    /// `swj` release, the DMA channel names and the EXTI vector.
+    ///
+    /// Knobs:
+    /// * `EIDE_F1_ASYNC_REMAP=1` - USART1 on PB6/PB7 and I2C1 on PB8/PB9, both
+    ///   remapped (the default is their unremapped pads plus TIM4 on PB8, which
+    ///   the time driver owns, so that timer must come out as a note);
+    /// * `EIDE_F1_ASYNC_DMA=1` - USART1, SPI1 and I2C1 all on DMA;
+    /// * `EIDE_F1_SWITCH=back` - also writes the project switched BACK to
+    ///   Blocking, to `eide_f1_check_async_back`.
+    ///
+    /// ```text
+    /// cargo test --bin rust_on_chip emit_f1_async_project -- --ignored --nocapture
+    /// cd %TEMP%\eide_f1_check_async && cargo check --target thumbv7m-none-eabi
+    /// ```
+    #[test]
+    #[ignore = "writes a project to disk for a manual cross-compile"]
+    fn emit_f1_async_project() {
+        warn_if_matrix_running();
+        use crate::panels::mcu_module::mcu::model::Runtime;
+        use crate::panels::mcu_module::mcu_def::build_cfg;
+        use crate::panels::mcu_module::modules::{AsyncBusMode, ModuleConfig, UsartMode};
+        use crate::panels::mcu_module::pins::logic::pin::Edge;
+        use crate::panels::mcu_module::watchdog::{IwdgConfig, WwdgConfig};
+
+        let remap = std::env::var("EIDE_F1_ASYNC_REMAP").is_ok();
+        let dma = std::env::var("EIDE_F1_ASYNC_DMA").is_ok();
+        let def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        let mut mcu = def.build_mcu();
+        let mut wiring: Vec<(&str, PinFunction)> = vec![
+            ("PA5", PinFunction::SpiSck(1)),
+            ("PA6", PinFunction::SpiMiso(1)),
+            ("PA7", PinFunction::SpiMosi(1)),
+            // TIM2 CH3/CH4: the same pads unremapped and partly remapped, so
+            // the remap has to be NAMED (E0283 otherwise).
+            (
+                "PA2",
+                PinFunction::TimerPwm {
+                    timer: 2,
+                    channel: 3,
+                },
+            ),
+            (
+                "PA3",
+                PinFunction::TimerPwm {
+                    timer: 2,
+                    channel: 4,
+                },
+            ),
+            ("PC13", PinFunction::GpioOutput),
+            // A JTAG pad: without `swj = SwdOnly` it compiles and does nothing.
+            ("PB3", PinFunction::GpioOutput),
+            // The CAN pads, which an F1 project switched to Async keeps on the
+            // canvas: bound raw, with the note that says why.
+            ("PA11", PinFunction::CanRx),
+            ("PA12", PinFunction::CanTx),
+        ];
+        if remap {
+            wiring.extend([
+                ("PB6", PinFunction::UsartTx(1)),
+                ("PB7", PinFunction::UsartRx(1)),
+                ("PB8", PinFunction::I2cScl(1)),
+                ("PB9", PinFunction::I2cSda(1)),
+            ]);
+        } else {
+            wiring.extend([
+                ("PA9", PinFunction::UsartTx(1)),
+                ("PA10", PinFunction::UsartRx(1)),
+                ("PB6", PinFunction::I2cScl(1)),
+                ("PB7", PinFunction::I2cSda(1)),
+                // TIM4 is embassy-time's on this chip: a note, not an init.
+                (
+                    "PB8",
+                    PinFunction::TimerPwm {
+                        timer: 4,
+                        channel: 3,
+                    },
+                ),
+            ]);
+        }
+        for (name, func) in wiring {
+            let num = mcu
+                .iter_all_pins()
+                .find(|p| p.name == name)
+                .map(|p| p.number)
+                .unwrap_or_else(|| panic!("no pad {name}"));
+            let p = mcu.find_pin_mut(num).expect("the pad just found");
+            p.selected_function = func;
+        }
+        // An armed input on EXTI line 5 (EXTI9_5).
+        let pb5 = mcu
+            .iter_all_pins()
+            .find(|p| p.name == "PB5")
+            .map(|p| p.number)
+            .expect("PB5");
+        let p = mcu.find_pin_mut(pb5).expect("PB5");
+        p.selected_function = PinFunction::GpioInput;
+        p.irq = Some(Edge::Both);
+        mcu.reconcile_modules();
+        for m in &mut mcu.modules {
+            match &mut m.config {
+                ModuleConfig::Usart(c) if dma => c.mode = UsartMode::Dma,
+                ModuleConfig::Spi(c) if dma => c.async_mode = AsyncBusMode::AsyncDma,
+                ModuleConfig::I2c(c) if dma => c.async_mode = AsyncBusMode::AsyncDma,
+                ModuleConfig::Timer(c) => {
+                    c.freq_hz = 20_000;
+                    c.set_duty_x100(3, 7_500);
+                }
+                _ => {}
+            }
+        }
+        mcu.watchdog.iwdg = Some(IwdgConfig {
+            timeout_us: 2_000_000,
+        });
+        mcu.watchdog.wwdg = Some(WwdgConfig {
+            timeout_us: 20_000,
+            window_us: 0,
+        });
+
+        // Through the switch, the way a user gets here.
+        let mut blocking = mcu.clone();
+        blocking.runtime = Runtime::Blocking;
+        blocking.pending_runtime = Runtime::Blocking;
+        mcu.runtime = Runtime::Async;
+        mcu.pending_runtime = Runtime::Async;
+        assert!(mcu.is_async(), "the F1 has an async path");
+        let main_rs = mcu.update_main_rs(&blocking.fresh_main_rs());
+        assert!(main_rs.contains("#[embassy_executor::main]"), "{main_rs}");
+        assert!(!main_rs.contains("stm32f1xx_hal"), "{main_rs}");
+        assert!(main_rs.contains("SwjCfg::SwdOnly"), "{main_rs}");
+        assert!(main_rs.contains("CAN is NOT initialised"), "{main_rs}");
+        if !remap {
+            assert!(main_rs.contains("TIM4 is NOT initialised"), "{main_rs}");
+        }
+
+        let project = build_cfg(&def, Some(&mcu));
+        assert!(
+            project.hal_dep.starts_with("embassy-stm32"),
+            "{}",
+            project.hal_dep
+        );
+        let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+        let blocking_cfg = build_cfg(&def, Some(&blocking));
+        let blocking_toml =
+            project_gen::build_project_files(&blocking_cfg, &def.toolchain, "").cargo_toml;
+        assert!(blocking_toml.contains("stm32f1xx-hal"), "{blocking_toml}");
+        assert_eq!(
+            project_gen::refresh_hal_dependency(&blocking_toml, &project, &def.toolchain),
+            files.cargo_toml,
+            "the switch lands on the fresh manifest"
+        );
+
+        let configs = mcu.config_files();
+        let names: Vec<&str> = configs.iter().map(|(n, _)| n.as_str()).collect();
+        for want in [
+            "usart1.rs",
+            "spi1.rs",
+            "i2c1.rs",
+            "pwm2.rs",
+            "iwdg.rs",
+            "wwdg.rs",
+        ] {
+            assert!(names.contains(&want), "{want} missing: {names:?}");
+        }
+        let write = |dir_name: &str,
+                     files: &project_gen::ProjectFiles,
+                     main_rs: &str,
+                     configs: &[(String, String)],
+                     mcu: &crate::panels::mcu_module::mcu::Mcu,
+                     is_async: bool| {
+            let mut user: Vec<(String, String)> = vec![
+                ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
+                (
+                    "src/pins/configs/mod.rs".into(),
+                    configs
+                        .iter()
+                        .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
+                        .collect(),
+                ),
+            ];
+            user.extend(
+                configs
+                    .iter()
+                    .map(|(name, body)| (format!("src/pins/configs/{name}"), body.clone())),
+            );
+            let dir = std::env::temp_dir().join(dir_name);
+            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::write_project(&dir, files, &user, &mcu.mcu_config_text(), "")
+                .expect("write f1 project");
+            let toml_path = dir.join("Cargo.toml");
+            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
+            let sources = [main_rs];
+            let has = |name: &str| configs.iter().any(|(n, _)| n.starts_with(name));
+            let (can, usart, spi, i2c, io) =
+                (has("can"), has("usart"), has("spi"), has("i2c"), has("io"));
+            // The chain `app.rs` runs after the HAL swap, with its inputs as
+            // `app.rs` computes them: the blocking bridges' crates off Async,
+            // the executor's on it, and `embedded-hal` for whichever needs it.
+            let toml = if is_async {
+                toml
+            } else {
+                project_gen::ensure_peripheral_deps(
+                    &toml,
+                    can,
+                    usart,
+                    spi,
+                    i2c,
+                    io,
+                    can || spi || usart,
+                    &sources,
+                )
+            };
+            let toml = project_gen::ensure_async_deps(
+                &toml,
+                is_async,
+                project_gen::async_flavor_for(&mcu.family, ""),
+                is_async && usart,
+                if is_async {
+                    spi || i2c
+                } else {
+                    spi || i2c || io
+                },
+                is_async && dma,
+                &sources,
+            );
+            let toml =
+                project_gen::ensure_exti_feature(&toml, main_rs.contains("embassy_stm32::exti"));
+            // The async USART's `static_cell` too - see the same call in `app.rs`.
+            let toml = project_gen::ensure_task_priority_deps(
+                &toml,
+                (is_async && usart) || main_rs.contains("InterruptExecutor"),
+                &sources,
+            );
+            let toml =
+                project_gen::ensure_m0_atomics(&toml, is_async, &def.project.target, &sources);
+            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
+            println!("wrote {}", dir.display());
+            println!("target: {}", def.project.target);
+        };
+        write(
+            "eide_f1_check_async",
+            &files,
+            &main_rs,
+            &configs,
+            &mcu,
+            true,
+        );
+
+        // And back: the header the Async runtime wrote has to go with it.
+        if std::env::var("EIDE_F1_SWITCH").as_deref() == Ok("back") {
+            let back_main = blocking.update_main_rs(&main_rs);
+            assert!(back_main.contains("use cortex_m_rt::entry;"), "{back_main}");
+            assert!(!back_main.contains("embassy_executor"), "{back_main}");
+            let back_files =
+                project_gen::build_project_files(&blocking_cfg, &def.toolchain, &back_main);
+            assert_eq!(
+                project_gen::refresh_hal_dependency(
+                    &files.cargo_toml,
+                    &blocking_cfg,
+                    &def.toolchain
+                ),
+                back_files.cargo_toml,
+                "the switch back lands on the blocking manifest"
+            );
+            let back_configs = blocking.config_files();
+            write(
+                "eide_f1_check_async_back",
+                &back_files,
+                &back_main,
+                &back_configs,
+                &blocking,
+                false,
+            );
+        }
     }
 
     /// The SAME wiring under the RTIC runtime.

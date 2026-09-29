@@ -63,7 +63,7 @@ map — and, from the STM32Cube database, its clock tree — in one click.
 
 | Family | HAL | Clock tree | Representative parts |
 |--------|-----|-----------|----------------------|
-| **STM32F1** | `stm32f1xx-hal` (own backend) | hand-drawn | STM32F103C8T6 · STM32F103RB · STM32F105 · STM32F107 |
+| **STM32F1** | `stm32f1xx-hal` (Blocking, Native, RTIC) · `embassy-stm32` (Async) | hand-drawn | STM32F103C8T6 · STM32F103RB · STM32F105 · STM32F107 |
 | **STM32C0 / F0** | `embassy-stm32` | from CubeMX | STM32C011F4 · STM32C071C8 · STM32F030R8 |
 | **STM32F2** | `embassy-stm32` | hand-drawn | STM32F217ZE |
 | **STM32F3** | `embassy-stm32` | from CubeMX | STM32F303RE · STM32F358CC |
@@ -283,8 +283,9 @@ change it:
 - **Over-limit warnings** — if a setting pushes a node past the chip's allowed
   maximum, it is flagged right on the diagram.
 - **Real codegen** — the clock you draw drives the actual setup chain in the
-  generated firmware (`rcc.cfgr…freeze()` on STM32F1, an embassy `rcc` config on
-  the other STM32s, `CpuClock` on ESP32), so what you see is what the chip runs.
+  generated firmware (`rcc.cfgr…freeze()` on STM32F1 under Blocking, Native and
+  RTIC, an embassy `rcc` config on every other STM32 and on the F1 under Async,
+  `CpuClock` on ESP32), so what you see is what the chip runs.
 - **Peripheral clock selectors** — the per-peripheral kernel clock choices are
   resolved per chip and emitted alongside the tree.
 - **Per-chip clock trees** — eight STM32 families and the ESP32-C3 ship a
@@ -328,7 +329,7 @@ zooms and pans like the Pins one.
 | **Blocking** | everywhere | Plain synchronous HAL calls. On every STM32 but F1 this is still `embassy-stm32` used as a sync HAL. |
 | **Native** | STM32F1 | `stm32f1xx-hal`'s own driver traits instead of the portable `embedded-io` / `embedded-hal` seam. |
 | **RTIC** | STM32F1 | `#[rtic::app]`, with each armed input becoming a `#[task(binds = EXTIn)]`. |
-| **Async** | every STM32 *except* F1, all ESP32, all Pico | `embassy-executor` tasks; on ESP via `esp-rtos`, on RP via `embassy-rp`. |
+| **Async** | every STM32, all ESP32, all Pico, the micro:bit | `embassy-executor` tasks; on ESP via `esp-rtos`, on RP via `embassy-rp`, on the micro:bit via `embassy-nrf`. On the F1 it swaps `stm32f1xx-hal` for `embassy-stm32`; USB and CAN are not generated there yet, and embassy-time takes one timer (TIM4 on an F103C8). |
 
 Where a runtime is greyed out, the tab **says why** rather than just refusing.
 
@@ -339,8 +340,8 @@ compiler can tell you that text is a program. `scripts/verify-codegen.ps1` emits
 a matrix of configurations and cross-compiles each one:
 
 ```powershell
-pwsh scripts/verify-codegen.ps1          # representative subset (29 cases)
-pwsh scripts/verify-codegen.ps1 -Full    # every case (35)
+pwsh scripts/verify-codegen.ps1          # representative subset (31 cases)
+pwsh scripts/verify-codegen.ps1 -Full    # every case (46)
 ```
 
 Each case prints its own time, and the run ends with a total and the three most

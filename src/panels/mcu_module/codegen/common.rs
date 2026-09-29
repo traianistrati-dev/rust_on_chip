@@ -314,17 +314,135 @@ pub const ASYNC_USER_TAIL: &str = concat!(
 ///
 /// Leading newlines are preserved so the blank line between `GEN_END` and `loop`
 /// does not drift on either side of the swap.
+///
+/// The seed may also be followed by the user's own items: a file that came from
+/// RTIC keeps its helpers AFTER the seed ([`tail_leaving_rtic`]), and anyone can
+/// add a `fn` below `main`. The seed is still ours then, so it is exchanged and
+/// what follows it is left exactly as it was.
 pub fn retarget_pristine_tail(after: &str, want_async: bool) -> String {
     let (from, to) = if want_async {
         (USER_TAIL, ASYNC_USER_TAIL)
     } else {
         (ASYNC_USER_TAIL, USER_TAIL)
     };
-    if after.trim() != from.trim() {
-        return after.to_owned();
+    let body = after.trim_start_matches('\n');
+    let lead = &after[..after.len() - body.len()];
+    if body.trim() == from.trim() {
+        return format!("{lead}{to}");
     }
-    let lead: String = after.chars().take_while(|&c| c == '\n').collect();
-    format!("{lead}{to}")
+    match body.strip_prefix(from) {
+        Some(rest) => format!("{lead}{to}{rest}"),
+        None => after.to_owned(),
+    }
+}
+
+/// Fit a kept `main.rs` header to the runtime now writing the file.
+///
+/// The header above the markers survives a re-splice, because a user may have
+/// added `mod`s and `use`s there. Two things in it belong to the RUNTIME,
+/// though, and after a switch they are the old one's: the `// MCU: … | HAL: …`
+/// label, and `use cortex_m_rt::entry;` - which Blocking and Native need and
+/// RTIC must not have (its macro writes `fn main`, so the import is dead). Both
+/// follow `own`, the header this runtime writes; every other line stays.
+///
+/// An Async header is not refitted but replaced, by the callers: it has more
+/// runtime lines than these two, and the Async splice rebuilds its own anyway.
+/// The callers refit only across a switch to or from RTIC; on every other
+/// splice the header is kept verbatim, as it always was.
+///
+/// The import is ADDED only when no form of it is there already: a user who
+/// wrote `use cortex_m_rt::{entry, exception};` for a fault handler has it, and
+/// a second one is E0252. It is REMOVED only as the exact line the generator
+/// writes - any other form is the user's, and at worst an unused import.
+pub fn refit_header(head: &str, own: &str) -> String {
+    const ENTRY: &str = "use cortex_m_rt::entry;";
+    let label = |h: &str| {
+        h.lines()
+            .find(|l| l.starts_with("// MCU:"))
+            .map(str::to_owned)
+    };
+    let mut out = head.to_owned();
+    if let (Some(theirs), Some(ours)) = (label(head), label(own))
+        && theirs != ours
+    {
+        out = out.replacen(&theirs, &ours, 1);
+    }
+    let seed_line = |h: &str| h.lines().any(|l| l.trim() == ENTRY);
+    if seed_line(own) {
+        if !imports_entry(&out) {
+            // Where the generator puts it: right under the panic handler.
+            let anchor = "use panic_halt as _;\n";
+            let at = match out.find(anchor) {
+                Some(at) => at + anchor.len(),
+                None => out.trim_end_matches('\n').len() + 1,
+            };
+            out.insert_str(at.min(out.len()), &format!("{ENTRY}\n"));
+        }
+    } else if seed_line(&out) {
+        out = out.replacen(&format!("{ENTRY}\n"), "", 1);
+    }
+    out
+}
+
+/// Does this header bring cortex-m-rt's `entry` into scope, in any form a
+/// person writes it: the plain line, a brace list (over several lines too), a
+/// glob, or an `x as entry` rename, with or without a trailing comment.
+fn imports_entry(head: &str) -> bool {
+    const USE: &str = "use cortex_m_rt::";
+    // Line comments out first, so a commented-out import does not count and a
+    // trailing comment does not hide a real one.
+    let code: Vec<&str> = head
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect();
+    let code = code.join("\n");
+    let mut rest = code.as_str();
+    while let Some(at) = rest.find(USE) {
+        let path_start = at + USE.len();
+        let end = rest[path_start..]
+            .find(';')
+            .map_or(rest.len(), |e| path_start + e);
+        let words: Vec<&str> = rest[path_start..end]
+            .split(|c: char| c == ',' || c == '{' || c == '}' || c.is_whitespace())
+            .filter(|w| !w.is_empty())
+            .collect();
+        // `entry as other` puts `other` in scope, not `entry`; `x as entry`
+        // ends on `entry` and counts.
+        let named = words.iter().enumerate().any(|(i, w)| match *w {
+            "*" => true,
+            "entry" => words.get(i + 1) != Some(&"as"),
+            _ => false,
+        });
+        if named {
+            return true;
+        }
+        rest = &rest[end..];
+    }
+    false
+}
+
+/// Did the RTIC runtime write this file's generated section?
+///
+/// RTIC generates its whole `#[rtic::app] mod app { … }` between the markers,
+/// so the tail below them closes nothing. Every other runtime opens its entry
+/// fn inside the markers and closes it in the tail - which is why the tail of
+/// a file leaving RTIC needs [`tail_leaving_rtic`].
+pub fn section_is_rtic(existing: &str) -> bool {
+    match (existing.find(GEN_BEGIN), existing.find(GEN_END)) {
+        (Some(begin), Some(end)) if begin < end => existing[begin..end].contains("#[rtic::app"),
+        _ => false,
+    }
+}
+
+/// The tail of a file leaving RTIC, for a runtime whose entry fn the tail has
+/// to close. RTIC's own seed is swapped for `seed`. A tail the user wrote in
+/// holds module-level helpers, so it is kept AFTER a fresh `seed` that closes
+/// the entry - moving it anywhere else would put `fn`s inside `fn main`.
+pub fn tail_leaving_rtic(after: &str, seed: &str) -> String {
+    if after.trim() == super::rtic::RTIC_USER_TAIL.trim() {
+        return seed.to_owned();
+    }
+    format!("{seed}\n{after}")
 }
 
 // ── Strict-lints exemption for generated code ─────────────────────────────────

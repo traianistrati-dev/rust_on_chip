@@ -184,6 +184,32 @@ const F7: &[(Bus, u8, Dir, &[&str])] = &[
     (Bus::I2c, 3, Dir::Rx, &["DMA1_CH2", "DMA1_CH1"]),
 ];
 
+/// The F1 request map, harvested from embassy-stm32 0.6's generated
+/// `dma_trait_impl!` lines for an STM32F103C8 build (stm32-metapac 21) and
+/// cross-compiled there. Only on the Async runtime: the Blocking F1 path runs
+/// on stm32f1xx-hal, which fixes each channel in its own types.
+///
+/// No request mux and one channel per request, so every list is a single
+/// entry - and two peripherals wanting the same channel is a real collision
+/// (USART1 and SPI2 both need CH4/CH5), which the allocator reports as such.
+/// Only DMA1: the high-density parts' DMA2 has not been harvested.
+const F1: &[(Bus, u8, Dir, &[&str])] = &[
+    (Bus::Usart, 1, Dir::Tx, &["DMA1_CH4"]),
+    (Bus::Usart, 1, Dir::Rx, &["DMA1_CH5"]),
+    (Bus::Usart, 2, Dir::Tx, &["DMA1_CH7"]),
+    (Bus::Usart, 2, Dir::Rx, &["DMA1_CH6"]),
+    (Bus::Usart, 3, Dir::Tx, &["DMA1_CH2"]),
+    (Bus::Usart, 3, Dir::Rx, &["DMA1_CH3"]),
+    (Bus::Spi, 1, Dir::Tx, &["DMA1_CH3"]),
+    (Bus::Spi, 1, Dir::Rx, &["DMA1_CH2"]),
+    (Bus::Spi, 2, Dir::Tx, &["DMA1_CH5"]),
+    (Bus::Spi, 2, Dir::Rx, &["DMA1_CH4"]),
+    (Bus::I2c, 1, Dir::Tx, &["DMA1_CH6"]),
+    (Bus::I2c, 1, Dir::Rx, &["DMA1_CH7"]),
+    (Bus::I2c, 2, Dir::Tx, &["DMA1_CH4"]),
+    (Bus::I2c, 2, Dir::Rx, &["DMA1_CH5"]),
+];
+
 impl Dir {
     pub fn label(self) -> &'static str {
         match self {
@@ -203,7 +229,8 @@ fn candidates(family: &str, bus: Bus, instance: u8, dir: Dir) -> Option<&'static
         "stm32f4" => F4,
         "stm32f2" => F2,
         "stm32f7" => F7,
-        // Every other family keeps the TODO. The three tables here differ from
+        "stm32f1" => F1,
+        // Every other family keeps the TODO. The tables here differ from
         // each other in ways no amount of squinting at the reference manuals
         // would have predicted, so a new one means harvesting and compiling it,
         // not extending a pattern.
@@ -226,6 +253,9 @@ fn irq_for(family: &str, channel: &str) -> Option<String> {
         // "channel" for the singleton. Verified against `dma_channel_impl!`
         // output for an F411 and an F217ZE.
         "stm32f4" | "stm32f2" | "stm32f7" => Some(channel.replace("_CH", "_STREAM")),
+        // The F1 has channels, not streams, and names the vector in full:
+        // `DMA1_CH4` is `DMA1_CHANNEL4`. Compiled on an STM32F103C8.
+        "stm32f1" => Some(channel.replace("_CH", "_CHANNEL")),
         _ => None,
     }
 }
@@ -506,6 +536,7 @@ mod tests {
             ("stm32f4", "STM32F411R(C-E)Tx.xml", F4),
             ("stm32f2", "STM32F217Z(E-G)Tx.xml", F2),
             ("stm32f7", "STM32F767ZITx.xml", F7),
+            ("stm32f1", "STM32F103C(8-B)Tx.xml", F1),
         ] {
             let path = db.join(chip);
             let Ok(xml) = std::fs::read_to_string(&path) else {
@@ -835,6 +866,35 @@ mod tests {
         assert_eq!(tx.peri, "DMA2_CH7");
         // The name that goes in `bind_interrupts!` is NOT the same string.
         assert_eq!(tx.irq, "DMA2_STREAM7");
+    }
+
+    /// The F1 has one DMA1 channel per request and names the vector in full:
+    /// `DMA1_CH4` is bound as `DMA1_CHANNEL4`. Both compiled on an F103C8.
+    #[test]
+    fn the_f1_takes_its_one_fixed_channel_per_request() {
+        let mut a = DmaAllocator::new("stm32f1");
+        let tx = a.take(Bus::Usart, 1, Dir::Tx).expect("USART1 TX");
+        assert_eq!(
+            (tx.peri.as_str(), tx.irq.as_str()),
+            ("DMA1_CH4", "DMA1_CHANNEL4")
+        );
+        let rx = a.take(Bus::Usart, 1, Dir::Rx).expect("USART1 RX");
+        assert_eq!(rx.peri, "DMA1_CH5");
+        // No second choice: a channel already given is not given again.
+        assert_eq!(a.take(Bus::Usart, 1, Dir::Tx), None);
+        // SPI1 and I2C1 do not collide with USART1, and nothing is on DMA2.
+        for (bus, n, dir) in [
+            (Bus::Spi, 1u8, Dir::Tx),
+            (Bus::Spi, 1, Dir::Rx),
+            (Bus::I2c, 1, Dir::Tx),
+            (Bus::I2c, 1, Dir::Rx),
+        ] {
+            let c = a
+                .take(bus, n, dir)
+                .unwrap_or_else(|| panic!("{bus:?}{n} {dir:?}"));
+            assert!(c.peri.starts_with("DMA1_CH"), "{c:?}");
+            assert_eq!(c.irq, c.peri.replace("_CH", "_CHANNEL"));
+        }
     }
 
     #[test]

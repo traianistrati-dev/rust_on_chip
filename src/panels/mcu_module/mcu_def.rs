@@ -178,7 +178,9 @@ pub struct ProjectDef {
     ///
     /// RP is the first family where it does: `rp2040-hal` drives the chip
     /// blocking, `embassy-rp` drives it async, and they are different crates.
-    /// STM32 and ESP keep one HAL for both runtimes, so they leave this `None`.
+    /// ESP and every STM32 but the F1 keep one HAL for both runtimes, so they
+    /// leave this `None`. The F1 swaps `stm32f1xx-hal` for embassy-stm32, but
+    /// its line is derived when this is `None` - see [`ProjectDef::for_async`].
     ///
     /// It lives on the CHIP rather than on the backend because the feature is
     /// chip-specific: an RP2350A wants `rp235xa` and an RP2350B `rp235xb`, and a
@@ -938,14 +940,47 @@ pub fn build_cfg(
 impl ProjectDef {
     /// This definition as it applies to `runtime` — the same thing, except that
     /// a family which swaps HAL crates gets the other line.
+    ///
+    /// An STM32F1 on `stm32f1xx-hal` with no `hal_dep_async` of its own gets its
+    /// embassy-stm32 line derived from the part number, so the built-in and
+    /// every F1 imported before Async existed build on it without re-import.
+    /// An explicit `hal_dep_async` still wins. An F1 whose part number cannot
+    /// be read still gets an embassy-stm32 line, with the chip feature left to
+    /// fill in.
+    ///
+    /// Off Async the definition is itself, with one exception: an F1 saved
+    /// with the old comment-only blocking line (`# TODO: set the stm32f1xx-hal
+    /// device feature for …`) gets a real `stm32f1xx-hal` line instead. A
+    /// comment names no crate, so a manifest that had swapped to embassy-stm32
+    /// on Async could never swap back.
     pub fn for_async(&self, is_async: bool) -> std::borrow::Cow<'_, ProjectDef> {
-        match (is_async, &self.hal_dep_async) {
-            (true, Some(line)) => {
+        use crate::panels::mcu_module::stm32_pin_data::{
+            f1_blocking_hal_dep_todo, f1_embassy_hal_dep, f1_embassy_hal_dep_todo,
+        };
+        let name = || {
+            [&self.probe_chip, &self.pkg_name]
+                .into_iter()
+                .find(|n| !n.trim().is_empty())
+                .map_or("this part", |n| n.as_str())
+        };
+        let line = if is_async {
+            self.hal_dep_async.clone().or_else(|| {
+                self.hal_dep.contains("stm32f1xx-hal").then(|| {
+                    f1_embassy_hal_dep(&self.probe_chip, &self.pkg_name)
+                        .unwrap_or_else(|| f1_embassy_hal_dep_todo(name()))
+                })
+            })
+        } else {
+            (self.hal_dep.trim_start().starts_with('#') && self.hal_dep.contains("stm32f1xx-hal"))
+                .then(|| f1_blocking_hal_dep_todo(name()))
+        };
+        match line {
+            Some(line) => {
                 let mut out = self.clone();
-                out.hal_dep = line.clone();
+                out.hal_dep = line;
                 std::borrow::Cow::Owned(out)
             }
-            _ => std::borrow::Cow::Borrowed(self),
+            None => std::borrow::Cow::Borrowed(self),
         }
     }
 }
@@ -1050,5 +1085,45 @@ mod the_manifest_follows_the_runtime {
             }
         }
         assert!(checked >= 1, "the micro:bit at least");
+    }
+
+    /// An F1 whose part number cannot be read still leaves stm32f1xx-hal on
+    /// Async: its line becomes an embassy-stm32 one with the feature to fill in,
+    /// never the blocking HAL under embassy code - and it comes back again.
+    #[test]
+    fn an_unreadable_f1_still_swaps_to_embassy() {
+        let mut def = builtin_definitions()
+            .into_iter()
+            .find(|d| d.family == "stm32f1")
+            .expect("the built-in F103");
+        def.project.probe_chip = "STM32F103xB".into();
+        def.project.pkg_name = String::new();
+        let line = def.project.for_async(true).hal_dep.clone();
+        assert!(line.starts_with("embassy-stm32 = {"), "{line}");
+        assert!(
+            line.contains("TODO: the chip feature for STM32F103xB"),
+            "{line}"
+        );
+        // The blocking HAL's old comment-only TODO line counts as an F1 too -
+        // and off Async it becomes a real line, so the manifest can swap BACK.
+        def.project.hal_dep = "# TODO: set the stm32f1xx-hal device feature for X".into();
+        let line = def.project.for_async(true).hal_dep.clone();
+        assert!(line.starts_with("embassy-stm32 = {"), "{line}");
+        let back = def.project.for_async(false).hal_dep.clone();
+        assert!(back.starts_with("stm32f1xx-hal = {"), "{back}");
+
+        let tc = def.toolchain.clone();
+        let blocking = def.project.for_async(false).into_owned();
+        let asynchronous = def.project.for_async(true).into_owned();
+        let toml = project_gen::gen_config(project_gen::ConfigFile::CargoToml, &blocking, &tc);
+        let there = project_gen::refresh_hal_dependency(&toml, &asynchronous, &tc);
+        assert!(there.contains("embassy-stm32 = {"), "{there}");
+        let home = project_gen::refresh_hal_dependency(&there, &blocking, &tc);
+        assert!(home.contains("stm32f1xx-hal = {"), "{home}");
+        assert!(!home.contains("embassy-stm32 = {"), "{home}");
+
+        // A real blocking line is left exactly as it is.
+        def.project.hal_dep = "stm32f1xx-hal = { version = \"0.10\" }".into();
+        assert_eq!(def.project.for_async(false).hal_dep, def.project.hal_dep);
     }
 }

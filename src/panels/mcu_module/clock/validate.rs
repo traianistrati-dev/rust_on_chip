@@ -87,6 +87,16 @@ pub fn warnings(c: &Stm32f1Clock, f: &ClockFrequencies, l: &ClockLimits) -> Vec<
             mhz(l.sysclk_max)
         )));
     }
+    // The floor of the same range (datasheet: PLL output 16..72 MHz). Not
+    // academic: embassy-stm32 asserts it at init, so on the Async runtime a
+    // slower PLL is a panic at boot. A floor, not a ceiling - so it does not
+    // start "PLL output", the prefix that marks the ceiling above.
+    if uses_pll && f.pllclk < 16_000_000 {
+        out.push(ClockWarning::error(format!(
+            "The PLL runs at {} MHz, below its 16 MHz minimum.",
+            mhz(f.pllclk)
+        )));
+    }
     if f.hclk > l.hclk_max {
         out.push(ClockWarning::error(format!(
             "HCLK {} MHz exceeds the {} MHz maximum.",
@@ -226,6 +236,24 @@ mod tests {
         c.pll_mul = 16; // 64 MHz — OK
         assert!(!warns(&c).iter().any(|w| w.msg.contains("64 MHz")));
         // Bump APB so nothing else errors, but sysclk stays 64 — still fine.
+    }
+
+    /// A PLL under its 16 MHz floor is an error: embassy-stm32 asserts the floor
+    /// at init. At exactly 16 it is fine, and a PLL nobody selects is ignored.
+    #[test]
+    fn a_pll_under_16_mhz_is_an_error() {
+        let floor = |c: &Stm32f1Clock| warns(c).iter().any(|w| w.msg.contains("16 MHz minimum"));
+        let mut c = Stm32f1Clock {
+            pll_src: super::super::model::PllSrc::HsiDiv2, // 4 MHz in
+            pll_mul: 2,                                    // 8 MHz out
+            ..Stm32f1Clock::default()
+        };
+        assert!(floor(&c), "{:?}", warns(&c));
+        c.pll_mul = 4; // 16 MHz out
+        assert!(!floor(&c), "{:?}", warns(&c));
+        c.pll_mul = 2;
+        c.sysclk_src = SysclkSrc::Hsi;
+        assert!(!floor(&c), "the PLL is not used");
     }
 
     /// Custom per-chip limits change the verdict: the default 72 MHz config is

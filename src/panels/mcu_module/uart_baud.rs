@@ -7,6 +7,7 @@
 //! | HAL | too fast | too slow |
 //! |---|---|---|
 //! | stm32f1xx-hal | `assert!`: panics at boot | BRR overflows its 16 bits: wrong rate, no error |
+//! | embassy-stm32 on the F1 | `Err`, unwrapped: panics at boot | `Err`, unwrapped: panics at boot |
 //! | rp2040-hal / rp235x-hal / embassy-rp | clamped silently | clamped silently |
 //! | esp-hal | `Err` above 5 000 000, unwrapped: panics at boot | `assert!` in the divider: panics at boot |
 //! | nRF UARTE | 18 fixed rates, the nearest one is taken | same |
@@ -26,10 +27,10 @@
 //! offers - both are followed here, so a verdict cannot be right about a clock
 //! the board never has.
 //!
-//! Imported STM32 parts (embassy-stm32) are not checked yet: nothing in the repo
-//! says which APB bus each USART instance sits on, and on the newer families a
-//! per-instance clock mux decides it. They get [`Plan::Unchecked`] rather than a
-//! guess.
+//! Imported STM32 parts on embassy-stm32 are not checked yet, the F1 on Async
+//! aside: nothing in the repo says which APB bus each USART instance sits on,
+//! and on the newer families a per-instance clock mux decides it. They get
+//! [`Plan::Unchecked`] rather than a guess.
 
 use super::codegen::{family::is_esp, nrf, rp, stm32};
 use super::mcu::{Mcu, Runtime};
@@ -53,6 +54,11 @@ pub enum Divider {
     /// stm32f1xx-hal 0.10: `brr = pclk / baud` (truncating), 16x oversampling
     /// only, `assert!(brr >= 16)`, then written RAW into a 16-bit field.
     F1 { pclk: u32 },
+    /// embassy-stm32 0.6 on the F1's USART (usart v1, no OVER8): `brr` is
+    /// `pclk / baud` ROUNDED to nearest, and outside `16..0x10000` `configure`
+    /// returns `BaudrateTooHigh` / `BaudrateTooLow`, which the generated code
+    /// unwraps. Same silicon as [`Divider::F1`], different arithmetic.
+    EmbassyV1 { pclk: u32 },
     /// The RP's PL011, as rp2040-hal 0.12, rp235x-hal 0.4 and embassy-rp 0.10
     /// all program it: `div = 8 * clk / baud`, 16-bit integer part plus a
     /// 6-bit fraction, clamped silently at both ends.
@@ -178,6 +184,10 @@ impl Fate {
 const WHY_ZERO: &str = "A rate of 0 divides by zero in the HAL";
 const WHY_F1_FAST: &str =
     "This rate is above the clock / 16, and stm32f1xx-hal asserts against that";
+const WHY_EMBASSY_FAST: &str =
+    "This rate needs a divider below 16, and embassy-stm32 refuses it with BaudrateTooHigh";
+const WHY_EMBASSY_SLOW: &str =
+    "This rate needs a divider above 65535, and embassy-stm32 refuses it with BaudrateTooLow";
 const WHY_ESP_REFUSED: &str = "esp-hal's Config::validate refuses 0 and anything above 5 000 000";
 const WHY_ESP_SLOW: &str =
     "This rate is below the divider's range, and esp-hal asserts against that";
@@ -206,6 +216,32 @@ pub fn outcome(d: Divider, baud: u32) -> Fate {
                 let low = brr & 0xFFFF;
                 Fate::Wraps {
                     actual: (low != 0).then(|| pclk as f64 / low as f64),
+                }
+            } else {
+                Fate::Runs {
+                    actual: pclk as f64 / brr as f64,
+                }
+            }
+        }
+        Divider::EmbassyV1 { pclk } => {
+            if baud == 0 {
+                return Fate::Panics {
+                    why: WHY_ZERO,
+                    too_fast: false,
+                };
+            }
+            // `calculate_brr` with mul = 1 and no prescaler: the truncated
+            // quotient plus the remainder rounded to nearest.
+            let brr = pclk / baud + (pclk % baud + baud / 2) / baud;
+            if brr < 16 {
+                Fate::Panics {
+                    why: WHY_EMBASSY_FAST,
+                    too_fast: true,
+                }
+            } else if brr >= 0x1_0000 {
+                Fate::Panics {
+                    why: WHY_EMBASSY_SLOW,
+                    too_fast: false,
                 }
             } else {
                 Fate::Runs {
@@ -378,6 +414,17 @@ pub fn range(d: Divider) -> Option<(u32, u32)> {
     (lo <= hi && in_range(outcome(d, lo)) && in_range(outcome(d, hi))).then_some((lo, hi))
 }
 
+/// The F1's (PCLK1, PCLK2) as the Clock tab computes them - what embassy-stm32
+/// programs on the Async runtime. `None` without a tree, or with a bus at zero.
+fn f1_tab_pclks(clock: &crate::panels::mcu_module::clock::ClockConfig) -> Option<(u32, u32)> {
+    let crate::panels::mcu_module::clock::ClockConfig::Graph(gc) = clock else {
+        return None;
+    };
+    let f = crate::panels::mcu_module::clock::graph::evaluate(&gc.graph);
+    let (p1, p2) = (*f.get("pclk1")?, *f.get("pclk2")?);
+    (p1 > 0 && p2 > 0).then_some((p1, p2))
+}
+
 /// What [`Chip::plan`] needs from the MCU, read once.
 ///
 /// Owned rather than borrowed: the module panel draws while `mcu.modules` is
@@ -388,7 +435,8 @@ pub fn range(d: Divider) -> Option<(u32, u32)> {
 pub struct Chip {
     family: String,
     runtime: Runtime,
-    /// F1: (PCLK1, PCLK2) as stm32f1xx-hal will program them from the chain.
+    /// F1: (PCLK1, PCLK2) as the runtime's HAL will program them - the chain on
+    /// stm32f1xx-hal, the tab itself on embassy-stm32.
     f1_pclks: Option<Result<(u32, u32), ()>>,
     /// RP, blocking backend: clk_peri from the Clock tab's PLL.
     rp_blocking_hz: Option<Result<u32, ()>>,
@@ -399,7 +447,21 @@ pub struct Chip {
 impl Chip {
     pub fn of(mcu: &Mcu) -> Self {
         let family = mcu.family.as_str();
-        let f1_pclks = (family == "stm32f1").then(|| stm32::f1_hal_pclks(&mcu.clock).ok_or(()));
+        // On Async the F1 is on embassy-stm32, which programs exactly the Clock
+        // tab's prescalers - so the tab's own PCLKs are the answer there, and
+        // stm32f1xx-hal's chain (with its `freeze` refusals) only off Async.
+        // embassy has refusals of its own: `rcc_assert!`s at init, checked on
+        // the clock the Async block is emitted from.
+        let f1_pclks = if family != "stm32f1" {
+            None
+        } else if mcu.pending_runtime == Runtime::Async {
+            let boots = super::codegen::rcc::f1_embassy_clock_ok(
+                &super::codegen::rcc::f1_embassy_clock(&mcu.clock),
+            );
+            f1_tab_pclks(&mcu.clock).map(|p| if boots { Ok(p) } else { Err(()) })
+        } else {
+            Some(stm32::f1_hal_pclks(&mcu.clock).ok_or(()))
+        };
         let rp_blocking_hz = rp::is_rp(family).then(|| {
             if rp::blocking_plls_ok(mcu) {
                 Ok(rp::blocking_peri_hz(mcu))
@@ -433,25 +495,43 @@ impl Chip {
     ///
     /// The runtime matters only where it swaps the HAL: an Async RP is
     /// embassy-rp on embassy's own clocks, and an STM32 other than the F1 builds
-    /// a driver only on Async. The F1 has no embassy path at all (every runtime
-    /// is stm32f1xx-hal), and an ESP or an nRF divides the same way on both.
+    /// a driver only on Async. The F1 builds one on every runtime - on
+    /// stm32f1xx-hal off Async, on embassy-stm32 on it, with the PCLKs each
+    /// programs (see [`Chip::of`]) - and an ESP or an nRF divides the same way
+    /// on both.
     pub fn plan(&self, instance: u8) -> Plan {
         let f = self.family.as_str();
         if f == "stm32f1" {
             let (pclk1, pclk2) = match self.f1_pclks {
                 Some(Ok(p)) => p,
+                Some(Err(())) if self.runtime == Runtime::Async => {
+                    return Plan::Doomed(F1_EMBASSY_INIT);
+                }
                 Some(Err(())) => return Plan::Doomed(F1_FREEZE),
                 None => return Plan::Unchecked(NO_CLOCK),
             };
             // stm32f1xx-hal's `enable.rs`: USART1 on APB2, USART2/3 on APB1.
-            // UART4/5 sit on APB1 too, but the HAL has no `Serial` for them.
+            // UART4/5 sit on APB1 too, but that HAL has no `Serial` for them;
+            // embassy-stm32 drives them like the others.
+            let embassy = self.runtime == Runtime::Async;
+            let divider = |pclk| {
+                if embassy {
+                    Divider::EmbassyV1 { pclk }
+                } else {
+                    Divider::F1 { pclk }
+                }
+            };
             return match instance {
                 1 => Plan::Checked(Source {
-                    divider: Divider::F1 { pclk: pclk2 },
+                    divider: divider(pclk2),
                     clock: "PCLK2",
                 }),
                 2 | 3 => Plan::Checked(Source {
-                    divider: Divider::F1 { pclk: pclk1 },
+                    divider: divider(pclk1),
+                    clock: "PCLK1",
+                }),
+                4 | 5 if embassy => Plan::Checked(Source {
+                    divider: divider(pclk1),
                     clock: "PCLK1",
                 }),
                 _ => Plan::NotUsed(F1_NO_UART45),
@@ -546,6 +626,7 @@ const NO_FAMILY: &str = "Rates are not checked for this chip family.";
 const NOT_USED_RAW: &str = "This runtime binds the USART pins raw and builds no driver, so the baud rate never reaches the generated code.";
 const F1_NO_UART45: &str = "stm32f1xx-hal 0.10 has no Serial for UART4 or UART5, so no driver is generated for it and the baud rate never reaches the code.";
 const F1_FREEZE: &str = "stm32f1xx-hal's freeze asserts on this clock setup (the Clock tab flags the limit it breaks), so the chip panics before the UART is set up.";
+const F1_EMBASSY_INIT: &str = "embassy-stm32's clock init asserts on this clock setup (the Clock tab flags the limit it breaks), so the chip panics before the UART is set up.";
 const RP_PLL_REFUSED: &str = "rp-hal refuses one of the Clock tab's PLLs (post dividers 1–6, VCO 750–1600 MHz on the RP2040 or 400–1600 MHz on the RP2350), so the board panics before the UART is set up.";
 
 /// The typed rates the field accepts under this plan. Fixed ends only - the
@@ -768,6 +849,7 @@ pub fn max_baud_text(chip: &Chip, f: &PinFunction) -> Option<String> {
 fn clock_label(src: Source) -> String {
     let hz = match src.divider {
         Divider::F1 { pclk: hz }
+        | Divider::EmbassyV1 { pclk: hz }
         | Divider::Pl011 { clk: hz }
         | Divider::EspSclk { clk: hz }
         | Divider::EspApb { clk: hz } => hz,
@@ -1092,26 +1174,102 @@ mod tests {
         mcu.pending_runtime = rt;
     }
 
-    /// The F103 as shipped: USART1 on the 72 MHz APB2, USART2/3 on 36 MHz -
-    /// and the runtime does not move it, because every F1 runtime is
-    /// stm32f1xx-hal. UART4/5 get no driver at all.
+    /// The F103 as shipped: USART1 on the 72 MHz APB2, USART2/3 on 36 MHz, on
+    /// every runtime. The DIVIDER follows the HAL: stm32f1xx-hal's off Async,
+    /// embassy-stm32's on it - which also drives UART4/5, where stm32f1xx-hal
+    /// builds no driver at all.
     #[test]
     fn the_f103_checks_each_usart_on_its_own_bus() {
         let mut mcu = builtin("stm32f103c8t6");
         for rt in [Runtime::Blocking, Runtime::Async, Runtime::Rtic] {
             set_runtime(&mut mcu, rt);
             let chip = Chip::of(&mcu);
+            let embassy = rt == Runtime::Async;
             let on = |pclk, clock| {
                 Plan::Checked(Source {
-                    divider: Divider::F1 { pclk },
+                    divider: if embassy {
+                        Divider::EmbassyV1 { pclk }
+                    } else {
+                        Divider::F1 { pclk }
+                    },
                     clock,
                 })
             };
             assert_eq!(chip.plan(1), on(72_000_000, "PCLK2"), "{rt:?}");
             assert_eq!(chip.plan(2), on(36_000_000, "PCLK1"), "{rt:?}");
             assert_eq!(chip.plan(3), on(36_000_000, "PCLK1"), "{rt:?}");
-            assert_eq!(chip.plan(4), Plan::NotUsed(F1_NO_UART45), "{rt:?}");
+            if embassy {
+                assert_eq!(chip.plan(4), on(36_000_000, "PCLK1"), "{rt:?}");
+            } else {
+                assert_eq!(chip.plan(4), Plan::NotUsed(F1_NO_UART45), "{rt:?}");
+            }
         }
+    }
+
+    /// A clock embassy-stm32's init asserts on dooms every rate on Async, with
+    /// embassy's reason - the verdict stm32f1xx-hal's `freeze` gets on Blocking.
+    #[test]
+    fn an_f1_clock_embassy_refuses_dooms_every_rate_on_async() {
+        use crate::panels::mcu_module::clock::Stm32f1Clock;
+        let mut mcu = builtin("stm32f103c8t6");
+        mcu.apply_saved_clock(Stm32f1Clock {
+            apb1_pre: 1, // PCLK1 72 MHz, over the 36 MHz ceiling
+            ..Stm32f1Clock::default()
+        });
+        set_runtime(&mut mcu, Runtime::Async);
+        let chip = Chip::of(&mcu);
+        for n in [1, 2, 4] {
+            assert_eq!(chip.plan(n), Plan::Doomed(F1_EMBASSY_INIT), "USART{n}");
+        }
+        set_runtime(&mut mcu, Runtime::Blocking);
+        assert_eq!(Chip::of(&mcu).plan(2), Plan::Doomed(F1_FREEZE));
+    }
+
+    /// embassy-stm32 ROUNDS the F1's divider and refuses both ends with an
+    /// error the generated code unwraps: too slow is a panic here, where
+    /// stm32f1xx-hal wraps silently.
+    #[test]
+    fn embassy_on_the_f1_rounds_and_refuses_both_ends() {
+        let e72 = Divider::EmbassyV1 { pclk: 72_000_000 };
+        let e36 = Divider::EmbassyV1 { pclk: 36_000_000 };
+        // Rounding moves the top: a divider of 15.5 already rounds to 16, so
+        // the fastest rate is PCLK / 15.5 rather than stm32f1xx-hal's PCLK / 16.
+        // The bottom stays: 72 MHz / 1099 rounds to 65514, / 1098 to 65574.
+        assert_eq!(range(e72), Some((1_099, 4_645_161)));
+        assert_eq!(range(e36), Some((550, 2_322_580)));
+        assert!(matches!(outcome(e72, 4_500_001), Fate::Runs { .. }));
+        assert!(matches!(
+            outcome(e72, 4_645_162),
+            Fate::Panics { too_fast: true, why } if why == WHY_EMBASSY_FAST
+        ));
+        assert!(matches!(
+            outcome(e36, 500),
+            Fate::Panics { too_fast: false, why } if why == WHY_EMBASSY_SLOW
+        ));
+        assert!(matches!(outcome(e72, 0), Fate::Panics { why, .. } if why == WHY_ZERO));
+        // Rounding, not truncating: 8 MHz / 230400 is 34.72, so 35 here and 34
+        // on stm32f1xx-hal - 0.79 % off instead of 2.12 %.
+        let e8 = Divider::EmbassyV1 { pclk: 8_000_000 };
+        match outcome(e8, 230_400) {
+            Fate::Runs { actual } => assert!((actual - 228_571.4).abs() < 0.1, "{actual}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(outcome(e8, 230_400).severity(230_400), Severity::Ok);
+        assert_eq!(outcome(F1_8, 230_400).severity(230_400), Severity::Marginal);
+        // The hover names the clock the same way as for the other HAL.
+        let h = hint(
+            &Plan::Checked(Source {
+                divider: e72,
+                clock: "PCLK2",
+            }),
+            115_200,
+        );
+        assert!(
+            h.range
+                .as_deref()
+                .is_some_and(|r| r.contains("PCLK2 72 MHz")),
+            "{h:?}"
+        );
     }
 
     /// A clock stm32f1xx-hal's `freeze` asserts on dooms every rate.

@@ -71,15 +71,16 @@ pub struct WatchdogLimits {
     pub iwdg_hal: IwdgHal,
 }
 
-/// Does this family's HAL expose a WWDG driver?
+/// Does this project's HAL expose a WWDG driver?
 ///
-/// `stm32f1xx-hal` 0.10 — the HAL the F1 blocking and RTIC backends use — has
-/// only `IndependentWatchdog`. Every embassy family has both. So on F1 the
-/// Configuration group is HALF live, which is exactly why the WWDG card is shown
-/// disabled with the reason rather than hidden: a control that silently vanishes
-/// on one chip is harder to understand than one that explains itself.
-pub fn wwdg_supported(family: &str) -> bool {
-    family != "stm32f1"
+/// `stm32f1xx-hal` 0.10 — the HAL the F1 uses on every runtime but Async — has
+/// only `IndependentWatchdog`. embassy-stm32 has both, on the F1 too (compiled
+/// on an STM32F103C8). So on an F1 off Async the Configuration group is HALF
+/// live, which is exactly why the WWDG card is shown disabled with the reason
+/// rather than hidden: a control that silently vanishes on one chip is harder
+/// to understand than one that explains itself.
+pub fn wwdg_supported(family: &str, runtime: crate::panels::mcu_module::mcu::Runtime) -> bool {
+    !crate::panels::mcu_module::codegen::family::uses_stm32f1xx_hal(family, runtime)
 }
 
 /// Is watchdog code actually GENERATED for this family yet?
@@ -116,7 +117,14 @@ pub fn is_rp(family: &str) -> bool {
 /// An unknown family gets the conservative common case (32 kHz LSI, /256, WWDG
 /// /8): every value it then offers is valid on any STM32, so a chip this does
 /// not know about is under-served rather than mis-served.
-pub fn limits_for(family: &str) -> WatchdogLimits {
+///
+/// `runtime` decides the HAL, which is what the last two fields are about: an
+/// F1 on Async is on embassy-stm32, with its window watchdog and its IWDG
+/// arithmetic. The LSI and the prescalers are the silicon's either way.
+pub fn limits_for(
+    family: &str,
+    runtime: crate::panels::mcu_module::mcu::Runtime,
+) -> WatchdogLimits {
     WatchdogLimits {
         // 40 kHz only on the three oldest families.
         lsi_hz: match family {
@@ -133,8 +141,9 @@ pub fn limits_for(family: &str) -> WatchdogLimits {
             "stm32g0" | "stm32g4" | "stm32c0" | "stm32h5" | "stm32u5" | "stm32wba" => 128,
             _ => 8,
         },
-        wwdg_available: wwdg_supported(family),
-        iwdg_hal: if family == "stm32f1" {
+        wwdg_available: wwdg_supported(family, runtime),
+        iwdg_hal: if crate::panels::mcu_module::codegen::family::uses_stm32f1xx_hal(family, runtime)
+        {
             IwdgHal::Stm32f1
         } else {
             IwdgHal::Embassy
@@ -572,14 +581,15 @@ pub fn wwdg_problem(cfg: &WwdgConfig, l: &WatchdogLimits, pclk1_hz: u32) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panels::mcu_module::mcu::Runtime;
 
     #[test]
     fn the_lsi_frequency_is_per_family() {
         // Getting this wrong scales every IWDG duration by 25 %.
-        assert_eq!(limits_for("stm32f1").lsi_hz, 40_000);
-        assert_eq!(limits_for("stm32f3").lsi_hz, 40_000);
-        assert_eq!(limits_for("stm32f4").lsi_hz, 32_000);
-        assert_eq!(limits_for("stm32g4").lsi_hz, 32_000);
+        assert_eq!(limits_for("stm32f1", Runtime::Blocking).lsi_hz, 40_000);
+        assert_eq!(limits_for("stm32f3", Runtime::Blocking).lsi_hz, 40_000);
+        assert_eq!(limits_for("stm32f4", Runtime::Blocking).lsi_hz, 32_000);
+        assert_eq!(limits_for("stm32g4", Runtime::Blocking).lsi_hz, 32_000);
     }
 
     #[test]
@@ -587,14 +597,20 @@ mod tests {
         // The one a glance at the family list would have got wrong: L4 sits
         // among the v2 families but its WWDG is v1, so its longest period is
         // sixteen times shorter than G4's.
-        assert_eq!(limits_for("stm32l4").wwdg_max_prescaler, 8);
-        assert_eq!(limits_for("stm32g4").wwdg_max_prescaler, 128);
+        assert_eq!(
+            limits_for("stm32l4", Runtime::Blocking).wwdg_max_prescaler,
+            8
+        );
+        assert_eq!(
+            limits_for("stm32g4", Runtime::Blocking).wwdg_max_prescaler,
+            128
+        );
     }
 
     #[test]
     fn the_iwdg_range_matches_embassys_own_arithmetic() {
         // 32 kHz LSI, /256, full 12-bit reload: 1e6 * 4096 / (32000/256) = 32.768 s.
-        let l = limits_for("stm32f4");
+        let l = limits_for("stm32f4", Runtime::Blocking);
         assert_eq!(iwdg_range_us(&l), (125, 32_768_000));
     }
 
@@ -602,7 +618,7 @@ mod tests {
     /// mistake caught only by reading `stm32f1xx-hal`.
     #[test]
     fn f1_uses_its_own_hals_arithmetic_not_embassys() {
-        let f1 = limits_for("stm32f1");
+        let f1 = limits_for("stm32f1", Runtime::Blocking);
         assert_eq!(f1.iwdg_hal, IwdgHal::Stm32f1);
         // `4096 * 256 / 40 kHz` = 26_214 ms. Applying embassy's formula to
         // the same chip gives 26_256_410 us - 42 ms MORE, every one of
@@ -623,14 +639,14 @@ mod tests {
         // maximum is 132.1 s, not the 134.2 s exact arithmetic would suggest.
         // Advertising the larger number would put the driver's `unwrap!` one
         // step past the end of our own range.
-        let l = limits_for("stm32u5");
+        let l = limits_for("stm32u5", Runtime::Blocking);
         assert_eq!(l.iwdg_max_prescaler, 1024);
         assert_eq!(iwdg_range_us(&l).1, 132_129_032);
     }
 
     #[test]
     fn the_wwdg_range_moves_with_pclk1() {
-        let l = limits_for("stm32f4");
+        let l = limits_for("stm32f4", Runtime::Blocking);
         // 4096 / 50 MHz = 81.92 us per tick, truncated to 81; 64 ticks x /8.
         let (lo, hi) = wwdg_range_us(&l, 50_000_000).unwrap();
         assert_eq!(lo, 81);
@@ -648,8 +664,14 @@ mod tests {
 
     #[test]
     fn an_unknown_clock_yields_no_range_rather_than_a_guess() {
-        assert_eq!(wwdg_range_us(&limits_for("stm32f4"), 0), None);
-        assert_eq!(WwdgConfig::default_for(&limits_for("stm32f4"), 0), None);
+        assert_eq!(
+            wwdg_range_us(&limits_for("stm32f4", Runtime::Blocking), 0),
+            None
+        );
+        assert_eq!(
+            WwdgConfig::default_for(&limits_for("stm32f4", Runtime::Blocking), 0),
+            None
+        );
     }
 
     #[test]
@@ -669,7 +691,7 @@ mod tests {
             "stm32c0",
             "unknown-family",
         ] {
-            let l = limits_for(fam);
+            let l = limits_for(fam, Runtime::Blocking);
             assert_eq!(
                 iwdg_problem(&IwdgConfig::default_for(&l), &l),
                 None,
@@ -686,7 +708,7 @@ mod tests {
 
     #[test]
     fn the_window_must_be_shorter_than_the_period() {
-        let l = limits_for("stm32f4");
+        let l = limits_for("stm32f4", Runtime::Blocking);
         let bad = WwdgConfig {
             timeout_us: 1000,
             window_us: 1000,
@@ -698,7 +720,7 @@ mod tests {
 
     #[test]
     fn problems_name_the_bound_they_broke() {
-        let l = limits_for("stm32f4");
+        let l = limits_for("stm32f4", Runtime::Blocking);
         let msg = iwdg_problem(&IwdgConfig { timeout_us: 1 }, &l).expect("1 us is too short");
         assert!(
             msg.contains("125"),
@@ -708,10 +730,10 @@ mod tests {
 
     #[test]
     fn f1_is_the_family_without_a_window_watchdog() {
-        assert!(!wwdg_supported("stm32f1"));
-        assert!(!limits_for("stm32f1").wwdg_available);
-        assert!(wwdg_supported("stm32f4"));
-        assert!(limits_for("stm32g0").wwdg_available);
+        assert!(!wwdg_supported("stm32f1", Runtime::Blocking));
+        assert!(!limits_for("stm32f1", Runtime::Blocking).wwdg_available);
+        assert!(wwdg_supported("stm32f4", Runtime::Blocking));
+        assert!(limits_for("stm32g0", Runtime::Blocking).wwdg_available);
     }
 
     #[test]

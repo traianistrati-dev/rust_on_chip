@@ -260,7 +260,8 @@ pub fn splice_config(
 /// names a different HAL CRATE than `c` does; otherwise unchanged.
 ///
 /// A Runtime switch changes the crate on the boards that swap HALs:
-/// `nrf52833-hal` for `embassy-nrf`, `rp2040-hal` for `embassy-rp`. The app
+/// `nrf52833-hal` for `embassy-nrf`, `rp2040-hal` for `embassy-rp`,
+/// `stm32f1xx-hal` for `embassy-stm32` on the STM32F1. The app
 /// used to refresh the block only on New Project and on open, so after Apply
 /// the `ensure_*` chain added the embassy executor to a manifest that still
 /// named the blocking HAL, and `main.rs` failed on `embassy_nrf` until the
@@ -268,8 +269,8 @@ pub fn splice_config(
 ///
 /// Keyed on the crate, not the whole line, so a version the user set on the
 /// HAL line is not undone on every sync (the splice keeps it anyway, see
-/// [`keep_user_dep_edits`]), and the STM32 and ESP families, whose crate is
-/// the same on both runtimes, never re-splice here. A file without the
+/// [`keep_user_dep_edits`]), and the ESP families and every STM32 but the F1,
+/// whose crate is the same on both runtimes, never re-splice here. A file without the
 /// markers is not the IDE's to change.
 pub fn refresh_hal_dependency(
     cargo_toml: &str,
@@ -1071,8 +1072,34 @@ mod the_hal_crate_follows_a_runtime_switch {
         );
     }
 
-    /// Nothing to do where the crate stays: an STM32 keeps embassy-stm32 on both
-    /// runtimes, and a HAL line the user re-versioned is not re-spliced.
+    /// The F103 is the one STM32 that swaps: stm32f1xx-hal on Blocking,
+    /// embassy-stm32 on Async - its line derived from the part number, with the
+    /// time driver the STM32 flavor toggles on it - and back again.
+    #[test]
+    fn the_f103_swaps_stm32f1xx_hal_for_embassy_stm32_and_back() {
+        let b = board("stm32f103c8t6");
+        let before = lived_in(&b);
+        assert!(before.contains("stm32f1xx-hal"), "{before}");
+
+        let after = async_sync(&b, &before);
+        assert!(after.contains("embassy-stm32 = "), "{after}");
+        assert!(after.contains("\"stm32f103c8\""), "{after}");
+        assert!(after.contains("time-driver-any"), "{after}");
+        assert!(!after.contains("stm32f1xx-hal"), "{after}");
+        assert!(after.contains("embassy-executor"), "{after}");
+        assert!(after.contains("heapless = \"0.8\""), "{after}");
+        assert_eq!(ide_added(&after), 1, "{after}");
+        // Settled: a second sync changes nothing.
+        assert_eq!(async_sync(&b, &after), after);
+
+        let back = refresh_hal_dependency(&after, &b.blocking, &b.tc);
+        assert!(back.contains("stm32f1xx-hal"), "{back}");
+        assert!(!back.contains("embassy-stm32 = "), "{back}");
+        assert!(back.contains("heapless = \"0.8\""), "{back}");
+    }
+
+    /// Nothing to do where the crate stays - an ESP keeps esp-hal on both
+    /// runtimes - and a HAL line the user re-versioned is not re-spliced.
     #[test]
     fn the_same_crate_is_left_alone() {
         let b = board("nrf52833_microbit_v2");
@@ -1084,15 +1111,18 @@ mod the_hal_crate_follows_a_runtime_switch {
             pinned
         );
 
-        for d in builtin_definitions()
-            .into_iter()
-            .filter(|d| d.family.starts_with("stm32"))
-        {
+        let mut same = 0;
+        for d in builtin_definitions() {
             let mut mcu = d.build_mcu();
             mcu.runtime = Runtime::Blocking;
             let b = build_cfg(&d, Some(&mcu));
             mcu.runtime = Runtime::Async;
             let a = build_cfg(&d, Some(&mcu));
+            let krate = |p: &ProjectDef| p.hal_dep.split_whitespace().next().map(str::to_owned);
+            if krate(&a) != krate(&b) {
+                continue; // a swap, not the same crate - the tests above
+            }
+            same += 1;
             let toml = gen_config(ConfigFile::CargoToml, &b, &d.toolchain);
             assert_eq!(
                 refresh_hal_dependency(&toml, &a, &d.toolchain),
@@ -1101,6 +1131,7 @@ mod the_hal_crate_follows_a_runtime_switch {
                 d.id
             );
         }
+        assert!(same >= 9, "the nine ESP parts at least, got {same}");
 
         // And a manifest the user took the markers out of is theirs.
         let hand = gen_config(ConfigFile::CargoToml, &b.blocking, &b.tc)

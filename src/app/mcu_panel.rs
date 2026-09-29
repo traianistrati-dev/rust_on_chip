@@ -2798,6 +2798,9 @@ impl AppIde {
                 }
                 McuTab::Configuration => self.show_configuration_tab(ui),
                 McuTab::System => {
+                    // A runtime Apply or an `@runtime` restore may have moved the
+                    // HAL line since the chip was picked (the F1 swaps crates).
+                    self.refresh_hal_check();
                     // Read the shared slot BEFORE borrowing `self.mcu` mutably.
                     let hal = self.hal_verdict_now();
                     // A background thread finishing does not wake egui. Without
@@ -3075,10 +3078,11 @@ impl AppIde {
             } else if async_sel {
                 // Async SELECTED on a family that has no async backend. The card
                 // itself cannot be clicked there, but `mcu.config` is a file the
-                // user can edit, and `@runtime Async` on an F1 project lands
-                // here. Codegen falls back to the blocking backend (see
-                // `Mcu::is_async`), so promising the executor would be a lie
-                // about code that does not exist.
+                // user can edit, and a hand-written `@runtime Async` lands here.
+                // (Every family this IDE ships has a backend now - the F1 was
+                // the last to get one.) Codegen falls back to the blocking
+                // backend (see `Mcu::is_async`), so promising the executor would
+                // be a lie about code that does not exist.
                 ui.label(
                     egui::RichText::new(format!(
                         "{}  Async is selected but INERT on this chip — main.rs is still \
@@ -3111,9 +3115,11 @@ impl AppIde {
             ui.add_space(8.0);
 
             // Only the STM32F1 backend has the io.rs bridge; on the (staged)
-            // Native runtime GPIO is forced raw regardless. Edits the STAGED
-            // `pending_gpio_api`.
-            let gpio_ok = native_ok && mcu.pending_runtime != Runtime::Native;
+            // Native runtime GPIO is forced raw regardless, and on Async the F1
+            // is on embassy-stm32, whose own `Output`/`Input` every pin binds
+            // to. Edits the STAGED `pending_gpio_api`.
+            let gpio_ok = native_ok
+                && !matches!(mcu.pending_runtime, Runtime::Native | Runtime::Async);
             // What the two cards SHOW. While the Native runtime is staged they
             // are dead and GPIO binds raw whatever this field holds, so Native
             // is what they show - derived here rather than written into
@@ -3173,6 +3179,17 @@ impl AppIde {
                     egui::RichText::new(format!(
                         "{}  The Native runtime already binds all GPIO raw — this choice \
                          applies on the Blocking runtime.",
+                        ph::INFO,
+                    ))
+                    .color(egui::Color32::from_rgb(120, 170, 220)),
+                );
+            } else if mcu.pending_runtime == Runtime::Async {
+                ui.label(
+                    egui::RichText::new(format!(
+                        concat!(
+                            "{}  The Async runtime binds every GPIO to embassy-stm32's own ",
+                            "Output / Input — this choice applies on Blocking and RTIC."
+                        ),
                         ph::INFO,
                     ))
                     .color(egui::Color32::from_rgb(120, 170, 220)),
@@ -4372,7 +4389,8 @@ mod a_greyed_runtime_card_has_no_details_pane {
     /// Per family, which of the three guarded cards draw a pane: (native,
     /// async, rtic). Blocking is not here because it is never greyed.
     const EXPECTED: &[(&str, (bool, bool, bool))] = &[
-        ("stm32f1", (true, false, true)),
+        // Every card: Blocking/Native/RTIC on stm32f1xx-hal, Async on embassy.
+        ("stm32f1", (true, true, true)),
         ("stm32f4", (false, true, false)),
         ("rp2040", (false, true, false)),
         ("rp235x", (false, true, false)),

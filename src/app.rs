@@ -1987,8 +1987,10 @@ pub struct AppIde {
     pending_mcu_id: Option<String>,
     /// The selected chip's HAL-feature verdict, looked up OFF the UI thread.
     ///
-    /// `(chip id, slot)`; `None` inside the slot means the answer has not landed
-    /// yet. The lookup hits the crates.io index and takes up to four seconds, so
+    /// `(embassy-stm32 feature, slot)`; `None` inside the slot means the answer
+    /// has not landed yet. Keyed on the feature, not the chip: an F1 has two
+    /// HAL lines, one per runtime (`refresh_hal_check`). The lookup hits the
+    /// crates.io index and takes up to four seconds, so
     /// doing it inline would freeze the app on every chip pick — and doing it in
     /// the `ui` function would do that on every repaint. Same shape as
     /// `ensure_version_fetch`, for the same reason.
@@ -3613,8 +3615,8 @@ impl AppIde {
             // On the async (embassy) path the blocking F1 trait-bridge deps
             // (embedded-io / embedded-hal-0-2 / nb / bxcan / usb-device) DON'T
             // apply — the async USART config pulls embedded-io-async + static_cell
-            // via `ensure_async_deps` instead. Async is only offered on non-F1
-            // STM32, where those bridges aren't generated anyway.
+            // via `ensure_async_deps` instead. An F1 on Async is on embassy-stm32
+            // too, so the bridges (and bxcan / usb-device) go with the HAL swap.
             let is_async = self.mcu.as_ref().is_some_and(|m| m.is_async());
             // Native runtime → the bus peripherals expose CONCRETE HAL types
             // (all `ApiStyle::Native`), so NONE of the portable trait-bridge
@@ -3782,21 +3784,21 @@ impl AppIde {
                 self.mcu.as_ref().map_or("", |m| m.family.as_str()),
                 &esp_chip,
             );
+            // `has_cfg` matches a config-FILE prefix, and the async RP backend
+            // writes no BUS config files (its only one is the watchdog's) - so a
+            // Pico with a `BufferedUart` in main.rs would ask for `static_cell`
+            // against a manifest that never got the line. A Pico W hides it,
+            // since the radio adds that crate for its own reasons.
+            let needs_async_usart = is_async && has_cfg("usart")
+                || self
+                    .mcu
+                    .as_ref()
+                    .is_some_and(crate::panels::mcu_module::codegen::rp::needs_async_usart);
             let new_toml = project_gen::ensure_async_deps(
                 &new_toml,
                 is_async,
                 async_flavor,
-                // `has_cfg` matches a config-FILE prefix, and the async RP
-                // backend writes no BUS config files (its only one is the
-                // watchdog's) - so a Pico with a
-                // `BufferedUart` in main.rs would ask for `static_cell` against
-                // a manifest that never got the line. A Pico W hides it, since
-                // the radio adds that crate for its own reasons.
-                is_async && has_cfg("usart")
-                    || self
-                        .mcu
-                        .as_ref()
-                        .is_some_and(crate::panels::mcu_module::codegen::rp::needs_async_usart),
+                needs_async_usart,
                 needs_eh_total,
                 needs_eh_async,
                 &sources,
@@ -3815,9 +3817,16 @@ impl AppIde {
             // reason as the line above. An async nRF TWIM needs it too, for its
             // `'static` RAM buffer; no config file names it, so `has_cfg` above
             // cannot see it, the same gap the Pico's `BufferedUart` had.
+            //
+            // And the async USART, which `ensure_async_deps` just added it for:
+            // its `StaticCell` lives in `src/pins/configs/usart*.rs`, which
+            // `sources` leaves out on purpose, so passing only the executor's
+            // need here took the line straight back out - every async STM32
+            // project with a USART lost `static_cell` on Save.
             let new_toml = project_gen::ensure_task_priority_deps(
                 &new_toml,
-                self.generated_code.contains("InterruptExecutor")
+                needs_async_usart
+                    || self.generated_code.contains("InterruptExecutor")
                     || self
                         .mcu
                         .as_ref()

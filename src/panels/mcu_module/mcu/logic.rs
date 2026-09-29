@@ -156,6 +156,7 @@ impl Mcu {
             collapse_modules: false,
             rotated: false,
             io_pin_pos: std::collections::BTreeMap::new(),
+            i2c_child_pos: std::collections::BTreeMap::new(),
             groups: Vec::new(),
             module_notes: std::collections::BTreeMap::new(),
             watchdog: Default::default(),
@@ -626,6 +627,11 @@ impl Mcu {
             .iter()
             .any(|m| m.pos != (0.0, 0.0) && m.connections.iter().any(|c| mine(c.mcu_pin)))
             || self.io_pin_pos.keys().any(|p| mine(*p))
+            || self.i2c_child_pos.keys().any(|dev| {
+                self.groups
+                    .iter()
+                    .any(|g| g.is_live() && g.name.trim() == name && g.i2c.contains(dev))
+            })
     }
 
     /// Return every part of device `name` to auto-packing.
@@ -654,6 +660,15 @@ impl Mcu {
         }
         for p in mine {
             self.io_pin_pos.remove(&p);
+        }
+        let devices: Vec<(u8, u32)> = self
+            .groups
+            .iter()
+            .filter(|g| g.is_live() && g.name.trim() == name)
+            .flat_map(|g| g.i2c.iter().copied())
+            .collect();
+        for d in devices {
+            self.i2c_child_pos.remove(&d);
         }
     }
 
@@ -1038,10 +1053,43 @@ impl Mcu {
         }
         self.push_module_undo(label);
         self.modules[pos].config = ModuleConfig::I2c(next);
-        if matches!(edit, I2cDeviceEdit::Remove(_)) {
+        if let I2cDeviceEdit::Remove(k) = &edit {
             self.i2c_remove_confirm = None;
+            // Its place goes with it - an undo brings it back into the column.
+            if let crate::panels::mcu_module::modules::I2cDeviceKey::Uid(u) = k {
+                self.i2c_child_pos.remove(&(instance, *u));
+            }
         }
         true
+    }
+
+    /// Put device `key` of bus `instance` where the user dragged it (`Some`,
+    /// the offset of its box's top-left from the chip centre), or back into
+    /// its bus's column (`None`). A device with no uid yet is minted first - the
+    /// place is kept by uid.
+    pub fn move_i2c_device(
+        &mut self,
+        instance: u8,
+        key: crate::panels::mcu_module::modules::I2cDeviceKey,
+        at: Option<(f32, f32)>,
+    ) {
+        let uid = match (key, at) {
+            (crate::panels::mcu_module::modules::I2cDeviceKey::Uid(u), _) => u,
+            // Nothing to reset for a device never moved.
+            (_, None) => return,
+            (k, Some(_)) => match self.ensure_i2c_uid(instance, k) {
+                Some(u) => u,
+                None => return,
+            },
+        };
+        match at {
+            Some(p) => {
+                self.i2c_child_pos.insert((instance, uid), p);
+            }
+            None => {
+                self.i2c_child_pos.remove(&(instance, uid));
+            }
+        }
     }
 
     /// The highest device uid of bus `instance` that anything outside the bus's
@@ -1180,32 +1228,31 @@ impl Mcu {
         bus(self)?.devices.get(at).map(|d| d.uid)
     }
 
-    /// The Device an I2C device is in: the one it was put in by hand, else its
-    /// bus's (the one holding its pads) - derived, like a module's.
+    /// The Device an I2C device is in: the one it was put in, and none until it
+    /// is put in one.
+    ///
+    /// Not its bus's. A device used to follow the Device its bus's pads were
+    /// in, which drew it inside that Device's mat and made it read as part of
+    /// the bus box: a display on the bus of a "control panel" was part of the
+    /// control panel whether or not it belonged there. Each device of a bus is
+    /// a board part of its own, grouped on its own.
     pub fn group_of_i2c_device(
         &self,
         instance: u8,
         key: crate::panels::mcu_module::modules::I2cDeviceKey,
     ) -> Option<&crate::panels::mcu_module::mcu_config::PinGroup> {
-        use crate::panels::mcu_module::modules::{I2cDeviceKey, ModuleKind};
-        if let I2cDeviceKey::Uid(u) = key
-            && let Some(g) = self
-                .groups
-                .iter()
-                .find(|g| g.is_live() && g.i2c.contains(&(instance, u)))
-        {
-            return Some(g);
-        }
-        let bus = self
-            .modules
+        use crate::panels::mcu_module::modules::I2cDeviceKey;
+        let I2cDeviceKey::Uid(u) = key else {
+            return None;
+        };
+        self.groups
             .iter()
-            .find(|m| m.kind == ModuleKind::GenericInterfaceI2c && m.instance() == instance)?;
-        self.group_of_module(bus)
+            .find(|g| g.is_live() && g.i2c.contains(&(instance, u)))
     }
 
     /// Put I2C device `key` of bus `instance` in the Device called `name`,
     /// creating it if it is new - or, with an empty name, take it out of the
-    /// one it was put in, back to its bus's. The same rules as
+    /// one it was put in, so it is in none. The same rules as
     /// [`Self::join_group`]: one Device at a time, and a Device this took its
     /// last member from is finished. Returns whether anything changed.
     pub fn join_group_i2c(
@@ -1442,6 +1489,25 @@ impl Mcu {
             }
             s.push_str(&iopins);
         }
+        // Dragged I2C device boxes (`@i2cpos`) - view preference, and only the
+        // ones whose device is still there.
+        let live: std::collections::BTreeMap<(u8, u32), (f32, f32)> = self
+            .i2c_child_pos
+            .iter()
+            .filter(|((inst, uid), _)| {
+                self.i2c_bus(*inst).is_some_and(|c| {
+                    c.has(crate::panels::mcu_module::modules::I2cDeviceKey::Uid(*uid))
+                })
+            })
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let i2cpos = mcu_config::i2c_pos_section(&live);
+        if !i2cpos.is_empty() {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&i2cpos);
+        }
         // Interrupt edges (`@irq`). Unlike the two sections above this is NOT a
         // view preference: it changes the generated code on the RTIC runtime.
         let irqs: std::collections::BTreeMap<usize, _> = self
@@ -1601,6 +1667,7 @@ impl Mcu {
         // `reset_all_pins` would clear every label it restored. It has its own
         // entry point, `apply_config_pin_labels`, called later in the sequence.
         self.io_pin_pos = mcu_config::parse_iopins(text);
+        self.i2c_child_pos = mcu_config::parse_i2c_pos(text);
         self.groups = mcu_config::parse_groups(text);
         self.watchdog = mcu_config::parse_watchdog(text);
         self.comp = mcu_config::parse_comp(text);

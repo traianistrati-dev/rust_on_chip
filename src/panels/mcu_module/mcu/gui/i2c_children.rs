@@ -1,11 +1,11 @@
-//! The devices on an I2C bus, drawn on the Pins canvas as boxes beside the
-//! bus's own box and wired to it by SCL and SDA.
+//! The devices on an I2C bus, drawn on the Pins canvas as boxes of their own,
+//! each joined to the bus's box by one line.
 //!
 //! # Layout
 //!
-//! A bus's devices form a COLUMN on the side of the bus box that faces away
-//! from the chip - never between the box and the pins, where the wire corridor
-//! is clear only by construction (`wire.rs`).
+//! A device the user has not moved sits in a COLUMN on the side of the bus box
+//! that faces away from the chip - never between the box and the pins, where
+//! the wire corridor is clear only by construction (`wire.rs`).
 //!
 //! * A bus above or below the chip stacks its devices further out, inside its
 //!   own 170 px band, so two buses on that side can never reach into each
@@ -14,17 +14,19 @@
 //!   little below its top edge. The packer is told how far the column runs past
 //!   the box (`tail`), so the next bus on that side is pushed clear of it.
 //!
+//! A device the user DRAGGED sits where it was put (`Mcu::i2c_child_pos`), like
+//! a dragged module box: it stays there when its bus moves, and moves with its
+//! module group.
+//!
 //! # Wires
 //!
-//! A real bus, as a schematic draws one: an SCL rail down one side of the
-//! column and an SDA rail down the other, with a tap into every device. SCL and
-//! SDA are the same green on this canvas (the pads' colour), so the layout is
-//! built to have NO crossing at all - a crossing of two lines of one colour
-//! reads as a short, whatever dot is or is not drawn on it. Each device box says
-//! which side is which in its top strip.
+//! ONE line per device, the bus as a schematic block diagram draws it - SCL and
+//! SDA are always a pair, and two lines per device said nothing a single one
+//! does not. The column shares a rail with a tap into each device; a moved
+//! device gets a line of its own, straight or with two bends.
 //!
-//! The gaps are kept under `device_frame::JOIN`, so a device mat merges a bus
-//! and its devices into one mat instead of drawing `name 1/2` and `name 2/2`.
+//! The column's gaps are kept under `device_frame::JOIN`, so a module group
+//! holding the bus and a device merges them into one mat.
 
 use super::i2c_devices::{I2cAct, id_field, name_field, remove_question};
 use super::modules::{Side, signal_color, text_scale, tint, wire_shapes};
@@ -35,46 +37,50 @@ use eframe::egui;
 /// A device box.
 pub const CHILD_W: f32 = 150.0;
 pub const CHILD_H: f32 = 60.0;
-/// The strip at the top of a device box: `SCL  #n  SDA`, and where the taps
-/// land. It is also what a click on the box lands on (the rest is fields).
+/// The strip at the top of a device box: its number, and where the tap lands.
 const STRIP_H: f32 = 14.0;
 /// Between a bus box above/below the chip and its first device, and between
 /// two devices of one bus.
 pub const GAP: f32 = 8.0;
-/// Between a bus box left/right of the chip and its column - the SCL rail runs
+/// Between a bus box left/right of the chip and its column - the rail runs
 /// down the middle of it.
 pub const GAP_SIDE: f32 = 20.0;
-/// How far below a left/right bus box's top its column starts: room for the
-/// SDA wire to pass over the first device on its way to the far side - and far
-/// enough that the SECOND device starts below the bus box. A device mat merging
-/// the bus box with its first device covers the box's whole height; with a
-/// device of another Device beside that span, the merge would be refused and
-/// the bus's Device drawn in two pieces.
+/// How far below a left/right bus box's top its column starts - far enough that
+/// the SECOND device starts below the bus box. A mat merging the bus box with
+/// its first device covers the box's whole height; with a device of another
+/// group beside that span, the merge would be refused and the bus's group drawn
+/// in two pieces.
 const SIDE_DROP: f32 = 32.0;
-/// Where the SDA wire leaves a left/right bus box, below its top.
-const SDA_Y: f32 = 8.0;
-/// How far outside a column the rails of an above/below bus run - inside the
+/// How far outside a column the rail of an above/below bus runs - inside the
 /// bus's 170 px band, which the 150 px column leaves 10 px of on each side.
 const RAIL_OUT: f32 = 5.0;
-/// How far past the column a left/right bus's SDA rail runs.
-const SDA_OUT: f32 = 10.0;
+/// How far a moved device's line keeps its ends from box corners.
+const END_INSET: f32 = 10.0;
+
+/// One line from the bus box to its device(s).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Wire {
+    /// From the bus box end to the device end.
+    pub path: Vec<egui::Pos2>,
+    /// The device it leads to alone - `None` for the column's rail, which
+    /// every device of the column hangs on.
+    pub serves: Option<usize>,
+}
 
 /// One bus's devices, placed, with their wires.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Bus {
     pub side: Side,
-    /// One per device, in list order; the first is the one nearest the bus box.
+    /// One per device: the column's first (nearest the bus box first), then the
+    /// moved ones in the order given.
     pub children: Vec<egui::Rect>,
-    /// SCL and SDA as polylines, each starting at the bus box end: one rail
-    /// that ends in the farthest device's tap, and one short tap per other
-    /// device.
-    pub scl: Vec<Vec<egui::Pos2>>,
-    pub sda: Vec<Vec<egui::Pos2>>,
+    pub wires: Vec<Wire>,
     /// Where a tap leaves a rail that goes on past it - drawn as a dot, the
     /// schematic sign that two lines are joined.
     pub junctions: Vec<egui::Pos2>,
-    /// The points on the bus box the two wires leave from: [SCL, SDA].
-    pub terminals: [egui::Pos2; 2],
+    /// Where lines leave the bus box, and where they reach a device.
+    pub terminals: Vec<egui::Pos2>,
+    pub ends: Vec<egui::Pos2>,
 }
 
 impl Bus {
@@ -84,7 +90,7 @@ impl Bus {
         for c in &self.children {
             r = r.union(*c);
         }
-        for p in self.scl.iter().chain(&self.sda).flatten() {
+        for p in self.wires.iter().flat_map(|w| w.path.iter()) {
             r.extend_with(*p);
         }
         r
@@ -96,9 +102,10 @@ fn column_len(n: usize) -> f32 {
     n as f32 * CHILD_H + n.saturating_sub(1) as f32 * GAP
 }
 
-/// How far a bus box's devices run past its far end along its side of the chip:
-/// what the packer adds before placing the next box on that side. Only a
+/// How far a bus box's column runs past its far end along its side of the
+/// chip: what the packer adds before placing the next box on that side. Only a
 /// left/right bus has any; above or below, the column goes outward instead.
+/// `n` counts the devices IN the column - a moved one is not.
 pub(super) fn tail(side: Side, box_h: f32, n: usize) -> f32 {
     match side {
         Side::Left | Side::Right if n > 0 => (SIDE_DROP + column_len(n) - box_h).max(0.0),
@@ -106,120 +113,209 @@ pub(super) fn tail(side: Side, box_h: f32, n: usize) -> f32 {
     }
 }
 
-/// How many device boxes a module draws: its I2C devices, none for anything else.
-pub(super) fn device_count(config: &ModuleConfig) -> usize {
-    match config {
-        ModuleConfig::I2c(c) => c.rows().len(),
+/// How many of a module's devices sit in its column: its I2C devices the user
+/// has not moved, none for anything else.
+pub(super) fn column_count(
+    mcu: &Mcu,
+    m: &crate::panels::mcu_module::modules::VirtualModule,
+) -> usize {
+    match &m.config {
+        ModuleConfig::I2c(c) => c
+            .rows()
+            .iter()
+            .filter(|r| moved_to(mcu, m.instance(), r.key).is_none())
+            .count(),
         _ => 0,
     }
 }
 
-/// Place `n` devices beside bus box `parent`, which sits on `side` of the chip.
-pub(super) fn layout(parent: egui::Rect, side: Side, n: usize) -> Bus {
+/// Where the user put device `key` of bus `instance`, as the offset of its
+/// box's top-left from the chip centre - `None` while it sits in the column.
+pub(super) fn moved_to(mcu: &Mcu, instance: u8, key: I2cDeviceKey) -> Option<(f32, f32)> {
+    match key {
+        I2cDeviceKey::Uid(u) => mcu.i2c_child_pos.get(&(instance, u)).copied(),
+        _ => None,
+    }
+}
+
+/// Place `n` devices in the column beside bus box `parent`, which sits on
+/// `side` of the chip, then the `moved` ones where they were put - and a line
+/// to each.
+pub(super) fn layout(parent: egui::Rect, side: Side, n: usize, moved: &[egui::Rect]) -> Bus {
     let mut bus = Bus {
         side,
         children: Vec::new(),
-        scl: Vec::new(),
-        sda: Vec::new(),
+        wires: Vec::new(),
         junctions: Vec::new(),
-        terminals: [parent.center(); 2],
+        terminals: Vec::new(),
+        ends: Vec::new(),
     };
-    if n == 0 {
-        return bus;
-    }
     let tap_y = |c: &egui::Rect| c.top() + STRIP_H / 2.0;
-    match side {
-        Side::Top | Side::Bottom => {
-            let top = side == Side::Top;
-            let edge_y = if top { parent.top() } else { parent.bottom() };
-            let left = parent.center().x - CHILD_W / 2.0;
-            for k in 0..n {
-                let near = GAP + k as f32 * (CHILD_H + GAP);
-                let y0 = if top {
-                    edge_y - near - CHILD_H
+    if n > 0 {
+        match side {
+            Side::Top | Side::Bottom => {
+                let top = side == Side::Top;
+                let edge_y = if top { parent.top() } else { parent.bottom() };
+                let left = parent.center().x - CHILD_W / 2.0;
+                for k in 0..n {
+                    let near = GAP + k as f32 * (CHILD_H + GAP);
+                    let y0 = if top {
+                        edge_y - near - CHILD_H
+                    } else {
+                        edge_y + near
+                    };
+                    bus.children.push(egui::Rect::from_min_size(
+                        egui::pos2(left, y0),
+                        egui::vec2(CHILD_W, CHILD_H),
+                    ));
+                }
+                let rail_x = left - RAIL_OUT;
+                let last = bus.children[n - 1];
+                bus.terminals.push(egui::pos2(rail_x, edge_y));
+                bus.wires.push(Wire {
+                    path: vec![
+                        egui::pos2(rail_x, edge_y),
+                        egui::pos2(rail_x, tap_y(&last)),
+                        egui::pos2(last.left(), tap_y(&last)),
+                    ],
+                    serves: None,
+                });
+                bus.ends.push(egui::pos2(last.left(), tap_y(&last)));
+                for (k, c) in bus.children[..n - 1].iter().enumerate() {
+                    let y = tap_y(c);
+                    bus.wires.push(Wire {
+                        path: vec![egui::pos2(rail_x, y), egui::pos2(c.left(), y)],
+                        serves: Some(k),
+                    });
+                    bus.junctions.push(egui::pos2(rail_x, y));
+                    bus.ends.push(egui::pos2(c.left(), y));
+                }
+            }
+            Side::Left | Side::Right => {
+                let right = side == Side::Right;
+                let dir = if right { 1.0 } else { -1.0 };
+                let edge_x = if right { parent.right() } else { parent.left() };
+                let col_left = if right {
+                    edge_x + GAP_SIDE
                 } else {
-                    edge_y + near
+                    edge_x - GAP_SIDE - CHILD_W
                 };
-                bus.children.push(egui::Rect::from_min_size(
-                    egui::pos2(left, y0),
-                    egui::vec2(CHILD_W, CHILD_H),
-                ));
-            }
-            let scl_x = left - RAIL_OUT;
-            let sda_x = left + CHILD_W + RAIL_OUT;
-            bus.terminals = [egui::pos2(scl_x, edge_y), egui::pos2(sda_x, edge_y)];
-            let last = &bus.children[n - 1];
-            bus.scl.push(vec![
-                egui::pos2(scl_x, edge_y),
-                egui::pos2(scl_x, tap_y(last)),
-                egui::pos2(last.left(), tap_y(last)),
-            ]);
-            bus.sda.push(vec![
-                egui::pos2(sda_x, edge_y),
-                egui::pos2(sda_x, tap_y(last)),
-                egui::pos2(last.right(), tap_y(last)),
-            ]);
-            for c in &bus.children[..n - 1] {
-                let y = tap_y(c);
-                bus.scl
-                    .push(vec![egui::pos2(scl_x, y), egui::pos2(c.left(), y)]);
-                bus.sda
-                    .push(vec![egui::pos2(sda_x, y), egui::pos2(c.right(), y)]);
-                bus.junctions.push(egui::pos2(scl_x, y));
-                bus.junctions.push(egui::pos2(sda_x, y));
-            }
-        }
-        Side::Left | Side::Right => {
-            let right = side == Side::Right;
-            let dir = if right { 1.0 } else { -1.0 };
-            let edge_x = if right { parent.right() } else { parent.left() };
-            let col_left = if right {
-                edge_x + GAP_SIDE
-            } else {
-                edge_x - GAP_SIDE - CHILD_W
-            };
-            for k in 0..n {
-                let y0 = parent.top() + SIDE_DROP + k as f32 * (CHILD_H + GAP);
-                bus.children.push(egui::Rect::from_min_size(
-                    egui::pos2(col_left, y0),
-                    egui::vec2(CHILD_W, CHILD_H),
-                ));
-            }
-            // SCL taps the device edge facing the bus, SDA the far one.
-            let near = |c: &egui::Rect| if right { c.left() } else { c.right() };
-            let far = |c: &egui::Rect| if right { c.right() } else { c.left() };
-            let scl_x = edge_x + dir * GAP_SIDE / 2.0;
-            let sda_x = far(&bus.children[0]) + dir * SDA_OUT;
-            let scl_y = parent.top() + SIDE_DROP;
-            let sda_y = parent.top() + SDA_Y;
-            bus.terminals = [egui::pos2(edge_x, scl_y), egui::pos2(edge_x, sda_y)];
-            let last = &bus.children[n - 1];
-            bus.scl.push(vec![
-                egui::pos2(edge_x, scl_y),
-                egui::pos2(scl_x, scl_y),
-                egui::pos2(scl_x, tap_y(last)),
-                egui::pos2(near(last), tap_y(last)),
-            ]);
-            // Over the top of the column, clear of the SCL rail, which only
-            // starts lower down.
-            bus.sda.push(vec![
-                egui::pos2(edge_x, sda_y),
-                egui::pos2(sda_x, sda_y),
-                egui::pos2(sda_x, tap_y(last)),
-                egui::pos2(far(last), tap_y(last)),
-            ]);
-            for c in &bus.children[..n - 1] {
-                let y = tap_y(c);
-                bus.scl
-                    .push(vec![egui::pos2(scl_x, y), egui::pos2(near(c), y)]);
-                bus.sda
-                    .push(vec![egui::pos2(sda_x, y), egui::pos2(far(c), y)]);
-                bus.junctions.push(egui::pos2(scl_x, y));
-                bus.junctions.push(egui::pos2(sda_x, y));
+                for k in 0..n {
+                    let y0 = parent.top() + SIDE_DROP + k as f32 * (CHILD_H + GAP);
+                    bus.children.push(egui::Rect::from_min_size(
+                        egui::pos2(col_left, y0),
+                        egui::vec2(CHILD_W, CHILD_H),
+                    ));
+                }
+                // The tap reaches the device edge facing the bus.
+                let near = |c: &egui::Rect| if right { c.left() } else { c.right() };
+                let rail_x = edge_x + dir * GAP_SIDE / 2.0;
+                let feed_y = parent.top() + SIDE_DROP;
+                let last = bus.children[n - 1];
+                bus.terminals.push(egui::pos2(edge_x, feed_y));
+                bus.wires.push(Wire {
+                    path: vec![
+                        egui::pos2(edge_x, feed_y),
+                        egui::pos2(rail_x, feed_y),
+                        egui::pos2(rail_x, tap_y(&last)),
+                        egui::pos2(near(&last), tap_y(&last)),
+                    ],
+                    serves: None,
+                });
+                bus.ends.push(egui::pos2(near(&last), tap_y(&last)));
+                for (k, c) in bus.children[..n - 1].iter().enumerate() {
+                    let y = tap_y(c);
+                    bus.wires.push(Wire {
+                        path: vec![egui::pos2(rail_x, y), egui::pos2(near(c), y)],
+                        serves: Some(k),
+                    });
+                    bus.junctions.push(egui::pos2(rail_x, y));
+                    bus.ends.push(egui::pos2(near(c), y));
+                }
             }
         }
+    }
+    for (k, c) in moved.iter().enumerate() {
+        bus.children.push(*c);
+        let path = link(parent, *c);
+        if let (Some(a), Some(b)) = (path.first(), path.last()) {
+            bus.terminals.push(*a);
+            bus.ends.push(*b);
+        }
+        bus.wires.push(Wire {
+            path,
+            serves: Some(n + k),
+        });
     }
     bus
+}
+
+/// The line from bus box `bus` to a device box the user moved: out of the bus
+/// box's edge that faces the device, into the device's edge that faces the
+/// bus - straight where the two overlap across that gap, else with two bends
+/// half way. Empty when the boxes overlap and no edge faces the other.
+pub(super) fn link(bus: egui::Rect, dev: egui::Rect) -> Vec<egui::Pos2> {
+    let d = dev.center() - bus.center();
+    let gap_x = if d.x >= 0.0 {
+        dev.left() - bus.right()
+    } else {
+        bus.left() - dev.right()
+    };
+    let gap_y = if d.y >= 0.0 {
+        dev.top() - bus.bottom()
+    } else {
+        bus.top() - dev.bottom()
+    };
+    // Along a range, kept off its ends.
+    let inside =
+        |v: f32, lo: f32, hi: f32| v.clamp(lo + END_INSET, (hi - END_INSET).max(lo + END_INSET));
+    let horizontal = gap_x > 0.0 && (gap_y <= 0.0 || d.x.abs() >= d.y.abs());
+    if horizontal {
+        let (x0, x1) = if d.x >= 0.0 {
+            (bus.right(), dev.left())
+        } else {
+            (bus.left(), dev.right())
+        };
+        // Straight across where both boxes span the same heights.
+        let lo = bus.top().max(dev.top()) + END_INSET;
+        let hi = bus.bottom().min(dev.bottom()) - END_INSET;
+        if lo <= hi {
+            let y = (lo + hi) / 2.0;
+            return vec![egui::pos2(x0, y), egui::pos2(x1, y)];
+        }
+        let y0 = inside(dev.center().y, bus.top(), bus.bottom());
+        let y1 = inside(bus.center().y, dev.top(), dev.bottom());
+        let mid = (x0 + x1) / 2.0;
+        vec![
+            egui::pos2(x0, y0),
+            egui::pos2(mid, y0),
+            egui::pos2(mid, y1),
+            egui::pos2(x1, y1),
+        ]
+    } else if gap_y > 0.0 {
+        let (y0, y1) = if d.y >= 0.0 {
+            (bus.bottom(), dev.top())
+        } else {
+            (bus.top(), dev.bottom())
+        };
+        let lo = bus.left().max(dev.left()) + END_INSET;
+        let hi = bus.right().min(dev.right()) - END_INSET;
+        if lo <= hi {
+            let x = (lo + hi) / 2.0;
+            return vec![egui::pos2(x, y0), egui::pos2(x, y1)];
+        }
+        let x0 = inside(dev.center().x, bus.left(), bus.right());
+        let x1 = inside(bus.center().x, dev.left(), dev.right());
+        let mid = (y0 + y1) / 2.0;
+        vec![
+            egui::pos2(x0, y0),
+            egui::pos2(x0, mid),
+            egui::pos2(x1, mid),
+            egui::pos2(x1, y1),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// One bus to draw: which module it is, where its box went, and its devices.
@@ -227,16 +323,16 @@ pub(super) struct BusDraw {
     pub module: usize,
     pub module_id: String,
     pub instance: u8,
-    /// The Device its box is in - the one its devices are in unless put in
-    /// another.
+    /// The module group its box is in.
     pub group: Option<String>,
     pub bus: Bus,
-    /// The devices, in column order (`bus.children`'s): which device, its
-    /// 1-based place in the bus's list (what its box and its panel row are
-    /// numbered by), and the Device it is in.
+    /// The devices, in `bus.children`'s order: which device, its 1-based place
+    /// in the bus's list (what its box and its panel row are numbered by), the
+    /// module group it is in, and whether the user moved it out of the column.
     pub keys: Vec<I2cDeviceKey>,
     pub numbers: Vec<usize>,
     pub child_groups: Vec<Option<String>>,
+    pub moved: Vec<bool>,
 }
 
 /// What the user did on the devices this frame, applied by the caller once it
@@ -246,6 +342,11 @@ pub(super) struct BusOut {
     pub acts: Vec<(u8, I2cAct)>,
     /// A device box clicked: (its bus module's id, which device).
     pub picked: Option<(String, I2cDeviceKey)>,
+    /// Device boxes dragged: (bus instance, which device, the new offset of
+    /// its top-left from the chip centre).
+    pub moves: Vec<(u8, I2cDeviceKey, (f32, f32))>,
+    /// "Reset to auto position": back into the column.
+    pub resets: Vec<(u8, I2cDeviceKey)>,
 }
 
 /// Where the "+ device" button sits on a bus box: its bottom-left corner,
@@ -313,44 +414,59 @@ pub(super) fn paint(
     active: Option<&str>,
     // The pulse of a pending removal, 0..1.
     blink: f32,
+    // What a dragged box's position is stored relative to.
+    chip_center: egui::Pos2,
     halos: &mut Vec<egui::Shape>,
     lines: &mut Vec<egui::Shape>,
 ) -> BusOut {
     let mut out = BusOut::default();
     let picked = mcu.selected_i2c_child().map(|(id, k)| (id.to_owned(), k));
+    // What "Put in Module Group" offers: every group the roster holds by a
+    // name, live or just created and still empty.
+    let mut devices: Vec<String> = Vec::new();
+    for g in &mcu.groups {
+        let name = g.name.trim();
+        if !name.is_empty() && !devices.iter().any(|d| d == name) {
+            devices.push(name.to_owned());
+        }
+    }
     for b in buses {
         let color = signal_color(ModuleSignal::Scl, b.instance);
         let is_active =
             |g: &Option<String>| active.filter(|a| g.as_deref().map(str::trim) == Some(a.trim()));
-        // A device's tap lights with ITS Device; the rails, which every device
-        // hangs on, with the bus's or with any of theirs.
+        // A device's own line lights with ITS group; the column's rail, which
+        // every device of the column hangs on, with the bus's or any of theirs.
         let taps_lit: Vec<Option<&str>> = b.child_groups.iter().map(is_active).collect();
-        let lit = is_active(&b.group).or_else(|| taps_lit.iter().flatten().next().copied());
-        for paths in [&b.bus.scl, &b.bus.sda] {
-            for (k, path) in paths.iter().enumerate() {
-                // Path 0 is the rail (ending in the farthest device's tap);
-                // path k >= 1 is the tap of device k - 1.
-                let on = if k == 0 {
-                    lit
-                } else {
-                    taps_lit.get(k - 1).copied().flatten()
-                };
-                let (halo, line) = wire_shapes(
-                    &crate::panels::structure_map::gui::rounded_path(path, super::wire::WIRE_R),
-                    color,
-                    1.6,
-                    on,
-                );
-                halos.extend(halo);
-                lines.push(line);
-            }
+        let column_lit = b
+            .moved
+            .iter()
+            .zip(&taps_lit)
+            .filter(|(moved, _)| !**moved)
+            .find_map(|(_, lit)| *lit);
+        let lit = is_active(&b.group).or(column_lit);
+        for w in &b.bus.wires {
+            let on = match w.serves {
+                None => lit,
+                Some(k) => taps_lit.get(k).copied().flatten(),
+            };
+            let (halo, line) = wire_shapes(
+                &crate::panels::structure_map::gui::rounded_path(&w.path, super::wire::WIRE_R),
+                color,
+                1.6,
+                on,
+            );
+            halos.extend(halo);
+            lines.push(line);
         }
         let dot = if lit.is_some() { 4.5 } else { 3.5 };
-        for t in b.bus.terminals {
-            painter.circle_filled(t, dot, color);
-        }
-        for j in &b.bus.junctions {
-            painter.circle_filled(*j, dot, color);
+        for p in b
+            .bus
+            .terminals
+            .iter()
+            .chain(&b.bus.junctions)
+            .chain(&b.bus.ends)
+        {
+            painter.circle_filled(*p, dot, color);
         }
         let Some(ModuleConfig::I2c(cfg)) = mcu.modules.get(b.module).map(|m| &m.config) else {
             continue;
@@ -386,39 +502,10 @@ pub(super) fn paint(
                 egui::Stroke::new(1.2_f32, color)
             };
             painter.rect_stroke(*rect, 4.0, stroke, egui::StrokeKind::Middle);
-            // The strip: which edge is SCL, which SDA, and which device.
+            // The strip: which device it is.
             let strip_y = rect.top() + STRIP_H / 2.0;
             let tag = egui::FontId::monospace(8.5 * scale);
             let dim = egui::Color32::from_rgb(170, 175, 190);
-            let (scl_align, sda_align, scl_x, sda_x) = match b.bus.side {
-                // SCL taps the edge facing the bus on a left/right bus.
-                Side::Left => (
-                    egui::Align2::RIGHT_CENTER,
-                    egui::Align2::LEFT_CENTER,
-                    rect.right() - 5.0,
-                    rect.left() + 5.0,
-                ),
-                _ => (
-                    egui::Align2::LEFT_CENTER,
-                    egui::Align2::RIGHT_CENTER,
-                    rect.left() + 5.0,
-                    rect.right() - 5.0,
-                ),
-            };
-            painter.text(
-                egui::pos2(scl_x, strip_y),
-                scl_align,
-                "SCL",
-                tag.clone(),
-                dim,
-            );
-            painter.text(
-                egui::pos2(sda_x, strip_y),
-                sda_align,
-                "SDA",
-                tag.clone(),
-                dim,
-            );
             painter.text(
                 egui::pos2(rect.center().x, strip_y),
                 egui::Align2::CENTER_CENTER,
@@ -426,22 +513,72 @@ pub(super) fn paint(
                 tag,
                 if selected { egui::Color32::WHITE } else { dim },
             );
-            // A click anywhere on the box that is not a field picks the device.
-            // The WHOLE box, registered before its fields so they win where
-            // they are: a click on its bare parts would otherwise reach the
-            // canvas background, which clears the selection and folds every
-            // config - the bus's included. Click only - a drag still pans.
+            // A click anywhere on the box that is not a field picks the device,
+            // and a drag from there moves it. The WHOLE box, registered before
+            // its fields so they win where they are: a click on its bare parts
+            // would otherwise reach the canvas background, which clears the
+            // selection and folds every config - the bus's included.
+            let moved = b.moved.get(n).copied().unwrap_or(false);
             let resp = ui
                 .interact(
                     *rect,
                     ui.id().with(("i2c_child", b.instance, *key)),
-                    egui::Sense::click(),
+                    egui::Sense::click_and_drag(),
                 )
-                .on_hover_text("Click to select this device");
+                .on_hover_cursor(egui::CursorIcon::Grab)
+                .on_hover_text("Click to select this device - drag to move it");
             if resp.clicked() {
                 out.picked = Some((b.module_id.clone(), *key));
             }
+            // egui 0.36 starts a drag the moment the pointer leaves the widget,
+            // so a click whose hand slipped would pin the box where it stood.
+            if resp.dragged() && crate::panels::drag_decided(ui) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                // Already in canvas coordinates - the Scene's transform is
+                // applied by egui - so right at any zoom.
+                let off = rect.min + resp.drag_delta() - chip_center;
+                out.moves.push((b.instance, *key, (off.x, off.y)));
+            }
+            let mine = b.child_groups.get(n).cloned().flatten();
             resp.context_menu(|ui| {
+                // Every device of a bus is grouped on its own, straight from
+                // its box: the groups the roster holds, or none.
+                ui.menu_button("Put in Module Group", |ui| {
+                    for name in &devices {
+                        let on = mine.as_deref() == Some(name.as_str());
+                        if ui.selectable_label(on, name).clicked() {
+                            if !on {
+                                out.acts
+                                    .push((b.instance, I2cAct::Group(*key, name.clone())));
+                            }
+                            ui.close();
+                        }
+                    }
+                    if devices.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No module groups yet - make one with + Module Group",
+                            )
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(130)),
+                        );
+                    }
+                    ui.separator();
+                    if ui
+                        .selectable_label(mine.is_none(), "No Module Group")
+                        .clicked()
+                    {
+                        if mine.is_some() {
+                            out.acts
+                                .push((b.instance, I2cAct::Group(*key, String::new())));
+                        }
+                        ui.close();
+                    }
+                });
+                if moved && ui.button("Reset to auto position").clicked() {
+                    out.resets.push((b.instance, *key));
+                    ui.close();
+                }
                 if ui.button("Remove device").clicked() {
                     out.acts.push((b.instance, I2cAct::ArmRemove(*key)));
                     ui.close();
@@ -573,99 +710,109 @@ mod tests {
 
     const SIDES: [Side; 4] = [Side::Top, Side::Bottom, Side::Left, Side::Right];
 
-    fn segments(paths: &[Vec<egui::Pos2>]) -> Vec<(egui::Pos2, egui::Pos2)> {
-        paths
-            .iter()
-            .flat_map(|p| p.windows(2).map(|w| (w[0], w[1])))
-            .collect()
-    }
-
-    /// Two axis-aligned segments touch or cross (bounding boxes overlap).
-    fn touch(a: (egui::Pos2, egui::Pos2), b: (egui::Pos2, egui::Pos2)) -> bool {
-        let ra = egui::Rect::from_two_pos(a.0, a.1).expand(0.01);
-        let rb = egui::Rect::from_two_pos(b.0, b.1).expand(0.01);
-        ra.intersects(rb)
-    }
-
     /// A segment runs through the INSIDE of `r` (its edges do not count).
     fn enters(s: (egui::Pos2, egui::Pos2), r: egui::Rect) -> bool {
         egui::Rect::from_two_pos(s.0, s.1).intersects(r.shrink(0.5))
     }
 
-    /// The whole point of the layout: SCL and SDA are one colour, so they may
-    /// not cross or touch anywhere - on any side, for any number of devices.
-    #[test]
-    fn scl_and_sda_never_cross() {
-        for side in SIDES {
-            for n in 1..=6 {
-                let bus = layout(parent(side), side, n);
-                for a in segments(&bus.scl) {
-                    for b in segments(&bus.sda) {
-                        assert!(!touch(a, b), "{side:?} x{n}: {a:?} meets {b:?}");
-                    }
-                }
-            }
-        }
+    fn on_edge(p: egui::Pos2, r: egui::Rect) -> bool {
+        let x_edge = (p.x - r.left()).abs() < 0.01 || (p.x - r.right()).abs() < 0.01;
+        let y_edge = (p.y - r.top()).abs() < 0.01 || (p.y - r.bottom()).abs() < 0.01;
+        (x_edge && p.y >= r.top() && p.y <= r.bottom())
+            || (y_edge && p.x >= r.left() && p.x <= r.right())
     }
 
-    /// No wire runs through a device box or the bus box - only to their edges.
+    /// Moved devices, somewhere around the bus box.
+    fn moved(p: egui::Rect) -> Vec<egui::Rect> {
+        [(420.0, -40.0), (-380.0, 260.0), (10.0, -330.0)]
+            .iter()
+            .map(|(dx, dy)| {
+                egui::Rect::from_min_size(
+                    p.center() + egui::vec2(*dx, *dy),
+                    egui::vec2(CHILD_W, CHILD_H),
+                )
+            })
+            .collect()
+    }
+
+    /// No line of the column runs through a device box or the bus box - only to
+    /// their edges. A moved device's line keeps out of the bus box and its own
+    /// box; where the user put the device, it may have to pass others.
     #[test]
     fn wires_go_to_the_boxes_not_through_them() {
         for side in SIDES {
-            for n in 1..=6 {
+            for n in 0..=5 {
                 let p = parent(side);
-                let bus = layout(p, side, n);
-                for s in segments(&bus.scl).into_iter().chain(segments(&bus.sda)) {
-                    assert!(!enters(s, p), "{side:?} x{n}: {s:?} crosses the bus box");
-                    for c in &bus.children {
-                        assert!(!enters(s, *c), "{side:?} x{n}: {s:?} crosses {c:?}");
+                let bus = layout(p, side, n, &moved(p));
+                for w in &bus.wires {
+                    let column = w.serves.is_none_or(|k| k < n);
+                    for s in w.path.windows(2).map(|q| (q[0], q[1])) {
+                        assert!(!enters(s, p), "{side:?} x{n}: {s:?} crosses the bus box");
+                        for (k, c) in bus.children.iter().enumerate() {
+                            if column || w.serves == Some(k) {
+                                assert!(!enters(s, *c), "{side:?} x{n}: {s:?} crosses {c:?}");
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Every device gets one SCL tap and one SDA tap, each ending on its edge,
-    /// on opposite sides of it.
+    /// ONE line reaches every device - column or moved - and it ends on the
+    /// device's edge; every line starts at the bus box or on the rail.
     #[test]
-    fn every_device_is_on_both_lines() {
+    fn every_device_is_reached_by_one_line() {
         for side in SIDES {
-            for n in 1..=6 {
-                let bus = layout(parent(side), side, n);
-                for c in &bus.children {
-                    let ends = |paths: &[Vec<egui::Pos2>]| {
-                        paths
-                            .iter()
-                            .filter(|p| {
-                                let e = *p.last().unwrap();
-                                (e.x - c.left()).abs() < 0.01 || (e.x - c.right()).abs() < 0.01
-                            })
-                            .filter(|p| {
-                                let e = *p.last().unwrap();
-                                e.y > c.top() && e.y < c.bottom()
-                            })
-                            .map(|p| *p.last().unwrap())
-                            .collect::<Vec<_>>()
-                    };
-                    let scl = ends(&bus.scl);
-                    let sda = ends(&bus.sda);
-                    assert_eq!(scl.len(), 1, "{side:?} x{n}: SCL taps {scl:?}");
-                    assert_eq!(sda.len(), 1, "{side:?} x{n}: SDA taps {sda:?}");
-                    assert!((scl[0].x - sda[0].x).abs() > 100.0, "{side:?}: same edge");
+            for n in 0..=5 {
+                let p = parent(side);
+                let away = moved(p);
+                let bus = layout(p, side, n, &away);
+                assert_eq!(bus.children.len(), n + away.len());
+                for (k, c) in bus.children.iter().enumerate() {
+                    let reaching: Vec<&Wire> = bus
+                        .wires
+                        .iter()
+                        .filter(|w| w.path.last().is_some_and(|e| on_edge(*e, *c)))
+                        .collect();
+                    assert_eq!(
+                        reaching.len(),
+                        1,
+                        "{side:?} x{n}: device {k} has {reaching:?}"
+                    );
+                    let serves = reaching[0].serves;
+                    // The column's last device hangs on the rail itself.
+                    assert!(
+                        serves == Some(k) || (serves.is_none() && k + 1 == n),
+                        "{side:?} x{n}: device {k} served by {serves:?}"
+                    );
                 }
+                for w in bus
+                    .wires
+                    .iter()
+                    .filter(|w| w.serves.is_none() || w.serves >= Some(n))
+                {
+                    assert!(
+                        on_edge(w.path[0], p),
+                        "{side:?}: {w:?} does not leave the bus box"
+                    );
+                }
+                assert_eq!(
+                    bus.ends.len(),
+                    n + away.len(),
+                    "a dot where each line arrives"
+                );
             }
         }
     }
 
-    /// Devices overlap neither each other nor the bus box, and sit on the side
-    /// facing AWAY from the chip.
+    /// The column stands clear of the bus box and faces AWAY from the chip.
     #[test]
-    fn devices_stand_clear_and_outward() {
+    fn the_column_stands_clear_and_outward() {
         for side in SIDES {
             for n in 1..=6 {
                 let p = parent(side);
-                let bus = layout(p, side, n);
-                assert_eq!(bus.children.len(), n);
+                let bus = layout(p, side, n, &[]);
                 for (i, a) in bus.children.iter().enumerate() {
                     assert!(!a.intersects(p), "{side:?}: device over the bus box");
                     for b in &bus.children[i + 1..] {
@@ -684,26 +831,64 @@ mod tests {
         }
     }
 
-    /// The gaps stay inside the device mats' merge distance, so a Device holding
-    /// the bus draws one mat around it and its devices, not two.
+    /// A moved device's line: out of the bus box's edge facing it, into its
+    /// own edge facing the bus - straight where they overlap, square bends
+    /// otherwise; none for boxes that overlap.
     #[test]
-    fn the_gaps_stay_inside_a_device_mat() {
+    fn a_moved_devices_line_runs_edge_to_edge_at_right_angles() {
+        let bus = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(170.0, 98.0));
+        let at = |x: f32, y: f32| {
+            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(CHILD_W, CHILD_H))
+        };
+        let straight = link(bus, at(300.0, 20.0));
+        assert_eq!(straight.len(), 2, "{straight:?}");
+        for dev in [
+            at(300.0, 200.0),
+            at(-400.0, -150.0),
+            at(20.0, 300.0),
+            at(-200.0, 250.0),
+        ] {
+            let path = link(bus, dev);
+            assert!(path.len() >= 2, "{dev:?}: {path:?}");
+            assert!(on_edge(path[0], bus), "{dev:?}: {path:?}");
+            assert!(on_edge(*path.last().unwrap(), dev), "{dev:?}: {path:?}");
+            for w in path.windows(2) {
+                assert!(
+                    w[0].x == w[1].x || w[0].y == w[1].y,
+                    "a slanted leg: {path:?}"
+                );
+                assert!(
+                    !enters((w[0], w[1]), bus) && !enters((w[0], w[1]), dev),
+                    "{path:?}"
+                );
+            }
+        }
+        assert!(
+            link(bus, at(50.0, 30.0)).is_empty(),
+            "overlapping boxes get no line"
+        );
+    }
+
+    /// The gaps stay inside the mats' merge distance, so a module group holding
+    /// the bus and a device of its column draws one mat around them, not two.
+    #[test]
+    fn the_gaps_stay_inside_a_group_mat() {
         const { assert!(GAP <= super::super::device_frame::JOIN) };
         const { assert!(GAP_SIDE <= super::super::device_frame::JOIN) };
-        const { assert!(SIDE_DROP > SDA_Y + 4.0) };
         // The second device of a left/right column starts below a 98 px bus
         // box (see `SIDE_DROP`).
         const { assert!(SIDE_DROP + CHILD_H + GAP > 98.0) };
     }
 
     /// A left/right bus reports how far its column runs past its box, so the
-    /// packer can push the next box on that side clear of it.
+    /// packer can push the next box on that side clear of it - the column only:
+    /// a moved device is no part of it.
     #[test]
     fn the_tail_is_how_far_the_column_runs_past_the_box() {
         for side in [Side::Left, Side::Right] {
             for n in 0..=6 {
                 let p = parent(side);
-                let bus = layout(p, side, n);
+                let bus = layout(p, side, n, &[]);
                 let bottom = bus
                     .children
                     .iter()
@@ -719,41 +904,41 @@ mod tests {
         );
     }
 
-    /// Junction dots sit only where a rail goes on past a tap: none for one
-    /// device, two per device after the first.
+    /// Junction dots sit only where the rail goes on past a tap: none for one
+    /// device, one per device after the first. A moved device's line joins
+    /// nothing.
     #[test]
     fn a_dot_marks_every_t_and_nothing_else() {
         for side in SIDES {
             for n in 1..=5 {
-                assert_eq!(layout(parent(side), side, n).junctions.len(), 2 * (n - 1));
+                let p = parent(side);
+                assert_eq!(layout(p, side, n, &moved(p)).junctions.len(), n - 1);
             }
         }
     }
 
-    /// A bus in one Device with some devices in another: the bus and its own
+    /// A bus in one group with some devices in another: the bus and its own
     /// devices draw ONE mat, and so do the others - on every side, for the
-    /// mixes a user makes. The layout puts the bus's own first; the second
-    /// device of a left/right column starts below the bus box, or the mat of
-    /// the bus and its first device would reach the foreign one and be refused.
+    /// mixes a user makes.
     #[test]
-    fn a_bus_and_its_own_devices_draw_one_mat_beside_another_device() {
+    fn a_bus_and_its_own_devices_draw_one_mat_beside_another_group() {
         use super::super::device_frame::cluster;
         for side in SIDES {
             for (own, other) in [(1, 1), (2, 1), (1, 2), (3, 2)] {
                 let p = parent(side);
-                let bus = layout(p, side, own + other);
+                let bus = layout(p, side, own + other, &[]);
                 let mut mine = vec![p];
                 mine.extend(&bus.children[..own]);
                 let theirs = &bus.children[own..];
                 assert_eq!(
                     cluster(&mine, theirs).len(),
                     1,
-                    "{side:?} {own}+{other}: the bus's Device split"
+                    "{side:?} {own}+{other}: the bus's group split"
                 );
                 assert_eq!(
                     cluster(theirs, &mine).len(),
                     1,
-                    "{side:?} {own}+{other}: the other Device split"
+                    "{side:?} {own}+{other}: the other group split"
                 );
             }
         }

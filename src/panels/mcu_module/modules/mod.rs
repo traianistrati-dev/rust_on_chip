@@ -412,30 +412,29 @@ mod tests {
         mcu.group_of_i2c_device(inst, k).map(|g| g.name.clone())
     }
 
-    /// A device of a bus is in its bus's Device until it is put in another -
-    /// and an empty name sends it back. The Device made for it alone is gone
-    /// once it leaves.
+    /// A device of a bus is in NO Device - not its bus's, though the bus's pads
+    /// are in "sensors" - until it is put in one, and an empty name takes it
+    /// out again. The Device made for it alone is gone once it leaves.
     #[test]
-    fn an_i2c_device_follows_its_bus_until_put_elsewhere() {
+    fn an_i2c_device_is_in_no_device_until_put_in_one() {
         let (mut mcu, inst, k) = grouped_bus();
-        assert_eq!(device_of(&mcu, inst, k[0]).as_deref(), Some("sensors"));
+        assert_eq!(device_of(&mcu, inst, k[0]), None, "it followed its bus");
         assert!(mcu.join_group_i2c(inst, k[1], "display"));
         assert_eq!(device_of(&mcu, inst, k[1]).as_deref(), Some("display"));
-        assert_eq!(
-            device_of(&mcu, inst, k[0]).as_deref(),
-            Some("sensors"),
-            "its sibling stays"
-        );
+        assert_eq!(device_of(&mcu, inst, k[0]), None, "its sibling stays out");
         assert!(
             !mcu.join_group_i2c(inst, k[1], "display"),
             "already there: no change"
         );
         assert!(mcu.join_group_i2c(inst, k[1], ""));
-        assert_eq!(device_of(&mcu, inst, k[1]).as_deref(), Some("sensors"));
+        assert_eq!(device_of(&mcu, inst, k[1]), None);
         assert!(
             !mcu.groups.iter().any(|g| g.name == "display"),
             "the emptied Device is finished"
         );
+        // And the bus's own Device never gained it along the way.
+        let sensors = mcu.groups.iter().find(|g| g.name == "sensors").unwrap();
+        assert!(sensors.i2c.is_empty(), "{:?}", sensors.i2c);
     }
 
     /// A Device that still holds an I2C device is not finished when its last
@@ -483,7 +482,11 @@ mod tests {
         assert!(mcu.edit_i2c_device(inst, E::Add));
         let fresh = *i2c_keys(&mcu).last().unwrap();
         assert_ne!(fresh, k, "the uid was handed out again");
-        assert_eq!(device_of(&mcu, inst, fresh).as_deref(), Some("sensors"));
+        assert_eq!(
+            device_of(&mcu, inst, fresh),
+            None,
+            "it walked into \"display\""
+        );
     }
 
     /// The legacy single address has no entry to hold a uid: grouping it mints
@@ -578,7 +581,7 @@ mod tests {
         assert!(mcu.join_group_i2c(inst, fresh, "clock"));
         mcu.undo_modules();
         mcu.undo_modules();
-        assert_eq!(device_of(&mcu, inst, k[1]).as_deref(), Some("sensors"));
+        assert_eq!(device_of(&mcu, inst, k[1]), None, "it inherited \"clock\"");
     }
 
     /// A removal nobody can answer is retired: its bus went, or a mint
@@ -675,6 +678,92 @@ mod tests {
             .map(|d| d.name.as_str())
             .collect();
         assert_eq!(names, vec!["oled", ""]);
+    }
+
+    /// A dragged device keeps its place by uid - a legacy one is minted for it -
+    /// "Reset to auto position" puts it back into the column, removing the
+    /// device drops its place, and a module group's reset resets its devices.
+    #[test]
+    fn a_dragged_device_keeps_its_place_until_reset_or_removed() {
+        use super::I2cDeviceEdit as E;
+        let mut mcu = create_stm32f103c8tx();
+        assert!(mcu.add_module(ModuleKind::GenericInterfaceI2c));
+        let inst = mcu.modules[0].instance();
+        if let ModuleConfig::I2c(c) = &mut mcu.modules[0].config {
+            c.address = 0x3C;
+        }
+        mcu.move_i2c_device(inst, I2cDeviceKey::Implicit, Some((10.0, 20.0)));
+        let k = i2c_keys(&mcu)[0];
+        let I2cDeviceKey::Uid(uid) = k else {
+            panic!("not minted: {k:?}")
+        };
+        assert_eq!(mcu.i2c_child_pos.get(&(inst, uid)), Some(&(10.0, 20.0)));
+        mcu.move_i2c_device(inst, k, None);
+        assert!(mcu.i2c_child_pos.is_empty(), "reset");
+
+        mcu.move_i2c_device(inst, k, Some((5.0, 5.0)));
+        assert!(mcu.join_group_i2c(inst, k, "display"));
+        assert!(mcu.device_is_manual("display"));
+        mcu.reset_device_position("display");
+        assert!(
+            mcu.i2c_child_pos.is_empty(),
+            "the group's reset resets its device"
+        );
+
+        mcu.move_i2c_device(inst, k, Some((5.0, 5.0)));
+        assert!(mcu.edit_i2c_device(inst, E::Remove(k)));
+        assert!(
+            mcu.i2c_child_pos.is_empty(),
+            "the removed device's place went with it"
+        );
+    }
+
+    /// The places are saved and read back - only the ones whose device is
+    /// still there.
+    #[test]
+    fn dragged_device_places_round_trip() {
+        use crate::panels::mcu_module::mcu_config::{i2c_pos_section, parse_i2c_pos};
+        let (mut mcu, inst, k) = grouped_bus();
+        mcu.move_i2c_device(inst, k[0], Some((-120.5, 44.0)));
+        let I2cDeviceKey::Uid(u) = k[0] else {
+            unreachable!()
+        };
+        mcu.i2c_child_pos.insert((inst, 999), (1.0, 1.0));
+        let text = mcu.mcu_config_text();
+        assert!(
+            text.contains(&format!("@i2cpos\ni2c{inst}/{u}=-120.5,44\n")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("/999="),
+            "a dead device's place was saved: {text}"
+        );
+        let back = parse_i2c_pos(&text);
+        assert_eq!(back.get(&(inst, u)), Some(&(-120.5, 44.0)));
+        assert_eq!(parse_i2c_pos(&i2c_pos_section(&back)), back);
+        assert!(parse_i2c_pos("@i2cpos\ni2c1/x=1,2\ni2c1/3=a,2\n").is_empty());
+        // And an open puts them back.
+        let (mut reopened, ..) = grouped_bus();
+        reopened.apply_mcu_config(&text);
+        assert_eq!(
+            reopened.i2c_child_pos.get(&(inst, u)),
+            Some(&(-120.5, 44.0))
+        );
+    }
+
+    /// "Put in Device" on a device's box goes through the same door as the
+    /// roster: into the Device named, and out of every Device with no name.
+    #[test]
+    fn put_in_device_from_the_canvas_groups_the_device() {
+        use crate::panels::mcu_module::mcu::gui::i2c_devices::{I2cAct, apply_acts};
+        let (mut mcu, inst, k) = grouped_bus();
+        apply_acts(
+            &mut mcu,
+            vec![(inst, I2cAct::Group(k[0], "display".into()))],
+        );
+        assert_eq!(device_of(&mcu, inst, k[0]).as_deref(), Some("display"));
+        apply_acts(&mut mcu, vec![(inst, I2cAct::Group(k[0], String::new()))]);
+        assert_eq!(device_of(&mcu, inst, k[0]), None);
     }
 
     /// A device picked on the canvas speaks for ITS Device, not its bus's.

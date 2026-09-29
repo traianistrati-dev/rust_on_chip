@@ -1379,7 +1379,7 @@ impl AppIde {
                                     // in the module's config, and every edit of
                                     // them snapshots first (`edit_i2c_device`).
                                     let hover = format!(
-                                        "Undo: {}  (Ctrl+Z)\n\nModules and the devices on an I2C bus. Adding, renaming or dissolving a Device (a group, above) is not on this stack.",
+                                        "Undo: {}  (Ctrl+Z)\n\nModules and the devices on an I2C bus. Adding, renaming or dissolving a module group is not on this stack.",
                                         mcu.last_module_undo_label().unwrap_or("last change")
                                     );
                                     if ui

@@ -1147,14 +1147,28 @@ fn draw_box(
     // Centred with the title and the summary, so the box reads as one column
     // rather than two things stacked left and centre. Clipped to the box, so a
     // long label cannot spill over the border.
-    painter.with_clip_rect(rect).text(
-        handle_caption_pos(m, rect),
-        egui::Align2::CENTER_CENTER,
-        handle_preview(m, native_forced),
-        egui::FontId::proportional(HANDLE_SIZE * scale),
-        SUB_COLOUR,
-    );
+    if shows_handle_caption(m.kind) {
+        painter.with_clip_rect(rect).text(
+            handle_caption_pos(m, rect),
+            egui::Align2::CENTER_CENTER,
+            handle_preview(m, native_forced),
+            egui::FontId::proportional(HANDLE_SIZE * scale),
+            SUB_COLOUR,
+        );
+    }
     title_rect
+}
+
+/// Whether a module's box carries its variable-name caption.
+///
+/// Every kind but an I2C bus. The bus's caption carried the module's label
+/// (`_i2c0_oled`), which named the one device a bus used to have; its devices
+/// are boxes of their own now, each with its own name, and the label on the
+/// bus read as a second name for one of them. The label still suffixes the
+/// variable in the generated code - it is edited, and shown, in the module's
+/// `Name:` row in the Virtual-modules panel.
+fn shows_handle_caption(kind: ModuleKind) -> bool {
+    kind != ModuleKind::GenericInterfaceI2c
 }
 
 /// Where a box's variable-name caption sits.
@@ -2391,7 +2405,7 @@ pub fn draw_modules(
         let mut cursor = f32::MIN;
         for e in group {
             let h = box_h(&mcu.modules[e.idx]);
-            let n = super::i2c_children::device_count(&mcu.modules[e.idx].config);
+            let n = super::i2c_children::column_count(mcu, &mcu.modules[e.idx]);
             let rect = packed_rect(
                 chip_rect,
                 e.side,
@@ -2458,22 +2472,42 @@ pub fn draw_modules(
         if rows.is_empty() {
             continue;
         }
-        // Each device's Device: the one it was put in, else its bus's.
+        // Each device's module group: the one it was put in, if any - not its
+        // bus's. And where the user put it, if they moved it.
         let bus_group = mcu.group_of_module(m).map(|g| g.name.trim().to_owned());
-        let mut devices: Vec<(usize, _, Option<String>)> = rows
+        let devices: Vec<_> = rows
             .iter()
             .enumerate()
             .map(|(n, r)| {
                 let g = mcu
                     .group_of_i2c_device(inst, r.key)
                     .map(|g| g.name.trim().to_owned());
-                (n + 1, r.key, g)
+                (
+                    n + 1,
+                    r.key,
+                    g,
+                    super::i2c_children::moved_to(mcu, inst, r.key),
+                )
             })
             .collect();
-        // The ones in ANOTHER Device go to the far end of the column: between
+        let (mut column, moved): (Vec<_>, Vec<_>) =
+            devices.into_iter().partition(|(.., at)| at.is_none());
+        // In the column, the ones in ANOTHER group go to the far end: between
         // two of the bus's own, one of them would split the bus's mat in two.
-        // And each other Device's devices kept together, for the same reason.
-        devices.sort_by_key(|(_, _, g)| (*g != bus_group, g.clone()));
+        // And each other group's devices kept together, for the same reason.
+        column.sort_by_key(|(_, _, g, _)| (*g != bus_group, g.clone()));
+        let moved_rects: Vec<egui::Rect> = moved
+            .iter()
+            .map(|(.., at)| {
+                let at = at.expect("partitioned on it");
+                egui::Rect::from_min_size(
+                    chip_center + egui::vec2(at.0, at.1),
+                    egui::vec2(super::i2c_children::CHILD_W, super::i2c_children::CHILD_H),
+                )
+            })
+            .collect();
+        let n_column = column.len();
+        let all: Vec<_> = column.into_iter().chain(moved).collect();
         buses.push((
             bi,
             super::i2c_children::BusDraw {
@@ -2481,10 +2515,11 @@ pub fn draw_modules(
                 module_id: m.id.clone(),
                 instance: inst,
                 group: bus_group,
-                bus: super::i2c_children::layout(*rect, *side, devices.len()),
-                keys: devices.iter().map(|(_, k, _)| *k).collect(),
-                numbers: devices.iter().map(|(n, ..)| *n).collect(),
-                child_groups: devices.into_iter().map(|(.., g)| g).collect(),
+                bus: super::i2c_children::layout(*rect, *side, n_column, &moved_rects),
+                keys: all.iter().map(|(_, k, ..)| *k).collect(),
+                numbers: all.iter().map(|(n, ..)| *n).collect(),
+                child_groups: all.iter().map(|(_, _, g, _)| g.clone()).collect(),
+                moved: all.iter().map(|(.., at)| at.is_some()).collect(),
             },
         ));
     }
@@ -2580,11 +2615,26 @@ pub fn draw_modules(
     // An auto-packed box is converted to a manual position AT the slot the packer
     // just gave it, so nothing jumps on the first frame of the gesture and the
     // arrangement the user was looking at is what starts moving.
+    // A device of an I2C bus in that group moves with it too - one still in
+    // its bus's column is taken out of it, at the place it was drawn.
+    let mut child_moves: Vec<(
+        u8,
+        crate::panels::mcu_module::modules::I2cDeviceKey,
+        (f32, f32),
+    )> = Vec::new();
     if let Some((dev, (dx, dy))) = mcu.device_drag.clone() {
         for ((i, rect, ..), g) in boxes.iter().zip(&box_groups) {
             if g.as_deref().map(str::trim) == Some(dev.trim()) {
                 let off = rect.min - chip_center + egui::vec2(dx, dy);
                 drag_updates.push((*i, nudge(off)));
+            }
+        }
+        for (_, b) in &buses {
+            for ((rect, key), g) in b.bus.children.iter().zip(&b.keys).zip(&b.child_groups) {
+                if g.as_deref() == Some(dev.trim()) {
+                    let off = rect.min - chip_center + egui::vec2(dx, dy);
+                    child_moves.push((b.instance, *key, (off.x, off.y)));
+                }
             }
         }
     }
@@ -2739,6 +2789,7 @@ pub fn draw_modules(
         &add_buttons,
         active.as_deref(),
         bus_blink(mcu, ui),
+        chip_center,
         &mut wire_halos,
         &mut wire_lines,
     );
@@ -2841,6 +2892,15 @@ pub fn draw_modules(
     acts.extend(bus_out.acts);
     if !acts.is_empty() {
         super::i2c_devices::apply_acts(mcu, acts);
+    }
+    // Device boxes moved - by their group's tab first, by their own drag after,
+    // so a box dragged on its own wins, as a module box does - and reset.
+    child_moves.extend(bus_out.moves);
+    for (inst, key, at) in child_moves {
+        mcu.move_i2c_device(inst, key, Some(at));
+    }
+    for (inst, key) in bus_out.resets {
+        mcu.move_i2c_device(inst, key, None);
     }
 
     if let Some(id) = clicked_id {
@@ -9255,7 +9315,22 @@ mod the_move_picker_respects_the_silicon {
 
 #[cfg(test)]
 mod the_box_shows_one_caption {
-    use super::{BOX_H, CUSTOM_ROW_H, box_h, custom_pin_row, handle_caption_pos};
+    use super::{
+        BOX_H, CUSTOM_ROW_H, box_h, custom_pin_row, handle_caption_pos, shows_handle_caption,
+    };
+
+    /// An I2C bus carries no caption - its devices carry the names - and every
+    /// other kind still does.
+    #[test]
+    fn only_an_i2c_bus_goes_without_a_caption() {
+        for kind in ModuleKind::ALL {
+            assert_eq!(
+                shows_handle_caption(kind),
+                kind != ModuleKind::GenericInterfaceI2c,
+                "{kind:?}"
+            );
+        }
+    }
     use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind, VirtualModule};
     use eframe::egui;
 

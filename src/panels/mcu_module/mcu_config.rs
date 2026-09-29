@@ -39,6 +39,7 @@ const IRQ_HEADER: &str = "@irq";
 const IOMODE_HEADER: &str = "@iomode";
 const GROUPS_HEADER: &str = "@groups";
 const GROUP_I2C_HEADER: &str = "@groupi2c";
+const I2C_POS_HEADER: &str = "@i2cpos";
 const WATCHDOG_HEADER: &str = "@watchdog";
 const COMP_HEADER: &str = "@comp";
 const LABELS_HEADER: &str = "@labels";
@@ -376,6 +377,40 @@ pub fn iopins_section(pos: &std::collections::BTreeMap<usize, (f32, f32)>) -> St
     s
 }
 
+/// The `@i2cpos` section - one `i2c<instance>/<uid>=x,y` per I2C device box the
+/// user dragged out of its bus's column - or "" when none was.
+pub fn i2c_pos_section(pos: &std::collections::BTreeMap<(u8, u32), (f32, f32)>) -> String {
+    if pos.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(I2C_POS_HEADER);
+    s.push('\n');
+    for ((inst, uid), (x, y)) in pos {
+        s.push_str(&format!("{}={x},{y}\n", i2c_token(*inst, *uid)));
+    }
+    s
+}
+
+/// Read `@i2cpos` back; a line that does not parse is dropped alone.
+pub fn parse_i2c_pos(text: &str) -> std::collections::BTreeMap<(u8, u32), (f32, f32)> {
+    let mut map = std::collections::BTreeMap::new();
+    let Some(body) = section_body(text, I2C_POS_HEADER) else {
+        return map;
+    };
+    for line in body.lines() {
+        let Some((dev, xy)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let (Some(dev), Some((xs, ys))) = (parse_i2c_token(dev), xy.split_once(',')) else {
+            continue;
+        };
+        if let (Ok(x), Ok(y)) = (xs.trim().parse::<f32>(), ys.trim().parse::<f32>()) {
+            map.insert(dev, (x, y));
+        }
+    }
+    map
+}
+
 /// One device on the board: a name, and the pads that belong to it.
 ///
 /// Keyed by PIN NUMBER, like `@iopins`, `@irq` and `@iomode` - and that is the
@@ -396,9 +431,9 @@ pub struct PinGroup {
     /// SCL and SDA, and a pad is in one group at most - so they cannot be
     /// members the way a pad is.
     ///
-    /// A device NOT listed in any group is in its bus's group (the one holding
-    /// its pads), derived like a module's; being listed here moves it to
-    /// another. Keyed by the uid, never by position, name or address (see
+    /// A device NOT listed in any group is in none - not in its bus's: each
+    /// device of a bus is a board part of its own. Keyed by the uid, never by
+    /// position, name or address (see
     /// `I2cDevice::uid`). A key whose device is gone stays - the way a pad
     /// keeps its group when its function goes - so an undo brings the device
     /// back into it; new uids are minted above every key a group still holds

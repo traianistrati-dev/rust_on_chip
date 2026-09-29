@@ -83,6 +83,34 @@ impl Bench {
         let _ = crate::headless::run_ui(&self.ctx, input, |ui| app.show_mcu_panel(ui));
     }
 
+    /// One frame, returning every string it painted.
+    fn painted(&mut self) -> Vec<String> {
+        fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        self.pass += 1;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            time: Some(self.pass as f64 / 30.0),
+            predicted_dt: 1.0 / 30.0,
+            ..Default::default()
+        };
+        let app = &mut self.app;
+        let out = crate::headless::run_ui(&self.ctx, input, |ui| app.show_mcu_panel(ui));
+        let mut texts = Vec::new();
+        for s in &out.shapes {
+            walk(&s.shape, &mut texts);
+        }
+        texts
+    }
+
     /// Let the canvas refit and the module list fold or unfold.
     fn settle(&mut self) {
         for _ in 0..10 {
@@ -185,6 +213,35 @@ impl Bench {
         self.step(vec![button(at, true)]);
         self.step(vec![button(at, false)]);
         self.step(vec![]);
+    }
+
+    /// Press at `at`, move the pointer by `by` over `steps` frames, release.
+    fn gesture(&mut self, at: egui::Pos2, by: egui::Vec2, steps: usize) {
+        self.step(vec![egui::Event::PointerMoved(at)]);
+        self.step(vec![button(at, true)]);
+        let mut p = at;
+        for _ in 0..steps {
+            p += by / steps as f32;
+            self.step(vec![egui::Event::PointerMoved(p)]);
+        }
+        self.step(vec![button(p, false)]);
+        self.step(vec![]);
+    }
+
+    /// The bus's first device, added and settled: (instance, its key).
+    fn one_device(&mut self) -> (u8, I2cDeviceKey) {
+        let at = self.add_button();
+        self.click(at);
+        self.settle();
+        let (_, inst, _) = self.bus();
+        (inst, self.key(0))
+    }
+
+    /// Where the strip of device `key` sits: a bare part of its box.
+    fn grip(&self, key: I2cDeviceKey) -> (Seen, egui::Pos2) {
+        let s = self.strip(key);
+        let p = s.at(egui::pos2(s.local.center().x, s.local.top() + 7.0));
+        (s, p)
     }
 
     /// The bus box's "+ device" button, on the screen.
@@ -550,4 +607,88 @@ fn two_buses_on_one_side_keep_their_columns_apart() {
             );
         }
     }
+}
+
+/// The bus box carries no name any more: its devices do. The module's label
+/// still names the variable in the code - it just is not painted on the bus.
+#[test]
+fn the_bus_box_carries_no_name() {
+    let mut b = Bench::new();
+    let (i, inst, _) = b.bus();
+    if let ModuleConfig::I2c(c) = &mut b.mcu_mut().modules[i].config {
+        c.custom_label = "oled".into();
+    }
+    b.settle();
+    let texts = b.painted();
+    assert!(
+        texts.iter().any(|t| t == &format!("I2C{inst}")),
+        "the bus box is drawn: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains(&format!("_i2c{inst}"))),
+        "the bus still shows a variable name: {texts:?}"
+    );
+}
+
+/// A device box is dragged on its own - out of its bus's column, to where the
+/// pointer took it - and a click whose hand slipped does not pin it.
+#[test]
+fn a_device_box_moves_on_a_real_drag_only() {
+    let mut b = Bench::new();
+    let (inst, key) = b.one_device();
+    let uid = match key {
+        I2cDeviceKey::Uid(u) => u,
+        other => panic!("{other:?}"),
+    };
+    let (before, at) = b.grip(key);
+    // A click that slips 3 px off the box's top edge.
+    let edge = egui::pos2(at.x, before.screen.top() + 1.0);
+    b.gesture(edge, egui::vec2(0.0, -3.0), 2);
+    assert!(
+        b.mcu().i2c_child_pos.is_empty(),
+        "a slipped click pinned it"
+    );
+
+    b.settle();
+    let (before, at) = b.grip(key);
+    b.gesture(at, egui::vec2(0.0, 30.0), 3);
+    assert!(
+        b.mcu().i2c_child_pos.contains_key(&(inst, uid)),
+        "a drag pins it"
+    );
+    b.settle();
+    let after = b.strip(key);
+    let went = (after.local.top() - before.local.top()) * before.zoom;
+    assert!(
+        (went - 30.0).abs() < 1.0,
+        "it followed the 30 px drag: {went}"
+    );
+}
+
+/// A device in a module group moves with the group's tab - also a group made
+/// of nothing but that device, whose tab moves nothing else.
+#[test]
+fn a_device_moves_with_its_module_group() {
+    let mut b = Bench::new();
+    let (inst, key) = b.one_device();
+    assert!(b.mcu_mut().join_group_i2c(inst, key, "display"));
+    b.settle();
+    let tab = b
+        .mcu()
+        .device_tabs
+        .iter()
+        .find(|t| t.name == "display")
+        .cloned()
+        .expect("the group has a tab");
+    let seen = b.find(("device_tab", &tab.name, tab.cluster));
+    let before = b.strip(key);
+    b.gesture(seen.screen.center(), egui::vec2(40.0, 0.0), 4);
+    b.settle();
+    assert!(
+        b.mcu().device_is_manual("display"),
+        "the group's device was moved"
+    );
+    let after = b.strip(key);
+    let went = (after.local.left() - before.local.left()) * before.zoom;
+    assert!((went - 40.0).abs() < 1.5, "it followed the group: {went}");
 }

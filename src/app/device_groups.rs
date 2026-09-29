@@ -17,8 +17,9 @@
 //! Membership is by PAD NUMBER, never by module id — see
 //! [`PinGroup`](crate::panels::mcu_module::mcu_config::PinGroup) for why - plus
 //! the devices of an I2C bus, which have no pad of their own, by their uid. A
-//! device of a bus is in its bus's Device until it is put in another. This
-//! panel is the only place a group is created, renamed, filled or dissolved.
+//! device of a bus is in no Device until it is put in one - here, or from its
+//! box on the canvas ("Put in Device"). This panel is the only place a group is
+//! created, renamed or dissolved.
 //!
 //! The roster draws the rows; the `Devices:` label and the `+ Device` button
 //! that creates one live on the panel's TOP BAR, beside `+ Add module` — see
@@ -47,8 +48,8 @@ enum Act {
     Drop(usize),
     /// Put one device of an I2C bus in the device: (row, bus instance, which).
     AddI2c(usize, u8, crate::panels::mcu_module::modules::I2cDeviceKey),
-    /// Take a device of an I2C bus out of the device it was put in, back to
-    /// its bus's: (bus instance, uid).
+    /// Take a device of an I2C bus out of the device it was put in, so it is
+    /// in none: (bus instance, uid).
     DropI2c(u8, u32),
 }
 
@@ -61,9 +62,7 @@ struct BusDevice {
     color: egui::Color32,
     /// The uid a Device holds it by, once it has one.
     uid: Option<u32>,
-    /// Put in a Device by hand - else it is in its bus's.
-    explicit: bool,
-    /// The Device it is in, either way (trimmed).
+    /// The Device it was put in, if any (trimmed).
     group: Option<String>,
 }
 
@@ -96,11 +95,6 @@ fn bus_devices(mcu: &Mcu) -> Vec<BusDevice> {
                 ),
                 color: mod_gui::module_color(m.kind, inst),
                 uid,
-                explicit: uid.is_some_and(|u| {
-                    mcu.groups
-                        .iter()
-                        .any(|g| g.is_live() && g.i2c.contains(&(inst, u)))
-                }),
                 group: mcu
                     .group_of_i2c_device(inst, row.key)
                     .map(|g| g.name.trim().to_owned()),
@@ -159,9 +153,9 @@ fn named(name: &String) -> bool {
 /// A device name nothing else on the board answers to.
 fn fresh_name(mcu: &Mcu) -> String {
     (1..)
-        .map(|n| format!("Device {n}"))
+        .map(|n| format!("Group {n}"))
         .find(|c| !mcu.groups.iter().any(|g| g.name.trim() == c.as_str()))
-        .unwrap_or_else(|| "Device".to_owned())
+        .unwrap_or_else(|| "Group".to_owned())
 }
 
 /// What the roster's "remove?" question should hold after this frame.
@@ -289,17 +283,14 @@ fn apply_renames(
 /// Returns whether a device was created.
 pub(super) fn device_add_button(ui: &mut egui::Ui, mcu: &mut Mcu) -> bool {
     ui.label(
-        egui::RichText::new("Devices:")
+        egui::RichText::new("Module Groups:")
             .size(12.0)
             .color(egui::Color32::from_rgb(150, 150, 160)),
     );
     let clicked = ui
-        .button(egui::RichText::new(format!("{} Device", ph::PLUS)).size(11.0))
+        .button(egui::RichText::new(format!("{} Module Group", ph::PLUS)).size(11.0))
         .on_hover_text(
-            "Gather the pads of one board part — a sensor's bus and its spare \
-             interrupt line — under one name.\n\nA device claims nothing: it \
-             renames no binding and moves no pin. It marks the pads on the \
-             diagram and writes one comment into the generated file.",
+            "Gather the parts of one board part - a sensor's bus and its spare interrupt line, or one device of an I2C bus - under one name.\n\nA module group claims nothing: it renames no binding and moves no pin. It marks its parts on the diagram and writes one comment into the generated file.",
         )
         .clicked();
     apply_act(mcu, clicked.then_some(Act::New))
@@ -361,7 +352,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
 
     if mcu.groups.is_empty() {
         ui.label(
-            egui::RichText::new("No devices yet.")
+            egui::RichText::new("No module groups yet.")
                 .size(10.0)
                 .italics()
                 .color(egui::Color32::from_gray(120)),
@@ -441,9 +432,9 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                         )
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text(if open {
-                            "Fold the device away. Its name stays; its pads are hidden."
+                            "Fold the group away. Its name stays; its parts are hidden."
                         } else {
-                            "Unfold the device to see its pads and rename it."
+                            "Unfold the group to see its parts and rename it."
                         })
                         .clicked()
                     {
@@ -467,8 +458,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                         focus[gi] = edit.has_focus();
                         left[gi] = edit.lost_focus();
                         edit.on_hover_text(
-                            "The device's name. It appears on the generated comment and \
-                             nowhere else in the code — renaming it is always safe.",
+                            "The group's name. It appears on the generated comment and nowhere else in the code - renaming it is always safe.",
                         );
                     } else {
                         // The whole name is a second, larger target for the
@@ -483,7 +473,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                                 .sense(egui::Sense::click()),
                             )
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text("Unfold the device to see its pads and rename it.")
+                            .on_hover_text("Unfold the group to see its parts and rename it.")
                             .clicked()
                         {
                             toggle = true;
@@ -518,7 +508,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                         }
                         if ui
                             .button(egui::RichText::new(ph::TRASH).size(11.0))
-                            .on_hover_text("Take the device apart. Its pads keep their functions.")
+                            .on_hover_text("Take the group apart. Its parts keep their functions.")
                             .clicked()
                         {
                             *arm = Some(name.clone());
@@ -565,7 +555,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                                 if ui
                                     .button(egui::RichText::new(&d.label).size(11.0).color(d.color))
                                     .on_hover_text(
-                                        "Put this device of the bus in the device. The rest of the bus stays where it is.",
+                                        "Put this device of the bus in the group. The rest of the bus stays where it is.",
                                     )
                                     .clicked()
                                 {
@@ -588,7 +578,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                 if asking {
                     ui.label(
                         egui::RichText::new(
-                            "Takes the device apart. Its pads keep their functions.",
+                            "Takes the group apart. Its parts keep their functions.",
                         )
                         .size(10.0)
                         .color(egui::Color32::from_rgb(220, 180, 90)),
@@ -605,7 +595,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .small_button(egui::RichText::new(ph::X).size(9.0))
-                                .on_hover_text("Take this pad out of the device.")
+                                .on_hover_text("Take this pad out of the group.")
                                 .clicked()
                             {
                                 act = Some(Act::Drop(*pin));
@@ -613,9 +603,7 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                         });
                     });
                 }
-                // Its devices of I2C buses: the ones put here by hand, with an X
-                // that sends them back to their bus's device; and, dimmer, the
-                // ones here BECAUSE their bus is - no X, the bus decides those.
+                // Its devices of I2C buses, each with an X that takes it out.
                 let here = names_before[gi].trim();
                 for d in bus_devs.iter().filter(|_| open) {
                     if d.group.as_deref() != Some(here) {
@@ -623,33 +611,17 @@ pub(super) fn device_roster(ui: &mut egui::Ui, mcu: &mut Mcu, just_added: bool) 
                     }
                     ui.horizontal(|ui| {
                         ui.add_space(13.0);
-                        if d.explicit {
-                            ui.label(egui::RichText::new(&d.label).size(10.0).color(d.color));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .small_button(egui::RichText::new(ph::X).size(9.0))
-                                        .on_hover_text(
-                                            "Take this device out - back to the device its bus is in.",
-                                        )
-                                        .clicked()
-                                        && let Some(u) = d.uid
-                                    {
-                                        act = Some(Act::DropI2c(d.instance, u));
-                                    }
-                                },
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new(format!("{}  - with its bus", d.label))
-                                    .size(10.0)
-                                    .color(egui::Color32::from_gray(130)),
-                            )
-                            .on_hover_text(
-                                "In this device because its bus is. Put it in another device to move it on its own.",
-                            );
-                        }
+                        ui.label(egui::RichText::new(&d.label).size(10.0).color(d.color));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button(egui::RichText::new(ph::X).size(9.0))
+                                .on_hover_text("Take this device out of the group.")
+                                .clicked()
+                                && let Some(u) = d.uid
+                            {
+                                act = Some(Act::DropI2c(d.instance, u));
+                            }
+                        });
                     });
                 }
             });
@@ -1246,7 +1218,7 @@ mod tests {
     }
 
     /// A device of an I2C bus through the roster: a named row takes it, a
-    /// nameless row takes it from nobody, and its X sends it back to its bus's
+    /// nameless row takes it from nobody, and its X takes it out of every
     /// device.
     #[test]
     fn an_i2c_device_joins_a_named_row_and_its_x_sends_it_back() {
@@ -1278,11 +1250,7 @@ mod tests {
         assert!(named(&mcu, "display").is_none(), "it held only that device");
 
         super::apply_act(&mut mcu, Some(super::Act::DropI2c(inst, uid)));
-        assert_eq!(
-            mcu.group_of_i2c_device(inst, key),
-            None,
-            "back with its bus, in none"
-        );
+        assert_eq!(mcu.group_of_i2c_device(inst, key), None, "out, in none");
     }
 
     /// The same gesture on a NAMED row does move the pad, which is what makes the
@@ -1330,8 +1298,8 @@ mod tests {
     #[test]
     fn a_new_device_skips_a_name_a_padded_one_already_answers_to() {
         let mut mcu = bare_mcu();
-        mcu.groups = vec![group("Device 1 ", &[1])];
-        assert_eq!(super::fresh_name(&mcu), "Device 2");
+        mcu.groups = vec![group("Group 1 ", &[1])];
+        assert_eq!(super::fresh_name(&mcu), "Group 2");
     }
 
     /// The roster's "+ Device" must not hand out a name already on the board —
@@ -1340,9 +1308,9 @@ mod tests {
     #[test]
     fn a_new_device_gets_a_name_nothing_else_answers_to() {
         let mut mcu = bare_mcu();
-        mcu.groups = vec![group("Device 1", &[1]), group("Device 3", &[2])];
-        assert_eq!(super::fresh_name(&mcu), "Device 2");
-        mcu.groups.push(group("Device 2", &[3]));
-        assert_eq!(super::fresh_name(&mcu), "Device 4");
+        mcu.groups = vec![group("Group 1", &[1]), group("Group 3", &[2])];
+        assert_eq!(super::fresh_name(&mcu), "Group 2");
+        mcu.groups.push(group("Group 2", &[3]));
+        assert_eq!(super::fresh_name(&mcu), "Group 4");
     }
 }

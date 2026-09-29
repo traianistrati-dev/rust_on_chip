@@ -146,30 +146,14 @@ impl Mcu {
         let mut tab_reset: Option<String> = None;
         for h in self.device_tabs.clone() {
             let manual = self.device_is_manual(&h.name);
-            // A device made only of devices on an I2C bus has nothing a drag
-            // could move: they sit beside their bus and move with it.
-            let movable = self
-                .groups
-                .iter()
-                .any(|g| g.name.trim() == h.name.trim() && !g.pins.is_empty());
-            let resp = ui.interact(
-                h.off.translate(center.to_vec2()),
-                ui.id().with(("device_tab", &h.name, h.cluster)),
-                if movable {
-                    egui::Sense::click_and_drag()
-                } else {
-                    egui::Sense::click()
-                },
-            );
-            let resp = if movable {
-                resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(
-                    "Click to select the whole device - drag to move every part of it",
+            let resp = ui
+                .interact(
+                    h.off.translate(center.to_vec2()),
+                    ui.id().with(("device_tab", &h.name, h.cluster)),
+                    egui::Sense::click_and_drag(),
                 )
-            } else {
-                resp.on_hover_text(
-                    "Click to select the whole device - its I2C devices sit beside their bus and move with it",
-                )
-            };
+                .on_hover_cursor(egui::CursorIcon::Grab)
+                .on_hover_text("Click to select the whole group - drag to move every part of it");
             if resp.dragged() && crate::panels::drag_decided(ui) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 let d = resp.drag_delta();
@@ -182,7 +166,7 @@ impl Mcu {
             }
             if manual {
                 resp.context_menu(|ui| {
-                    if ui.button("Reset device to auto position").clicked() {
+                    if ui.button("Reset group to auto position").clicked() {
                         tab_reset = Some(h.name.clone());
                         ui.close();
                     }

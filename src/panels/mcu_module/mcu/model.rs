@@ -427,6 +427,12 @@ pub struct Mcu {
     /// auto-placed beside the pin. Draggable like virtual modules; persisted in
     /// `mcu.config` `@iopins`. View-only.
     pub io_pin_pos: std::collections::BTreeMap<usize, (f32, f32)>,
+    /// Devices of an I2C bus the user dragged out of their bus's column:
+    /// `(bus instance, device uid)` -> the offset of the box's top-left from
+    /// the chip centre, like a dragged module's `pos`. Absent = in the column.
+    /// A dragged device stays put when its bus moves, and moves with its module
+    /// group. Persisted in `mcu.config` `@i2cpos`; view-only, never hashed.
+    pub i2c_child_pos: std::collections::BTreeMap<(u8, u32), (f32, f32)>,
     /// Devices on the board: a name over a set of pads.
     ///
     /// A VIEW of the wiring, not part of it: nothing here changes a binding, an

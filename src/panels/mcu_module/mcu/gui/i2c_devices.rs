@@ -32,6 +32,9 @@ pub enum I2cAct {
     /// Ask before removing: the device's config file goes with it.
     ArmRemove(I2cDeviceKey),
     CancelRemove,
+    /// Put the device in the Device of this name - or, with an empty one, in
+    /// none. The canvas's right-click "Put in Device"; the roster has its own.
+    Group(I2cDeviceKey, String),
 }
 
 /// What the panel's device rows need from outside the one module they see, and
@@ -111,6 +114,7 @@ pub fn apply_acts(mcu: &mut Mcu, mut acts: Vec<(u8, I2cAct)>) -> bool {
             I2cAct::Edit(e) => changed |= mcu.edit_i2c_device(instance, e),
             I2cAct::ArmRemove(k) => mcu.i2c_remove_confirm = Some((instance, k)),
             I2cAct::CancelRemove => mcu.i2c_remove_confirm = None,
+            I2cAct::Group(k, name) => changed |= mcu.join_group_i2c(instance, k, &name),
         }
     }
     changed
@@ -122,7 +126,8 @@ fn act_key(act: &I2cAct) -> Option<I2cDeviceKey> {
         I2cAct::Edit(I2cDeviceEdit::Remove(k))
         | I2cAct::Edit(I2cDeviceEdit::Name(k, _))
         | I2cAct::Edit(I2cDeviceEdit::Address(k, _))
-        | I2cAct::ArmRemove(k) => Some(*k),
+        | I2cAct::ArmRemove(k)
+        | I2cAct::Group(k, _) => Some(*k),
         I2cAct::Edit(I2cDeviceEdit::Add) | I2cAct::CancelRemove => None,
     }
 }
@@ -132,7 +137,8 @@ fn set_act_key(act: &mut I2cAct, key: I2cDeviceKey) {
         I2cAct::Edit(I2cDeviceEdit::Remove(k))
         | I2cAct::Edit(I2cDeviceEdit::Name(k, _))
         | I2cAct::Edit(I2cDeviceEdit::Address(k, _))
-        | I2cAct::ArmRemove(k) => *k = key,
+        | I2cAct::ArmRemove(k)
+        | I2cAct::Group(k, _) => *k = key,
         I2cAct::Edit(I2cDeviceEdit::Add) | I2cAct::CancelRemove => {}
     }
 }

@@ -861,6 +861,16 @@ fn draw_frame(
 
 /// The tooltip of a hovered box: everything its text had no room for.
 fn box_tip(ui: &egui::Ui, b: &Placed) {
+    text_tip(ui, box_tip_text(b));
+}
+
+/// What [`box_tip`] says - separate so it can be read without a frame.
+///
+/// This is the only place a statement the box had no room for can be read, so
+/// what it holds is what the parser kept: `LABEL_KEPT`, well past anything a
+/// box can draw. While the parser cut at the display width instead, this said
+/// the same thing the box already did.
+pub fn box_tip_text(b: &Placed) -> String {
     let mut tip = b.node.text.clone();
     for d in &b.node.detail {
         tip.push('\n');
@@ -873,7 +883,7 @@ fn box_tip(ui: &egui::Ui, b: &Placed) {
     if b.node.awaits {
         tip.push_str("  ·  yields to the executor (.await)");
     }
-    text_tip(ui, tip);
+    tip
 }
 
 /// A monospace tooltip at the pointer.
@@ -2116,6 +2126,30 @@ mod tests {
         (texts, shapes, result)
     }
 
+    /// What each painted galley really SHOWS, with where it landed.
+    ///
+    /// [`render`] reads `Galley::text()`, which is the string the job was
+    /// HANDED; truncation never touches it. A row cut by `truncate_at_width`
+    /// therefore comes back whole from there, its ellipsis missing, while its
+    /// `rect` is the cut width. The glyphs are the only honest reading of what
+    /// reached the screen, so anything asserting on visible text reads them.
+    fn painted(shapes: &[egui::Shape]) -> Vec<(String, egui::Rect)> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some((
+                    t.galley
+                        .rows
+                        .iter()
+                        .flat_map(|r| r.row.glyphs.iter().map(|g| g.chr))
+                        .collect::<String>(),
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
         vec![
             egui::Event::PointerMoved(pos),
@@ -2600,7 +2634,7 @@ mod tests {
             selected: "f".to_string(),
             ..Default::default()
         };
-        let (texts, _, _) = render(
+        let (_, shapes, _) = render(
             &ctx,
             &m,
             &lay,
@@ -2610,6 +2644,7 @@ mod tests {
             0.0,
             egui::vec2(1000.0, 800.0),
         );
+        let texts = painted(&shapes);
         let scale = v.last_scale;
         assert!(scale > 0.0, "the chart was never drawn");
 
@@ -2641,10 +2676,71 @@ mod tests {
                     b.node.shape,
                     rect.width()
                 );
-                cut += usize::from(drawn.ends_with('…'));
+                cut += usize::from(*drawn != row);
             }
         }
         assert!(cut > 0, "nothing was cut at all, so this proves nothing");
+    }
+
+    /// The box shows what fits; the hover holds the statement.
+    ///
+    /// Two cuts stand between the source and the screen, and only one of them
+    /// should be a cut at all. The painter's is honest - a box is only so wide,
+    /// and the hover is there for the rest. The parser's was not: it cut at
+    /// roughly the same width, so the hover repeated what the box already said
+    /// and the tail of the statement existed nowhere in the application. This
+    /// asserts the two now disagree, which is the whole point of the hover.
+    #[test]
+    fn the_hover_holds_the_tail_the_box_had_no_room_for() {
+        let stmt = "crate::utils::i2c1_display::write_text(&mut display, nav.selected_node().name(), Style::Bold);";
+        let src = format!("fn f() {{\n    {stmt}\n}}\n");
+        let m = crate::panels::flow_map::parse::parse_file(&src).unwrap();
+        let lay = crate::panels::flow_map::layout::layout(&m.charts[0]);
+        let ctx = egui::Context::default();
+        let mut v = FlowView {
+            selected: "f".to_string(),
+            ..Default::default()
+        };
+        let (_, shapes, _) = render(
+            &ctx,
+            &m,
+            &lay,
+            None,
+            &mut v,
+            Vec::new(),
+            0.0,
+            egui::vec2(500.0, 400.0),
+        );
+
+        let b = lay
+            .boxes
+            .iter()
+            .find(|b| b.node.text.starts_with("crate::utils"))
+            .expect("the statement's box");
+        let texts = painted(&shapes);
+        let drawn = texts
+            .iter()
+            .map(|(t, _)| t)
+            .find(|t| t.starts_with("crate::utils"))
+            .expect("the statement was never painted");
+        assert!(
+            *drawn != b.node.text,
+            "the fixture no longer overflows its box, so this proves nothing: {drawn}"
+        );
+        assert!(
+            !drawn.contains("Style::Bold"),
+            "the box already shows the tail: {drawn}"
+        );
+
+        let tip = box_tip_text(b);
+        assert!(
+            tip.contains("Style::Bold)"),
+            "the hover lost the tail as well: {tip}"
+        );
+        assert!(
+            tip.starts_with(drawn.trim_end_matches('…')),
+            "the hover is not the statement the box began: {tip}"
+        );
     }
 
     /// A test module nested inside the one that was picked is drawn too - a

@@ -514,8 +514,20 @@ pub fn generated_ranges(src: &str) -> Vec<(usize, usize)> {
 
 /// Plain statements folded into one box before the rest become "+N more".
 const RUN_DETAIL_MAX: usize = 5;
-/// Longest label kept on a box; the rest is elided.
-const LABEL_MAX: usize = 56;
+/// How much of a statement a box KEEPS. Not a display cap: what the box shows
+/// is decided by the box's own width, where `fit_galley` cuts the row to the
+/// room its shape leaves.
+///
+/// It used to be 56, and that was the display cap — which made it a data
+/// ceiling too, because [`super::gui::box_tip`] has nothing to show but what is
+/// kept here. 56 was also below anything it could affect: `box_size` returns
+/// `MAX_W` for any label past 44 characters, so the cap has never once changed
+/// a box's width. 200 is chosen against the other end — the widest a flow box
+/// can be drawn is `MAX_W` at the maximum scale with the font at its 20 pt
+/// ceiling, which is 113 characters, and a card 179 — so the text kept here can
+/// always fill the widest box the UI can produce, and the hover carries the
+/// rest of the statement instead of a second copy of what is already on screen.
+const LABEL_KEPT: usize = 200;
 
 /// Longest one-line signature kept on an outline row; the tooltip has the rest.
 const SIG_MAX: usize = 96;
@@ -1869,7 +1881,7 @@ impl<'a> Builder<'a> {
     }
 
     fn decision(&self, text: String, line: usize) -> FlowNode {
-        FlowNode::new(truncate(&text, LABEL_MAX), Shape::Decision, line)
+        FlowNode::new(truncate(&text, LABEL_KEPT), Shape::Decision, line)
     }
 
     /// A plain statement box (classification happens in [`Self::mark`]).
@@ -1879,7 +1891,7 @@ impl<'a> Builder<'a> {
 
     /// Text of `span`, squeezed and truncated for a box label.
     fn label(&self, span: Span) -> String {
-        truncate(&self.snippet(span), LABEL_MAX)
+        truncate(&self.snippet(span), LABEL_KEPT)
     }
 
     /// Classify `expr` and stamp the node with what the scan found.
@@ -2565,15 +2577,42 @@ mod tests {
         assert_eq!(n.text, "for byte in buf.iter()");
     }
 
+    /// A pathological label is cut here, on one line, rather than wrapped - but
+    /// only where nothing can draw it anyway. `LABEL_KEPT` is the ceiling on
+    /// what a node HOLDS; what a box SHOWS is cut to the box's own width by the
+    /// painter, and the hover shows everything kept.
     #[test]
-    fn long_labels_are_elided_not_wrapped() {
-        let long = "a".repeat(200);
+    fn a_pathological_label_is_elided_on_one_line() {
+        let long = "a".repeat(LABEL_KEPT * 2);
         let c = chart(&format!("fn f() {{ if {long} {{ go(); }} }}"));
         let Flow::Branch { cond, .. } = &seq(&c.body)[0] else {
             panic!()
         };
-        assert_eq!(cond.text.chars().count(), LABEL_MAX);
+        assert_eq!(cond.text.chars().count(), LABEL_KEPT);
         assert!(cond.text.ends_with('…'));
+        assert!(!cond.text.contains('\n'), "wrapped: {}", cond.text);
+    }
+
+    /// An ordinary long statement is kept WHOLE, because the box it goes in is
+    /// what decides how much of it the reader sees. Before, every label past 56
+    /// characters was cut here - so the tail existed nowhere in the app, not
+    /// even in the hover that is supposed to hold it.
+    #[test]
+    fn an_ordinary_long_statement_is_kept_whole() {
+        let stmt = "crate::utils::i2c1_display::write_text(&mut display, nav.selected_node().name(), Style::Bold);";
+        assert!(
+            stmt.chars().count() > 56,
+            "the fixture must exceed the old cap"
+        );
+        let c = chart(&format!("fn f() {{ {stmt} }}"));
+        let Flow::Node(n) = &seq(&c.body)[0] else {
+            panic!("the statement did not become a box")
+        };
+        let text = &n.text;
+        assert!(
+            text.ends_with("Style::Bold)") && !text.contains('…'),
+            "the statement was cut: {text}"
+        );
     }
 }
 

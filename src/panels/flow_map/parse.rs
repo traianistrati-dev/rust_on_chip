@@ -132,6 +132,25 @@ impl FlowNode {
     pub fn lines(&self) -> usize {
         1 + self.detail.len() + usize::from(self.hidden > 0)
     }
+
+    /// Every row a painter draws for this box, in order: the label, the folded
+    /// statements, then the "+N more" tail.
+    ///
+    /// Here rather than in the painter because the measuring pass needs the
+    /// same list: `box_size` used to walk `text` + `detail` while `draw_box`
+    /// painted `text` + `detail` + the tail row, so a box whose statements were
+    /// folded away was sized for a row it does not draw and not for one it
+    /// does. The tail is short enough that the gap has never shown, which is
+    /// exactly why it has to be a shared list rather than a shared habit.
+    pub fn rows(&self) -> Vec<String> {
+        let mut v = Vec::with_capacity(self.lines());
+        v.push(self.text.clone());
+        v.extend(self.detail.iter().cloned());
+        if self.hidden > 0 {
+            v.push(format!("+{} more", self.hidden));
+        }
+        v
+    }
 }
 
 /// One labelled way out of a [`Flow::Branch`].

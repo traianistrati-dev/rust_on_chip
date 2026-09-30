@@ -25,17 +25,40 @@ const LINE_H: f32 = 14.0;
 const PAD_X: f32 = 14.0;
 const PAD_Y: f32 = 9.0;
 const MIN_W: f32 = 96.0;
-/// Labels are already elided by the parser; this is the drawing cap.
+/// The drawing cap on a box's width.
+///
+/// It does NOT follow from the parser's label cap — 56 characters want 347
+/// units here, and this is 300 — so a long label produces a box that does not
+/// hold its own text. That is what [`text_room`] exists to tell the painter.
 const MAX_W: f32 = 300.0;
 const MIN_H: f32 = 32.0;
 /// A diamond wastes its corners, so its text needs noticeably more room.
 const DIAMOND_PAD: f32 = 44.0;
 const DIAMOND_MIN_W: f32 = 116.0;
 const DIAMOND_H: f32 = 48.0;
+/// A stadium wastes its two round ends the way a diamond wastes its corners.
+const TERMINAL_PAD: f32 = 40.0;
+const TERMINAL_MIN_W: f32 = 90.0;
 const TERMINAL_H: f32 = 30.0;
 /// The parallelogram's slant, and the subroutine box's side bars.
 const SLANT: f32 = 14.0;
 const BARS: f32 = 16.0;
+/// A declaration card is read down its left edge, so its text starts closer in
+/// than a flow box's centred label — `draw_card_text` paints it here.
+const CARD_PAD_LEFT: f32 = 10.0;
+/// What is left of a card's reserve once the left inset is spent. The two sum
+/// to `2 * PAD_X`, so naming the left one did not move any card's width.
+const CARD_PAD_RIGHT: f32 = 2.0 * PAD_X - CARD_PAD_LEFT;
+/// Spaces `draw_card_text` puts before every row under a card's header. It is
+/// here, not in the painter, because [`box_size`] has to measure them: a card
+/// sized for an unindented row is two characters too narrow for the one drawn.
+pub const CARD_ROW_INDENT: usize = 2;
+/// The least gap this feature ever leaves between a box's text and its border.
+///
+/// Every shape's own reserve below is larger, so this never binds today; it is
+/// the floor [`text_insets`] is held to, and the guard that a future shape
+/// cannot be given a reserve so thin the text touches the outline.
+pub const MIN_TEXT_PAD: f32 = 5.0;
 
 /// Vertical room between two boxes — arrowheads and edge labels live here.
 pub const V_GAP: f32 = 36.0;
@@ -132,35 +155,75 @@ enum MKind {
     },
 }
 
-/// Width and height of one box, from its shape and how many lines it shows.
+/// How far inside a box its text starts, on the left and on the right, for a
+/// row whose centre sits at `t` of the box's height (0 = top, 1 = bottom).
+///
+/// The inverse of the reserve [`box_size`] adds, and the reason it has to exist
+/// separately: the moment the `MAX_W` clamp fires, `box_size` returns a width
+/// that does NOT hold the text it was handed, and nothing outside this module
+/// can say by how much. Without it the painter drew the whole string centred
+/// and let its clip rectangle cut the overflow — which takes as many characters
+/// off the HEAD as off the tail, and the head is the half that says what the
+/// statement is.
+///
+/// `t` matters for [`Shape::Io`] alone. The parallelogram is a SHEAR, not a
+/// taper: `(left + s, top), (right, top), (right - s, bottom), (left, bottom)`
+/// keeps the same usable width on every row and slides its centre sideways
+/// instead. A diamond does narrow with `t`, but a [`Shape::Decision`] is built
+/// from a single condition and never carries a second row, so its text sits on
+/// the middle row where the shape is at its widest.
+pub fn text_insets(shape: Shape, t: f32) -> (f32, f32) {
+    match shape {
+        Shape::Decision => (DIAMOND_PAD * 0.5, DIAMOND_PAD * 0.5),
+        Shape::Terminal => (TERMINAL_PAD * 0.5, TERMINAL_PAD * 0.5),
+        Shape::Decl => (CARD_PAD_LEFT, CARD_PAD_RIGHT),
+        Shape::Io => {
+            let t = t.clamp(0.0, 1.0);
+            (PAD_X + SLANT * (1.0 - t), PAD_X + SLANT * t)
+        }
+        // The side bars are painted INSIDE the box, so the text clears them.
+        Shape::Subroutine => (PAD_X + BARS * 0.5, PAD_X + BARS * 0.5),
+        Shape::Process | Shape::Generated => (PAD_X, PAD_X),
+    }
+}
+
+/// The width one row of text may occupy inside a box of width `w`.
+pub fn text_room(shape: Shape, w: f32, t: f32) -> f32 {
+    let (l, r) = text_insets(shape, t);
+    (w - l - r).max(0.0)
+}
+
+/// Width and height of one box, from its shape and the rows it shows.
 pub fn box_size(n: &FlowNode) -> (f32, f32) {
-    let widest = std::iter::once(n.text.chars().count())
-        .chain(n.detail.iter().map(|d| d.chars().count()))
+    let indent = if n.shape == Shape::Decl {
+        CARD_ROW_INDENT
+    } else {
+        0
+    };
+    let widest = n
+        .rows()
+        .iter()
+        .enumerate()
+        .map(|(i, row)| row.chars().count() + if i == 0 { 0 } else { indent })
         .max()
         .unwrap_or(0) as f32;
-    let text_w = widest * CHAR_W;
+    // The middle row: what the shape reserves there is what it reserves in
+    // total, because `Io` only ever trades one side's inset for the other's.
+    let (il, ir) = text_insets(n.shape, 0.5);
+    let w = widest * CHAR_W + il + ir;
     match n.shape {
-        Shape::Decision => (
-            (text_w + DIAMOND_PAD).clamp(DIAMOND_MIN_W, MAX_W),
-            DIAMOND_H,
-        ),
-        Shape::Terminal => ((text_w + 40.0).clamp(90.0, MAX_W), TERMINAL_H),
+        Shape::Decision => (w.clamp(DIAMOND_MIN_W, MAX_W), DIAMOND_H),
+        Shape::Terminal => (w.clamp(TERMINAL_MIN_W, MAX_W), TERMINAL_H),
         // A card reads like code, left-aligned, so it may run wider than a
         // flow box - a field's type is often the longest thing in the file.
         Shape::Decl => (
-            (text_w + 2.0 * PAD_X).clamp(CARD_MIN_W, CARD_MAX_W),
+            w.clamp(CARD_MIN_W, CARD_MAX_W),
             2.0 * PAD_Y + n.lines() as f32 * LINE_H,
         ),
-        other => {
-            let extra = match other {
-                Shape::Io => SLANT,
-                Shape::Subroutine => BARS,
-                _ => 0.0,
-            };
-            let w = (text_w + 2.0 * PAD_X + extra).clamp(MIN_W, MAX_W);
-            let h = (2.0 * PAD_Y + n.lines() as f32 * LINE_H).max(MIN_H);
-            (w, h)
-        }
+        _ => (
+            w.clamp(MIN_W, MAX_W),
+            (2.0 * PAD_Y + n.lines() as f32 * LINE_H).max(MIN_H),
+        ),
     }
 }
 
@@ -711,6 +774,131 @@ mod tests {
             .find(|b| b.node.text.contains(text))
             .unwrap_or_else(|| panic!("no box containing {text:?} in {:?}", texts(l)))
             .clone()
+    }
+
+    /// Every shape, so a new one cannot quietly skip the tests below. The
+    /// exhaustive `match` in [`text_insets`] is the other half of that guard.
+    const ALL_SHAPES: [Shape; 7] = [
+        Shape::Terminal,
+        Shape::Process,
+        Shape::Io,
+        Shape::Decision,
+        Shape::Subroutine,
+        Shape::Generated,
+        Shape::Decl,
+    ];
+
+    fn node(shape: Shape, text: &str) -> FlowNode {
+        let mut n = terminal(text, 1);
+        n.shape = shape;
+        n
+    }
+
+    /// The forward and the inverse are the same arithmetic read in two
+    /// directions, so a box sized for its text has room for EXACTLY that text.
+    ///
+    /// This is the drift the whole change exists to stop: `box_size` adds a
+    /// per-shape reserve, `text_insets` takes it back, and until they were one
+    /// function nobody could notice when only one of them moved. Thirty
+    /// characters is long enough to clear every shape's minimum width and short
+    /// enough to stay under `MAX_W`, so no clamp hides the comparison.
+    #[test]
+    fn every_shape_gives_back_exactly_the_room_it_reserved() {
+        let text = "x".repeat(30);
+        for shape in ALL_SHAPES {
+            let (w, _) = box_size(&node(shape, &text));
+            let (il, ir) = text_insets(shape, 0.5);
+            assert!(
+                (w - (30.0 * CHAR_W + il + ir)).abs() < 0.01,
+                "{shape:?}: sized to {w}, but its own insets ({il}, {ir}) say {}",
+                30.0 * CHAR_W + il + ir
+            );
+            let room = text_room(shape, w, 0.5);
+            assert!(
+                (room - 30.0 * CHAR_W).abs() < 0.01,
+                "{shape:?}: sized to {w} but offers {room} for text that needs {}",
+                30.0 * CHAR_W
+            );
+        }
+    }
+
+    /// No shape may be given a reserve so thin its text touches its outline.
+    #[test]
+    fn no_shape_lets_its_text_touch_the_outline() {
+        for shape in ALL_SHAPES {
+            for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let (l, r) = text_insets(shape, t);
+                assert!(
+                    l >= MIN_TEXT_PAD && r >= MIN_TEXT_PAD,
+                    "{shape:?} at t={t}: ({l}, {r}) is under the {MIN_TEXT_PAD} floor"
+                );
+            }
+        }
+    }
+
+    /// The parallelogram is a shear: every row has the same room, and it is the
+    /// CENTRE that slides. Reading it as a taper would make a centred row
+    /// under-use one side and cross the slant on the other.
+    #[test]
+    fn the_parallelogram_keeps_its_width_and_slides_its_centre() {
+        let rooms: Vec<f32> = [0.0, 0.5, 1.0]
+            .iter()
+            .map(|&t| text_room(Shape::Io, 200.0, t))
+            .collect();
+        assert!(
+            (rooms[0] - rooms[1]).abs() < 0.01 && (rooms[1] - rooms[2]).abs() < 0.01,
+            "the slant changed the usable width: {rooms:?}"
+        );
+        let (top_l, _) = text_insets(Shape::Io, 0.0);
+        let (bot_l, _) = text_insets(Shape::Io, 1.0);
+        assert!(
+            (top_l - bot_l - SLANT).abs() < 0.01,
+            "the top row should start a full slant right of the bottom one: {top_l} vs {bot_l}"
+        );
+    }
+
+    /// `draw_box` paints a "+N more" row; `box_size` used to measure only the
+    /// label and the folded statements, so a box whose tail row was the widest
+    /// thing in it was sized for a row it does not draw.
+    #[test]
+    fn a_folded_box_is_sized_for_the_tail_row_it_draws() {
+        let mut n = node(Shape::Process, "a");
+        n.hidden = 99_999_999;
+        let (w, _) = box_size(&n);
+        let room = text_room(Shape::Process, w, 0.5);
+        let tail = n.rows().pop().expect("a tail row");
+        assert_eq!(tail, "+99999999 more");
+        assert!(
+            room >= tail.chars().count() as f32 * CHAR_W,
+            "sized to {w} ({room} of room) for a {} unit tail row",
+            tail.chars().count() as f32 * CHAR_W
+        );
+    }
+
+    /// A card indents everything under its header, and those two spaces are as
+    /// wide as any other two characters.
+    #[test]
+    fn a_card_is_sized_for_the_indent_it_draws() {
+        let mut n = node(Shape::Decl, "Log");
+        n.detail = vec!["x".repeat(30)];
+        let (w, _) = box_size(&n);
+        let room = text_room(Shape::Decl, w, 0.5);
+        assert!(
+            room >= (30 + CARD_ROW_INDENT) as f32 * CHAR_W,
+            "sized to {w} ({room} of room) for a row that draws {} units",
+            (30 + CARD_ROW_INDENT) as f32 * CHAR_W
+        );
+    }
+
+    /// The row list and the row count are two readings of one thing.
+    #[test]
+    fn the_rows_a_box_draws_are_the_lines_it_counts() {
+        let mut n = node(Shape::Process, "head");
+        n.detail = vec!["one".into(), "two".into()];
+        assert_eq!(n.rows().len(), n.lines());
+        n.hidden = 3;
+        assert_eq!(n.rows().len(), n.lines());
+        assert_eq!(n.rows()[0], "head");
     }
 
     /// Nothing may be placed outside the canvas the GUI is told to scale — an

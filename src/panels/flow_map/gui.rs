@@ -1276,8 +1276,8 @@ fn outline(
             };
             let x = rect.left() + 6.0 + (e.depth - base_depth) as f32 * INDENT;
             let mid = rect.center().y;
-            let kind = row_galley(
-                ui,
+            let kind = fit_galley(
+                painter,
                 e.kind.word(),
                 10.5,
                 dim(kind_color(e.kind)),
@@ -1286,7 +1286,7 @@ fn outline(
             painter.galley(egui::pos2(x, mid - kind.size().y / 2.0), kind, TEXT);
             let text_x = x + KIND_W;
             let room = rect.right() - LINE_W - text_x;
-            let sig = row_galley(ui, &e.signature, 11.5, dim(TEXT), room);
+            let sig = fit_galley(painter, &e.signature, 11.5, dim(TEXT), room);
             painter.galley(egui::pos2(text_x, mid - sig.size().y / 2.0), sig, TEXT);
             painter.text(
                 egui::pos2(rect.right() - 6.0, mid),
@@ -1312,8 +1312,16 @@ fn outline(
 
 /// One line of monospace text, cut with an ellipsis at `max_w` rather than
 /// wrapped - a row is one line high.
-fn row_galley(
-    ui: &egui::Ui,
+///
+/// The one place this feature shortens text to fit a width, used by the outline
+/// rows, the flow boxes and the declaration cards. It cuts by MEASURED width,
+/// never by counting characters against [`super::layout`]'s `CHAR_W`: that
+/// constant over-states the real advance by 3 % - safe when it SIZES a box,
+/// wrong as a divisor - and a label carrying a glyph the monospace face lacks
+/// is laid out from a proportional fallback, where no per-character width is
+/// right at all. egui measures the glyphs it is about to draw; nothing else can.
+fn fit_galley(
+    painter: &egui::Painter,
     text: &str,
     size: f32,
     color: egui::Color32,
@@ -1324,7 +1332,7 @@ fn row_galley(
         egui::TextFormat::simple(egui::FontId::monospace(size), color),
     );
     job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(8.0));
-    ui.painter().layout_job(job)
+    painter.layout_job(job)
 }
 
 /// The hover text of an outline row: everything the row had no room for.
@@ -1530,24 +1538,27 @@ fn draw_box(
     } else {
         TEXT
     };
-    let mut lines: Vec<String> = std::iter::once(b.node.text.clone())
-        .chain(b.node.detail.iter().cloned())
-        .collect();
-    if b.node.hidden > 0 {
-        lines.push(format!("+{} more", b.node.hidden));
-    }
+    // Each row is cut to the room its SHAPE leaves, rather than painted whole
+    // and left to the clip rectangle. A clip cuts a centred row at both ends,
+    // and the half it takes off the front is the half that says what the
+    // statement is - `…er.feed(b) && let Some(frame) = parser.decode_pa…` reads
+    // as neither of the two calls it names. The ellipsis egui puts in its place
+    // is also the only sign the reader gets that anything was dropped: the
+    // parser's own ellipsis, at the far end of the string, was itself clipped.
+    let rows = b.node.rows();
     let inner = painter.with_clip_rect(r.shrink(2.0 * scale));
     let line_h = font.size * 1.32;
-    let total = line_h * lines.len() as f32;
+    let total = line_h * rows.len() as f32;
     let mut y = r.center().y - total * 0.5 + line_h * 0.5;
-    for l in &lines {
-        inner.text(
-            egui::pos2(r.center().x, y),
-            egui::Align2::CENTER_CENTER,
-            l,
-            font.clone(),
-            color,
-        );
+    for row in &rows {
+        // How far down the box this row sits, which is what the parallelogram's
+        // shear needs to know; every other shape ignores it.
+        let t = (y - r.top()) / r.height().max(1.0);
+        let (il, ir) = super::layout::text_insets(b.node.shape, t);
+        let (x0, x1) = (r.left() + il * scale, r.right() - ir * scale);
+        let g = fit_galley(painter, row, font.size, color, x1 - x0);
+        let pos = egui::pos2((x0 + x1 - g.size().x) * 0.5, y - g.size().y * 0.5);
+        inner.galley(pos, g, color);
         y += line_h;
     }
 
@@ -1586,25 +1597,28 @@ fn draw_card_text(
     let body = if generated { DIM_TEXT } else { TEXT };
     let inner = painter.with_clip_rect(r.shrink(2.0 * scale));
     let line_h = font.size * 1.32;
-    let x = r.left() + 10.0 * scale;
-    let total = line_h * b.node.lines() as f32;
+    // The card's own inset is narrower than a flow box's, and asymmetric: it is
+    // read down its left edge, so the room it gives its text is not the room the
+    // shape reserves minus the same amount on both sides.
+    let (il, ir) = super::layout::text_insets(Shape::Decl, 0.5);
+    let x = r.left() + il * scale;
+    let room = r.width() - (il + ir) * scale;
+    let indent = " ".repeat(super::layout::CARD_ROW_INDENT);
+    let rows = b.node.rows();
+    let tail = usize::from(b.node.hidden > 0);
+    let total = line_h * rows.len() as f32;
     let mut y = r.center().y - total * 0.5 + line_h * 0.5;
-    let mut row = |text: &str, color: egui::Color32| {
-        inner.text(
-            egui::pos2(x, y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            font.clone(),
-            color,
-        );
+    for (i, text) in rows.iter().enumerate() {
+        let (line, color) = if i == 0 {
+            (text.clone(), kind)
+        } else if tail == 1 && i + 1 == rows.len() {
+            (format!("{indent}{text}"), DIM_TEXT)
+        } else {
+            (format!("{indent}{text}"), body)
+        };
+        let g = fit_galley(painter, &line, font.size, color, room);
+        inner.galley(egui::pos2(x, y - g.size().y * 0.5), g, color);
         y += line_h;
-    };
-    row(&b.node.text, kind);
-    for d in &b.node.detail {
-        row(&format!("  {d}"), body);
-    }
-    if b.node.hidden > 0 {
-        row(&format!("  +{} more", b.node.hidden), DIM_TEXT);
     }
 }
 
@@ -2554,6 +2568,83 @@ mod tests {
             "wide {wide}, narrow {}",
             v.header_h
         );
+    }
+
+    /// A box paints the START of every row, and never wider than its own shape
+    /// leaves room for.
+    ///
+    /// `box_size` clamps a box to `MAX_W`, so a label at the parser's 56-char
+    /// cap is some 40 units wider than the box it is given. The painter used to
+    /// draw the whole string centred and leave the overflow to
+    /// `with_clip_rect`, and a clip takes as much off the head of a centred row
+    /// as off its tail - which is how a condition reached the screen reading
+    /// `…er.feed(b) && let Some(frame) = parser.decode_pa…`, naming neither of
+    /// the two calls in it. Worse, the parser's own ellipsis sits at the far end
+    /// and was clipped with everything else, so a cut box looked intact.
+    ///
+    /// egui records a galley at the width it laid out whether or not the clip
+    /// shows it, so `rect.width()` below is what was really measured out, not
+    /// what happened to be visible. And the bare test context is faithful for
+    /// this one measurement: egui-phosphor adds its face to the PROPORTIONAL
+    /// family only, so the monospace chain here is the app's.
+    #[test]
+    fn a_box_paints_the_head_of_each_row_and_never_wider_than_its_shape_allows() {
+        let src = "fn f() {\n    \
+                   if parser.feed(b) && parser.decode_payload().is_some() && nav.is_leaf() {\n        \
+                   crate::utils::i2c1_display::write_text(&mut display, nav.selected_node());\n    \
+                   }\n}\n";
+        let m = crate::panels::flow_map::parse::parse_file(src).unwrap();
+        let lay = crate::panels::flow_map::layout::layout(&m.charts[0]);
+        let ctx = egui::Context::default();
+        let mut v = FlowView {
+            selected: "f".to_string(),
+            ..Default::default()
+        };
+        let (texts, _, _) = render(
+            &ctx,
+            &m,
+            &lay,
+            None,
+            &mut v,
+            Vec::new(),
+            0.0,
+            egui::vec2(1000.0, 800.0),
+        );
+        let scale = v.last_scale;
+        assert!(scale > 0.0, "the chart was never drawn");
+
+        let mut cut = 0;
+        for b in &lay.boxes {
+            for row in b.node.rows() {
+                // Short rows can neither overflow nor be told apart from the
+                // toolbar's own words by a prefix.
+                if row.chars().count() < 20 {
+                    continue;
+                }
+                let (drawn, rect) = texts
+                    .iter()
+                    .find(|(t, _)| {
+                        let head = t.trim_end_matches('…');
+                        head.chars().count() >= 8 && row.starts_with(head)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "nothing painted starts with {row:?}; painted: {:?}",
+                            texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                        )
+                    });
+                let room =
+                    crate::panels::flow_map::layout::text_room(b.node.shape, b.w, 0.5) * scale;
+                assert!(
+                    rect.width() <= room + 0.5,
+                    "{:?} laid out {} px of text into {room} px of room: {drawn:?}",
+                    b.node.shape,
+                    rect.width()
+                );
+                cut += usize::from(drawn.ends_with('…'));
+            }
+        }
+        assert!(cut > 0, "nothing was cut at all, so this proves nothing");
     }
 
     /// A test module nested inside the one that was picked is drawn too - a

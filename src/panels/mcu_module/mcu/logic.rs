@@ -1912,7 +1912,9 @@ impl Mcu {
         for name in names {
             match (body_of(&before, &name), body_of(&after, &name)) {
                 (None, Some(_)) => out.push(format!("+ src/pins/configs/{name}  (new)")),
-                (Some(_), None) => out.push(format!("- src/pins/configs/{name}  (removed)")),
+                (Some(_), None) => out.push(format!(
+                    "- src/pins/configs/{name}  (removed - your code in it comes back with it until you close the IDE)"
+                )),
                 (Some(b), Some(a)) if b != a => {
                     out.push(format!("~ src/pins/configs/{name}  (regenerated)"))
                 }

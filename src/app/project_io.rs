@@ -30,6 +30,12 @@ impl AppIde {
         // The RA workspace content is about to change wholesale — drop the
         // flush hash cache so the first flush re-writes every file.
         self.flushed_hashes.lock().unwrap().clear();
+        // Regenerate against the files just read, even when the MCU state
+        // hashes the same as the project before: a project from before I2C
+        // buses were folders moves into them on its first regeneration, and
+        // that should be now - not in the middle of the user's first edit.
+        self.mcu_state_hash = 0;
+        self.config_moves = Default::default();
         // Arm the one-shot post-load re-verify: RA's first analysis of this
         // project can be stale (a document opened before the workspace was
         // complete), so once it is loaded, errors get one forced re-check.

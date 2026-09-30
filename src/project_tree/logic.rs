@@ -1,5 +1,6 @@
 //! Project tree logic — file operations, directory scanning, filesystem watching.
 
+use crate::panels::mcu_module::codegen::common as codegen;
 use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
 use std::path::Path;
 
@@ -10,6 +11,44 @@ pub struct ProjectTreeState {
     pub user_src_files: Vec<(String, String)>,
     /// Explicitly-created folders inside src/.
     pub user_src_folders: Vec<String>,
+    /// `(path, content)` of every `pins/configs/` file the sync pruned this
+    /// session, newest content per path - per path AND device for an I2C
+    /// device file, whose path the next device takes over on a renumber. A
+    /// file that comes back - the bus re-wired after a pad was cleared, a
+    /// Runtime switched away and back, a device's Remove undone - comes back
+    /// with what the user wrote in it, not as a fresh template. Memory only: a
+    /// new or opened project starts empty.
+    pub config_graveyard: Vec<(String, String)>,
+}
+
+/// What [`ProjectTreeState::sync_config_files`] did besides splicing - what
+/// the app has to follow up on the disk, in rust-analyzer and in state keyed
+/// by path.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigSync {
+    /// `(old, new)` of every file that moved, its content with it: a device
+    /// renamed or renumbered, or a file from before buses were folders.
+    pub moved: Vec<(String, String)>,
+    /// Every file pruned (its content is in the graveyard).
+    pub removed: Vec<String>,
+    /// `(old path, content before the move)` of each file from before buses
+    /// were folders that was moved into one.
+    pub migrated: Vec<(String, String)>,
+    /// `(path, content)` of an old `<bus>.rs` dropped because `<bus>/mod.rs`
+    /// was there too - the two at once do not compile.
+    pub conflicts: Vec<(String, String)>,
+    /// `(path, content)` of a device file from before buses were folders
+    /// that no device claimed: dropped, so the user has to hear where a copy
+    /// is - nothing will ever generate its flat name again.
+    pub unplaced: Vec<(String, String)>,
+}
+
+impl ConfigSync {
+    /// Did a file leave a path - so the workspace copy and rust-analyzer still
+    /// have it where it was?
+    pub fn left_a_path(&self) -> bool {
+        !self.moved.is_empty() || !self.removed.is_empty()
+    }
 }
 
 /// Name for a duplicate of `path` (relative to `src/`): the first free
@@ -70,6 +109,7 @@ impl ProjectTreeState {
         Self {
             user_src_files: Vec::new(),
             user_src_folders: Vec::new(),
+            config_graveyard: Vec::new(),
         }
     }
 
@@ -130,6 +170,7 @@ impl ProjectTreeState {
         Self {
             user_src_files: files,
             user_src_folders: folders,
+            config_graveyard: Vec::new(),
         }
     }
 
@@ -301,27 +342,65 @@ impl ProjectTreeState {
     /// Drop every file whose path matches, carrying `selected` across the
     /// shift (`None` when its own file is dropped).
     fn remove_files_where(&mut self, drop: impl Fn(&str) -> bool, selected: &mut Option<usize>) {
+        self.take_files(|_, p| drop(p), selected);
+    }
+
+    /// Take out every file `drop(index, path)` picks, returning them, and carry
+    /// `selected` across the shift (`None` when its own file goes).
+    fn take_files(
+        &mut self,
+        drop: impl Fn(usize, &str) -> bool,
+        selected: &mut Option<usize>,
+    ) -> Vec<(String, String)> {
         let sel = *selected;
-        let mut idx = 0;
         let mut dropped_before = 0;
         let mut sel_dropped = false;
-        self.user_src_files.retain(|(p, _)| {
-            let gone = drop(p);
-            if gone {
+        let mut kept = Vec::with_capacity(self.user_src_files.len());
+        let mut gone = Vec::new();
+        for (i, entry) in std::mem::take(&mut self.user_src_files)
+            .into_iter()
+            .enumerate()
+        {
+            if drop(i, &entry.0) {
                 match sel {
-                    Some(s) if s == idx => sel_dropped = true,
-                    Some(s) if idx < s => dropped_before += 1,
+                    Some(s) if s == i => sel_dropped = true,
+                    Some(s) if i < s => dropped_before += 1,
                     _ => {}
                 }
+                gone.push(entry);
+            } else {
+                kept.push(entry);
             }
-            idx += 1;
-            !gone
-        });
+        }
+        self.user_src_files = kept;
         *selected = if sel_dropped {
             None
         } else {
             sel.map(|s| s - dropped_before)
         };
+        gone
+    }
+
+    /// Keep what the sync pruned, so it can come back ([`Self::config_graveyard`]).
+    ///
+    /// One per path - but an I2C device file is one per path AND device id: a
+    /// renumber hands `device1.rs` to the next device, and burying that one's
+    /// file must not erase the first device's, which an undo still wants.
+    fn bury(&mut self, gone: Vec<(String, String)>, report: &mut ConfigSync) {
+        let id = |body: &str| codegen::device_file_id(body).map(|(_, uid)| uid);
+        for (path, body) in gone {
+            report.removed.push(path.clone());
+            let uid = id(&body);
+            self.config_graveyard
+                .retain(|(p, b)| !(*p == path && id(b) == uid));
+            self.config_graveyard.push((path, body));
+        }
+    }
+
+    /// The content last pruned from `path`, taken out of the graveyard.
+    fn unbury(&mut self, path: &str) -> Option<String> {
+        let i = self.config_graveyard.iter().position(|(p, _)| p == path)?;
+        Some(self.config_graveyard.remove(i).1)
     }
 
     /// Keep the `src/pins/` scaffold in step with the pin configuration:
@@ -470,6 +549,21 @@ impl ProjectTreeState {
     /// it does not exist yet, and never touched again — not spliced, not forced.
     /// Every Update produces a new revision file, so a pin change still reaches
     /// the code, while whatever the user wrote into an existing one stays.
+    ///
+    /// A name may carry ONE folder level (`i2c1/mod.rs`, `i2c1/device1.rs`):
+    /// `configs/mod.rs` then declares the folder once (`pub mod i2c1;`) and the
+    /// folder's own `mod.rs` declares what is inside it. Such a folder is an I2C
+    /// bus, and its device files MOVE when a device is renamed or renumbered -
+    /// see [`Self::carry_bus_folders`] - instead of being pruned and written
+    /// anew; they are never rewritten whole by `force` either, their template
+    /// has nothing a Runtime changes.
+    ///
+    /// Nothing pruned is lost for the session: it goes to
+    /// [`Self::config_graveyard`] and comes back if its file is generated again.
+    ///
+    /// `selected` is the index of the file open in the editor, which names its
+    /// file by index; it follows that file across every index a prune shifts,
+    /// and becomes `None` when the file itself is pruned.
     pub fn sync_config_files(
         &mut self,
         files: &[(String, String)],
@@ -479,28 +573,41 @@ impl ProjectTreeState {
         // revisions are kept on disk (they are not in `configs/mod.rs`, so they
         // are never compiled and can't clash with the current struct).
         keep_prefixes: &[String],
-    ) {
+        selected: &mut Option<usize>,
+    ) -> ConfigSync {
         const DIR: &str = "src/pins/configs";
         const MOD_PATH: &str = "src/pins/configs/mod.rs";
         const GEN_BEGIN: &str = "// <<< GENERATED>>>";
         const GEN_END: &str = "// <<< GENERATED END >>>";
+        const UNDER: &str = "src/pins/configs/";
+        let mut report = ConfigSync::default();
 
         if files.is_empty() {
             // No configured peripherals → drop the entire configs/ subtree.
-            self.user_src_files
-                .retain(|(p, _)| !p.starts_with("src/pins/configs/"));
-            self.user_src_folders.retain(|f| f != DIR);
-            return;
+            let gone = self.take_files(|_, p| p.starts_with(UNDER), selected);
+            self.bury(gone, &mut report);
+            self.user_src_folders
+                .retain(|f| f != DIR && !f.starts_with(UNDER));
+            return report;
         }
 
-        // 1. Register the folder.
+        // 1. Register the folder, and every folder a nested name lives in.
         if !self.user_src_folders.iter().any(|f| f == DIR) {
             self.user_src_folders.push(DIR.to_string());
         }
-        // 2. Ensure configs/mod.rs exists.
+        for (name, _) in files {
+            if let Some((folder, _)) = name.rsplit_once('/') {
+                let folder = format!("{UNDER}{folder}");
+                if !self.user_src_folders.contains(&folder) {
+                    self.user_src_folders.push(folder);
+                }
+            }
+        }
+        // 2. Ensure configs/mod.rs exists - with what the user wrote around its
+        //    markers, if a moment with no config files at all pruned it.
         if !self.user_src_files.iter().any(|(p, _)| p == MOD_PATH) {
-            self.user_src_files
-                .push((MOD_PATH.to_string(), String::new()));
+            let old = self.unbury(MOD_PATH).unwrap_or_default();
+            self.user_src_files.push((MOD_PATH.to_string(), old));
         }
 
         // Active module stems (file names without `.rs`).
@@ -520,14 +627,27 @@ impl ProjectTreeState {
                 .any(|p| stem == p || stem.starts_with(&format!("{p}_")))
         };
 
-        // 3. Drop config files no longer configured.
-        self.user_src_files.retain(|(path, _)| {
-            let Some(rest) = path.strip_prefix("src/pins/configs/") else {
-                return true;
-            };
-            let stem = rest.trim_end_matches(".rs");
-            rest == "mod.rs" || active.iter().any(|a| a == stem) || is_custom_stem(stem)
-        });
+        // 3. Move what is already written to where it goes now - an I2C bus
+        //    file from before buses were folders, and every device file whose
+        //    name changed - BEFORE the prune below, which would take the
+        //    user's code with it.
+        self.carry_bus_folders(files, selected, &mut report);
+
+        //    Then drop config files no longer configured. A Custom module's
+        //    revisions are flat names, never nested.
+        let gone = self.take_files(
+            |_, path| {
+                let Some(rest) = path.strip_prefix(UNDER) else {
+                    return false;
+                };
+                let stem = rest.trim_end_matches(".rs");
+                !(rest == "mod.rs"
+                    || active.iter().any(|a| a == stem)
+                    || (!rest.contains('/') && is_custom_stem(stem)))
+            },
+            selected,
+        );
+        self.bury(gone, &mut report);
 
         // 4. Create / update each config file. The codegen `body` already wraps
         //    ONLY the constants in `// <<< GENERATED>>>` markers; everything below
@@ -543,12 +663,27 @@ impl ProjectTreeState {
             {
                 continue;
             }
+            // A device file's template holds nothing a Runtime changes, and
+            // everything below its markers is the user's.
+            let is_device = name
+                .split_once('/')
+                .is_some_and(|(_, file)| codegen::parse_device_file_name(file).is_some());
+            // Generated again after being pruned this session: back with the
+            // user's code, and spliced (or forced) below like any file. Not a
+            // device file: step 3 already chose ITS old content by device,
+            // and a path alone may belong to another one.
+            if !is_device
+                && !self.user_src_files.iter().any(|(p, _)| p == &file_path)
+                && let Some(old) = self.unbury(&file_path)
+            {
+                self.user_src_files.push((file_path.clone(), old));
+            }
             if let Some((_, content)) = self
                 .user_src_files
                 .iter_mut()
                 .find(|(p, _)| p == &file_path)
             {
-                if force {
+                if force && !is_device {
                     // Template swapped (runtime / api style) → replace the whole
                     // file; the editable region carries the init that must change.
                     if *content != *body {
@@ -568,6 +703,17 @@ impl ProjectTreeState {
             }
         }
 
+        // A folder the prune emptied goes too - after step 4, which is what
+        // fills a folder registered in step 1.
+        let files_now = &self.user_src_files;
+        self.user_src_folders.retain(|f| {
+            if !f.starts_with(UNDER) {
+                return true;
+            }
+            let inside = format!("{f}/");
+            files_now.iter().any(|(p, _)| p.starts_with(&inside))
+        });
+
         // 5. Rebuild configs/mod.rs (`pub mod usart1;` …), preserving user code.
         //
         // A Custom module ALSO gets `pub use <stem>::*;`, so its struct is
@@ -576,7 +722,21 @@ impl ProjectTreeState {
         // stem changes on every Update. The peripheral configs deliberately do
         // NOT get this: they all define `init` / `get_config`, and glob-importing
         // two of them into one namespace is a compile error.
-        let gen_section: String = active
+        //
+        // A folder is ONE module however many files it holds: `i2c1/mod.rs`
+        // declares it, and its other files are declared by that `mod.rs`.
+        let mut top: Vec<&str> = Vec::new();
+        for s in &active {
+            let seg = match s.split_once('/') {
+                None => s.as_str(),
+                Some((folder, "mod")) => folder,
+                Some(_) => continue,
+            };
+            if !top.contains(&seg) {
+                top.push(seg);
+            }
+        }
+        let gen_section: String = top
             .iter()
             .map(|s| {
                 if is_custom_stem(s) {
@@ -595,6 +755,188 @@ impl ProjectTreeState {
                 *mod_content = updated;
             }
         }
+        debug_assert!(
+            {
+                let mut paths: Vec<&str> = self
+                    .user_src_files
+                    .iter()
+                    .map(|(p, _)| p.as_str())
+                    .filter(|p| p.starts_with(UNDER))
+                    .collect();
+                paths.sort_unstable();
+                paths.windows(2).all(|w| w[0] != w[1])
+            },
+            "two files on one path after a config sync"
+        );
+        report
+    }
+
+    /// Step 3 of [`Self::sync_config_files`], for every I2C bus in `files`
+    /// (a `<bus>/mod.rs`):
+    ///
+    /// - The bus file from before buses were folders, `<bus>.rs`, becomes the
+    ///   folder's `mod.rs` in place - the same entry, so the user's `init`
+    ///   and the editor's selection stay. When `<bus>/mod.rs` is there too,
+    ///   `<bus>.rs` is left to the prune and reported as a conflict: both at
+    ///   once do not compile.
+    /// - Each device file that exists - in the folder, as a flat
+    ///   `<bus>_<name>.rs` from before the folders, or in the graveyard - is
+    ///   paired with the device file it is now ([`match_devices`]) and moved
+    ///   there. One left unpaired is buried BY INDEX: the file taking its
+    ///   path may already stand on it. An unpaired flat one is also reported
+    ///   (`unplaced`), since nothing will ever bring its name back.
+    ///
+    /// Nothing is remembered between calls. What pairs a file with its device
+    /// is written in the files themselves - the device's id, name and address -
+    /// so a restart, an Open or a branch switch changes nothing.
+    fn carry_bus_folders(
+        &mut self,
+        files: &[(String, String)],
+        selected: &mut Option<usize>,
+        report: &mut ConfigSync,
+    ) {
+        const UNDER: &str = "src/pins/configs/";
+        let buses: Vec<&str> = files
+            .iter()
+            .filter_map(|(n, _)| n.strip_suffix("/mod.rs"))
+            .collect();
+        for bus in buses {
+            let mod_path = format!("{UNDER}{bus}/mod.rs");
+            let flat_path = format!("{UNDER}{bus}.rs");
+            if let Some(i) = self
+                .user_src_files
+                .iter()
+                .position(|(p, _)| *p == flat_path)
+            {
+                let body = self.user_src_files[i].1.clone();
+                if self.user_src_files.iter().any(|(p, _)| *p == mod_path) {
+                    report.conflicts.push((flat_path, body));
+                } else {
+                    report.migrated.push((flat_path.clone(), body));
+                    report.moved.push((flat_path, mod_path.clone()));
+                    self.user_src_files[i].0 = mod_path;
+                }
+            }
+
+            let folder = format!("{UNDER}{bus}/");
+            let mut targets: Vec<DevSig> = files
+                .iter()
+                .filter_map(|(name, body)| {
+                    let file = name.strip_prefix(bus)?.strip_prefix('/')?;
+                    let (k, slug) = codegen::parse_device_file_name(file)?;
+                    Some(DevSig::nested(format!("{UNDER}{name}"), k, slug, body, bus))
+                })
+                .collect();
+            // The flat name each device would have had before the folders.
+            let legacy = {
+                let devices: Vec<(usize, &str)> = targets
+                    .iter()
+                    .map(|t| (t.k.unwrap_or(0), t.slugs[0].as_str()))
+                    .collect();
+                codegen::legacy_device_stems_for(bus, &devices)
+            };
+            for (t, stem) in targets.iter_mut().zip(legacy) {
+                t.legacy = Some(stem);
+            }
+            if targets.is_empty()
+                && !self
+                    .user_src_files
+                    .iter()
+                    .any(|(p, _)| p.starts_with(&folder))
+            {
+                continue;
+            }
+            // Where each candidate is: the tree (index) or the graveyard.
+            let mut olds: Vec<(Result<usize, usize>, DevSig)> = Vec::new();
+            for (i, (path, body)) in self.user_src_files.iter().enumerate() {
+                if let Some(file) = path.strip_prefix(&folder) {
+                    if let Some((k, slug)) = codegen::parse_device_file_name(file) {
+                        olds.push((Ok(i), DevSig::nested(path.clone(), k, slug, body, bus)));
+                    }
+                } else if let Some(rest) = path
+                    .strip_prefix(UNDER)
+                    .and_then(|r| r.strip_prefix(bus))
+                    .and_then(|r| r.strip_prefix('_'))
+                    .and_then(|r| r.strip_suffix(".rs"))
+                    && !rest.contains('/')
+                {
+                    // A flat `<bus>_<name>.rs` is a device file from before the
+                    // folders whatever it holds: nothing else was ever
+                    // generated under that name, and the old bus file is
+                    // `<bus>.rs`, no `_`.
+                    olds.push((Ok(i), DevSig::legacy(path.clone(), rest, body, bus)));
+                }
+            }
+            // Every grave of the folder, also one on a path the tree holds: a
+            // renumber hands a path to the next device, and the device whose
+            // grave it is decides - not the path.
+            for (g, (path, body)) in self.config_graveyard.iter().enumerate() {
+                let Some(file) = path.strip_prefix(&folder) else {
+                    continue;
+                };
+                if let Some((k, slug)) = codegen::parse_device_file_name(file) {
+                    let mut sig = DevSig::nested(path.clone(), k, slug, body, bus);
+                    sig.grave = true;
+                    olds.push((Err(g), sig));
+                }
+            }
+
+            let sigs: Vec<&DevSig> = olds.iter().map(|(_, s)| s).collect();
+            let pairs = match_devices(&sigs, &targets);
+            let mut paired = vec![false; olds.len()];
+            let mut revived: Vec<(usize, String)> = Vec::new();
+            for (o, t) in pairs {
+                paired[o] = true;
+                let to = targets[t].path.clone();
+                match olds[o].0 {
+                    Ok(i) => {
+                        let from = self.user_src_files[i].0.clone();
+                        if from == to {
+                            continue;
+                        }
+                        if !from.starts_with(&folder) {
+                            // From before the folders: its warning that a
+                            // rename loses the code is no longer true.
+                            let body = self.user_src_files[i].1.clone();
+                            self.user_src_files[i].1 = body
+                                .replace(codegen::LEGACY_DEVICE_WARNING, codegen::DEVICE_MOVE_NOTE);
+                            report.migrated.push((from.clone(), body));
+                        }
+                        report.moved.push((from, to.clone()));
+                        self.user_src_files[i].0 = to;
+                    }
+                    Err(g) => revived.push((g, to)),
+                }
+            }
+            // Out of the graveyard BEFORE anything is buried, which reorders
+            // it - and from the highest index down, so each one still holds.
+            revived.sort_by_key(|a| std::cmp::Reverse(a.0));
+            let mut graves: Vec<(String, String)> = Vec::new();
+            for (g, to) in revived {
+                graves.push((to, self.config_graveyard.remove(g).1));
+            }
+            let drop: Vec<usize> = olds
+                .iter()
+                .zip(&paired)
+                .filter_map(|((at, _), p)| match at {
+                    Ok(i) if !p => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            // A flat file no device claimed is never generated again, so the
+            // graveyard can never give it back: the user hears where a copy is.
+            for i in &drop {
+                let (path, body) = &self.user_src_files[*i];
+                if !path.starts_with(&folder) {
+                    report.unplaced.push((path.clone(), body.clone()));
+                }
+            }
+            if !drop.is_empty() {
+                let gone = self.take_files(|i, _| drop.contains(&i), selected);
+                self.bury(gone, report);
+            }
+            self.user_src_files.extend(graves);
+        }
     }
 
     /// Initialize the pins/ scaffold (folder + empty mod.rs).
@@ -608,6 +950,157 @@ impl ProjectTreeState {
             self.user_src_files.push((mod_path, String::new()));
         }
     }
+}
+
+/// What can tell one I2C device file from another: where it is, the number
+/// and name in its file name, and the address and id in its generated block.
+#[derive(Debug, Clone)]
+struct DevSig {
+    path: String,
+    k: Option<usize>,
+    /// Every name this file may carry. A file from before the folders is
+    /// ambiguous: `i2c1_sensor_2.rs` is a device called "sensor 2" or the
+    /// second "sensor".
+    slugs: Vec<String>,
+    address: Option<u8>,
+    uid: Option<u32>,
+    /// The flat name from before the folders: what a flat file IS called, and
+    /// what a target WOULD have been called (`<bus>_<slug>`, `<bus>_device<k>`,
+    /// `_2` on a repeat).
+    legacy: Option<String>,
+    /// Kept in the graveyard: written this session, so its id is the live
+    /// model's - a device with ANOTHER id is another device.
+    grave: bool,
+}
+
+impl DevSig {
+    /// A device file in a bus folder, `device<k>[_<slug>].rs`.
+    fn nested(path: String, k: usize, slug: &str, body: &str, bus: &str) -> Self {
+        DevSig {
+            path,
+            k: Some(k),
+            slugs: vec![slug.to_owned()],
+            address: codegen::device_file_address(body),
+            uid: codegen::device_file_id(body)
+                .filter(|(b, _)| *b == bus)
+                .map(|(_, u)| u),
+            legacy: None,
+            grave: false,
+        }
+    }
+
+    /// A flat `<bus>_<rest>.rs` from before the folders.
+    fn legacy(path: String, rest: &str, body: &str, bus: &str) -> Self {
+        let mut slugs = vec![rest.to_owned()];
+        if let Some((base, n)) = rest.rsplit_once('_')
+            && !base.is_empty()
+            && !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+        {
+            slugs.push(base.to_owned());
+        }
+        // An unnamed device was `<bus>_device<k>`: it is `device<k>.rs` now.
+        let k = rest
+            .strip_prefix("device")
+            .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|d| d.parse().ok());
+        if k.is_some() {
+            slugs.push(String::new());
+        }
+        DevSig {
+            path,
+            k,
+            slugs,
+            address: codegen::device_file_address(body),
+            uid: None,
+            legacy: Some(format!("{bus}_{rest}")),
+            grave: false,
+        }
+    }
+}
+
+fn same_address(o: &DevSig, t: &DevSig) -> bool {
+    o.address.is_some() && o.address == t.address
+}
+
+fn same_name(o: &DevSig, t: &DevSig) -> bool {
+    o.slugs.iter().any(|s| t.slugs.contains(s))
+}
+
+/// Pair each old device file (`olds`) with the device file it is now
+/// (`targets`), returning `(old, target)` indices.
+///
+/// Tiers, strongest first; a pair is taken only when it is the ONLY one its
+/// tier allows for BOTH files among those still unpaired - a guess is worse
+/// than a fresh file, and a fresh file is what an unpaired target gets.
+///
+/// 1. The device's id - written only once it has one, and taken only when
+///    the name or the address agrees too: an `mcu.config` restored on its own
+///    can hand the same uids to other devices.
+/// 2. Name and address: a device whose number moved.
+/// 3. The flat name from before the folders: a project's first sync, where
+///    two unnamed devices at 0x00 differ in nothing else.
+/// 4. Number and a set address: a device renamed.
+/// 5. A set address alone: renamed AND renumbered in one frame (the panel's
+///    and the canvas's edits arrive together).
+/// 6. A name alone: a device whose address changed.
+/// 7. The same path: nothing about it changed that could tell.
+///
+/// In no tier does a file from the graveyard go to a device with another id:
+/// it was written this session, so that is another device - a new one that
+/// happens to take a removed one's number and name.
+fn match_devices(olds: &[&DevSig], targets: &[DevSig]) -> Vec<(usize, usize)> {
+    let tiers: [fn(&DevSig, &DevSig) -> bool; 7] = [
+        |o, t| o.uid.is_some() && o.uid == t.uid && (same_name(o, t) || same_address(o, t)),
+        |o, t| same_name(o, t) && same_address(o, t),
+        |o, t| o.legacy.is_some() && o.legacy == t.legacy,
+        |o, t| o.k.is_some() && o.k == t.k && same_address(o, t) && o.address != Some(0),
+        |o, t| same_address(o, t) && o.address != Some(0),
+        |o, t| o.slugs.iter().any(|s| !s.is_empty() && t.slugs.contains(s)),
+        |o, t| o.path == t.path,
+    ];
+    let other_device =
+        |o: &DevSig, t: &DevSig| o.grave && o.uid.is_some() && t.uid.is_some() && o.uid != t.uid;
+    let mut old_done = vec![false; olds.len()];
+    let mut target_done = vec![false; targets.len()];
+    let mut pairs = Vec::new();
+    for tier in tiers {
+        loop {
+            let mut found: Vec<(usize, usize)> = Vec::new();
+            for (o, old) in olds.iter().enumerate() {
+                if old_done[o] {
+                    continue;
+                }
+                let mut hits = targets.iter().enumerate().filter(|(t, target)| {
+                    !target_done[*t] && tier(old, target) && !other_device(old, target)
+                });
+                let (Some((t, target)), None) = (hits.next(), hits.next()) else {
+                    continue;
+                };
+                let rivals = olds
+                    .iter()
+                    .enumerate()
+                    .filter(|(o2, other)| {
+                        !old_done[*o2] && tier(other, target) && !other_device(other, target)
+                    })
+                    .count();
+                if rivals == 1 {
+                    found.push((o, t));
+                }
+            }
+            if found.is_empty() {
+                break;
+            }
+            for (o, t) in found {
+                if !old_done[o] && !target_done[t] {
+                    old_done[o] = true;
+                    target_done[t] = true;
+                    pairs.push((o, t));
+                }
+            }
+        }
+    }
+    pairs
 }
 
 /// Replace the GENERATED section in a pin file while preserving user code.
@@ -1238,6 +1731,7 @@ mod tests {
             ],
             false,
             &["custom_led".to_string()],
+            &mut None,
         );
         let mod_rs = &state
             .user_src_files
@@ -1264,6 +1758,7 @@ mod tests {
             &[("custom_menu_nav.rs".to_string(), generated.to_string())],
             false,
             &keep,
+            &mut None,
         );
         let edited = "pub struct Encoder<A> {\n    pub a: A,\n    pub was_pressed: bool,\n}\n";
         state
@@ -1278,6 +1773,7 @@ mod tests {
                 &[("custom_menu_nav.rs".to_string(), generated.to_string())],
                 force,
                 &keep,
+                &mut None,
             );
             let body = &state
                 .user_src_files
@@ -1293,6 +1789,7 @@ mod tests {
             &[("custom_menu_nav_1.rs".to_string(), generated.to_string())],
             false,
             &keep,
+            &mut None,
         );
         let new = state
             .user_src_files
@@ -1320,7 +1817,12 @@ mod tests {
         let mut state = ProjectTreeState::new();
         let path = "src/pins/configs/usart1.rs";
         let v1 = "// <<< GENERATED>>>\nconst BAUDRATE: u32 = 115200;\n// <<< GENERATED END >>>\n\nuse foo;\npub fn init() { /* orig */ }\n";
-        state.sync_config_files(&[("usart1.rs".to_string(), v1.to_string())], false, &[]);
+        state.sync_config_files(
+            &[("usart1.rs".to_string(), v1.to_string())],
+            false,
+            &[],
+            &mut None,
+        );
         assert!(state.user_src_files.iter().any(|(p, _)| p == path));
 
         // User edits the EDITABLE part (below the markers).
@@ -1335,7 +1837,12 @@ mod tests {
 
         // Regenerate with a new baud rate (only the constants block changes).
         let v2 = "// <<< GENERATED>>>\nconst BAUDRATE: u32 = 9600;\n// <<< GENERATED END >>>\n\nuse foo;\npub fn init() { /* orig */ }\n";
-        state.sync_config_files(&[("usart1.rs".to_string(), v2.to_string())], false, &[]);
+        state.sync_config_files(
+            &[("usart1.rs".to_string(), v2.to_string())],
+            false,
+            &[],
+            &mut None,
+        );
 
         let body = &state
             .user_src_files
@@ -1368,11 +1875,17 @@ mod tests {
             &[("usart1.rs".to_string(), portable.to_string())],
             false,
             &[],
+            &mut None,
         );
 
         // Apply switches the runtime → a completely different (native) template.
         let native = "// <<< GENERATED>>>\nconst BAUDRATE: u32 = 115200;\n// <<< GENERATED END >>>\n\nuse native;\npub fn init() -> (Tx, Rx) { /* native */ }\n";
-        state.sync_config_files(&[("usart1.rs".to_string(), native.to_string())], true, &[]);
+        state.sync_config_files(
+            &[("usart1.rs".to_string(), native.to_string())],
+            true,
+            &[],
+            &mut None,
+        );
 
         let body = &state
             .user_src_files
@@ -1382,5 +1895,765 @@ mod tests {
             .1;
         assert!(body.contains("(Tx, Rx)"), "new template applied:\n{body}");
         assert!(!body.contains("SerialIo"), "old template gone:\n{body}");
+    }
+
+    /// A config module may be a FOLDER: `configs/mod.rs` declares it once, by
+    /// its folder name, and never names a file inside it - `pub mod i2c1/mod;`
+    /// is not Rust. The folder shows in the tree while it holds a file.
+    #[test]
+    fn a_config_folder_is_declared_once_by_its_name() {
+        let mut state = ProjectTreeState::new();
+        let body = "// <<< GENERATED>>>\n// <<< GENERATED END >>>\n";
+        let files: Vec<(String, String)> = [
+            "usart1.rs",
+            "i2c1/mod.rs",
+            "i2c1/device1.rs",
+            "i2c1/device2_imu.rs",
+        ]
+        .iter()
+        .map(|n| (n.to_string(), body.to_string()))
+        .collect();
+        state.sync_config_files(&files, false, &[], &mut None);
+        let mod_rs = &state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == "src/pins/configs/mod.rs")
+            .unwrap()
+            .1;
+        assert_eq!(mod_rs.matches("pub mod i2c1;").count(), 1, "{mod_rs}");
+        assert!(mod_rs.contains("pub mod usart1;"), "{mod_rs}");
+        assert!(!mod_rs.contains("device"), "{mod_rs}");
+        assert!(
+            !mod_rs
+                .lines()
+                .any(|l| l.starts_with("pub mod") && l.contains('/')),
+            "{mod_rs}"
+        );
+        for f in ["i2c1/mod.rs", "i2c1/device1.rs", "i2c1/device2_imu.rs"] {
+            assert_file_exists(&state, &format!("src/pins/configs/{f}"));
+        }
+        assert_folder_exists(&state, "src/pins/configs/i2c1");
+
+        // The bus goes: its whole folder goes, and so does the folder entry.
+        state.sync_config_files(&files[..1], false, &[], &mut None);
+        assert_file_not_exists(&state, "src/pins/configs/i2c1/mod.rs");
+        assert_file_not_exists(&state, "src/pins/configs/i2c1/device1.rs");
+        assert!(
+            !state
+                .user_src_folders
+                .iter()
+                .any(|f| f == "src/pins/configs/i2c1"),
+            "{:?}",
+            state.user_src_folders
+        );
+
+        // Nothing configured at all: the subtree goes, subfolders included.
+        state.sync_config_files(&files, false, &[], &mut None);
+        state.sync_config_files(&[], false, &[], &mut None);
+        assert!(
+            !state
+                .user_src_folders
+                .iter()
+                .any(|f| f.starts_with("src/pins/configs")),
+            "{:?}",
+            state.user_src_folders
+        );
+        assert!(
+            !state
+                .user_src_files
+                .iter()
+                .any(|(p, _)| p.starts_with("src/pins/configs/"))
+        );
+    }
+
+    /// The editor names its file by index. A prune in front of it shifts it
+    /// down with the list; a prune of the file itself leaves no selection.
+    #[test]
+    fn a_config_prune_carries_the_open_file() {
+        let body = "// <<< GENERATED>>>\n// <<< GENERATED END >>>\n";
+        let both = [
+            ("spi1.rs".to_string(), body.to_string()),
+            ("usart1.rs".to_string(), body.to_string()),
+        ];
+        let mut state = ProjectTreeState::new();
+        state
+            .user_src_files
+            .push(("src/app/logic.rs".into(), "fn a() {}".into()));
+        state.sync_config_files(&both, false, &[], &mut None);
+        let at = |s: &ProjectTreeState, p: &str| s.user_src_files.iter().position(|(q, _)| q == p);
+        let usart = at(&state, "src/pins/configs/usart1.rs").unwrap();
+        let spi = at(&state, "src/pins/configs/spi1.rs").unwrap();
+        assert!(spi < usart, "the fixture needs spi1 in front of usart1");
+
+        let mut selected = Some(usart);
+        state.sync_config_files(&both[1..], false, &[], &mut selected);
+        assert_eq!(
+            selected,
+            at(&state, "src/pins/configs/usart1.rs"),
+            "followed its file"
+        );
+
+        let mut selected = at(&state, "src/pins/configs/usart1.rs");
+        state.sync_config_files(
+            &[("spi1.rs".to_string(), body.to_string())],
+            false,
+            &[],
+            &mut selected,
+        );
+        assert_eq!(selected, None, "its own file was pruned");
+
+        let mut selected = at(&state, "src/app/logic.rs");
+        state.sync_config_files(&[], false, &[], &mut selected);
+        assert_eq!(
+            selected,
+            at(&state, "src/app/logic.rs"),
+            "a file outside configs/"
+        );
+    }
+
+    // ── I2C bus folders: device files move with their device ───────────────
+
+    use crate::panels::mcu_module::modules::{I2cDevice, I2cModuleConfig};
+
+    const BUS: &str = "src/pins/configs/i2c1";
+
+    /// What codegen emits for I2C1 with these devices: `mod.rs` plus a file
+    /// per device, through the real helpers. `(name, address, uid)`.
+    fn bus_files(devs: &[(&str, u8, u32)]) -> Vec<(String, String)> {
+        let mut c = I2cModuleConfig::new(1);
+        c.devices = devs
+            .iter()
+            .map(|(n, a, u)| I2cDevice {
+                name: (*n).into(),
+                address: *a,
+                uid: *u,
+            })
+            .collect();
+        let body = format!(
+            "// <<< GENERATED>>>\npub const CLOCK_KHZ: u32 = 100;\n{}// <<< GENERATED END >>>\n\npub fn init() {{}}\n",
+            codegen::i2c_device_mods(Some(&c))
+        );
+        codegen::i2c_bus_files("i2c1", body, Some(&c))
+    }
+
+    fn sync(state: &mut ProjectTreeState, files: &[(String, String)]) -> ConfigSync {
+        state.sync_config_files(files, false, &[], &mut None)
+    }
+
+    fn text<'a>(state: &'a ProjectTreeState, path: &str) -> Option<&'a str> {
+        state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, c)| c.as_str())
+    }
+
+    /// The user writes below the markers of `path`.
+    fn write_below(state: &mut ProjectTreeState, path: &str, code: &str) {
+        let f = state
+            .user_src_files
+            .iter_mut()
+            .find(|(p, _)| p == path)
+            .unwrap_or_else(|| panic!("{path} is not in the tree"));
+        f.1.push_str(code);
+        f.1.push('\n');
+    }
+
+    fn device_files(state: &ProjectTreeState) -> Vec<&str> {
+        let mut v: Vec<&str> = state
+            .user_src_files
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .filter(|p| p.starts_with(BUS) && !p.ends_with("/mod.rs"))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn dev(f: &str) -> String {
+        format!("{BUS}/{f}.rs")
+    }
+
+    /// Rename, remove the first, undo: each device's code goes where the
+    /// device goes, and the removed one's comes back with it.
+    #[test]
+    fn a_device_file_moves_with_its_device() {
+        let mut st = ProjectTreeState::new();
+        sync(&mut st, &bus_files(&[("oled", 0x3C, 1), ("imu", 0x68, 2)]));
+        write_below(&mut st, &dev("device1_oled"), "// MINE-OLED");
+        write_below(&mut st, &dev("device2_imu"), "// MINE-IMU");
+
+        let r = sync(
+            &mut st,
+            &bus_files(&[("display", 0x3C, 1), ("imu", 0x68, 2)]),
+        );
+        assert!(
+            text(&st, &dev("device1_display"))
+                .unwrap()
+                .contains("MINE-OLED")
+        );
+        assert!(text(&st, &dev("device1_oled")).is_none());
+        assert_eq!(r.moved, vec![(dev("device1_oled"), dev("device1_display"))]);
+        assert!(r.removed.is_empty(), "{:?}", r.removed);
+
+        sync(&mut st, &bus_files(&[("imu", 0x68, 2)]));
+        assert_eq!(device_files(&st), vec![dev("device1_imu")]);
+        assert!(text(&st, &dev("device1_imu")).unwrap().contains("MINE-IMU"));
+
+        // Ctrl+Z: both where they were, the removed one's code included.
+        sync(
+            &mut st,
+            &bus_files(&[("display", 0x3C, 1), ("imu", 0x68, 2)]),
+        );
+        assert_eq!(
+            device_files(&st),
+            vec![dev("device1_display"), dev("device2_imu")]
+        );
+        assert!(
+            text(&st, &dev("device1_display"))
+                .unwrap()
+                .contains("MINE-OLED")
+        );
+        assert!(text(&st, &dev("device2_imu")).unwrap().contains("MINE-IMU"));
+        assert!(
+            !text(&st, &dev("device2_imu"))
+                .unwrap()
+                .contains("MINE-OLED")
+        );
+    }
+
+    /// Three unnamed devices at 0x00 - nothing tells them apart but their id.
+    /// Remove the first: each survivor keeps its OWN code on its new number.
+    #[test]
+    fn unnamed_devices_at_zero_are_told_apart_by_their_id() {
+        let mut st = ProjectTreeState::new();
+        sync(&mut st, &bus_files(&[("", 0, 1), ("", 0, 2), ("", 0, 3)]));
+        write_below(&mut st, &dev("device1"), "// CODE-A");
+        write_below(&mut st, &dev("device2"), "// CODE-B");
+        write_below(&mut st, &dev("device3"), "// CODE-C");
+        let mut selected = st
+            .user_src_files
+            .iter()
+            .position(|(p, _)| *p == dev("device3"));
+        let r = st.sync_config_files(
+            &bus_files(&[("", 0, 2), ("", 0, 3)]),
+            false,
+            &[],
+            &mut selected,
+        );
+        assert_eq!(device_files(&st), vec![dev("device1"), dev("device2")]);
+        let one = text(&st, &dev("device1")).unwrap();
+        let two = text(&st, &dev("device2")).unwrap();
+        assert!(one.contains("CODE-B") && !one.contains("CODE-A"), "{one}");
+        assert!(two.contains("CODE-C") && !two.contains("CODE-B"), "{two}");
+        assert_eq!(r.removed, vec![dev("device1")], "the first device's file");
+        assert_eq!(
+            selected.map(|i| st.user_src_files[i].0.as_str()),
+            Some(dev("device2").as_str()),
+            "the open file is followed, not its old path"
+        );
+    }
+
+    /// A bus nobody edited since it was loaded has no ids in its files. Its
+    /// first edit still sends each file to the right device: by name and
+    /// address, by number and address, or by address alone - two edits in one
+    /// frame included.
+    #[test]
+    fn without_ids_names_numbers_and_addresses_decide() {
+        // Remove the middle one.
+        let mut st = ProjectTreeState::new();
+        sync(
+            &mut st,
+            &bus_files(&[("oled", 0x3C, 0), ("imu", 0x68, 0), ("baro", 0x76, 0)]),
+        );
+        write_below(&mut st, &dev("device1_oled"), "// MINE-OLED");
+        write_below(&mut st, &dev("device3_baro"), "// MINE-BARO");
+        sync(&mut st, &bus_files(&[("oled", 0x3C, 1), ("baro", 0x76, 3)]));
+        assert_eq!(
+            device_files(&st),
+            vec![dev("device1_oled"), dev("device2_baro")]
+        );
+        assert!(
+            text(&st, &dev("device2_baro"))
+                .unwrap()
+                .contains("MINE-BARO")
+        );
+
+        // Remove the first AND rename the second, in one frame.
+        let mut st = ProjectTreeState::new();
+        sync(&mut st, &bus_files(&[("a", 0x10, 0), ("b", 0x20, 0)]));
+        write_below(&mut st, &dev("device2_b"), "// MINE-B");
+        sync(&mut st, &bus_files(&[("y", 0x20, 2)]));
+        assert_eq!(device_files(&st), vec![dev("device1_y")]);
+        assert!(text(&st, &dev("device1_y")).unwrap().contains("MINE-B"));
+
+        // Nothing tells two files apart: the path decides, as it always did,
+        // and nothing is doubled or lost from the tree.
+        let mut st = ProjectTreeState::new();
+        sync(&mut st, &bus_files(&[("s", 0, 0), ("s", 0, 0)]));
+        sync(&mut st, &bus_files(&[("s", 0, 2)]));
+        assert_eq!(device_files(&st), vec![dev("device1_s")]);
+    }
+
+    /// A project from before buses were folders: its bus file becomes the
+    /// folder's `mod.rs` - the same entry, the user's `init` kept, the address
+    /// gone - and its device files move in, their code with them, losing the
+    /// warning that a rename throws it away.
+    #[test]
+    fn a_project_from_before_the_folders_moves_in() {
+        let legacy_device = |addr: u8, mine: &str| {
+            format!(
+                "// <<< GENERATED>>>\n// Device config (from the Virtual Module) — auto-updated; edit in the module.\npub const DEVICE_ADDRESS: u8 = 0x{addr:02X};\n// <<< GENERATED END >>>\n\n// Everything below is editable.\n{}{mine}\n",
+                codegen::LEGACY_DEVICE_WARNING
+            )
+        };
+        let seed = |st: &mut ProjectTreeState| {
+            st.user_src_files.push((
+                "src/pins/configs/mod.rs".into(),
+                "// <<< GENERATED>>>\npub mod i2c1;\npub mod i2c1_oled;\npub mod i2c1_imu;\n// <<< GENERATED END >>>\n".into(),
+            ));
+            st.user_src_files.push((
+                "src/pins/configs/i2c1.rs".into(),
+                "// <<< GENERATED>>>\npub const CLOCK_KHZ: u32 = 100;\npub const DEVICE_ADDRESS: u8 = 0x3C;\n// <<< GENERATED END >>>\n\npub fn init() { /* EDITED */ }\n".into(),
+            ));
+            st.user_src_files.push((
+                "src/pins/configs/i2c1_oled.rs".into(),
+                legacy_device(0x3C, "// MINE-OLED"),
+            ));
+            st.user_src_files.push((
+                "src/pins/configs/i2c1_imu.rs".into(),
+                legacy_device(0x68, "// MINE-IMU"),
+            ));
+        };
+
+        let mut st = ProjectTreeState::new();
+        seed(&mut st);
+        let at = st
+            .user_src_files
+            .iter()
+            .position(|(p, _)| p == "src/pins/configs/i2c1.rs");
+        let mut selected = at;
+        let r = st.sync_config_files(
+            &bus_files(&[("oled", 0x3C, 0), ("imu", 0x68, 0)]),
+            false,
+            &[],
+            &mut selected,
+        );
+        let m = text(&st, &format!("{BUS}/mod.rs")).unwrap();
+        assert!(m.contains("/* EDITED */"), "{m}");
+        assert!(
+            m.contains("pub mod device1_oled;") && m.contains("pub mod device2_imu;"),
+            "{m}"
+        );
+        assert!(!m.contains("DEVICE_ADDRESS: u8"), "{m}");
+        assert_eq!(
+            selected.map(|i| st.user_src_files[i].0.clone()),
+            Some(format!("{BUS}/mod.rs"))
+        );
+        let oled = text(&st, &dev("device1_oled")).unwrap();
+        assert!(
+            oled.contains("MINE-OLED") && oled.contains("DEVICE_ADDRESS: u8 = 0x3C;"),
+            "{oled}"
+        );
+        assert!(!oled.contains(codegen::LEGACY_DEVICE_WARNING), "{oled}");
+        assert!(oled.contains(codegen::DEVICE_MOVE_NOTE), "{oled}");
+        assert!(text(&st, &dev("device2_imu")).unwrap().contains("MINE-IMU"));
+        for flat in ["i2c1.rs", "i2c1_oled.rs", "i2c1_imu.rs"] {
+            assert!(
+                text(&st, &format!("src/pins/configs/{flat}")).is_none(),
+                "{flat} is still there"
+            );
+        }
+        assert_eq!(r.migrated.len(), 3, "{:?}", r.migrated);
+        let cfg_mod = text(&st, "src/pins/configs/mod.rs").unwrap();
+        assert_eq!(cfg_mod.matches("pub mod i2c1;").count(), 1, "{cfg_mod}");
+        assert!(!cfg_mod.contains("i2c1_oled"), "{cfg_mod}");
+
+        // Reopened, and the FIRST thing the user does is an edit: the old
+        // files are read by what they hold, not rebuilt from the new list.
+        let mut st = ProjectTreeState::new();
+        seed(&mut st);
+        sync(
+            &mut st,
+            &bus_files(&[("display", 0x3C, 1), ("imu", 0x68, 2)]),
+        );
+        assert!(
+            text(&st, &dev("device1_display"))
+                .unwrap()
+                .contains("MINE-OLED")
+        );
+        assert!(text(&st, &dev("device2_imu")).unwrap().contains("MINE-IMU"));
+        let mut st = ProjectTreeState::new();
+        seed(&mut st);
+        sync(&mut st, &bus_files(&[("imu", 0x68, 2)]));
+        assert_eq!(device_files(&st), vec![dev("device1_imu")]);
+        assert!(text(&st, &dev("device1_imu")).unwrap().contains("MINE-IMU"));
+
+        // A second device of the same name was `<bus>_<name>_2`.
+        let mut st = ProjectTreeState::new();
+        st.user_src_files.push((
+            "src/pins/configs/i2c1_sensor.rs".into(),
+            legacy_device(0x40, "// FIRST"),
+        ));
+        st.user_src_files.push((
+            "src/pins/configs/i2c1_sensor_2.rs".into(),
+            legacy_device(0x41, "// SECOND"),
+        ));
+        sync(
+            &mut st,
+            &bus_files(&[("sensor", 0x40, 0), ("sensor", 0x41, 0)]),
+        );
+        assert!(text(&st, &dev("device1_sensor")).unwrap().contains("FIRST"));
+        assert!(
+            text(&st, &dev("device2_sensor"))
+                .unwrap()
+                .contains("SECOND")
+        );
+    }
+
+    /// `i2c1.rs` beside an `i2c1/mod.rs` does not compile. The folder's wins,
+    /// and the dropped one is reported - with its content - not lost quietly.
+    #[test]
+    fn an_old_bus_file_beside_its_folder_is_reported() {
+        let mut st = ProjectTreeState::new();
+        sync(&mut st, &bus_files(&[("oled", 0x3C, 1)]));
+        write_below(&mut st, &format!("{BUS}/mod.rs"), "// NEW-INIT");
+        st.user_src_files.push((
+            "src/pins/configs/i2c1.rs".into(),
+            "pub fn init() { /* OLD */ }\n".into(),
+        ));
+        let r = sync(&mut st, &bus_files(&[("oled", 0x3C, 1)]));
+        assert!(text(&st, "src/pins/configs/i2c1.rs").is_none());
+        assert!(
+            text(&st, &format!("{BUS}/mod.rs"))
+                .unwrap()
+                .contains("NEW-INIT")
+        );
+        assert_eq!(r.conflicts.len(), 1);
+        assert!(r.conflicts[0].1.contains("/* OLD */"));
+    }
+
+    /// A Runtime Apply rewrites a bus's `mod.rs` whole - its `init` is what
+    /// changed - but a device file only gets its generated block: nothing in
+    /// it depends on the Runtime, and the rest is the user's.
+    #[test]
+    fn force_leaves_the_device_files_alone() {
+        let mut st = ProjectTreeState::new();
+        let files = bus_files(&[("oled", 0x3C, 1)]);
+        sync(&mut st, &files);
+        write_below(&mut st, &dev("device1_oled"), "// MINE");
+        write_below(&mut st, &format!("{BUS}/mod.rs"), "// OLD-INIT");
+        st.sync_config_files(&files, true, &[], &mut None);
+        assert!(text(&st, &dev("device1_oled")).unwrap().contains("// MINE"));
+        assert!(
+            !text(&st, &format!("{BUS}/mod.rs"))
+                .unwrap()
+                .contains("OLD-INIT")
+        );
+    }
+
+    /// A bus that leaves the generated files - a pad cleared, a Runtime with
+    /// no config files - and comes back brings the user's code back with it.
+    #[test]
+    fn a_bus_that_comes_back_brings_its_code_back() {
+        let usart = (
+            "usart1.rs".to_string(),
+            "// <<< GENERATED>>>\n// <<< GENERATED END >>>\n".to_string(),
+        );
+        let mut with_bus = bus_files(&[("oled", 0x3C, 1)]);
+        with_bus.push(usart.clone());
+        let mut st = ProjectTreeState::new();
+        sync(&mut st, &with_bus);
+        write_below(&mut st, &dev("device1_oled"), "// MINE-DEVICE");
+        write_below(&mut st, &format!("{BUS}/mod.rs"), "// MINE-INIT");
+
+        for away in [vec![usart.clone()], Vec::new()] {
+            let r = sync(&mut st, &away);
+            assert!(text(&st, &dev("device1_oled")).is_none());
+            assert!(r.removed.contains(&dev("device1_oled")), "{:?}", r.removed);
+            sync(&mut st, &with_bus);
+            assert!(
+                text(&st, &dev("device1_oled"))
+                    .unwrap()
+                    .contains("MINE-DEVICE")
+            );
+            assert!(
+                text(&st, &format!("{BUS}/mod.rs"))
+                    .unwrap()
+                    .contains("MINE-INIT")
+            );
+        }
+        assert_eq!(
+            st.user_src_files
+                .iter()
+                .filter(|(p, _)| p.starts_with(BUS))
+                .count(),
+            2,
+            "nothing doubled"
+        );
+    }
+
+    /// A device file exactly as the build before the folders wrote it - its
+    /// warning, its example - with the user's own `init_display` below the
+    /// markers. Its code moves in; nothing in what the user wrote decides
+    /// whether it is a device file.
+    #[test]
+    fn an_old_device_file_moves_in_whatever_the_user_wrote() {
+        let head = "// <<< GENERATED>>>\n// Device config (from the Virtual Module) — auto-updated; edit in the module.\n// 7-bit address of the device on this bus — for YOUR code, not for `init`:\n// an I2C master takes the address per transaction.\npub const DEVICE_ADDRESS: u8 = 0x3C;\n// <<< GENERATED END >>>\n\n// Everything below is editable — your changes are preserved on regeneration.\n//\n// `oled` is one of the devices sharing the i2c1 bus. The bus driver is\n// built ONCE — see `i2c1` — and `main.rs` owns the handle; this file only says\n// which address on it is yours. Write the device's own routines here and\n// take the bus as an argument:\n//\n//     pub fn read_id<I: embedded_hal::i2c::I2c>(bus: &mut I) -> Option<u8> {\n//         let mut rx = [0u8; 1];\n//         bus.write_read(DEVICE_ADDRESS, &[0x00], &mut rx).ok()?;\n//         Some(rx[0])\n//     }\n//\n// Renaming this device in the panel renames this file, and the old one is\n// removed with whatever was below its markers. Move anything you want to\n// keep before you rename.\npub fn init_display<I>(bus: &mut I) { /* MINE */ }\n";
+        let mut st = ProjectTreeState::new();
+        st.user_src_files
+            .push(("src/pins/configs/i2c1_oled.rs".into(), head.into()));
+        st.user_src_files.push((
+            "src/pins/configs/i2c1_imu.rs".into(),
+            head.replace("0x3C", "0x68")
+                .replace("/* MINE */", "/* IMU */"),
+        ));
+        let r = sync(&mut st, &bus_files(&[("oled", 0x3C, 0), ("imu", 0x68, 0)]));
+        let oled = text(&st, &dev("device1_oled")).unwrap();
+        assert!(oled.contains("/* MINE */"), "{oled}");
+        assert!(
+            !oled.contains("Move anything you want to"),
+            "the old warning stayed:\n{oled}"
+        );
+        assert!(
+            text(&st, &dev("device2_imu"))
+                .unwrap()
+                .contains("/* IMU */")
+        );
+        assert!(r.unplaced.is_empty(), "{:?}", r.unplaced);
+    }
+
+    /// Two unnamed devices still at 0x00 differ in nothing but their old flat
+    /// names, and that is enough. When a first edit removes one, the file
+    /// left over is not lost quietly: it is reported, with its text.
+    #[test]
+    fn old_unnamed_devices_at_zero_move_in_by_their_old_names() {
+        let old = |mine: &str| {
+            format!(
+                "// <<< GENERATED>>>\npub const DEVICE_ADDRESS: u8 = 0x00;\n// <<< GENERATED END >>>\n{mine}\n"
+            )
+        };
+        let seed = |st: &mut ProjectTreeState| {
+            st.user_src_files
+                .push(("src/pins/configs/i2c1_device1.rs".into(), old("// CODE-A")));
+            st.user_src_files
+                .push(("src/pins/configs/i2c1_device2.rs".into(), old("// CODE-B")));
+        };
+        let mut st = ProjectTreeState::new();
+        seed(&mut st);
+        let r = sync(&mut st, &bus_files(&[("", 0, 0), ("", 0, 0)]));
+        assert!(text(&st, &dev("device1")).unwrap().contains("CODE-A"));
+        assert!(text(&st, &dev("device2")).unwrap().contains("CODE-B"));
+        assert!(r.unplaced.is_empty(), "{:?}", r.unplaced);
+
+        let mut st = ProjectTreeState::new();
+        seed(&mut st);
+        let r = sync(&mut st, &bus_files(&[("", 0, 2)]));
+        assert_eq!(device_files(&st), vec![dev("device1")]);
+        assert_eq!(r.unplaced.len(), 1, "{:?}", r.unplaced);
+        let (left, body) = &r.unplaced[0];
+        assert!(left.starts_with("src/pins/configs/i2c1_device"), "{left}");
+        assert!(body.contains("CODE-"), "{body}");
+    }
+
+    /// Three old devices called the same, at three addresses, and the first
+    /// edit removes the first: each survivor finds its code by name AND
+    /// address - `i2c1_sensor_2.rs` is a "sensor" too - before the old names
+    /// (which now belong to the wrong ones) get a say. The removed one's file
+    /// is reported.
+    #[test]
+    fn old_devices_of_one_name_move_in_by_name_and_address() {
+        let old = |addr: u8, mine: &str| {
+            format!(
+                "// <<< GENERATED>>>\npub const DEVICE_ADDRESS: u8 = 0x{addr:02X};\n// <<< GENERATED END >>>\n{mine}\n"
+            )
+        };
+        let mut st = ProjectTreeState::new();
+        st.user_src_files.push((
+            "src/pins/configs/i2c1_sensor.rs".into(),
+            old(0x40, "// FIRST"),
+        ));
+        st.user_src_files.push((
+            "src/pins/configs/i2c1_sensor_2.rs".into(),
+            old(0x41, "// SECOND"),
+        ));
+        st.user_src_files.push((
+            "src/pins/configs/i2c1_sensor_3.rs".into(),
+            old(0x42, "// THIRD"),
+        ));
+        let r = sync(
+            &mut st,
+            &bus_files(&[("sensor", 0x41, 2), ("sensor", 0x42, 3)]),
+        );
+        assert!(
+            text(&st, &dev("device1_sensor"))
+                .unwrap()
+                .contains("SECOND")
+        );
+        assert!(text(&st, &dev("device2_sensor")).unwrap().contains("THIRD"));
+        assert_eq!(r.unplaced.len(), 1, "{:?}", r.unplaced);
+        assert!(r.unplaced[0].1.contains("FIRST"));
+    }
+
+    /// Remove the first device twice, undo twice. The second removal buries
+    /// a file on the SAME path as the first one's grave, and must not erase
+    /// it: both undos bring each device's own code back.
+    #[test]
+    fn two_graves_on_one_path_are_two_devices() {
+        let mut st = ProjectTreeState::new();
+        let three = bus_files(&[("", 0x10, 1), ("", 0x20, 2), ("", 0x30, 3)]);
+        sync(&mut st, &three);
+        write_below(&mut st, &dev("device1"), "// CODE-A");
+        write_below(&mut st, &dev("device2"), "// CODE-B");
+        write_below(&mut st, &dev("device3"), "// CODE-C");
+        sync(&mut st, &bus_files(&[("", 0x20, 2), ("", 0x30, 3)]));
+        sync(&mut st, &bus_files(&[("", 0x30, 3)]));
+        assert!(text(&st, &dev("device1")).unwrap().contains("CODE-C"));
+        sync(&mut st, &bus_files(&[("", 0x20, 2), ("", 0x30, 3)]));
+        sync(&mut st, &three);
+        for (f, code) in [
+            ("device1", "CODE-A"),
+            ("device2", "CODE-B"),
+            ("device3", "CODE-C"),
+        ] {
+            let t = text(&st, &dev(f)).unwrap();
+            assert!(t.contains(code), "{f}:\n{t}");
+            assert_eq!(t.matches("// CODE-").count(), 1, "{f}:\n{t}");
+        }
+    }
+
+    /// A device removed and a NEW one added in its place - same number, no
+    /// name, 0x00 - is another device: it starts from the template, and the
+    /// removed one's code stays for its own undo.
+    #[test]
+    fn a_new_device_does_not_get_a_removed_ones_code() {
+        let mut st = ProjectTreeState::new();
+        sync(&mut st, &bus_files(&[("oled", 0x3C, 1), ("", 0, 2)]));
+        write_below(&mut st, &dev("device2"), "// REMOVED-ONE");
+        sync(&mut st, &bus_files(&[("oled", 0x3C, 1)]));
+        sync(&mut st, &bus_files(&[("oled", 0x3C, 1), ("", 0, 3)]));
+        assert!(!text(&st, &dev("device2")).unwrap().contains("REMOVED-ONE"));
+        // Undo both: the removed one is back with its code.
+        sync(&mut st, &bus_files(&[("oled", 0x3C, 1)]));
+        sync(&mut st, &bus_files(&[("oled", 0x3C, 1), ("", 0, 2)]));
+        assert!(text(&st, &dev("device2")).unwrap().contains("REMOVED-ONE"));
+    }
+
+    /// A moment with no config files at all prunes `configs/mod.rs` too; the
+    /// code the user wrote around its markers comes back with the files.
+    #[test]
+    fn configs_mod_comes_back_with_its_code() {
+        let usart = vec![(
+            "usart1.rs".to_string(),
+            "// <<< GENERATED>>>\n// <<< GENERATED END >>>\n".to_string(),
+        )];
+        let mut st = ProjectTreeState::new();
+        sync(&mut st, &usart);
+        write_below(
+            &mut st,
+            "src/pins/configs/mod.rs",
+            "pub mod helpers_of_mine;",
+        );
+        sync(&mut st, &[]);
+        sync(&mut st, &usart);
+        let m = text(&st, "src/pins/configs/mod.rs").unwrap();
+        assert!(
+            m.contains("pub mod helpers_of_mine;") && m.contains("pub mod usart1;"),
+            "{m}"
+        );
+    }
+
+    /// Two devices leave and come back - several graves revived at once, each
+    /// to its own file.
+    #[test]
+    fn two_devices_come_back_each_with_its_own_code() {
+        let usart = (
+            "usart1.rs".to_string(),
+            "// <<< GENERATED>>>\n// <<< GENERATED END >>>\n".to_string(),
+        );
+        let mut with_bus = bus_files(&[("oled", 0x3C, 1), ("imu", 0x68, 2)]);
+        with_bus.push(usart.clone());
+        for away in [vec![usart.clone()], Vec::new()] {
+            let mut st = ProjectTreeState::new();
+            sync(&mut st, &with_bus);
+            write_below(&mut st, &dev("device1_oled"), "// MINE-OLED");
+            write_below(&mut st, &dev("device2_imu"), "// MINE-IMU");
+            sync(&mut st, &away);
+            sync(&mut st, &with_bus);
+            let oled = text(&st, &dev("device1_oled")).unwrap();
+            let imu = text(&st, &dev("device2_imu")).unwrap();
+            assert!(
+                oled.contains("MINE-OLED") && !oled.contains("MINE-IMU"),
+                "{oled}"
+            );
+            assert!(
+                imu.contains("MINE-IMU") && !imu.contains("MINE-OLED"),
+                "{imu}"
+            );
+        }
+    }
+
+    fn sig(path: &str, k: usize, slug: &str, address: u8, uid: Option<u32>) -> DevSig {
+        DevSig {
+            path: path.into(),
+            k: Some(k),
+            slugs: vec![slug.into()],
+            address: Some(address),
+            uid,
+            legacy: None,
+            grave: false,
+        }
+    }
+
+    /// The pairing's own rules, one by one.
+    #[test]
+    fn match_devices_takes_only_what_is_certain() {
+        // A uid held by a device with another name AND address is not proof:
+        // name and address win over it.
+        let old = sig("o1", 1, "oled", 0x3C, Some(5));
+        let targets = [
+            sig("t0", 1, "imu", 0x68, Some(5)),
+            sig("t1", 2, "oled", 0x3C, Some(9)),
+        ];
+        assert_eq!(match_devices(&[&old], &targets), vec![(0, 1)]);
+
+        // Two hits in one tier: that tier passes, a later one decides.
+        let old = sig("o1", 1, "s", 0x10, None);
+        let targets = [sig("t0", 2, "s", 0x10, None), sig("t1", 1, "s", 0x10, None)];
+        assert_eq!(match_devices(&[&old], &targets), vec![(0, 1)]);
+
+        // Two old files that each hit only this target: neither takes it.
+        let (a, b) = (sig("o1", 1, "a", 0x10, None), sig("o2", 2, "a", 0x10, None));
+        assert!(match_devices(&[&a, &b], &[sig("t0", 3, "a", 0x10, None)]).is_empty());
+
+        // 0x00 is every new device's address, not an identity - not with two
+        // targets, not with one, not with the same number.
+        let old = sig("o1", 1, "x", 0, None);
+        let targets = [sig("t0", 1, "y", 0, None), sig("t1", 2, "z", 0, None)];
+        assert!(match_devices(&[&old], &targets).is_empty());
+        assert!(match_devices(&[&old], &[sig("t0", 2, "y", 0, None)]).is_empty());
+        assert!(match_devices(&[&old], &[sig("t0", 1, "y", 0, None)]).is_empty());
+
+        // A grave beside a live file on the same path: the grave is another
+        // device's, so the live file takes the target - the grave neither
+        // takes it nor counts as its rival.
+        let mut grave = sig("same", 2, "", 0, Some(2));
+        grave.grave = true;
+        let live = sig("same", 2, "", 0, None);
+        assert_eq!(
+            match_devices(&[&grave, &live], &[sig("same", 2, "", 0, Some(3))]),
+            vec![(1, 0)]
+        );
+
+        // A grave never goes to a device with another id - not even on the
+        // same path.
+        let mut grave = sig("same", 2, "", 0, Some(2));
+        grave.grave = true;
+        assert!(match_devices(&[&grave], &[sig("same", 2, "", 0, Some(3))]).is_empty());
+        grave.uid = Some(3);
+        assert_eq!(
+            match_devices(&[&grave], &[sig("same", 2, "", 0, Some(3))]),
+            vec![(0, 0)]
+        );
     }
 }

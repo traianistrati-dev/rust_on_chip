@@ -2661,7 +2661,7 @@ pub struct I2cModuleConfig {
     /// generated output does not move, which is the point of `serde(default)`
     /// plus `skip_serializing_if`. The first edit of a device turns it into a
     /// list, one entry per device - a one-entry list generates exactly what
-    /// the scalar does (no per-device file below two devices).
+    /// the scalar does: the same one device file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<I2cDevice>,
     pub rx_model: String,
@@ -2724,12 +2724,11 @@ impl I2cModuleConfig {
         }
     }
 
-    /// The address the BUS file's own `DEVICE_ADDRESS` carries: the first
-    /// device's, or the legacy scalar when there is no device list.
+    /// The first device's address, or the legacy scalar when there is no
+    /// device list - what the RP/nRF async runtimes call
+    /// `I2C0_DEVICE_ADDRESS` for a bus's only device.
     ///
-    /// ONE reader for every emitter. The bus file names a device and so does
-    /// each per-device file; deciding "which is the first one" in two places is
-    /// how they come to disagree.
+    /// ONE reader, so "which is the first one" is decided in one place.
     pub fn primary_address(&self) -> u8 {
         self.devices.first().map_or(self.address, |d| d.address)
     }

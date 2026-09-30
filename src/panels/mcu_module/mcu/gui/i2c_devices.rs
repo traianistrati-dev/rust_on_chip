@@ -9,14 +9,16 @@
 //!
 //! # Why the fields are staged
 //!
-//! A device's config file is named after the device (`pins/configs/i2c0_oled.rs`),
-//! and the tree drops a config file whose name is no longer generated, the
-//! user's code below its markers included. A field bound straight to the model
-//! renamed that file on every keystroke: typing "oled" went through `o`, `ol`
-//! and `ole`, and each step deleted the file of the step before. So the field
-//! edits a copy and commits it once: on Enter, when it loses focus, or (if it
-//! vanished first, on a tab switch or a folded panel) the next time it is
-//! drawn. Escape throws the copy away.
+//! A device's config file is named after the device
+//! (`pins/configs/i2c0/device1_oled.rs`), so a rename renames the file. The
+//! user's code moves with it now, but each move is a workspace write and a
+//! round trip through rust-analyzer - and before the tree moved device files
+//! it DROPPED them, the code below the markers included. A field bound
+//! straight to the model renamed the file on every keystroke: typing "oled"
+//! went through `o`, `ol` and `ole`. So the field edits a copy and commits it
+//! once: on Enter, when it loses focus, or (if it vanished first, on a tab
+//! switch or a folded panel) the next time it is drawn. Escape throws the copy
+//! away.
 
 use crate::panels::mcu_module::mcu::Mcu;
 use crate::panels::mcu_module::mcu::gui::module_docs as docs;
@@ -46,23 +48,25 @@ pub struct I2cIo {
     pub acts: Vec<(u8, I2cAct)>,
 }
 
-/// The question an armed removal asks, and what it warns about.
+/// The question an armed removal asks, and what it warns about. `n` is the
+/// device's number (1-based), `devices` how many the bus has.
+///
+/// Every device has a file now, the only one included, so every removal
+/// takes one - and each device after it moves up a number, which renames
+/// its file.
 pub fn remove_question(name: &str, n: usize, devices: usize) -> String {
     let who = if name.trim().is_empty() {
         format!("device {n}")
     } else {
         name.trim().to_owned()
     };
-    if devices == 2 {
+    let file = "Its file under pins/configs/ goes too, with any code you wrote in it - Ctrl+Z brings both back until you close the IDE.";
+    if n < devices {
         format!(
-            "Remove {who}? The bus drops back to one device, so BOTH device files under pins/configs/ go - with any code you wrote in them."
-        )
-    } else if devices > 2 {
-        format!(
-            "Remove {who}? Its file under pins/configs/ goes too - with any code you wrote in it."
+            "Remove {who}? {file} The devices after it move up a number; their files are renamed and keep their code."
         )
     } else {
-        format!("Remove {who}?")
+        format!("Remove {who}? {file}")
     }
 }
 
@@ -229,7 +233,7 @@ pub fn issue_color(issue: AddressIssue) -> egui::Color32 {
     }
 }
 
-const NAME_HOVER: &str = "What this device is called. Its config file under pins/configs/ is named after it, so the name is kept only when you press Enter or leave the field - Escape keeps the old one.";
+const NAME_HOVER: &str = "What this device is called. Its file under pins/configs/<bus>/ is named after it and renamed with it, your code inside included - so the name is kept only when you press Enter or leave the field. Escape keeps the old one.";
 
 /// A device's name field. `n` is its 1-based position, for the hint.
 pub fn name_field(

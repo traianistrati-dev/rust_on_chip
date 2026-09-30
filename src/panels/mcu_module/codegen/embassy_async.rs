@@ -16,7 +16,7 @@
 //! [`Runtime::Async`]: crate::panels::mcu_module::mcu::Runtime
 
 use super::common::{ASYNC_USER_TAIL, retarget_pristine_tail};
-use super::common::{device_address_const, duty_percent_str, pin_binding, sanitize_label};
+use super::common::{duty_percent_str, pin_binding, sanitize_label};
 use super::dma_map;
 use super::embassy_common::{NO_PINS_PLACEHOLDER, gpio_bindings_exti};
 use super::nvic;
@@ -1937,9 +1937,9 @@ pub fn async_peripherals(
                  pins::configs::i2c{n}::init(p.I2C{n}, p.{scl}, p.{sda});\n"
             ));
         }
-        files.push((format!("i2c{n}.rs"), i2c_config_file(n, cfg)));
-        files.extend(super::common::i2c_device_config_files(
+        files.extend(super::common::i2c_bus_files(
             &format!("i2c{n}"),
+            i2c_config_file(n, cfg),
             cfg,
         ));
     }
@@ -4754,7 +4754,7 @@ pub fn init<'d>(
 const ASYNC_I2C_TMPL_BLOCKING: &str = r#"// <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const CLOCK_HZ: u32 = {CLK};
-{ADDR}// <<< GENERATED END >>>
+{DEVICES}// <<< GENERATED END >>>
 
 // Everything below is editable — your changes are preserved on regeneration.
 //
@@ -4787,6 +4787,8 @@ pub fn init<'d>(
 // `I2c` — no `.await`. Switch the module to Async-DMA for long transfers.
 //
 //     use embedded_hal::i2c::I2c;
+//     // The address is the device's own, in its file beside this one:
+//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
 //
 //     let mut rx = [0u8; 2];
 //     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).ok();
@@ -4799,7 +4801,7 @@ pub fn init<'d>(
 const ASYNC_I2C_TMPL_DMA: &str = r#"// <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const CLOCK_HZ: u32 = {CLK};
-{ADDR}// <<< GENERATED END >>>
+{DEVICES}// <<< GENERATED END >>>
 
 // Everything below is editable — your changes are preserved on regeneration.
 //
@@ -4852,6 +4854,8 @@ pub fn init<'d, TxD: TxDma<peripherals::I2C{N}>, RxD: RxDma<peripherals::I2C{N}>
 // Async-DMA init: the handle is an `embedded-hal-async` `I2c`.
 //
 //     use embedded_hal_async::i2c::I2c;
+//     // The address is the device's own, in its file beside this one:
+//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
 //
 //     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).await.ok();
 //
@@ -4891,10 +4895,7 @@ pub fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>) -> String {
         .replace("{N}", &n.to_string())
         .replace("{EXTRA_CFG}", &extra)
         .replace("{CLK}", &clk.to_string())
-        .replace(
-            "{ADDR}",
-            &device_address_const(None, cfg.map_or(0, |c| c.primary_address())),
-        )
+        .replace("{DEVICES}", &super::common::i2c_device_mods(cfg))
 }
 
 #[cfg(test)]
@@ -8328,14 +8329,15 @@ mod spi_i2c_option_tests {
         assert!(!i2c.contains("timeout"), "{i2c}");
     }
 
-    /// The address reaches BOTH I2C templates, and the usage example stops
-    /// inventing one of its own.
+    /// BOTH I2C templates declare the bus's devices - each one's address is in
+    /// its own file beside this `mod.rs`, so the bus names none - and the usage
+    /// example uses that address rather than inventing one of its own.
     ///
     /// Each example used to open with `const ADDR: u8 = 0x3C;` - a literal that
     /// ignored whatever the user had set two panels away, so following the
     /// example talked to the wrong device.
     #[test]
-    fn the_address_reaches_both_i2c_templates_and_their_examples() {
+    fn both_i2c_templates_declare_their_devices_and_the_example_uses_their_address() {
         for mode in [AsyncBusMode::Blocking, AsyncBusMode::AsyncDma] {
             let c = I2cModuleConfig {
                 address: 0x68,
@@ -8343,24 +8345,32 @@ mod spi_i2c_option_tests {
                 ..I2cModuleConfig::new(1)
             };
             let f = i2c_config_file(1, Some(&c));
-            assert!(f.contains("pub const DEVICE_ADDRESS: u8 = 0x68;"), "{f}");
+            assert!(f.contains("pub mod device1;"), "{f}");
+            assert!(!f.contains("pub const DEVICE_ADDRESS"), "{f}");
             assert!(!f.contains("const ADDR: u8"), "{f}");
             assert!(f.contains("DEVICE_ADDRESS, &[0x10]"), "{f}");
+            assert!(f.contains("i2c1::device1_<name>::DEVICE_ADDRESS"), "{f}");
         }
     }
 
-    /// The const sits INSIDE the generated markers, beside the clock: it
-    /// follows the Virtual Module, and everything below the markers is the
-    /// user's to edit.
+    /// The device modules sit INSIDE the generated markers - they follow the
+    /// Virtual Module - and the END marker still starts its own line: the
+    /// template puts it straight after them.
     #[test]
-    fn the_address_is_in_the_regenerated_half() {
-        let f = i2c_config_file(1, Some(&I2cModuleConfig::new(1)));
-        let gen_end = f.find("<<< GENERATED END >>>").expect("markers");
-        let addr = f.find("pub const DEVICE_ADDRESS").expect("the const");
-        assert!(
-            addr < gen_end,
-            "the address must precede the END marker:\n{f}"
-        );
+    fn the_devices_are_in_the_regenerated_half() {
+        for address in [0, 0x3C] {
+            let c = I2cModuleConfig {
+                address,
+                ..I2cModuleConfig::new(1)
+            };
+            let f = i2c_config_file(1, Some(&c));
+            let gen_end = f.find("// <<< GENERATED END >>>").expect("markers");
+            assert_eq!(&f[gen_end - 1..gen_end], "\n", "END joined a line:\n{f}");
+            let devices = f
+                .find("each holding its DEVICE_ADDRESS")
+                .or(f.find("No device on this bus yet"));
+            assert!(devices.is_some_and(|d| d < gen_end), "{f}");
+        }
     }
 
     /// LSB first reaches the config, fully qualified so no template needs a
@@ -8422,7 +8432,7 @@ mod spi_i2c_option_tests {
         let i2c = i2c_config_file(2, Some(&I2cModuleConfig::new(2)));
         for f in [&spi, &i2c] {
             assert!(!f.contains('{') || !f.contains("_CFG}"), "{f}");
-            for ph in ["{MSB}", "{TMO}", "{EXTRA_CFG}"] {
+            for ph in ["{MSB}", "{TMO}", "{EXTRA_CFG}", "{DEVICES}"] {
                 assert!(!f.contains(ph), "left {ph} behind:\n{f}");
             }
         }

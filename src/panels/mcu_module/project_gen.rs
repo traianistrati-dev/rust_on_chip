@@ -1877,7 +1877,6 @@ pub fn write_project(
         .chain(std::iter::once("src/main.rs".to_string()))
         .chain(std::iter::once("build.rs".to_string()))
         .collect();
-    remove_stale_rs(dest, dest, &expected);
 
     // NOTE: Cargo.lock is intentionally NOT deleted here. Re-resolving the
     // dependency graph on every save made saving slow (cargo re-solves the
@@ -1936,6 +1935,11 @@ pub fn write_project(
         }
         write_if_changed(&full, content.as_bytes())?;
     }
+    // The prune comes AFTER the writes. A file the tree moved - an I2C device
+    // renamed, `i2c1.rs` into `i2c1/mod.rs` - is on disk at ONE of its two
+    // paths at every moment: a write that fails (a full disk) returns above
+    // with the old copy still there, never with neither.
+    remove_stale_rs(dest, dest, &expected);
 
     // mcu.config — virtual modules + clock state, persisted out-of-source at the
     // project root (not in src/, so the project tree doesn't show it). Written

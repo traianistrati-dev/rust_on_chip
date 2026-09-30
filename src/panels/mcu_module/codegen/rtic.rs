@@ -1012,35 +1012,9 @@ mod tests {
             &[],
         );
 
-        let configs = mcu.config_files();
         // `sync_pin_files` normally writes these two; without them `mod pins;`
         // in the invariant header has nothing to point at.
-        let mut user: Vec<(String, String)> = vec![
-            (
-                "src/pins/mod.rs".into(),
-                "pub mod configs;
-"
-                .into(),
-            ),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| {
-                        format!(
-                            "pub mod {};
-",
-                            n.trim_end_matches(".rs")
-                        )
-                    })
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         std::fs::create_dir_all(&dest).expect("create dest");
         project_gen::write_project(&dest, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write project");

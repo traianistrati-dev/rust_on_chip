@@ -1392,6 +1392,11 @@ impl AppIde {
                         // ── Reset project files ───────────────────────────
                         self.project_tree.user_src_files.clear();
                         self.project_tree.user_src_folders.clear();
+                        // The previous project's pruned config files: a new
+                        // project's first regeneration would bring them back,
+                        // their code below the markers included.
+                        self.project_tree.config_graveyard.clear();
+                        self.config_moves = Default::default();
                         // Fresh config files (Cargo.toml, memory.x, …) for the
                         // selected chip — a clean slate for the new project.
                         self.reset_config_files();

@@ -32,6 +32,7 @@ mod chip_search_ui;
 mod clock_import_dialog;
 mod clone_project_dialog;
 mod close_guard;
+mod config_moves;
 mod datasheet_import_dialog;
 mod device_groups;
 mod dialogs;
@@ -2181,6 +2182,11 @@ pub struct AppIde {
     /// that flag for one frame.
     workspace_write_requested: bool,
 
+    /// What still follows a `pins/configs/` sync that moved or dropped files:
+    /// the workspace write, rust-analyzer's closes, the notice (see
+    /// `config_moves`).
+    config_moves: config_moves::ConfigMoves,
+
     /// A `--project` argument that could not be used (missing folder, no
     /// `Cargo.toml`). Shown as a banner and dismissible: a bad argument must
     /// not stop the IDE from starting, but it must not be swallowed either —
@@ -2546,6 +2552,7 @@ impl AppIde {
                     persisted.user_src_folders,
                     persisted.paths_root_relative,
                 ),
+                config_graveyard: Vec::new(),
             },
             new_src_name: None,
             new_src_folder_name: None,
@@ -2620,6 +2627,7 @@ impl AppIde {
             pending_open_dir: None,
             startup_picker: None,
             workspace_write_requested: false,
+            config_moves: Default::default(),
             cli_project_error: cli_error,
             // Empty, not the startup title: the first frame then always pushes
             // one title, so what the window shows can't drift from what this
@@ -3879,16 +3887,24 @@ impl AppIde {
             let keep: Vec<String> = self
                 .mcu
                 .as_ref()
-                .map(|m| {
-                    m.modules
-                        .iter()
-                        .filter(|md| md.kind.is_custom())
-                        .map(crate::panels::mcu_module::mcu::gui::modules::custom_file_prefix)
-                        .collect()
-                })
+                .map(|m| m.custom_keep_prefixes())
                 .unwrap_or_default();
-            self.project_tree
-                .sync_config_files(&config_files, force_configs, &keep);
+            // The editor names its file by index, which a prune shifts.
+            let mut selected = match self.selected_file {
+                ProjectFileId::UserFile(i) => Some(i),
+                _ => None,
+            };
+            let report = self.project_tree.sync_config_files(
+                &config_files,
+                force_configs,
+                &keep,
+                &mut selected,
+            );
+            if let ProjectFileId::UserFile(_) = self.selected_file {
+                self.selected_file =
+                    selected.map_or(ProjectFileId::MainRs, ProjectFileId::UserFile);
+            }
+            self.follow_config_sync(report);
             self.project_tree.sync_pin_files(&all_pins);
             if force_configs {
                 if let Some(m) = &mut self.mcu {
@@ -3902,6 +3918,9 @@ impl AppIde {
         if mcu_changed {
             self.last_workspace_change = Some(std::time::Instant::now());
         }
+        // A config file that moved or went is still at its old path in the
+        // workspace and in rust-analyzer: ask for the write that fixes both.
+        self.config_moves_frame();
 
         // ── "Show me this pin in the code" ────────────────────────────────────
         // Deliberately AFTER the regen above: a click that also assigns the pin's
@@ -5746,6 +5765,7 @@ impl eframe::App for AppIde {
         self.show_clone_project_dialog(ui);
         self.show_library_action_dialog(ui);
         self.show_workspace_add_error_dialog(ui);
+        self.show_config_moves_notice(ui);
         self.show_exit_prompt(ui);
         self.show_open_project_prompt(ui, &mut save_project_needed);
         self.show_new_project_prompt(ui);
@@ -5768,6 +5788,7 @@ impl eframe::App for AppIde {
                 );
                 // The first write creates `src/`; watch it from the next frame.
                 self.request_fs_watch_check();
+                self.config_moves_after_write();
             }
         }
 

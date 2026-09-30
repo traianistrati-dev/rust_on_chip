@@ -690,122 +690,236 @@ mod device_address_tests {
         assert!(!set.contains("Not set in the IDE yet"), "{set}");
     }
 
-    /// A bus with ONE device emits no device file at all.
-    ///
-    /// This is the case every existing project reaches the moment its one device
-    /// is edited - the edit turns the legacy `address` into a one-entry list - so
-    /// anything emitted here would rewrite the output of every project that ever
-    /// configured an I2C address, to say a second time what the bus file already
-    /// says.
-    #[test]
-    fn one_device_adds_no_file() {
-        let mut c = I2cModuleConfig::new(1);
-        c.devices = vec![I2cDevice {
-            name: "imu".into(),
-            address: 0x68,
+    fn device(name: &str, address: u8) -> I2cDevice {
+        I2cDevice {
+            name: name.into(),
+            address,
             ..Default::default()
-        }];
-        assert!(super::i2c_device_stems("i2c1", &c).is_empty());
-        assert!(super::i2c_device_config_files("i2c1", Some(&c)).is_empty());
-        // And no config at all behaves the same, so a backend never has to ask.
-        assert!(super::i2c_device_config_files("i2c1", None).is_empty());
+        }
     }
 
-    /// Two devices: a file each, named after the bus and the device, carrying
-    /// that device's address and no other.
+    fn names(files: &[(String, String)]) -> Vec<&str> {
+        files.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    fn body<'a>(files: &'a [(String, String)], name: &str) -> &'a str {
+        &files.iter().find(|(n, _)| n == name).expect(name).1
+    }
+
+    /// A bus is a folder: its `mod.rs` declares one module per device, and
+    /// each device - the ONLY one included - has a file carrying its address.
+    /// The bus itself no longer names an address.
     #[test]
-    fn each_device_gets_its_own_file_under_the_bus_name() {
+    fn a_bus_is_a_folder_with_a_file_per_device() {
         let mut c = I2cModuleConfig::new(1);
-        c.devices = vec![
-            I2cDevice {
-                name: "SSD1306 display".into(),
-                address: 0x3C,
-                ..Default::default()
-            },
-            I2cDevice {
-                name: "imu".into(),
-                address: 0x68,
-                ..Default::default()
-            },
-        ];
-        let files = super::i2c_device_config_files("i2c1", Some(&c));
-        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["i2c1_ssd1306_display.rs", "i2c1_imu.rs"]);
-        assert!(
-            files[0].1.contains("pub const DEVICE_ADDRESS: u8 = 0x3C;"),
-            "{}",
-            files[0].1
+        c.devices = vec![device("imu", 0x68)];
+        let files = super::i2c_bus_files("i2c1", super::i2c_device_mods(Some(&c)), Some(&c));
+        assert_eq!(names(&files), vec!["i2c1/mod.rs", "i2c1/device1_imu.rs"]);
+        assert_eq!(
+            body(&files, "i2c1/mod.rs")
+                .matches("pub mod device1_imu;")
+                .count(),
+            1
         );
+        assert!(!body(&files, "i2c1/mod.rs").contains("DEVICE_ADDRESS: u8"));
+        let dev = body(&files, "i2c1/device1_imu.rs");
         assert!(
-            files[1].1.contains("pub const DEVICE_ADDRESS: u8 = 0x68;"),
-            "{}",
-            files[1].1
+            dev.contains("pub const DEVICE_ADDRESS: u8 = 0x68;"),
+            "{dev}"
         );
-        // Each file points at the ONE bus driver rather than implying its own.
-        assert!(files[1].1.contains("built ONCE"), "{}", files[1].1);
+        assert!(dev.contains("Device #1 on I2C1: imu"), "{dev}");
+
+        c.devices.push(device("SSD1306 display", 0x3C));
+        let files = super::i2c_bus_files("i2c1", String::new(), Some(&c));
+        assert_eq!(
+            names(&files),
+            vec![
+                "i2c1/mod.rs",
+                "i2c1/device1_imu.rs",
+                "i2c1/device2_ssd1306_display.rs"
+            ]
+        );
+        let second = body(&files, "i2c1/device2_ssd1306_display.rs");
+        assert!(second.contains("= 0x3C;"), "{second}");
         assert!(
-            !files[1].1.contains("0x3C"),
+            !second.contains("0x68"),
             "a device must not carry its neighbour's address"
         );
     }
 
-    /// Two devices the user named the same thing must not produce two files with
-    /// one stem.
-    ///
-    /// `sync_config_files` maps its file list to module stems with no dedup and
-    /// writes one `pub mod <stem>;` per entry, so a repeat is a
-    /// duplicate-definition error in the generated crate - from two panel rows
-    /// that look perfectly reasonable.
+    /// The legacy single address is device 1, as on the canvas - a bus from
+    /// before device lists gets its file too. No device: `mod.rs` alone, saying
+    /// where they will go.
     #[test]
-    fn two_devices_with_one_name_still_get_distinct_files() {
-        let mut c = I2cModuleConfig::new(1);
-        c.devices = vec![
-            I2cDevice {
-                name: "sensor".into(),
-                address: 0x40,
-                ..Default::default()
-            },
-            I2cDevice {
-                name: "sensor".into(),
-                address: 0x41,
-                ..Default::default()
-            },
-            I2cDevice {
-                name: "Sensor!".into(),
-                address: 0x42,
-                ..Default::default()
-            },
-        ];
-        let files = super::i2c_device_config_files("i2c1", Some(&c));
-        let mut names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
-        let before = names.len();
-        names.sort();
-        names.dedup();
-        assert_eq!(names.len(), before, "stems collided: {names:?}");
+    fn the_legacy_address_is_device_one_and_no_device_is_a_bare_folder() {
+        let mut c = I2cModuleConfig::new(0);
+        c.address = 0x3C;
+        let files = super::i2c_bus_files("twim0", String::new(), Some(&c));
+        assert_eq!(names(&files), vec!["twim0/mod.rs", "twim0/device1.rs"]);
+        assert!(body(&files, "twim0/device1.rs").contains("= 0x3C;"));
+        assert!(super::i2c_device_mods(Some(&c)).contains("pub mod device1;\n"));
+
+        c.address = 0;
+        assert_eq!(
+            names(&super::i2c_bus_files("twim0", String::new(), Some(&c))),
+            vec!["twim0/mod.rs"]
+        );
+        let none = super::i2c_device_mods(Some(&c));
+        assert!(none.contains("No device on this bus yet"), "{none}");
+        assert!(!none.contains("pub mod"), "{none}");
+        assert_eq!(super::i2c_device_mods(None), none);
+        assert!(none.ends_with('\n') && super::i2c_device_mods(Some(&c)).ends_with('\n'));
     }
 
-    /// An unnamed device is still a device. It falls back to its position, so it
-    /// gets a file rather than being silently dropped - which is the difference
-    /// between the panel telling the truth and not.
+    /// The number keeps names apart - three devices called the same get three
+    /// files, and no `_2` - and an unnamed device is just its number.
     #[test]
-    fn an_unnamed_device_falls_back_to_its_position() {
+    fn the_number_keeps_the_names_apart() {
         let mut c = I2cModuleConfig::new(1);
         c.devices = vec![
-            I2cDevice {
-                name: String::new(),
-                address: 0x40,
-                ..Default::default()
-            },
-            I2cDevice {
-                name: String::new(),
-                address: 0x41,
-                ..Default::default()
-            },
+            device("sensor", 0x40),
+            device("sensor", 0x41),
+            device("", 0x42),
+            device("Sensor!", 0x43),
         ];
-        let files = super::i2c_device_config_files("twim0", Some(&c));
-        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["twim0_device1.rs", "twim0_device2.rs"]);
-        assert!(files[0].1.contains("device 1"), "{}", files[0].1);
+        let files = super::i2c_bus_files("i2c1", String::new(), Some(&c));
+        assert_eq!(
+            names(&files),
+            vec![
+                "i2c1/mod.rs",
+                "i2c1/device1_sensor.rs",
+                "i2c1/device2_sensor.rs",
+                "i2c1/device3.rs",
+                "i2c1/device4_sensor.rs"
+            ]
+        );
+        assert!(body(&files, "i2c1/device3.rs").contains("Device #3 on I2C1: device 3"));
+    }
+
+    /// The editable half is the same text in every device file: it is kept
+    /// verbatim when the file is renamed, so nothing in it may name the device.
+    #[test]
+    fn the_editable_half_names_no_device() {
+        let tail = |f: &str| f[f.find("GENERATED END").unwrap()..].to_owned();
+        let a = super::I2cDeviceFile {
+            k: 1,
+            stem: "device1_oled".into(),
+            shown: "oled".into(),
+            address: 0x3C,
+            uid: 4,
+        };
+        let b = super::I2cDeviceFile {
+            k: 7,
+            stem: "device7".into(),
+            shown: "device 7".into(),
+            address: 0,
+            uid: 0,
+        };
+        assert_eq!(
+            tail(&super::i2c_device_file("i2c1", &a)),
+            tail(&super::i2c_device_file("twim0", &b))
+        );
+    }
+
+    /// What `sync_config_files` reads back is what the device file writes -
+    /// including after the strict-lints attribute went in - and only from the
+    /// generated block. No uid, no id line.
+    #[test]
+    fn a_device_file_reads_back() {
+        let d = super::I2cDeviceFile {
+            k: 2,
+            stem: "device2_imu".into(),
+            shown: "imu".into(),
+            address: 0x68,
+            uid: 7,
+        };
+        for strict in [false, true] {
+            let f = super::strict_config_exemption(super::i2c_device_file("i2c1", &d), strict);
+            assert_eq!(super::device_file_address(&f), Some(0x68), "{f}");
+            assert_eq!(super::device_file_id(&f), Some(("i2c1", 7)), "{f}");
+        }
+        let unminted = super::i2c_device_file(
+            "i2c1",
+            &super::I2cDeviceFile {
+                uid: 0,
+                ..d.clone()
+            },
+        );
+        assert!(!unminted.contains("device-id"), "{unminted}");
+        assert_eq!(super::device_file_id(&unminted), None);
+        // Below the markers is the user's, whatever it says.
+        let fake =
+            format!("{unminted}\n// device-id: i2c1/9\npub const DEVICE_ADDRESS: u8 = 0x11;\n");
+        assert_eq!(super::device_file_id(&fake), None);
+        assert_eq!(super::device_file_address(&fake), Some(0x68));
+
+        assert_eq!(
+            super::parse_device_file_name("device3_imu.rs"),
+            Some((3, "imu"))
+        );
+        assert_eq!(super::parse_device_file_name("device12.rs"), Some((12, "")));
+        assert_eq!(super::parse_device_file_name("device_imu.rs"), None);
+        assert_eq!(super::parse_device_file_name("device1_.rs"), None);
+        assert_eq!(super::parse_device_file_name("mod.rs"), None);
+        assert_eq!(super::parse_device_file_name("device1"), None);
+    }
+
+    /// The names the RP/nRF async consts are built from, which are also the
+    /// file names of a project from before buses were folders - unchanged.
+    #[test]
+    fn the_legacy_stems_are_unchanged() {
+        let mut c = I2cModuleConfig::new(1);
+        c.devices = vec![device("imu", 0x68)];
+        assert!(
+            super::legacy_i2c_device_stems("i2c1", &c).is_empty(),
+            "one device: none"
+        );
+        c.devices = vec![device("SSD1306 display", 0x3C), device("imu", 0x68)];
+        let stems: Vec<String> = super::legacy_i2c_device_stems("i2c1", &c)
+            .into_iter()
+            .map(|(s, ..)| s)
+            .collect();
+        assert_eq!(stems, vec!["i2c1_ssd1306_display", "i2c1_imu"]);
+        c.devices = vec![
+            device("sensor", 0x40),
+            device("sensor", 0x41),
+            device("", 0x42),
+        ];
+        let stems: Vec<String> = super::legacy_i2c_device_stems("twim0", &c)
+            .into_iter()
+            .map(|(s, ..)| s)
+            .collect();
+        assert_eq!(
+            stems,
+            vec!["twim0_sensor", "twim0_sensor_2", "twim0_device3"]
+        );
+    }
+
+    /// Read back off the new file names, the old names come out the same as
+    /// the rule that wrote them - repeats, unnamed devices and all.
+    #[test]
+    fn old_names_are_rebuilt_from_the_new_ones() {
+        let mut c = I2cModuleConfig::new(1);
+        c.devices = vec![
+            device("sensor", 0x40),
+            device("", 0),
+            device("sensor", 0x41),
+            device("SSD1306 display", 0x3C),
+            device("", 0),
+        ];
+        let old: Vec<String> = super::legacy_i2c_device_stems("i2c1", &c)
+            .into_iter()
+            .map(|(s, ..)| s)
+            .collect();
+        let names: Vec<String> = super::i2c_device_files_of(&c)
+            .iter()
+            .map(|d| format!("{}.rs", d.stem))
+            .collect();
+        let read_back: Vec<(usize, &str)> = names
+            .iter()
+            .map(|n| super::parse_device_file_name(n).unwrap())
+            .collect();
+        assert_eq!(super::legacy_device_stems_for("i2c1", &read_back), old);
     }
 
     /// The comment is the half that stops a reader hunting for an `init`
@@ -819,27 +933,22 @@ mod device_address_tests {
     }
 }
 
-/// Every device on one I2C bus, as `(file stem, address, name as typed)`.
+/// Every device on one I2C bus as the RP/nRF ASYNC runtimes name its const in
+/// `main.rs`: `(stem, address, name as typed)`, EMPTY below two devices.
 ///
-/// EMPTY unless the bus carries two or more devices. One device is what every
-/// project has had since the module existed and its address is already in the bus
-/// file, so emitting a file for it would rewrite the output of every existing
-/// project to say the same thing twice. Two is where the bus file stops being
-/// able to answer "which address" on its own, and that is exactly where the
-/// per-device files start.
+/// Those runtimes build their buses inline and have no `pins/configs/`, so
+/// the const is all a device gets - `I2C0_DEVICE_ADDRESS` for a bus's one
+/// device, `I2C0_OLED_DEVICE_ADDRESS` and so on for several. The names are
+/// the ones the per-device FILES carried before a bus became a folder, and
+/// they stay: the user's code below the markers names them, and a position in
+/// the name would move every time an earlier device is removed.
 ///
-/// `bus_stem` is the bus file's own stem (`i2c1`, or `twim0` on Nordic, which
-/// calls the peripheral a TWIM everywhere else in its generated code). Sharing
-/// the prefix keeps a device file sorted beside its bus and stops the two being
-/// read as different peripherals.
+/// Also the old file names of those per-device files (`<bus>_<slug>.rs`),
+/// which is how a project from before the folders is read.
 ///
-/// An unnamed device falls back to its position, and a name that collides with an
-/// earlier one gets a number. That is not tidiness: `sync_config_files` builds
-/// its module list with a plain `map` and no dedup of its own, then writes one
-/// `pub mod <stem>;` per entry — so two devices agreeing on a stem is a
-/// duplicate-definition error in the generated crate, from two rows of a panel
-/// that look perfectly reasonable.
-pub fn i2c_device_stems(bus_stem: &str, cfg: &I2cModuleConfig) -> Vec<(String, u8, String)> {
+/// An unnamed device falls back to its position, and a name that collides with
+/// an earlier one gets a number, so no two consts share a name.
+pub fn legacy_i2c_device_stems(bus_stem: &str, cfg: &I2cModuleConfig) -> Vec<(String, u8, String)> {
     if cfg.devices.len() < 2 {
         return Vec::new();
     }
@@ -865,65 +974,255 @@ pub fn i2c_device_stems(bus_stem: &str, cfg: &I2cModuleConfig) -> Vec<(String, u
     out
 }
 
-/// The per-device config files for one bus, ready to extend a backend's list.
+/// The markers of a `pins/configs/` file - not main.rs's [`GEN_BEGIN`].
+const CFG_GEN_BEGIN: &str = "// <<< GENERATED>>>";
+const CFG_GEN_END: &str = "// <<< GENERATED END >>>";
+
+/// How a device file names the device it belongs to, inside its generated
+/// block: `// device-id: i2c1/7`. The bus and the device's hidden uid.
+pub const DEVICE_ID_TAG: &str = "// device-id:";
+
+/// One device of an I2C bus, as its file under `pins/configs/<bus>/` is named
+/// and filled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I2cDeviceFile {
+    /// 1-based position on the bus: the `#n` on the device's box.
+    pub k: usize,
+    /// `device{k}`, or `device{k}_{slug}` once the device has a name.
+    pub stem: String,
+    /// The name as typed, or `device {k}` when it has none.
+    pub shown: String,
+    pub address: u8,
+    /// The device's hidden uid; `0` while it has none (a bus nobody has
+    /// edited since it was loaded).
+    pub uid: u32,
+}
+
+/// Every device on `cfg`'s bus, in the order the canvas numbers them - the
+/// legacy single address included, as device 1.
 ///
-/// One call per backend, because there are five of them and a five-way copy of
-/// "which devices, what stem, what body" is five chances for one family to drift.
-/// `None` and a short list both give an empty vec, so a backend never has to ask
-/// whether this bus has devices before calling.
-pub fn i2c_device_config_files(
-    bus_stem: &str,
-    cfg: Option<&I2cModuleConfig>,
-) -> Vec<(String, String)> {
-    let Some(c) = cfg else {
-        return Vec::new();
-    };
-    i2c_device_stems(bus_stem, c)
-        .into_iter()
-        .map(|(stem, addr, shown)| {
-            (
-                format!("{stem}.rs"),
-                i2c_device_file(bus_stem, &shown, addr),
-            )
+/// The number is in the name because it is the one thing two devices never
+/// share: names repeat or are empty, and every new device starts at 0x00.
+pub fn i2c_device_files_of(cfg: &I2cModuleConfig) -> Vec<I2cDeviceFile> {
+    cfg.rows()
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let k = i + 1;
+            let slug = sanitize_label(r.name);
+            let stem = if slug.is_empty() {
+                format!("device{k}")
+            } else {
+                format!("device{k}_{slug}")
+            };
+            let shown = if r.name.trim().is_empty() {
+                format!("device {k}")
+            } else {
+                r.name.replace(['\n', '\r'], " ")
+            };
+            let uid = match r.key {
+                super::super::modules::I2cDeviceKey::Uid(u) => u,
+                _ => 0,
+            };
+            I2cDeviceFile {
+                k,
+                stem,
+                shown,
+                address: r.address,
+                uid,
+            }
         })
         .collect()
 }
 
-/// One device's config file: its address, and a place to put the code that talks
-/// to it.
+/// What an I2C bus's `mod.rs` holds about its devices, for the generated
+/// block: one `pub mod` per device file beside it - or, with no device yet, a
+/// line saying where they will go.
+///
+/// Always ends in a newline: one template puts the END marker straight after
+/// it.
+pub fn i2c_device_mods(cfg: Option<&I2cModuleConfig>) -> String {
+    let devices = cfg.map(i2c_device_files_of).unwrap_or_default();
+    if devices.is_empty() {
+        return "// No device on this bus yet - each one you add gets its own file here,\n\
+                // holding its DEVICE_ADDRESS.\n"
+            .to_owned();
+    }
+    let mut s =
+        String::from("// One file per device on this bus, each holding its DEVICE_ADDRESS.\n");
+    for d in devices {
+        s.push_str(&format!("pub mod {};\n", d.stem));
+    }
+    s
+}
+
+/// An I2C bus's config files: `<bus>/mod.rs` (the bus, `bus_body`) and one
+/// `<bus>/device<k>[_<name>].rs` per device - also for a bus's only device.
+///
+/// ONE call per backend: there are five of them, and a five-way copy of
+/// "which devices, what name, what body" is five chances for one to drift.
+/// `bus_stem` is the bus's module name, `i2c1` - or `twim0` on Nordic, which
+/// calls the peripheral a TWIM everywhere else in its generated code.
+///
+/// A bus is a folder even with no device on it: switching between `i2c1.rs`
+/// and `i2c1/mod.rs` on the first add and the last remove would move the
+/// user's `init` twice, through a moment where both exist and neither builds.
+pub fn i2c_bus_files(
+    bus_stem: &str,
+    bus_body: String,
+    cfg: Option<&I2cModuleConfig>,
+) -> Vec<(String, String)> {
+    let mut out = vec![(format!("{bus_stem}/mod.rs"), bus_body)];
+    for d in cfg.map(i2c_device_files_of).unwrap_or_default() {
+        out.push((
+            format!("{bus_stem}/{}.rs", d.stem),
+            i2c_device_file(bus_stem, &d),
+        ));
+    }
+    out
+}
+
+/// One device's config file: its address, and a place to put the code that
+/// talks to it.
 ///
 /// The BUS is not built here and cannot be. An I2C peripheral produces exactly
 /// one driver, `main.rs` owns it, and every master on every HAL in this project
-/// takes the address per transaction — so a device is an address plus whatever
+/// takes the address per transaction - so a device is an address plus whatever
 /// the user writes around it, never a second driver. That is the whole reason
 /// several devices on one pair of pads is expressible at all.
-pub fn i2c_device_file(bus: &str, shown: &str, address: u8) -> String {
+///
+/// Everything that names THIS device - its number, its name, its id - is in the
+/// generated block. The half below it is the same text in every device file:
+/// it is kept verbatim when the file is renamed, so a name in it would be the
+/// old one forever.
+pub fn i2c_device_file(bus_stem: &str, d: &I2cDeviceFile) -> String {
     let mut s = String::new();
-    s.push_str("// <<< GENERATED>>>\n");
+    s.push_str(CFG_GEN_BEGIN);
+    s.push('\n');
     s.push_str("// Device config (from the Virtual Module) — auto-updated; edit in the module.\n");
-    s.push_str(&device_address_const(None, address));
-    s.push_str("// <<< GENERATED END >>>\n\n");
-    s.push_str("// Everything below is editable — your changes are preserved on regeneration.\n");
-    s.push_str("//\n");
     s.push_str(&format!(
-        "// `{shown}` is one of the devices sharing the {bus} bus. The bus driver is\n"
+        "// Device #{} on {}: {}\n",
+        d.k,
+        bus_stem.to_ascii_uppercase(),
+        d.shown
     ));
-    s.push_str(&format!(
-        "// built ONCE — see `{bus}` — and `main.rs` owns the handle; this file only says\n"
-    ));
-    s.push_str("// which address on it is yours. Write the device's own routines here and\n");
-    s.push_str("// take the bus as an argument:\n");
-    s.push_str("//\n");
-    s.push_str("//     pub fn read_id<I: embedded_hal::i2c::I2c>(bus: &mut I) -> Option<u8> {\n");
-    s.push_str("//         let mut rx = [0u8; 1];\n");
-    s.push_str("//         bus.write_read(DEVICE_ADDRESS, &[0x00], &mut rx).ok()?;\n");
-    s.push_str("//         Some(rx[0])\n");
-    s.push_str("//     }\n");
-    s.push_str("//\n");
-    s.push_str("// Renaming this device in the panel renames this file, and the old one is\n");
-    s.push_str("// removed with whatever was below its markers. Move anything you want to\n");
-    s.push_str("// keep before you rename.\n");
+    if d.uid != 0 {
+        s.push_str(&format!("{DEVICE_ID_TAG} {bus_stem}/{}\n", d.uid));
+    }
+    s.push_str(&device_address_const(None, d.address));
+    s.push_str(CFG_GEN_END);
+    s.push_str("\n\n");
+    s.push_str(DEVICE_FILE_TAIL);
+    s.push_str(DEVICE_MOVE_NOTE);
     s
+}
+
+/// The editable half of every device file, up to [`DEVICE_MOVE_NOTE`] - see
+/// [`i2c_device_file`].
+const DEVICE_FILE_TAIL: &str = "\
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// This file is ONE device on the bus that `mod.rs` beside it builds. The bus
+// driver exists once and `main.rs` owns its handle; this file only says which
+// address on it is yours. Write the device's own routines here and take the
+// bus as an argument:
+//
+//     pub fn read_id<I: embedded_hal::i2c::I2c>(bus: &mut I) -> Option<u8> {
+//         let mut rx = [0u8; 1];
+//         bus.write_read(DEVICE_ADDRESS, &[0x00], &mut rx).ok()?;
+//         Some(rx[0])
+//     }
+//
+// That is the blocking embedded-hal 1.0 shape. An async or a Native bus takes
+// the same address; the example at the end of `mod.rs` shows its calls.
+//
+";
+
+/// How a device file ends: what happens to it on a rename. Also what replaces
+/// [`LEGACY_DEVICE_WARNING`] in a file from before buses were folders.
+pub const DEVICE_MOVE_NOTE: &str = "\
+// Renaming this device, or removing one listed above it, renames this file,
+// and what you wrote below the markers moves with it. Code elsewhere that
+// names this module by its path has to follow the new name.
+";
+
+/// The warning an old per-device file carried, which a migrated one must not:
+/// its code now moves with a rename.
+pub const LEGACY_DEVICE_WARNING: &str = "\
+// Renaming this device in the panel renames this file, and the old one is
+// removed with whatever was below its markers. Move anything you want to
+// keep before you rename.
+";
+
+/// `device3_imu.rs` → `(3, "imu")`, `device2.rs` → `(2, "")`; any other file
+/// name `None`.
+pub fn parse_device_file_name(file: &str) -> Option<(usize, &str)> {
+    let rest = file.strip_suffix(".rs")?.strip_prefix("device")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let k: usize = rest[..digits].parse().ok()?;
+    let slug = match &rest[digits..] {
+        "" => "",
+        tail => tail.strip_prefix('_').filter(|t| !t.is_empty())?,
+    };
+    Some((k, slug))
+}
+
+/// The inside of a config file's FIRST generated block - the rule
+/// `sync_config_files` splices by.
+fn first_cfg_gen_block(body: &str) -> Option<&str> {
+    let begin = body.find(CFG_GEN_BEGIN)? + CFG_GEN_BEGIN.len();
+    let end = begin + body[begin..].find(CFG_GEN_END)?;
+    Some(&body[begin..end])
+}
+
+/// The address a device file's generated block carries.
+pub fn device_file_address(body: &str) -> Option<u8> {
+    first_cfg_gen_block(body)?.lines().find_map(|l| {
+        let hex = l
+            .trim()
+            .strip_prefix("pub const DEVICE_ADDRESS: u8 = 0x")?
+            .strip_suffix(';')?;
+        u8::from_str_radix(hex, 16).ok()
+    })
+}
+
+/// The `(bus, uid)` a device file's generated block names, if it has one.
+pub fn device_file_id(body: &str) -> Option<(&str, u32)> {
+    first_cfg_gen_block(body)?.lines().find_map(|l| {
+        let (bus, uid) = l
+            .trim()
+            .strip_prefix(DEVICE_ID_TAG)?
+            .trim()
+            .rsplit_once('/')?;
+        Some((bus, uid.parse().ok()?))
+    })
+}
+
+/// The names the devices `(k, slug)` - in order - would have had as flat files
+/// before buses were folders: `<bus>_<slug>`, `<bus>_device<k>` for an unnamed
+/// one, and `_2`, `_3` on a repeat. The same rule as
+/// [`legacy_i2c_device_stems`], from a device list read back off file names.
+///
+/// What lets a project from before the folders find each old file's device by
+/// its NAME even when nothing else tells them apart - two unnamed devices
+/// still at 0x00, say.
+pub fn legacy_device_stems_for(bus_stem: &str, devices: &[(usize, &str)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (k, slug) in devices {
+        let base = if slug.is_empty() {
+            format!("device{k}")
+        } else {
+            (*slug).to_owned()
+        };
+        let mut stem = format!("{bus_stem}_{base}");
+        let mut n = 2;
+        while out.contains(&stem) {
+            stem = format!("{bus_stem}_{base}_{n}");
+            n += 1;
+        }
+        out.push(stem);
+    }
+    out
 }
 
 // ── Edge hooks — the user's handler for an armed input ───────────────────────

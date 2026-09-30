@@ -1219,7 +1219,7 @@ mod tests {
         let body = mcu
             .config_files()
             .into_iter()
-            .find(|(n, _)| n == "i2c1.rs")
+            .find(|(n, _)| n == "i2c1/mod.rs")
             .unwrap()
             .1;
         assert!(

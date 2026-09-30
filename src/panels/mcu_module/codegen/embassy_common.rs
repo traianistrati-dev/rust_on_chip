@@ -404,15 +404,7 @@ mod emit_for_manual_compile {
         // `sync_pin_files` always keeps `src/pins/mod.rs` in a real project, and
         // every invariant header declares `pub mod pins;` — so the harness has to
         // supply it too, or it tests a project shape the app never produces.
-        let pins_mod: Vec<(String, String)> = vec![
-            (
-                "src/pins/mod.rs".into(),
-                "pub mod configs;
-"
-                .into(),
-            ),
-            ("src/pins/configs/mod.rs".into(), String::new()),
-        ];
+        let pins_mod = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_embassy_check");
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &pins_mod, "", "").expect("write project");
@@ -438,7 +430,8 @@ mod emit_for_manual_compile {
         );
         let adir = std::env::temp_dir().join("eide_embassy_check_async");
         let _ = std::fs::remove_dir_all(&adir);
-        project_gen::write_project(&adir, &files, &pins_mod, "", "").expect("write async project");
+        project_gen::write_project(&adir, &files, &mcu.pin_tree_files(), "", "")
+            .expect("write async project");
         println!("wrote {}", adir.display());
         println!("target: {}", def.project.target);
 
@@ -474,32 +467,7 @@ mod emit_for_manual_compile {
             false,
             &[],
         );
-        let mut user: Vec<(String, String)> = vec![
-            (
-                "src/pins/mod.rs".into(),
-                "pub mod configs;
-"
-                .into(),
-            ),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| {
-                        format!(
-                            "pub mod {};
-",
-                            n.trim_end_matches(".rs")
-                        )
-                    })
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let udir = std::env::temp_dir().join("eide_embassy_check_usart");
         let _ = std::fs::remove_dir_all(&udir);
         project_gen::write_project(&udir, &files, &user, &mcu.mcu_config_text(), "")
@@ -620,32 +588,11 @@ mod emit_for_manual_compile {
             true,
             &[],
         );
-        let mut user: Vec<(String, String)> = vec![
-            (
-                "src/pins/mod.rs".into(),
-                "pub mod configs;
-"
-                .into(),
-            ),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| {
-                        format!(
-                            "pub mod {};
-",
-                            n.trim_end_matches(".rs")
-                        )
-                    })
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        // One device, so its file and the `pub mod` in the bus's `mod.rs` -
+        // which sits right against the END marker in this template - are
+        // compiled too.
+        assert!(mcu.with_i2c_devices(&[("imu", 0x68)]));
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let ddir = std::env::temp_dir().join("eide_embassy_check_dma");
         let _ = std::fs::remove_dir_all(&ddir);
         project_gen::write_project(&ddir, &files, &user, &mcu.mcu_config_text(), "")
@@ -715,32 +662,7 @@ mod emit_for_manual_compile {
             true,
             &[],
         );
-        let mut f2user: Vec<(String, String)> = vec![
-            (
-                "src/pins/mod.rs".into(),
-                "pub mod configs;
-"
-                .into(),
-            ),
-            (
-                "src/pins/configs/mod.rs".into(),
-                f2cfgs
-                    .iter()
-                    .map(|(n, _)| {
-                        format!(
-                            "pub mod {};
-",
-                            n.trim_end_matches(".rs")
-                        )
-                    })
-                    .collect(),
-            ),
-        ];
-        f2user.extend(
-            f2cfgs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let f2user: Vec<(String, String)> = f2mcu.pin_tree_files();
         let f2dir = std::env::temp_dir().join("eide_embassy_check_dma_f2");
         let _ = std::fs::remove_dir_all(&f2dir);
         project_gen::write_project(&f2dir, &f2files, &f2user, &f2mcu.mcu_config_text(), "")
@@ -804,32 +726,7 @@ mod emit_for_manual_compile {
             true,
             &[],
         );
-        let mut f7user: Vec<(String, String)> = vec![
-            (
-                "src/pins/mod.rs".into(),
-                "pub mod configs;
-"
-                .into(),
-            ),
-            (
-                "src/pins/configs/mod.rs".into(),
-                f7cfgs
-                    .iter()
-                    .map(|(n, _)| {
-                        format!(
-                            "pub mod {};
-",
-                            n.trim_end_matches(".rs")
-                        )
-                    })
-                    .collect(),
-            ),
-        ];
-        f7user.extend(
-            f7cfgs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let f7user: Vec<(String, String)> = f7mcu.pin_tree_files();
         let f7dir = std::env::temp_dir().join("eide_embassy_check_dma_f7");
         let _ = std::fs::remove_dir_all(&f7dir);
         project_gen::write_project(&f7dir, &f7files, &f7user, &f7mcu.mcu_config_text(), "")
@@ -876,32 +773,7 @@ mod emit_for_manual_compile {
                 false,
                 &[],
             );
-            let mut wuser: Vec<(String, String)> = vec![
-                (
-                    "src/pins/mod.rs".into(),
-                    "pub mod configs;
-"
-                    .into(),
-                ),
-                (
-                    "src/pins/configs/mod.rs".into(),
-                    wcfgs
-                        .iter()
-                        .map(|(n, _)| {
-                            format!(
-                                "pub mod {};
-",
-                                n.trim_end_matches(".rs")
-                            )
-                        })
-                        .collect(),
-                ),
-            ];
-            wuser.extend(
-                wcfgs
-                    .into_iter()
-                    .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-            );
+            let wuser: Vec<(String, String)> = w.pin_tree_files();
             let wdir = std::env::temp_dir().join("eide_embassy_check_wdg");
             let _ = std::fs::remove_dir_all(&wdir);
             project_gen::write_project(&wdir, &wfiles, &wuser, &w.mcu_config_text(), "")
@@ -941,34 +813,8 @@ mod emit_for_manual_compile {
                 ..Default::default()
             };
             let w_main = w.fresh_main_rs();
-            let wcfgs = w.config_files();
             let wfiles = project_gen::build_project_files(&wdef.project, &wdef.toolchain, &w_main);
-            let mut wuser: Vec<(String, String)> = vec![
-                (
-                    "src/pins/mod.rs".into(),
-                    "pub mod configs;
-"
-                    .into(),
-                ),
-                (
-                    "src/pins/configs/mod.rs".into(),
-                    wcfgs
-                        .iter()
-                        .map(|(n, _)| {
-                            format!(
-                                "pub mod {};
-",
-                                n.trim_end_matches(".rs")
-                            )
-                        })
-                        .collect(),
-                ),
-            ];
-            wuser.extend(
-                wcfgs
-                    .into_iter()
-                    .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-            );
+            let wuser: Vec<(String, String)> = w.pin_tree_files();
             let bdir = std::env::temp_dir().join("eide_wba_check_wdg");
             let _ = std::fs::remove_dir_all(&bdir);
             project_gen::write_project(&bdir, &wfiles, &wuser, &w.mcu_config_text(), "")
@@ -1014,7 +860,6 @@ mod emit_for_manual_compile {
         }
         let main_rs = m1.fresh_main_rs();
         let mut files = project_gen::build_project_files(&f1.project, &f1.toolchain, &main_rs);
-        let configs = m1.config_files();
         files.cargo_toml = project_gen::ensure_peripheral_deps(
             &files.cargo_toml,
             false,
@@ -1025,32 +870,7 @@ mod emit_for_manual_compile {
             true,
             &[],
         );
-        let mut user: Vec<(String, String)> = vec![
-            (
-                "src/pins/mod.rs".into(),
-                "pub mod configs;
-"
-                .into(),
-            ),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| {
-                        format!(
-                            "pub mod {};
-",
-                            n.trim_end_matches(".rs")
-                        )
-                    })
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = m1.pin_tree_files();
         let f1dir = std::env::temp_dir().join("eide_f1_check_usart");
         let _ = std::fs::remove_dir_all(&f1dir);
         project_gen::write_project(&f1dir, &files, &user, &m1.mcu_config_text(), "")
@@ -1215,21 +1035,7 @@ mod emit_for_manual_compile {
             false,
             &[],
         );
-        let mut user: Vec<(String, String)> = vec![
-            ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_comp_check");
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -1549,7 +1355,6 @@ mod emit_for_manual_compile {
         }
 
         let mut files = project_gen::build_project_files(&f1.project, &f1.toolchain, &main_rs);
-        let configs = mcu.config_files();
         files.cargo_toml = project_gen::ensure_peripheral_deps(
             &files.cargo_toml,
             // CAN is wired below, so `bxcan` is needed — unless the USB took
@@ -1570,21 +1375,15 @@ mod emit_for_manual_compile {
         // same call `AppIde::save` makes.
         files.cargo_toml =
             project_gen::ensure_usb_deps(&files.cargo_toml, usb_pads.is_some(), &[&main_rs]);
-        let mut user: Vec<(String, String)> = vec![
-            ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
+        // Two named devices on I2C1: the bus is a folder, and each device file
+        // is a module of it.
+        // A half-wired I2C (`EIDE_I2C_HALF`) may have no module to put them on.
+        let on_bus = mcu.with_i2c_devices(&[("oled", 0x3C), ("imu", 0x68)]);
+        assert!(
+            on_bus || std::env::var("EIDE_I2C_HALF").is_ok(),
+            "no I2C bus for the devices"
         );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_f1_check_dma");
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -1755,7 +1554,7 @@ mod emit_for_manual_compile {
         for want in [
             "usart1.rs",
             "spi1.rs",
-            "i2c1.rs",
+            "i2c1/mod.rs",
             "pwm2.rs",
             "iwdg.rs",
             "wwdg.rs",
@@ -1768,21 +1567,7 @@ mod emit_for_manual_compile {
                      configs: &[(String, String)],
                      mcu: &crate::panels::mcu_module::mcu::Mcu,
                      is_async: bool| {
-            let mut user: Vec<(String, String)> = vec![
-                ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-                (
-                    "src/pins/configs/mod.rs".into(),
-                    configs
-                        .iter()
-                        .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                        .collect(),
-                ),
-            ];
-            user.extend(
-                configs
-                    .iter()
-                    .map(|(name, body)| (format!("src/pins/configs/{name}"), body.clone())),
-            );
+            let user = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             let _ = std::fs::remove_dir_all(&dir);
             project_gen::write_project(&dir, files, &user, &mcu.mcu_config_text(), "")
@@ -1952,7 +1737,6 @@ mod emit_for_manual_compile {
         );
 
         let mut files = project_gen::build_project_files(&f1.project, &f1.toolchain, &main_rs);
-        let configs = mcu.config_files();
         files.cargo_toml = project_gen::ensure_peripheral_deps(
             &files.cargo_toml,
             false,
@@ -1965,21 +1749,7 @@ mod emit_for_manual_compile {
         );
         files.cargo_toml =
             project_gen::ensure_rtic_deps(&files.cargo_toml, true, &f1.project.target, &[&main_rs]);
-        let mut user: Vec<(String, String)> = vec![
-            ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_f1_check_rtic");
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -2089,7 +1859,6 @@ mod emit_for_manual_compile {
         );
 
         let mut files = project_gen::build_project_files(&f1.project, &f1.toolchain, &main_rs);
-        let configs = mcu.config_files();
         // What `AppIde::save` computes on this runtime: NO portable trait crates
         // (that is the whole point of Native), but `nb` stays — the concrete
         // `Tx`/`Rx` are nb-based.
@@ -2103,21 +1872,7 @@ mod emit_for_manual_compile {
             true,
             &[],
         );
-        let mut user: Vec<(String, String)> = vec![
-            ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_f1_check_native");
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -2320,21 +2075,16 @@ mod emit_for_manual_compile {
             false,
             &[],
         );
-        let mut user: Vec<(String, String)> = vec![
-            ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        // The legacy single address, never edited into a list - what every
+        // project from before device lists holds. It is device 1 all the same,
+        // and gets `device1.rs`. Set straight on the config: any edit through
+        // the panel would turn it into a list first.
+        for m in &mut mcu.modules {
+            if let crate::panels::mcu_module::modules::ModuleConfig::I2c(c) = &mut m.config {
+                c.address = 0x3C;
+            }
+        }
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join(format!("eide_esp_check_{chip}"));
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -2397,33 +2147,7 @@ mod emit_for_manual_compile {
         // `main.rs` declares `pub mod pins;`, and the app writes that module
         // when it saves. A harness that skips it compiles a project the IDE
         // never produces - and fails on the one file it forgot.
-        let configs = mcu.config_files();
-        let mut user: Vec<(String, String)> = vec![
-            (
-                "src/pins/mod.rs".into(),
-                "pub mod configs;
-"
-                .into(),
-            ),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| {
-                        format!(
-                            "pub mod {};
-",
-                            n.trim_end_matches(".rs")
-                        )
-                    })
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_n6_check");
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -3000,21 +2724,7 @@ mod emit_for_manual_compile {
         );
         files.cargo_toml =
             project_gen::ensure_m0_atomics(&files.cargo_toml, true, &def.project.target, &[]);
-        let mut user: Vec<(String, String)> = vec![
-            ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_dma_check");
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")

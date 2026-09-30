@@ -734,9 +734,10 @@ fn bus_config_file(
     pads: &[(&str, u8)],
     hz: u32,
     frame: Option<&UsartModuleConfig>,
-    // The I2C module's 7-bit address, 0 for the other two kinds. Resolved by the
-    // caller the way `hz` is, so this function stays a pure formatter.
-    i2c_addr: u8,
+    // The I2C bus's device modules (`common::i2c_device_mods`), empty for the
+    // other two kinds. Resolved by the caller the way `hz` is, so this function
+    // stays a pure formatter.
+    i2c_mods: &str,
 ) -> String {
     let mut o = String::new();
     o.push_str("// <<< GENERATED>>>\n");
@@ -756,7 +757,7 @@ fn bus_config_file(
         "spi" => o.push_str(&format!("pub const SPI_HZ: u32 = {hz};\n")),
         _ => {
             o.push_str(&format!("pub const I2C_HZ: u32 = {hz};\n"));
-            o.push_str(&super::common::device_address_const(None, i2c_addr));
+            o.push_str(i2c_mods);
         }
     }
     o.push_str("// <<< GENERATED END >>>\n\n");
@@ -1039,20 +1040,23 @@ impl FamilyBackend for RpBackend {
                     .collect();
                 if pads.len() == roles.len() {
                     let frame = (kind == "uart").then(|| ucfgs.get(&i)).flatten();
-                    let addr = if kind == "i2c" {
-                        icfgs.get(&i).map_or(0, |c| c.primary_address())
+                    // Only the I2C bus is a folder - its devices each get a
+                    // file beside its `mod.rs`.
+                    let mods = if kind == "i2c" {
+                        super::common::i2c_device_mods(icfgs.get(&i))
                     } else {
-                        0
+                        String::new()
                     };
-                    out.push((
-                        format!("{kind}{i}.rs"),
-                        bus_config_file(hal, kind, i, &pads, bus_speed(mcu, kind, i), frame, addr),
-                    ));
+                    let body =
+                        bus_config_file(hal, kind, i, &pads, bus_speed(mcu, kind, i), frame, &mods);
                     if kind == "i2c" {
-                        out.extend(super::common::i2c_device_config_files(
+                        out.extend(super::common::i2c_bus_files(
                             &format!("i2c{i}"),
+                            body,
                             icfgs.get(&i),
                         ));
+                    } else {
+                        out.push((format!("{kind}{i}.rs"), body));
                     }
                 }
             }
@@ -1367,6 +1371,9 @@ mod emit_for_manual_compile {
             let (_, max) = crate::panels::mcu_module::watchdog::rp_range_us(&mcu.family, false);
             mcu.watchdog.rp =
                 Some(crate::panels::mcu_module::watchdog::RpWdtConfig { timeout_us: max });
+            // Two devices on I2C0, one of them unnamed: `device1_oled.rs` and
+            // `device2.rs` beside the bus's `mod.rs`.
+            assert!(mcu.with_i2c_devices(&[("oled", 0x3C), ("", 0x68)]));
             let main_rs = mcu.fresh_main_rs();
             assert!(
                 main_rs.contains("pins::configs::watchdog::init(&mut watchdog);"),
@@ -1378,33 +1385,7 @@ mod emit_for_manual_compile {
             // supply it too, or it compiles a project shape the app never
             // produces. Which is exactly what happened: the invariant test went
             // green while `cargo check` said "file not found for module `pins`".
-            let configs = mcu.config_files();
-            let mut user: Vec<(String, String)> = vec![
-                (
-                    "src/pins/mod.rs".into(),
-                    "pub mod configs;
-"
-                    .into(),
-                ),
-                (
-                    "src/pins/configs/mod.rs".into(),
-                    configs
-                        .iter()
-                        .map(|(n, _)| {
-                            format!(
-                                "pub mod {};
-",
-                                n.trim_end_matches(".rs")
-                            )
-                        })
-                        .collect(),
-                ),
-            ];
-            user.extend(
-                configs
-                    .into_iter()
-                    .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-            );
+            let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             let _ = std::fs::remove_dir_all(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -3918,8 +3899,8 @@ pub fn dma_uses(mcu: &Mcu) -> Vec<super::dma_map::DmaUse> {
 
 /// The device-address consts for the I2C buses this runtime builds INLINE.
 ///
-/// The blocking runtime puts the address in `pins/configs/i2c{n}.rs` beside the
-/// clock; this one has no such file — `config_files` here returns watchdogs
+/// The blocking runtime puts each address in its device's own file under
+/// `pins/configs/i2c{n}/`; this one has no such file — `config_files` here returns watchdogs
 /// only, because every bus is constructed in `main.rs` — so the const goes where
 /// the bus goes. Without this the address a user set in the panel reached the
 /// generated code on the blocking runtime and vanished on the async one, which
@@ -3941,7 +3922,7 @@ fn async_i2c_address_consts(mcu: &Mcu) -> String {
         }
         let cfg = cfgs.get(&i);
         let stems = cfg.map_or_else(Vec::new, |c| {
-            super::common::i2c_device_stems(&format!("i2c{i}"), c)
+            super::common::legacy_i2c_device_stems(&format!("i2c{i}"), c)
         });
         if stems.is_empty() {
             o.push_str(&super::common::device_address_const(
@@ -3949,9 +3930,10 @@ fn async_i2c_address_consts(mcu: &Mcu) -> String {
                 cfg.map_or(0, |c| c.primary_address()),
             ));
         } else {
-            // Several devices on the bus: one const each, named after the file
-            // the runtimes WITH a `pins/configs/` would have given it, so the
-            // two spellings of the same project read the same way.
+            // Several devices on the bus: one const each, named as the device
+            // files were before a bus became a folder. Kept, because the code
+            // below the markers names them - and a device number in the name
+            // would move whenever an earlier device is removed.
             for (stem, addr, _) in stems {
                 o.push_str(&super::common::device_address_const(
                     Some(&stem.to_ascii_uppercase()),
@@ -4764,10 +4746,7 @@ mod async_pwm_keeps_both_channels {
         // green while the application shipped a manifest with no embassy in it.
         let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
         let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
-        let user: Vec<(String, String)> = vec![
-            ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-            ("src/pins/configs/mod.rs".into(), String::new()),
-        ];
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_rp2040_pwm_ab");
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -4862,15 +4841,7 @@ mod emit_async_for_manual_compile {
             // green while the application shipped a manifest with no embassy in it.
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
-            let user: Vec<(String, String)> = vec![
-                (
-                    "src/pins/mod.rs".into(),
-                    "pub mod configs;
-"
-                    .into(),
-                ),
-                ("src/pins/configs/mod.rs".into(), String::new()),
-            ];
+            let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             let _ = std::fs::remove_dir_all(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -5004,6 +4975,9 @@ mod emit_async_for_manual_compile {
             let (_, max) = crate::panels::mcu_module::watchdog::rp_range_us(&mcu.family, true);
             mcu.watchdog.rp =
                 Some(crate::panels::mcu_module::watchdog::RpWdtConfig { timeout_us: max });
+            // Two devices on I2C0: this runtime has no config files, so their
+            // addresses are the `I2C0_<NAME>_DEVICE_ADDRESS` consts in main.rs.
+            assert!(mcu.with_i2c_devices(&[("oled", 0x3C), ("", 0x68)]));
             let main_rs = mcu.fresh_main_rs();
             assert!(
                 main_rs.contains("pins::configs::watchdog::init(p.WATCHDOG);"),
@@ -5020,22 +4994,7 @@ mod emit_async_for_manual_compile {
             // This used to be an empty `configs/mod.rs` - true while this
             // backend had no config files, and a project shape the app stopped
             // producing the day the watchdog became one.
-            let configs = mcu.config_files();
-            let mut user: Vec<(String, String)> = vec![
-                ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-                (
-                    "src/pins/configs/mod.rs".into(),
-                    configs
-                        .iter()
-                        .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                        .collect(),
-                ),
-            ];
-            user.extend(
-                configs
-                    .into_iter()
-                    .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-            );
+            let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             let _ = std::fs::remove_dir_all(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -5155,22 +5114,7 @@ mod emit_async_for_manual_compile {
             // Through `build_cfg`, the SAME pairing the app uses.
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
-            let configs = mcu.config_files();
-            let mut user: Vec<(String, String)> = vec![
-                ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-                (
-                    "src/pins/configs/mod.rs".into(),
-                    configs
-                        .iter()
-                        .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                        .collect(),
-                ),
-            ];
-            user.extend(
-                configs
-                    .into_iter()
-                    .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-            );
+            let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             let _ = std::fs::remove_dir_all(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")

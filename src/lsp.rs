@@ -868,6 +868,24 @@ impl LspState {
         );
     }
 
+    /// Send `textDocument/didClose` for `rel_path` if it was open - for a file
+    /// the project no longer has at that path (a config file the tree moved),
+    /// which rust-analyzer would otherwise keep analysing from its overlay.
+    pub fn did_close(&mut self, rel_path: &str) {
+        if self.open_files.remove(rel_path).is_none() || self.sender.is_none() {
+            return;
+        }
+        let uri = format!("{}/{}", self.root_uri, rel_path);
+        self.send_raw(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method":  "textDocument/didClose",
+                "params": { "textDocument": { "uri": uri } }
+            })
+            .to_string(),
+        );
+    }
+
     /// Send `textDocument/didChange` for `rel_path` when the text has changed.
     /// Auto-opens the file via `didOpen` if it hasn't been opened yet.
     ///

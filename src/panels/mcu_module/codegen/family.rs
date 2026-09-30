@@ -2413,7 +2413,8 @@ mod tests {
                     !body.contains("{HANDLE}")
                         && !body.contains("{TX}")
                         && !body.contains("{RX}")
-                        && !body.contains("{ADDR}"),
+                        && !body.contains("{ADDR}")
+                        && !body.contains("{DEVICES}"),
                     "{what}/{name}: unsubstituted placeholder:\n{body}"
                 );
                 for h in handles_in(body) {
@@ -2576,6 +2577,179 @@ mod tests {
             assert!(
                 all.contains("DEVICE_ADDRESS: u8 = 0x3C;"),
                 "{what}: the configured address never reaches the generated code:\n{all}"
+            );
+        }
+    }
+
+    /// `files` (a `src/pins/` tree) is a module tree rustc can read: no
+    /// `pub mod` names a path, no `X.rs` sits beside an `X/mod.rs`, every
+    /// `pub mod` has its file, and every file is declared by exactly one chain
+    /// from `pins/mod.rs`.
+    fn assert_module_tree(what: &str, files: &[(String, String)]) {
+        let has = |p: &str| files.iter().any(|(q, _)| q == p);
+        let mut declared: Vec<String> = Vec::new();
+        let mut queue = vec!["src/pins/mod.rs".to_owned()];
+        while let Some(file) = queue.pop() {
+            let body = &files
+                .iter()
+                .find(|(p, _)| *p == file)
+                .unwrap_or_else(|| panic!("{what}: {file} is declared but not there"))
+                .1;
+            declared.push(file.clone());
+            let dir = file.strip_suffix("mod.rs").expect("only mod.rs declares");
+            for name in body
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("pub mod "))
+                .filter_map(|l| l.strip_suffix(';'))
+            {
+                assert!(!name.contains('/'), "{what}: `pub mod {name};` in {file}");
+                let flat = format!("{dir}{name}.rs");
+                let folder = format!("{dir}{name}/mod.rs");
+                assert!(
+                    has(&flat) != has(&folder),
+                    "{what}: `{name}` in {file} is neither or both of {flat} / {folder}"
+                );
+                if has(&folder) {
+                    queue.push(folder);
+                } else {
+                    declared.push(flat);
+                }
+            }
+        }
+        for (path, _) in files {
+            assert_eq!(
+                declared.iter().filter(|d| *d == path).count(),
+                1,
+                "{what}: {path} is not declared exactly once:\n{declared:#?}"
+            );
+        }
+    }
+
+    /// The `src/pins/` tree a project with I2C devices gets is a module tree
+    /// rustc can read, on every family that builds a bus - and still is after
+    /// a device is renamed and the SAME tree is synced again, with the code
+    /// the user wrote below the device file's markers moved along. The emit
+    /// harnesses compile a fresh tree for real, behind `--ignored`; this runs
+    /// on every `cargo test`, and is the one place the real emitters' output
+    /// goes through a rename.
+    #[test]
+    fn the_pin_tree_with_i2c_devices_is_a_module_tree() {
+        use crate::panels::mcu_module::modules::{I2cDeviceEdit, ModuleConfig, ModuleKind};
+        use crate::project_tree::logic::ProjectTreeState;
+
+        for (what, mut mcu, runtime) in i2c_bus_cases() {
+            mcu.runtime = runtime;
+            mcu.add_module(ModuleKind::GenericInterfaceI2c);
+            assert!(mcu.with_i2c_devices(&[("oled", 0x3C), ("", 0x68)]));
+            let files = mcu.pin_tree_files();
+            assert_module_tree(what, &files);
+            // RP and nRF build their buses inline on Async: no config files,
+            // the addresses are consts in main.rs.
+            let inline =
+                what.ends_with("async") && (what.starts_with("rp") || what.starts_with("nrf"));
+            let folder = files.iter().any(|(p, _)| {
+                p.ends_with("/mod.rs") && (p.contains("configs/i2c") || p.contains("configs/twim"))
+            });
+            assert_eq!(
+                folder,
+                !inline,
+                "{what}: {:?}",
+                files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+            );
+            if !folder {
+                continue;
+            }
+            assert_eq!(
+                files.iter().filter(|(p, _)| p.contains("/device")).count(),
+                2,
+                "{what}: two devices, two files: {:?}",
+                files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+            );
+
+            // One tree, synced the way the app does it, before and after a
+            // rename made through the panel's own write path.
+            let mut tree = ProjectTreeState::new();
+            let sync = |tree: &mut ProjectTreeState, mcu: &Mcu| {
+                tree.sync_config_files(&mcu.config_files(), false, &[], &mut None);
+                tree.sync_pin_files(&mcu.all_pin_functions());
+            };
+            sync(&mut tree, &mcu);
+            tree.user_src_files
+                .iter_mut()
+                .find(|(p, _)| p.ends_with("/device1_oled.rs"))
+                .unwrap_or_else(|| panic!("{what}: no device1_oled.rs"))
+                .1
+                .push_str("\n// MINE-OLED\n");
+            let (instance, key) = mcu
+                .modules
+                .iter()
+                .find_map(|m| match &m.config {
+                    ModuleConfig::I2c(c) => Some((m.instance(), c.rows()[0].key)),
+                    _ => None,
+                })
+                .expect("the I2C bus");
+            assert!(mcu.edit_i2c_device(instance, I2cDeviceEdit::Name(key, "display".into())));
+            sync(&mut tree, &mcu);
+            assert_module_tree(what, &tree.user_src_files);
+            let renamed = tree
+                .user_src_files
+                .iter()
+                .find(|(p, _)| p.ends_with("/device1_display.rs"))
+                .unwrap_or_else(|| panic!("{what}: no device1_display.rs"));
+            assert!(renamed.1.contains("// MINE-OLED"), "{what}:\n{}", renamed.1);
+            assert!(
+                !tree
+                    .user_src_files
+                    .iter()
+                    .any(|(p, _)| p.ends_with("/device1_oled.rs")),
+                "{what}: the old name stayed"
+            );
+        }
+    }
+
+    /// The RP and nRF async runtimes keep each device's address const in
+    /// main.rs under the name it had before buses were folders: the user's
+    /// code below the markers names them.
+    #[test]
+    fn the_async_device_consts_keep_their_names() {
+        use crate::panels::mcu_module::modules::ModuleKind;
+
+        for (what, mut mcu, runtime) in i2c_bus_cases() {
+            let peri = match what {
+                w if w.starts_with("rp") => "I2C",
+                w if w.starts_with("nrf") => "TWIM",
+                _ => continue,
+            };
+            if runtime != Runtime::Async {
+                continue;
+            }
+            mcu.runtime = runtime;
+            mcu.add_module(ModuleKind::GenericInterfaceI2c);
+            let consts = |main: &str| -> Vec<String> {
+                main.lines()
+                    .map(str::trim)
+                    .filter(|l| l.starts_with(&format!("pub const {peri}")))
+                    .map(str::to_owned)
+                    .collect()
+            };
+            assert!(mcu.with_i2c_devices(&[("oled", 0x3C)]));
+            let one = consts(&mcu.fresh_main_rs());
+            assert!(
+                one.iter()
+                    .any(|l| l.ends_with("_DEVICE_ADDRESS: u8 = 0x3C;") && !l.contains("OLED")),
+                "{what}: one device keeps the bus's name: {one:?}"
+            );
+            assert!(mcu.with_i2c_devices(&[("", 0x68)]));
+            let two = consts(&mcu.fresh_main_rs());
+            assert!(
+                two.iter()
+                    .any(|l| l.ends_with("_OLED_DEVICE_ADDRESS: u8 = 0x3C;")),
+                "{what}: {two:?}"
+            );
+            assert!(
+                two.iter()
+                    .any(|l| l.ends_with("_DEVICE2_DEVICE_ADDRESS: u8 = 0x68;")),
+                "{what}: {two:?}"
             );
         }
     }
@@ -3323,12 +3497,6 @@ mod tests {
             connections: Vec::new(),
         });
 
-        let files = crate::panels::mcu_module::codegen::family::backend_for_runtime(
-            &mcu.family,
-            mcu.runtime,
-        )
-        .expect("an ESP backend")
-        .config_files(&mcu);
         let main_rs = crate::panels::mcu_module::codegen::family::backend_for_runtime(
             &mcu.family,
             mcu.runtime,
@@ -3347,7 +3515,6 @@ mod tests {
             false,
             &[],
         );
-        fs::create_dir_all(out.join("src/pins/configs")).unwrap();
         fs::create_dir_all(out.join(".cargo")).unwrap();
         fs::write(out.join("Cargo.toml"), cargo_toml).unwrap();
         fs::write(
@@ -3363,13 +3530,7 @@ mod tests {
             fs::write(out.join("rust-toolchain.toml"), toolchain).unwrap();
         }
         fs::write(out.join("src/main.rs"), &main_rs).unwrap();
-        let mut mods = String::new();
-        for (name, body) in &files {
-            fs::write(out.join("src/pins/configs").join(name), body).unwrap();
-            mods.push_str(&format!("pub mod {};\n", name.trim_end_matches(".rs")));
-        }
-        fs::write(out.join("src/pins/configs/mod.rs"), mods).unwrap();
-        fs::write(out.join("src/pins/mod.rs"), "pub mod configs;\n").unwrap();
+        write_pin_tree(&out, &mcu);
         assert!(
             main_rs.contains("peripherals.DMA_"),
             "main.rs passes no DMA channel:\n{main_rs}"
@@ -3460,25 +3621,24 @@ mod tests {
         fs::write(out.join("src/main.rs"), main_rs).unwrap();
 
         // The per-peripheral init modules main.rs calls into, plus the `mod`
-        // declarations the real project tree writes (see
-        // `ProjectTreeState::sync_config_files` / `sync_pin_files`).
-        let cfgs = mcu.config_files();
-        fs::create_dir_all(out.join("src/pins/configs")).unwrap();
-        let mut decls = String::new();
-        for (name, body) in &cfgs {
-            fs::write(out.join("src/pins/configs").join(name), body).unwrap();
-            decls.push_str(&format!("pub mod {};\n", name.trim_end_matches(".rs")));
+        // declarations the real project tree writes.
+        write_pin_tree(&out, &mcu);
+    }
+
+    /// Writes `src/pins/` into `out` exactly as the project tree holds it for
+    /// `mcu` ([`Mcu::pin_tree_files`]). `out` is a folder the caller named,
+    /// possibly a real project, so only the fully generated `configs/` goes
+    /// first - a leftover `i2c0.rs` beside a new `i2c0/mod.rs` would not
+    /// compile - and nothing else the user keeps under `src/pins/` is touched.
+    fn write_pin_tree(out: &std::path::Path, mcu: &crate::panels::mcu_module::mcu::Mcu) {
+        let _ = std::fs::remove_dir_all(out.join("src/pins/configs"));
+        for (rel, body) in mcu.pin_tree_files() {
+            let path = out.join(&rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, body).unwrap();
         }
-        fs::write(out.join("src/pins/configs/mod.rs"), decls).unwrap();
-        fs::write(
-            out.join("src/pins/mod.rs"),
-            if cfgs.is_empty() {
-                String::new()
-            } else {
-                "pub mod configs;\n".to_owned()
-            },
-        )
-        .unwrap();
     }
 
     /// The ESP async backend swaps the entry point for `#[esp_rtos::main]` and
@@ -3759,8 +3919,8 @@ mod tests {
         assert!(spi1.contains("embedded_hal::spi::SpiBus"));
         let i2c1 = &cfgs
             .iter()
-            .find(|(n, _)| n == "i2c1.rs")
-            .expect("i2c1.rs")
+            .find(|(n, _)| n == "i2c1/mod.rs")
+            .expect("i2c1/mod.rs")
             .1;
         assert!(i2c1.contains("I2c::new_blocking"));
         assert!(i2c1.contains("embedded_hal::i2c::I2c"));

@@ -717,7 +717,7 @@ pub const I2C_ADDRESS: &str = "The 7-bit address of the device this bus talks to
                                it at the start of every transaction rather than once at setup, \
                                so it is kept for your code to use; wrong, and nothing answers.";
 
-pub const I2C_DEVICES: &str = "Every device sharing these two pads, each with a name and its 7-bit address (the ID on its box under the bus, on the canvas). An I2C bus is meant to be shared, and the address is the ONLY thing that tells its devices apart - the bus driver itself is built once, whatever is on it. With two devices or more each gets its own file under `pins/configs/`, named after it and carrying its address for your code to use; one device keeps its address in the bus file.";
+pub const I2C_DEVICES: &str = "Every device sharing these two pads, each with a name and its 7-bit address (the ID on its box under the bus, on the canvas). An I2C bus is meant to be shared, and the address is the ONLY thing that tells its devices apart - the bus driver itself is built once, whatever is on it. The bus is a folder under `pins/configs/`: its `mod.rs` builds the driver, and every device - a bus's only one included - has a file beside it, `device<n>_<name>.rs`, carrying its address for your code to use.";
 
 pub const I2C_CLOCK: &str = "How fast SCL is driven. 100 kHz is what every I2C device supports; \
                              400 kHz needs the whole bus to agree - every device on it, and \

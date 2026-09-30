@@ -1212,12 +1212,9 @@ pub fn config_files(
     }
     for n in 1u8..=2 {
         if has(PinFunction::I2cScl(n)) && has(PinFunction::I2cSda(n)) {
-            out.push((
-                format!("i2c{n}.rs"),
-                i2c_config_file(n, i2c.get(&n), &i2c_pin_tys(n, all_pins)),
-            ));
-            out.extend(super::common::i2c_device_config_files(
+            out.extend(super::common::i2c_bus_files(
                 &format!("i2c{n}"),
+                i2c_config_file(n, i2c.get(&n), &i2c_pin_tys(n, all_pins)),
                 i2c.get(&n),
             ));
         }
@@ -2827,7 +2824,7 @@ pub fn init(
 const I2C_TMPL: &str = r#"// <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const CLOCK_KHZ: u32 = {KHZ}; // <=100 Standard, >100 Fast
-{ADDR}
+{DEVICES}
 
 // The wired pins, straight from the MCU Configurator's pin map. They live in
 // this block because re-wiring the peripheral has to update them; the `use` is
@@ -2941,6 +2938,8 @@ pub fn init(
 // there before calling anything below (bus methods take `&mut self`).
 //
 //     use embedded_hal::i2c::I2c;
+//     // The address is the device's own, in its file beside this one:
+//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
 //
 //     // Write to a register
 //     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();
@@ -2972,17 +2971,14 @@ fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>, pins: &str) -> String {
         .replace("{PINS}", pins)
         .replace("{AFIO_PARAM}", afio_param)
         .replace("{AFIO_ARG}", afio_arg)
-        .replace(
-            "{ADDR}",
-            &super::common::device_address_const(None, cfg.map_or(0, |c| c.primary_address())),
-        )
+        .replace("{DEVICES}", &super::common::i2c_device_mods(cfg))
 }
 
 /// Native `stm32f1xx-hal` I2C init (no eh-1.0 bridge). Returns `BlockingI2c<…>`.
 const I2C_TMPL_NATIVE: &str = r#"// <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const CLOCK_KHZ: u32 = {KHZ}; // <=100 Standard, >100 Fast
-{ADDR}
+{DEVICES}
 
 // The wired pins, straight from the MCU Configurator's pin map. They live in
 // this block because re-wiring the peripheral has to update them; the `use` is
@@ -3044,6 +3040,8 @@ pub fn init(
 // there before calling anything below (bus methods take `&mut self`).
 //
 //     use embedded_hal_0_2::blocking::i2c::{Read, Write, WriteRead};
+//     // The address is the device's own, in its file beside this one:
+//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
 //
 //     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();
 //
@@ -3862,7 +3860,7 @@ mod blocking_dma_tests {
                 "{main_rs}"
             );
             assert!(
-                !mcu.config_files().iter().any(|(f, _)| f == "i2c1.rs"),
+                !mcu.config_files().iter().any(|(f, _)| f == "i2c1/mod.rs"),
                 "no init to offer, so no file"
             );
         }
@@ -3871,7 +3869,7 @@ mod blocking_dma_tests {
         let main_rs = mcu.fresh_main_rs();
         assert!(main_rs.contains("configs::i2c1::init"), "{main_rs}");
         assert!(!main_rs.contains("is NOT initialised"), "{main_rs}");
-        assert!(mcu.config_files().iter().any(|(f, _)| f == "i2c1.rs"));
+        assert!(mcu.config_files().iter().any(|(f, _)| f == "i2c1/mod.rs"));
 
         // And the CAN, the third pair — `can::Pins` is (PA12, PA11) or the
         // PB9/PB8 remap. This one had the USART's bug: `_can_rx` / `_can_tx`.

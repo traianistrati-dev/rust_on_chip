@@ -730,9 +730,10 @@ fn bus_config_file(
     hz: u32,
     frame: Option<&UsartModuleConfig>,
     spi_mode: u8,
-    // The I2C module's 7-bit address, 0 for the other two kinds. Resolved by the
-    // caller the way `hz` and `spi_mode` are, so this stays a pure formatter.
-    i2c_addr: u8,
+    // The TWIM bus's device modules (`common::i2c_device_mods`), empty for the
+    // other two kinds. Resolved by the caller the way `hz` and `spi_mode` are,
+    // so this stays a pure formatter.
+    i2c_mods: &str,
 ) -> String {
     use crate::panels::mcu_module::modules::{Parity, StopBits};
     let mut o = String::new();
@@ -796,7 +797,7 @@ fn bus_config_file(
             o.push_str(&format!(
                 "pub const FREQUENCY: {hal}::twim::Frequency = {hal}::twim::Frequency::{variant};\n"
             ));
-            o.push_str(&super::common::device_address_const(None, i2c_addr));
+            o.push_str(i2c_mods);
         }
     }
     o.push_str("// <<< GENERATED END >>>\n\n");
@@ -1023,28 +1024,30 @@ impl FamilyBackend for NrfBackend {
                 if required.iter().all(|r| role_of(&pins, i, r).is_some()) {
                     let frame = (kind == "uarte").then(|| ucfgs.get(&i)).flatten();
                     let spi_mode = scfgs.get(&i).map_or(0, |c| c.mode);
-                    let addr = if kind == "twim" {
-                        icfgs.get(&i).map_or(0, |c| c.primary_address())
+                    // Only the TWIM bus is a folder - its devices each get a
+                    // file beside its `mod.rs`.
+                    let mods = if kind == "twim" {
+                        super::common::i2c_device_mods(icfgs.get(&i))
                     } else {
-                        0
+                        String::new()
                     };
-                    out.push((
-                        format!("{kind}{i}.rs"),
-                        bus_config_file(
-                            &hal,
-                            kind,
-                            i,
-                            bus_speed(mcu, kind, i),
-                            frame,
-                            spi_mode,
-                            addr,
-                        ),
-                    ));
+                    let body = bus_config_file(
+                        &hal,
+                        kind,
+                        i,
+                        bus_speed(mcu, kind, i),
+                        frame,
+                        spi_mode,
+                        &mods,
+                    );
                     if kind == "twim" {
-                        out.extend(super::common::i2c_device_config_files(
+                        out.extend(super::common::i2c_bus_files(
                             &format!("twim{i}"),
+                            body,
                             icfgs.get(&i),
                         ));
+                    } else {
+                        out.push((format!("{kind}{i}.rs"), body));
                     }
                 }
             }
@@ -1478,7 +1481,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         // driver appear together or not at all.
         let icfg = icfgs.get(&i);
         let stems = icfg.map_or_else(Vec::new, |c| {
-            super::common::i2c_device_stems(&format!("twim{i}"), c)
+            super::common::legacy_i2c_device_stems(&format!("twim{i}"), c)
         });
         if stems.is_empty() {
             items.push_str(&super::common::device_address_const(
@@ -2121,7 +2124,7 @@ mod blocking_codegen {
         let files = mcu.config_files();
         let mut names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["pwm0.rs", "spim2.rs", "twim0.rs", "uarte0.rs"]);
+        assert_eq!(names, ["pwm0.rs", "spim2.rs", "twim0/mod.rs", "uarte0.rs"]);
     }
 
     /// The pull and drive chosen in the pin panel pick the `into_*` method,
@@ -2330,7 +2333,7 @@ mod blocking_codegen {
         let e = spim.find("// <<< GENERATED END >>>").unwrap();
         assert!(spim[..e].contains("pub const MODE"), "{spim}");
 
-        let twim = body("twim0.rs");
+        let twim = body("twim0/mod.rs");
         assert!(twim.contains("Frequency::K100;"), "{twim}");
         assert!(!twim.contains("asked for"), "{twim}");
 
@@ -2515,6 +2518,12 @@ mod blocking_codegen {
                     .contains("let watchdog = pins::configs::watchdog::init(p.WDT);"),
                 "{dir_name}: no watchdog in main.rs"
             );
+            // A device on TWIM0 - added here rather than in `everything()`,
+            // which unit tests share - so `twim0/` is a folder with a device.
+            // The other branches wire no TWIM.
+            if dir_name == "eide_nrf52833_check" {
+                assert!(mcu.with_i2c_devices(&[("accel", 0x19)]));
+            }
             emit(&mcu, dir_name);
         }
     }
@@ -2526,22 +2535,7 @@ mod blocking_codegen {
             .expect("built-in micro:bit v2");
         let main_rs = mcu.fresh_main_rs();
         let files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
-        let configs = mcu.config_files();
-        let mut user: Vec<(String, String)> = vec![
-            ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-            (
-                "src/pins/configs/mod.rs".into(),
-                configs
-                    .iter()
-                    .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                    .collect(),
-            ),
-        ];
-        user.extend(
-            configs
-                .into_iter()
-                .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-        );
+        let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join(dir_name);
         let _ = std::fs::remove_dir_all(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -3109,6 +3103,12 @@ mod async_codegen {
             // the runtime switch carries it the way a user's project would.
             mcu.watchdog.nrf =
                 Some(crate::panels::mcu_module::watchdog::NrfWdtConfig::default_for());
+            // Two devices on the TWIM that has one: no config files on this
+            // runtime, so their addresses are consts in main.rs - built from
+            // the names the device files had before buses were folders.
+            if dir_name == "eide_nrf52833_async_check" {
+                assert!(mcu.with_i2c_devices(&[("accel", 0x19), ("", 0x1E)]));
+            }
             let def = builtins::builtin_definitions()
                 .into_iter()
                 .find(|d| d.id == "nrf52833_microbit_v2")
@@ -3147,21 +3147,7 @@ mod async_codegen {
             let configs = mcu.config_files();
             let names: Vec<&str> = configs.iter().map(|(n, _)| n.as_str()).collect();
             assert_eq!(names, ["watchdog.rs"], "{dir_name}");
-            let mut user: Vec<(String, String)> = vec![
-                ("src/pins/mod.rs".into(), "pub mod configs;\n".into()),
-                (
-                    "src/pins/configs/mod.rs".into(),
-                    configs
-                        .iter()
-                        .map(|(n, _)| format!("pub mod {};\n", n.trim_end_matches(".rs")))
-                        .collect(),
-                ),
-            ];
-            user.extend(
-                configs
-                    .into_iter()
-                    .map(|(name, body)| (format!("src/pins/configs/{name}"), body)),
-            );
+            let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             let _ = std::fs::remove_dir_all(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")

@@ -199,6 +199,68 @@ impl Mcu {
             .collect()
     }
 
+    /// The `custom_<name>` root of every Custom module's file: the older
+    /// revisions under it stay on disk when the project tree prunes
+    /// `pins/configs/` (see `ProjectTreeState::sync_config_files`).
+    pub fn custom_keep_prefixes(&self) -> Vec<String> {
+        self.modules
+            .iter()
+            .filter(|m| m.kind.is_custom())
+            .map(crate::panels::mcu_module::mcu::gui::modules::custom_file_prefix)
+            .collect()
+    }
+
+    /// The `src/pins/` files a project with this configuration holds, built by
+    /// the SAME two calls the app makes on every regeneration. Every emit
+    /// harness writes these rather than assembling `configs/mod.rs` itself: a
+    /// harness that builds the tree its own way tests a project the app never
+    /// produces.
+    #[cfg(test)]
+    pub(crate) fn pin_tree_files(&self) -> Vec<(String, String)> {
+        let mut tree = crate::project_tree::logic::ProjectTreeState::new();
+        tree.sync_config_files(
+            &self.config_files(),
+            false,
+            &self.custom_keep_prefixes(),
+            &mut None,
+        );
+        tree.sync_pin_files(&self.all_pin_functions());
+        tree.user_src_files
+    }
+
+    /// Put `devices` - `(name, address)`, an empty name for an unnamed one -
+    /// on the first I2C bus, through the panel's own write path, so an emit
+    /// harness compiles a project WITH device files rather than a bus that
+    /// has none. `false`, and no change, when there is no I2C module: a
+    /// harness asserts it, so a fixture that lost its bus cannot pass quietly
+    /// without a device.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_i2c_devices(&mut self, devices: &[(&str, u8)]) -> bool {
+        use crate::panels::mcu_module::modules::{I2cDeviceEdit as E, ModuleConfig};
+        let Some(instance) = self.modules.iter().find_map(|m| match m.config {
+            ModuleConfig::I2c(_) => Some(m.instance()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        for (name, address) in devices {
+            assert!(
+                self.edit_i2c_device(instance, E::Add),
+                "no I2C{instance} to add to"
+            );
+            let key = self
+                .i2c_bus(instance)
+                .and_then(|c| c.rows().last().map(|r| r.key))
+                .expect("the device just added");
+            if !name.is_empty() {
+                self.edit_i2c_device(instance, E::Name(key, (*name).to_owned()));
+            }
+            self.edit_i2c_device(instance, E::Address(key, *address));
+        }
+        true
+    }
+
     /// `let <name> = <Struct>::new(<pin bindings…>);` for every Custom module —
     /// the lines spliced into main.rs's generated section, right after the pin
     /// bindings the call consumes.
@@ -839,7 +901,7 @@ mod tests {
         );
         let cfgs = mcu.config_files();
         let spi1 = &cfgs.iter().find(|(n, _)| n == "spi1.rs").unwrap().1;
-        let i2c1 = &cfgs.iter().find(|(n, _)| n == "i2c1.rs").unwrap().1;
+        let i2c1 = &cfgs.iter().find(|(n, _)| n == "i2c1/mod.rs").unwrap().1;
         assert_eq!(spi1.matches("pub fn init").count(), 1);
         assert_eq!(i2c1.matches("pub fn init").count(), 1);
     }
@@ -889,7 +951,7 @@ mod tests {
             ("PB7", PinFunction::I2cSda(1)),
         ]);
         let spi1 = &cfgs.iter().find(|(n, _)| n == "spi1.rs").unwrap().1;
-        let i2c1 = &cfgs.iter().find(|(n, _)| n == "i2c1.rs").unwrap().1;
+        let i2c1 = &cfgs.iter().find(|(n, _)| n == "i2c1/mod.rs").unwrap().1;
 
         // The pin types are the ones the `into_*` calls in main.rs produce.
         assert_contains_substring(spi1, "hal_gpio::PA5<hal_gpio::Alternate>,");
@@ -1079,7 +1141,7 @@ mod tests {
         let spi1 = body(&one, "spi1.rs");
         assert_contains_substring(&spi1, "Spi::spi1(spi, pins, &mut afio.mapr, get_mode()");
         assert_contains_substring(&spi1, "    afio: &mut afio::Parts,");
-        let i2c1 = body(&one, "i2c1.rs");
+        let i2c1 = body(&one, "i2c1/mod.rs");
         assert_contains_substring(
             &i2c1,
             "BlockingI2c::i2c1(i2c, pins, &mut afio.mapr, get_mode()",
@@ -1090,7 +1152,7 @@ mod tests {
         // The parameter is still there — main.rs passes it — but unused.
         assert_contains_substring(&spi2, "    _afio: &mut afio::Parts,");
         assert_not_contains_substring(&spi2, "afio.mapr");
-        let i2c2 = body(&two, "i2c2.rs");
+        let i2c2 = body(&two, "i2c2/mod.rs");
         assert_contains_substring(&i2c2, "BlockingI2c::i2c2(i2c, pins, get_mode()");
         assert_contains_substring(&i2c2, "    _afio: &mut afio::Parts,");
         assert_not_contains_substring(&i2c2, "afio.mapr");

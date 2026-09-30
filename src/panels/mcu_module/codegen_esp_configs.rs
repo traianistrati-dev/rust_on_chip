@@ -2853,15 +2853,12 @@ fn rmt_file(n: u8, cfg: Option<&RmtModuleConfig>, rt: EspRuntime, source_hz: u32
 // ── I2C ──────────────────────────────────────────────────────────────────────
 
 fn i2c_file(n: u8, sigs: &[&str], cfg: Option<&I2cModuleConfig>, rt: EspRuntime) -> String {
-    // The address line now comes from the shared emitter rather than being
-    // spelled out here: this file was the ONLY one that wrote it, so the text
-    // that explains it had nowhere to be reused from and the other families
-    // dropped the setting entirely. Wording moved with it — "an I2C master",
-    // not "an esp-hal I2C master", because it is true of every HAL here.
+    // The devices' modules come from the shared emitter, like on every other
+    // family: each device's address is in its own file beside this `mod.rs`.
     let consts = format!(
         "pub const FREQUENCY_HZ: u32 = {};\n{}",
         cfg.map_or(100_000, |c| c.clock_hz),
-        super::codegen::common::device_address_const(None, cfg.map_or(0, |c| c.primary_address())),
+        super::codegen::common::i2c_device_mods(cfg),
     );
     let bound = "impl PeripheralInput<'d> + PeripheralOutput<'d>";
     let params = format!(
@@ -2894,7 +2891,8 @@ fn i2c_file(n: u8, sigs: &[&str], cfg: Option<&I2cModuleConfig>, rt: EspRuntime)
         &[
             "In main.rs, after the init above:",
             "",
-            "    use pins::configs::i2c{N}::DEVICE_ADDRESS;",
+            "    // The address is the device's own, in its file beside this one:",
+            "    use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;",
             "",
             "    // Write to a register",
             "    {H}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();",
@@ -2910,7 +2908,8 @@ fn i2c_file(n: u8, sigs: &[&str], cfg: Option<&I2cModuleConfig>, rt: EspRuntime)
         &[
             "main.rs calls `init_async`, so the handle is an `I2c<'_, Async>`:",
             "",
-            "    use pins::configs::i2c{N}::DEVICE_ADDRESS;",
+            "    // The address is the device's own, in its file beside this one:",
+            "    use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;",
             "",
             "    {H}.write_async(DEVICE_ADDRESS, &[0x10, 0x42]).await.ok();",
             "",
@@ -3381,9 +3380,9 @@ pub fn config_files(
         out.push((format!("spi{n}.rs"), spi_file(*n, sigs, spi_cfg.get(n), rt)));
     }
     for (n, sigs) in i2c {
-        out.push((format!("i2c{n}.rs"), i2c_file(*n, sigs, i2c_cfg.get(n), rt)));
-        out.extend(super::codegen::common::i2c_device_config_files(
+        out.extend(super::codegen::common::i2c_bus_files(
             &format!("i2c{n}"),
+            i2c_file(*n, sigs, i2c_cfg.get(n), rt),
             i2c_cfg.get(n),
         ));
     }
@@ -3951,7 +3950,7 @@ mod tests {
             vec![
                 "uart1.rs",
                 "spi2.rs",
-                "i2c0.rs",
+                "i2c0/mod.rs",
                 "i2s0.rs",
                 "rmt2.rs",
                 "pcnt1.rs",

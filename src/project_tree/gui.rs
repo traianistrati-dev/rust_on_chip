@@ -91,8 +91,17 @@ fn generated_folder_reason(path: &str) -> Option<&'static str> {
         "src/pins/configs" => {
             Some("`pins/configs/` is auto-generated from the Virtual Modules (USART/SPI/I2C)")
         }
+        p if p.starts_with("src/pins/configs/") => Some(
+            "an I2C bus folder is auto-generated from its Virtual Module - its device files are renamed with the devices",
+        ),
         _ => None,
     }
+}
+
+/// `pins/configs/` or a folder in it: every file there is generated, and one
+/// put there by hand is pruned by the next regeneration.
+pub(crate) fn in_generated_configs(folder: &str) -> bool {
+    folder == "src/pins/configs" || folder.starts_with("src/pins/configs/")
 }
 
 /// If `path` (relative to the PROJECT ROOT) is an auto-generated file that must
@@ -2383,8 +2392,14 @@ fn render_tree_node(
                     }
 
                     ch.header_response.context_menu(|ui| {
+                        // Nothing new goes into `pins/configs/`: the next
+                        // regeneration prunes what it did not generate.
+                        let can_add = !in_generated_configs(&folder_path);
                         if ui
-                            .button(menu_label(ph::FILE_PLUS, "New File", ICON_NEW))
+                            .add_enabled(
+                                can_add,
+                                egui::Button::new(menu_label(ph::FILE_PLUS, "New File", ICON_NEW)),
+                            )
                             .clicked()
                         {
                             begin_inline_new(
@@ -2400,7 +2415,14 @@ fn render_tree_node(
                             ui.close();
                         }
                         if ui
-                            .button(menu_label(ph::FOLDER_PLUS, "New Folder", ICON_FOLDER))
+                            .add_enabled(
+                                can_add,
+                                egui::Button::new(menu_label(
+                                    ph::FOLDER_PLUS,
+                                    "New Folder",
+                                    ICON_FOLDER,
+                                )),
+                            )
                             .clicked()
                         {
                             begin_inline_new(
@@ -2790,6 +2812,23 @@ fn user_file_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An I2C bus folder is as generated as `pins/configs/` itself: it cannot
+    /// be moved, renamed or deleted, nothing new goes into it - and the user's
+    /// own `src/pins/utils/` stays theirs.
+    #[test]
+    fn bus_folders_are_generated_and_pins_utils_is_not() {
+        assert!(generated_folder_reason("src/pins/configs/i2c1").is_some());
+        assert!(generated_folder_reason("src/pins/configs/twim0").is_some());
+        assert!(generated_folder_reason("src/pins/configs").is_some());
+        assert!(generated_folder_reason("src/pins/utils").is_none());
+        assert!(generated_folder_reason("src/pins_configs").is_none());
+        assert!(in_generated_configs("src/pins/configs"));
+        assert!(in_generated_configs("src/pins/configs/i2c1"));
+        assert!(!in_generated_configs("src/pins"));
+        assert!(!in_generated_configs("src/pins/utils"));
+        assert!(generated_file_reason("src/pins/configs/i2c1/device1_oled.rs").is_some());
+    }
 
     /// A rename is a NAME. Typing a path used to change the in-memory path
     /// while `fs::rename` failed on the missing directory - memory and disk

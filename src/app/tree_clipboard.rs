@@ -129,6 +129,16 @@ impl AppIde {
             return;
         }
 
+        // Ctrl+V reaches here with any selection, a generated file's too.
+        if crate::project_tree::gui::in_generated_configs(&req.target_dir) {
+            set_tree_notice(
+                ctx,
+                "Can't paste into `pins/configs/` - it's auto-managed by the MCU Configurator."
+                    .into(),
+            );
+            return;
+        }
+
         let taken: std::collections::HashSet<&str> = self
             .project_tree
             .user_src_files

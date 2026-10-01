@@ -6891,6 +6891,39 @@ pub fn module_config_ui(
                     ui.label("Product ID");
                     ui.add(crate::panels::drag_value(ui, &mut cfg.pid).hexadecimal(4, false, true));
                     ui.end_row();
+                    // The nRF builds one of two stacks, chosen by the Runtime -
+                    // the same answer `nrf::usb_stack` gives the manifest.
+                    if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
+                        let stack = if is_async {
+                            "embassy-usb  ·  device in its own task"
+                        } else if crate::panels::mcu_module::codegen::nrf::blocking_on_embassy(family) {
+                            "none on Blocking for this part  ·  switch to Async"
+                        } else {
+                            "usb-device + usbd-serial"
+                        };
+                        out.field("Stack", docs::USB_STACK_NRF);
+                        ui.label("Stack");
+                        ui.label(
+                            egui::RichText::new(stack)
+                                .size(11.0)
+                                .color(egui::Color32::GRAY),
+                        )
+                        .on_hover_text(docs::USB_STACK_NRF);
+                        ui.end_row();
+                        out.field("Clock", docs::USB_CLOCK_NRF);
+                        ui.label("Clock");
+                        ui.label(
+                            egui::RichText::new("32 MHz crystal, started for you")
+                                .size(11.0)
+                                .color(egui::Color32::GRAY),
+                        )
+                        .on_hover_text(docs::USB_CLOCK_NRF);
+                        ui.end_row();
+                        // This path draws fewer rows and leaves here, so it
+                        // marks its own roster complete.
+                        out.all_fields_documented();
+                        break 'cfg;
+                    }
                     if cfg.role.is_otg() {
                         out.field("Stack", docs::USB_STACK);
                         ui.label("Stack");

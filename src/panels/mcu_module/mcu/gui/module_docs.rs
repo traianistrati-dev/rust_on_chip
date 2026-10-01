@@ -210,6 +210,8 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("USB_VID", USB_VID),
     ("USB_PID", USB_PID),
     ("USB_STACK", USB_STACK),
+    ("USB_STACK_NRF", USB_STACK_NRF),
+    ("USB_CLOCK_NRF", USB_CLOCK_NRF),
     ("RMT_DIRECTION_LOCKED", RMT_DIRECTION_LOCKED),
     ("RMT_DIRECTION", RMT_DIRECTION),
     ("RMT_CLK_DIVIDER", RMT_CLK_DIVIDER),
@@ -601,10 +603,12 @@ pub const ROSTER: &[KindRoster] = &[
     (
         "USB",
         &[
+            ("Clock", Some(USB_CLOCK_NRF)),
             ("Identity", Some(USB_IDENTITY)),
             ("Port", Some(USB_PORT)),
             ("Product", Some(USB_PRODUCT)),
             ("Product ID", Some(USB_PID)),
+            ("Stack", Some(USB_STACK_NRF)),
             ("Vendor ID", Some(USB_VID)),
         ],
     ),
@@ -836,6 +840,14 @@ pub const USB_STACK: &str = "The usb-device and usbd-serial crates come with thi
                              are added for you, wired up as a CDC serial port. Not a choice, and \
                              not a limit either - the class is swappable in your own code for \
                              anything the crate offers.";
+pub const USB_STACK_NRF: &str = "Which USB stack the generated code builds on, and it follows the \
+                                 Runtime: on Blocking nrf-hal's Usbd under usb-device and \
+                                 usbd-serial, on Async embassy-nrf's driver under embassy-usb, \
+                                 with the device running in its own task. Either crate set is \
+                                 added to Cargo.toml for you, as a CDC serial port.";
+pub const USB_CLOCK_NRF: &str = "USB runs only from the 32 MHz crystal. With the pads wired, the \
+                                 generated code starts it whatever the Clock tab chose, and says \
+                                 so in a comment where it does.";
 // ── RMT ───────────────────────────────────────────────────────────────────────
 
 pub const RMT_DIRECTION_LOCKED: &str = "Fixed in silicon on this chip: the low RMT channels only \

@@ -547,14 +547,27 @@ pub fn ensure_esp_usb_deps(cargo_toml: &str, needs_otg: bool, sources: &[&str]) 
         cargo_toml,
         "usb-device",
         needs_otg,
-        &format!("usb-device  = \"0.3\"   {DEP_MARKER}"),
+        "usb-device  = \"0.3\"",
         sources,
     );
     ensure_dep(
         &s,
         "usbd-serial",
         needs_otg,
-        &format!("usbd-serial = \"0.2\"   {DEP_MARKER}"),
+        "usbd-serial = \"0.2\"",
+        sources,
+    )
+}
+
+/// Add or remove `embassy-usb`, the stack embassy-nrf's USB driver runs
+/// under on the Async runtime. 0.6 is on `embassy-usb-driver` 0.2, the
+/// version embassy-nrf 0.11 implements.
+pub fn ensure_embassy_usb_deps(cargo_toml: &str, needs: bool, sources: &[&str]) -> String {
+    ensure_dep(
+        cargo_toml,
+        "embassy-usb",
+        needs,
+        "embassy-usb = \"0.6\"",
         sources,
     )
 }
@@ -3319,6 +3332,33 @@ mod tests {
         assert!(spliced.contains("0x08002000"), "block reflects new chip");
         assert!(!spliced.contains("0x08000000"), "old generated value gone");
         assert!(spliced.contains("/* my note */"), "user edit preserved");
+    }
+
+    /// `ensure_dep` writes the provenance marker itself. The usb-device 0.3
+    /// lines passed it in as well, so every ESP OTG (and now nRF) manifest
+    /// carried `# <rust_on_chip>   # <rust_on_chip>`.
+    #[test]
+    fn the_usb_lines_carry_one_marker_and_leave_cleanly() {
+        let base = gen_config(
+            ConfigFile::CargoToml,
+            &stm32_def(),
+            &ToolchainKind::RustEmbedded,
+        );
+        let with = ensure_embassy_usb_deps(&ensure_esp_usb_deps(&base, true, &[]), true, &[]);
+        for name in ["usb-device", "usbd-serial", "embassy-usb"] {
+            let line = with
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} line:\n{with}"));
+            assert_eq!(line.matches(DEP_MARKER).count(), 1, "{line}");
+        }
+        assert_eq!(
+            ensure_embassy_usb_deps(&ensure_esp_usb_deps(&with, true, &[]), true, &[]),
+            with,
+            "idempotent"
+        );
+        let back = ensure_embassy_usb_deps(&ensure_esp_usb_deps(&with, false, &[]), false, &[]);
+        assert_eq!(back, base, "removal restores base");
     }
 
     #[test]

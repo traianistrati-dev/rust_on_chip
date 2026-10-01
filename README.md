@@ -219,6 +219,18 @@ UART, the QSPI flash and the 32.768 kHz crystal along the top. The crystal IS
 fitted here, so the Clock tab offers LFXO as a third LFCLK source. Both kits
 flash through their on-board J-Link with probe-rs.
 
+The nRF52840 DK also offers its **nRF USB connector** and the **64 Mbit QSPI
+flash**:
+
+- **USB** — wire `USB D+` and `USB D-` (they are the chip's dedicated balls,
+  not GPIO). Blocking builds a `usb-device` 0.3 CDC serial port on nrf-hal's
+  `Usbd`; Async builds `embassy-usb` with a CDC-ACM class and runs the device in
+  its own task. Either way the 32 MHz crystal is started, overriding the Clock
+  tab: USB cannot run from the RC oscillator.
+- **QSPI** — Async only: embassy-nrf's `qspi::Qspi`, quad I/O, with the
+  module's size, address width and clock (32 MHz / (prescaler + 1)). nrf-hal has
+  no QSPI driver, so a Blocking project says so instead of building one.
+
 Every other nRF52 part works through **New MCU → Auto-fill**: type `nRF52810`
 (or 52805, 52811, 52820, 52832, 52833, 52840) and the form fills the target,
 memory, probe-rs name, both HAL lines and the clock tree. The generator knows

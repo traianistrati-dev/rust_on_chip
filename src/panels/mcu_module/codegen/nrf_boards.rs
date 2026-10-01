@@ -44,6 +44,12 @@ enum Pad {
     Spi(u8, u8, &'static str, Role),
     /// The I2C pads of the Arduino header: both TWIMs' role, plus the rest.
     I2c(u8, u8, &'static str, Role),
+    /// A pad wired to the kit's QSPI flash, offered as that QSPI role only:
+    /// the flash chip is soldered to it, so nothing else can use it.
+    Qspi(u8, u8, &'static str, Role),
+    /// One of the chip's dedicated USB balls - not a GPIO, so the name does
+    /// not lead with a pin and codegen never binds it.
+    Usb(&'static str, Role),
     /// Spoken for by the kit: reserved, explained by its name.
     Fixed(&'static str),
 }
@@ -60,10 +66,15 @@ enum Role {
     Miso,
     Sda,
     Scl,
+    QClk,
+    QCs,
+    QIo(u8),
+    Dp,
+    Dm,
 }
 
 #[cfg(test)]
-use Pad::{Button, Fixed, Gp, I2c, Led, Spi, Uart};
+use Pad::{Button, Fixed, Gp, I2c, Led, Qspi, Spi, Uart, Usb};
 #[cfg(test)]
 use Role::*;
 
@@ -141,6 +152,19 @@ fn pin_def(c: &NrfChip, number: usize, pad: Pad) -> PinDef {
             f.splice(at..at, bus);
             (name(port, pin, note), false, f)
         }
+        Qspi(port, pin, note, role) => {
+            let f = match role {
+                QClk => QspiClk,
+                QCs => QspiNcs { bank: 1 },
+                QIo(lane) => QspiIo { bank: 1, lane },
+                _ => unreachable!("a QSPI pad's role"),
+            };
+            (name(port, pin, note), false, vec![f])
+        }
+        Usb(name, role) => {
+            let f = if matches!(role, Dp) { UsbDp } else { UsbDm };
+            (name.to_owned(), false, vec![f])
+        }
         Fixed(name) => (name.to_owned(), true, Vec::new()),
     };
     PinDef {
@@ -217,12 +241,14 @@ const NRF52840_DK: Board = Board {
         Uart(0, 8, "VCOM RXD", Rx),
         Uart(0, 7, "VCOM CTS", Cts),
         Uart(0, 5, "VCOM RTS", Rts),
-        Fixed("P0.17 (QSPI CS)"),
-        Fixed("P0.19 (QSPI CLK)"),
-        Fixed("P0.20 (QSPI IO0)"),
-        Fixed("P0.21 (QSPI IO1)"),
-        Fixed("P0.22 (QSPI IO2)"),
-        Fixed("P0.23 (QSPI IO3)"),
+        Qspi(0, 17, "QSPI CS, 64 Mbit flash", QCs),
+        Qspi(0, 19, "QSPI CLK, 64 Mbit flash", QClk),
+        Qspi(0, 20, "QSPI IO0, 64 Mbit flash", QIo(0)),
+        Qspi(0, 21, "QSPI IO1, 64 Mbit flash", QIo(1)),
+        Qspi(0, 22, "QSPI IO2, 64 Mbit flash", QIo(2)),
+        Qspi(0, 23, "QSPI IO3, 64 Mbit flash", QIo(3)),
+        Usb("USB D+ (nRF USB connector)", Dp),
+        Usb("USB D- (nRF USB connector)", Dm),
         Fixed("P0.00 (XL1, 32.768 kHz)"),
         Fixed("P0.01 (XL2, 32.768 kHz)"),
         Fixed("P0.18 (RESET)"),
@@ -493,7 +519,17 @@ mod tests {
         let mut mcu = def.build_mcu();
         mcu.runtime = case.runtime;
         let pwm = |channel| PinFunction::TimerPwm { timer: 0, channel };
-        let wire: [(&str, PinFunction); 11] = [
+        // USB and QSPI only exist on the 52840 DK's pads: elsewhere these
+        // keys match nothing, which is the point of wiring them everywhere.
+        let wire: [(&str, PinFunction); 19] = [
+            ("USB D+", PinFunction::UsbDp),
+            ("USB D-", PinFunction::UsbDm),
+            ("(QSPI CS,", PinFunction::QspiNcs { bank: 1 }),
+            ("(QSPI CLK,", PinFunction::QspiClk),
+            ("(QSPI IO0,", PinFunction::QspiIo { bank: 1, lane: 0 }),
+            ("(QSPI IO1,", PinFunction::QspiIo { bank: 1, lane: 1 }),
+            ("(QSPI IO2,", PinFunction::QspiIo { bank: 1, lane: 2 }),
+            ("(QSPI IO3,", PinFunction::QspiIo { bank: 1, lane: 3 }),
             ("(LED1", PinFunction::GpioOutput),
             ("(LED2", pwm(0)),
             ("(LED3", pwm(1)),
@@ -530,7 +566,11 @@ mod tests {
         let ClockConfig::Graph(gc) = &mut mcu.clock else {
             panic!("the kit carries a graph");
         };
-        gc.graph.node_mut("hfclk_src").unwrap().state = NodeState::Index(1);
+        // The 52840 DK keeps the INTERNAL oscillator on both runtimes, so the
+        // crystal USB needs comes from the override - on Blocking a type
+        // (`Clocks<ExternalOscillator, ..>`) that only a compiler checks.
+        let hf = if case.board == "nrf52840_dk" { 0 } else { 1 };
+        gc.graph.node_mut("hfclk_src").unwrap().state = NodeState::Index(hf);
         gc.graph.node_mut("lfclk_src").unwrap().state = NodeState::Index(2);
         mcu.watchdog.nrf = Some(crate::panels::mcu_module::watchdog::NrfWdtConfig::default_for());
         (def, mcu)
@@ -571,6 +611,50 @@ mod tests {
         }
     }
 
+    /// The 52840 DK's USB and QSPI on both runtimes: nrf-hal builds the
+    /// usb-device bus on the crystal and says it has no QSPI; embassy-nrf
+    /// builds both, the USB device in its own task.
+    #[test]
+    fn the_52840_dk_builds_usb_and_qspi() {
+        let main = |dir: &str| {
+            let case = CASES.iter().find(|c| c.dir == dir).unwrap();
+            let (_, mcu) = wired(case);
+            (super::super::nrf::usb_stack(&mcu), mcu.fresh_main_rs())
+        };
+        let (stack, m) = main("eide_nrf52840_dk_check");
+        assert_eq!(stack, (true, false));
+        for want in [
+            "// The USB module needs the crystal",
+            ".enable_ext_hfosc()",
+            "nrf52840_hal::usbd::UsbPeripheral::new(p.USBD, &clocks)",
+            "usbd_serial::SerialPort::new(&usb_bus)",
+            "const USB_VID: u16 = 0x16c0;",
+            "QSPI is NOT built: nrf-hal has no QSPI driver",
+        ] {
+            assert!(m.contains(want), "missing {want:?}:\n{m}");
+        }
+        let (stack, m) = main("eide_nrf52840_dk_async_check");
+        assert_eq!(stack, (false, true));
+        for want in [
+            "config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;",
+            "async fn usb_task(",
+            "spawner.spawn(usb_task(usb_builder.build()).unwrap());",
+            "async fn main(spawner: embassy_executor::Spawner)",
+            "USBD => embassy_nrf::usb::InterruptHandler<embassy_nrf::peripherals::USBD>;",
+            "CLOCK_POWER => embassy_nrf::usb::vbus_detect::InterruptHandler;",
+            "QSPI => embassy_nrf::qspi::InterruptHandler<embassy_nrf::peripherals::QSPI>;",
+            "p.P0_19, // SCK\n        p.P0_17, // CSN\n        p.P0_20, // IO0",
+            "qspi_cfg.capacity = 16777216;",
+            "qspi_cfg.frequency = embassy_nrf::qspi::Frequency::M16;",
+        ] {
+            assert!(m.contains(want), "missing {want:?}:\n{m}");
+        }
+        // The 52820 has a USBD but, on Blocking, no stack to run it under.
+        let (stack, m) = main("eide_nrf52820_check");
+        assert_eq!(stack, (false, false));
+        assert!(!m.contains("USB (USBD)"), "{m}");
+    }
+
     /// The small parts' serial blocks, by their embassy-nrf names.
     #[test]
     fn each_part_names_its_own_serial_blocks() {
@@ -606,10 +690,16 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf project");
+            let toml_path = dir.join("Cargo.toml");
+            let sources = [main_rs.as_str()];
+            // The USB crates, by the decision `app.rs` asks of the same function.
+            let (usb_device, embassy_usb) = super::super::nrf::usb_stack(&mcu);
+            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
+            let toml = project_gen::ensure_esp_usb_deps(&toml, usb_device, &sources);
+            let toml = project_gen::ensure_embassy_usb_deps(&toml, embassy_usb, &sources);
+            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             if mcu.is_async() {
-                let toml_path = dir.join("Cargo.toml");
                 let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-                let sources = [main_rs.as_str()];
                 let toml = project_gen::ensure_async_deps(
                     &toml,
                     true,
@@ -659,6 +749,19 @@ mod tests {
             let mut numbers = std::collections::BTreeSet::new();
             for p in mcu.iter_all_pins() {
                 assert!(numbers.insert(p.number), "{}: pad {} twice", def.id, p.number);
+                // The USB balls are no GPIO: they offer their USB role only.
+                if p.name.starts_with("USB ") {
+                    assert!(c.usbd, "{}: USB pads on a part without USBD", def.id);
+                    assert!(
+                        p.available_functions
+                            .iter()
+                            .all(|f| matches!(f, PinFunction::UsbDp | PinFunction::UsbDm)),
+                        "{}: {}",
+                        def.id,
+                        p.name
+                    );
+                    continue;
+                }
                 let pp = super::super::nrf::nrf_pin(&p.name)
                     .unwrap_or_else(|| panic!("{}: {} names no pin", def.id, p.name));
                 assert!(seen.insert(pp), "{}: {:?} twice", def.id, pp);
@@ -675,6 +778,9 @@ mod tests {
                         PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => c.has("twim", *i),
                         PinFunction::TimerPwm { timer, .. } => c.has("pwm", *timer),
                         PinFunction::AdcChannel { channel, .. } => c.ain.contains(channel),
+                        PinFunction::QspiClk
+                        | PinFunction::QspiNcs { .. }
+                        | PinFunction::QspiIo { .. } => c.qspi,
                         _ => true,
                     };
                     assert!(ok, "{}: {} offers {f:?}", def.id, p.name);

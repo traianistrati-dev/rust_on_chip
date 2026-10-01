@@ -385,54 +385,96 @@ McuDefinition(
             ),
             PinDef(
                 number: 40,
-                name: "P0.17 (QSPI CS)",
-                reserved: true,
-                functions: [],
+                name: "P0.17 (QSPI CS, 64 Mbit flash)",
+                reserved: false,
+                functions: [
+                    QspiNcs(
+                        bank: 1,
+                    ),
+                ],
             ),
             PinDef(
                 number: 41,
-                name: "P0.19 (QSPI CLK)",
-                reserved: true,
-                functions: [],
+                name: "P0.19 (QSPI CLK, 64 Mbit flash)",
+                reserved: false,
+                functions: [
+                    QspiClk,
+                ],
             ),
             PinDef(
                 number: 42,
-                name: "P0.20 (QSPI IO0)",
-                reserved: true,
-                functions: [],
+                name: "P0.20 (QSPI IO0, 64 Mbit flash)",
+                reserved: false,
+                functions: [
+                    QspiIo(
+                        bank: 1,
+                        lane: 0,
+                    ),
+                ],
             ),
             PinDef(
                 number: 43,
-                name: "P0.21 (QSPI IO1)",
-                reserved: true,
-                functions: [],
+                name: "P0.21 (QSPI IO1, 64 Mbit flash)",
+                reserved: false,
+                functions: [
+                    QspiIo(
+                        bank: 1,
+                        lane: 1,
+                    ),
+                ],
             ),
             PinDef(
                 number: 44,
-                name: "P0.22 (QSPI IO2)",
-                reserved: true,
-                functions: [],
+                name: "P0.22 (QSPI IO2, 64 Mbit flash)",
+                reserved: false,
+                functions: [
+                    QspiIo(
+                        bank: 1,
+                        lane: 2,
+                    ),
+                ],
             ),
             PinDef(
                 number: 45,
-                name: "P0.23 (QSPI IO3)",
-                reserved: true,
-                functions: [],
+                name: "P0.23 (QSPI IO3, 64 Mbit flash)",
+                reserved: false,
+                functions: [
+                    QspiIo(
+                        bank: 1,
+                        lane: 3,
+                    ),
+                ],
             ),
             PinDef(
                 number: 46,
+                name: "USB D+ (nRF USB connector)",
+                reserved: false,
+                functions: [
+                    UsbDp,
+                ],
+            ),
+            PinDef(
+                number: 47,
+                name: "USB D- (nRF USB connector)",
+                reserved: false,
+                functions: [
+                    UsbDm,
+                ],
+            ),
+            PinDef(
+                number: 48,
                 name: "P0.00 (XL1, 32.768 kHz)",
                 reserved: true,
                 functions: [],
             ),
             PinDef(
-                number: 47,
+                number: 49,
                 name: "P0.01 (XL2, 32.768 kHz)",
                 reserved: true,
                 functions: [],
             ),
             PinDef(
-                number: 48,
+                number: 50,
                 name: "P0.18 (RESET)",
                 reserved: true,
                 functions: [],

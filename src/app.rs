@@ -3717,7 +3717,20 @@ impl AppIde {
             // The STM32F1 `usb-device` 0.2 stack. It used to fire on an ESP too:
             // both pads wired on a blocking project added two crates nothing
             // referenced, at versions the ESP bus cannot even use.
-            let needs_usb = !is_async && !is_esp_family && both_usb_pads;
+            //
+            // Not on an nRF either: its USB is not this stack (see below).
+            let is_nrf_family = self
+                .mcu
+                .as_ref()
+                .is_some_and(|m| crate::panels::mcu_module::codegen::nrf::is_nrf(&m.family));
+            let needs_usb = !is_async && !is_esp_family && !is_nrf_family && both_usb_pads;
+            // The nRF's: nrf-hal's `Usbd` is a usb-device 0.3 bus (the ESP OTG
+            // versions), embassy-nrf's driver runs under embassy-usb. One
+            // decision, shared with the harness - see `nrf::usb_stack`.
+            let (nrf_usb_device, nrf_embassy_usb) = self
+                .mcu
+                .as_ref()
+                .map_or((false, false), crate::panels::mcu_module::codegen::nrf::usb_stack);
             // …and the ESP's own stack, which only the OTG role wants.
             let needs_esp_otg = is_esp_family
                 && both_usb_pads
@@ -3764,7 +3777,13 @@ impl AppIde {
                 &sources,
             );
             let new_toml = project_gen::ensure_usb_deps(&new_toml, needs_usb, &sources);
-            let new_toml = project_gen::ensure_esp_usb_deps(&new_toml, needs_esp_otg, &sources);
+            let new_toml = project_gen::ensure_esp_usb_deps(
+                &new_toml,
+                needs_esp_otg || nrf_usb_device,
+                &sources,
+            );
+            let new_toml =
+                project_gen::ensure_embassy_usb_deps(&new_toml, nrf_embassy_usb, &sources);
             // Async runtime (embassy-executor + embassy-time + the HAL time
             // driver), plus — when the respective config files were emitted —
             // embedded-io-async + static_cell (USART) and embedded-hal /

@@ -76,6 +76,10 @@ pub(crate) struct NrfChip {
     /// The SAADC inputs (`AINn`), empty for a part without a SAADC. The
     /// 52805 has two: embassy-nrf implements AIN2 and AIN3 only.
     pub ain: &'static [u8],
+    /// The full-speed USB device controller (USBD): 52820, 52833, 52840.
+    pub usbd: bool,
+    /// The QSPI flash controller: the 52840 alone.
+    pub qspi: bool,
 }
 
 /// Every nRF52 part both HALs know, smallest first.
@@ -94,6 +98,8 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
         twim: &[0],
         pwm: &[],
         ain: &[2, 3],
+        usbd: false,
+        qspi: false,
     },
     NrfChip {
         family: "nrf52810",
@@ -109,6 +115,8 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
         twim: &[0],
         pwm: &[0],
         ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+        usbd: false,
+        qspi: false,
     },
     NrfChip {
         family: "nrf52811",
@@ -124,6 +132,8 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
         twim: &[0],
         pwm: &[0],
         ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+        usbd: false,
+        qspi: false,
     },
     NrfChip {
         family: "nrf52820",
@@ -139,6 +149,8 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
         twim: &[0, 1],
         pwm: &[],
         ain: &[],
+        usbd: true,
+        qspi: false,
     },
     NrfChip {
         family: "nrf52832",
@@ -154,6 +166,8 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
         twim: &[0, 1],
         pwm: &[0, 1, 2],
         ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+        usbd: false,
+        qspi: false,
     },
     NrfChip {
         family: "nrf52833",
@@ -169,6 +183,8 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
         twim: &[0, 1],
         pwm: &[0, 1, 2, 3],
         ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+        usbd: true,
+        qspi: false,
     },
     NrfChip {
         family: "nrf52840",
@@ -184,6 +200,8 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
         twim: &[0, 1],
         pwm: &[0, 1, 2, 3],
         ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+        usbd: true,
+        qspi: true,
     },
 ];
 
@@ -383,6 +401,11 @@ fn clock_lines(mcu: &Mcu, hal: &str) -> String {
     ));
     if c.hfxo {
         o.push_str("        .enable_ext_hfosc()\n");
+    } else if usb_wired(mcu) {
+        // Not a preference: `UsbPeripheral::new` takes `&Clocks<ExternalOscillator, ..>`,
+        // so the crystal is a type the USB bus cannot be built without.
+        o.push_str("        // The USB module needs the crystal: the Clock tab's internal choice is\n        // overridden, since USB cannot run from the RC oscillator.\n");
+        o.push_str("        .enable_ext_hfosc()\n");
     }
     match c.lf {
         LfSource::Rc => o.push_str("        .set_lfclk_src_rc()\n"),
@@ -494,6 +517,8 @@ fn block_present(mcu: &Mcu, kind: &str, n: Option<u8>) -> bool {
     match (kind, n) {
         ("saadc", Some(ch)) => c.ain.contains(&ch),
         ("saadc", None) => !c.ain.is_empty(),
+        ("usbd", _) => c.usbd,
+        ("qspi", _) => c.qspi,
         (k, Some(n)) => c.has(k, n),
         _ => true,
     }
@@ -512,6 +537,10 @@ fn block_of(f: &PinFunction) -> Option<(&'static str, Option<u8>, String)> {
         PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => ("twim", Some(*i), format!("TWIM{i}")),
         PinFunction::TimerPwm { timer, .. } => ("pwm", Some(*timer), format!("PWM{timer}")),
         PinFunction::AdcChannel { channel, .. } => ("saadc", Some(*channel), format!("AIN{channel}")),
+        PinFunction::UsbDm | PinFunction::UsbDp => ("usbd", None, "USBD".to_owned()),
+        PinFunction::QspiClk | PinFunction::QspiNcs { .. } | PinFunction::QspiIo { .. } => {
+            ("qspi", None, "QSPI".to_owned())
+        }
         _ => return None,
     })
 }
@@ -527,21 +556,21 @@ fn missing_block_notes(mcu: &Mcu) -> String {
     let Some(c) = chip(&mcu.family) else {
         return String::new();
     };
-    let mut missing: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
+    let mut missing: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for p in mcu.iter_all_pins().filter(|p| !p.reserved) {
-        let (Some(pp), Some((kind, n, name))) = (nrf_pin(&p.name), block_of(&p.selected_function))
-        else {
+        let Some((kind, n, name)) = block_of(&p.selected_function) else {
             continue;
         };
         if !block_present(mcu, kind, n) {
-            missing.entry(name).or_default().push(pp);
+            // The USB pads are no GPIO, so they are named as the pad is.
+            let pad = nrf_pin(&p.name).map_or_else(|| p.name.clone(), label);
+            missing.entry(name).or_default().push(pad);
         }
     }
     let mut o = String::new();
     for (name, mut pads) in missing {
         pads.sort_unstable();
-        let pads: Vec<String> = pads.into_iter().map(label).collect();
         o.push_str(&format!(
             "    // {name} is wired on {}, but the {} has no {name}: it is not built.\n",
             pads.join(" and "),
@@ -549,6 +578,96 @@ fn missing_block_notes(mcu: &Mcu) -> String {
         ));
     }
     o
+}
+
+// ── USB and QSPI ────────────────────────────────────────────────────────────
+
+/// Whether the USB device is built: both pads wired, on a part with a USBD.
+///
+/// The pads are the chip's dedicated D+/D- balls, not GPIO, so nothing about
+/// them reaches a constructor: wiring them is how the user asks for the
+/// controller.
+fn usb_wired(mcu: &Mcu) -> bool {
+    let wired = |f: PinFunction| {
+        mcu.iter_all_pins()
+            .any(|p| !p.reserved && p.selected_function == f)
+    };
+    block_present(mcu, "usbd", None) && wired(PinFunction::UsbDp) && wired(PinFunction::UsbDm)
+}
+
+/// `(sck, csn, [io0..io3])`, each as `(port, pin)`.
+type QspiPads = ((u8, u8), (u8, u8), [(u8, u8); 4]);
+
+/// The QSPI's six pads as `(sck, csn, [io0..io3])`, when every one is wired on
+/// a part with a QSPI. The nRF driver is quad-only: its one constructor takes
+/// all six, so a bank short of a lane builds nothing.
+fn qspi_wired(mcu: &Mcu) -> Option<QspiPads> {
+    if !block_present(mcu, "qspi", None) {
+        return None;
+    }
+    let pad = |want: &PinFunction| {
+        mcu.iter_all_pins()
+            .filter(|p| !p.reserved && p.selected_function == *want)
+            .find_map(|p| nrf_pin(&p.name))
+    };
+    let io = |lane| pad(&PinFunction::QspiIo { bank: 1, lane });
+    Some((
+        pad(&PinFunction::QspiClk)?,
+        pad(&PinFunction::QspiNcs { bank: 1 })?,
+        [io(0)?, io(1)?, io(2)?, io(3)?],
+    ))
+}
+
+/// Whether any QSPI pad is wired at all - to say what is missing when
+/// [`qspi_wired`] cannot build it.
+fn qspi_touched(mcu: &Mcu) -> bool {
+    mcu.iter_all_pins().any(|p| {
+        !p.reserved
+            && matches!(
+                p.selected_function,
+                PinFunction::QspiClk | PinFunction::QspiNcs { .. } | PinFunction::QspiIo { .. }
+            )
+    })
+}
+
+/// The USB crates an nRF project needs, as `(usb-device stack, embassy-usb)`.
+///
+/// Asked by `app.rs` when it writes `Cargo.toml` and by the harness that
+/// cross-compiles the same project, so the two cannot disagree. nrf-hal's
+/// `Usbd` is a `usb-device` 0.3 bus - the ESP OTG stack's versions - and
+/// embassy-nrf's driver runs under `embassy-usb`. The part nrf-hal has no
+/// crate for builds no USB on Blocking (embassy-usb needs an executor).
+pub fn usb_stack(mcu: &Mcu) -> (bool, bool) {
+    if !is_nrf(&mcu.family) || !usb_wired(mcu) {
+        return (false, false);
+    }
+    if mcu.is_async() {
+        (false, true)
+    } else {
+        (hal_crate(&mcu.family).is_some(), false)
+    }
+}
+
+/// The module's VID / PID / product, as three consts at the top of `main`.
+fn usb_identity(mcu: &Mcu) -> String {
+    let d = crate::panels::mcu_module::modules::UsbModuleConfig::new(1);
+    let cfgs = crate::panels::mcu_module::modules::usb_configs(&mcu.modules);
+    let c = cfgs.values().next().unwrap_or(&d);
+    format!(
+        "    // From the USB module. `0x16c0:0x27dd` is pid.codes' test pair - fine on\n    // a bench, not for anything shipped.\n    const USB_VID: u16 = 0x{:04x};\n    const USB_PID: u16 = 0x{:04x};\n    const USB_PRODUCT: &str = {:?};\n",
+        c.vid, c.pid, c.product
+    )
+}
+
+/// The QSPI bus clock for the module's prescaler: 32 MHz / (prescaler + 1),
+/// as `(Hz, Frequency variant)`. The block's divider runs 1..=16.
+fn qspi_frequency(prescaler: u8) -> (u32, &'static str) {
+    const F: [&str; 16] = [
+        "M32", "M16", "M10_7", "M8", "M6_4", "M5_3", "M4_6", "M4", "M3_6", "M3_2", "M2_9",
+        "M2_7", "M2_5", "M2_3", "M2_1", "M2",
+    ];
+    let i = usize::from(prescaler).min(F.len() - 1);
+    (32_000_000 / (i as u32 + 1), F[i])
 }
 
 /// Which pin carries each role of one bus instance.
@@ -831,6 +950,35 @@ fn pwm_adc_lines(mcu: &Mcu, hal: &str) -> String {
     o
 }
 
+/// USB and QSPI on nrf-hal.
+///
+/// USB: `Usbd` is a `usb-device` bus, and the allocator is BORROWED by the
+/// serial class and the device, so all three are built here in `main`'s
+/// scope - the shape the F1 and ESP OTG paths have, for the same reason.
+///
+/// QSPI: nrf-hal has no QSPI driver at all, so Blocking says so and leaves
+/// the pads alone; embassy-nrf has one, on the Async runtime.
+fn usb_qspi_lines(mcu: &Mcu, hal: &str) -> String {
+    let mut o = String::new();
+    if usb_wired(mcu) {
+        o.push_str("\n    // ── USB (USBD) ──\n");
+        o.push_str(&usb_identity(mcu));
+        o.push_str(&format!(
+            "    let usb_bus = usb_device::bus::UsbBusAllocator::new({hal}::usbd::Usbd::new(\n        {hal}::usbd::UsbPeripheral::new(p.USBD, &clocks),\n    ));\n"
+        ));
+        o.push_str(
+            "    // These two ARE the device. They must be `mut` for `poll`, and they stay\n    // unused until you write that poll into your loop:\n    //     if usb_dev.poll(&mut [&mut usb_serial]) { /* usb_serial.read / write */ }\n    // `poll` must run often - more than once a millisecond while enumerating.\n",
+        );
+        o.push_str(&format!(
+            "{ALLOW}    let mut usb_serial = usbd_serial::SerialPort::new(&usb_bus);\n{ALLOW}    let mut usb_dev = usb_device::device::UsbDeviceBuilder::new(\n        &usb_bus,\n        usb_device::device::UsbVidPid(USB_VID, USB_PID),\n    )\n    .strings(&[usb_device::device::StringDescriptors::default().product(USB_PRODUCT)])\n    .unwrap()\n    .device_class(usbd_serial::USB_CLASS_CDC)\n    .build();\n"
+        ));
+    }
+    if qspi_touched(mcu) && block_present(mcu, "qspi", None) {
+        o.push_str("\n    // QSPI is NOT built: nrf-hal has no QSPI driver. The Async runtime has\n    // one (embassy-nrf's `qspi::Qspi`) and generates it from the same pads.\n");
+    }
+    o
+}
+
 // ── The generated region ────────────────────────────────────────────────────
 
 fn section(mcu: &Mcu) -> String {
@@ -872,7 +1020,12 @@ fn section(mcu: &Mcu) -> String {
     o.push('\n');
     o.push_str(&nfc_note(mcu));
     let gpio = gpio_lines(mcu, &hal);
-    let rest = format!("{}{}", bus_lines(mcu, &hal), pwm_adc_lines(mcu, &hal));
+    let rest = format!(
+        "{}{}{}",
+        bus_lines(mcu, &hal),
+        pwm_adc_lines(mcu, &hal),
+        usb_qspi_lines(mcu, &hal)
+    );
     o.push_str(&gpio);
     if !gpio.is_empty() && !rest.is_empty() {
         o.push('\n');
@@ -1573,7 +1726,13 @@ fn async_edge_hooks(mcu: &Mcu) -> Vec<EdgeHook> {
 /// The two clock muxes, as `init`'s `Config`, and the `init` call itself.
 fn async_clock_lines(mcu: &Mcu) -> String {
     let c = clock_choice(mcu);
-    let hf = if c.hfxo { "ExternalXtal" } else { "Internal" };
+    // USB runs only from the crystal: wired, it overrides the Clock tab.
+    let usb_forces_xtal = !c.hfxo && usb_wired(mcu) && mcu.is_async();
+    let hf = if c.hfxo || usb_forces_xtal {
+        "ExternalXtal"
+    } else {
+        "Internal"
+    };
     let lf = match c.lf {
         LfSource::Rc => "InternalRC",
         LfSource::Synth => "Synthesized",
@@ -1586,6 +1745,9 @@ fn async_clock_lines(mcu: &Mcu) -> String {
         o.push_str("    // 32.768 kHz, and it clocks RTC1, which is embassy-time's driver.\n");
     } else {
         o.push_str("    // 32.768 kHz, and it clocks the RTCs and the watchdog.\n");
+    }
+    if usb_forces_xtal {
+        o.push_str("    // The USB module needs the crystal: the Clock tab's internal choice is\n    // overridden, since USB cannot run from the RC oscillator.\n");
     }
     o.push_str("    let mut config = embassy_nrf::config::Config::default();\n");
     o.push_str(&format!(
@@ -1629,8 +1791,12 @@ struct AsyncBuses {
     /// whose block a SPIM already took - so the only place that knows is this
     /// loop.
     items: String,
-    /// Whether `body` names `static_cell` (a TWIM's RAM buffer).
+    /// Whether `body` names `static_cell` (a TWIM's RAM buffer, the USB
+    /// stack's buffers).
     static_cell: bool,
+    /// Whether `body` spawns a task (the USB device's), so `main` needs its
+    /// spawner by name.
+    spawns: bool,
 }
 
 /// UARTE, SPIM, TWIM, PWM and SAADC on embassy-nrf, in that order.
@@ -1991,11 +2157,97 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         irqs.push("    SAADC => embassy_nrf::saadc::InterruptHandler;".to_owned());
     }
 
+    let mut spawns = false;
+    if usb_wired(mcu) && !mcu.is_async() {
+        // The part nrf-hal has no crate for, on Blocking: embassy-nrf's USB
+        // driver only runs under embassy-usb, which needs the executor.
+        o.push_str("    // USB is NOT built: on this part Blocking is embassy-nrf, whose USB driver\n    // runs under embassy-usb and needs the executor. Switch to the Async runtime.\n");
+    } else if usb_wired(mcu) {
+        // The device runs in its own task forever; the class stays in `main`.
+        // Every buffer the builder keeps is `'static`, because the device it
+        // builds moves into that task.
+        items.push_str("/// Runs the USB device: enumeration, control requests, suspend and resume.\n/// It never returns; the CDC class in `main` does the talking.\n#[embassy_executor::task]\nasync fn usb_task(\n    mut device: embassy_usb::UsbDevice<\n        'static,\n        embassy_nrf::usb::Driver<'static, embassy_nrf::usb::vbus_detect::HardwareVbusDetect>,\n    >,\n) -> ! {\n    device.run().await\n}\n\n");
+        o.push_str("\n    // ── USB (USBD) ──\n");
+        o.push_str(&usb_identity(mcu));
+        o.push_str("    let usb_driver = embassy_nrf::usb::Driver::new(\n        p.USBD,\n        Irqs,\n        embassy_nrf::usb::vbus_detect::HardwareVbusDetect::new(Irqs),\n    );\n");
+        o.push_str("    let mut usb_config = embassy_usb::Config::new(USB_VID, USB_PID);\n    usb_config.product = Some(USB_PRODUCT);\n    usb_config.max_power = 100;\n    usb_config.max_packet_size_0 = 64;\n");
+        o.push_str("    static USB_CONFIG_DESC: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();\n    static USB_BOS_DESC: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();\n    static USB_MSOS_DESC: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();\n    static USB_CONTROL: static_cell::StaticCell<[u8; 64]> = static_cell::StaticCell::new();\n    static USB_CDC_STATE: static_cell::StaticCell<embassy_usb::class::cdc_acm::State> =\n        static_cell::StaticCell::new();\n");
+        o.push_str("    let mut usb_builder = embassy_usb::Builder::new(\n        usb_driver,\n        usb_config,\n        USB_CONFIG_DESC.init([0; 256]),\n        USB_BOS_DESC.init([0; 256]),\n        USB_MSOS_DESC.init([0; 256]),\n        USB_CONTROL.init([0; 64]),\n    );\n");
+        o.push_str("    // A CDC serial port: `usb_serial.wait_connection().await`, then\n    // `read_packet` / `write_packet`, 64 bytes at a time.\n");
+        o.push_str(&format!(
+            "{ALLOW}    let mut usb_serial = embassy_usb::class::cdc_acm::CdcAcmClass::new(\n        &mut usb_builder,\n        USB_CDC_STATE.init(embassy_usb::class::cdc_acm::State::new()),\n        64,\n    );\n"
+        ));
+        o.push_str("    spawner.spawn(usb_task(usb_builder.build()).unwrap());\n");
+        irqs.push(
+            "    USBD => embassy_nrf::usb::InterruptHandler<embassy_nrf::peripherals::USBD>;".to_owned(),
+        );
+        irqs.push("    CLOCK_POWER => embassy_nrf::usb::vbus_detect::InterruptHandler;".to_owned());
+        static_cell = true;
+        spawns = true;
+    }
+
+    if let Some((sck, csn, io)) = qspi_wired(mcu).filter(|_| mcu.is_async()) {
+        let d = crate::panels::mcu_module::modules::QspiModuleConfig::new(1);
+        let c = modules::qspi_config(&mcu.modules).unwrap_or(d);
+        let (hz, freq) = qspi_frequency(c.prescaler);
+        // embassy's sizes run 1 KiB << i; `capacity` is a u32 of bytes.
+        let bytes = (1024u64 << c.memory_size.min(22)).min(u64::from(u32::MAX));
+        o.push_str("\n    // ── QSPI ──\n");
+        o.push_str("    let mut qspi_cfg = embassy_nrf::qspi::Config::default();\n");
+        if c.prescaler > 15 {
+            o.push_str(&format!(
+                "    // Prescaler {} asked for; the nRF QSPI divides 32 MHz by 16 at most.\n",
+                c.prescaler
+            ));
+        }
+        o.push_str(&format!(
+            "    // {} of flash, the size `embedded-storage` reports.\n    qspi_cfg.capacity = {bytes};\n",
+            c.memory_size_label()
+        ));
+        o.push_str(&format!(
+            "    // 32 MHz / {}: {} Hz on SCK.\n    qspi_cfg.frequency = embassy_nrf::qspi::Frequency::{freq};\n",
+            32_000_000 / hz,
+            hz
+        ));
+        use crate::panels::mcu_module::modules::QspiAddressSize;
+        let addr = match c.address_size {
+            QspiAddressSize::Bits32 => "_32bit",
+            QspiAddressSize::Bits24 => "_24bit",
+            other => {
+                o.push_str(&format!(
+                    "    // {} addressing asked for; the nRF QSPI addresses in 24 or 32 bits.\n",
+                    other.label()
+                ));
+                "_24bit"
+            }
+        };
+        o.push_str(&format!(
+            "    qspi_cfg.address_mode = embassy_nrf::qspi::AddressMode::{addr};\n"
+        ));
+        o.push_str("    // Quad I/O read and page program by default - Config::default()'s opcodes.\n");
+        o.push_str(&format!(
+            "{ALLOW}    let mut qspi = embassy_nrf::qspi::Qspi::new(\n        p.QSPI,\n        Irqs,\n        p.{}, // SCK\n        p.{}, // CSN\n        p.{}, // IO0\n        p.{}, // IO1\n        p.{}, // IO2\n        p.{}, // IO3\n        qspi_cfg,\n    );\n",
+            periph(sck),
+            periph(csn),
+            periph(io[0]),
+            periph(io[1]),
+            periph(io[2]),
+            periph(io[3]),
+        ));
+        irqs.push(
+            "    QSPI => embassy_nrf::qspi::InterruptHandler<embassy_nrf::peripherals::QSPI>;"
+                .to_owned(),
+        );
+    } else if qspi_touched(mcu) && block_present(mcu, "qspi", None) && mcu.is_async() {
+        o.push_str("    // QSPI is NOT built: the driver is quad-only and takes SCK, CSN and all four\n    // IO lanes. Wire the missing ones on the Pins canvas.\n");
+    }
+
     AsyncBuses {
         irqs,
         body: o,
         items,
         static_cell,
+        spawns,
     }
 }
 
@@ -2075,7 +2327,7 @@ fn async_section(mcu: &Mcu) -> String {
     let buses = async_bus_lines(mcu);
     let (tasks, gpio) = async_gpio_lines(mcu);
     // An armed input is the only thing here that needs the spawner.
-    let spawner = if tasks.is_empty() {
+    let spawner = if tasks.is_empty() && !buses.spawns {
         "_spawner"
     } else {
         "spawner"

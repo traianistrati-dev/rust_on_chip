@@ -341,6 +341,19 @@ $ALL_CASES = @(
     # the two runtimes share, and Cargo.toml has its HAL crate swapped.
     @{ n = "BBC micro:bit v2 async x2";    t = "emit_nrf_async_project";     e = @{};                       q = $true; fam = "nrf"; hk = $true }
 
+    # The rest of the nRF52 family, TEN projects on two targets: Nordic's two
+    # kits on both runtimes, and the small parts on the nRF52 DK the way the
+    # New MCU form retargets a definition. Each part is here for what it does
+    # differently - the 52810 has SPIM0 and TWIM0 as SEPARATE blocks, the 52811
+    # shares TWIM0 with SPIM1, the 52805 has no PWM and only AIN2/AIN3, and the
+    # 52820 has no nrf-hal crate at all, so its Blocking project is embassy-nrf
+    # without an executor. All of them wire the blocks the part LACKS too: those
+    # must come out as comments, and only a compiler proves none slipped through.
+    # Quick runs one per target plus the 52820's Blocking, the only emitter here
+    # nothing else exercises.
+    @{ n = "nRF52 family x10";             t = "emit_nrf_family_projects";   e = @{};                       q = $true; fam = "nrf";
+       only = @("eide_nrf52840_dk_async_check", "eide_nrf52810_check", "eide_nrf52820_check") }
+
     # The same two boards on embassy-rp, which is a DIFFERENT HAL crate, not a
     # feature of the first one. Every bus is wired, because that is where the
     # compiler found the two things reading could not: a DMA channel needs its

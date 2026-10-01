@@ -232,7 +232,7 @@ impl ToolsState {
                 (None, _) => true,        // needed by everything
             })
             .filter(|t| match (t.only_for_target, target) {
-                (Some(prefix), Some(sel)) => sel.starts_with(prefix),
+                (Some(prefix), Some(sel)) => target_gate_matches(prefix, sel),
                 (Some(_), None) => true, // no project open — show it anyway
                 (None, _) => true,
             })
@@ -293,7 +293,7 @@ impl ToolsState {
             .filter(|t| t.severity == Severity::Blocking)
             .filter(|t| matches!(t.status, ToolStatus::Missing))
             .filter(|t| match (t.only_for_target, target) {
-                (Some(prefix), Some(sel)) => sel.starts_with(prefix),
+                (Some(prefix), Some(sel)) => target_gate_matches(prefix, sel),
                 _ => true,
             })
             .any(|t| match (&t.toolchain, toolchain) {
@@ -468,9 +468,11 @@ pub fn make_tools_state() -> Arc<Mutex<ToolsState>> {
         // about `thumbv6m-none-eabi` (which does). Every STM32 outside F1 had
         // the same wrong advice.
         //
-        // The gates are whole triples, so they cannot overlap: `thumbv7m-` is
-        // not a prefix of `thumbv7em-`, and no soft-float `thumbv7em-none-eabi`
-        // entry exists — it WOULD be a prefix of the hard-float one.
+        // The gates are whole triples, matched up to a `-` boundary
+        // (`target_gate_matches`): `thumbv7m-` is not a prefix of `thumbv7em-`,
+        // and the soft-float `thumbv7em-none-eabi` does NOT match the
+        // hard-float `thumbv7em-none-eabihf`, which a plain prefix test would.
+        // The installed check is line-exact for the same reason.
         RequiredTool {
             name: "thumbv6m-none-eabi",
             description: "Rust target for ARM Cortex-M0 / M0+ (STM32C0 / F0 / G0 / L0 / U0, RP2040)",
@@ -500,6 +502,22 @@ pub fn make_tools_state() -> Arc<Mutex<ToolsState>> {
             min_version: None,
             install_cmd: Some("rustup"),
             install_args: &["target", "add", "thumbv7m-none-eabi"],
+            manual_url: "https://docs.rust-embedded.org/book/intro/install.html",
+            status: ToolStatus::Unknown,
+        },
+        RequiredTool {
+            name: "thumbv7em-none-eabi",
+            description: "Rust target for ARM Cortex-M4 without an FPU (nRF52805 / 52810 / 52811 / 52820)",
+            toolchain: Some(ToolchainKind::RustEmbedded),
+            only_for_target: Some("thumbv7em-none-eabi"),
+            severity: Severity::Blocking,
+            impact: "This chip cannot be compiled at all until the target is installed.",
+            check_cmd: "rustup",
+            check_args: &["target", "list", "--installed"],
+            check_pattern: "thumbv7em-none-eabi",
+            min_version: None,
+            install_cmd: Some("rustup"),
+            install_args: &["target", "add", "thumbv7em-none-eabi"],
             manual_url: "https://docs.rust-embedded.org/book/intro/install.html",
             status: ToolStatus::Unknown,
         },
@@ -1641,6 +1659,28 @@ fn check_msvc_toolchain() -> ToolStatus {
     ToolStatus::Ok("n/a (not Windows)".to_string())
 }
 
+/// Whether a tool gated on `gate` applies to a project built for `target`.
+///
+/// A prefix match that must end at a `-` (or at the end): `riscv32imc` gates
+/// `riscv32imc-unknown-none-elf` and `xtensa` gates every Xtensa triple, but
+/// `thumbv7em-none-eabi` does NOT gate `thumbv7em-none-eabihf`.
+fn target_gate_matches(gate: &str, target: &str) -> bool {
+    target
+        .strip_prefix(gate)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+}
+
+/// Whether `pattern` is present in a check's output. A rustup target is one
+/// WHOLE line of `rustup target list --installed`: by substring,
+/// `thumbv7em-none-eabi` would be found inside `thumbv7em-none-eabihf`.
+fn output_has(args: &[&str], output: &str, pattern: &str) -> bool {
+    if args == ["target", "list", "--installed"] {
+        output.lines().any(|l| l.trim() == pattern)
+    } else {
+        output.contains(pattern)
+    }
+}
+
 fn run_check_blocking(
     cmd: &str,
     args: &[&str],
@@ -1688,7 +1728,7 @@ fn run_check_blocking(
             if !out.status.success() {
                 return ToolStatus::Missing;
             }
-            if !pattern.is_empty() && !combined.contains(pattern) {
+            if !pattern.is_empty() && !output_has(args, &combined, pattern) {
                 return ToolStatus::Missing;
             }
 
@@ -1808,7 +1848,7 @@ mod tests {
 
     /// Every bundled chip is offered exactly the target-gated tools it needs.
     ///
-    /// `only_for_target` is a PREFIX match, and the two RISC-V targets differ by
+    /// `only_for_target` is a prefix match up to a `-`, and the two RISC-V targets differ by
     /// one letter in the middle - `riscv32imc` against `riscv32imac`. If either
     /// were a prefix of the other, a C3 would be told to install the C6's target
     /// (or worse, silently not told to install its own). They are not, and this
@@ -1864,14 +1904,34 @@ mod tests {
     }
 
     /// Every rustup target the catalog knows, ARM and RISC-V alike.
-    const RUSTUP_TARGETS: [&str; 6] = [
+    const RUSTUP_TARGETS: [&str; 7] = [
         "thumbv6m-none-eabi",
         "thumbv7m-none-eabi",
+        "thumbv7em-none-eabi",
         "thumbv7em-none-eabihf",
         "thumbv8m.main-none-eabihf",
         "riscv32imc-unknown-none-elf",
         "riscv32imac-unknown-none-elf",
     ];
+
+    /// The soft-float M4 target is a string prefix of the hard-float one, so
+    /// both the gate and the installed check must stop at a `-` / a line.
+    #[test]
+    fn the_soft_float_target_is_not_the_hard_float_one() {
+        assert!(target_gate_matches("thumbv7em-none-eabi", "thumbv7em-none-eabi"));
+        assert!(!target_gate_matches("thumbv7em-none-eabi", "thumbv7em-none-eabihf"));
+        assert!(target_gate_matches("riscv32imc", "riscv32imc-unknown-none-elf"));
+        assert!(!target_gate_matches("riscv32imc", "riscv32imac-unknown-none-elf"));
+        assert!(target_gate_matches("xtensa", "xtensa-esp32s3-none-elf"));
+
+        let args = ["target", "list", "--installed"];
+        let only_hf = "thumbv6m-none-eabi\nthumbv7em-none-eabihf\n";
+        assert!(!output_has(&args, only_hf, "thumbv7em-none-eabi"));
+        assert!(output_has(&args, only_hf, "thumbv7em-none-eabihf"));
+        assert!(output_has(&args, "thumbv7em-none-eabi\r\n", "thumbv7em-none-eabi"));
+        // Other checks keep the substring rule: `esp (default)` is the esp toolchain.
+        assert!(output_has(&["toolchain", "list"], "esp (default)\n", "esp"));
+    }
 
     /// The bundled chips cover only three of the four ARM targets - no built-in
     /// uses `thumbv7em-none-eabihf`, yet it is what every imported STM32F4 / G4 /
@@ -1887,7 +1947,7 @@ mod tests {
             t.status = ToolStatus::Missing;
         }
 
-        for target in &RUSTUP_TARGETS[..4] {
+        for target in &RUSTUP_TARGETS[..5] {
             let names: Vec<&str> = s
                 .problems_for(Some(&ToolchainKind::RustEmbedded), Some(target))
                 .into_iter()

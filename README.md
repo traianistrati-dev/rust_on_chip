@@ -12,9 +12,10 @@ safe across regenerations.
 
 ![A tour of RustOnChip](docs/rust_on_chip_tour.gif)
 
-> Status: early development (`v0.2.4`). **Sixteen chips ship built in** — one
+> Status: early development (`v0.2.4`). **Eighteen chips ship built in** — one
 > STM32, nine ESP32, five RP2040/RP2350 boards (the four Raspberry Pi Picos and
-> tinyVision's pico2-ice) and the BBC micro:bit v2 —
+> tinyVision's pico2-ice), the BBC micro:bit v2 and Nordic's nRF52840 DK and
+> nRF52 DK —
 > and the rest of the STM32 catalogue is reachable by importing a part from ST's
 > own database. A new chip inside a supported family is plain data, no rebuild.
 > Renamed from `embedded_ide` on 2026-09-20. The old URL still redirects — update your
@@ -205,6 +206,35 @@ the synthesized LFCLK; the tree's two muxes are exactly the two `Clocks` calls
 (or the two `Config` fields, on Async) that reach `main.rs`. There is no DMA
 channel to allocate on either runtime: EasyDMA is built into each peripheral.
 
+### Nordic nRF52 DKs, and the rest of the nRF52 family
+
+| Board | Chip | Core | Max clock | Target |
+|-------|------|------|-----------|--------|
+| **nRF52840 DK** (PCA10056) | nRF52840 | Cortex-M4F | 64 MHz | `thumbv7em-none-eabihf` |
+| **nRF52 DK** (PCA10040) | nRF52832 | Cortex-M4F | 64 MHz | `thumbv7em-none-eabihf` |
+
+Laid out the way the kits are used: the Arduino header's analog side on the
+left, its digital side on the right, and the LEDs, buttons, the J-Link's VCOM
+UART, the QSPI flash and the 32.768 kHz crystal along the top. The crystal IS
+fitted here, so the Clock tab offers LFXO as a third LFCLK source. Both kits
+flash through their on-board J-Link with probe-rs.
+
+Every other nRF52 part works through **New MCU → Auto-fill**: type `nRF52810`
+(or 52805, 52811, 52820, 52832, 52833, 52840) and the form fills the target,
+memory, probe-rs name, both HAL lines and the clock tree. The generator knows
+which blocks each part has, so a definition cloned from a bigger part never
+builds a peripheral the silicon lacks — it writes a comment saying so:
+
+| Part | Target | Blocking HAL | Differs in |
+|------|--------|--------------|------------|
+| nRF52805 / 52810 | `thumbv7em-none-eabi` | `nrf52805-hal` / `nrf52810-hal` | SPIM0 and TWIM0 are separate blocks; the 52805 has no PWM and AIN2/AIN3 only |
+| nRF52811 | `thumbv7em-none-eabi` | `nrf52811-hal` | TWIM0 shares its block with SPIM1 |
+| nRF52820 | `thumbv7em-none-eabi` | `embassy-nrf`, no executor | no nrf-hal crate exists; no PWM, no SAADC |
+| nRF52832 | `thumbv7em-none-eabihf` | `nrf52832-hal` | no P1, one UARTE, three PWM |
+| nRF52833 / 52840 | `thumbv7em-none-eabihf` | `nrf52833-hal` / `nrf52840-hal` | — |
+
+The four small parts have no FPU, hence the soft-float target.
+
 ---
 
 ## Visual MCU configuration
@@ -329,7 +359,7 @@ zooms and pans like the Pins one.
 | **Blocking** | everywhere | Plain synchronous HAL calls. On every STM32 but F1 this is still `embassy-stm32` used as a sync HAL. |
 | **Native** | STM32F1 | `stm32f1xx-hal`'s own driver traits instead of the portable `embedded-io` / `embedded-hal` seam. |
 | **RTIC** | STM32F1 | `#[rtic::app]`, with each armed input becoming a `#[task(binds = EXTIn)]`. |
-| **Async** | every STM32, all ESP32, all Pico, the micro:bit | `embassy-executor` tasks; on ESP via `esp-rtos`, on RP via `embassy-rp`, on the micro:bit via `embassy-nrf`. On the F1 it swaps `stm32f1xx-hal` for `embassy-stm32`; USB and CAN are not generated there yet, and embassy-time takes one timer (TIM4 on an F103C8). |
+| **Async** | every STM32, all ESP32, all Pico, every nRF52 | `embassy-executor` tasks; on ESP via `esp-rtos`, on RP via `embassy-rp`, on the nRF52 via `embassy-nrf`. On the F1 it swaps `stm32f1xx-hal` for `embassy-stm32`; USB and CAN are not generated there yet, and embassy-time takes one timer (TIM4 on an F103C8). |
 
 Where a runtime is greyed out, the tab **says why** rather than just refusing.
 

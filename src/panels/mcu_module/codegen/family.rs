@@ -1173,7 +1173,7 @@ const NRF_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "Cargo.toml:",
-            "The embassy-nrf line is the chip's own (nrf52833, time-driver-rtc1, gpiote, nfc-pins-as-gpio); adds embassy-executor 0.10 (platform-cortex-m) + embassy-time. A TWIM's RAM buffer adds static_cell. Leaving Async removes them again.",
+            "The embassy-nrf line is the chip's own (the part's feature, time-driver-rtc1, gpiote, plus nfc-pins-as-gpio on a part with NFC); adds embassy-executor 0.10 (platform-cortex-m) + embassy-time. A TWIM's RAM buffer adds static_cell. Leaving Async removes them again.",
         ),
         ("Applies to:", "nRF52 (the BBC micro:bit v2 today)."),
     ],
@@ -1278,8 +1278,15 @@ pub fn blocking_hal_note(family: &str) -> &'static str {
          executor, no .await"
     } else if family.starts_with("esp") {
         "esp-hal  ·  blocking drivers"
+    } else if super::nrf::blocking_on_embassy(family) {
+        "embassy-nrf used SYNCHRONOUSLY — nrf-hal has no crate for this part; \
+         no executor, no .await"
     } else if family == "nrf52833" {
         "nrf52833-hal  ·  blocking drivers (embedded-hal 1.0)"
+    } else if family == "nrf52840" {
+        "nrf52840-hal  ·  blocking drivers (embedded-hal 1.0)"
+    } else if family == "nrf52832" {
+        "nrf52832-hal  ·  blocking drivers (embedded-hal 1.0)"
     } else if super::nrf::is_nrf(family) {
         "nrf-hal  ·  blocking drivers (embedded-hal 1.0)"
     } else {

@@ -623,6 +623,13 @@ pub fn nrf_config_files(
         .replace("{TICKS}", &watchdog::nrf_ticks(c.timeout_us).to_string());
     let body = if is_async {
         NRF_ASYNC_TMPL.to_owned()
+    } else if super::nrf::blocking_on_embassy(family) {
+        // No nrf-hal crate for the part, so Blocking is embassy-nrf too: the
+        // same driver, petted from a loop with no executor to sleep on.
+        NRF_ASYNC_TMPL.replace(
+            "embassy_time::Timer::after_micros(pins::configs::watchdog::TIMEOUT_US / 2).await;",
+            "cortex_m::asm::delay(64 * (pins::configs::watchdog::TIMEOUT_US / 2) as u32);",
+        )
     } else {
         // One HAL crate per chip, named after it (`nrf52833_hal`).
         NRF_BLOCKING_TMPL.replace("{HAL}", &format!("{family}_hal"))

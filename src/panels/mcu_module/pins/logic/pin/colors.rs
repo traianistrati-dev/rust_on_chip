@@ -85,6 +85,14 @@ pub fn reserved_role(name: &str) -> &'static str {
     // board reserves for assistive switches.
     } else if n == "3V" || n.starts_with("3V (") {
         "3.3 V from the micro:bit's own regulator, shared with the chip and the on-board hardware, so the current left for accessories is limited."
+    // Nordic's DKs. These are GPIOs on the die that the kit has wired to its
+    // own hardware, so the name leads with the pin and the role is inside.
+    } else if n.contains("(QSPI ") {
+        "Wired to the DK's 64 Mbit QSPI flash. The QSPI block owns it; using it as GPIO fights the flash chip."
+    } else if n.contains("(XL1") || n.contains("(XL2") {
+        "The 32.768 kHz crystal. It is the LFXO the Clock tab offers, so the pin is not free for GPIO."
+    } else if n.starts_with("P0.") && n.contains("(RESET)") {
+        "Pin reset, wired to the DK's RESET button. Usable as GPIO only after the UICR's PSELRESET is cleared."
     } else if n.contains("ACCESSIBILITY") {
         "P0.12, reserved by the micro:bit for accessibility hardware (switch access). The foundation asks that nothing else use it."
     } else if n == "VBUS" {

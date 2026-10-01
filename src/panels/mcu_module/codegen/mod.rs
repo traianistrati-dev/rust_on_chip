@@ -16,6 +16,7 @@ pub mod embassy_async;
 pub mod embassy_common;
 pub mod family;
 pub mod nrf;
+pub mod nrf_boards;
 pub mod nvic;
 pub mod rcc;
 pub mod rcc_mux;

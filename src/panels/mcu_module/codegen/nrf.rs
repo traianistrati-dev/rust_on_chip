@@ -42,19 +42,239 @@ use crate::panels::mcu_module::pins::logic::pin::{GpioMode, Pin};
 
 pub struct NrfBackend;
 
-/// Whether `family` is one of Nordic's nRF52 parts.
+/// What one nRF52 part has, as far as the generated code is concerned.
 ///
-/// A prefix, not a list: the family key is the chip (`nrf52833`), the way it
-/// is on the ESP parts, and every nRF52 shares the HAL shape. An nRF52840
-/// definition then needs no change here.
-pub fn is_nrf(family: &str) -> bool {
-    family.starts_with("nrf52")
+/// Read from the two HALs' own chip files (embassy-nrf 0.11 `src/chips/*.rs`,
+/// nrf-hal-common 0.19 `spim.rs` / `twim.rs` / `uarte.rs` / `pwm.rs`), which
+/// agree on every instance set below. A definition offers what its PADS can
+/// carry; this says which blocks the SILICON has, so a definition cloned from
+/// a bigger part cannot generate a constructor for a block that is not there.
+#[derive(Debug)]
+pub(crate) struct NrfChip {
+    /// The family key, which is also embassy-nrf's feature name.
+    pub family: &'static str,
+    /// `nRF52840`, as Nordic writes it.
+    pub part: &'static str,
+    /// The nrf-hal crate, or `None` where nrf-hal has none - the nRF52820.
+    /// Blocking then runs on embassy-nrf's blocking API instead.
+    pub nrf_hal: Option<&'static str>,
+    /// Cortex-M4 with or without the FPU: the four small parts have none.
+    pub fpu: bool,
+    pub flash_kb: u32,
+    pub ram_kb: u32,
+    /// NFCT: P0.09/P0.10 are antenna pins until the UICR says otherwise, and
+    /// embassy-nrf refuses `nfc-pins-as-gpio` on a part without them.
+    pub nfc: bool,
+    /// Port 1 exists. Read by the kits' own check that no pad names a pin
+    /// the part does not have.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub p1: bool,
+    pub uarte: &'static [u8],
+    pub spim: &'static [u8],
+    pub twim: &'static [u8],
+    pub pwm: &'static [u8],
+    /// The SAADC inputs (`AINn`), empty for a part without a SAADC. The
+    /// 52805 has two: embassy-nrf implements AIN2 and AIN3 only.
+    pub ain: &'static [u8],
 }
 
-/// `nrf52833_hal` — the HAL crate as it is written in Rust. One crate per
-/// chip, named after it, so the family key IS the crate name.
-fn hal_crate(family: &str) -> String {
-    format!("{family}_hal")
+/// Every nRF52 part both HALs know, smallest first.
+pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
+    NrfChip {
+        family: "nrf52805",
+        part: "nRF52805",
+        nrf_hal: Some("nrf52805-hal"),
+        fpu: false,
+        flash_kb: 192,
+        ram_kb: 24,
+        nfc: false,
+        p1: false,
+        uarte: &[0],
+        spim: &[0],
+        twim: &[0],
+        pwm: &[],
+        ain: &[2, 3],
+    },
+    NrfChip {
+        family: "nrf52810",
+        part: "nRF52810",
+        nrf_hal: Some("nrf52810-hal"),
+        fpu: false,
+        flash_kb: 192,
+        ram_kb: 24,
+        nfc: false,
+        p1: false,
+        uarte: &[0],
+        spim: &[0],
+        twim: &[0],
+        pwm: &[0],
+        ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+    },
+    NrfChip {
+        family: "nrf52811",
+        part: "nRF52811",
+        nrf_hal: Some("nrf52811-hal"),
+        fpu: false,
+        flash_kb: 192,
+        ram_kb: 24,
+        nfc: false,
+        p1: false,
+        uarte: &[0],
+        spim: &[0, 1],
+        twim: &[0],
+        pwm: &[0],
+        ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+    },
+    NrfChip {
+        family: "nrf52820",
+        part: "nRF52820",
+        nrf_hal: None,
+        fpu: false,
+        flash_kb: 256,
+        ram_kb: 32,
+        nfc: false,
+        p1: false,
+        uarte: &[0],
+        spim: &[0, 1],
+        twim: &[0, 1],
+        pwm: &[],
+        ain: &[],
+    },
+    NrfChip {
+        family: "nrf52832",
+        part: "nRF52832",
+        nrf_hal: Some("nrf52832-hal"),
+        fpu: true,
+        flash_kb: 512,
+        ram_kb: 64,
+        nfc: true,
+        p1: false,
+        uarte: &[0],
+        spim: &[0, 1, 2],
+        twim: &[0, 1],
+        pwm: &[0, 1, 2],
+        ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+    },
+    NrfChip {
+        family: "nrf52833",
+        part: "nRF52833",
+        nrf_hal: Some("nrf52833-hal"),
+        fpu: true,
+        flash_kb: 512,
+        ram_kb: 128,
+        nfc: true,
+        p1: true,
+        uarte: &[0, 1],
+        spim: &[0, 1, 2, 3],
+        twim: &[0, 1],
+        pwm: &[0, 1, 2, 3],
+        ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+    },
+    NrfChip {
+        family: "nrf52840",
+        part: "nRF52840",
+        nrf_hal: Some("nrf52840-hal"),
+        fpu: true,
+        flash_kb: 1024,
+        ram_kb: 256,
+        nfc: true,
+        p1: true,
+        uarte: &[0, 1],
+        spim: &[0, 1, 2, 3],
+        twim: &[0, 1],
+        pwm: &[0, 1, 2, 3],
+        ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+    },
+];
+
+/// The part `family` names, or `None` for anything that is not an nRF52.
+pub(crate) fn chip(family: &str) -> Option<&'static NrfChip> {
+    NRF52_CHIPS.iter().find(|c| c.family == family)
+}
+
+impl NrfChip {
+    /// The Rust target: Cortex-M4F is hard-float, the M4 without an FPU is not.
+    pub fn target(&self) -> &'static str {
+        if self.fpu {
+            "thumbv7em-none-eabihf"
+        } else {
+            "thumbv7em-none-eabi"
+        }
+    }
+
+    pub fn cpu(&self) -> &'static str {
+        if self.fpu {
+            "ARM Cortex-M4F"
+        } else {
+            "ARM Cortex-M4"
+        }
+    }
+
+    /// probe-rs's name for the part. Every nRF52 is `_xxAA` there; the
+    /// 52832's 256 KiB `_xxAB` is the one variant, and its flash is a
+    /// definition's to state.
+    pub fn probe_chip(&self) -> String {
+        format!("{}_xxAA", self.part)
+    }
+
+    /// The Blocking runtime's dependency line: the part's nrf-hal crate, or
+    /// embassy-nrf with no time driver where nrf-hal has no crate for it.
+    pub fn hal_dep(&self) -> String {
+        match self.nrf_hal {
+            Some(krate) => format!(
+                "{krate} = {{ version = \"0.19\", default-features = false, features = [\"rt\"] }}"
+            ),
+            None => format!("embassy-nrf = {{ version = \"0.11\", features = [\"{}\"] }}", self.family),
+        }
+    }
+
+    /// The Async runtime's dependency line. `nfc-pins-as-gpio` only on a part
+    /// with NFCT: embassy-nrf has a `compile_error!` for it anywhere else.
+    pub fn hal_dep_async(&self) -> String {
+        let nfc = if self.nfc {
+            ", \"nfc-pins-as-gpio\""
+        } else {
+            ""
+        };
+        format!(
+            "embassy-nrf = {{ version = \"0.11\", features = [\"{}\", \"time-driver-rtc1\", \"gpiote\"{nfc}] }}",
+            self.family
+        )
+    }
+
+    /// Whether the part has `kind` block `n` (`"uarte"`, `"spim"`, `"twim"`,
+    /// `"pwm"`).
+    pub fn has(&self, kind: &str, n: u8) -> bool {
+        let set = match kind {
+            "uarte" => self.uarte,
+            "spim" => self.spim,
+            "twim" => self.twim,
+            "pwm" => self.pwm,
+            _ => return false,
+        };
+        set.contains(&n)
+    }
+}
+
+/// Whether `family` is one of Nordic's nRF52 parts.
+///
+/// A list, not a prefix: the parts differ in which blocks they have and in
+/// which crate drives them, so a key this backend has no row for would be
+/// generated against guesses.
+pub fn is_nrf(family: &str) -> bool {
+    chip(family).is_some()
+}
+
+/// `nrf52833_hal` — the nrf-hal crate as it is written in Rust, or `None`
+/// for the part nrf-hal has no crate for.
+fn hal_crate(family: &str) -> Option<String> {
+    chip(family)?.nrf_hal.map(|c| c.replace('-', "_"))
+}
+
+/// Whether the Blocking runtime on `family` is embassy-nrf used without an
+/// executor, because nrf-hal has no crate for the part.
+pub fn blocking_on_embassy(family: &str) -> bool {
+    chip(family).is_some_and(|c| c.nrf_hal.is_none())
 }
 
 /// A GPIO as (port, pin): `P0.21 (ROW1)` -> `(0, 21)`.
@@ -248,8 +468,12 @@ fn nfc_note(mcu: &Mcu) -> String {
     )
 }
 
-/// The NFC pads anything is wired to, as `P0.09` labels.
+/// The NFC pads anything is wired to, as `P0.09` labels. None on a part
+/// without NFCT, where P0.09/P0.10 are ordinary GPIO from reset.
 fn nfc_pads_used(mcu: &Mcu) -> Vec<String> {
+    if !chip(&mcu.family).is_some_and(|c| c.nfc) {
+        return Vec::new();
+    }
     mcu.iter_all_pins()
         .filter(|p| !p.reserved && p.selected_function != PinFunction::Unset)
         .filter_map(|p| nrf_pin(&p.name))
@@ -260,9 +484,80 @@ fn nfc_pads_used(mcu: &Mcu) -> Vec<String> {
 
 // ── Buses ───────────────────────────────────────────────────────────────────
 
+/// Whether the part has block `kind` instance `n` (`None` for the SAADC,
+/// which has no number). An unknown family answers yes: nothing to check
+/// against, and `is_nrf` already keeps such a family out of this backend.
+fn block_present(mcu: &Mcu, kind: &str, n: Option<u8>) -> bool {
+    let Some(c) = chip(&mcu.family) else {
+        return true;
+    };
+    match (kind, n) {
+        ("saadc", Some(ch)) => c.ain.contains(&ch),
+        ("saadc", None) => !c.ain.is_empty(),
+        (k, Some(n)) => c.has(k, n),
+        _ => true,
+    }
+}
+
+/// The block a pin function belongs to: `("spim", Some(2), "SPIM2")`.
+fn block_of(f: &PinFunction) -> Option<(&'static str, Option<u8>, String)> {
+    Some(match f {
+        PinFunction::UsartTx(i)
+        | PinFunction::UsartRx(i)
+        | PinFunction::UsartCts(i)
+        | PinFunction::UsartRts(i) => ("uarte", Some(*i), format!("UARTE{i}")),
+        PinFunction::SpiSck(i) | PinFunction::SpiMosi(i) | PinFunction::SpiMiso(i) => {
+            ("spim", Some(*i), format!("SPIM{i}"))
+        }
+        PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => ("twim", Some(*i), format!("TWIM{i}")),
+        PinFunction::TimerPwm { timer, .. } => ("pwm", Some(*timer), format!("PWM{timer}")),
+        PinFunction::AdcChannel { channel, .. } => ("saadc", Some(*channel), format!("AIN{channel}")),
+        _ => return None,
+    })
+}
+
+/// A comment per wired block the part does not have.
+///
+/// A definition cloned from a bigger part keeps offering its blocks - a pad
+/// of an nRF52-DK running an nRF52810 still lists SPIM2 - and a constructor
+/// for a block the PAC does not have is a compile error in the user's
+/// project. Every emitter drops such a signal; this says so where it would
+/// have been built.
+fn missing_block_notes(mcu: &Mcu) -> String {
+    let Some(c) = chip(&mcu.family) else {
+        return String::new();
+    };
+    let mut missing: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
+        std::collections::BTreeMap::new();
+    for p in mcu.iter_all_pins().filter(|p| !p.reserved) {
+        let (Some(pp), Some((kind, n, name))) = (nrf_pin(&p.name), block_of(&p.selected_function))
+        else {
+            continue;
+        };
+        if !block_present(mcu, kind, n) {
+            missing.entry(name).or_default().push(pp);
+        }
+    }
+    let mut o = String::new();
+    for (name, mut pads) in missing {
+        pads.sort_unstable();
+        let pads: Vec<String> = pads.into_iter().map(label).collect();
+        o.push_str(&format!(
+            "    // {name} is wired on {}, but the {} has no {name}: it is not built.\n",
+            pads.join(" and "),
+            c.part
+        ));
+    }
+    o
+}
+
 /// Which pin carries each role of one bus instance.
+///
+/// Only instances of `kind` the part has: a pad offering SPIM2 on a part
+/// without one is reported by `missing_block_notes`, not built.
 fn bus_pins(
     mcu: &Mcu,
+    kind: &str,
     want: impl Fn(&PinFunction) -> Option<(u8, &'static str)>,
 ) -> Vec<(u8, &'static str, (u8, u8))> {
     let mut out = Vec::new();
@@ -270,7 +565,9 @@ fn bus_pins(
         let Some(pp) = nrf_pin(&p.name) else {
             continue;
         };
-        if let Some((inst, role)) = want(&p.selected_function) {
+        if let Some((inst, role)) = want(&p.selected_function)
+            && block_present(mcu, kind, Some(inst))
+        {
             out.push((inst, role, pp));
         }
     }
@@ -293,7 +590,7 @@ fn instances(pins: &[(u8, &'static str, (u8, u8))]) -> Vec<u8> {
 }
 
 fn uart_pins(mcu: &Mcu) -> Vec<(u8, &'static str, (u8, u8))> {
-    bus_pins(mcu, |f| match f {
+    bus_pins(mcu, "uarte", |f| match f {
         PinFunction::UsartTx(i) => Some((*i, "txd")),
         PinFunction::UsartRx(i) => Some((*i, "rxd")),
         PinFunction::UsartCts(i) => Some((*i, "cts")),
@@ -303,7 +600,7 @@ fn uart_pins(mcu: &Mcu) -> Vec<(u8, &'static str, (u8, u8))> {
 }
 
 fn spi_pins(mcu: &Mcu) -> Vec<(u8, &'static str, (u8, u8))> {
-    bus_pins(mcu, |f| match f {
+    bus_pins(mcu, "spim", |f| match f {
         PinFunction::SpiSck(i) => Some((*i, "sck")),
         PinFunction::SpiMosi(i) => Some((*i, "mosi")),
         PinFunction::SpiMiso(i) => Some((*i, "miso")),
@@ -312,7 +609,7 @@ fn spi_pins(mcu: &Mcu) -> Vec<(u8, &'static str, (u8, u8))> {
 }
 
 fn i2c_pins(mcu: &Mcu) -> Vec<(u8, &'static str, (u8, u8))> {
-    bus_pins(mcu, |f| match f {
+    bus_pins(mcu, "twim", |f| match f {
         PinFunction::I2cSda(i) => Some((*i, "sda")),
         PinFunction::I2cScl(i) => Some((*i, "scl")),
         _ => None,
@@ -399,6 +696,7 @@ fn opt(arg: Option<String>) -> String {
 /// TWIM needs both lines.
 fn bus_lines(mcu: &Mcu, hal: &str) -> String {
     let mut o = ambiguity_notes(mcu);
+    o.push_str(&missing_block_notes(mcu));
 
     let uart = uart_pins(mcu);
     for i in instances(&uart) {
@@ -471,6 +769,7 @@ fn pwm_channels(mcu: &Mcu) -> std::collections::BTreeMap<u8, PwmChannels> {
             }
             _ => None,
         })
+        .filter(|(timer, _, _)| block_present(mcu, "pwm", Some(*timer)))
         .collect();
     all.sort_unstable();
     let mut by_inst: std::collections::BTreeMap<u8, PwmChannels> =
@@ -508,6 +807,7 @@ fn pwm_adc_lines(mcu: &Mcu, hal: &str) -> String {
             _ => None,
         })
         .collect();
+    adc.retain(|a| block_present(mcu, "saadc", Some(a.0)));
     adc.sort_unstable();
     if !adc.is_empty() {
         o.push_str("    // One SAADC for every analog input; a read names the pin it samples.\n");
@@ -534,7 +834,9 @@ fn pwm_adc_lines(mcu: &Mcu, hal: &str) -> String {
 // ── The generated region ────────────────────────────────────────────────────
 
 fn section(mcu: &Mcu) -> String {
-    let hal = hal_crate(&mcu.family);
+    let Some(hal) = hal_crate(&mcu.family) else {
+        return async_section(mcu);
+    };
     let mut o = String::new();
     o.push_str(GEN_BEGIN);
     o.push('\n');
@@ -586,10 +888,8 @@ fn hal_line(mcu: &Mcu, is_async: bool) -> String {
     if is_async {
         format!("// MCU: {} | HAL: embassy-nrf (async)\n", mcu.name)
     } else {
-        format!(
-            "// MCU: {} | HAL: {}-hal (blocking)\n",
-            mcu.name, mcu.family
-        )
+        let krate = chip(&mcu.family).and_then(|c| c.nrf_hal).unwrap_or("embassy-nrf");
+        format!("// MCU: {} | HAL: {krate} (blocking)\n", mcu.name)
     }
 }
 
@@ -881,7 +1181,9 @@ fn pwm_actual_hz(freq_hz: u32, div: u32) -> u32 {
 /// `src/pins/configs/pwm{n}.rs` — one PWM block, its frequency and the duty
 /// of each channel it drives.
 fn pwm_config_file(mcu: &Mcu, inst: u8, chans: &[(u8, (u8, u8))]) -> String {
-    let hal = hal_crate(&mcu.family);
+    // Only reached through `NrfBackend::config_files`, which writes no PWM
+    // file for a part without an nrf-hal crate - and that part has no PWM.
+    let hal = hal_crate(&mcu.family).unwrap_or_default();
     let cfg = crate::panels::mcu_module::modules::timer_configs(&mcu.modules);
     let cfg = cfg.get(&inst);
     let want = cfg.map_or(0, |c| c.freq_hz);
@@ -1003,12 +1305,16 @@ impl FamilyBackend for NrfBackend {
     // both output drives as `into_*` methods, which is exactly the full set.
 
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
+        // On embassy-nrf every bus is built inline in main.rs, as on Async:
+        // the watchdog's is the only file.
+        let Some(hal) = hal_crate(&mcu.family) else {
+            return super::watchdog_gen::nrf_config_files(&mcu.watchdog, &mcu.family, false);
+        };
         let mut out: Vec<(String, String)> = pwm_channels(mcu)
             .into_iter()
             .map(|(inst, chans)| (format!("pwm{inst}.rs"), pwm_config_file(mcu, inst, &chans)))
             .collect();
 
-        let hal = hal_crate(&mcu.family);
         let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
         let scfgs = crate::panels::mcu_module::modules::spi_configs(&mcu.modules);
         // The I2C modules, so each twim file can carry its own device address.
@@ -1113,13 +1419,20 @@ fn periph((port, pin): (u8, u8)) -> String {
 ///
 /// embassy-nrf names a SHARED block after what it shares: SPIM0 and TWIM0 are
 /// one peripheral, `TWISPI0`, on one vector. SPIM2 is `SPI2`, and SPIM3 is
-/// `SPI3` on a vector named `SPIM3`. The nRF52840 spells them the same.
-fn serial_block(kind: &str, n: u8) -> (String, String) {
-    match (kind, n) {
-        ("uarte", _) => (format!("UARTE{n}"), format!("UARTE{n}")),
-        ("spim", 2) => ("SPI2".to_owned(), "SPI2".to_owned()),
-        ("spim", 3) => ("SPI3".to_owned(), "SPIM3".to_owned()),
-        _ => (format!("TWISPI{n}"), format!("TWISPI{n}")),
+/// `SPI3` on a vector named `SPIM3`. The 52820, 52832 and 52840 spell them
+/// the same. The small parts do not: on the 52805 and 52810 SPIM0 and TWIM0
+/// are SEPARATE blocks (`SPI0`, `TWI0`), and on the 52811 the shared one is
+/// SPIM1 with TWIM0, named `TWI0_SPI1`.
+fn serial_block(family: &str, kind: &str, n: u8) -> (String, String) {
+    let same = |s: &str| (s.to_owned(), s.to_owned());
+    match (family, kind, n) {
+        (_, "uarte", _) => same(&format!("UARTE{n}")),
+        ("nrf52805" | "nrf52810" | "nrf52811", "spim", 0) => same("SPI0"),
+        ("nrf52805" | "nrf52810", "twim", 0) => same("TWI0"),
+        ("nrf52811", "spim", 1) | ("nrf52811", "twim", 0) => same("TWI0_SPI1"),
+        (_, "spim", 2) => same("SPI2"),
+        (_, "spim", 3) => ("SPI3".to_owned(), "SPIM3".to_owned()),
+        _ => same(&format!("TWISPI{n}")),
     }
 }
 
@@ -1183,8 +1496,19 @@ fn async_gpio_lines(mcu: &Mcu) -> (String, String) {
                     _ => "None",
                 };
                 let ctor = format!("Input::new(p.{}, Pull::{pull})", periph(pp));
-                let Some(edge) = p.irq else {
-                    pins_out.push(format!("    // {what}\n{ALLOW}    let {var} = {ctor};\n"));
+                // On Blocking (the part nrf-hal has no crate for) there is no
+                // executor to run the waiting task: the pin is an input, and
+                // the edge is said rather than dropped, as on nrf-hal.
+                let edge = p.irq.filter(|_| mcu.is_async());
+                let Some(edge) = edge else {
+                    let mut entry = format!("    // {what}\n{ALLOW}    let {var} = {ctor};\n");
+                    if p.irq.is_some() {
+                        entry.push_str(&format!(
+                            "    // {} is armed for an interrupt, which this Blocking project does\n    // not generate: poll it, or switch to the Async runtime.\n",
+                            label(pp)
+                        ));
+                    }
+                    pins_out.push(entry);
                     continue;
                 };
                 let (wait, desc) = match edge {
@@ -1258,7 +1582,11 @@ fn async_clock_lines(mcu: &Mcu) -> String {
     let mut o = String::new();
     o.push_str("    // From the Clock tab. HFCLK is 64 MHz either way; the choice is whether\n");
     o.push_str("    // the 32 MHz crystal is started, which the radio and USB need. LFCLK is\n");
-    o.push_str("    // 32.768 kHz, and it clocks RTC1, which is embassy-time's driver.\n");
+    if mcu.is_async() {
+        o.push_str("    // 32.768 kHz, and it clocks RTC1, which is embassy-time's driver.\n");
+    } else {
+        o.push_str("    // 32.768 kHz, and it clocks the RTCs and the watchdog.\n");
+    }
     o.push_str("    let mut config = embassy_nrf::config::Config::default();\n");
     o.push_str(&format!(
         "    config.hfclk_source = embassy_nrf::config::HfclkSource::{hf};\n"
@@ -1316,6 +1644,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     };
     let mut irqs: Vec<String> = Vec::new();
     let mut o = ambiguity_notes(mcu);
+    o.push_str(&missing_block_notes(mcu));
     let mut items = String::new();
     let mut static_cell = false;
     let mut taken: Vec<(String, String)> = Vec::new();
@@ -1336,7 +1665,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             ));
             continue;
         };
-        let (peri, irq) = serial_block("uarte", i);
+        let (peri, irq) = serial_block(&mcu.family, "uarte", i);
         let var = format!("uarte{i}");
         let hz = bus_speed(mcu, "uarte", i);
         let (got, variant) = baud_variant(hz);
@@ -1405,7 +1734,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             ));
             continue;
         };
-        let (peri, irq) = serial_block("spim", i);
+        let (peri, irq) = serial_block(&mcu.family, "spim", i);
         let var = format!("spim{i}");
         // embassy-nrf has a constructor for both data lines and one for each
         // alone, and none for a clock with neither.
@@ -1471,7 +1800,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             ));
             continue;
         };
-        let (peri, irq) = serial_block("twim", i);
+        let (peri, irq) = serial_block(&mcu.family, "twim", i);
         if let Some(note) = clash(&taken, &peri, &format!("TWIM{i}")) {
             o.push_str(&note);
             continue;
@@ -1508,20 +1837,29 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         ));
         // Without it, `twim.write(addr, &[REG, 0x01])` fails at run time: a
         // slice of constants is promoted into flash, and EasyDMA reads RAM only.
+        let up = var.to_ascii_uppercase();
+        o.push_str("    // EasyDMA reads RAM only, and a write of constant bytes (`&[REG, 0x01]`)\n    // lives in flash, so the driver copies it through this buffer first; a longer\n    // one fails with `RAMBufferTooSmall`.");
+        // On Async `'static`, so the bus can move into a task. On Blocking
+        // `main` never returns, so a local outlives every use of the bus and
+        // the project needs no `static_cell`.
+        let ram = if mcu.is_async() {
+            o.push_str(&format!(
+                " `'static`, so the bus can move into a task.\n    static {up}_RAM: static_cell::StaticCell<[u8; 32]> = static_cell::StaticCell::new();\n"
+            ));
+            static_cell = true;
+            format!("{up}_RAM.init([0; 32])")
+        } else {
+            o.push_str(&format!("\n    let mut {var}_ram = [0u8; 32];\n"));
+            format!("&mut {var}_ram")
+        };
         o.push_str(&format!(
-            "    // EasyDMA reads RAM only, and a write of constant bytes (`&[REG, 0x01]`)\n    // lives in flash, so the driver copies it through this buffer first; a longer\n    // one fails with `RAMBufferTooSmall`. `'static`, so the bus can move into a task.\n    static {up}_RAM: static_cell::StaticCell<[u8; 32]> = static_cell::StaticCell::new();\n",
-            up = var.to_ascii_uppercase()
-        ));
-        o.push_str(&format!(
-            "{ALLOW}    let mut {var} = embassy_nrf::twim::Twim::new(\n        p.{peri},\n        Irqs,\n        p.{}, // SDA\n        p.{}, // SCL\n        {var}_cfg,\n        {up}_RAM.init([0; 32]),\n    );\n",
+            "{ALLOW}    let mut {var} = embassy_nrf::twim::Twim::new(\n        p.{peri},\n        Irqs,\n        p.{}, // SDA\n        p.{}, // SCL\n        {var}_cfg,\n        {ram},\n    );\n",
             periph(sda),
             periph(scl),
-            up = var.to_ascii_uppercase()
         ));
         irqs.push(format!(
             "    {irq} => embassy_nrf::twim::InterruptHandler<embassy_nrf::peripherals::{peri}>;"
         ));
-        static_cell = true;
         taken.push((peri, format!("TWIM{i}")));
     }
 
@@ -1626,6 +1964,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             _ => None,
         })
         .collect();
+    adc.retain(|a| block_present(mcu, "saadc", Some(a.0)));
     adc.sort_unstable();
     if !adc.is_empty() {
         let order: Vec<String> = adc
@@ -1695,27 +2034,43 @@ pub fn shared_block_partner(
     if !is_nrf(&mcu.family) {
         return None;
     }
+    let family = mcu.family.as_str();
     let n = me.instance();
-    if n > 1 {
-        return None;
-    }
-    let name = match me.kind {
-        ModuleKind::GenericInterfaceSpi => format!("TWIM{n}"),
-        ModuleKind::GenericInterfaceI2c => format!("SPIM{n}"),
+    // The partner is the instance of the OTHER kind on the same block, and
+    // which one that is depends on the part: TWIM0 shares with SPIM1 on the
+    // 52811, and with nothing on the 52805/52810.
+    let (sn, tn) = match me.kind {
+        ModuleKind::GenericInterfaceSpi => {
+            let block = serial_block(family, "spim", n).0;
+            (n, (0..4).find(|&m| serial_block(family, "twim", m).0 == block)?)
+        }
+        ModuleKind::GenericInterfaceI2c => {
+            let block = serial_block(family, "twim", n).0;
+            ((0..4).find(|&m| serial_block(family, "spim", m).0 == block)?, n)
+        }
         _ => return None,
     };
+    let name = match me.kind {
+        ModuleKind::GenericInterfaceSpi => format!("TWIM{tn}"),
+        _ => format!("SPIM{sn}"),
+    };
+    // embassy-nrf has no clock-only constructor; on the part nrf-hal has no
+    // crate for, Blocking is embassy-nrf too.
+    let embassy = is_async || blocking_on_embassy(family);
     // The same tests, in the same order, as the two SPIM loops: SCK first,
-    // then (Async only) a data line, since embassy-nrf has no clock-only
-    // constructor and nrf-hal takes MOSI and MISO as `Option`s.
+    // then (embassy only) a data line, since nrf-hal takes MOSI and MISO as
+    // `Option`s.
     let spi = spi_pins(mcu);
-    let spim = role_of(&spi, n, "sck").is_some()
-        && (!is_async || role_of(&spi, n, "mosi").is_some() || role_of(&spi, n, "miso").is_some());
+    let spim = role_of(&spi, sn, "sck").is_some()
+        && (!embassy || role_of(&spi, sn, "mosi").is_some() || role_of(&spi, sn, "miso").is_some());
     // Both TWIM loops take the pair or nothing.
     let i2c = i2c_pins(mcu);
-    let twim = role_of(&i2c, n, "scl").is_some() && role_of(&i2c, n, "sda").is_some();
+    let twim = role_of(&i2c, tn, "scl").is_some() && role_of(&i2c, tn, "sda").is_some();
     (spim && twim).then_some(name)
 }
 
+/// The block on embassy-nrf: under the executor on Async, and under a plain
+/// `#[entry]` on Blocking for the part nrf-hal has no crate for.
 fn async_section(mcu: &Mcu) -> String {
     let buses = async_bus_lines(mcu);
     let (tasks, gpio) = async_gpio_lines(mcu);
@@ -1736,11 +2091,19 @@ fn async_section(mcu: &Mcu) -> String {
     }
     o.push_str(&buses.items);
     o.push_str(&tasks);
-    o.push_str("#[embassy_executor::main]\n");
-    o.push_str(&format!(
-        "async fn main({spawner}: embassy_executor::Spawner) {{\n"
-    ));
-    o.push_str("    // Imported here, not in the header: a runtime switch keeps the header, and\n    // on Blocking embassy-nrf is not a dependency.\n");
+    if mcu.is_async() {
+        o.push_str("#[embassy_executor::main]\n");
+        o.push_str(&format!(
+            "async fn main({spawner}: embassy_executor::Spawner) {{\n"
+        ));
+        o.push_str("    // Imported here, not in the header: a runtime switch keeps the header, and\n    // on Blocking embassy-nrf is not a dependency.\n");
+    } else {
+        // The part nrf-hal has no crate for: embassy-nrf with no executor,
+        // through its `blocking_*` methods.
+        o.push_str("#[cortex_m_rt::entry]\n");
+        o.push_str("fn main() -> ! {\n");
+        o.push_str("    // embassy-nrf without an executor: nrf-hal has no crate for this part, so\n    // Blocking calls the drivers' `blocking_*` methods (`blocking_write`, ...).\n");
+    }
     o.push_str("    #[allow(unused_imports)]\n    use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};\n\n");
     o.push_str(&async_clock_lines(mcu));
     // Only the peripheral: starting it is configuring it on this HAL.

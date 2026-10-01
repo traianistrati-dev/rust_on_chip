@@ -1,0 +1,2831 @@
+McuDefinition(
+    id: "nrf52840_dk",
+    display_name: "Nordic nRF52840 DK",
+    family: "nrf52840",
+    package: "DK headers",
+    board_chip: Some("nRF52840"),
+    max_mhz: Some(64),
+    sram_kb: Some(256),
+    dma: None,
+    cpu: "ARM Cortex-M4F",
+    toolchain: RustEmbedded,
+    project: ProjectDef(
+        pkg_name: "nrf52840_dk",
+        target: "thumbv7em-none-eabihf",
+        flash_origin: "0x00000000",
+        flash_size: "1024K",
+        ram_origin: "0x20000000",
+        ram_size: "256K",
+        hal_dep: "nrf52840-hal = { version = \"0.19\", default-features = false, features = [\"rt\"] }",
+        hal_dep_async: Some("embassy-nrf = { version = \"0.11\", features = [\"nrf52840\", \"time-driver-rtc1\", \"gpiote\", \"nfc-pins-as-gpio\"] }"),
+        probe_chip: "nRF52840_xxAA",
+        memory_comment: "Nordic nRF52840 DK (nRF52840)  -  1024 KiB Flash / 256 KiB RAM",
+    ),
+    pins: PinLayout(
+        top: [
+            PinDef(
+                number: 28,
+                name: "P0.13 (LED1, active LOW)",
+                reserved: false,
+                functions: [
+                    GpioOutput,
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 29,
+                name: "P0.14 (LED2, active LOW)",
+                reserved: false,
+                functions: [
+                    GpioOutput,
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 30,
+                name: "P0.15 (LED3, active LOW)",
+                reserved: false,
+                functions: [
+                    GpioOutput,
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 31,
+                name: "P0.16 (LED4, active LOW)",
+                reserved: false,
+                functions: [
+                    GpioOutput,
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 32,
+                name: "P0.11 (BUTTON1, active LOW)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                ],
+            ),
+            PinDef(
+                number: 33,
+                name: "P0.12 (BUTTON2, active LOW)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                ],
+            ),
+            PinDef(
+                number: 34,
+                name: "P0.24 (BUTTON3, active LOW)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                ],
+            ),
+            PinDef(
+                number: 35,
+                name: "P0.25 (BUTTON4, active LOW)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                ],
+            ),
+            PinDef(
+                number: 36,
+                name: "P0.06 (VCOM TXD)",
+                reserved: false,
+                functions: [
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartTx(1),
+                ],
+            ),
+            PinDef(
+                number: 37,
+                name: "P0.08 (VCOM RXD)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    UsartRx(0),
+                    UsartRx(1),
+                ],
+            ),
+            PinDef(
+                number: 38,
+                name: "P0.07 (VCOM CTS)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    UsartCts(0),
+                    UsartCts(1),
+                ],
+            ),
+            PinDef(
+                number: 39,
+                name: "P0.05 (VCOM RTS)",
+                reserved: false,
+                functions: [
+                    GpioOutput,
+                    UsartRts(0),
+                    UsartRts(1),
+                ],
+            ),
+            PinDef(
+                number: 40,
+                name: "P0.17 (QSPI CS)",
+                reserved: true,
+                functions: [],
+            ),
+            PinDef(
+                number: 41,
+                name: "P0.19 (QSPI CLK)",
+                reserved: true,
+                functions: [],
+            ),
+            PinDef(
+                number: 42,
+                name: "P0.20 (QSPI IO0)",
+                reserved: true,
+                functions: [],
+            ),
+            PinDef(
+                number: 43,
+                name: "P0.21 (QSPI IO1)",
+                reserved: true,
+                functions: [],
+            ),
+            PinDef(
+                number: 44,
+                name: "P0.22 (QSPI IO2)",
+                reserved: true,
+                functions: [],
+            ),
+            PinDef(
+                number: 45,
+                name: "P0.23 (QSPI IO3)",
+                reserved: true,
+                functions: [],
+            ),
+            PinDef(
+                number: 46,
+                name: "P0.00 (XL1, 32.768 kHz)",
+                reserved: true,
+                functions: [],
+            ),
+            PinDef(
+                number: 47,
+                name: "P0.01 (XL2, 32.768 kHz)",
+                reserved: true,
+                functions: [],
+            ),
+            PinDef(
+                number: 48,
+                name: "P0.18 (RESET)",
+                reserved: true,
+                functions: [],
+            ),
+        ],
+        bottom: [],
+        left: [
+            PinDef(
+                number: 1,
+                name: "P0.03 (A0)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                    AdcChannel(
+                        adc: 0,
+                        channel: 1,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 2,
+                name: "P0.04 (A1)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                    AdcChannel(
+                        adc: 0,
+                        channel: 2,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 3,
+                name: "P0.28 (A2)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                    AdcChannel(
+                        adc: 0,
+                        channel: 4,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 4,
+                name: "P0.29 (A3)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                    AdcChannel(
+                        adc: 0,
+                        channel: 5,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 5,
+                name: "P0.30 (A4)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                    AdcChannel(
+                        adc: 0,
+                        channel: 6,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 6,
+                name: "P0.31 (A5)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                    AdcChannel(
+                        adc: 0,
+                        channel: 7,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 7,
+                name: "P0.02 (AREF)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                    AdcChannel(
+                        adc: 0,
+                        channel: 0,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 8,
+                name: "P1.00 (SWO)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 9,
+                name: "P1.09 ()",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 10,
+                name: "P0.09 (NFC1)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 11,
+                name: "P0.10 (NFC2)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+        ],
+        right: [
+            PinDef(
+                number: 12,
+                name: "P1.01 (D0)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 13,
+                name: "P1.02 (D1)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 14,
+                name: "P1.03 (D2)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 15,
+                name: "P1.04 (D3)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 16,
+                name: "P1.05 (D4)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 17,
+                name: "P1.06 (D5)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 18,
+                name: "P1.07 (D6)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 19,
+                name: "P1.08 (D7)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 20,
+                name: "P1.10 (D8)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 21,
+                name: "P1.11 (D9)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 22,
+                name: "P1.12 (D10)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 23,
+                name: "P1.13 (D11, MOSI)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    SpiMosi(2),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 24,
+                name: "P1.14 (D12, MISO)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    SpiMiso(2),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 25,
+                name: "P1.15 (D13, SCK)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    SpiSck(2),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 26,
+                name: "P0.26 (SDA)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    I2cSda(0),
+                    I2cSda(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 27,
+                name: "P0.27 (SCL)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(0),
+                    UsartRx(0),
+                    UsartCts(0),
+                    UsartRts(0),
+                    UsartTx(1),
+                    UsartRx(1),
+                    UsartCts(1),
+                    UsartRts(1),
+                    I2cScl(0),
+                    I2cScl(1),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 0,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 1,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 2,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 3,
+                        channel: 3,
+                    ),
+                ],
+            ),
+        ],
+        grid: None,
+    ),
+    clock: Graph(GraphClock(
+        graph: ClockGraph(
+            nodes: [
+                Node(
+                    id: "hfint",
+                    kind: Source(
+                        min_hz: 64000000,
+                        max_hz: 64000000,
+                        gated: false,
+                    ),
+                    state: Source(
+                        enabled: true,
+                        hz: 64000000,
+                    ),
+                    limit: None,
+                ),
+                Node(
+                    id: "hfxo",
+                    kind: Source(
+                        min_hz: 32000000,
+                        max_hz: 32000000,
+                        gated: true,
+                    ),
+                    state: Source(
+                        enabled: true,
+                        hz: 32000000,
+                    ),
+                    limit: None,
+                ),
+                Node(
+                    id: "hfxo_pll",
+                    kind: Multiplier(
+                        min: 2,
+                        max: 2,
+                    ),
+                    state: Value(2),
+                    limit: None,
+                ),
+                Node(
+                    id: "hfclk_src",
+                    kind: Mux(
+                        inputs: 2,
+                    ),
+                    state: Index(0),
+                    limit: None,
+                ),
+                Node(
+                    id: "hfclk",
+                    kind: Output,
+                    state: Fixed,
+                    limit: Some(Hz(64000000)),
+                ),
+                Node(
+                    id: "lfrc",
+                    kind: Source(
+                        min_hz: 32768,
+                        max_hz: 32768,
+                        gated: false,
+                    ),
+                    state: Source(
+                        enabled: true,
+                        hz: 32768,
+                    ),
+                    limit: None,
+                ),
+                Node(
+                    id: "lfsynth",
+                    kind: Choice(
+                        ratios: [
+                            (8, 15625),
+                        ],
+                    ),
+                    state: Index(0),
+                    limit: None,
+                ),
+                Node(
+                    id: "lfxo",
+                    kind: Source(
+                        min_hz: 32768,
+                        max_hz: 32768,
+                        gated: true,
+                    ),
+                    state: Source(
+                        enabled: true,
+                        hz: 32768,
+                    ),
+                    limit: None,
+                ),
+                Node(
+                    id: "lfclk_src",
+                    kind: Mux(
+                        inputs: 3,
+                    ),
+                    state: Index(0),
+                    limit: None,
+                ),
+                Node(
+                    id: "lfclk",
+                    kind: Output,
+                    state: Fixed,
+                    limit: None,
+                ),
+            ],
+            edges: [
+                Edge(
+                    from: "hfint",
+                    to: "hfclk_src",
+                    input: 0,
+                ),
+                Edge(
+                    from: "hfxo",
+                    to: "hfxo_pll",
+                    input: 0,
+                ),
+                Edge(
+                    from: "hfxo_pll",
+                    to: "hfclk_src",
+                    input: 1,
+                ),
+                Edge(
+                    from: "hfclk_src",
+                    to: "hfclk",
+                    input: 0,
+                ),
+                Edge(
+                    from: "lfrc",
+                    to: "lfclk_src",
+                    input: 0,
+                ),
+                Edge(
+                    from: "hfclk_src",
+                    to: "lfsynth",
+                    input: 0,
+                ),
+                Edge(
+                    from: "lfsynth",
+                    to: "lfclk_src",
+                    input: 1,
+                ),
+                Edge(
+                    from: "lfxo",
+                    to: "lfclk_src",
+                    input: 2,
+                ),
+                Edge(
+                    from: "lfclk_src",
+                    to: "lfclk",
+                    input: 0,
+                ),
+            ],
+        ),
+        layout: ClockLayout(
+            blocks: [],
+            outputs: [],
+            tags: [],
+            labels_above: [],
+            mux_titles: [],
+            wires: [],
+            widgets: [],
+        ),
+    )),
+)

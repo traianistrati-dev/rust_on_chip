@@ -1183,7 +1183,9 @@ mod tests {
         assert_eq!(
             informative,
             [
+                "nrf52832_dk",
                 "nrf52833_microbit_v2",
+                "nrf52840_dk",
                 "rp2040_pico_w",
                 "rp2350_pico2_ice",
                 "rp2350_pico2_w",

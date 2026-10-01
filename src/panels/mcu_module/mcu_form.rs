@@ -367,6 +367,10 @@ impl McuForm {
         } else {
             self.id.trim().to_string()
         };
+        if let Some(c) = nrf52_in_name(&name) {
+            self.auto_fill_nrf(c);
+            return true;
+        }
         let Some((family, cpu, toolchain, target)) = super::mcu_identity::identity_from_name(&name)
         else {
             return false;
@@ -430,6 +434,42 @@ impl McuForm {
             self.probe_chip = name;
         }
         true
+    }
+
+    /// Auto-fill for an nRF52 part: every field the built-in kits carry, from
+    /// the same table and the same methods `nrf_boards::apply_chip` uses.
+    ///
+    /// The clock is the tree WITHOUT the 32.768 kHz crystal: on a board that
+    /// has none, an LFXO choice generates a `start_lfclk` that never returns,
+    /// while the RC works on every board. A board with the crystal can import
+    /// a tree that has it.
+    fn auto_fill_nrf(&mut self, c: &'static crate::panels::mcu_module::codegen::nrf::NrfChip) {
+        let new_family = self.family.trim() != c.family;
+        self.family = c.family.into();
+        self.cpu = c.cpu().into();
+        self.toolchain = ToolchainKind::RustEmbedded;
+        self.target = c.target().into();
+        self.max_mhz = Some(64);
+        self.flash_origin = "0x00000000".into();
+        self.flash_size = format!("{}K", c.flash_kb);
+        self.ram_origin = "0x20000000".into();
+        self.ram_size = format!("{}K", c.ram_kb);
+        self.sram_kb = Some(c.ram_kb);
+        self.loaded_ram_size = self.ram_size.clone();
+        self.hal_dep = c.hal_dep();
+        self.hal_dep_async = c.hal_dep_async();
+        if self.probe_chip.trim().is_empty() || new_family {
+            self.probe_chip = c.probe_chip();
+        }
+        // Only on a move, for the reason `auto_fill_identity` gives: a tree
+        // the user attached to this nRF form is their answer for it.
+        if new_family {
+            self.imported_clock = Some(ClockDef::Graph(
+                crate::panels::mcu_module::codegen::nrf_boards::clock_graph(false),
+            ));
+            self.clock_carried_in = true;
+            self.clock = ClockChoice::None;
+        }
     }
 
     /// Move pin `idx` from side `from` to the END of side `to`, keeping the row
@@ -787,6 +827,17 @@ impl McuForm {
 }
 
 /// A valid registry id / file stem: non-empty, ASCII `a–z 0–9 _` only.
+/// The nRF52 part a chip name names - `nRF52840`, `nrf52810-qcaa`,
+/// `My nRF52833 board` - or `None`. The LONGEST family that appears wins, so
+/// no key can be read off a longer one.
+fn nrf52_in_name(name: &str) -> Option<&'static crate::panels::mcu_module::codegen::nrf::NrfChip> {
+    let lower = name.to_ascii_lowercase();
+    crate::panels::mcu_module::codegen::nrf::NRF52_CHIPS
+        .iter()
+        .filter(|c| lower.contains(c.family))
+        .max_by_key(|c| c.family.len())
+}
+
 pub fn is_valid_id(id: &str) -> bool {
     let id = id.trim();
     !id.is_empty()
@@ -2075,6 +2126,36 @@ mod tests {
         let mut g = McuForm::blank();
         g.display_name = "ESP32-C3".into();
         assert!(!g.auto_fill_identity());
+    }
+
+    /// An nRF52 name fills every line the generator reads, from the chip
+    /// table: the soft-float target on the small parts, the part's own HAL
+    /// crates, no `nfc-pins-as-gpio` where there is no NFC, and a clock tree.
+    #[test]
+    fn auto_fill_completes_an_nrf52_form() {
+        for (name, family, target, hal, nfc) in [
+            ("nRF52810-QFAA", "nrf52810", "thumbv7em-none-eabi", "nrf52810-hal", false),
+            ("nRF52820", "nrf52820", "thumbv7em-none-eabi", "embassy-nrf", false),
+            ("my nrf52840 board", "nrf52840", "thumbv7em-none-eabihf", "nrf52840-hal", true),
+        ] {
+            let mut f = McuForm::empty();
+            f.id = "x".into();
+            f.display_name = name.into();
+            assert!(f.auto_fill_identity(), "{name}");
+            assert_eq!(f.family, family);
+            assert_eq!(f.target, target);
+            assert!(f.hal_dep.starts_with(hal), "{name}: {}", f.hal_dep);
+            assert!(f.hal_dep_async.starts_with("embassy-nrf"), "{name}");
+            assert_eq!(f.hal_dep_async.contains("nfc-pins-as-gpio"), nfc, "{name}");
+            assert_eq!(f.flash_origin, "0x00000000");
+            assert!(f.probe_chip.ends_with("_xxAA"), "{}", f.probe_chip);
+            assert!(matches!(f.effective_clock(), ClockDef::Graph(_)), "{name}");
+            let w = f.warnings();
+            assert!(
+                !w.iter().any(|w| w.contains("codegen backend") || w.contains("HAL")),
+                "{name}: {w:?}"
+            );
+        }
     }
 
     #[test]

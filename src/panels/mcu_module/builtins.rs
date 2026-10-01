@@ -46,6 +46,10 @@ const RP2350_PICO2_ICE_RON: &str = include_str!("../../../assets/mcus/rp2350_pic
 // `top`. Each name leads with the nRF port and pin the codegen reads.
 const NRF52833_MICROBIT_V2_RON: &str =
     include_str!("../../../assets/mcus/nrf52833_microbit_v2.ron");
+// Nordic's own kits. Generated from their pin tables by
+// `codegen::nrf_boards`, which also checks these files against them.
+const NRF52840_DK_RON: &str = include_str!("../../../assets/mcus/nrf52840_dk.ron");
+const NRF52832_DK_RON: &str = include_str!("../../../assets/mcus/nrf52832_dk.ron");
 
 /// Raw `(id, ron-text)` for every bundled chip.
 const BUILTINS: &[(&str, &str)] = &[
@@ -65,6 +69,8 @@ const BUILTINS: &[(&str, &str)] = &[
     ("rp2350_pico2_w", RP2350_PICO2_W_RON),
     ("rp2350_pico2_ice", RP2350_PICO2_ICE_RON),
     ("nrf52833_microbit_v2", NRF52833_MICROBIT_V2_RON),
+    ("nrf52840_dk", NRF52840_DK_RON),
+    ("nrf52832_dk", NRF52832_DK_RON),
 ];
 
 /// Parse all bundled built-in MCU definitions (bad files are skipped + logged).

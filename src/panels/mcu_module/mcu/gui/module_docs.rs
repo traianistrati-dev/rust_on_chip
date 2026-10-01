@@ -247,6 +247,7 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("QSPI_WIRING_INCOMPLETE", QSPI_WIRING_INCOMPLETE),
     ("QSPI_FLASH_SIZE", QSPI_FLASH_SIZE),
     ("QSPI_ADDRESS", QSPI_ADDRESS),
+    ("QSPI_ADDRESS_NRF", QSPI_ADDRESS_NRF),
     ("SDMMC_WIDTH", SDMMC_WIDTH),
     ("SDMMC_WIDTH_UNSUPPORTED", SDMMC_WIDTH_UNSUPPORTED),
     ("SDMMC_DATA_TIMEOUT", SDMMC_DATA_TIMEOUT),
@@ -1028,6 +1029,11 @@ pub const QSPI_ADDRESS: &str = "How many address bytes the chip expects, and how
                                 it. 24 bit reaches 16 MiB and bigger flash needs 32; the bus \
                                 runs at kernel clock / (value + 1), so 0 is the fastest the \
                                 controller can go and is often more than the flash can follow.";
+pub const QSPI_ADDRESS_NRF: &str = "How many address bytes the chip expects, and how fast to clock \
+                                    it. The nRF52840 addresses in 24 bit, which reaches 16 MiB, or \
+                                    32 bit for bigger flash; its bus runs at 32 MHz divided by 1 \
+                                    to 16, so the fastest setting is 32 MHz and is often more \
+                                    than the flash can follow.";
 // ── SDMMC ─────────────────────────────────────────────────────────────────────
 
 pub const SDMMC_WIDTH: &str = "Read-only: the width is however many data lanes you wired, not a \

@@ -6057,14 +6057,40 @@ pub fn module_config_ui(
                         );
                     ui.end_row();
 
-                    out.field("Address", docs::QSPI_ADDRESS);
+                    // The nRF52840's QSPI: 24- or 32-bit addresses only, and a
+                    // divider of 1..=16 off a fixed 32 MHz. A value carried over
+                    // from an STM32 config is put back in range rather than
+                    // offered as a choice this block does not have.
+                    let nrf = crate::panels::mcu_module::codegen::nrf::is_nrf(family);
+                    if nrf {
+                        if matches!(
+                            cfg.address_size,
+                            QspiAddressSize::Bits8 | QspiAddressSize::Bits16
+                        ) {
+                            cfg.address_size = QspiAddressSize::Bits24;
+                        }
+                        cfg.prescaler = cfg.prescaler.min(15);
+                    }
+                    out.field(
+                        "Address",
+                        if nrf {
+                            docs::QSPI_ADDRESS_NRF
+                        } else {
+                            docs::QSPI_ADDRESS
+                        },
+                    );
                     ui.label("Address");
                     ui.horizontal(|ui| {
+                        let sizes: &[QspiAddressSize] = if nrf {
+                            &[QspiAddressSize::Bits24, QspiAddressSize::Bits32]
+                        } else {
+                            &QspiAddressSize::ALL
+                        };
                         egui::ComboBox::from_id_salt("qspi_addr")
                             .width(88.0)
                             .selected_text(cfg.address_size.label())
                             .show_ui(ui, |ui| {
-                                for v in QspiAddressSize::ALL {
+                                for v in sizes.iter().copied() {
                                     ui.selectable_value(&mut cfg.address_size, v, v.label());
                                 }
                             })
@@ -6073,19 +6099,51 @@ pub fn module_config_ui(
                                 "How many address bytes the chip expects. 24 bit covers up to \
                                  16 MiB; bigger flash needs 32.",
                             );
-                        ui.add(
-                            crate::panels::drag_value(ui, &mut cfg.prescaler)
-                                .range(0..=255)
-                                .prefix("clk / "),
-                        )
-                        .on_hover_text(
-                            "The bus runs at kernel clock / (prescaler + 1). 0 is the fastest \
-                             the chip can do and often too fast for the flash.",
-                        );
+                        if nrf {
+                            let mhz = 32.0 / (f32::from(cfg.prescaler) + 1.0);
+                            ui.add(
+                                crate::panels::drag_value(ui, &mut cfg.prescaler)
+                                    .range(0..=15)
+                                    .prefix("32 MHz / ")
+                                    // Shown and typed as the DIVIDER, 1..=16;
+                                    // stored as the prescaler, 0..=15.
+                                    .custom_formatter(|v, _| format!("{}", v as u32 + 1))
+                                    .custom_parser(|s| {
+                                        s.trim().parse::<f64>().ok().map(|d| d - 1.0)
+                                    }),
+                            )
+                            .on_hover_text(docs::QSPI_ADDRESS_NRF);
+                            ui.label(
+                                egui::RichText::new(format!("= {mhz:.1} MHz"))
+                                    .size(11.0)
+                                    .color(egui::Color32::GRAY),
+                            );
+                        } else {
+                            ui.add(
+                                crate::panels::drag_value(ui, &mut cfg.prescaler)
+                                    .range(0..=255)
+                                    .prefix("clk / "),
+                            )
+                            .on_hover_text(
+                                "The bus runs at kernel clock / (prescaler + 1). 0 is the fastest \
+                                 the chip can do and often too fast for the flash.",
+                            );
+                        }
                     });
                     ui.end_row();
 
-                    if !is_async {
+                    if nrf && !is_async {
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(
+                                "nrf-hal has no QSPI driver — only the Async runtime \
+                                 (embassy-nrf) builds this bus",
+                            )
+                            .size(10.5)
+                            .color(egui::Color32::from_gray(140)),
+                        );
+                        ui.end_row();
+                    } else if !is_async {
                         ui.label("");
                         ui.label(
                             egui::RichText::new(

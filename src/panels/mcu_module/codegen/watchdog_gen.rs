@@ -621,12 +621,17 @@ pub fn nrf_config_files(
     let head = NRF_TMPL_HEAD
         .replace("{US}", &c.timeout_us.to_string())
         .replace("{TICKS}", &watchdog::nrf_ticks(c.timeout_us).to_string());
+    // The application core of an nRF5340 has two watchdogs; its own is WDT0.
+    let wdt = super::nrf::chip(family).map_or("WDT", |c| c.wdt());
+    let embassy_tmpl = NRF_ASYNC_TMPL
+        .replace("use embassy_nrf::peripherals::WDT;", &format!("use embassy_nrf::peripherals::{wdt};"))
+        .replace("Peri<'static, WDT>", &format!("Peri<'static, {wdt}>"));
     let body = if is_async {
-        NRF_ASYNC_TMPL.to_owned()
+        embassy_tmpl
     } else if super::nrf::blocking_on_embassy(family) {
         // No nrf-hal crate for the part, so Blocking is embassy-nrf too: the
         // same driver, petted from a loop with no executor to sleep on.
-        NRF_ASYNC_TMPL.replace(
+        embassy_tmpl.replace(
             "embassy_time::Timer::after_micros(pins::configs::watchdog::TIMEOUT_US / 2).await;",
             "cortex_m::asm::delay(64 * (pins::configs::watchdog::TIMEOUT_US / 2) as u32);",
         )
@@ -643,7 +648,7 @@ pub fn nrf_config_files(
 /// Blocking the configured, not-yet-started driver (or the `Err` of a
 /// leftover one), on Async only the peripheral, because starting it there is
 /// configuring it.
-pub fn nrf_init_lines(w: &WatchdogSettings, is_async: bool) -> String {
+pub fn nrf_init_lines(w: &WatchdogSettings, is_async: bool, wdt: &str) -> String {
     if w.nrf.is_none() {
         return String::new();
     }
@@ -654,7 +659,7 @@ pub fn nrf_init_lines(w: &WatchdogSettings, is_async: bool) -> String {
         );
         s.push_str("    // stopped - call pins::configs::watchdog::start(watchdog) when ready.\n");
         s.push_str("    #[allow(unused_variables)]\n");
-        s.push_str("    let watchdog = p.WDT;\n");
+        s.push_str(&format!("    let watchdog = p.{wdt};\n"));
     } else {
         s.push_str(
             "    // Configured, NOT started - `Err` is a watchdog the previous image left\n",

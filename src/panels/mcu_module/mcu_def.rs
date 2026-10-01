@@ -1012,8 +1012,9 @@ mod the_manifest_follows_the_runtime {
                 .split_whitespace()
                 .next()
                 .expect("a dependency line names a crate");
-            let blocking = d.project.hal_dep.split_whitespace().next().unwrap_or("");
-            assert_ne!(krate, blocking, "{}: the two lines differ", d.id);
+            // The LINES differ, not always the crate: the nRF5340 is on
+            // embassy-nrf both ways, with the time driver only on Async.
+            assert_ne!(async_line, d.project.hal_dep, "{}: the two lines differ", d.id);
 
             let mut mcu = d.build_mcu();
             mcu.runtime = Runtime::Async;
@@ -1023,8 +1024,8 @@ mod the_manifest_follows_the_runtime {
             let toml =
                 project_gen::gen_config(project_gen::ConfigFile::CargoToml, &cfg, &d.toolchain);
             assert!(
-                toml.contains(krate),
-                "{}: Async must name {krate}, got:\n{toml}",
+                toml.contains(krate) && toml.contains(async_line.as_str()),
+                "{}: Async must carry its own line ({krate}), got:\n{toml}",
                 d.id
             );
 
@@ -1036,8 +1037,9 @@ mod the_manifest_follows_the_runtime {
             let btoml =
                 project_gen::gen_config(project_gen::ConfigFile::CargoToml, &bcfg, &d.toolchain);
             assert!(
-                btoml.contains(blocking),
-                "{}: Blocking must name {blocking}, got:\n{btoml}",
+                btoml.contains(d.project.hal_dep.as_str())
+                    && !btoml.contains(async_line.as_str()),
+                "{}: Blocking must carry its own line, got:\n{btoml}",
                 d.id
             );
             checked += 1;

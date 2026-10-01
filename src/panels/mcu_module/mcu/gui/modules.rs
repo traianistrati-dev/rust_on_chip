@@ -6001,17 +6001,33 @@ pub fn module_config_ui(
                     let ok1 = io1 == 4 && ncs1;
                     let ok2 = io2 == 4 && ncs2;
                     let clk = conn_rows.iter().any(|(sig, _, _)| *sig == "CLK");
+                    // The nRF52840 has one chip select and no second bank, so
+                    // "bank 1" / "dual flash" describe a controller it lacks.
+                    let nrf_qspi = crate::panels::mcu_module::codegen::nrf::is_nrf(family);
 
                     out.field(
                         "Wiring",
-                        if clk && (ok1 || ok2) {
-                            docs::QSPI_WIRING
-                        } else {
-                            docs::QSPI_WIRING_INCOMPLETE
+                        match (clk && (ok1 || ok2), nrf_qspi) {
+                            (true, true) => docs::QSPI_WIRING_NRF,
+                            (true, false) => docs::QSPI_WIRING,
+                            (false, true) => docs::QSPI_WIRING_INCOMPLETE_NRF,
+                            (false, false) => docs::QSPI_WIRING_INCOMPLETE,
                         },
                     );
                     ui.label("Wiring");
                     let (text, colour) = match (clk, ok1, ok2) {
+                        (true, true, _) if nrf_qspi => (
+                            "quad, one flash - SCK, CSN and IO0..IO3".to_owned(),
+                            egui::Color32::from_gray(200),
+                        ),
+                        (true, false, _) if nrf_qspi => (
+                            format!(
+                                "incomplete - the driver takes CSN and all four IO \
+                                 ({io1}/4 wired{})",
+                                if ncs1 { "" } else { ", no CSN" }
+                            ),
+                            egui::Color32::from_rgb(200, 140, 60),
+                        ),
                         (true, true, true) => (
                             "both banks — dual flash, 8 lines wide".to_owned(),
                             egui::Color32::from_gray(200),

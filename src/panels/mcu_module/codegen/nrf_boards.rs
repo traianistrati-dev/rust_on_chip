@@ -79,19 +79,6 @@ use Pad::{Button, Fixed, Gp, I2c, Led, Qspi, Spi, Uart, Usb};
 use Role::*;
 
 #[cfg(test)]
-/// The SAADC input a pad is: the same eight pins on every nRF52 that has one.
-fn ain(port: u8, pin: u8) -> Option<u8> {
-    if port != 0 {
-        return None;
-    }
-    match pin {
-        2..=5 => Some(pin - 2),
-        28..=31 => Some(pin - 24),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
 /// A general pad's functions on `c`: both directions, every role of every
 /// UARTE, every channel of every PWM block, and its analog input if it has one.
 fn general(c: &NrfChip, port: u8, pin: u8) -> Vec<PinFunction> {
@@ -101,7 +88,7 @@ fn general(c: &NrfChip, port: u8, pin: u8) -> Vec<PinFunction> {
         f.extend([UsartTx(u), UsartRx(u), UsartCts(u), UsartRts(u)]);
     }
     f.extend(pwm(c));
-    if let Some(channel) = ain(port, pin).filter(|ch| c.ain.contains(ch)) {
+    if let Some(channel) = c.ain_of((port, pin)) {
         f.push(AdcChannel { adc: 0, channel });
     }
     f
@@ -116,7 +103,7 @@ fn pwm(c: &NrfChip) -> Vec<PinFunction> {
 }
 
 #[cfg(test)]
-fn pin_def(c: &NrfChip, number: usize, pad: Pad) -> PinDef {
+fn pin_def(c: &NrfChip, b: &Board, number: usize, pad: Pad) -> PinDef {
     use PinFunction::*;
     let name = |port: u8, pin: u8, note: &str| format!("P{port}.{pin:02} ({note})");
     let (name, reserved, functions) = match pad {
@@ -143,11 +130,11 @@ fn pin_def(c: &NrfChip, number: usize, pad: Pad) -> PinDef {
             // After the UARTEs, before the PWM channels: the micro:bit's order.
             let at = 2 + 4 * c.uarte.len();
             let bus: Vec<PinFunction> = match role {
-                Sck => vec![SpiSck(2)],
-                Mosi => vec![SpiMosi(2)],
-                Miso => vec![SpiMiso(2)],
-                Sda => c.twim.iter().map(|&t| I2cSda(t)).collect(),
-                _ => c.twim.iter().map(|&t| I2cScl(t)).collect(),
+                Sck => vec![SpiSck(b.spim)],
+                Mosi => vec![SpiMosi(b.spim)],
+                Miso => vec![SpiMiso(b.spim)],
+                Sda => b.twim.iter().map(|&t| I2cSda(t)).collect(),
+                _ => b.twim.iter().map(|&t| I2cScl(t)).collect(),
             };
             f.splice(at..at, bus);
             (name(port, pin, note), false, f)
@@ -183,6 +170,10 @@ struct Board {
     id: &'static str,
     display_name: &'static str,
     family: &'static str,
+    /// The SPIM the header's SPI pads offer: the one no TWIM shares.
+    spim: u8,
+    /// The TWIMs its I2C pads offer.
+    twim: &'static [u8],
     left: &'static [Pad],
     right: &'static [Pad],
     top: &'static [Pad],
@@ -197,6 +188,8 @@ const NRF52840_DK: Board = Board {
     id: "nrf52840_dk",
     display_name: "Nordic nRF52840 DK",
     family: "nrf52840",
+    spim: 2,
+    twim: &[0, 1],
     left: &[
         Gp(0, 3, "A0"),
         Gp(0, 4, "A1"),
@@ -264,6 +257,8 @@ const NRF52_DK: Board = Board {
     id: "nrf52832_dk",
     display_name: "Nordic nRF52 DK (nRF52832)",
     family: "nrf52832",
+    spim: 2,
+    twim: &[0, 1],
     left: &[
         Gp(0, 3, "A0"),
         Gp(0, 4, "A1"),
@@ -305,7 +300,79 @@ const NRF52_DK: Board = Board {
 };
 
 #[cfg(test)]
-const BOARDS: [&Board; 2] = [&NRF52840_DK, &NRF52_DK];
+/// nRF5340 DK (PCA10095), the application core's view. Pin map from the board
+/// files Zephyr ships for it (`nrf5340dk_nrf5340_cpuapp`), cross-checked with
+/// the PCA10095 hardware guide: LEDs P0.28..31 and buttons P0.23/24/08/09,
+/// all active low; VCOM0 on P0.19..22; the 64 Mbit QSPI flash on P0.13..18;
+/// the Arduino SPI on SPIM4 (P1.13..15) and I2C on P1.02/03; the 32.768 kHz
+/// crystal on P0.00/01 and NFC on P0.02/03. UARTE/SPIM/TWIM n share SERIALn,
+/// so the header's I2C offers TWIM1/2 and leaves SERIAL0 to the VCOM UART.
+const NRF5340_DK: Board = Board {
+    id: "nrf5340_dk",
+    display_name: "Nordic nRF5340 DK (application core)",
+    family: "nrf5340",
+    spim: 4,
+    twim: &[1, 2],
+    left: &[
+        Gp(0, 4, "A0"),
+        Gp(0, 5, "A1"),
+        Gp(0, 6, "A2"),
+        Gp(0, 7, "A3"),
+        Gp(0, 25, "A4"),
+        Gp(0, 26, "A5"),
+        Gp(0, 27, ""),
+        Gp(0, 10, ""),
+        Gp(0, 11, ""),
+        Gp(0, 12, ""),
+        Gp(0, 2, "NFC1"),
+        Gp(0, 3, "NFC2"),
+    ],
+    right: &[
+        Gp(1, 0, "D0"),
+        Gp(1, 1, "D1"),
+        Gp(1, 4, "D2"),
+        Gp(1, 5, "D3"),
+        Gp(1, 6, "D4"),
+        Gp(1, 7, "D5"),
+        Gp(1, 8, "D6"),
+        Gp(1, 9, "D7"),
+        Gp(1, 10, "D8"),
+        Gp(1, 11, "D9"),
+        Gp(1, 12, "D10"),
+        Spi(1, 13, "D11, MOSI", Mosi),
+        Spi(1, 14, "D12, MISO", Miso),
+        Spi(1, 15, "D13, SCK", Sck),
+        I2c(1, 2, "SDA", Sda),
+        I2c(1, 3, "SCL", Scl),
+    ],
+    top: &[
+        Led(0, 28, "LED1, active LOW"),
+        Led(0, 29, "LED2, active LOW"),
+        Led(0, 30, "LED3, active LOW"),
+        Led(0, 31, "LED4, active LOW"),
+        Button(0, 23, "BUTTON1, active LOW"),
+        Button(0, 24, "BUTTON2, active LOW"),
+        Button(0, 8, "BUTTON3, active LOW"),
+        Button(0, 9, "BUTTON4, active LOW"),
+        Uart(0, 20, "VCOM TXD", Tx),
+        Uart(0, 22, "VCOM RXD", Rx),
+        Uart(0, 21, "VCOM CTS", Cts),
+        Uart(0, 19, "VCOM RTS", Rts),
+        Qspi(0, 18, "QSPI CS, 64 Mbit flash", QCs),
+        Qspi(0, 17, "QSPI CLK, 64 Mbit flash", QClk),
+        Qspi(0, 13, "QSPI IO0, 64 Mbit flash", QIo(0)),
+        Qspi(0, 14, "QSPI IO1, 64 Mbit flash", QIo(1)),
+        Qspi(0, 15, "QSPI IO2, 64 Mbit flash", QIo(2)),
+        Qspi(0, 16, "QSPI IO3, 64 Mbit flash", QIo(3)),
+        Usb("USB D+ (nRF5340 USB connector)", Dp),
+        Usb("USB D- (nRF5340 USB connector)", Dm),
+        Fixed("P0.00 (XL1, 32.768 kHz)"),
+        Fixed("P0.01 (XL2, 32.768 kHz)"),
+    ],
+};
+
+#[cfg(test)]
+const BOARDS: [&Board; 3] = [&NRF52840_DK, &NRF52_DK, &NRF5340_DK];
 
 /// The nRF52 clock tree, with or without the 32.768 kHz crystal.
 ///
@@ -406,7 +473,7 @@ fn definition_of(b: &Board) -> McuDefinition {
         pads.iter()
             .map(|p| {
                 next += 1;
-                pin_def(c, next - 1, *p)
+                pin_def(c, b, next - 1, *p)
             })
             .collect()
     };
@@ -488,7 +555,7 @@ mod tests {
         twim: u8,
     }
 
-    const CASES: [Case; 10] = [
+    const CASES: [Case; 12] = [
         Case { dir: "eide_nrf52840_dk_check", board: "nrf52840_dk", part: None, runtime: Runtime::Blocking, spim: 2, twim: 0 },
         Case { dir: "eide_nrf52840_dk_async_check", board: "nrf52840_dk", part: None, runtime: Runtime::Async, spim: 2, twim: 0 },
         Case { dir: "eide_nrf52832_dk_check", board: "nrf52832_dk", part: None, runtime: Runtime::Blocking, spim: 2, twim: 1 },
@@ -503,6 +570,10 @@ mod tests {
         // No nrf-hal crate: Blocking is embassy-nrf without an executor.
         Case { dir: "eide_nrf52820_check", board: "nrf52832_dk", part: Some("nrf52820"), runtime: Runtime::Blocking, spim: 0, twim: 1 },
         Case { dir: "eide_nrf52820_async_check", board: "nrf52832_dk", part: Some("nrf52820"), runtime: Runtime::Async, spim: 0, twim: 1 },
+        // The nRF5340's application core: SERIALn blocks, SPIM4, WDT0, Cortex-M33,
+        // and Blocking on embassy-nrf.
+        Case { dir: "eide_nrf5340_dk_check", board: "nrf5340_dk", part: None, runtime: Runtime::Blocking, spim: 4, twim: 1 },
+        Case { dir: "eide_nrf5340_dk_async_check", board: "nrf5340_dk", part: None, runtime: Runtime::Async, spim: 4, twim: 1 },
     ];
 
     /// The case's definition and its wired `Mcu`: an LED, a PWM on two more
@@ -653,6 +724,35 @@ mod tests {
         let (stack, m) = main("eide_nrf52820_check");
         assert_eq!(stack, (false, false));
         assert!(!m.contains("USB (USBD)"), "{m}");
+    }
+
+    /// What the nRF5340's application core does differently, on both
+    /// runtimes: SERIALn blocks and SPIM4, the M33 target, WDT0 for the
+    /// watchdog, the USB regulator's vector for VBUS, and the secure feature.
+    #[test]
+    fn the_5340_names_its_own_blocks() {
+        let c = chip("nrf5340").unwrap();
+        assert_eq!(c.target(), "thumbv8m.main-none-eabihf");
+        assert!(c.hal_dep().contains("\"nrf5340-app-s\""), "{}", c.hal_dep());
+        assert_eq!(c.ain_of((0, 4)), Some(0));
+        assert_eq!(c.ain_of((0, 28)), Some(7));
+        assert_eq!(c.ain_of((0, 2)), None);
+        let main = |dir: &str| {
+            let case = CASES.iter().find(|c| c.dir == dir).unwrap();
+            wired(case).1.fresh_main_rs()
+        };
+        for dir in ["eide_nrf5340_dk_check", "eide_nrf5340_dk_async_check"] {
+            let m = main(dir);
+            for want in ["p.SERIAL0,", "p.SPIM4,", "p.SERIAL1,", "let watchdog = p.WDT0;"] {
+                assert!(m.contains(want), "{dir}: missing {want:?}:\n{m}");
+            }
+        }
+        let m = main("eide_nrf5340_dk_async_check");
+        assert!(
+            m.contains("USBREGULATOR => embassy_nrf::usb::vbus_detect::InterruptHandler;"),
+            "{m}"
+        );
+        assert!(!m.contains("CLOCK_POWER"), "{m}");
     }
 
     /// The small parts' serial blocks, by their embassy-nrf names.

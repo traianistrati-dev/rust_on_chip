@@ -50,6 +50,7 @@ const NRF52833_MICROBIT_V2_RON: &str =
 // `codegen::nrf_boards`, which also checks these files against them.
 const NRF52840_DK_RON: &str = include_str!("../../../assets/mcus/nrf52840_dk.ron");
 const NRF52832_DK_RON: &str = include_str!("../../../assets/mcus/nrf52832_dk.ron");
+const NRF5340_DK_RON: &str = include_str!("../../../assets/mcus/nrf5340_dk.ron");
 
 /// Raw `(id, ron-text)` for every bundled chip.
 const BUILTINS: &[(&str, &str)] = &[
@@ -71,6 +72,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ("nrf52833_microbit_v2", NRF52833_MICROBIT_V2_RON),
     ("nrf52840_dk", NRF52840_DK_RON),
     ("nrf52832_dk", NRF52832_DK_RON),
+    ("nrf5340_dk", NRF5340_DK_RON),
 ];
 
 /// Parse all bundled built-in MCU definitions (bad files are skipped + logged).

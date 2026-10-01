@@ -351,8 +351,10 @@ $ALL_CASES = @(
     # must come out as comments, and only a compiler proves none slipped through.
     # Quick runs one per target plus the 52820's Blocking, the only emitter here
     # nothing else exercises.
-    @{ n = "nRF52 family x10";             t = "emit_nrf_family_projects";   e = @{};                       q = $true; fam = "nrf";
-       only = @("eide_nrf52840_dk_async_check", "eide_nrf52810_check", "eide_nrf52820_check") }
+    # The nRF5340 DK joins it, a third target (thumbv8m.main): the application
+    # core's SERIALn blocks, SPIM4, WDT0 and the USB regulator's VBUS vector.
+    @{ n = "nRF52 family + nRF5340 x12";   t = "emit_nrf_family_projects";   e = @{};                       q = $true; fam = "nrf";
+       only = @("eide_nrf52840_dk_async_check", "eide_nrf52810_check", "eide_nrf52820_check", "eide_nrf5340_dk_async_check") }
 
     # The same two boards on embassy-rp, which is a DIFFERENT HAL crate, not a
     # feature of the first one. Every bus is wired, because that is where the

@@ -82,8 +82,9 @@ pub(crate) struct NrfChip {
     pub qspi: bool,
 }
 
-/// Every nRF52 part both HALs know, smallest first.
-pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
+/// Every nRF52 part both HALs know, smallest first, then the nRF5340's
+/// application core.
+pub(crate) const NRF52_CHIPS: [NrfChip; 8] = [
     NrfChip {
         family: "nrf52805",
         part: "nRF52805",
@@ -203,6 +204,28 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 7] = [
         usbd: true,
         qspi: true,
     },
+    // The APPLICATION core of the nRF5340, secure (`nrf5340-app-s`): a
+    // Cortex-M33 at up to 128 MHz. UARTE/SPIM/TWIM n share SERIALn, SPIM4 is
+    // its own 32 MHz block, and the network core is not this definition's.
+    // nrf-hal's `nrf5340-app-hal` exists but shares none of the nRF52 calls
+    // this backend emits, so Blocking is embassy-nrf, as on the 52820.
+    NrfChip {
+        family: "nrf5340",
+        part: "nRF5340",
+        nrf_hal: None,
+        fpu: true,
+        flash_kb: 1024,
+        ram_kb: 512,
+        nfc: true,
+        p1: true,
+        uarte: &[0, 1, 2, 3],
+        spim: &[0, 1, 2, 3, 4],
+        twim: &[0, 1, 2, 3],
+        pwm: &[0, 1, 2, 3],
+        ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+        usbd: true,
+        qspi: true,
+    },
 ];
 
 /// The part `family` names, or `None` for anything that is not an nRF52.
@@ -211,9 +234,68 @@ pub(crate) fn chip(family: &str) -> Option<&'static NrfChip> {
 }
 
 impl NrfChip {
-    /// The Rust target: Cortex-M4F is hard-float, the M4 without an FPU is not.
+    /// The nRF5340's application core, where the nRF52 answers stop holding.
+    pub fn nrf53(&self) -> bool {
+        self.family == "nrf5340"
+    }
+
+    /// embassy-nrf's feature for the part: the family key on an nRF52, the
+    /// SECURE application core on the nRF5340 - bare metal, no TF-M.
+    pub fn embassy_feature(&self) -> &'static str {
+        if self.nrf53() { "nrf5340-app-s" } else { self.family }
+    }
+
+    /// The watchdog's `Peripherals` field: the nRF5340 has two, and the
+    /// application core's own is WDT0.
+    pub fn wdt(&self) -> &'static str {
+        if self.nrf53() { "WDT0" } else { "WDT" }
+    }
+
+    /// The two NFC antenna pins.
+    pub fn nfc_pins(&self) -> [(u8, u8); 2] {
+        if self.nrf53() {
+            [(0, 2), (0, 3)]
+        } else {
+            [(0, 9), (0, 10)]
+        }
+    }
+
+    /// The SAADC input a pin is, or `None`. The nRF52 parts put AIN0..7 on
+    /// P0.02..05 and P0.28..31; the nRF5340 on P0.04..07 and P0.25..28.
+    /// Read by the kits' generator, which is an authoring tool (tests only).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ain_of(&self, (port, pin): (u8, u8)) -> Option<u8> {
+        if port != 0 {
+            return None;
+        }
+        let ch = if self.nrf53() {
+            match pin {
+                4..=7 => pin - 4,
+                25..=28 => pin - 21,
+                _ => return None,
+            }
+        } else {
+            match pin {
+                2..=5 => pin - 2,
+                28..=31 => pin - 24,
+                _ => return None,
+            }
+        };
+        self.ain.contains(&ch).then_some(ch)
+    }
+
+    /// The vector USB's VBUS detection binds: the power block on an nRF52,
+    /// the USB regulator on the nRF5340.
+    pub fn vbus_irq(&self) -> &'static str {
+        if self.nrf53() { "USBREGULATOR" } else { "CLOCK_POWER" }
+    }
+
+    /// The Rust target: Cortex-M4F is hard-float, the M4 without an FPU is
+    /// not, and the nRF5340's Cortex-M33 is Armv8-M Mainline.
     pub fn target(&self) -> &'static str {
-        if self.fpu {
+        if self.nrf53() {
+            "thumbv8m.main-none-eabihf"
+        } else if self.fpu {
             "thumbv7em-none-eabihf"
         } else {
             "thumbv7em-none-eabi"
@@ -221,7 +303,9 @@ impl NrfChip {
     }
 
     pub fn cpu(&self) -> &'static str {
-        if self.fpu {
+        if self.nrf53() {
+            "ARM Cortex-M33"
+        } else if self.fpu {
             "ARM Cortex-M4F"
         } else {
             "ARM Cortex-M4"
@@ -242,7 +326,10 @@ impl NrfChip {
             Some(krate) => format!(
                 "{krate} = {{ version = \"0.19\", default-features = false, features = [\"rt\"] }}"
             ),
-            None => format!("embassy-nrf = {{ version = \"0.11\", features = [\"{}\"] }}", self.family),
+            None => format!(
+                "embassy-nrf = {{ version = \"0.11\", features = [\"{}\"] }}",
+                self.embassy_feature()
+            ),
         }
     }
 
@@ -256,7 +343,7 @@ impl NrfChip {
         };
         format!(
             "embassy-nrf = {{ version = \"0.11\", features = [\"{}\", \"time-driver-rtc1\", \"gpiote\"{nfc}] }}",
-            self.family
+            self.embassy_feature()
         )
     }
 
@@ -290,7 +377,8 @@ fn hal_crate(family: &str) -> Option<String> {
 }
 
 /// Whether the Blocking runtime on `family` is embassy-nrf used without an
-/// executor, because nrf-hal has no crate for the part.
+/// executor: the nRF52820, which nrf-hal has no crate for, and the nRF5340,
+/// whose nrf-hal crate shares none of the calls this backend emits.
 pub fn blocking_on_embassy(family: &str) -> bool {
     chip(family).is_some_and(|c| c.nrf_hal.is_none())
 }
@@ -332,11 +420,6 @@ fn board_name(name: &str) -> Option<&str> {
 /// it is a pad they are about to use. Same words the F1 and RP backends use.
 const ALLOW: &str = "    #[allow(unused_mut, unused_variables)]
 ";
-
-/// The two NFC antenna pins. On the nRF52833 they are NFC until the UICR's
-/// `NFCPINS` register is cleared, and the UICR is flash: nothing this code
-/// emits at run time can change it.
-const NFC_PINS: [(u8, u8); 2] = [(0, 9), (0, 10)];
 
 // ── Clock tab ───────────────────────────────────────────────────────────────
 
@@ -494,13 +577,16 @@ fn nfc_note(mcu: &Mcu) -> String {
 /// The NFC pads anything is wired to, as `P0.09` labels. None on a part
 /// without NFCT, where P0.09/P0.10 are ordinary GPIO from reset.
 fn nfc_pads_used(mcu: &Mcu) -> Vec<String> {
-    if !chip(&mcu.family).is_some_and(|c| c.nfc) {
+    // The two antenna pins - P0.09/P0.10 on an nRF52, P0.02/P0.03 on the
+    // nRF5340 - are NFC until the UICR's `NFCPINS` register is cleared, and
+    // the UICR is flash: nothing this code emits at run time can change it.
+    let Some(nfc) = chip(&mcu.family).filter(|c| c.nfc).map(|c| c.nfc_pins()) else {
         return Vec::new();
-    }
+    };
     mcu.iter_all_pins()
         .filter(|p| !p.reserved && p.selected_function != PinFunction::Unset)
         .filter_map(|p| nrf_pin(&p.name))
-        .filter(|pp| NFC_PINS.contains(pp))
+        .filter(|pp| nfc.contains(pp))
         .map(label)
         .collect()
 }
@@ -996,7 +1082,7 @@ fn section(mcu: &Mcu) -> String {
     o.push_str(&clock_lines(mcu, &hal));
     // After the clocks, so the LFCLK source the Clock tab picked is the one the
     // WDT will count. Configured only - nothing bites until `activate`.
-    o.push_str(&super::watchdog_gen::nrf_init_lines(&mcu.watchdog, false));
+    o.push_str(&super::watchdog_gen::nrf_init_lines(&mcu.watchdog, false, "WDT"));
     // Port 1 only where the definition names a P1 pin: the nRF52832, 52810 and
     // 52811 have P0 alone, and their HALs have no `p1` module to take.
     let has_p1 = mcu
@@ -1579,6 +1665,9 @@ fn periph((port, pin): (u8, u8)) -> String {
 fn serial_block(family: &str, kind: &str, n: u8) -> (String, String) {
     let same = |s: &str| (s.to_owned(), s.to_owned());
     match (family, kind, n) {
+        // UARTE, SPIM and TWIM n are all SERIALn; SPIM4 shares nothing.
+        ("nrf5340", "spim", 4) => same("SPIM4"),
+        ("nrf5340", _, _) => same(&format!("SERIAL{n}")),
         (_, "uarte", _) => same(&format!("UARTE{n}")),
         ("nrf52805" | "nrf52810" | "nrf52811", "spim", 0) => same("SPI0"),
         ("nrf52805" | "nrf52810", "twim", 0) => same("TWI0"),
@@ -2181,7 +2270,12 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         irqs.push(
             "    USBD => embassy_nrf::usb::InterruptHandler<embassy_nrf::peripherals::USBD>;".to_owned(),
         );
-        irqs.push("    CLOCK_POWER => embassy_nrf::usb::vbus_detect::InterruptHandler;".to_owned());
+        // VBUS detection sits on the power block's vector on an nRF52 and on
+        // the USB regulator's on the nRF5340.
+        let vbus = chip(&mcu.family).map_or("CLOCK_POWER", |c| c.vbus_irq());
+        irqs.push(format!(
+            "    {vbus} => embassy_nrf::usb::vbus_detect::InterruptHandler;"
+        ));
         static_cell = true;
         spawns = true;
     }
@@ -2354,12 +2448,16 @@ fn async_section(mcu: &Mcu) -> String {
         // through its `blocking_*` methods.
         o.push_str("#[cortex_m_rt::entry]\n");
         o.push_str("fn main() -> ! {\n");
-        o.push_str("    // embassy-nrf without an executor: nrf-hal has no crate for this part, so\n    // Blocking calls the drivers' `blocking_*` methods (`blocking_write`, ...).\n");
+        o.push_str("    // embassy-nrf without an executor: nrf-hal is not used for this part, so\n    // Blocking calls the drivers' `blocking_*` methods (`blocking_write`, ...).\n");
     }
     o.push_str("    #[allow(unused_imports)]\n    use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};\n\n");
     o.push_str(&async_clock_lines(mcu));
     // Only the peripheral: starting it is configuring it on this HAL.
-    o.push_str(&super::watchdog_gen::nrf_init_lines(&mcu.watchdog, true));
+    o.push_str(&super::watchdog_gen::nrf_init_lines(
+        &mcu.watchdog,
+        true,
+        chip(&mcu.family).map_or("WDT", |c| c.wdt()),
+    ));
     o.push_str(&async_nfc_note(mcu));
     o.push_str(&gpio);
     if !gpio.is_empty() && !buses.body.is_empty() {
@@ -2427,10 +2525,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nrf52_parts_are_nrf_and_nothing_else_is() {
+    fn nrf_parts_are_nrf_and_nothing_else_is() {
         assert!(is_nrf("nrf52833"));
         assert!(is_nrf("nrf52840"));
-        for other in ["nrf51", "nrf5340", "rp2040", "stm32f4", "esp32c3", ""] {
+        assert!(is_nrf("nrf5340"));
+        for other in ["nrf51", "nrf5340-net", "nrf54l15", "rp2040", "stm32f4", "esp32c3", ""] {
             assert!(!is_nrf(other), "{other:?} matched");
         }
     }

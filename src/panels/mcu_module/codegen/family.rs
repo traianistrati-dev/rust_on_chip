@@ -1279,7 +1279,7 @@ pub fn blocking_hal_note(family: &str) -> &'static str {
     } else if family.starts_with("esp") {
         "esp-hal  ·  blocking drivers"
     } else if super::nrf::blocking_on_embassy(family) {
-        "embassy-nrf used SYNCHRONOUSLY — nrf-hal has no crate for this part; \
+        "embassy-nrf used SYNCHRONOUSLY — nrf-hal is not used for this part; \
          no executor, no .await"
     } else if family == "nrf52833" {
         "nrf52833-hal  ·  blocking drivers (embedded-hal 1.0)"
@@ -1907,14 +1907,15 @@ mod tests {
     fn unknown_family_is_none() {
         assert!(backend_for("stm8").is_none());
         assert!(backend_for("").is_none());
-        // Not an nRF52: those resolve through `is_nrf`'s prefix now.
+        // Not a part the nRF table has a row for. The nRF5340's application
+        // core has one now; the nRF51 and the 5340's network core do not.
         assert!(backend_for("nrf51").is_none());
-        assert!(backend_for("nrf5340").is_none());
+        assert!(backend_for("nrf5340-net").is_none());
     }
 
     #[test]
     fn the_nrf52_parts_resolve_to_the_nrf_backend() {
-        for fam in ["nrf52833", "nrf52840"] {
+        for fam in ["nrf52833", "nrf52840", "nrf5340"] {
             assert_eq!(backend_for(fam).unwrap().family_id(), "nrf52833", "{fam}");
         }
     }

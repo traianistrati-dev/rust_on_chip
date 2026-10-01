@@ -12,10 +12,10 @@ safe across regenerations.
 
 ![A tour of RustOnChip](docs/rust_on_chip_tour.gif)
 
-> Status: early development (`v0.2.4`). **Eighteen chips ship built in** — one
+> Status: early development (`v0.2.4`). **Nineteen chips ship built in** — one
 > STM32, nine ESP32, five RP2040/RP2350 boards (the four Raspberry Pi Picos and
-> tinyVision's pico2-ice), the BBC micro:bit v2 and Nordic's nRF52840 DK and
-> nRF52 DK —
+> tinyVision's pico2-ice), the BBC micro:bit v2 and Nordic's nRF52840 DK, nRF52 DK and
+> nRF5340 DK —
 > and the rest of the STM32 catalogue is reachable by importing a part from ST's
 > own database. A new chip inside a supported family is plain data, no rebuild.
 > Renamed from `embedded_ide` on 2026-09-20. The old URL still redirects — update your
@@ -212,6 +212,14 @@ channel to allocate on either runtime: EasyDMA is built into each peripheral.
 |-------|------|------|-----------|--------|
 | **nRF52840 DK** (PCA10056) | nRF52840 | Cortex-M4F | 64 MHz | `thumbv7em-none-eabihf` |
 | **nRF52 DK** (PCA10040) | nRF52832 | Cortex-M4F | 64 MHz | `thumbv7em-none-eabihf` |
+| **nRF5340 DK** (PCA10095), application core | nRF5340 | Cortex-M33 | 128 MHz | `thumbv8m.main-none-eabihf` |
+
+The nRF5340 is the application core alone, secure and bare metal
+(`nrf5340-app-s`, no TF-M); the network core is not generated. UARTE, SPIM and
+TWIM *n* share one `SERIALn` block, so the header's I2C offers TWIM1/2 and
+leaves SERIAL0 to the VCOM UART; SPI is on SPIM4, the 32 MHz block that shares
+nothing. Both runtimes run on `embassy-nrf` (Blocking without an executor), so
+Blocking builds no USB there.
 
 Laid out the way the kits are used: the Arduino header's analog side on the
 left, its digital side on the right, and the LEDs, buttons, the J-Link's VCOM
@@ -371,7 +379,7 @@ zooms and pans like the Pins one.
 | **Blocking** | everywhere | Plain synchronous HAL calls. On every STM32 but F1 this is still `embassy-stm32` used as a sync HAL. |
 | **Native** | STM32F1 | `stm32f1xx-hal`'s own driver traits instead of the portable `embedded-io` / `embedded-hal` seam. |
 | **RTIC** | STM32F1 | `#[rtic::app]`, with each armed input becoming a `#[task(binds = EXTIn)]`. |
-| **Async** | every STM32, all ESP32, all Pico, every nRF52 | `embassy-executor` tasks; on ESP via `esp-rtos`, on RP via `embassy-rp`, on the nRF52 via `embassy-nrf`. On the F1 it swaps `stm32f1xx-hal` for `embassy-stm32`; USB and CAN are not generated there yet, and embassy-time takes one timer (TIM4 on an F103C8). |
+| **Async** | every STM32, all ESP32, all Pico, every nRF52 and the nRF5340 | `embassy-executor` tasks; on ESP via `esp-rtos`, on RP via `embassy-rp`, on the nRF via `embassy-nrf`. On the F1 it swaps `stm32f1xx-hal` for `embassy-stm32`; USB and CAN are not generated there yet, and embassy-time takes one timer (TIM4 on an F103C8). |
 
 Where a runtime is greyed out, the tab **says why** rather than just refusing.
 
@@ -590,6 +598,7 @@ The bottom panel carries twelve tabs.
     that auto-starts after a flash.
   - **Pico** — UF2 or probe-rs.
   - **micro:bit** — probe-rs, through the on-board DAPLink (CMSIS-DAP).
+  - **nRF DKs** — probe-rs, through the on-board J-Link.
   - One shared **probe selector** across Flash, RTT, Debug and Profile.
 - **RTT / defmt** — live logs streamed through the debug probe.
 - **Debug** — an on-target debugger over `probe-rs dap-server`: gutter
@@ -653,7 +662,9 @@ flash) builds `--release` and parses the ELF itself into Flash/RAM bars against
   - ESP32 RISC-V: `riscv32imc-unknown-none-elf` · `riscv32imac-unknown-none-elf`
   - ESP32 Xtensa: the `esp` toolchain from [espup](https://github.com/esp-rs/espup)
   - Pico: `thumbv6m-none-eabi` · Pico 2 / pico2-ice: `thumbv8m.main-none-eabihf`
-  - micro:bit v2: `thumbv7em-none-eabihf`
+  - micro:bit v2, nRF52832 / 52833 / 52840: `thumbv7em-none-eabihf`
+  - nRF52805 / 52810 / 52811 / 52820: `thumbv7em-none-eabi`
+  - nRF5340: `thumbv8m.main-none-eabihf`
 - Flashing tools as needed: [`probe-rs`](https://probe.rs/),
   [OpenOCD](https://openocd.org/),
   [`espflash`](https://github.com/esp-rs/espflash), `dfu-util`. The **Required

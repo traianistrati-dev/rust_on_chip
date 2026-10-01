@@ -245,6 +245,8 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("OSPI_DEVICE", OSPI_DEVICE),
     ("QSPI_WIRING", QSPI_WIRING),
     ("QSPI_WIRING_INCOMPLETE", QSPI_WIRING_INCOMPLETE),
+    ("QSPI_WIRING_NRF", QSPI_WIRING_NRF),
+    ("QSPI_WIRING_INCOMPLETE_NRF", QSPI_WIRING_INCOMPLETE_NRF),
     ("QSPI_FLASH_SIZE", QSPI_FLASH_SIZE),
     ("QSPI_ADDRESS", QSPI_ADDRESS),
     ("QSPI_ADDRESS_NRF", QSPI_ADDRESS_NRF),
@@ -1018,6 +1020,15 @@ pub const QSPI_WIRING_INCOMPLETE: &str = "Read-only, and nothing will be generat
                                           The controller needs CLK plus at least one whole bank \
                                           - that bank's NCS and all four of its IO lines. Three \
                                           lines wired is not a narrower bus, it is no bus.";
+
+pub const QSPI_WIRING_NRF: &str = "Read-only: the bus is complete. The nRF52840's QSPI drives one \
+                                   flash chip, four data lines wide, and its driver takes SCK, CSN \
+                                   and IO0 to IO3 together.";
+
+pub const QSPI_WIRING_INCOMPLETE_NRF: &str = "Read-only, and nothing will be generated as it \
+                                              stands. The nRF52840's QSPI driver is quad only: it \
+                                              takes SCK, CSN and all four IO lines in one call, so \
+                                              a missing lane is not a narrower bus, it is no bus.";
 
 pub const QSPI_FLASH_SIZE: &str = "The capacity of the flash chip on the board. The controller \
                                    needs it to know where its memory-mapped window ends: set it \

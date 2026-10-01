@@ -390,6 +390,9 @@ pub fn show_diagnostics_overlay(
     // pill the usages overlay painted earlier in this same frame. The inline
     // message steps around them; see [`inline_message_x`].
     pill_edges: &[(u32, f32)],
+    // A 1-based line whose inline message is left out: the call-signature
+    // ghost is drawn there instead (see `editor_panel::signature_hint`).
+    quiet_line: Option<u32>,
 ) -> Option<egui::Rect> {
     let total_chars = line_index.total_chars();
     // Every position below is `galley.pos_from_cursor`, looked up by binary
@@ -438,7 +441,7 @@ pub fn show_diagnostics_overlay(
 
     // Lines that already drew an inline message — a line can carry several
     // diagnostics, but a second message would overlap the first, so show one.
-    let mut msg_lines: Vec<u32> = Vec::new();
+    let mut msg_lines: Vec<u32> = quiet_line.into_iter().collect();
     // `(index into diags, hover rect)` of every visible diagnostic, grouped into
     // tooltips after the drawing pass.
     let mut hover_spans: Vec<(usize, egui::Rect)> = Vec::new();
@@ -581,12 +584,21 @@ pub fn show_diagnostics_overlay(
             }
         }
 
+        // The call-signature ghost owns `quiet_line` past its end. A span that
+        // runs on to a later line reaches the galley's full width there, over
+        // the ghost, and the two tooltips would compete: stop it at the end
+        // of the line. Squiggle and tint are untouched.
+        let hover_ex = if !same_line && quiet_line == Some(diag.line) {
+            ex.min(gp.x + loc_eol.min.x + 8.0).max(sx + 1.0)
+        } else {
+            ex
+        };
         // The hover region is collected, not interacted with here: several
         // diagnostics on one span each opened their OWN tooltip at the same
         // spot, drawn on top of each other. See the grouping pass below.
         hover_spans.push((
             di,
-            egui::Rect::from_min_max(egui::pos2(sx, sy_top), egui::pos2(ex, sy_bot + 3.0)),
+            egui::Rect::from_min_max(egui::pos2(sx, sy_top), egui::pos2(hover_ex, sy_bot + 3.0)),
         ));
     }
 

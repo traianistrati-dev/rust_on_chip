@@ -93,6 +93,10 @@ impl AppIde {
         // keyboard; the direction arrives here because this is where the error
         // rows and the caret both already exist.
         err_step: Option<bool>,
+        // Buffer → galley positions. While folded the galley is the
+        // projection, so a buffer index has to be translated before it is
+        // looked up in it — and one inside a folded block draws nothing.
+        fold_map: &super::fold::FoldMap,
     ) {
         // ── LSP completion: post-editor apply + trigger + popup ───────
         let cursor_char_idx = editor_resp
@@ -841,6 +845,35 @@ impl AppIde {
             );
         }
 
+        // ── Call-signature ghost: decided BEFORE the overlay ──────────
+        // The ghost takes the end of the line holding the call's `(`, which is
+        // where that line's inline message would go — "arguments to this
+        // function are incorrect", or the count error itself. Two texts at one
+        // spot overprint, and the ghost says more (the count included), so
+        // the overlay is told to leave that line's message out; the full
+        // message stays in the hover tooltip and the error list.
+        let sig_ghost = self.update_signature_hint(
+            &line_index,
+            cursor_char_idx,
+            current_rel_path.as_deref(),
+            lsp_file_tracked,
+            slot,
+        );
+        // Where it goes in the galley — nowhere when its line is inside a
+        // folded block, or heads one: the "… N lines" badge sits at that
+        // line's end, and the ghost would paint over it and its click.
+        let sig_eol = sig_ghost.as_ref().and_then(|g| {
+            let eol = fold_map.to_display(g.eol_idx)?;
+            let heads_a_fold = g.eol_idx < line_index.total_chars()
+                && fold_map.to_display(g.eol_idx + 1).is_none();
+            (!heads_a_fold).then_some(eol)
+        });
+        // Only a ghost that is drawn takes the line's message.
+        let quiet_line = sig_ghost
+            .as_ref()
+            .filter(|_| sig_eol.is_some())
+            .map(|g| g.line);
+
         // ── Diagnostic overlays ───────────────────────────────────────
         // Both editors. Everything here is driven by `current_rel_path` and
         // bounded by `editor_clip`, and the two highlight bands arrive as
@@ -946,6 +979,7 @@ impl AppIde {
                 highlight,
                 def_line,
                 pill_edges,
+                quiet_line,
             );
             // Remembered for the focus hand-back in `show_code_view`, which
             // runs before this in BOTH views — see `click_in_tooltip`.
@@ -1048,9 +1082,14 @@ impl AppIde {
             current_rel_path.as_deref(),
             slot,
         );
+        // Whether the hint is on screen: Tab accepts only a hint the user can
+        // see (`mod.rs`), and the signature ghost can take its line.
+        self.ed.inlay_hint_drawn = false;
         if let (Some(line), Some(hint)) = (inlay_line, self.ed.inlay_hint.as_ref()) {
-            // Only draw a hint that still belongs to the caret's current line.
-            if hint.line == line {
+            // Only draw a hint that still belongs to the caret's current line,
+            // and not on the line the call-signature ghost has taken: both go
+            // to the end of the line, and the signature is what is wrong there.
+            if hint.line == line && quiet_line != Some(hint.line + 1) {
                 let eol_idx = line_index.line_end_char_idx(hint.line + 1);
                 show_inlay_hint(
                     ui,
@@ -1061,7 +1100,30 @@ impl AppIde {
                     &hint.label,
                     self.editor_font_size,
                 );
+                self.ed.inlay_hint_drawn = true;
             }
+        }
+
+        // ── Call-signature ghost ───────────────────────────────────────
+        // Gated, like the type hint, by the "Types" toolbar button — not by
+        // the inline-errors one: it answers "what does this call want?",
+        // which is worth seeing whether or not the squiggles are.
+        if let (Some(ghost), Some(eol)) = (&sig_ghost, sig_eol) {
+            let pill_right = pill_edges
+                .iter()
+                .find(|(l, _)| *l == ghost.line)
+                .map(|(_, r)| *r);
+            super::signature_hint::draw_signature_ghost(
+                ui,
+                editor_resp.galley_pos,
+                editor_clip,
+                &editor_resp.galley,
+                eol,
+                pill_right,
+                self.editor_font_size,
+                ghost,
+                egui::Id::new(("sig_hint", current_rel_path.as_deref(), slot)),
+            );
         }
     }
 

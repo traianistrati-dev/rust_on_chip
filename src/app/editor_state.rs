@@ -256,9 +256,20 @@ pub(crate) struct EditorState {
     /// at frame TOP next `init_frame` (like code actions, to dodge the revert).
     pub(crate) inlay_accept_pending: bool,
 
+    /// Whether the hint was DRAWN last frame. Tab accepts only a hint the user
+    /// can see: the call-signature ghost can take its line and hide it.
+    pub(crate) inlay_hint_drawn: bool,
+
     /// The last scan for the caret's untyped `let`, reused while the text and
     /// caret are unchanged: see `inlay_hint::InlayScan`.
     pub(crate) inlay_scan: Option<editor_panel::inlay_hint::InlayScan>,
+
+    /// The last scan for the calls around the caret, reused while the text
+    /// and caret are unchanged: see `signature_hint::SigScan`.
+    pub(crate) sig_scan: Option<editor_panel::signature_hint::SigScan>,
+    /// The call-signature ghost hint: its request, its answer, and what was
+    /// last shown (see `signature_hint::SigState`).
+    pub(crate) sig: editor_panel::signature_hint::SigState,
 
     /// Request keyboard focus for the rename input on the frame it opens.
     pub(crate) rename_focus: bool,
@@ -347,7 +358,10 @@ impl EditorState {
             inlay_requested: None,
             inlay_asked_at: (0, false),
             inlay_accept_pending: false,
+            inlay_hint_drawn: false,
             inlay_scan: None,
+            sig_scan: None,
+            sig: Default::default(),
             rename_focus: false,
             find: editor_panel::find_replace::FindReplace::default(),
             full_block_selection: None,

@@ -1160,7 +1160,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 9,
-                name: "P1.09 ()",
+                name: "P1.09",
                 reserved: false,
                 functions: [
                     GpioInput,

@@ -1187,6 +1187,7 @@ mod tests {
                 "nrf52833_microbit_v2",
                 "nrf52840_dk",
                 "nrf5340_dk",
+                "nrf54l15_dk",
                 "rp2040_pico_w",
                 "rp2350_pico2_ice",
                 "rp2350_pico2_w",

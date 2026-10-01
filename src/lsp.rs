@@ -212,6 +212,36 @@ pub struct InlayHint {
     pub text_edits: Vec<RenameEdit>,
 }
 
+/// One `textDocument/signatureHelp` answer: the signature of the call the
+/// asked position sits in. Drawn as ghost text when that call's arguments are
+/// wrong (`editor_panel::signature_hint`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureHelp {
+    /// rust-analyzer's whole label, e.g. `fn write_text<D: …>(display: &mut …,
+    /// text: &str, x: i32, y: i32) -> Result<…>`. The INFERRED types are
+    /// substituted in, so it can run to hundreds of characters.
+    pub label: String,
+    /// Each parameter's `[start, end)` in `label`, in CHARS. rust-analyzer
+    /// sends UTF-16 offsets (`labelOffsetSupport`); they are converted on
+    /// arrival, so slicing can never land inside a character.
+    pub params: Vec<(usize, usize)>,
+    /// The parameter the asked position falls in. It can be past the last
+    /// one: rust-analyzer answers 4 for the fifth argument of a
+    /// four-parameter fn.
+    pub active: Option<u32>,
+    /// The callee's documentation as sent (usually markdown).
+    pub doc: Option<String>,
+}
+
+/// What became of one signature request (see [`LspState::take_signature_reply`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignatureReply {
+    /// Answered. `None` is rust-analyzer's "no call here" (`result: null`).
+    Help(Option<SignatureHelp>),
+    /// Cancelled because a document changed under it — worth asking again.
+    Cancelled,
+}
+
 /// A `textDocument/definition` target: the file + 0-based position RA points to.
 #[derive(Clone, Debug)]
 pub struct DefinitionLoc {
@@ -486,6 +516,29 @@ pub struct LspState {
     pub inlay_response_received: bool,
     /// The (type-only) inlay hints from the last request (cursor-line scope).
     pub inlay_result: Vec<InlayHint>,
+    /// In-flight `textDocument/signatureHelp` requests: request id → the
+    /// asker's own token. Keyed rather than one slot: both editor views can
+    /// ask in the same frame, and a single slot let the second request drop
+    /// the first one's reply (the inlay hint's `inlay_req_id` still can).
+    signature_pending: HashMap<u64, u64>,
+    /// Arrived signature replies by token, oldest first, capped at
+    /// [`SIGNATURE_REPLIES_KEPT`]: a reply whose asker moved on is never taken.
+    signature_replies: Vec<(u64, SignatureReply)>,
+    /// In-flight `textDocument/diagnostic` pulls: request id → (file, the
+    /// [`PullStamp`] it was asked at).
+    diag_pull_pending: HashMap<u64, (String, PullStamp)>,
+    /// The stamp and refresh generation each file was last pulled at, so a
+    /// pull goes out once per stamp. Dropped on a transient error so it is
+    /// asked again, and outdated by a `workspace/diagnostic/refresh`.
+    diag_pull_asked: HashMap<String, (PullStamp, u64)>,
+    /// rust-analyzer's OWN diagnostics per file, pulled, with the stamp they
+    /// were computed at. It never pushes these — measured, every pushed
+    /// diagnostic is cargo check's, after a Save — so a pull is the only way to
+    /// see a type error while typing.
+    pulled_diagnostics: HashMap<String, (PullStamp, Vec<LspDiagnostic>)>,
+    /// Bumped by `workspace/diagnostic/refresh`: rust-analyzer's own answer has
+    /// changed (the workspace finished loading, say), so every pull is outdated.
+    diag_refresh_gen: u64,
     /// In-flight `textDocument/references` requests: request id → the caller's
     /// own index for that symbol (its position in the app's item list) — lets
     /// many reference lookups run concurrently for one file (one per symbol),
@@ -588,6 +641,12 @@ impl Default for LspState {
             inlay_for_line: 0,
             inlay_response_received: false,
             inlay_result: Vec::new(),
+            signature_pending: HashMap::new(),
+            signature_replies: Vec::new(),
+            diag_pull_pending: HashMap::new(),
+            diag_pull_asked: HashMap::new(),
+            pulled_diagnostics: HashMap::new(),
+            diag_refresh_gen: 0,
             references_pending: HashMap::new(),
             references_results: HashMap::new(),
             calls_refs_pending: HashMap::new(),
@@ -603,6 +662,16 @@ impl Default for LspState {
 
 /// Cap on `LspState::load_log` — a startup trace, not a full server log.
 const LOAD_LOG_CAP: usize = 250;
+
+/// Signature replies kept for their askers. One per editor view is all that
+/// is ever waited on; the rest is slack for replies nobody takes.
+const SIGNATURE_REPLIES_KEPT: usize = 8;
+
+/// What one file's pulled diagnostics were computed against: its own document
+/// version, and `edit_gen` — the OTHER files' edits too, since a call into
+/// another file is checked against that file's text. Editing a callee's
+/// parameter in one view outdates the caller's pull in the other.
+type PullStamp = (u64, u64);
 
 /// How long after the `initialize` handshake a server that has sent no
 /// `experimental/serverStatus` is taken to be loaded (see
@@ -850,6 +919,9 @@ impl LspState {
                 last_sent_code: text.to_owned(),
             },
         );
+        // A re-open restarts the version at 1, where a pull of the old
+        // document may already sit.
+        self.forget_pull(rel_path);
         let uri = format!("{}/{}", self.root_uri, rel_path);
         self.send_raw(
             serde_json::json!({
@@ -875,6 +947,7 @@ impl LspState {
         if self.open_files.remove(rel_path).is_none() || self.sender.is_none() {
             return;
         }
+        self.forget_pull(rel_path);
         let uri = format!("{}/{}", self.root_uri, rel_path);
         self.send_raw(
             serde_json::json!({
@@ -1546,6 +1619,142 @@ impl LspState {
         }
     }
 
+    /// The document version rust-analyzer holds for `rel_path`, if it is open.
+    pub fn doc_version(&self, rel_path: &str) -> Option<u64> {
+        self.open_files.get(rel_path).map(|f| f.doc_version)
+    }
+
+    /// Bumped on every real `didChange`, of any file.
+    pub fn edit_gen(&self) -> u64 {
+        self.edit_gen
+    }
+
+    /// Bumped by every `workspace/diagnostic/refresh` — one per cargo check.
+    pub fn diag_refresh_gen(&self) -> u64 {
+        self.diag_refresh_gen
+    }
+
+    /// Drop every pull of `rel_path`: its document is gone or new.
+    fn forget_pull(&mut self, rel_path: &str) {
+        self.diag_pull_asked.remove(rel_path);
+        self.pulled_diagnostics.remove(rel_path);
+        self.diag_pull_pending.retain(|_, (r, _)| r != rel_path);
+    }
+
+    /// Ask for the signature of the call at 0-based `(line, character)` of
+    /// `rel_path`. The position must be INSIDE the call's parentheses: on the
+    /// callee's name, or after the `)`, rust-analyzer answers `null`. `token`
+    /// is the asker's own key; collect the reply with
+    /// [`take_signature_reply`](Self::take_signature_reply). Returns whether a
+    /// request went out.
+    pub fn request_signature_help(
+        &mut self,
+        rel_path: &str,
+        line: u32,
+        character: u32,
+        token: u64,
+    ) -> bool {
+        if self.sender.is_none() {
+            return false;
+        }
+        self.next_req_id += 1;
+        let id = self.next_req_id;
+        self.signature_pending.insert(id, token);
+        let uri = format!("{}/{}", self.root_uri, rel_path);
+        self.send_raw(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id":      id,
+                "method":  "textDocument/signatureHelp",
+                "params": {
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }
+            })
+            .to_string(),
+        );
+        true
+    }
+
+    /// The reply to the signature request asked with `token`, once it has
+    /// arrived. Taken once.
+    pub fn take_signature_reply(&mut self, token: u64) -> Option<SignatureReply> {
+        let at = self
+            .signature_replies
+            .iter()
+            .position(|(t, _)| *t == token)?;
+        Some(self.signature_replies.remove(at).1)
+    }
+
+    /// Whether the signature request asked with `token` is still unanswered.
+    pub fn signature_in_flight(&self, token: u64) -> bool {
+        self.signature_pending.values().any(|t| *t == token)
+    }
+
+    /// File a signature reply under its asker's token. `false` when `req_id`
+    /// is not a signature request of ours.
+    fn record_signature_reply(&mut self, req_id: u64, reply: SignatureReply) -> bool {
+        let Some(token) = self.signature_pending.remove(&req_id) else {
+            return false;
+        };
+        self.signature_replies.retain(|(t, _)| *t != token);
+        self.signature_replies.push((token, reply));
+        if self.signature_replies.len() > SIGNATURE_REPLIES_KEPT {
+            self.signature_replies.remove(0);
+        }
+        true
+    }
+
+    /// Pull rust-analyzer's own diagnostics for `rel_path`
+    /// (`textDocument/diagnostic`), once per [`PullStamp`] — and again after a
+    /// `workspace/diagnostic/refresh`. Returns whether a request went out.
+    ///
+    /// Sends no `didChange`: it asks about the text rust-analyzer already holds,
+    /// so it cancels nothing.
+    pub fn request_document_diagnostics(&mut self, rel_path: &str) -> bool {
+        if self.sender.is_none() {
+            return false;
+        }
+        let Some(version) = self.doc_version(rel_path) else {
+            return false;
+        };
+        let stamp = (version, self.edit_gen);
+        let key = (stamp, self.diag_refresh_gen);
+        if self.diag_pull_asked.get(rel_path) == Some(&key) {
+            return false;
+        }
+        self.diag_pull_asked.insert(rel_path.to_owned(), key);
+        self.next_req_id += 1;
+        let id = self.next_req_id;
+        self.diag_pull_pending
+            .insert(id, (rel_path.to_owned(), stamp));
+        let uri = format!("{}/{}", self.root_uri, rel_path);
+        self.send_raw(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id":      id,
+                "method":  "textDocument/diagnostic",
+                "params": { "textDocument": { "uri": uri } }
+            })
+            .to_string(),
+        );
+        true
+    }
+
+    /// rust-analyzer's own diagnostics for `rel_path`, as pulled for the text
+    /// it holds NOW (this file's and every other's) — `None` until a pull of
+    /// exactly that answered.
+    pub fn pulled_diagnostics(&self, rel_path: &str) -> Option<&[LspDiagnostic]> {
+        let stamp = (self.doc_version(rel_path)?, self.edit_gen);
+        let (s, diags) = self.pulled_diagnostics.get(rel_path)?;
+        (*s == stamp).then_some(diags.as_slice())
+    }
+
+    /// Whether a diagnostics pull for `rel_path` is still unanswered.
+    pub fn diagnostics_pull_in_flight(&self, rel_path: &str) -> bool {
+        self.diag_pull_pending.values().any(|(r, _)| r == rel_path)
+    }
+
     /// Request every usage site of the symbol at `(line, character)` in
     /// `rel_path` (`textDocument/references`, declaration excluded). `local_idx`
     /// is an opaque caller-assigned key (e.g. the symbol's index in the app's own
@@ -1648,6 +1857,8 @@ impl LspState {
             || self.implementation_req_id.is_some()
             || self.symbols_req_id.is_some()
             || self.inlay_req_id.is_some()
+            || !self.signature_pending.is_empty()
+            || !self.diag_pull_pending.is_empty()
             || self.references_busy()
     }
 
@@ -1769,6 +1980,12 @@ impl LspState {
         self.inlay_for_line = 0;
         self.inlay_response_received = false;
         self.inlay_result.clear();
+        self.signature_pending.clear();
+        self.signature_replies.clear();
+        self.diag_pull_pending.clear();
+        self.diag_pull_asked.clear();
+        self.pulled_diagnostics.clear();
+        self.diag_refresh_gen = 0;
         self.code_action_pending.clear();
         self.code_action_response_received = false;
         self.code_actions.clear();
@@ -2506,6 +2723,25 @@ fn handle_incoming(
             ctx.request_repaint();
         }
 
+        // ── Pulled diagnostics outdated (`workspace/diagnostic/refresh`) ──────
+        // A server REQUEST, so it is answered — rust-analyzer would otherwise
+        // keep it pending. It means its own diagnostics changed without a
+        // document changing (the workspace finished loading, say): every pull
+        // is outdated, and the next frame that wants one asks again.
+        "workspace/diagnostic/refresh" => {
+            if let Some(id) = msg.get("id") {
+                let _ = tx.send(
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null }).to_string(),
+                );
+            }
+            let mut s = state.lock().unwrap();
+            if s.generation != my_gen {
+                return;
+            }
+            s.diag_refresh_gen += 1;
+            ctx.request_repaint();
+        }
+
         // ── Window progress ────────────────────────────────────────────────────
         // RA sends $/progress for two kinds of work:
         //   1. Indexing  — token contains "rust" or "index";  "end" → Ready
@@ -2641,6 +2877,18 @@ fn handle_incoming(
                     s.inlay_result = parse_inlay_hints(&msg["result"], &rel);
                     s.inlay_response_received = true;
                     ctx.request_repaint();
+                } else if s.signature_pending.contains_key(&req_id) {
+                    // `null` lands here too: rust-analyzer's "no call here".
+                    let help = parse_signature_help(&msg["result"]);
+                    s.record_signature_reply(req_id, SignatureReply::Help(help));
+                    ctx.request_repaint();
+                } else if let Some((rel, stamp)) = s.diag_pull_pending.remove(&req_id) {
+                    // Kept with the stamp it was asked at: a pull answered
+                    // after another edit describes the old text, and
+                    // `pulled_diagnostics` will not hand it out.
+                    let items = parse_pulled_diagnostics(&msg["result"]);
+                    s.pulled_diagnostics.insert(rel, (stamp, items));
+                    ctx.request_repaint();
                 } else if s.is_code_action_req(req_id) {
                     // Parsed only once the id is known to be ours: every reply
                     // this far down the chain would otherwise be parsed too.
@@ -2734,6 +2982,34 @@ fn handle_incoming(
                 } else if s.inlay_req_id == Some(req_id) {
                     s.inlay_req_id = None;
                     s.inlay_response_received = true; // no hints, stop waiting
+                    ctx.request_repaint();
+                } else if s.signature_pending.contains_key(&req_id) {
+                    // Cancelled by an edit: the asker asks again. Any other
+                    // error is an answer — "no signature" — so a call that
+                    // makes rust-analyzer fail is not re-asked every frame.
+                    let code = msg["error"]["code"].as_i64().unwrap_or(0);
+                    let reply = if is_transient_lsp_error(code) {
+                        SignatureReply::Cancelled
+                    } else {
+                        SignatureReply::Help(None)
+                    };
+                    s.record_signature_reply(req_id, reply);
+                    ctx.request_repaint();
+                } else if let Some((rel, stamp)) = s.diag_pull_pending.remove(&req_id) {
+                    // Cancelled → forget that this stamp was asked, so it is
+                    // asked again. Any other error stays asked — re-pulling a
+                    // file rust-analyzer cannot analyse would repeat per frame
+                    // — and counts as an answer: rust-analyzer has nothing to
+                    // say about this text, so the picture can complete on cargo
+                    // check's own, and an older pull stops standing in for it.
+                    let code = msg["error"]["code"].as_i64().unwrap_or(0);
+                    if is_transient_lsp_error(code) {
+                        if s.diag_pull_asked.get(&rel).map(|k| k.0) == Some(stamp) {
+                            s.diag_pull_asked.remove(&rel);
+                        }
+                    } else {
+                        s.pulled_diagnostics.insert(rel, (stamp, Vec::new()));
+                    }
                     ctx.request_repaint();
                 } else if s.record_code_actions(req_id, Vec::new()) {
                     // An error answers its part with an empty list, so the
@@ -3052,6 +3328,18 @@ fn client_capabilities() -> serde_json::Value {
             // `inlayHint/resolve` round-trip).
             "inlayHint": {
                 "dynamicRegistration": false,
+            },
+            // The callee's signature, drawn as ghost text when a call's
+            // arguments are wrong. `labelOffsetSupport` makes each parameter
+            // an offset pair into the label, which is what lets one parameter
+            // be coloured: by name alone, `x` would match inside `text`.
+            "signatureHelp": {
+                "dynamicRegistration": false,
+                "signatureInformation": {
+                    "documentationFormat": ["plaintext", "markdown"],
+                    "parameterInformation": { "labelOffsetSupport": true },
+                    "activeParameterSupport": true,
+                },
             },
         },
         "window": { "workDoneProgress": true },
@@ -3372,6 +3660,80 @@ fn parse_inlay_hints(result: &serde_json::Value, rel: &str) -> Vec<InlayHint> {
             })
         })
         .collect()
+}
+
+/// Parse a `textDocument/signatureHelp` result into the active signature.
+/// `None` for `null` (no call at the position) or a result without one.
+fn parse_signature_help(result: &serde_json::Value) -> Option<SignatureHelp> {
+    let sigs = result["signatures"].as_array()?;
+    let pick = result["activeSignature"].as_u64().unwrap_or(0) as usize;
+    let sig = sigs.get(pick).or_else(|| sigs.first())?;
+    let label = sig["label"].as_str()?.to_owned();
+    let params = sig["parameters"]
+        .as_array()
+        .map(|ps| {
+            ps.iter()
+                .filter_map(|p| parameter_range(&label, &p["label"]))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The signature's own field wins over the result's (LSP 3.16).
+    let active = sig["activeParameter"]
+        .as_u64()
+        .or_else(|| result["activeParameter"].as_u64())
+        .map(|n| n as u32);
+    let doc = match &sig["documentation"] {
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => other["value"].as_str().map(str::to_owned),
+    }
+    .filter(|d| !d.trim().is_empty());
+    Some(SignatureHelp {
+        label,
+        params,
+        active,
+        doc,
+    })
+}
+
+/// A parameter's `[start, end)` in `label`, in chars. The label is either an
+/// offset pair (UTF-16 units, as `labelOffsetSupport` asks) or, from a server
+/// that ignores that, the parameter's text — found by search.
+fn parameter_range(label: &str, p: &serde_json::Value) -> Option<(usize, usize)> {
+    if let Some(pair) = p.as_array() {
+        let start = utf16_to_char_idx(label, pair.first()?.as_u64()? as usize)?;
+        let end = utf16_to_char_idx(label, pair.get(1)?.as_u64()? as usize)?;
+        return (start <= end).then_some((start, end));
+    }
+    let text = p.as_str()?;
+    let byte = label.find(text)?;
+    let start = label[..byte].chars().count();
+    Some((start, start + text.chars().count()))
+}
+
+/// The char index of UTF-16 offset `units` in `s`; `None` past the end or
+/// between the two halves of a surrogate pair.
+fn utf16_to_char_idx(s: &str, units: usize) -> Option<usize> {
+    let mut seen = 0;
+    for (i, c) in s.chars().enumerate() {
+        if seen == units {
+            return Some(i);
+        }
+        if seen > units {
+            return None;
+        }
+        seen += c.len_utf16();
+    }
+    (seen == units).then(|| s.chars().count())
+}
+
+/// Parse a `textDocument/diagnostic` result: a full report's `items`. An
+/// `unchanged` report only ever answers a `previousResultId`, which is never
+/// sent, so anything else reads as "no diagnostics".
+fn parse_pulled_diagnostics(result: &serde_json::Value) -> Vec<LspDiagnostic> {
+    result["items"]
+        .as_array()
+        .map(|items| items.iter().filter_map(parse_diag).collect())
+        .unwrap_or_default()
 }
 
 /// Flatten an inlay-hint `label` — a `String` or an `InlayHintLabelPart[]`
@@ -4716,6 +5078,315 @@ mod held_save_tests {
             client_capabilities()["textDocument"]["synchronization"]["didSave"],
             serde_json::json!(true)
         );
+    }
+}
+
+#[cfg(test)]
+mod signature_help_tests {
+    use super::*;
+
+    fn session() -> (
+        Arc<Mutex<LspState>>,
+        mpsc::Receiver<String>,
+        mpsc::Sender<String>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let s = LspState {
+            sender: Some(tx.clone()),
+            root_uri: "file:///w".to_owned(),
+            ..Default::default()
+        };
+        (Arc::new(Mutex::new(s)), rx, tx)
+    }
+
+    fn reply(state: &Arc<Mutex<LspState>>, tx: &mpsc::Sender<String>, msg: serde_json::Value) {
+        let generation = state.lock().unwrap().generation;
+        handle_incoming(
+            msg,
+            state,
+            &eframe::egui::Context::default(),
+            tx,
+            "file:///w",
+            generation,
+        );
+    }
+
+    /// The id of the last request that went out.
+    fn last_id(rx: &mpsc::Receiver<String>) -> u64 {
+        let sent: Vec<serde_json::Value> = rx
+            .try_iter()
+            .filter_map(|m| serde_json::from_str(&m).ok())
+            .collect();
+        sent.iter()
+            .rev()
+            .find_map(|m| m["id"].as_u64())
+            .expect("a request went out")
+    }
+
+    /// rust-analyzer's real answer for the reported call.
+    #[test]
+    fn the_real_answer_parses_into_its_parameters() {
+        let result = serde_json::json!({"signatures":[{"label":"fn write_text<D: DrawTarget<Color = BinaryColor>>(display: &mut Ssd1306Async<I2CInterface<I2c<'_, Async>>, DisplaySize128x32, BufferedGraphicsModeAsync<DisplaySize128x32>>, text: &str, x: i32, y: i32) -> Result<(), <Ssd1306Async<I2CInterface<I2c<'_, Async>>, DisplaySize128x32, BufferedGraphicsModeAsync<DisplaySize128x32>> as DrawTarget>::Error>","documentation":{"kind":"markdown","value":"Writes text using the 6x10 font."},"parameters":[{"label":[50,171]},{"label":[173,183]},{"label":[185,191]},{"label":[193,199]}],"activeParameter":3}],"activeSignature":0,"activeParameter":0});
+        let help = parse_signature_help(&result).expect("a signature");
+        let label: Vec<char> = help.label.chars().collect();
+        let params: Vec<String> = help
+            .params
+            .iter()
+            .map(|&(s, e)| label[s..e].iter().collect())
+            .collect();
+        assert_eq!(params[1..], ["text: &str", "x: i32", "y: i32"]);
+        assert_eq!(help.active, Some(3), "the signature's own field wins");
+        assert_eq!(
+            help.doc.as_deref(),
+            Some("Writes text using the 6x10 font.")
+        );
+    }
+
+    #[test]
+    fn null_is_no_signature() {
+        assert_eq!(parse_signature_help(&serde_json::Value::Null), None);
+        assert_eq!(
+            parse_signature_help(&serde_json::json!({"signatures": []})),
+            None
+        );
+    }
+
+    /// Offsets are UTF-16 units: an astral char before a parameter is two of
+    /// them but one char, and slicing by the raw offset would land mid-char.
+    #[test]
+    fn utf16_offsets_become_char_offsets() {
+        let result = serde_json::json!({"signatures":[{"label":"fn 😀(a: u8, b: u16)",
+            "parameters":[{"label":[6,11]},{"label":[13,19]}]}]});
+        let help = parse_signature_help(&result).unwrap();
+        assert_eq!(help.params, [(5, 10), (12, 18)]);
+        assert_eq!(utf16_to_char_idx("😀x", 1), None, "between the two halves");
+        assert_eq!(utf16_to_char_idx("😀x", 3), Some(2), "the end");
+        assert_eq!(utf16_to_char_idx("😀x", 4), None, "past the end");
+    }
+
+    /// A server that ignores `labelOffsetSupport` sends the parameter's text.
+    #[test]
+    fn a_text_parameter_label_is_found_in_the_label() {
+        let result = serde_json::json!({"signatures":[{"label":"fn f(x: i32, y: i32)",
+            "parameters":[{"label":"x: i32"},{"label":"y: i32"}]}]});
+        assert_eq!(
+            parse_signature_help(&result).unwrap().params,
+            [(5, 11), (13, 19)]
+        );
+    }
+
+    /// Two views asking at once: each reply reaches its own asker, and a
+    /// cancellation says "ask again" rather than "no signature".
+    #[test]
+    fn replies_go_to_their_own_token() {
+        let (state, rx, tx) = session();
+        state
+            .lock()
+            .unwrap()
+            .request_signature_help("src/main.rs", 3, 9, 11);
+        let first = last_id(&rx);
+        state
+            .lock()
+            .unwrap()
+            .request_signature_help("src/a.rs", 1, 2, 22);
+        let second = last_id(&rx);
+        assert!(state.lock().unwrap().any_request_in_flight());
+        reply(
+            &state,
+            &tx,
+            serde_json::json!({"jsonrpc":"2.0","id":second,"result":null}),
+        );
+        assert_eq!(
+            state.lock().unwrap().take_signature_reply(11),
+            None,
+            "still asked"
+        );
+        assert_eq!(
+            state.lock().unwrap().take_signature_reply(22),
+            Some(SignatureReply::Help(None))
+        );
+        reply(
+            &state,
+            &tx,
+            serde_json::json!({"jsonrpc":"2.0","id":first,"error":{"code":-32801,"message":"content modified"}}),
+        );
+        let mut s = state.lock().unwrap();
+        assert_eq!(s.take_signature_reply(11), Some(SignatureReply::Cancelled));
+        assert_eq!(s.take_signature_reply(11), None, "taken once");
+        assert!(
+            !s.any_request_in_flight(),
+            "nothing left to hold the idle sync"
+        );
+    }
+
+    /// One pull per document version, answered for that version only.
+    #[test]
+    fn a_pull_answers_for_its_own_version() {
+        let (state, rx, tx) = session();
+        let rel = "src/main.rs";
+        state.lock().unwrap().did_open(rel, "fn main() {}");
+        assert!(state.lock().unwrap().request_document_diagnostics(rel));
+        let id = last_id(&rx);
+        assert!(
+            !state.lock().unwrap().request_document_diagnostics(rel),
+            "asked once per version"
+        );
+        assert!(state.lock().unwrap().diagnostics_pull_in_flight(rel));
+        reply(
+            &state,
+            &tx,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"kind":"full","items":[
+                {"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":7}},
+                 "severity":1,"code":"E0308","source":"rust-analyzer","message":"expected i32, found u32"}]}}),
+        );
+        {
+            let s = state.lock().unwrap();
+            let got = s.pulled_diagnostics(rel).expect("pulled");
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                (got[0].line, got[0].col, got[0].code.as_deref()),
+                (1, 4, Some("E0308"))
+            );
+        }
+        state
+            .lock()
+            .unwrap()
+            .did_change(rel, "fn main() { }", false);
+        let mut s = state.lock().unwrap();
+        assert!(
+            s.pulled_diagnostics(rel).is_none(),
+            "they describe the old text"
+        );
+        assert!(
+            s.request_document_diagnostics(rel),
+            "the new version is asked"
+        );
+    }
+
+    /// A cancelled pull is asked again; a failed one is not, or a file
+    /// rust-analyzer cannot analyse would be re-pulled every frame.
+    #[test]
+    fn a_cancelled_pull_is_asked_again_a_failed_one_is_not() {
+        let (state, rx, tx) = session();
+        let rel = "src/main.rs";
+        state.lock().unwrap().did_open(rel, "x");
+        state.lock().unwrap().request_document_diagnostics(rel);
+        let id = last_id(&rx);
+        reply(
+            &state,
+            &tx,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32801,"message":"content modified"}}),
+        );
+        assert!(state.lock().unwrap().request_document_diagnostics(rel));
+        let id = last_id(&rx);
+        reply(
+            &state,
+            &tx,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"boom"}}),
+        );
+        let mut s = state.lock().unwrap();
+        assert!(!s.request_document_diagnostics(rel));
+        assert!(!s.any_request_in_flight());
+        assert_eq!(
+            s.pulled_diagnostics(rel).map(<[_]>::len),
+            Some(0),
+            "a failure answers \"nothing to say\", so the picture can complete"
+        );
+    }
+
+    /// A caller's diagnostics depend on its callees: an edit to ANOTHER file
+    /// outdates the pull, and the file is pulled again.
+    #[test]
+    fn an_edit_to_another_file_outdates_the_pull() {
+        let (state, rx, tx) = session();
+        let (a, b) = ("src/main.rs", "src/display.rs");
+        state.lock().unwrap().did_open(a, "a");
+        state.lock().unwrap().did_open(b, "b");
+        state.lock().unwrap().request_document_diagnostics(a);
+        let id = last_id(&rx);
+        reply(
+            &state,
+            &tx,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"kind":"full","items":[]}}),
+        );
+        assert!(state.lock().unwrap().pulled_diagnostics(a).is_some());
+        state.lock().unwrap().did_change(b, "b changed", false);
+        let mut s = state.lock().unwrap();
+        assert!(
+            s.pulled_diagnostics(a).is_none(),
+            "computed against the old callee"
+        );
+        assert!(s.request_document_diagnostics(a));
+    }
+
+    /// A re-opened document starts again at version 1: the old document's
+    /// pull must not pass for the new one's.
+    #[test]
+    fn a_reopened_file_is_pulled_again() {
+        let (state, rx, tx) = session();
+        let rel = "src/main.rs";
+        state.lock().unwrap().did_open(rel, "old");
+        state.lock().unwrap().request_document_diagnostics(rel);
+        let id = last_id(&rx);
+        reply(
+            &state,
+            &tx,
+            serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"kind":"full","items":[]}}),
+        );
+        let mut s = state.lock().unwrap();
+        s.did_close(rel);
+        s.did_open(rel, "new");
+        assert!(s.pulled_diagnostics(rel).is_none());
+        assert!(s.request_document_diagnostics(rel));
+    }
+
+    /// `workspace/diagnostic/refresh` is a request: it is answered, and every
+    /// pull is asked again.
+    #[test]
+    fn a_refresh_is_answered_and_outdates_every_pull() {
+        let (state, rx, tx) = session();
+        let rel = "src/main.rs";
+        state.lock().unwrap().did_open(rel, "x");
+        state.lock().unwrap().request_document_diagnostics(rel);
+        let _ = rx.try_iter().count();
+        reply(
+            &state,
+            &tx,
+            serde_json::json!({"jsonrpc":"2.0","id":7,"method":"workspace/diagnostic/refresh"}),
+        );
+        let answers: Vec<serde_json::Value> = rx
+            .try_iter()
+            .filter_map(|m| serde_json::from_str(&m).ok())
+            .collect();
+        assert!(
+            answers
+                .iter()
+                .any(|a| a["id"] == 7 && a.get("result") == Some(&serde_json::Value::Null)),
+            "{answers:?}"
+        );
+        assert!(state.lock().unwrap().request_document_diagnostics(rel));
+    }
+
+    #[test]
+    fn the_client_asks_for_parameter_offsets() {
+        let caps = client_capabilities();
+        let info = &caps["textDocument"]["signatureHelp"]["signatureInformation"];
+        assert_eq!(
+            info["parameterInformation"]["labelOffsetSupport"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn reset_forgets_every_signature_and_pull() {
+        let (state, _rx, _tx) = session();
+        let mut s = state.lock().unwrap();
+        s.did_open("src/main.rs", "x");
+        s.request_signature_help("src/main.rs", 0, 0, 1);
+        s.request_document_diagnostics("src/main.rs");
+        s.reset();
+        assert!(!s.any_request_in_flight());
+        assert!(s.diag_pull_asked.is_empty() && s.signature_replies.is_empty());
     }
 }
 

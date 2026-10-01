@@ -84,10 +84,10 @@ use Role::*;
 fn general(c: &NrfChip, port: u8, pin: u8) -> Vec<PinFunction> {
     use PinFunction::*;
     let mut f = vec![GpioInput, GpioOutput];
-    for &u in c.uarte {
+    for u in uartes(c, port) {
         f.extend([UsartTx(u), UsartRx(u), UsartCts(u), UsartRts(u)]);
     }
-    f.extend(pwm(c));
+    f.extend(pwm(c, port));
     if let Some(channel) = c.ain_of((port, pin)) {
         f.push(AdcChannel { adc: 0, channel });
     }
@@ -95,22 +95,42 @@ fn general(c: &NrfChip, port: u8, pin: u8) -> Vec<PinFunction> {
 }
 
 #[cfg(test)]
-fn pwm(c: &NrfChip) -> Vec<PinFunction> {
+fn pwm(c: &NrfChip, port: u8) -> Vec<PinFunction> {
     c.pwm
         .iter()
+        .filter(|&&timer| reaches(c, timer, port))
         .flat_map(|&timer| (0..4).map(move |channel| PinFunction::TimerPwm { timer, channel }))
         .collect()
 }
 
 #[cfg(test)]
+/// Whether block instance `inst` can reach a pin on `port` - see
+/// [`NrfChip::reaches`].
+fn reaches(c: &NrfChip, inst: u8, port: u8) -> bool {
+    c.reaches(inst, port)
+}
+
+#[cfg(test)]
+/// The UARTEs a pin on `port` can carry.
+fn uartes(c: &NrfChip, port: u8) -> Vec<u8> {
+    c.uarte.iter().copied().filter(|&u| reaches(c, u, port)).collect()
+}
+
+#[cfg(test)]
 fn pin_def(c: &NrfChip, b: &Board, number: usize, pad: Pad) -> PinDef {
     use PinFunction::*;
-    let name = |port: u8, pin: u8, note: &str| format!("P{port}.{pin:02} ({note})");
+    let name = |port: u8, pin: u8, note: &str| {
+        if note.is_empty() {
+            format!("P{port}.{pin:02}")
+        } else {
+            format!("P{port}.{pin:02} ({note})")
+        }
+    };
     let (name, reserved, functions) = match pad {
         Gp(port, pin, note) => (name(port, pin, note), false, general(c, port, pin)),
         Led(port, pin, note) => {
             let mut f = vec![GpioOutput];
-            f.extend(pwm(c));
+            f.extend(pwm(c, port));
             (name(port, pin, note), false, f)
         }
         Button(port, pin, note) => (name(port, pin, note), false, vec![GpioInput]),
@@ -122,13 +142,13 @@ fn pin_def(c: &NrfChip, b: &Board, number: usize, pad: Pad) -> PinDef {
                 _ => (GpioOutput, UsartRts),
             };
             let mut f = vec![dir];
-            f.extend(c.uarte.iter().map(|&u| role(u)));
+            f.extend(uartes(c, port).into_iter().map(role));
             (name(port, pin, note), false, f)
         }
         Spi(port, pin, note, role) | I2c(port, pin, note, role) => {
             let mut f = general(c, port, pin);
             // After the UARTEs, before the PWM channels: the micro:bit's order.
-            let at = 2 + 4 * c.uarte.len();
+            let at = 2 + 4 * uartes(c, port).len();
             let bus: Vec<PinFunction> = match role {
                 Sck => vec![SpiSck(b.spim)],
                 Mosi => vec![SpiMosi(b.spim)],
@@ -372,7 +392,65 @@ const NRF5340_DK: Board = Board {
 };
 
 #[cfg(test)]
-const BOARDS: [&Board; 3] = [&NRF52840_DK, &NRF52_DK, &NRF5340_DK];
+/// nRF54L15 DK (PCA10156). Pin map from the board files Zephyr ships for it
+/// (`nrf54l15dk_nrf54l15_cpuapp`): LEDs on P2.09/P1.10/P2.07/P1.14 (active
+/// HIGH, unlike the older kits), buttons on P1.13/P1.09/P1.08/P0.04 (active
+/// low), VCOM0 on UARTE20 (P1.04..07) and VCOM1 on UARTE30 (P0.00..03), the
+/// 64 Mbit SPI flash on SPIM00 (P2.01/02/04, CS P2.05), the 32.768 kHz crystal
+/// on P1.00/01 and NFC on P1.02/03. The kit has no Arduino header; I2C is
+/// offered on the two free P1 pins with an analog input each, P1.11/P1.12,
+/// on TWIM21/22, which share no SERIAL with the VCOM UART.
+const NRF54L15_DK: Board = Board {
+    id: "nrf54l15_dk",
+    display_name: "Nordic nRF54L15 DK",
+    family: "nrf54l15",
+    spim: 0,
+    twim: &[21, 22],
+    left: &[
+        I2c(1, 11, "AIN4, SDA", Sda),
+        I2c(1, 12, "AIN5, SCL", Scl),
+        Gp(1, 15, ""),
+        Gp(1, 16, ""),
+        Gp(1, 2, "NFC1"),
+        Gp(1, 3, "NFC2"),
+        Gp(0, 5, ""),
+        Gp(0, 6, ""),
+    ],
+    right: &[
+        Gp(2, 0, "FLASH WP"),
+        Spi(2, 1, "FLASH SCK", Sck),
+        Spi(2, 2, "FLASH MOSI", Mosi),
+        Gp(2, 3, "FLASH HOLD"),
+        Spi(2, 4, "FLASH MISO", Miso),
+        Gp(2, 5, "FLASH CS"),
+        Gp(2, 6, ""),
+        Gp(2, 8, ""),
+        Gp(2, 10, ""),
+    ],
+    top: &[
+        Led(2, 9, "LED0, active HIGH"),
+        Led(1, 10, "LED1, active HIGH"),
+        Led(2, 7, "LED2, active HIGH"),
+        Led(1, 14, "LED3, AIN7, active HIGH"),
+        Button(1, 13, "BUTTON0, active LOW"),
+        Button(1, 9, "BUTTON1, active LOW"),
+        Button(1, 8, "BUTTON2, active LOW"),
+        Button(0, 4, "BUTTON3, active LOW"),
+        Uart(1, 4, "VCOM0 TXD, AIN0", Tx),
+        Uart(1, 5, "VCOM0 RXD, AIN1", Rx),
+        Uart(1, 7, "VCOM0 CTS, AIN3", Cts),
+        Uart(1, 6, "VCOM0 RTS, AIN2", Rts),
+        Uart(0, 0, "VCOM1 TXD", Tx),
+        Uart(0, 1, "VCOM1 RXD", Rx),
+        Uart(0, 3, "VCOM1 CTS", Cts),
+        Uart(0, 2, "VCOM1 RTS", Rts),
+        Fixed("P1.00 (XL1, 32.768 kHz)"),
+        Fixed("P1.01 (XL2, 32.768 kHz)"),
+    ],
+};
+
+#[cfg(test)]
+const BOARDS: [&Board; 4] = [&NRF52840_DK, &NRF52_DK, &NRF5340_DK, &NRF54L15_DK];
 
 /// The nRF52 clock tree, with or without the 32.768 kHz crystal.
 ///
@@ -555,7 +633,7 @@ mod tests {
         twim: u8,
     }
 
-    const CASES: [Case; 12] = [
+    const CASES: [Case; 14] = [
         Case { dir: "eide_nrf52840_dk_check", board: "nrf52840_dk", part: None, runtime: Runtime::Blocking, spim: 2, twim: 0 },
         Case { dir: "eide_nrf52840_dk_async_check", board: "nrf52840_dk", part: None, runtime: Runtime::Async, spim: 2, twim: 0 },
         Case { dir: "eide_nrf52832_dk_check", board: "nrf52832_dk", part: None, runtime: Runtime::Blocking, spim: 2, twim: 1 },
@@ -574,6 +652,9 @@ mod tests {
         // and Blocking on embassy-nrf.
         Case { dir: "eide_nrf5340_dk_check", board: "nrf5340_dk", part: None, runtime: Runtime::Blocking, spim: 4, twim: 1 },
         Case { dir: "eide_nrf5340_dk_async_check", board: "nrf5340_dk", part: None, runtime: Runtime::Async, spim: 4, twim: 1 },
+        // The nRF54L15: SERIAL00/2x/30, PWM20, the GRTC time driver, P2.
+        Case { dir: "eide_nrf54l15_dk_check", board: "nrf54l15_dk", part: None, runtime: Runtime::Blocking, spim: 0, twim: 21 },
+        Case { dir: "eide_nrf54l15_dk_async_check", board: "nrf54l15_dk", part: None, runtime: Runtime::Async, spim: 0, twim: 21 },
     ];
 
     /// The case's definition and its wired `Mcu`: an LED, a PWM on two more
@@ -589,10 +670,30 @@ mod tests {
         }
         let mut mcu = def.build_mcu();
         mcu.runtime = case.runtime;
-        let pwm = |channel| PinFunction::TimerPwm { timer: 0, channel };
+        let c = chip(&def.family).unwrap();
+        // The first PWM the part has - PWM20 on the nRF54L, PWM0 elsewhere,
+        // and PWM0 on a part with none, which must then come out as a note.
+        let timer = c.pwm.first().copied().unwrap_or(0);
+        let pwm = |channel| PinFunction::TimerPwm { timer, channel };
+        // The nRF54L15 DK has its own names, and its blocks reach one port
+        // each: PWM20 the P1 LEDs, UARTE30 VCOM1 on P0, the SAADC VCOM0's P1
+        // pins. A pad this list does not name keeps the common list below.
+        let nrf54: Vec<(&str, PinFunction)> = if c.nrf54() {
+            vec![
+                ("(LED0", PinFunction::GpioOutput),
+                ("(LED1", pwm(0)),
+                ("(LED3", pwm(1)),
+                ("VCOM1 TXD", PinFunction::UsartTx(30)),
+                ("VCOM1 RXD", PinFunction::UsartRx(30)),
+                ("VCOM0 TXD", PinFunction::AdcChannel { adc: 0, channel: 0 }),
+                ("VCOM0 RXD", PinFunction::AdcChannel { adc: 0, channel: 1 }),
+            ]
+        } else {
+            Vec::new()
+        };
         // USB and QSPI only exist on the 52840 DK's pads: elsewhere these
         // keys match nothing, which is the point of wiring them everywhere.
-        let wire: [(&str, PinFunction); 19] = [
+        let common: [(&str, PinFunction); 19] = [
             ("USB D+", PinFunction::UsbDp),
             ("USB D-", PinFunction::UsbDm),
             ("(QSPI CS,", PinFunction::QspiNcs { bank: 1 }),
@@ -610,11 +711,15 @@ mod tests {
             ("SCK)", PinFunction::SpiSck(case.spim)),
             ("MOSI)", PinFunction::SpiMosi(case.spim)),
             ("MISO)", PinFunction::SpiMiso(case.spim)),
-            ("(SDA", PinFunction::I2cSda(case.twim)),
-            ("(SCL", PinFunction::I2cScl(case.twim)),
+            ("SDA)", PinFunction::I2cSda(case.twim)),
+            ("SCL)", PinFunction::I2cScl(case.twim)),
         ];
         for p in mcu.iter_all_pins_mut() {
-            if let Some((_, f)) = wire.iter().find(|(key, _)| p.name.contains(key)) {
+            if let Some((_, f)) = nrf54
+                .iter()
+                .chain(common.iter())
+                .find(|(key, _)| p.name.contains(key))
+            {
                 p.selected_function = f.clone();
                 if p.name.contains("BUTTON1") {
                     p.irq = Some(PinEdge::Falling);
@@ -675,7 +780,8 @@ mod tests {
             }
             if super::super::nrf::blocking_on_embassy(&mcu.family) && !mcu.is_async() {
                 assert!(main.contains("let p = embassy_nrf::init(config);"), "{main}");
-                assert!(main.contains("let mut twim1_ram = [0u8; 32];"), "{main}");
+                let ram = format!("let mut twim{}_ram = [0u8; 32];", case.twim);
+                assert!(main.contains(&ram), "{main}");
                 assert!(!main.contains("static_cell"), "{main}");
                 assert!(main.contains("| HAL: embassy-nrf (blocking)"), "{main}");
             }
@@ -753,6 +859,80 @@ mod tests {
             "{m}"
         );
         assert!(!m.contains("CLOCK_POWER"), "{m}");
+    }
+
+    /// The nRF54L15: blocks numbered by power domain, each reaching ONE port
+    /// - so no pad of the kit offers an instance that cannot reach it - the
+    /// GRTC time driver, WDT0 on the secure core, and the SAADC on P1.
+    #[test]
+    fn the_54l15_keeps_each_block_on_its_own_port() {
+        let c = chip("nrf54l15").unwrap();
+        assert_eq!(c.target(), "thumbv8m.main-none-eabihf");
+        assert!(c.hal_dep_async().contains("\"time-driver-grtc\""));
+        assert!(c.hal_dep_async().contains("\"nrf54l15-app-s\""));
+        assert_eq!(c.ain_of((1, 4)), Some(0));
+        assert_eq!(c.ain_of((1, 14)), Some(7));
+        assert_eq!(c.ain_of((0, 4)), None);
+
+        let def = builtins::builtin_for("nrf54l15_dk").unwrap();
+        for p in def.build_mcu().iter_all_pins() {
+            let Some((port, _)) = super::super::nrf::nrf_pin(&p.name) else {
+                continue;
+            };
+            for f in &p.available_functions {
+                let inst = match f {
+                    PinFunction::UsartTx(i)
+                    | PinFunction::UsartRx(i)
+                    | PinFunction::UsartCts(i)
+                    | PinFunction::UsartRts(i)
+                    | PinFunction::SpiSck(i)
+                    | PinFunction::SpiMosi(i)
+                    | PinFunction::SpiMiso(i)
+                    | PinFunction::I2cSda(i)
+                    | PinFunction::I2cScl(i) => *i,
+                    PinFunction::TimerPwm { timer, .. } => *timer,
+                    _ => continue,
+                };
+                assert!(reaches(c, inst, port), "{}: offers {f:?} across domains", p.name);
+            }
+        }
+
+        let main = |dir: &str| {
+            let case = CASES.iter().find(|c| c.dir == dir).unwrap();
+            wired(case).1.fresh_main_rs()
+        };
+        for dir in ["eide_nrf54l15_dk_check", "eide_nrf54l15_dk_async_check"] {
+            let m = main(dir);
+            for want in [
+                "p.SERIAL00,",
+                "p.SERIAL21,",
+                "p.SERIAL30,",
+                "p.PWM20,",
+                "let watchdog = p.WDT0;",
+                "single_ended(p.P1_04)",
+            ] {
+                assert!(m.contains(want), "{dir}: missing {want:?}:\n{m}");
+            }
+        }
+        assert!(main("eide_nrf54l15_dk_async_check").contains("clocks the GRTC"));
+
+        // A hand-made pairing across domains compiles, and says it will not work.
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Async;
+        for p in mcu.iter_all_pins_mut() {
+            if p.name.contains("VCOM1 TXD") {
+                p.selected_function = PinFunction::UsartTx(20);
+            }
+            if p.name.contains("VCOM0 RXD") {
+                p.selected_function = PinFunction::UsartRx(20);
+            }
+        }
+        let m = mcu.fresh_main_rs();
+        assert!(
+            m.contains("UARTE20 TXD is on P0.00, but on the nRF54L15 its block reaches P1 only"),
+            "{m}"
+        );
+        assert!(!m.contains("UARTE20 RXD is on"), "P1.05 is P1's own:\n{m}");
     }
 
     /// The small parts' serial blocks, by their embassy-nrf names.

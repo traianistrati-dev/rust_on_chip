@@ -83,8 +83,8 @@ pub(crate) struct NrfChip {
 }
 
 /// Every nRF52 part both HALs know, smallest first, then the nRF5340's
-/// application core.
-pub(crate) const NRF52_CHIPS: [NrfChip; 8] = [
+/// application core and the nRF54L15's.
+pub(crate) const NRF52_CHIPS: [NrfChip; 9] = [
     NrfChip {
         family: "nrf52805",
         part: "nRF52805",
@@ -226,6 +226,29 @@ pub(crate) const NRF52_CHIPS: [NrfChip; 8] = [
         usbd: true,
         qspi: true,
     },
+    // The nRF54L15's application core, secure (`nrf54l15-app-s`): a Cortex-M33
+    // at 128 MHz with 1524 KiB of RRAM. Instances are numbered by POWER
+    // DOMAIN - SERIAL00 is the fast one, SERIAL20/21/22 and SERIAL30 the rest -
+    // so the numbers here are 0, 20, 21, 22 and 30, and the PWMs 20..22. GPIO
+    // has three ports. No nrf-hal crate, no USB, no QSPI; embassy-time runs on
+    // the GRTC. Instance 0 is UARTE00 / SPIM00 only: there is no TWIM00.
+    NrfChip {
+        family: "nrf54l15",
+        part: "nRF54L15",
+        nrf_hal: None,
+        fpu: true,
+        flash_kb: 1524,
+        ram_kb: 256,
+        nfc: true,
+        p1: true,
+        uarte: &[0, 20, 21, 22, 30],
+        spim: &[0, 20, 21, 22, 30],
+        twim: &[20, 21, 22, 30],
+        pwm: &[20, 21, 22],
+        ain: &[0, 1, 2, 3, 4, 5, 6, 7],
+        usbd: false,
+        qspi: false,
+    },
 ];
 
 /// The part `family` names, or `None` for anything that is not an nRF52.
@@ -239,22 +262,61 @@ impl NrfChip {
         self.family == "nrf5340"
     }
 
+    /// The nRF54L15, where they stop holding again, differently.
+    pub fn nrf54(&self) -> bool {
+        self.family == "nrf54l15"
+    }
+
+    /// Whether block instance `inst` can reach a pin on `port`.
+    ///
+    /// On an nRF52 or the nRF5340 any signal routes to any pin. On the nRF54L
+    /// each block lives in a power domain and reaches that domain's port only:
+    /// SERIAL00 is on P2, SERIAL20/21/22 and PWM20/21/22 on P1, SERIAL30 on P0.
+    pub fn reaches(&self, inst: u8, port: u8) -> bool {
+        !self.nrf54()
+            || match port {
+                0 => inst == 30,
+                1 => (20..=22).contains(&inst),
+                _ => inst == 0,
+            }
+    }
+
+    /// The embassy-time driver: RTC1 on the nRF52 and nRF5340, the GRTC on
+    /// the nRF54L, which has no RTC1 to give.
+    pub fn time_driver(&self) -> &'static str {
+        if self.nrf54() {
+            "time-driver-grtc"
+        } else {
+            "time-driver-rtc1"
+        }
+    }
+
     /// embassy-nrf's feature for the part: the family key on an nRF52, the
     /// SECURE application core on the nRF5340 - bare metal, no TF-M.
     pub fn embassy_feature(&self) -> &'static str {
-        if self.nrf53() { "nrf5340-app-s" } else { self.family }
+        if self.nrf53() {
+            "nrf5340-app-s"
+        } else if self.nrf54() {
+            "nrf54l15-app-s"
+        } else {
+            self.family
+        }
     }
 
     /// The watchdog's `Peripherals` field: the nRF5340 has two, and the
     /// application core's own is WDT0.
     pub fn wdt(&self) -> &'static str {
-        if self.nrf53() { "WDT0" } else { "WDT" }
+        // The nRF54L names it WDT0 too on the SECURE core (WDT31 underneath);
+        // its `WDT` alias exists on the non-secure one only.
+        if self.nrf53() || self.nrf54() { "WDT0" } else { "WDT" }
     }
 
     /// The two NFC antenna pins.
     pub fn nfc_pins(&self) -> [(u8, u8); 2] {
         if self.nrf53() {
             [(0, 2), (0, 3)]
+        } else if self.nrf54() {
+            [(1, 2), (1, 3)]
         } else {
             [(0, 9), (0, 10)]
         }
@@ -265,6 +327,15 @@ impl NrfChip {
     /// Read by the kits' generator, which is an authoring tool (tests only).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn ain_of(&self, (port, pin): (u8, u8)) -> Option<u8> {
+        if self.nrf54() {
+            // AIN0..7 are P1.04..07 and P1.11..14 on the nRF54L15.
+            let ch = match (port, pin) {
+                (1, 4..=7) => pin - 4,
+                (1, 11..=14) => pin - 7,
+                _ => return None,
+            };
+            return self.ain.contains(&ch).then_some(ch);
+        }
         if port != 0 {
             return None;
         }
@@ -291,9 +362,10 @@ impl NrfChip {
     }
 
     /// The Rust target: Cortex-M4F is hard-float, the M4 without an FPU is
-    /// not, and the nRF5340's Cortex-M33 is Armv8-M Mainline.
+    /// not, and the Cortex-M33 of the nRF5340 and nRF54L15 is Armv8-M
+    /// Mainline.
     pub fn target(&self) -> &'static str {
-        if self.nrf53() {
+        if self.nrf53() || self.nrf54() {
             "thumbv8m.main-none-eabihf"
         } else if self.fpu {
             "thumbv7em-none-eabihf"
@@ -303,7 +375,7 @@ impl NrfChip {
     }
 
     pub fn cpu(&self) -> &'static str {
-        if self.nrf53() {
+        if self.nrf53() || self.nrf54() {
             "ARM Cortex-M33"
         } else if self.fpu {
             "ARM Cortex-M4F"
@@ -342,8 +414,9 @@ impl NrfChip {
             ""
         };
         format!(
-            "embassy-nrf = {{ version = \"0.11\", features = [\"{}\", \"time-driver-rtc1\", \"gpiote\"{nfc}] }}",
-            self.embassy_feature()
+            "embassy-nrf = {{ version = \"0.11\", features = [\"{}\", \"{}\", \"gpiote\"{nfc}] }}",
+            self.embassy_feature(),
+            self.time_driver()
         )
     }
 
@@ -391,7 +464,7 @@ pub(crate) fn nrf_pin(name: &str) -> Option<(u8, u8)> {
     let head = name.split_whitespace().next()?;
     let (port, pin) = head.strip_prefix('P')?.split_once('.')?;
     let (port, pin): (u8, u8) = (port.parse().ok()?, pin.parse().ok()?);
-    (port <= 1 && pin < 32).then_some((port, pin))
+    (port <= 2 && pin < 32).then_some((port, pin))
 }
 
 /// `P0.21` — how the generated comments name a pin.
@@ -754,6 +827,41 @@ fn qspi_frequency(prescaler: u8) -> (u32, &'static str) {
     ];
     let i = usize::from(prescaler).min(F.len() - 1);
     (32_000_000 / (i as u32 + 1), F[i])
+}
+
+/// A comment per signal wired to a port its block cannot reach (nRF54L).
+///
+/// The PSEL register takes any pin number, so this compiles - and the pin
+/// never moves. A built-in kit offers no such pairing; a definition made by
+/// hand can, and this is the only place that would say so.
+fn domain_notes(mcu: &Mcu) -> String {
+    let Some(c) = chip(&mcu.family).filter(|c| c.nrf54()) else {
+        return String::new();
+    };
+    let mut o = String::new();
+    for p in mcu.iter_all_pins().filter(|p| !p.reserved) {
+        let (Some(pp), Some(sig), Some((_, Some(inst), _))) = (
+            nrf_pin(&p.name),
+            signal_name(&p.selected_function),
+            block_of(&p.selected_function),
+        ) else {
+            continue;
+        };
+        if matches!(p.selected_function, PinFunction::AdcChannel { .. }) || c.reaches(inst, pp.0) {
+            continue;
+        }
+        let home = match inst {
+            30 => "P0",
+            20..=22 => "P1",
+            _ => "P2",
+        };
+        o.push_str(&format!(
+            "    // {sig} is on {}, but on the {} its block reaches {home} only: the pin\n    // will not move. Wire it to a {home} pad.\n",
+            label(pp),
+            c.part
+        ));
+    }
+    o
 }
 
 /// Which pin carries each role of one bus instance.
@@ -1667,6 +1775,10 @@ fn serial_block(family: &str, kind: &str, n: u8) -> (String, String) {
     match (family, kind, n) {
         // UARTE, SPIM and TWIM n are all SERIALn; SPIM4 shares nothing.
         ("nrf5340", "spim", 4) => same("SPIM4"),
+        // The nRF54L numbers by power domain: instance 0 is SERIAL00, the
+        // others SERIAL20/21/22/30 - the same number the instance has.
+        ("nrf54l15", _, 0) => same("SERIAL00"),
+        ("nrf54l15", _, _) => same(&format!("SERIAL{n}")),
         ("nrf5340", _, _) => same(&format!("SERIAL{n}")),
         (_, "uarte", _) => same(&format!("UARTE{n}")),
         ("nrf52805" | "nrf52810" | "nrf52811", "spim", 0) => same("SPI0"),
@@ -1830,7 +1942,9 @@ fn async_clock_lines(mcu: &Mcu) -> String {
     let mut o = String::new();
     o.push_str("    // From the Clock tab. HFCLK is 64 MHz either way; the choice is whether\n");
     o.push_str("    // the 32 MHz crystal is started, which the radio and USB need. LFCLK is\n");
-    if mcu.is_async() {
+    if mcu.is_async() && chip(&mcu.family).is_some_and(|c| c.nrf54()) {
+        o.push_str("    // 32.768 kHz, and it clocks the GRTC, which is embassy-time's driver.\n");
+    } else if mcu.is_async() {
         o.push_str("    // 32.768 kHz, and it clocks RTC1, which is embassy-time's driver.\n");
     } else {
         o.push_str("    // 32.768 kHz, and it clocks the RTCs and the watchdog.\n");
@@ -1900,6 +2014,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     let mut irqs: Vec<String> = Vec::new();
     let mut o = ambiguity_notes(mcu);
     o.push_str(&missing_block_notes(mcu));
+    o.push_str(&domain_notes(mcu));
     let mut items = String::new();
     let mut static_cell = false;
     let mut taken: Vec<(String, String)> = Vec::new();
@@ -2529,7 +2644,8 @@ mod tests {
         assert!(is_nrf("nrf52833"));
         assert!(is_nrf("nrf52840"));
         assert!(is_nrf("nrf5340"));
-        for other in ["nrf51", "nrf5340-net", "nrf54l15", "rp2040", "stm32f4", "esp32c3", ""] {
+        assert!(is_nrf("nrf54l15"));
+        for other in ["nrf51", "nrf5340-net", "nrf54h20", "rp2040", "stm32f4", "esp32c3", ""] {
             assert!(!is_nrf(other), "{other:?} matched");
         }
     }

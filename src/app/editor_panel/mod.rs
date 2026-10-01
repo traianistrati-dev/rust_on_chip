@@ -64,6 +64,7 @@ pub(crate) mod multi_cursor;
 mod rename;
 #[cfg(test)]
 mod replace_enter_tests;
+pub(super) mod signature_hint;
 mod snippet;
 mod toggle_case;
 mod toolbar;
@@ -684,7 +685,13 @@ impl AppIde {
         // at/after the name — so Tab still inserts a tab when indenting at
         // line start. Consumed here so the editor doesn't also type a tab;
         // the edit is applied at frame top next `init_frame`.
-        let hint_pos = self.ed.inlay_hint.as_ref().map(|h| (h.line, h.character));
+        // Only a hint that was drawn: the call-signature ghost can take its line.
+        let hint_pos = self
+            .ed
+            .inlay_hint
+            .as_ref()
+            .filter(|_| self.ed.inlay_hint_drawn)
+            .map(|h| (h.line, h.character));
         if let Some((hint_line, hint_char)) = hint_pos {
             let popup_up = self.ed.completion_open
                 || self.ed.code_action_popup_open
@@ -2328,6 +2335,7 @@ impl AppIde {
                 displayed_file,
                 &pill_edges,
                 err_step,
+                &fold_map,
             );
         }
         // Rename input popup (shown while active; sends the request on

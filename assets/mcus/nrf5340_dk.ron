@@ -1044,7 +1044,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 7,
-                name: "P0.27 ()",
+                name: "P0.27",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -1137,7 +1137,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 8,
-                name: "P0.10 ()",
+                name: "P0.10",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -1226,7 +1226,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 9,
-                name: "P0.11 ()",
+                name: "P0.11",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -1315,7 +1315,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 10,
-                name: "P0.12 ()",
+                name: "P0.12",
                 reserved: false,
                 functions: [
                     GpioInput,

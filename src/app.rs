@@ -635,7 +635,7 @@ enum BuildPanelTab {
 /// this is not a tag on shared state any more — it names WHICH state, at the few
 /// points that have to reach across: the completion popup's owner (only one
 /// caret can have a list up at a time) and [`LspAsker`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) enum EditorSlot {
     /// The main editor (left panel).
     #[default]

@@ -1856,6 +1856,32 @@ fn write_bytes_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::write(path, bytes)
 }
 
+/// Empty a harness's project directory for a fresh write, but keep its
+/// `target/`.
+///
+/// The emit harnesses used to `remove_dir_all` the whole directory, which also
+/// threw away every compiled dependency, so the matrix rebuilt embassy-nrf or
+/// rp-hal from scratch on EVERY run: the nRF row took 601 s warm or cold, ~40 s
+/// a project. Everything the IDE writes is removed - a config file a previous
+/// run emitted must not survive into this one - and only the build cache stays.
+#[cfg(test)]
+pub(crate) fn clear_project_dir_keep_target(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name() == "target" {
+            continue;
+        }
+        let path = e.path();
+        let _ = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+    }
+}
+
 pub fn write_project(
     dest: &Path,
     files: &ProjectFiles,
@@ -3332,6 +3358,25 @@ mod tests {
         assert!(spliced.contains("0x08002000"), "block reflects new chip");
         assert!(!spliced.contains("0x08000000"), "old generated value gone");
         assert!(spliced.contains("/* my note */"), "user edit preserved");
+    }
+
+    /// A fresh write keeps the build cache and nothing else the IDE wrote.
+    #[test]
+    fn clearing_a_project_dir_keeps_only_target() {
+        let dir = std::env::temp_dir().join(format!("eide_clear_keep_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::write(dir.join("target/debug/dep.rlib"), "cache").unwrap();
+        fs::create_dir_all(dir.join("src/pins/configs")).unwrap();
+        fs::write(dir.join("src/pins/configs/stale.rs"), "old").unwrap();
+        fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+        clear_project_dir_keep_target(&dir);
+        assert!(dir.join("target/debug/dep.rlib").exists(), "the cache stays");
+        assert!(!dir.join("src").exists(), "a stale config file must not survive");
+        assert!(!dir.join("Cargo.toml").exists());
+        // A directory that does not exist yet is not an error.
+        clear_project_dir_keep_target(&dir.join("nope"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `ensure_dep` writes the provenance marker itself. The usb-device 0.3

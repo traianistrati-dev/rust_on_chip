@@ -3367,7 +3367,7 @@ mod blocking_codegen {
         let files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join(dir_name);
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write nrf project");
         println!("wrote {}", dir.display());
@@ -3979,7 +3979,7 @@ mod async_codegen {
             assert_eq!(names, ["watchdog.rs"], "{dir_name}");
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
-            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf async project");
 

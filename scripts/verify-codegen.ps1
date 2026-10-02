@@ -355,8 +355,13 @@ $ALL_CASES = @(
     # core's SERIALn blocks, SPIM4, WDT0 and the USB regulator's VBUS vector.
     # Then the nRF54L15 DK: SERIAL00/2x/30, PWM20, the GRTC, port 2, and WDT0
     # on the secure core - the one name the compiler caught (`WDT` is `_ns`).
-    @{ n = "nRF52 + nRF5340 + nRF54L15 x14"; t = "emit_nrf_family_projects"; e = @{};                     q = $true; fam = "nrf";
-       only = @("eide_nrf52840_dk_async_check", "eide_nrf52810_check", "eide_nrf52820_check", "eide_nrf5340_dk_async_check", "eide_nrf54l15_dk_async_check") }
+    #
+    # All fourteen in quick mode and in the hook. It had an `only` subset of
+    # five while every run rebuilt every dependency (601 s - the harness used
+    # to delete `target/` along with the project); with the cache kept the row
+    # costs ~70 s warm, and the micro:bit rows alone told the hook nothing
+    # about the other eight parts.
+    @{ n = "nRF52 + nRF5340 + nRF54L15 x14"; t = "emit_nrf_family_projects"; e = @{};                     q = $true; fam = "nrf"; hk = $true }
 
     # The same two boards on embassy-rp, which is a DIFFERENT HAL crate, not a
     # feature of the first one. Every bus is wired, because that is where the

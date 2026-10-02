@@ -260,6 +260,9 @@ pub struct Pin {
     /// [`PinDef::fn_owner`](crate::panels::mcu_module::mcu_def::PinDef::fn_owner).
     /// Read through [`Pin::gpio_for`]; never index it directly.
     pub fn_owner: Vec<(PinFunction, String)>,
+    /// The board's note on this pad - see
+    /// [`PinDef::note`](crate::panels::mcu_module::mcu_def::PinDef::note).
+    pub note: String,
 }
 
 impl Pin {

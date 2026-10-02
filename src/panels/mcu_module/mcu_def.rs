@@ -58,6 +58,16 @@ pub struct PinDef {
     /// majority of pins, so no existing definition changes on disk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fn_owner: Vec<(PinFunction, String)>,
+    /// What the BOARD does to this pad that its functions cannot say: a solder
+    /// bridge that keeps it off the header, a resistor to change before NFC
+    /// pins are GPIO, the debugger driving it. Shown in the pin's panel.
+    ///
+    /// Data, not code, because it is per board: the same `P0.09 (NFC1)` needs
+    /// different resistors changed on two Nordic kits, so nothing keyed by the
+    /// pad's name - the way `reserved_role` is - could say it right on both.
+    /// Empty on almost every pad, and then absent from the file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 impl PinDef {
@@ -73,6 +83,7 @@ impl PinDef {
             // round-trip through a live chip therefore drops it.
             af: Vec::new(),
             fn_owner: p.fn_owner.clone(),
+            note: p.note.clone(),
         }
     }
 
@@ -91,6 +102,7 @@ impl PinDef {
             io_mode: None,
             af: self.af.clone(),
             fn_owner: self.fn_owner.clone(),
+            note: self.note.clone(),
         }
     }
 }

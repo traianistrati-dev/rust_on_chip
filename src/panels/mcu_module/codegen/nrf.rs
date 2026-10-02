@@ -62,7 +62,8 @@ pub(crate) struct NrfChip {
     pub fpu: bool,
     pub flash_kb: u32,
     pub ram_kb: u32,
-    /// NFCT: P0.09/P0.10 are antenna pins until the UICR says otherwise, and
+    /// NFCT: `nfc_pins` are antenna pins until the UICR (NFCT.PADCONFIG on
+    /// the nRF54L) says otherwise, and
     /// embassy-nrf refuses `nfc-pins-as-gpio` on a part without them.
     pub nfc: bool,
     /// Port 1 exists. Read by the kits' own check that no pad names a pin
@@ -659,6 +660,8 @@ fn nfc_pads_used(mcu: &Mcu) -> Vec<String> {
     // The two antenna pins - P0.09/P0.10 on an nRF52, P0.02/P0.03 on the
     // nRF5340 - are NFC until the UICR's `NFCPINS` register is cleared, and
     // the UICR is flash: nothing this code emits at run time can change it.
+    // The nRF54L's P1.02/P1.03 are the exception: NFCT.PADCONFIG, a plain
+    // register, written by embassy-nrf's `init` at every boot.
     let Some(nfc) = chip(&mcu.family).filter(|c| c.nfc).map(|c| c.nfc_pins()) else {
         return Vec::new();
     };
@@ -2078,8 +2081,14 @@ fn async_nfc_note(mcu: &Mcu) -> String {
     if used.is_empty() {
         return String::new();
     }
+    // The nRF54L has no UICR.NFCPINS: the pads are a register of NFCT itself.
+    let how = if chip(&mcu.family).is_some_and(|c| c.nrf54()) {
+        "has `init` turn the NFCT pads off\n    // (NFCT.PADCONFIG) on every boot, so they are GPIO from the first one.\n"
+    } else {
+        "has `init` clear UICR.NFCPINS and reset\n    // once, so they are GPIO from the second boot on, until the UICR is erased.\n"
+    };
     format!(
-        "    // {} {} the NFC antenna pins. The `nfc-pins-as-gpio` feature on the\n    // embassy-nrf line in Cargo.toml has `init` clear UICR.NFCPINS and reset\n    // once, so they are GPIO from the second boot on, until the UICR is erased.\n",
+        "    // {} {} the NFC antenna pins. The `nfc-pins-as-gpio` feature on the\n    // embassy-nrf line in Cargo.toml {how}",
         used.join(" and "),
         if used.len() == 1 { "is one of" } else { "are" }
     )

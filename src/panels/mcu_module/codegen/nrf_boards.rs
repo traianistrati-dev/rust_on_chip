@@ -188,6 +188,7 @@ fn pin_def(c: &NrfChip, b: &Board, number: usize, pad: Pad) -> PinDef {
         functions,
         af: Vec::new(),
         fn_owner: Vec::new(),
+        note: String::new(),
     }
 }
 
@@ -204,7 +205,23 @@ struct Board {
     left: &'static [Pad],
     right: &'static [Pad],
     top: &'static [Pad],
+    /// What the kit does to a pad that its functions cannot say - solder
+    /// bridges, resistors, the debugger - keyed by pin, shown in the pin's
+    /// panel. Every line here was checked against the kit's user guide before
+    /// it went in; the pin tables above were checked the same way.
+    notes: &'static [((u8, u8), &'static str)],
+    /// Pins the chip's product specification marks low-frequency I/O - the
+    /// nRF52's GPIOs next to the radio. Each gets [`LOW_FREQ_NOTE`] after its
+    /// own note.
+    low_freq: &'static [(u8, u8)],
+    /// A note EVERY usable pad of the kit carries before its own - the
+    /// nRF54L15 DK's 1.8 V logic level, which nothing on a pad would hint at.
+    every_pad: &'static str,
 }
+
+#[cfg(test)]
+/// What the nRF52 product specifications say about their low-frequency pins.
+const LOW_FREQ_NOTE: &str = "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.";
 
 #[cfg(test)]
 /// nRF52840 DK (PCA10056). Pin map from Nordic's PCA10056 hardware guide:
@@ -273,6 +290,32 @@ const NRF52840_DK: Board = Board {
         Fixed("P0.01 (XL2, 32.768 kHz)"),
         Fixed("P0.18 (RESET)"),
     ],
+    notes: &[
+        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB2 and short SB4."),
+        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and short SB3."),
+        ((0, 5), "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR; free for other use when flow control is not detected. Cut SB51 to disconnect it."),
+        ((0, 6), "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR. Cut SB53 to disconnect it."),
+        ((0, 7), "VCOM CTS: once flow control is detected, the interface MCU drives it until it power-cycles or sees a new DTR; free otherwise. Cut SB50 to disconnect it."),
+        ((0, 8), "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR. Cut SB52 to disconnect it."),
+        ((0, 9), "Wired to the NFC antenna by default. For GPIO: remove R44 and R46, fit 0R at R43 and R45, and set UICR.NFCPINS to GPIO."),
+        ((0, 10), "Wired to the NFC antenna by default. For GPIO: remove R44 and R46, fit 0R at R43 and R45, and set UICR.NFCPINS to GPIO."),
+        ((0, 17), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23."),
+        ((0, 18), "Goes to the interface MCU through SB56, closed by default - cut it to disconnect."),
+        ((0, 19), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21."),
+        ((0, 20), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22."),
+        ((0, 21), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24."),
+        ((0, 22), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25."),
+        ((0, 23), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20."),
+        ((0, 26), "The on-board I2C pull-ups are switched in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+        ((0, 27), "The on-board I2C pull-ups are switched in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+        ((1, 0), "SWO / TRACEDATA[0], connected to the interface MCU through a signal switch. Cut SB57 to disconnect it."),
+    ],
+    low_freq: &[
+        (0, 2), (0, 3), (0, 9), (0, 10), (0, 28), (0, 29), (0, 30), (0, 31),
+        (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7),
+        (1, 10), (1, 11), (1, 12), (1, 13), (1, 14), (1, 15),
+    ],
+    every_pad: "",
 };
 
 #[cfg(test)]
@@ -327,6 +370,22 @@ const NRF52_DK: Board = Board {
         Fixed("P0.01 (XL2, 32.768 kHz)"),
         Fixed("P0.21 (RESET)"),
     ],
+    notes: &[
+        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4."),
+        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4."),
+        ((0, 5), "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR."),
+        ((0, 6), "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR."),
+        ((0, 7), "VCOM CTS: tri-stated until a terminal sends DTR; once flow control is detected the interface MCU drives it until a power-on reset or a new DTR."),
+        ((0, 8), "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR."),
+        ((0, 9), "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO."),
+        ((0, 10), "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO."),
+        ((0, 18), "Also SWO / TRACEDATA[0], wired to the interface MCU through SB27 (closed by default; SB26 on v1.x boards) - cut it to isolate the pin."),
+        ((0, 21), "Goes to the interface MCU through SB26 (closed by default; SB27 on v1.x boards). The Arduino RESET pin is NOT this pin by default: SB17 and SB43 are open."),
+    ],
+    low_freq: &[
+        (0, 22), (0, 23), (0, 24), (0, 25), (0, 26), (0, 27), (0, 28), (0, 29), (0, 30), (0, 31),
+    ],
+    every_pad: "",
 };
 
 #[cfg(test)]
@@ -402,6 +461,29 @@ const NRF5340_DK: Board = Board {
         Fixed("P0.00 (XL1, 32.768 kHz)"),
         Fixed("P0.01 (XL2, 32.768 kHz)"),
     ],
+    notes: &[
+        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4."),
+        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4."),
+        ((0, 2), "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO."),
+        ((0, 3), "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO."),
+        ((0, 8), "Also TRACEDATA[3] and SPIM4's dedicated SCK: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
+        ((0, 9), "Also TRACEDATA[2] and SPIM4's dedicated MOSI: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
+        ((0, 10), "Serial port 0 (VCOM0) CTS, also TRACEDATA[1] and SPIM4's dedicated 32 Mbps MISO. Set SW7 (serial port 0 flow control) OFF to use it for trace."),
+        ((0, 11), "Serial port 0 (VCOM0) RTS, also TRACEDATA[0] / SWO and SPIM4's dedicated 32 Mbps CSN. Set SW7 (serial port 0 flow control) OFF to use it for trace."),
+        ((0, 12), "TRACECLK, and SPIM4's dedicated DCX: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
+        ((0, 13), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22."),
+        ((0, 14), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24."),
+        ((0, 15), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25."),
+        ((0, 16), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20."),
+        ((0, 17), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21."),
+        ((0, 18), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23."),
+        ((1, 0), "Serial port 0 (VCOM0) RXD. Zephyr's stock app-core board hands it to the network core, which uses it as its console."),
+        ((1, 1), "Serial port 0 (VCOM0) TXD. Zephyr's stock app-core board hands it to the network core, which uses it as its console."),
+        ((1, 2), "With P1.03, the nRF5340's only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+        ((1, 3), "With P1.02, the nRF5340's only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+    ],
+    low_freq: &[],
+    every_pad: "",
 };
 
 #[cfg(test)]
@@ -464,6 +546,35 @@ const NRF54L15_DK: Board = Board {
         Fixed("P1.00 (XL1, 32.768 kHz)"),
         Fixed("P1.01 (XL2, 32.768 kHz)"),
     ],
+    notes: &[
+        ((0, 0), "VCOM0 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
+        ((0, 1), "VCOM0 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
+        ((0, 2), "VCOM0 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected."),
+        ((0, 3), "VCOM0 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR."),
+        ((1, 0), "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6."),
+        ((1, 1), "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6."),
+        ((1, 2), "Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf's `nfc-pins-as-gpio` does at every boot."),
+        ((1, 3), "Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf's `nfc-pins-as-gpio` does at every boot."),
+        ((1, 4), "VCOM1 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
+        ((1, 5), "VCOM1 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
+        ((1, 6), "VCOM1 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected."),
+        ((1, 7), "VCOM1 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR."),
+        ((1, 10), "Switches LED1 through a transistor; the LEDs are powered by the PMIC and stay dark if 'Power to LEDs' is off in Board Configurator."),
+        ((1, 14), "Switches LED3 through a transistor; the LEDs are powered by the PMIC and stay dark if 'Power to LEDs' is off in Board Configurator."),
+        ((2, 0), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 1), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 2), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 3), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 4), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 5), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 6), "Trace port TRACECLK."),
+        ((2, 7), "Switches LED2 through a transistor (LEDs powered by the PMIC, dark if 'Power to LEDs' is off). Also TRACEDATA[0] / SWO: on v1.0.0 boards the debugger's SWO reaches it only with 'SWO Control' on in Board Configurator; on v0.9.x boards it does through SB24, closed by default (cut it to disconnect)."),
+        ((2, 8), "Trace port TRACEDATA[1]."),
+        ((2, 9), "Switches LED0 through a transistor (LEDs powered by the PMIC, dark if 'Power to LEDs' is off). Also trace port TRACEDATA[2]."),
+        ((2, 10), "Trace port TRACEDATA[3]."),
+    ],
+    low_freq: &[],
+    every_pad: "Logic level is 1.8 V by default (the nPM1300 PMIC's VOUT1); set 1.8-3.3 V with 'VDD (nPM VOUT1)' in nRF Connect for Desktop's Board Configurator.",
 };
 
 #[cfg(test)]
@@ -579,6 +690,15 @@ fn definition_of(b: &Board) -> McuDefinition {
         bottom: Vec::new(),
         grid: None,
     };
+    for side in [&mut d.pins.left, &mut d.pins.right, &mut d.pins.top] {
+        for p in side.iter_mut() {
+            let pp = super::nrf::nrf_pin(&p.name);
+            let own = b.notes.iter().find(|(at, _)| Some(*at) == pp).map(|(_, t)| *t);
+            let low = pp.filter(|pp| b.low_freq.contains(pp)).map(|_| LOW_FREQ_NOTE);
+            let every = Some(b.every_pad).filter(|t| !t.is_empty() && !p.reserved);
+            p.note = [every, own, low].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        }
+    }
     d.clock = ClockDef::Graph(clock_graph(true));
     d
 }
@@ -886,6 +1006,25 @@ mod tests {
         assert!(!m.contains("CLOCK_POWER"), "{m}");
     }
 
+    /// The nRF54L has no UICR.NFCPINS: NFCT.PADCONFIG frees its NFC pads, at
+    /// every boot, on both runtimes (both are embassy-nrf here).
+    #[test]
+    fn the_54l15_nfc_comment_names_its_own_register() {
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mut mcu = builtins::builtin_for("nrf54l15_dk").unwrap().build_mcu();
+            mcu.runtime = runtime;
+            for p in mcu.iter_all_pins_mut() {
+                if p.name.starts_with("P1.02") {
+                    p.selected_function = PinFunction::GpioInput;
+                }
+            }
+            let main = mcu.fresh_main_rs();
+            assert!(main.contains("// P1.02 is one of the NFC antenna pins."), "{main}");
+            assert!(main.contains("(NFCT.PADCONFIG) on every boot"), "{main}");
+            assert!(!main.contains("UICR"), "{main}");
+        }
+    }
+
     /// The nRF54L15: blocks numbered by power domain, each reaching one port
     /// (with dedicated pins on P2 and clock pins for SCK/SCL), so no pad of
     /// the kit offers a signal its pin cannot carry; the GRTC time driver,
@@ -1039,6 +1178,36 @@ mod tests {
             }
             println!("wrote {}", dir.display());
             println!("target: {}", project.target);
+        }
+    }
+
+    /// A note keyed to a pin the kit has no pad for would vanish without a
+    /// word - the generator matches by pin - so every key must land, and land
+    /// once. And the 54L15's logic-level warning must reach every usable pad.
+    #[test]
+    fn every_pad_note_lands_on_a_pad() {
+        for b in BOARDS {
+            let def = definitions().into_iter().find(|d| d.id == b.id).unwrap();
+            let pads: Vec<&PinDef> = [&def.pins.left, &def.pins.right, &def.pins.top]
+                .into_iter()
+                .flatten()
+                .collect();
+            let at = |pp: (u8, u8)| {
+                pads.iter()
+                    .filter(|p| super::super::nrf::nrf_pin(&p.name) == Some(pp))
+                    .count()
+            };
+            for (pp, _) in b.notes {
+                assert_eq!(at(*pp), 1, "{}: note for {pp:?} lands on no pad", b.id);
+            }
+            for pp in b.low_freq {
+                assert_eq!(at(*pp), 1, "{}: low-frequency pin {pp:?} has no pad", b.id);
+            }
+            if !b.every_pad.is_empty() {
+                for p in pads.iter().filter(|p| !p.reserved) {
+                    assert!(p.note.starts_with(b.every_pad), "{}: {} misses it", b.id, p.name);
+                }
+            }
         }
     }
 

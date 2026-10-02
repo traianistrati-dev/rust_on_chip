@@ -30,6 +30,7 @@ McuDefinition(
                 functions: [
                     GpioOutput,
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Switches LED0 through a transistor (LEDs powered by the PMIC, dark if \'Power to LEDs\' is off). Also trace port TRACEDATA[2].",
             ),
             PinDef(
                 number: 17,
@@ -86,6 +87,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Switches LED1 through a transistor; the LEDs are powered by the PMIC and stay dark if \'Power to LEDs\' is off in Board Configurator.",
             ),
             PinDef(
                 number: 18,
@@ -94,6 +96,7 @@ McuDefinition(
                 functions: [
                     GpioOutput,
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Switches LED2 through a transistor (LEDs powered by the PMIC, dark if \'Power to LEDs\' is off). Also TRACEDATA[0] / SWO: on v1.0.0 boards the debugger\'s SWO reaches it only with \'SWO Control\' on in Board Configurator; on v0.9.x boards it does through SB24, closed by default (cut it to disconnect).",
             ),
             PinDef(
                 number: 19,
@@ -150,6 +153,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Switches LED3 through a transistor; the LEDs are powered by the PMIC and stay dark if \'Power to LEDs\' is off in Board Configurator.",
             ),
             PinDef(
                 number: 20,
@@ -158,6 +162,7 @@ McuDefinition(
                 functions: [
                     GpioInput,
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator.",
             ),
             PinDef(
                 number: 21,
@@ -166,6 +171,7 @@ McuDefinition(
                 functions: [
                     GpioInput,
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator.",
             ),
             PinDef(
                 number: 22,
@@ -174,6 +180,7 @@ McuDefinition(
                 functions: [
                     GpioInput,
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator.",
             ),
             PinDef(
                 number: 23,
@@ -182,6 +189,7 @@ McuDefinition(
                 functions: [
                     GpioInput,
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator.",
             ),
             PinDef(
                 number: 24,
@@ -191,6 +199,7 @@ McuDefinition(
                     GpioOutput,
                     UsartTx(30),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. VCOM0 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR.",
             ),
             PinDef(
                 number: 25,
@@ -200,6 +209,7 @@ McuDefinition(
                     GpioInput,
                     UsartRx(30),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. VCOM0 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR.",
             ),
             PinDef(
                 number: 26,
@@ -209,6 +219,7 @@ McuDefinition(
                     GpioInput,
                     UsartCts(30),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. VCOM0 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR.",
             ),
             PinDef(
                 number: 27,
@@ -218,6 +229,7 @@ McuDefinition(
                     GpioOutput,
                     UsartRts(30),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. VCOM0 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected.",
             ),
             PinDef(
                 number: 28,
@@ -229,6 +241,7 @@ McuDefinition(
                     UsartTx(21),
                     UsartTx(22),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. VCOM1 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR.",
             ),
             PinDef(
                 number: 29,
@@ -240,6 +253,7 @@ McuDefinition(
                     UsartRx(21),
                     UsartRx(22),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. VCOM1 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR.",
             ),
             PinDef(
                 number: 30,
@@ -251,6 +265,7 @@ McuDefinition(
                     UsartCts(21),
                     UsartCts(22),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. VCOM1 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR.",
             ),
             PinDef(
                 number: 31,
@@ -262,18 +277,21 @@ McuDefinition(
                     UsartRts(21),
                     UsartRts(22),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. VCOM1 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected.",
             ),
             PinDef(
                 number: 32,
                 name: "P1.00 (XL1, 32.768 kHz)",
                 reserved: true,
                 functions: [],
+                note: "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6.",
             ),
             PinDef(
                 number: 33,
                 name: "P1.01 (XL2, 32.768 kHz)",
                 reserved: true,
                 functions: [],
+                note: "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6.",
             ),
         ],
         bottom: [],
@@ -352,6 +370,7 @@ McuDefinition(
                         channel: 4,
                     ),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator.",
             ),
             PinDef(
                 number: 2,
@@ -427,6 +446,7 @@ McuDefinition(
                         channel: 5,
                     ),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator.",
             ),
             PinDef(
                 number: 3,
@@ -496,6 +516,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf\'s `nfc-pins-as-gpio` does at every boot.",
             ),
             PinDef(
                 number: 4,
@@ -565,6 +586,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf\'s `nfc-pins-as-gpio` does at every boot.",
             ),
             PinDef(
                 number: 5,
@@ -578,6 +600,7 @@ McuDefinition(
                     UsartCts(30),
                     UsartRts(30),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator.",
             ),
             PinDef(
                 number: 6,
@@ -591,6 +614,7 @@ McuDefinition(
                     UsartCts(30),
                     UsartRts(30),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator.",
             ),
         ],
         right: [
@@ -603,6 +627,7 @@ McuDefinition(
                     GpioOutput,
                     UsartRx(0),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Wired to the on-board flash by default, not to header P2: turn off \'External memory\' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
             ),
             PinDef(
                 number: 8,
@@ -613,6 +638,7 @@ McuDefinition(
                     GpioOutput,
                     SpiSck(0),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Wired to the on-board flash by default, not to header P2: turn off \'External memory\' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
             ),
             PinDef(
                 number: 9,
@@ -624,6 +650,7 @@ McuDefinition(
                     UsartTx(0),
                     SpiMosi(0),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Wired to the on-board flash by default, not to header P2: turn off \'External memory\' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
             ),
             PinDef(
                 number: 10,
@@ -633,6 +660,7 @@ McuDefinition(
                     GpioInput,
                     GpioOutput,
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Wired to the on-board flash by default, not to header P2: turn off \'External memory\' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
             ),
             PinDef(
                 number: 11,
@@ -644,6 +672,7 @@ McuDefinition(
                     UsartCts(0),
                     SpiMiso(0),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Wired to the on-board flash by default, not to header P2: turn off \'External memory\' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
             ),
             PinDef(
                 number: 12,
@@ -654,6 +683,7 @@ McuDefinition(
                     GpioOutput,
                     UsartRts(0),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Wired to the on-board flash by default, not to header P2: turn off \'External memory\' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
             ),
             PinDef(
                 number: 13,
@@ -663,6 +693,7 @@ McuDefinition(
                     GpioInput,
                     GpioOutput,
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Trace port TRACECLK.",
             ),
             PinDef(
                 number: 14,
@@ -673,6 +704,7 @@ McuDefinition(
                     GpioOutput,
                     UsartTx(0),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Trace port TRACEDATA[1].",
             ),
             PinDef(
                 number: 15,
@@ -683,6 +715,7 @@ McuDefinition(
                     GpioOutput,
                     UsartRts(0),
                 ],
+                note: "Logic level is 1.8 V by default (the nPM1300 PMIC\'s VOUT1); set 1.8-3.3 V with \'VDD (nPM VOUT1)\' in nRF Connect for Desktop\'s Board Configurator. Trace port TRACEDATA[3].",
             ),
         ],
         grid: None,

@@ -603,6 +603,10 @@ fn pin_side_editor(
             let mut remove: Option<usize> = None;
             let count = rows.len();
             for (i, row) in rows.iter_mut().enumerate() {
+                let note_open_id = egui::Id::new(("mcu_form_pin_note", side, i));
+                let mut note_open = ui
+                    .data(|d| d.get_temp::<bool>(note_open_id))
+                    .unwrap_or(false);
                 ui.horizontal(|ui| {
                     if row.imported {
                         ui.label(
@@ -671,6 +675,26 @@ fn pin_side_editor(
                         .on_hover_text(
                             "Move this pin to another side — the pin and its number are kept",
                         );
+                    // ── The board's note on this pad, shown in the pin panel.
+                    // A kit's notes name its own solder bridges, so a copy
+                    // saved as another board must be able to see and drop them.
+                    let has_note = !row.note.trim().is_empty();
+                    let icon = egui::RichText::new(ph::NOTE_PENCIL).size(11.0);
+                    let icon = if has_note {
+                        icon.color(egui::Color32::from_rgb(230, 205, 130))
+                    } else {
+                        icon
+                    };
+                    let hover = if has_note {
+                        format!("Board note, shown in the pin panel:\n\n{}", row.note)
+                    } else {
+                        "Add a board note: what the BOARD does to this pad (a solder bridge, \
+                         a resistor, a pin the debugger drives). Shown in the pin panel."
+                            .to_owned()
+                    };
+                    if ui.selectable_label(note_open, icon).on_hover_text(hover).clicked() {
+                        note_open = !note_open;
+                    }
                     if ui
                         .button(egui::RichText::new(ph::TRASH).size(11.0))
                         .on_hover_text("Remove this pin")
@@ -679,6 +703,15 @@ fn pin_side_editor(
                         remove = Some(i);
                     }
                 });
+                if note_open {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut row.note)
+                            .desired_rows(2)
+                            .desired_width(560.0)
+                            .hint_text("What the board does to this pad…"),
+                    );
+                }
+                ui.data_mut(|d| d.insert_temp(note_open_id, note_open));
             }
             if let Some(i) = remove {
                 rows.remove(i);

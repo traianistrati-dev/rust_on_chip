@@ -134,6 +134,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Also SWO / TRACEDATA[0], wired to the interface MCU through SB27 (closed by default; SB26 on v1.x boards) - cut it to isolate the pin.",
             ),
             PinDef(
                 number: 24,
@@ -255,6 +256,7 @@ McuDefinition(
                     GpioOutput,
                     UsartTx(0),
                 ],
+                note: "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR.",
             ),
             PinDef(
                 number: 27,
@@ -264,6 +266,7 @@ McuDefinition(
                     GpioInput,
                     UsartRx(0),
                 ],
+                note: "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR.",
             ),
             PinDef(
                 number: 28,
@@ -273,6 +276,7 @@ McuDefinition(
                     GpioInput,
                     UsartCts(0),
                 ],
+                note: "VCOM CTS: tri-stated until a terminal sends DTR; once flow control is detected the interface MCU drives it until a power-on reset or a new DTR.",
             ),
             PinDef(
                 number: 29,
@@ -282,24 +286,28 @@ McuDefinition(
                     GpioOutput,
                     UsartRts(0),
                 ],
+                note: "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR.",
             ),
             PinDef(
                 number: 30,
                 name: "P0.00 (XL1, 32.768 kHz)",
                 reserved: true,
                 functions: [],
+                note: "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4.",
             ),
             PinDef(
                 number: 31,
                 name: "P0.01 (XL2, 32.768 kHz)",
                 reserved: true,
                 functions: [],
+                note: "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4.",
             ),
             PinDef(
                 number: 32,
                 name: "P0.21 (RESET)",
                 reserved: true,
                 functions: [],
+                note: "Goes to the interface MCU through SB26 (closed by default; SB27 on v1.x boards). The Arduino RESET pin is NOT this pin by default: SB17 and SB43 are open.",
             ),
         ],
         bottom: [],
@@ -498,6 +506,7 @@ McuDefinition(
                         channel: 4,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 4,
@@ -563,6 +572,7 @@ McuDefinition(
                         channel: 5,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 5,
@@ -628,6 +638,7 @@ McuDefinition(
                         channel: 6,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 6,
@@ -693,6 +704,7 @@ McuDefinition(
                         channel: 7,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 7,
@@ -819,6 +831,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO.",
             ),
             PinDef(
                 number: 9,
@@ -880,6 +893,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO.",
             ),
         ],
         right: [
@@ -1309,6 +1323,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 17,
@@ -1371,6 +1386,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 18,
@@ -1433,6 +1449,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 19,
@@ -1495,6 +1512,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 20,
@@ -1558,6 +1576,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
             PinDef(
                 number: 21,
@@ -1621,6 +1640,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.",
             ),
         ],
         grid: None,

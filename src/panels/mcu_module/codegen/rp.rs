@@ -2549,6 +2549,7 @@ pub(super) mod pico2_ice_board {
             functions,
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         }
     }
 

@@ -64,6 +64,7 @@ mod tests {
             io_mode: None,
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         }
     }
 

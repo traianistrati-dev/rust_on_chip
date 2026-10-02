@@ -334,6 +334,7 @@ McuDefinition(
                 functions: [
                     GpioInput,
                 ],
+                note: "Also TRACEDATA[3] and SPIM4\'s dedicated SCK: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX).",
             ),
             PinDef(
                 number: 36,
@@ -342,6 +343,7 @@ McuDefinition(
                 functions: [
                     GpioInput,
                 ],
+                note: "Also TRACEDATA[2] and SPIM4\'s dedicated MOSI: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX).",
             ),
             PinDef(
                 number: 37,
@@ -400,6 +402,7 @@ McuDefinition(
                         bank: 1,
                     ),
                 ],
+                note: "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23.",
             ),
             PinDef(
                 number: 42,
@@ -408,6 +411,7 @@ McuDefinition(
                 functions: [
                     QspiClk,
                 ],
+                note: "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21.",
             ),
             PinDef(
                 number: 43,
@@ -419,6 +423,7 @@ McuDefinition(
                         lane: 0,
                     ),
                 ],
+                note: "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22.",
             ),
             PinDef(
                 number: 44,
@@ -430,6 +435,7 @@ McuDefinition(
                         lane: 1,
                     ),
                 ],
+                note: "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24.",
             ),
             PinDef(
                 number: 45,
@@ -441,6 +447,7 @@ McuDefinition(
                         lane: 2,
                     ),
                 ],
+                note: "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25.",
             ),
             PinDef(
                 number: 46,
@@ -452,6 +459,7 @@ McuDefinition(
                         lane: 3,
                     ),
                 ],
+                note: "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20.",
             ),
             PinDef(
                 number: 47,
@@ -474,12 +482,14 @@ McuDefinition(
                 name: "P0.00 (XL1, 32.768 kHz)",
                 reserved: true,
                 functions: [],
+                note: "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4.",
             ),
             PinDef(
                 number: 50,
                 name: "P0.01 (XL2, 32.768 kHz)",
                 reserved: true,
                 functions: [],
+                note: "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4.",
             ),
         ],
         bottom: [],
@@ -1223,6 +1233,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Serial port 0 (VCOM0) CTS, also TRACEDATA[1] and SPIM4\'s dedicated 32 Mbps MISO. Set SW7 (serial port 0 flow control) OFF to use it for trace.",
             ),
             PinDef(
                 number: 9,
@@ -1312,6 +1323,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Serial port 0 (VCOM0) RTS, also TRACEDATA[0] / SWO and SPIM4\'s dedicated 32 Mbps CSN. Set SW7 (serial port 0 flow control) OFF to use it for trace.",
             ),
             PinDef(
                 number: 10,
@@ -1401,6 +1413,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "TRACECLK, and SPIM4\'s dedicated DCX: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX).",
             ),
             PinDef(
                 number: 11,
@@ -1490,6 +1503,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO.",
             ),
             PinDef(
                 number: 12,
@@ -1579,6 +1593,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO.",
             ),
         ],
         right: [
@@ -1670,6 +1685,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Serial port 0 (VCOM0) RXD. Zephyr\'s stock app-core board hands it to the network core, which uses it as its console.",
             ),
             PinDef(
                 number: 14,
@@ -1759,6 +1775,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Serial port 0 (VCOM0) TXD. Zephyr\'s stock app-core board hands it to the network core, which uses it as its console.",
             ),
             PinDef(
                 number: 15,
@@ -2921,6 +2938,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "With P1.03, the nRF5340\'s only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off.",
             ),
             PinDef(
                 number: 28,
@@ -3012,6 +3030,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "With P1.02, the nRF5340\'s only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off.",
             ),
         ],
         grid: None,

@@ -406,7 +406,7 @@ mod emit_for_manual_compile {
         // supply it too, or it tests a project shape the app never produces.
         let pins_mod = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_embassy_check");
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &pins_mod, "", "").expect("write project");
         println!("wrote {}", dir.display());
         println!("target: {}", def.project.target);
@@ -429,7 +429,7 @@ mod emit_for_manual_compile {
             &[],
         );
         let adir = std::env::temp_dir().join("eide_embassy_check_async");
-        let _ = std::fs::remove_dir_all(&adir);
+        project_gen::clear_project_dir_keep_target(&adir);
         project_gen::write_project(&adir, &files, &mcu.pin_tree_files(), "", "")
             .expect("write async project");
         println!("wrote {}", adir.display());
@@ -469,7 +469,7 @@ mod emit_for_manual_compile {
         );
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let udir = std::env::temp_dir().join("eide_embassy_check_usart");
-        let _ = std::fs::remove_dir_all(&udir);
+        project_gen::clear_project_dir_keep_target(&udir);
         project_gen::write_project(&udir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write usart project");
         println!("wrote {}", udir.display());
@@ -594,7 +594,7 @@ mod emit_for_manual_compile {
         assert!(mcu.with_i2c_devices(&[("imu", 0x68)]));
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let ddir = std::env::temp_dir().join("eide_embassy_check_dma");
-        let _ = std::fs::remove_dir_all(&ddir);
+        project_gen::clear_project_dir_keep_target(&ddir);
         project_gen::write_project(&ddir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write dma project");
         println!("wrote {}", ddir.display());
@@ -664,7 +664,7 @@ mod emit_for_manual_compile {
         );
         let f2user: Vec<(String, String)> = f2mcu.pin_tree_files();
         let f2dir = std::env::temp_dir().join("eide_embassy_check_dma_f2");
-        let _ = std::fs::remove_dir_all(&f2dir);
+        project_gen::clear_project_dir_keep_target(&f2dir);
         project_gen::write_project(&f2dir, &f2files, &f2user, &f2mcu.mcu_config_text(), "")
             .expect("write f2 dma project");
         println!("wrote {}", f2dir.display());
@@ -728,7 +728,7 @@ mod emit_for_manual_compile {
         );
         let f7user: Vec<(String, String)> = f7mcu.pin_tree_files();
         let f7dir = std::env::temp_dir().join("eide_embassy_check_dma_f7");
-        let _ = std::fs::remove_dir_all(&f7dir);
+        project_gen::clear_project_dir_keep_target(&f7dir);
         project_gen::write_project(&f7dir, &f7files, &f7user, &f7mcu.mcu_config_text(), "")
             .expect("write f7 dma project");
         println!("wrote {}", f7dir.display());
@@ -775,7 +775,7 @@ mod emit_for_manual_compile {
             );
             let wuser: Vec<(String, String)> = w.pin_tree_files();
             let wdir = std::env::temp_dir().join("eide_embassy_check_wdg");
-            let _ = std::fs::remove_dir_all(&wdir);
+            project_gen::clear_project_dir_keep_target(&wdir);
             project_gen::write_project(&wdir, &wfiles, &wuser, &w.mcu_config_text(), "")
                 .expect("write watchdog project");
             println!("wrote {}", wdir.display());
@@ -816,7 +816,7 @@ mod emit_for_manual_compile {
             let wfiles = project_gen::build_project_files(&wdef.project, &wdef.toolchain, &w_main);
             let wuser: Vec<(String, String)> = w.pin_tree_files();
             let bdir = std::env::temp_dir().join("eide_wba_check_wdg");
-            let _ = std::fs::remove_dir_all(&bdir);
+            project_gen::clear_project_dir_keep_target(&bdir);
             project_gen::write_project(&bdir, &wfiles, &wuser, &w.mcu_config_text(), "")
                 .expect("write wba watchdog project");
             println!("wrote {}", bdir.display());
@@ -872,7 +872,7 @@ mod emit_for_manual_compile {
         );
         let user: Vec<(String, String)> = m1.pin_tree_files();
         let f1dir = std::env::temp_dir().join("eide_f1_check_usart");
-        let _ = std::fs::remove_dir_all(&f1dir);
+        project_gen::clear_project_dir_keep_target(&f1dir);
         project_gen::write_project(&f1dir, &files, &user, &m1.mcu_config_text(), "")
             .expect("write f1 project");
         println!("wrote {}", f1dir.display());
@@ -1037,7 +1037,7 @@ mod emit_for_manual_compile {
         );
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_comp_check");
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write comp project");
         println!("wrote {} ({})", dir.display(), def.display_name);
@@ -1385,7 +1385,7 @@ mod emit_for_manual_compile {
         );
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_f1_check_dma");
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write f1 dma project");
         println!("wrote {}", dir.display());
@@ -1569,7 +1569,7 @@ mod emit_for_manual_compile {
                      is_async: bool| {
             let user = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
-            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, files, &user, &mcu.mcu_config_text(), "")
                 .expect("write f1 project");
             let toml_path = dir.join("Cargo.toml");
@@ -1751,7 +1751,7 @@ mod emit_for_manual_compile {
             project_gen::ensure_rtic_deps(&files.cargo_toml, true, &f1.project.target, &[&main_rs]);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_f1_check_rtic");
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write f1 rtic project");
         println!("wrote {}", dir.display());
@@ -1874,7 +1874,7 @@ mod emit_for_manual_compile {
         );
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_f1_check_native");
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write f1 native project");
         println!("wrote {}", dir.display());
@@ -2086,7 +2086,7 @@ mod emit_for_manual_compile {
         }
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join(format!("eide_esp_check_{chip}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write esp project");
         println!("wrote {}", dir.display());
@@ -2149,7 +2149,7 @@ mod emit_for_manual_compile {
         // never produces - and fails on the one file it forgot.
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_n6_check");
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write n6 project");
         println!("wrote {} ({})", dir.display(), def.display_name);
@@ -2726,7 +2726,7 @@ mod emit_for_manual_compile {
             project_gen::ensure_m0_atomics(&files.cargo_toml, true, &def.project.target, &[]);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_dma_check");
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write dma project");
         println!("wrote {} ({})", dir.display(), def.display_name);

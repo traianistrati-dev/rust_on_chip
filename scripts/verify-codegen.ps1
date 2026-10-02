@@ -492,6 +492,17 @@ foreach ($c in $cases) {
 
     Set-Location $repo
     $out = cargo test --bins $c.t -- --ignored --nocapture 2>&1
+    # The test binary itself did not build - an unfinished edit elsewhere in
+    # the repo, typically. Without this it fell through to "NO SUCH TEST",
+    # which sends whoever reads it hunting for a renamed harness: on
+    # 2026-10-02 the last two cases of a run "lost" their tests to a half-done
+    # struct field in src/lsp.rs while the rest of the matrix was green.
+    if ($out | Select-String -Pattern "^error: could not compile") {
+        $why = $out | Select-String -Pattern "^error(\[E\d+\])?:" | Select-Object -First 1
+        $results += [pscustomobject]@{ Case = $c.n; Status = "HARNESS COMPILE FAILED"; Detail = "$($why.Line.Trim()) - is someone editing the repo?" }
+        Write-Host ("  {0,-34} HARNESS COMPILE FAILED" -f $c.n) -ForegroundColor Red
+        continue
+    }
     if ($out | Select-String -Pattern "panicked at|test result: FAILED") {
         $results += [pscustomobject]@{ Case = $c.n; Status = "EMIT FAILED"; Detail = "the harness's own assertions" }
         continue

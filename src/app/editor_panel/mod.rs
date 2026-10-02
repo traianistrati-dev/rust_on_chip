@@ -57,6 +57,7 @@ mod generics;
 mod idle_sync;
 pub(crate) mod impl_picker;
 pub(super) mod inlay_hint;
+mod macro_uses;
 mod kbd_scope;
 mod let_annotation;
 mod move_lines;

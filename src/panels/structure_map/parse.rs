@@ -833,7 +833,7 @@ fn scan_items(text: &str) -> (usize, usize, Vec<SymbolItem>, Vec<(usize, usize, 
 /// angle-bracket depth 0: `<const N: usize> Parser<N> {` → `Parser`,
 /// ` Frame for HmmdFrame {` → `HmmdFrame`, ` fmt::Display for Config` →
 /// `Config` (last path segment; `impl Trait for Type` targets the TYPE).
-fn impl_target_name(rest: &str) -> Option<String> {
+pub(crate) fn impl_target_name(rest: &str) -> Option<String> {
     // Flatten to the angle-depth-0 text, stopping at the body brace.
     let mut flat = String::new();
     let mut depth = 0i32;

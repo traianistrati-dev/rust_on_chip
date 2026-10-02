@@ -1859,11 +1859,12 @@ fn write_bytes_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Empty a harness's project directory for a fresh write, but keep its
 /// `target/`.
 ///
-/// The emit harnesses used to `remove_dir_all` the whole directory, which also
-/// threw away every compiled dependency, so the matrix rebuilt embassy-nrf or
-/// rp-hal from scratch on EVERY run: the nRF row took 601 s warm or cold, ~40 s
-/// a project. Everything the IDE writes is removed - a config file a previous
-/// run emitted must not survive into this one - and only the build cache stays.
+/// Every emit harness the verification matrix runs used to `remove_dir_all`
+/// the whole directory, which also threw away every compiled dependency, so
+/// each run rebuilt embassy-stm32, esp-hal, rp-hal or embassy-nrf from
+/// scratch: the nRF row took 601 s warm or cold, ~40 s a project. Everything
+/// the IDE writes is removed - a config file a previous run emitted must not
+/// survive into this one - and only the build cache stays.
 #[cfg(test)]
 pub(crate) fn clear_project_dir_keep_target(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {

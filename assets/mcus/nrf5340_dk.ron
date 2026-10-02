@@ -345,7 +345,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 37,
-                name: "P0.20 (VCOM TXD)",
+                name: "P0.20 (VCOM2 TXD)",
                 reserved: false,
                 functions: [
                     GpioOutput,
@@ -357,7 +357,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 38,
-                name: "P0.22 (VCOM RXD)",
+                name: "P0.22 (VCOM2 RXD)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -369,7 +369,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 39,
-                name: "P0.21 (VCOM CTS)",
+                name: "P0.21 (VCOM2 CTS)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -381,7 +381,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 40,
-                name: "P0.19 (VCOM RTS)",
+                name: "P0.19 (VCOM2 RTS)",
                 reserved: false,
                 functions: [
                     GpioOutput,
@@ -1137,7 +1137,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 8,
-                name: "P0.10",
+                name: "P0.10 (VCOM0 CTS)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -1226,7 +1226,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 9,
-                name: "P0.11",
+                name: "P0.11 (VCOM0 RTS)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -1584,7 +1584,7 @@ McuDefinition(
         right: [
             PinDef(
                 number: 13,
-                name: "P1.00 (D0)",
+                name: "P1.00 (D0, VCOM0 RXD)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -1673,7 +1673,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 14,
-                name: "P1.01 (D1)",
+                name: "P1.01 (D1, VCOM0 TXD)",
                 reserved: false,
                 functions: [
                     GpioInput,

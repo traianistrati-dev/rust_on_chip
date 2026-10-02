@@ -24,7 +24,7 @@ McuDefinition(
     pins: PinLayout(
         top: [
             PinDef(
-                number: 18,
+                number: 16,
                 name: "P2.09 (LED0, active HIGH)",
                 reserved: false,
                 functions: [
@@ -32,7 +32,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 19,
+                number: 17,
                 name: "P1.10 (LED1, active HIGH)",
                 reserved: false,
                 functions: [
@@ -88,7 +88,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 20,
+                number: 18,
                 name: "P2.07 (LED2, active HIGH)",
                 reserved: false,
                 functions: [
@@ -96,7 +96,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 21,
+                number: 19,
                 name: "P1.14 (LED3, AIN7, active HIGH)",
                 reserved: false,
                 functions: [
@@ -152,7 +152,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 22,
+                number: 20,
                 name: "P1.13 (BUTTON0, active LOW)",
                 reserved: false,
                 functions: [
@@ -160,7 +160,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 23,
+                number: 21,
                 name: "P1.09 (BUTTON1, active LOW)",
                 reserved: false,
                 functions: [
@@ -168,7 +168,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 24,
+                number: 22,
                 name: "P1.08 (BUTTON2, active LOW)",
                 reserved: false,
                 functions: [
@@ -176,7 +176,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 25,
+                number: 23,
                 name: "P0.04 (BUTTON3, active LOW)",
                 reserved: false,
                 functions: [
@@ -184,8 +184,44 @@ McuDefinition(
                 ],
             ),
             PinDef(
+                number: 24,
+                name: "P0.00 (VCOM0 TXD)",
+                reserved: false,
+                functions: [
+                    GpioOutput,
+                    UsartTx(30),
+                ],
+            ),
+            PinDef(
+                number: 25,
+                name: "P0.01 (VCOM0 RXD)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    UsartRx(30),
+                ],
+            ),
+            PinDef(
                 number: 26,
-                name: "P1.04 (VCOM0 TXD, AIN0)",
+                name: "P0.03 (VCOM0 CTS)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    UsartCts(30),
+                ],
+            ),
+            PinDef(
+                number: 27,
+                name: "P0.02 (VCOM0 RTS)",
+                reserved: false,
+                functions: [
+                    GpioOutput,
+                    UsartRts(30),
+                ],
+            ),
+            PinDef(
+                number: 28,
+                name: "P1.04 (VCOM1 TXD, AIN0)",
                 reserved: false,
                 functions: [
                     GpioOutput,
@@ -195,8 +231,8 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 27,
-                name: "P1.05 (VCOM0 RXD, AIN1)",
+                number: 29,
+                name: "P1.05 (VCOM1 RXD, AIN1)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -206,8 +242,8 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 28,
-                name: "P1.07 (VCOM0 CTS, AIN3)",
+                number: 30,
+                name: "P1.07 (VCOM1 CTS, AIN3)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -217,8 +253,8 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 29,
-                name: "P1.06 (VCOM0 RTS, AIN2)",
+                number: 31,
+                name: "P1.06 (VCOM1 RTS, AIN2)",
                 reserved: false,
                 functions: [
                     GpioOutput,
@@ -228,49 +264,13 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 30,
-                name: "P0.00 (VCOM1 TXD)",
-                reserved: false,
-                functions: [
-                    GpioOutput,
-                    UsartTx(30),
-                ],
-            ),
-            PinDef(
-                number: 31,
-                name: "P0.01 (VCOM1 RXD)",
-                reserved: false,
-                functions: [
-                    GpioInput,
-                    UsartRx(30),
-                ],
-            ),
-            PinDef(
                 number: 32,
-                name: "P0.03 (VCOM1 CTS)",
-                reserved: false,
-                functions: [
-                    GpioInput,
-                    UsartCts(30),
-                ],
-            ),
-            PinDef(
-                number: 33,
-                name: "P0.02 (VCOM1 RTS)",
-                reserved: false,
-                functions: [
-                    GpioOutput,
-                    UsartRts(30),
-                ],
-            ),
-            PinDef(
-                number: 34,
                 name: "P1.00 (XL1, 32.768 kHz)",
                 reserved: true,
                 functions: [],
             ),
             PinDef(
-                number: 35,
+                number: 33,
                 name: "P1.01 (XL2, 32.768 kHz)",
                 reserved: true,
                 functions: [],
@@ -280,82 +280,7 @@ McuDefinition(
         left: [
             PinDef(
                 number: 1,
-                name: "P1.11 (AIN4, SDA)",
-                reserved: false,
-                functions: [
-                    GpioInput,
-                    GpioOutput,
-                    UsartTx(20),
-                    UsartRx(20),
-                    UsartCts(20),
-                    UsartRts(20),
-                    UsartTx(21),
-                    UsartRx(21),
-                    UsartCts(21),
-                    UsartRts(21),
-                    UsartTx(22),
-                    UsartRx(22),
-                    UsartCts(22),
-                    UsartRts(22),
-                    I2cSda(21),
-                    I2cSda(22),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 3,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 3,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 3,
-                    ),
-                    AdcChannel(
-                        adc: 0,
-                        channel: 4,
-                    ),
-                ],
-            ),
-            PinDef(
-                number: 2,
-                name: "P1.12 (AIN5, SCL)",
+                name: "P1.11 (AIN4, SCL)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -424,150 +349,87 @@ McuDefinition(
                     ),
                     AdcChannel(
                         adc: 0,
+                        channel: 4,
+                    ),
+                ],
+            ),
+            PinDef(
+                number: 2,
+                name: "P1.12 (AIN5, SDA)",
+                reserved: false,
+                functions: [
+                    GpioInput,
+                    GpioOutput,
+                    UsartTx(20),
+                    UsartRx(20),
+                    UsartCts(20),
+                    UsartRts(20),
+                    UsartTx(21),
+                    UsartRx(21),
+                    UsartCts(21),
+                    UsartRts(21),
+                    UsartTx(22),
+                    UsartRx(22),
+                    UsartCts(22),
+                    UsartRts(22),
+                    I2cSda(21),
+                    I2cSda(22),
+                    TimerPwm(
+                        timer: 20,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 20,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 20,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 20,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 21,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 21,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 21,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 21,
+                        channel: 3,
+                    ),
+                    TimerPwm(
+                        timer: 22,
+                        channel: 0,
+                    ),
+                    TimerPwm(
+                        timer: 22,
+                        channel: 1,
+                    ),
+                    TimerPwm(
+                        timer: 22,
+                        channel: 2,
+                    ),
+                    TimerPwm(
+                        timer: 22,
+                        channel: 3,
+                    ),
+                    AdcChannel(
+                        adc: 0,
                         channel: 5,
                     ),
                 ],
             ),
             PinDef(
                 number: 3,
-                name: "P1.15",
-                reserved: false,
-                functions: [
-                    GpioInput,
-                    GpioOutput,
-                    UsartTx(20),
-                    UsartRx(20),
-                    UsartCts(20),
-                    UsartRts(20),
-                    UsartTx(21),
-                    UsartRx(21),
-                    UsartCts(21),
-                    UsartRts(21),
-                    UsartTx(22),
-                    UsartRx(22),
-                    UsartCts(22),
-                    UsartRts(22),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 3,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 3,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 3,
-                    ),
-                ],
-            ),
-            PinDef(
-                number: 4,
-                name: "P1.16",
-                reserved: false,
-                functions: [
-                    GpioInput,
-                    GpioOutput,
-                    UsartTx(20),
-                    UsartRx(20),
-                    UsartCts(20),
-                    UsartRts(20),
-                    UsartTx(21),
-                    UsartRx(21),
-                    UsartCts(21),
-                    UsartRts(21),
-                    UsartTx(22),
-                    UsartRx(22),
-                    UsartCts(22),
-                    UsartRts(22),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 20,
-                        channel: 3,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 21,
-                        channel: 3,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 0,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 1,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 2,
-                    ),
-                    TimerPwm(
-                        timer: 22,
-                        channel: 3,
-                    ),
-                ],
-            ),
-            PinDef(
-                number: 5,
                 name: "P1.02 (NFC1)",
                 reserved: false,
                 functions: [
@@ -636,7 +498,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 6,
+                number: 4,
                 name: "P1.03 (NFC2)",
                 reserved: false,
                 functions: [
@@ -705,7 +567,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 7,
+                number: 5,
                 name: "P0.05",
                 reserved: false,
                 functions: [
@@ -718,7 +580,7 @@ McuDefinition(
                 ],
             ),
             PinDef(
-                number: 8,
+                number: 6,
                 name: "P0.06",
                 reserved: false,
                 functions: [
@@ -733,122 +595,92 @@ McuDefinition(
         ],
         right: [
             PinDef(
-                number: 9,
-                name: "P2.00 (FLASH WP)",
+                number: 7,
+                name: "P2.00 (FLASH HOLD)",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
-                    UsartTx(0),
                     UsartRx(0),
-                    UsartCts(0),
-                    UsartRts(0),
                 ],
             ),
             PinDef(
-                number: 10,
+                number: 8,
                 name: "P2.01 (FLASH SCK)",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
-                    UsartTx(0),
-                    UsartRx(0),
-                    UsartCts(0),
-                    UsartRts(0),
                     SpiSck(0),
                 ],
             ),
             PinDef(
-                number: 11,
+                number: 9,
                 name: "P2.02 (FLASH MOSI)",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
                     UsartTx(0),
-                    UsartRx(0),
-                    UsartCts(0),
-                    UsartRts(0),
                     SpiMosi(0),
                 ],
             ),
             PinDef(
-                number: 12,
-                name: "P2.03 (FLASH HOLD)",
+                number: 10,
+                name: "P2.03 (FLASH WP)",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
-                    UsartTx(0),
-                    UsartRx(0),
-                    UsartCts(0),
-                    UsartRts(0),
                 ],
             ),
             PinDef(
-                number: 13,
+                number: 11,
                 name: "P2.04 (FLASH MISO)",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
-                    UsartTx(0),
-                    UsartRx(0),
                     UsartCts(0),
-                    UsartRts(0),
                     SpiMiso(0),
                 ],
             ),
             PinDef(
-                number: 14,
+                number: 12,
                 name: "P2.05 (FLASH CS)",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
-                    UsartTx(0),
-                    UsartRx(0),
-                    UsartCts(0),
                     UsartRts(0),
                 ],
             ),
             PinDef(
-                number: 15,
+                number: 13,
                 name: "P2.06",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
-                    UsartTx(0),
-                    UsartRx(0),
-                    UsartCts(0),
-                    UsartRts(0),
                 ],
             ),
             PinDef(
-                number: 16,
+                number: 14,
                 name: "P2.08",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
                     UsartTx(0),
-                    UsartRx(0),
-                    UsartCts(0),
-                    UsartRts(0),
                 ],
             ),
             PinDef(
-                number: 17,
+                number: 15,
                 name: "P2.10",
                 reserved: false,
                 functions: [
                     GpioInput,
                     GpioOutput,
-                    UsartTx(0),
-                    UsartRx(0),
-                    UsartCts(0),
                     UsartRts(0),
                 ],
             ),

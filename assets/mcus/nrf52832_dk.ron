@@ -25,7 +25,7 @@ McuDefinition(
         top: [
             PinDef(
                 number: 22,
-                name: "P0.17 (LED1, D6, active LOW)",
+                name: "P0.17 (LED1, D6, I/O expander INT, active LOW)",
                 reserved: false,
                 functions: [
                     GpioOutput,
@@ -1498,7 +1498,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 20,
-                name: "P0.26 (SDA)",
+                name: "P0.26 (SDA, I/O expander 0x20)",
                 reserved: false,
                 functions: [
                     GpioInput,
@@ -1561,7 +1561,7 @@ McuDefinition(
             ),
             PinDef(
                 number: 21,
-                name: "P0.27 (SCL)",
+                name: "P0.27 (SCL, I/O expander 0x20)",
                 reserved: false,
                 functions: [
                     GpioInput,

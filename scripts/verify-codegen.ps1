@@ -32,10 +32,13 @@
 [CmdletBinding()]
 param(
     [switch]$Full,
-    # One representative case per named family (f1, esp, rp, nrf, embassy,
-    # import, n6) — what the pre-push hook runs. The full set stays a deliberate act:
-    # a gate that costs twenty minutes is a gate people turn off, and this repo
-    # already has the scar (`git push --no-verify`) to prove it.
+    # EVERY case of the named families (f1, esp, rp, nrf, embassy, import, n6) -
+    # what the pre-push hook runs for a push confined to them. It used to be one
+    # representative case per family, because a family cost minutes per case:
+    # each harness deleted its project's target/ and rebuilt every dependency.
+    # With the cache kept, a whole family costs 0.5-3.5 minutes warm (F1's 21
+    # cases 146 s, ESP's 14 179 s, measured 2026-10-02), so the hook no longer
+    # has to guess which case stands for the rest.
     #
     # Names it does not recognise are an ERROR, not an empty run. A hook that
     # silently verified nothing would be worse than no hook at all.
@@ -231,7 +234,7 @@ $CUBE_DB = if ($env:EIDE_CUBE_DB) { $env:EIDE_CUBE_DB }
 # link evaluates the assert. It costs a codegen pass per project, so only the
 # rows whose risk IS the layout carry it.
 $ALL_CASES = @(
-    @{ n = "F1 blocking, full wiring";     t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off" };  q = $true; fam = "f1"; hk = $true }
+    @{ n = "F1 blocking, full wiring";     t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off" };  q = $true; fam = "f1" }
     @{ n = "F1 blocking, DMA tx";          t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "tx" };   q = $false; fam = "f1" }
     @{ n = "F1 blocking, DMA rx";          t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "rx" };   q = $false; fam = "f1" }
     @{ n = "F1 blocking, DMA both";        t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "both" }; q = $true; fam = "f1" }
@@ -253,7 +256,7 @@ $ALL_CASES = @(
     # The F1 on embassy-stm32: every bus pin carries the AFIO remap, the timer
     # names its own, and the manifest is swapped by the same chain `app.rs`
     # runs. Linked, because 64 KiB of flash is the F103C8's real limit.
-    @{ n = "F1 Async, default pads";       t = "emit_f1_async_project";  e = @{};                       q = $true; fam = "f1"; lk = $true; hk = $true }
+    @{ n = "F1 Async, default pads";       t = "emit_f1_async_project";  e = @{};                       q = $true; fam = "f1"; lk = $true }
     @{ n = "F1 Async, remapped, all DMA";  t = "emit_f1_async_project";  e = @{ EIDE_F1_ASYNC_REMAP = "1"; EIDE_F1_ASYNC_DMA = "1" }; q = $true; fam = "f1"; lk = $true }
     @{ n = "F1 Async -> Blocking switch";  t = "emit_f1_async_project";  e = @{ EIDE_F1_SWITCH = "back" }; q = $false; fam = "f1" }
     @{ n = "F1 RTIC";                      t = "emit_f1_rtic_project";   e = @{};                       q = $true; fam = "f1" }
@@ -271,7 +274,7 @@ $ALL_CASES = @(
     # The async arm now says so out loud instead of relying on a default, which
     # is what let the mistake hide.
     @{ n = "ESP32-C3 blocking";            t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking" }; q = $true; fam = "esp" }
-    @{ n = "ESP32-C3 async (esp-rtos)";    t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async" }; q = $true; fam = "esp"; hk = $true }
+    @{ n = "ESP32-C3 async (esp-rtos)";    t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async" }; q = $true; fam = "esp" }
     # The pull rides on the two runtimes that emit it. Two arms and not six:
     # `Pull::Up` and `Pull::Down` differ from `Pull::None` only in the variant
     # named, and the variants are checked by esp-hal - one of each per runtime
@@ -329,7 +332,7 @@ $ALL_CASES = @(
     # PWM with no frequency). Same reason as the Pico row: the HAL calls were
     # read from nrf-hal-common's source, and the type-state on `Clocks` plus
     # the degraded-vs-typed pin split are things only a compiler settles.
-    @{ n = "BBC micro:bit v2 x2";          t = "emit_nrf_project";           e = @{};                       q = $true; fam = "nrf"; hk = $true }
+    @{ n = "BBC micro:bit v2 x2";          t = "emit_nrf_project";           e = @{};                       q = $true; fam = "nrf" }
 
     # The same board on embassy-nrf, TWO projects again: every peripheral on
     # the default branches, and one on the others (crystal HFCLK, synthesized
@@ -339,7 +342,7 @@ $ALL_CASES = @(
     # with no frequency). Both projects are reached through a runtime SWITCH
     # from the blocking one, the path a user takes: main.rs keeps the header
     # the two runtimes share, and Cargo.toml has its HAL crate swapped.
-    @{ n = "BBC micro:bit v2 async x2";    t = "emit_nrf_async_project";     e = @{};                       q = $true; fam = "nrf"; hk = $true }
+    @{ n = "BBC micro:bit v2 async x2";    t = "emit_nrf_async_project";     e = @{};                       q = $true; fam = "nrf" }
 
     # The rest of the nRF52 family, TEN projects on two targets: Nordic's two
     # kits on both runtimes, and the small parts on the nRF52 DK the way the
@@ -361,7 +364,7 @@ $ALL_CASES = @(
     # to delete `target/` along with the project); with the cache kept the row
     # costs ~70 s warm, and the micro:bit rows alone told the hook nothing
     # about the other eight parts.
-    @{ n = "nRF52 + nRF5340 + nRF54L15 x14"; t = "emit_nrf_family_projects"; e = @{};                     q = $true; fam = "nrf"; hk = $true }
+    @{ n = "nRF52 + nRF5340 + nRF54L15 x14"; t = "emit_nrf_family_projects"; e = @{};                     q = $true; fam = "nrf" }
 
     # The same two boards on embassy-rp, which is a DIFFERENT HAL crate, not a
     # feature of the first one. Every bus is wired, because that is where the
@@ -382,7 +385,7 @@ $ALL_CASES = @(
     # Blocking one on the RP2350. It is the first config file this backend ever
     # wrote, so the harness now writes what `config_files` returns instead of
     # an empty `configs/mod.rs`.
-    @{ n = "Raspberry Pi Pico async x3";   t = "emit_rp_async_project";      e = @{};                       q = $true; fam = "rp"; hk = $true; lk = $true }
+    @{ n = "Raspberry Pi Pico async x3";   t = "emit_rp_async_project";      e = @{};                       q = $true; fam = "rp"; lk = $true }
 
 
     # The two W boards, whose on-board LED is not on the chip at all - it is
@@ -418,7 +421,7 @@ $ALL_CASES = @(
     #
     # The harness still WRITES all nine: writing is free, `cargo check` is not,
     # and a harness that emits less under a flag is a harness that can rot.
-    @{ n = "embassy (9 projects)";         t = "emit_embassy_project";       e = @{};                       q = $true; fam = "embassy"; hk = $true
+    @{ n = "embassy (9 projects)";         t = "emit_embassy_project";       e = @{};                       q = $true; fam = "embassy"
        only = @("eide_embassy_check_dma", "eide_embassy_check_async", "eide_embassy_check_dma_f2", "eide_wba_check_wdg") }
 
     # These two build from a REAL part in the vendor database rather than from a
@@ -426,7 +429,7 @@ $ALL_CASES = @(
     # output — channel names, interrupt names, the `bind_interrupts!` grouping.
     # `p` is what they need; without it they are skipped, not failed, because a
     # machine without the database is a normal machine.
-    @{ n = "imported chip, async DMA";     t = "emit_imported_dma_project";  e = @{}; q = $true; p = $CUBE_DB; fam = "import"; hk = $true }
+    @{ n = "imported chip, async DMA";     t = "emit_imported_dma_project";  e = @{}; q = $true; p = $CUBE_DB; fam = "import" }
     @{ n = "imported chip, comparators";   t = "emit_comp_project";          e = @{}; q = $true; p = $CUBE_DB; fam = "import" }
 
     # STM32N6 — the first family whose clock block does not come from the
@@ -434,7 +437,7 @@ $ALL_CASES = @(
     # through the `x`+suffix rule, and an RCC block with four-PLL types in it:
     # three separate derivations that were each wrong until this project was
     # emitted end to end.
-    @{ n = "STM32N6 clock + project";      t = "emit_n6_project";            e = @{}; q = $true; p = $CUBE_DB; fam = "n6"; hk = $true }
+    @{ n = "STM32N6 clock + project";      t = "emit_n6_project";            e = @{}; q = $true; p = $CUBE_DB; fam = "n6" }
 
     # Not a project: a VERDICT (`v`). STM32WL30 is the chip the import preflight
     # was written for — `embassy-stm32` publishes no `stm32wl3*` feature, its
@@ -458,6 +461,13 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG")
 
+# The hook passes its families as ONE comma-joined argument ("embassy,f1"), and
+# `powershell -File` binds that to [string[]] as a single element - it does not
+# split on commas the way an interactive call does. Unsplit, it was an "unknown
+# family", exit 2, and every push touching two families was refused. Split
+# here, so both `-Hook a,b` and `-Hook "a,b"` mean the same.
+$Hook = @($Hook | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
 if ($Hook.Count -gt 0) {
     $known = $ALL_CASES | ForEach-Object { $_.fam } | Sort-Object -Unique
     $bad = $Hook | Where-Object { $known -notcontains $_ }
@@ -468,7 +478,7 @@ if ($Hook.Count -gt 0) {
     # `@(...)` on every branch: a pipeline that matches exactly ONE case yields
     # the hashtable itself, not an array, and `.Count` on a hashtable is its
     # number of KEYS. That printed "7 of 30" for a single-case run.
-    $cases = @($ALL_CASES | Where-Object { $_.hk -and $Hook -contains $_.fam })
+    $cases = @($ALL_CASES | Where-Object { $Hook -contains $_.fam })
 } elseif ($Full) {
     $cases = @($ALL_CASES)
 } else {
@@ -559,7 +569,10 @@ foreach ($c in $cases) {
 
     # Quick mode may check only some of what a multi-project harness wrote.
     $wrote = $projects.Count
-    if ($c.only -and -not $Full) {
+    # Not under -Hook either: that mode promises EVERY case of a family, and the
+    # projects outside `only` are the ones a narrowed push would otherwise never
+    # compile - the embassy harness's F1 project among them.
+    if ($c.only -and -not $Full -and $Hook.Count -eq 0) {
         $projects = @($projects | Where-Object { $c.only -contains (Split-Path $_.Dir -Leaf) })
         # A name that matches nothing would SHRINK the case silently and still
         # report ok — the same shape as the "filter matched no tests" bug this
@@ -642,6 +655,13 @@ if ($timed) {
 }
 Write-Host ("all {0} cases pass{1}" -f $ran,
     $(if ($skipped) { " ($($skipped.Count) skipped)" } else { "" })) -ForegroundColor Green
+# "All 0 pass" is not a pass. A family whose only case needs the vendor
+# database (n6) verifies nothing on a machine without it, and saying so is the
+# least a gate can do. Not a failure: blocking a push over a missing optional
+# database would be worse than the gap.
+if ($ran -eq 0) {
+    Write-Host "NOTHING WAS VERIFIED - every selected case was skipped (no vendor database?)" -ForegroundColor Yellow
+}
 
 # Drop what no longer belongs, and ONLY then.
 #
@@ -653,9 +673,13 @@ Write-Host ("all {0} cases pass{1}" -f $ran,
 # Three guards, each for a different way this could delete something wanted:
 #   - a FAILED run may not have reached the cases that write the rest;
 #   - a SKIPPED case (no vendor database) writes nothing but is not gone;
-#   - a -Hook subset touches a handful of directories on purpose.
+#   - a -Hook subset touches a handful of directories on purpose;
+#   - so does the QUICK set: it never runs the -Full-only cases, so their
+#     directories look stale to it and their warm caches would go. That stayed
+#     unseen while only manual runs had a work root; once the hook exported
+#     EIDE_MATRIX_DIR, every quick-set push would have emptied them.
 # Any of them, and the prune is the wrong answer, so it does not run.
-if ($script:workRoot -and $Hook.Count -eq 0 -and -not $skipped) {
+if ($script:workRoot -and $Full -and $Hook.Count -eq 0 -and -not $skipped) {
     $stale = @(Get-ChildItem $script:workRoot -Directory -Filter "eide_*" -ErrorAction SilentlyContinue |
         Where-Object { -not $script:touched.ContainsKey($_.Name) })
     if ($stale) {

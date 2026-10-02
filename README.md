@@ -417,9 +417,14 @@ compiler can tell you that text is a program. `scripts/verify-codegen.ps1` emits
 a matrix of configurations and cross-compiles each one:
 
 ```powershell
-pwsh scripts/verify-codegen.ps1          # representative subset (31 cases)
-pwsh scripts/verify-codegen.ps1 -Full    # every case (46)
+pwsh scripts/verify-codegen.ps1             # representative subset (32 cases)
+pwsh scripts/verify-codegen.ps1 -Full       # every case (47), about 13 minutes warm
+pwsh scripts/verify-codegen.ps1 -Hook nrf   # every case of the named families
 ```
+
+Each harness keeps its project's `target/` between runs and only rewrites the
+sources, so a warm run rebuilds the generated crate and nothing under it: the
+full matrix went from 50 minutes to 13 when they stopped deleting it.
 
 Each case prints its own time, and the run ends with a total and the three most
 expensive — which is how you find out that one case, `embassy`, was a third of
@@ -438,8 +443,13 @@ To run it before every push:
 git config core.hooksPath scripts/hooks
 ```
 
-The hook only fires when something under `src/panels/mcu_module/` changed, so a
-README edit costs nothing; `git push --no-verify` skips it outright.
+The hook only fires when something under `src/panels/mcu_module/`, a built-in
+`.ron` or the script itself changed, so a README edit costs nothing; `git push
+--no-verify` skips it outright. When every changed file belongs to known
+backends - `nrf.rs`, an `nrf*.ron`, `rp.rs`, the ESP generators - it runs every
+case of those families and nothing else; anything shared (`family.rs`,
+`project_gen.rs`, `watchdog_gen.rs`) runs the representative subset. It checks
+the commit being pushed in a worktree of its own, not your working tree.
 
 It covers every runtime, all three vendors' HALs, and each half-wired shape — a
 bus with one pad missing, a SPI without MISO, a USB with one data pin. Those last

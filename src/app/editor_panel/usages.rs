@@ -93,7 +93,9 @@ impl UsageItem {
         self.references = self.ra_refs.as_ref().map(|ra| {
             let mut all = ra.clone();
             all.extend(self.macro_refs.iter().cloned());
-            all.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+            // The two sources spell paths differently (rust-analyzer's URI
+            // decoding, the workspace join), so they sort by a normal form.
+            all.sort_by_cached_key(|r| (r.path.replace('\\', "/").to_lowercase(), r.line));
             all
         });
     }
@@ -268,15 +270,20 @@ fn macro_refs_of(
     macros: &super::macro_uses::MacroIndex,
     workspace: &std::path::Path,
 ) -> Vec<UsageRef> {
-    // rust-analyzer reports a `macro_rules!` as a Function: its range starts
-    // at the `macro_rules!` keyword, before the name.
+    // rust-analyzer reports a `macro_rules!` as a Function. Told apart by the
+    // code right before the name — not by the whole range, which starts at
+    // the item's doc comment and attributes: a helper documented as "called
+    // from the macro_rules body" would otherwise match only `helper!`.
     let start = index.pos_to_char_idx(s.start_line + 1, s.start_char + 1);
     let sel = index.pos_to_char_idx(s.sel_line + 1, s.sel_char + 1);
-    let is_macro = start <= sel
+    let is_macro = s.kind == 12
+        && start <= sel
         && index
             .text()
             .get(index.byte_of_char(start)..index.byte_of_char(sel))
-            .is_some_and(|t| t.contains("macro_rules"));
+            .and_then(|t| t.trim_end().strip_suffix('!'))
+            .and_then(|t| t.trim_end().strip_suffix("macro_rules"))
+            .is_some_and(|p| !p.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
     let shape = super::macro_uses::ItemShape {
         name: &s.name,
         kind: s.kind,
@@ -643,7 +650,11 @@ impl AppIde {
                 // resolves: read from every project file — the displayed one
                 // as this reply describes it. Once per settled run, no request.
                 let rel = self.ed.usages.rel_path.clone();
-                let macros = {
+                // A build script, `tests/`, `examples/` is its own unit: only
+                // its own macros expand into it, and none of its into the crate.
+                let macros = if !super::macro_uses::in_crate_src(&rel) {
+                    super::macro_uses::MacroIndex::of_unit(&rel, &text)
+                } else {
                     let mut files: Vec<(&str, &str)> = vec![(rel.as_str(), text.as_str())];
                     if rel != "src/main.rs" {
                         files.push(("src/main.rs", self.generated_code.as_str()));
@@ -655,7 +666,7 @@ impl AppIde {
                             .filter(|(r, _)| *r != rel)
                             .map(|(r, t)| (r.as_str(), t.as_str())),
                     );
-                    super::macro_uses::MacroIndex::scan(files)
+                    self.ed.macro_facts.index(files)
                 };
                 let krate = crate::panels::structure_map::parse::split_crate(&rel).0;
                 let workspace = crate::workspace::dir();
@@ -1468,6 +1479,29 @@ mod tests {
         );
         let other = symbol("value", 12, 1, 17, Some((19, "Other")));
         assert!(macro_refs_of(&other, &index, "", &macros, ws).is_empty());
+    }
+
+    /// rust-analyzer's range starts at the doc comment: one that mentions
+    /// `macro_rules` must not make a fn a macro (it would then match only
+    /// `value!`), while a real `macro_rules!` still is one.
+    #[test]
+    fn a_doc_comment_does_not_make_a_function_a_macro() {
+        let text = "impl Node {\n    /// Called from the menu macro_rules body.\n    \
+                    pub const fn value() -> Self { todo!() }\n}\n\
+                    macro_rules! menu { () => { static A: Node = Node::value(); } }\n\
+                    macro_rules! outer { () => { menu!(); } }\n\
+                    outer!();\n";
+        let index = LineIndex::new(text);
+        let macros = super::super::macro_uses::MacroIndex::scan([("src/menu.rs", text)]);
+        let ws = std::path::Path::new("/w");
+        let mut value = symbol("value", 12, 2, 17, Some((19, "Node")));
+        value.start_line = 1; // the `///` line, as rust-analyzer sends it
+        assert_eq!(macro_refs_of(&value, &index, "", &macros, ws).len(), 1);
+        let mut menu = symbol("menu", 12, 4, 13, None);
+        menu.start_char = 0; // from `macro_rules!`
+        let refs = macro_refs_of(&menu, &index, "", &macros, ws);
+        assert_eq!(refs.len(), 1, "its `menu!` in outer");
+        assert_eq!(refs[0].via_macro.as_deref(), Some("outer"));
     }
 
     // ── flycheck lint spans ──────────────────────────────────────────────────

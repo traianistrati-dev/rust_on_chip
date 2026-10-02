@@ -3838,12 +3838,12 @@ fn parse_document_symbols(result: &serde_json::Value) -> Vec<SymbolInfo> {
         let child_container = container_for_children(&name, kind);
 
         if let (Some(range), Some(sel)) = (node.get("range"), node.get("selectionRange")) {
-            if !name.is_empty() && is_trackable_symbol_kind(kind) {
-                if let Some(info) =
+            if !name.is_empty()
+                && is_trackable_symbol_kind(kind)
+                && let Some(info) =
                     symbol_from_ranges(name, kind, range, sel, in_trait_impl, container)
-                {
-                    out.push(info);
-                }
+            {
+                out.push(info);
             }
             if let Some(children) = node["children"].as_array() {
                 for c in children {
@@ -3854,8 +3854,7 @@ fn parse_document_symbols(result: &serde_json::Value) -> Vec<SymbolInfo> {
             // Flat SymbolInformation — no separate selection span or children.
             if !name.is_empty() && is_trackable_symbol_kind(kind) {
                 let r = &loc["range"];
-                if let Some(info) = symbol_from_ranges(name, kind, r, r, in_trait_impl, container)
-                {
+                if let Some(info) = symbol_from_ranges(name, kind, r, r, in_trait_impl, container) {
                     out.push(info);
                 }
             }
@@ -4393,15 +4392,31 @@ mod document_symbol_tests {
     #[test]
     fn items_know_their_container() {
         let result = serde_json::json!([
-            sym("impl Node", 19, serde_json::json!([sym("value", 12, serde_json::json!([]))])),
+            sym(
+                "impl Node",
+                19,
+                serde_json::json!([sym("value", 12, serde_json::json!([]))])
+            ),
             sym(
                 "impl core::fmt::Display for Node",
                 19,
                 serde_json::json!([sym("fmt", 6, serde_json::json!([]))])
             ),
-            sym("Kind", 10, serde_json::json!([sym("Back", 22, serde_json::json!([]))])),
-            sym("Node", 23, serde_json::json!([sym("name", 8, serde_json::json!([]))])),
-            sym("Menu", 11, serde_json::json!([sym("show", 6, serde_json::json!([]))])),
+            sym(
+                "Kind",
+                10,
+                serde_json::json!([sym("Back", 22, serde_json::json!([]))])
+            ),
+            sym(
+                "Node",
+                23,
+                serde_json::json!([sym("name", 8, serde_json::json!([]))])
+            ),
+            sym(
+                "Menu",
+                11,
+                serde_json::json!([sym("show", 6, serde_json::json!([]))])
+            ),
             sym("BACK", 14, serde_json::json!([])),
         ]);
         let syms = parse_document_symbols(&result);

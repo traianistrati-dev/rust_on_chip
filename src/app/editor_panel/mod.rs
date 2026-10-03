@@ -59,6 +59,7 @@ pub(crate) mod impl_picker;
 pub(super) mod inlay_hint;
 mod kbd_scope;
 mod let_annotation;
+pub(super) mod macro_uses;
 mod move_lines;
 pub(crate) mod multi_cursor;
 mod rename;

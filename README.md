@@ -218,18 +218,35 @@ channel to allocate on either runtime: EasyDMA is built into each peripheral.
 The nRF5340 is the application core alone, secure and bare metal
 (`nrf5340-app-s`, no TF-M); the network core is not generated. UARTE, SPIM and
 TWIM *n* share one `SERIALn` block, so the header's I2C offers TWIM1/2 and
-leaves SERIAL0 to the VCOM UART; SPI is on SPIM4, the 32 MHz block that shares
-nothing. Both runtimes run on `embassy-nrf` (Blocking without an executor), so
-Blocking builds no USB there.
+leaves SERIAL0 to the console UART; SPI is on SPIM4, the 32 MHz block that
+shares nothing. The kit has two virtual COM ports, and its PCB prints them
+**VCOM0** and **VCOM2**: VCOM2 (P0.19..22) is Zephyr's application-core
+console, VCOM0 sits on Arduino D0/D1 (P1.00/01) with RTS/CTS on P0.11/P0.10.
+Both runtimes run on `embassy-nrf` (Blocking without an executor), so Blocking
+builds no USB there.
 
 The nRF54L15 is again the secure application core (`nrf54l15-app-s`), on
 `embassy-nrf` both ways, with embassy-time on the **GRTC**. Its blocks are
 numbered by power domain — `SERIAL00`, `SERIAL20/21/22`, `SERIAL30`, `PWM20..22`
-— and, unlike every older nRF, **each block reaches one port only**: SERIAL00
-P2, SERIAL20..22 and the PWMs P1, SERIAL30 P0. The kit's pads offer only the
-instances that can reach them, and a hand-made definition that wires a signal
-across domains gets a comment saying the pin will not move. The kit's LEDs are
-active HIGH. It has no USB and no QSPI.
+— and, unlike every older nRF, **a block reaches its own port**: SERIAL20..22
+and the PWMs P1, SERIAL30 P0, SERIAL00 only its *dedicated* P2 pins. On top of
+that, SPIM SCK and TWIM SCL must sit on a **clock pin** (QFN48: P0.03, P0.04,
+P1.03, P1.04, P1.08, P1.11, P1.12, P2.01, P2.06), and SERIAL20/21 reach a few P2
+pins only in Constant Latency mode. Every one of these mistakes compiles and
+then does nothing, so the kit's pads offer only what their pin can carry, and a
+hand-made definition gets a comment in `main.rs` naming the rule it broke. On
+the DK, I2C is SCL P1.11 / SDA P1.12 (Nordic's own wiring), VCOM0 is UARTE30 on
+P0.00..03 and VCOM1 UARTE20 on P1.04..07, and the LEDs are active HIGH. It has
+no USB and no QSPI.
+
+On the nRF52 DK, the Arduino I2C pins also carry the kit's PCAL6408A I/O
+expander at **0x20** (interrupt on P0.17, LED1): a shield device at that
+address collides with it.
+
+These pin maps were checked claim by claim against the Nordic user guides,
+Zephyr's board files and the nRF5 SDK headers (two independent sources each,
+three blind readers for anything they disagreed on); the hardware itself has
+not been run.
 
 Laid out the way the kits are used: the Arduino header's analog side on the
 left, its digital side on the right, and the LEDs, buttons, the J-Link's VCOM
@@ -400,9 +417,14 @@ compiler can tell you that text is a program. `scripts/verify-codegen.ps1` emits
 a matrix of configurations and cross-compiles each one:
 
 ```powershell
-pwsh scripts/verify-codegen.ps1          # representative subset (31 cases)
-pwsh scripts/verify-codegen.ps1 -Full    # every case (46)
+pwsh scripts/verify-codegen.ps1             # representative subset (32 cases)
+pwsh scripts/verify-codegen.ps1 -Full       # every case (47), about 13 minutes warm
+pwsh scripts/verify-codegen.ps1 -Hook nrf   # every case of the named families
 ```
+
+Each harness keeps its project's `target/` between runs and only rewrites the
+sources, so a warm run rebuilds the generated crate and nothing under it: the
+full matrix went from 50 minutes to 13 when they stopped deleting it.
 
 Each case prints its own time, and the run ends with a total and the three most
 expensive — which is how you find out that one case, `embassy`, was a third of
@@ -421,8 +443,13 @@ To run it before every push:
 git config core.hooksPath scripts/hooks
 ```
 
-The hook only fires when something under `src/panels/mcu_module/` changed, so a
-README edit costs nothing; `git push --no-verify` skips it outright.
+The hook only fires when something under `src/panels/mcu_module/`, a built-in
+`.ron` or the script itself changed, so a README edit costs nothing; `git push
+--no-verify` skips it outright. When every changed file belongs to known
+backends - `nrf.rs`, an `nrf*.ron`, `rp.rs`, the ESP generators - it runs every
+case of those families and nothing else; anything shared (`family.rs`,
+`project_gen.rs`, `watchdog_gen.rs`) runs the representative subset. It checks
+the commit being pushed in a worktree of its own, not your working tree.
 
 It covers every runtime, all three vendors' HALs, and each half-wired shape — a
 bus with one pad missing, a SPI without MISO, a USB with one data pin. Those last

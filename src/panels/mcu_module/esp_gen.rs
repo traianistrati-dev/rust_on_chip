@@ -1099,6 +1099,7 @@ fn package_layout(chip: &EspChip, pads: &[(u8, &str)]) -> PinLayout {
             functions: gpio.map(|g| functions_for(chip, g)).unwrap_or_default(),
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         }
     };
     let side = |from: usize| pads[from..from + per].iter().map(one).collect::<Vec<_>>();
@@ -1139,6 +1140,7 @@ fn logical_layout(chip: &EspChip, reserved: &[u8]) -> PinLayout {
             // publish, which is the whole difference from an STM32 pad.
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         });
     }
     let mut it = sides.into_iter();

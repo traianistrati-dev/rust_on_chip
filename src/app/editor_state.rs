@@ -264,6 +264,11 @@ pub(crate) struct EditorState {
     /// caret are unchanged: see `inlay_hint::InlayScan`.
     pub(crate) inlay_scan: Option<editor_panel::inlay_hint::InlayScan>,
 
+    /// What each project file contributes to the `macro_rules!` usages scan,
+    /// kept per text so a typing pause re-reads only the file that changed.
+    /// Here rather than in `usages`, which is reset on every file switch.
+    pub(crate) macro_facts: editor_panel::macro_uses::FactsCache,
+
     /// The last scan for the calls around the caret, reused while the text
     /// and caret are unchanged: see `signature_hint::SigScan`.
     pub(crate) sig_scan: Option<editor_panel::signature_hint::SigScan>,
@@ -360,6 +365,7 @@ impl EditorState {
             inlay_accept_pending: false,
             inlay_hint_drawn: false,
             inlay_scan: None,
+            macro_facts: Default::default(),
             sig_scan: None,
             sig: Default::default(),
             rename_focus: false,

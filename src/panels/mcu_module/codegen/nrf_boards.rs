@@ -174,6 +174,13 @@ fn pin_def(c: &NrfChip, b: &Board, number: usize, pad: Pad) -> PinDef {
         }
         Fixed(name) => (name.to_owned(), true, Vec::new()),
     };
+    // The per-signal rule last: on the nRF54L a block's port is not the whole
+    // story (SERIAL00 has dedicated P2 pins, SCK/SCL want clock pins), and a
+    // pad must not offer what it cannot do.
+    let mut functions = functions;
+    if let Some(pp) = super::nrf::nrf_pin(&name) {
+        functions.retain(|f| super::nrf::pin_fits(c, f, pp));
+    }
     PinDef {
         number,
         name,
@@ -181,6 +188,7 @@ fn pin_def(c: &NrfChip, b: &Board, number: usize, pad: Pad) -> PinDef {
         functions,
         af: Vec::new(),
         fn_owner: Vec::new(),
+        note: String::new(),
     }
 }
 
@@ -197,7 +205,23 @@ struct Board {
     left: &'static [Pad],
     right: &'static [Pad],
     top: &'static [Pad],
+    /// What the kit does to a pad that its functions cannot say - solder
+    /// bridges, resistors, the debugger - keyed by pin, shown in the pin's
+    /// panel. Every line here was checked against the kit's user guide before
+    /// it went in; the pin tables above were checked the same way.
+    notes: &'static [((u8, u8), &'static str)],
+    /// Pins the chip's product specification marks low-frequency I/O - the
+    /// nRF52's GPIOs next to the radio. Each gets [`LOW_FREQ_NOTE`] after its
+    /// own note.
+    low_freq: &'static [(u8, u8)],
+    /// A note EVERY usable pad of the kit carries before its own - the
+    /// nRF54L15 DK's 1.8 V logic level, which nothing on a pad would hint at.
+    every_pad: &'static str,
 }
+
+#[cfg(test)]
+/// What the nRF52 product specifications say about their low-frequency pins.
+const LOW_FREQ_NOTE: &str = "Nordic marks this pin low-frequency I/O (signals up to 10 kHz): faster or high-current signals here can degrade radio sensitivity.";
 
 #[cfg(test)]
 /// nRF52840 DK (PCA10056). Pin map from Nordic's PCA10056 hardware guide:
@@ -266,13 +290,42 @@ const NRF52840_DK: Board = Board {
         Fixed("P0.01 (XL2, 32.768 kHz)"),
         Fixed("P0.18 (RESET)"),
     ],
+    notes: &[
+        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB2 and short SB4."),
+        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and short SB3."),
+        ((0, 5), "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR; free for other use when flow control is not detected. Cut SB51 to disconnect it."),
+        ((0, 6), "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR. Cut SB53 to disconnect it."),
+        ((0, 7), "VCOM CTS: once flow control is detected, the interface MCU drives it until it power-cycles or sees a new DTR; free otherwise. Cut SB50 to disconnect it."),
+        ((0, 8), "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR. Cut SB52 to disconnect it."),
+        ((0, 9), "Wired to the NFC antenna by default. For GPIO: remove R44 and R46, fit 0R at R43 and R45, and set UICR.NFCPINS to GPIO."),
+        ((0, 10), "Wired to the NFC antenna by default. For GPIO: remove R44 and R46, fit 0R at R43 and R45, and set UICR.NFCPINS to GPIO."),
+        ((0, 17), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23."),
+        ((0, 18), "Goes to the interface MCU through SB56, closed by default - cut it to disconnect."),
+        ((0, 19), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21."),
+        ((0, 20), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22."),
+        ((0, 21), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24."),
+        ((0, 22), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25."),
+        ((0, 23), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20."),
+        ((0, 26), "The on-board I2C pull-ups are switched in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+        ((0, 27), "The on-board I2C pull-ups are switched in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+        ((1, 0), "SWO / TRACEDATA[0], connected to the interface MCU through a signal switch. Cut SB57 to disconnect it."),
+    ],
+    low_freq: &[
+        (0, 2), (0, 3), (0, 9), (0, 10), (0, 28), (0, 29), (0, 30), (0, 31),
+        (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7),
+        (1, 10), (1, 11), (1, 12), (1, 13), (1, 14), (1, 15),
+    ],
+    every_pad: "",
 };
 
 #[cfg(test)]
 /// nRF52 DK (PCA10040), the nRF52832's kit - and the one Nordic hands out
 /// for the nRF52810 and nRF52805 too. Pin map from the PCA10040 hardware
 /// guide. Here the Arduino header and the kit SHARE pins: D2..D5 are the four
-/// buttons and D6..D9 the four LEDs, so a pad says both.
+/// buttons and D6..D9 the four LEDs, so a pad says both. The Arduino I2C pins
+/// also carry the kit's PCAL6408A I/O expander at 0x20, its interrupt on
+/// P0.17 (LED1): idle until a shield grounds SHIELD DETECT, then it takes the
+/// buttons and LEDs off D2..D9 - but a shield device at 0x20 collides with it.
 const NRF52_DK: Board = Board {
     id: "nrf52832_dk",
     display_name: "Nordic nRF52 DK (nRF52832)",
@@ -301,11 +354,11 @@ const NRF52_DK: Board = Board {
         Spi(0, 23, "D11, MOSI", Mosi),
         Spi(0, 24, "D12, MISO", Miso),
         Spi(0, 25, "D13, SCK", Sck),
-        I2c(0, 26, "SDA", Sda),
-        I2c(0, 27, "SCL", Scl),
+        I2c(0, 26, "SDA, I/O expander 0x20", Sda),
+        I2c(0, 27, "SCL, I/O expander 0x20", Scl),
     ],
     top: &[
-        Led(0, 17, "LED1, D6, active LOW"),
+        Led(0, 17, "LED1, D6, I/O expander INT, active LOW"),
         Led(0, 18, "LED2, D7, SWO, active LOW"),
         Led(0, 19, "LED3, D8, active LOW"),
         Led(0, 20, "LED4, D9, active LOW"),
@@ -317,16 +370,35 @@ const NRF52_DK: Board = Board {
         Fixed("P0.01 (XL2, 32.768 kHz)"),
         Fixed("P0.21 (RESET)"),
     ],
+    notes: &[
+        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4."),
+        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4."),
+        ((0, 5), "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR."),
+        ((0, 6), "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR."),
+        ((0, 7), "VCOM CTS: tri-stated until a terminal sends DTR; once flow control is detected the interface MCU drives it until a power-on reset or a new DTR."),
+        ((0, 8), "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR."),
+        ((0, 9), "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO."),
+        ((0, 10), "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO."),
+        ((0, 18), "Also SWO / TRACEDATA[0], wired to the interface MCU through SB27 (closed by default; SB26 on v1.x boards) - cut it to isolate the pin."),
+        ((0, 21), "Goes to the interface MCU through SB26 (closed by default; SB27 on v1.x boards). The Arduino RESET pin is NOT this pin by default: SB17 and SB43 are open."),
+    ],
+    low_freq: &[
+        (0, 22), (0, 23), (0, 24), (0, 25), (0, 26), (0, 27), (0, 28), (0, 29), (0, 30), (0, 31),
+    ],
+    every_pad: "",
 };
 
 #[cfg(test)]
 /// nRF5340 DK (PCA10095), the application core's view. Pin map from the board
 /// files Zephyr ships for it (`nrf5340dk_nrf5340_cpuapp`), cross-checked with
 /// the PCA10095 hardware guide: LEDs P0.28..31 and buttons P0.23/24/08/09,
-/// all active low; VCOM0 on P0.19..22; the 64 Mbit QSPI flash on P0.13..18;
+/// all active low; two virtual COM ports - Serial Port 1, printed VCOM2 on
+/// the PCB, on P0.19..22 (Zephyr's application-core console), and Serial
+/// Port 0, printed VCOM0, on D0/D1 (P1.00/01) with RTS/CTS on P0.11/P0.10
+/// (the network core's console in Zephyr); the 64 Mbit QSPI flash on P0.13..18;
 /// the Arduino SPI on SPIM4 (P1.13..15) and I2C on P1.02/03; the 32.768 kHz
 /// crystal on P0.00/01 and NFC on P0.02/03. UARTE/SPIM/TWIM n share SERIALn,
-/// so the header's I2C offers TWIM1/2 and leaves SERIAL0 to the VCOM UART.
+/// so the header's I2C offers TWIM1/2 and leaves SERIAL0 to the VCOM2 UART.
 const NRF5340_DK: Board = Board {
     id: "nrf5340_dk",
     display_name: "Nordic nRF5340 DK (application core)",
@@ -341,15 +413,15 @@ const NRF5340_DK: Board = Board {
         Gp(0, 25, "A4"),
         Gp(0, 26, "A5"),
         Gp(0, 27, ""),
-        Gp(0, 10, ""),
-        Gp(0, 11, ""),
+        Gp(0, 10, "VCOM0 CTS"),
+        Gp(0, 11, "VCOM0 RTS"),
         Gp(0, 12, ""),
         Gp(0, 2, "NFC1"),
         Gp(0, 3, "NFC2"),
     ],
     right: &[
-        Gp(1, 0, "D0"),
-        Gp(1, 1, "D1"),
+        Gp(1, 0, "D0, VCOM0 RXD"),
+        Gp(1, 1, "D1, VCOM0 TXD"),
         Gp(1, 4, "D2"),
         Gp(1, 5, "D3"),
         Gp(1, 6, "D4"),
@@ -374,10 +446,10 @@ const NRF5340_DK: Board = Board {
         Button(0, 24, "BUTTON2, active LOW"),
         Button(0, 8, "BUTTON3, active LOW"),
         Button(0, 9, "BUTTON4, active LOW"),
-        Uart(0, 20, "VCOM TXD", Tx),
-        Uart(0, 22, "VCOM RXD", Rx),
-        Uart(0, 21, "VCOM CTS", Cts),
-        Uart(0, 19, "VCOM RTS", Rts),
+        Uart(0, 20, "VCOM2 TXD", Tx),
+        Uart(0, 22, "VCOM2 RXD", Rx),
+        Uart(0, 21, "VCOM2 CTS", Cts),
+        Uart(0, 19, "VCOM2 RTS", Rts),
         Qspi(0, 18, "QSPI CS, 64 Mbit flash", QCs),
         Qspi(0, 17, "QSPI CLK, 64 Mbit flash", QClk),
         Qspi(0, 13, "QSPI IO0, 64 Mbit flash", QIo(0)),
@@ -389,17 +461,46 @@ const NRF5340_DK: Board = Board {
         Fixed("P0.00 (XL1, 32.768 kHz)"),
         Fixed("P0.01 (XL2, 32.768 kHz)"),
     ],
+    notes: &[
+        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4."),
+        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4."),
+        ((0, 2), "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO."),
+        ((0, 3), "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO."),
+        ((0, 8), "Also TRACEDATA[3] and SPIM4's dedicated SCK: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
+        ((0, 9), "Also TRACEDATA[2] and SPIM4's dedicated MOSI: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
+        ((0, 10), "Serial port 0 (VCOM0) CTS, also TRACEDATA[1] and SPIM4's dedicated 32 Mbps MISO. Set SW7 (serial port 0 flow control) OFF to use it for trace."),
+        ((0, 11), "Serial port 0 (VCOM0) RTS, also TRACEDATA[0] / SWO and SPIM4's dedicated 32 Mbps CSN. Set SW7 (serial port 0 flow control) OFF to use it for trace."),
+        ((0, 12), "TRACECLK, and SPIM4's dedicated DCX: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
+        ((0, 13), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22."),
+        ((0, 14), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24."),
+        ((0, 15), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25."),
+        ((0, 16), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20."),
+        ((0, 17), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21."),
+        ((0, 18), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23."),
+        ((1, 0), "Serial port 0 (VCOM0) RXD. Zephyr's stock app-core board hands it to the network core, which uses it as its console."),
+        ((1, 1), "Serial port 0 (VCOM0) TXD. Zephyr's stock app-core board hands it to the network core, which uses it as its console."),
+        ((1, 2), "With P1.03, the nRF5340's only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+        ((1, 3), "With P1.02, the nRF5340's only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+    ],
+    low_freq: &[],
+    every_pad: "",
 };
 
 #[cfg(test)]
-/// nRF54L15 DK (PCA10156). Pin map from the board files Zephyr ships for it
-/// (`nrf54l15dk_nrf54l15_cpuapp`): LEDs on P2.09/P1.10/P2.07/P1.14 (active
-/// HIGH, unlike the older kits), buttons on P1.13/P1.09/P1.08/P0.04 (active
-/// low), VCOM0 on UARTE20 (P1.04..07) and VCOM1 on UARTE30 (P0.00..03), the
-/// 64 Mbit SPI flash on SPIM00 (P2.01/02/04, CS P2.05), the 32.768 kHz crystal
-/// on P1.00/01 and NFC on P1.02/03. The kit has no Arduino header; I2C is
-/// offered on the two free P1 pins with an analog input each, P1.11/P1.12,
-/// on TWIM21/22, which share no SERIAL with the VCOM UART.
+/// nRF54L15 DK (PCA10156), whose SoC is the QFN48 package: P0.00..06,
+/// P1.00..14, P2.00..10. Pin map from the DK user guide and the board files
+/// Zephyr ships for it (`nrf54l15dk_nrf54l15_cpuapp`): LEDs on
+/// P2.09/P1.10/P2.07/P1.14 (active HIGH, unlike the older kits), buttons on
+/// P1.13/P1.09/P1.08/P0.04 (active low), VCOM0 (Serial Port 0) on UARTE30
+/// (P0.00..03) and VCOM1 (Serial Port 1) on UARTE20 (P1.04..07) - Zephyr's
+/// console is uart20, so VCOM1 - the 64 Mbit SPI flash on SPIM00
+/// (P2.01/02/04, CS P2.05, WP/IO2 P2.03, HOLD/IO3 P2.00), the 32.768 kHz
+/// crystal on P1.00/01 and NFC on P1.02/03.
+///
+/// The kit has no Arduino header. I2C goes on the only two free P1 pins,
+/// SCL on P1.11 and SDA on P1.12 - Nordic DevAcademy's own DK wiring. TWIM
+/// SCL must sit on a CLOCK pin on this part, and both are; TWIM21/22 share no
+/// SERIAL with either VCOM UART.
 const NRF54L15_DK: Board = Board {
     id: "nrf54l15_dk",
     display_name: "Nordic nRF54L15 DK",
@@ -407,20 +508,18 @@ const NRF54L15_DK: Board = Board {
     spim: 0,
     twim: &[21, 22],
     left: &[
-        I2c(1, 11, "AIN4, SDA", Sda),
-        I2c(1, 12, "AIN5, SCL", Scl),
-        Gp(1, 15, ""),
-        Gp(1, 16, ""),
+        I2c(1, 11, "AIN4, SCL", Scl),
+        I2c(1, 12, "AIN5, SDA", Sda),
         Gp(1, 2, "NFC1"),
         Gp(1, 3, "NFC2"),
         Gp(0, 5, ""),
         Gp(0, 6, ""),
     ],
     right: &[
-        Gp(2, 0, "FLASH WP"),
+        Gp(2, 0, "FLASH HOLD"),
         Spi(2, 1, "FLASH SCK", Sck),
         Spi(2, 2, "FLASH MOSI", Mosi),
-        Gp(2, 3, "FLASH HOLD"),
+        Gp(2, 3, "FLASH WP"),
         Spi(2, 4, "FLASH MISO", Miso),
         Gp(2, 5, "FLASH CS"),
         Gp(2, 6, ""),
@@ -436,17 +535,46 @@ const NRF54L15_DK: Board = Board {
         Button(1, 9, "BUTTON1, active LOW"),
         Button(1, 8, "BUTTON2, active LOW"),
         Button(0, 4, "BUTTON3, active LOW"),
-        Uart(1, 4, "VCOM0 TXD, AIN0", Tx),
-        Uart(1, 5, "VCOM0 RXD, AIN1", Rx),
-        Uart(1, 7, "VCOM0 CTS, AIN3", Cts),
-        Uart(1, 6, "VCOM0 RTS, AIN2", Rts),
-        Uart(0, 0, "VCOM1 TXD", Tx),
-        Uart(0, 1, "VCOM1 RXD", Rx),
-        Uart(0, 3, "VCOM1 CTS", Cts),
-        Uart(0, 2, "VCOM1 RTS", Rts),
+        Uart(0, 0, "VCOM0 TXD", Tx),
+        Uart(0, 1, "VCOM0 RXD", Rx),
+        Uart(0, 3, "VCOM0 CTS", Cts),
+        Uart(0, 2, "VCOM0 RTS", Rts),
+        Uart(1, 4, "VCOM1 TXD, AIN0", Tx),
+        Uart(1, 5, "VCOM1 RXD, AIN1", Rx),
+        Uart(1, 7, "VCOM1 CTS, AIN3", Cts),
+        Uart(1, 6, "VCOM1 RTS, AIN2", Rts),
         Fixed("P1.00 (XL1, 32.768 kHz)"),
         Fixed("P1.01 (XL2, 32.768 kHz)"),
     ],
+    notes: &[
+        ((0, 0), "VCOM0 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
+        ((0, 1), "VCOM0 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
+        ((0, 2), "VCOM0 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected."),
+        ((0, 3), "VCOM0 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR."),
+        ((1, 0), "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6."),
+        ((1, 1), "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6."),
+        ((1, 2), "Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf's `nfc-pins-as-gpio` does at every boot."),
+        ((1, 3), "Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf's `nfc-pins-as-gpio` does at every boot."),
+        ((1, 4), "VCOM1 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
+        ((1, 5), "VCOM1 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
+        ((1, 6), "VCOM1 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected."),
+        ((1, 7), "VCOM1 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR."),
+        ((1, 10), "Switches LED1 through a transistor; the LEDs are powered by the PMIC and stay dark if 'Power to LEDs' is off in Board Configurator."),
+        ((1, 14), "Switches LED3 through a transistor; the LEDs are powered by the PMIC and stay dark if 'Power to LEDs' is off in Board Configurator."),
+        ((2, 0), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 1), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 2), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 3), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 4), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 5), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        ((2, 6), "Trace port TRACECLK."),
+        ((2, 7), "Switches LED2 through a transistor (LEDs powered by the PMIC, dark if 'Power to LEDs' is off). Also TRACEDATA[0] / SWO: on v1.0.0 boards the debugger's SWO reaches it only with 'SWO Control' on in Board Configurator; on v0.9.x boards it does through SB24, closed by default (cut it to disconnect)."),
+        ((2, 8), "Trace port TRACEDATA[1]."),
+        ((2, 9), "Switches LED0 through a transistor (LEDs powered by the PMIC, dark if 'Power to LEDs' is off). Also trace port TRACEDATA[2]."),
+        ((2, 10), "Trace port TRACEDATA[3]."),
+    ],
+    low_freq: &[],
+    every_pad: "Logic level is 1.8 V by default (the nPM1300 PMIC's VOUT1); set 1.8-3.3 V with 'VDD (nPM VOUT1)' in nRF Connect for Desktop's Board Configurator.",
 };
 
 #[cfg(test)]
@@ -562,6 +690,15 @@ fn definition_of(b: &Board) -> McuDefinition {
         bottom: Vec::new(),
         grid: None,
     };
+    for side in [&mut d.pins.left, &mut d.pins.right, &mut d.pins.top] {
+        for p in side.iter_mut() {
+            let pp = super::nrf::nrf_pin(&p.name);
+            let own = b.notes.iter().find(|(at, _)| Some(*at) == pp).map(|(_, t)| *t);
+            let low = pp.filter(|pp| b.low_freq.contains(pp)).map(|_| LOW_FREQ_NOTE);
+            let every = Some(b.every_pad).filter(|t| !t.is_empty() && !p.reserved);
+            p.note = [every, own, low].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        }
+    }
     d.clock = ClockDef::Graph(clock_graph(true));
     d
 }
@@ -676,24 +813,27 @@ mod tests {
         let timer = c.pwm.first().copied().unwrap_or(0);
         let pwm = |channel| PinFunction::TimerPwm { timer, channel };
         // The nRF54L15 DK has its own names, and its blocks reach one port
-        // each: PWM20 the P1 LEDs, UARTE30 VCOM1 on P0, the SAADC VCOM0's P1
+        // each: PWM20 the P1 LEDs, UARTE30 VCOM0 on P0, the SAADC VCOM1's P1
         // pins. A pad this list does not name keeps the common list below.
         let nrf54: Vec<(&str, PinFunction)> = if c.nrf54() {
             vec![
                 ("(LED0", PinFunction::GpioOutput),
                 ("(LED1", pwm(0)),
+                // LED2 is P2.07, which no PWM reaches: the common list's PWM
+                // there compiled and would never have lit it.
+                ("(LED2", PinFunction::GpioOutput),
                 ("(LED3", pwm(1)),
-                ("VCOM1 TXD", PinFunction::UsartTx(30)),
-                ("VCOM1 RXD", PinFunction::UsartRx(30)),
-                ("VCOM0 TXD", PinFunction::AdcChannel { adc: 0, channel: 0 }),
-                ("VCOM0 RXD", PinFunction::AdcChannel { adc: 0, channel: 1 }),
+                ("VCOM0 TXD", PinFunction::UsartTx(30)),
+                ("VCOM0 RXD", PinFunction::UsartRx(30)),
+                ("VCOM1 TXD", PinFunction::AdcChannel { adc: 0, channel: 0 }),
+                ("VCOM1 RXD", PinFunction::AdcChannel { adc: 0, channel: 1 }),
             ]
         } else {
             Vec::new()
         };
         // USB and QSPI only exist on the 52840 DK's pads: elsewhere these
         // keys match nothing, which is the point of wiring them everywhere.
-        let common: [(&str, PinFunction); 19] = [
+        let common: [(&str, PinFunction); 21] = [
             ("USB D+", PinFunction::UsbDp),
             ("USB D-", PinFunction::UsbDm),
             ("(QSPI CS,", PinFunction::QspiNcs { bank: 1 }),
@@ -708,11 +848,16 @@ mod tests {
             ("BUTTON1", PinFunction::GpioInput),
             ("VCOM TXD", PinFunction::UsartTx(0)),
             ("VCOM RXD", PinFunction::UsartRx(0)),
+            // The nRF5340 DK's console port, printed VCOM2 on its PCB.
+            ("VCOM2 TXD", PinFunction::UsartTx(0)),
+            ("VCOM2 RXD", PinFunction::UsartRx(0)),
             ("SCK)", PinFunction::SpiSck(case.spim)),
             ("MOSI)", PinFunction::SpiMosi(case.spim)),
             ("MISO)", PinFunction::SpiMiso(case.spim)),
-            ("SDA)", PinFunction::I2cSda(case.twim)),
-            ("SCL)", PinFunction::I2cScl(case.twim)),
+            // No closing paren: the nRF52 DK's I2C pads go on to name the
+            // I/O expander that shares them.
+            ("SDA", PinFunction::I2cSda(case.twim)),
+            ("SCL", PinFunction::I2cScl(case.twim)),
         ];
         for p in mcu.iter_all_pins_mut() {
             if let Some((_, f)) = nrf54
@@ -861,9 +1006,30 @@ mod tests {
         assert!(!m.contains("CLOCK_POWER"), "{m}");
     }
 
-    /// The nRF54L15: blocks numbered by power domain, each reaching ONE port
-    /// - so no pad of the kit offers an instance that cannot reach it - the
-    /// GRTC time driver, WDT0 on the secure core, and the SAADC on P1.
+    /// The nRF54L has no UICR.NFCPINS: NFCT.PADCONFIG frees its NFC pads, at
+    /// every boot, on both runtimes (both are embassy-nrf here).
+    #[test]
+    fn the_54l15_nfc_comment_names_its_own_register() {
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mut mcu = builtins::builtin_for("nrf54l15_dk").unwrap().build_mcu();
+            mcu.runtime = runtime;
+            for p in mcu.iter_all_pins_mut() {
+                if p.name.starts_with("P1.02") {
+                    p.selected_function = PinFunction::GpioInput;
+                }
+            }
+            let main = mcu.fresh_main_rs();
+            assert!(main.contains("// P1.02 is one of the NFC antenna pins."), "{main}");
+            assert!(main.contains("(NFCT.PADCONFIG) on every boot"), "{main}");
+            assert!(!main.contains("UICR"), "{main}");
+        }
+    }
+
+    /// The nRF54L15: blocks numbered by power domain, each reaching one port
+    /// (with dedicated pins on P2 and clock pins for SCK/SCL), so no pad of
+    /// the kit offers a signal its pin cannot carry; the GRTC time driver,
+    /// WDT0 on the secure core, and the SAADC on P1. Every hand-made mistake
+    /// compiles, so each gets its comment.
     #[test]
     fn the_54l15_keeps_each_block_on_its_own_port() {
         let c = chip("nrf54l15").unwrap();
@@ -876,24 +1042,17 @@ mod tests {
 
         let def = builtins::builtin_for("nrf54l15_dk").unwrap();
         for p in def.build_mcu().iter_all_pins() {
-            let Some((port, _)) = super::super::nrf::nrf_pin(&p.name) else {
+            let Some(pp) = super::super::nrf::nrf_pin(&p.name) else {
                 continue;
             };
+            // QFN48 ports: P0.00..06, P1.00..14, P2.00..10.
+            assert!(pp.1 <= [6, 14, 10][pp.0 as usize], "{}: not a QFN48 pin", p.name);
             for f in &p.available_functions {
-                let inst = match f {
-                    PinFunction::UsartTx(i)
-                    | PinFunction::UsartRx(i)
-                    | PinFunction::UsartCts(i)
-                    | PinFunction::UsartRts(i)
-                    | PinFunction::SpiSck(i)
-                    | PinFunction::SpiMosi(i)
-                    | PinFunction::SpiMiso(i)
-                    | PinFunction::I2cSda(i)
-                    | PinFunction::I2cScl(i) => *i,
-                    PinFunction::TimerPwm { timer, .. } => *timer,
-                    _ => continue,
-                };
-                assert!(reaches(c, inst, port), "{}: offers {f:?} across domains", p.name);
+                assert!(
+                    super::super::nrf::pin_fits(c, f, pp),
+                    "{}: offers {f:?}, which that pin cannot carry",
+                    p.name
+                );
             }
         }
 
@@ -916,23 +1075,42 @@ mod tests {
         }
         assert!(main("eide_nrf54l15_dk_async_check").contains("clocks the GRTC"));
 
-        // A hand-made pairing across domains compiles, and says it will not work.
-        let mut mcu = def.build_mcu();
-        mcu.runtime = Runtime::Async;
-        for p in mcu.iter_all_pins_mut() {
-            if p.name.contains("VCOM1 TXD") {
-                p.selected_function = PinFunction::UsartTx(20);
+        // A hand-made definition can wire anything; each kind of mistake
+        // compiles, and says why the pin will not do it.
+        let notes = |wire: &[(&str, PinFunction)]| {
+            let mut mcu = def.build_mcu();
+            mcu.runtime = Runtime::Async;
+            for p in mcu.iter_all_pins_mut() {
+                if let Some((_, f)) = wire.iter().find(|(head, _)| p.name.starts_with(head)) {
+                    p.selected_function = f.clone();
+                }
             }
-            if p.name.contains("VCOM0 RXD") {
-                p.selected_function = PinFunction::UsartRx(20);
-            }
-        }
-        let m = mcu.fresh_main_rs();
+            mcu.fresh_main_rs()
+        };
+        // The wrong power domain.
+        let m = notes(&[("P0.00", PinFunction::UsartTx(20)), ("P1.05", PinFunction::UsartRx(20))]);
         assert!(
-            m.contains("UARTE20 TXD is on P0.00, but on the nRF54L15 its block reaches P1 only"),
+            m.contains("UARTE20 TXD is on P0.00, which the nRF54L15 cannot use for it: SERIAL20 reaches P1 only."),
             "{m}"
         );
         assert!(!m.contains("UARTE20 RXD is on"), "P1.05 is P1's own:\n{m}");
+        // SERIAL00 on a P2 pin that is not one of its dedicated ones.
+        let m = notes(&[("P2.03", PinFunction::UsartTx(0)), ("P2.07", PinFunction::UsartRx(0))]);
+        assert!(m.contains("UARTE0 TXD is on P2.03, which the nRF54L15 cannot use for it: SERIAL00 reaches only its dedicated P2 pins - P2.02 or P2.08"), "{m}");
+        assert!(!m.contains("UARTE0 RXD is on"), "P2.07 is a dedicated RXD pin:\n{m}");
+        // SERIAL20 on its own cross-domain P2 pin: Constant Latency only.
+        let m = notes(&[("P2.02", PinFunction::UsartTx(20)), ("P2.07", PinFunction::UsartRx(20))]);
+        assert!(m.contains("UARTE20 TXD is on P2.02, which the nRF54L15 cannot use for it: a cross-domain pin SERIAL20 reaches only in Constant Latency mode"), "{m}");
+        assert!(m.contains("UARTE20 RXD is on P2.07, which the nRF54L15 cannot use for it: SERIAL20 reaches P1, and on P2 only P2.00"), "{m}");
+        // TWIM on P2 has no pin at all, and SCL off a clock pin.
+        let m = notes(&[("P2.06", PinFunction::I2cScl(21)), ("P1.10", PinFunction::I2cScl(22)), ("P1.12", PinFunction::I2cSda(22))]);
+        assert!(m.contains("TWIM21 SCL is on P2.06, which the nRF54L15 cannot use for it: SERIAL21 reaches P1 only."), "{m}");
+        assert!(m.contains("TWIM22 SCL is on P1.10, which the nRF54L15 cannot use for it: not a clock pin"), "{m}");
+        assert!(!m.contains("TWIM22 SDA is on"), "SDA needs no clock pin:\n{m}");
+        // The kit's own wiring has nothing to say.
+        for dir in ["eide_nrf54l15_dk_check", "eide_nrf54l15_dk_async_check"] {
+            assert!(!main(dir).contains("cannot use for it"), "{dir}:\n{}", main(dir));
+        }
     }
 
     /// The small parts' serial blocks, by their embassy-nrf names.
@@ -967,7 +1145,7 @@ mod tests {
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(case.dir);
-            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf project");
             let toml_path = dir.join("Cargo.toml");
@@ -1000,6 +1178,36 @@ mod tests {
             }
             println!("wrote {}", dir.display());
             println!("target: {}", project.target);
+        }
+    }
+
+    /// A note keyed to a pin the kit has no pad for would vanish without a
+    /// word - the generator matches by pin - so every key must land, and land
+    /// once. And the 54L15's logic-level warning must reach every usable pad.
+    #[test]
+    fn every_pad_note_lands_on_a_pad() {
+        for b in BOARDS {
+            let def = definitions().into_iter().find(|d| d.id == b.id).unwrap();
+            let pads: Vec<&PinDef> = [&def.pins.left, &def.pins.right, &def.pins.top]
+                .into_iter()
+                .flatten()
+                .collect();
+            let at = |pp: (u8, u8)| {
+                pads.iter()
+                    .filter(|p| super::super::nrf::nrf_pin(&p.name) == Some(pp))
+                    .count()
+            };
+            for (pp, _) in b.notes {
+                assert_eq!(at(*pp), 1, "{}: note for {pp:?} lands on no pad", b.id);
+            }
+            for pp in b.low_freq {
+                assert_eq!(at(*pp), 1, "{}: low-frequency pin {pp:?} has no pad", b.id);
+            }
+            if !b.every_pad.is_empty() {
+                for p in pads.iter().filter(|p| !p.reserved) {
+                    assert!(p.note.starts_with(b.every_pad), "{}: {} misses it", b.id, p.name);
+                }
+            }
         }
     }
 

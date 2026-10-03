@@ -1387,7 +1387,7 @@ mod emit_for_manual_compile {
             // green while `cargo check` said "file not found for module `pins`".
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
-            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write rp project");
             println!("wrote {}", dir.display());
@@ -2549,6 +2549,7 @@ pub(super) mod pico2_ice_board {
             functions,
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         }
     }
 
@@ -4748,7 +4749,7 @@ mod async_pwm_keeps_both_channels {
         let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_rp2040_pwm_ab");
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write rp pwm project");
         let toml_path = dir.join("Cargo.toml");
@@ -4843,7 +4844,7 @@ mod emit_async_for_manual_compile {
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
-            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write rp radio project");
             let toml_path = dir.join("Cargo.toml");
@@ -4996,7 +4997,7 @@ mod emit_async_for_manual_compile {
             // producing the day the watchdog became one.
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
-            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write rp async project");
             // The async deps the runtime needs, added the way the app adds them.
@@ -5116,7 +5117,7 @@ mod emit_async_for_manual_compile {
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
-            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write pico2-ice project");
             if matches!(runtime, Runtime::Async) {

@@ -62,7 +62,8 @@ pub(crate) struct NrfChip {
     pub fpu: bool,
     pub flash_kb: u32,
     pub ram_kb: u32,
-    /// NFCT: P0.09/P0.10 are antenna pins until the UICR says otherwise, and
+    /// NFCT: `nfc_pins` are antenna pins until the UICR (NFCT.PADCONFIG on
+    /// the nRF54L) says otherwise, and
     /// embassy-nrf refuses `nfc-pins-as-gpio` on a part without them.
     pub nfc: bool,
     /// Port 1 exists. Read by the kits' own check that no pad names a pin
@@ -267,11 +268,17 @@ impl NrfChip {
         self.family == "nrf54l15"
     }
 
-    /// Whether block instance `inst` can reach a pin on `port`.
+    /// Whether block instance `inst` can reach a pin on `port` - the SAFE
+    /// answer the built-in kits are generated from.
     ///
     /// On an nRF52 or the nRF5340 any signal routes to any pin. On the nRF54L
-    /// each block lives in a power domain and reaches that domain's port only:
+    /// each block lives in a power domain and reaches that domain's port:
     /// SERIAL00 is on P2, SERIAL20/21/22 and PWM20/21/22 on P1, SERIAL30 on P0.
+    /// The datasheet allows more and less than this at the edges - SERIAL00
+    /// only on its dedicated P2 pins, SERIAL20/21 also on a few P2 pins in
+    /// Constant Latency mode - which `nrf54_pin_rule` checks per signal.
+    /// Read by the kits' generator (an authoring tool, so tests only).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reaches(&self, inst: u8, port: u8) -> bool {
         !self.nrf54()
             || match port {
@@ -653,6 +660,8 @@ fn nfc_pads_used(mcu: &Mcu) -> Vec<String> {
     // The two antenna pins - P0.09/P0.10 on an nRF52, P0.02/P0.03 on the
     // nRF5340 - are NFC until the UICR's `NFCPINS` register is cleared, and
     // the UICR is flash: nothing this code emits at run time can change it.
+    // The nRF54L's P1.02/P1.03 are the exception: NFCT.PADCONFIG, a plain
+    // register, written by embassy-nrf's `init` at every boot.
     let Some(nfc) = chip(&mcu.family).filter(|c| c.nfc).map(|c| c.nfc_pins()) else {
         return Vec::new();
     };
@@ -829,37 +838,139 @@ fn qspi_frequency(prescaler: u8) -> (u32, &'static str) {
     (32_000_000 / (i as u32 + 1), F[i])
 }
 
-/// A comment per signal wired to a port its block cannot reach (nRF54L).
+/// The nRF54L15's clock pins in the QFN48 package (the nRF54L15 DK's): the
+/// only pins SPIM SCK and TWIM SCL may use. From the datasheet's QFN48 pin
+/// assignment table; other packages differ.
+const NRF54_CLOCK_PINS: [(u8, u8); 9] = [
+    (0, 3),
+    (0, 4),
+    (1, 3),
+    (1, 4),
+    (1, 8),
+    (1, 11),
+    (1, 12),
+    (2, 1),
+    (2, 6),
+];
+
+/// What a pin function does on its serial block, for the nRF54L pin rules.
+fn serial_role(f: &PinFunction) -> Option<(u8, &'static str)> {
+    Some(match f {
+        PinFunction::SpiSck(i) => (*i, "sck"),
+        PinFunction::SpiMosi(i) => (*i, "mosi"),
+        PinFunction::SpiMiso(i) => (*i, "miso"),
+        PinFunction::UsartTx(i) => (*i, "txd"),
+        PinFunction::UsartRx(i) => (*i, "rxd"),
+        PinFunction::UsartCts(i) => (*i, "cts"),
+        PinFunction::UsartRts(i) => (*i, "rts"),
+        PinFunction::I2cScl(i) => (*i, "scl"),
+        PinFunction::I2cSda(i) => (*i, "sda"),
+        _ => return None,
+    })
+}
+
+/// The dedicated P2 pin of a SPIM/UARTE `role` in the SERIAL20 (P2.00..05)
+/// or SERIAL21 (P2.06..10) group - the nRF54L15 datasheet's QFN48 table.
+/// SERIAL00 may use either group's pin; SERIAL20/21 their own, cross-domain.
+/// No TWIM has a P2 pin at all.
+fn nrf54_p2_pin(role: &str, group: u8) -> Option<u8> {
+    let (g20, g21) = match role {
+        "sck" => (1, 6),
+        "mosi" | "txd" => (2, 8),
+        "miso" | "cts" => (4, 9),
+        "rxd" => (0, 7),
+        "rts" => (5, 10),
+        _ => return None,
+    };
+    match group {
+        20 => Some(g20),
+        21 => Some(g21),
+        _ => None,
+    }
+}
+
+/// What is wrong with `f` on pin `pp` of an nRF54L15, or `None`.
 ///
-/// The PSEL register takes any pin number, so this compiles - and the pin
-/// never moves. A built-in kit offers no such pairing; a definition made by
-/// hand can, and this is the only place that would say so.
+/// Every case here COMPILES - PSEL takes any pin number - and then the pin
+/// never moves, or moves only in a power mode nothing started. That is why
+/// the generated code says so rather than leaving it to the scope.
+fn nrf54_pin_rule(f: &PinFunction, pp: (u8, u8)) -> Option<String> {
+    let (port, pin) = pp;
+    let list = |pins: &[u8]| {
+        pins.iter()
+            .map(|p| label((2, *p)))
+            .collect::<Vec<_>>()
+            .join(" or ")
+    };
+    if let PinFunction::TimerPwm { timer, .. } = f {
+        return (port != 1).then(|| format!("PWM{timer} reaches P1 only"));
+    }
+    let (inst, role) = serial_role(f)?;
+    let twi = matches!(role, "scl" | "sda");
+    let domain = match (inst, port) {
+        (30, 0) | (20..=22, 1) => None,
+        (0, 2) => {
+            let ok: Vec<u8> = [20, 21].iter().filter_map(|g| nrf54_p2_pin(role, *g)).collect();
+            (!ok.contains(&pin)).then(|| format!("SERIAL00 reaches only its dedicated P2 pins - {} for this signal", list(&ok)))
+        }
+        (20 | 21, 2) if !twi && nrf54_p2_pin(role, inst) == Some(pin) => {
+            return Some(format!(
+                "a cross-domain pin SERIAL{inst} reaches only in Constant Latency mode\n    // (POWER TASKS_CONSTLAT), which this code does not start"
+            ));
+        }
+        (20 | 21, 2) if !twi => Some(format!(
+            "SERIAL{inst} reaches P1, and on P2 only {} for this signal",
+            list(&nrf54_p2_pin(role, inst).into_iter().collect::<Vec<_>>())
+        )),
+        (30, _) => Some("SERIAL30 reaches P0 only".to_owned()),
+        (0, _) => Some("SERIAL00 reaches its dedicated P2 pins only".to_owned()),
+        _ => Some(format!("SERIAL{inst} reaches P1 only")),
+    };
+    if domain.is_some() {
+        return domain;
+    }
+    // In the right domain: the clock signal still needs a clock pin. SDA and
+    // MOSI/MISO need none - only "close to the clock pin".
+    (matches!(role, "sck" | "scl") && !NRF54_CLOCK_PINS.contains(&pp)).then(|| {
+        let pins: Vec<String> = NRF54_CLOCK_PINS.iter().map(|p| label(*p)).collect();
+        format!(
+            "not a clock pin, which SCK and SCL must use - in the QFN48 package\n    // {}",
+            pins.join(", ")
+        )
+    })
+}
+
+/// Whether `f` works from pin `pp` on part `c` with nothing else to set up:
+/// always on an nRF52 or the nRF5340, and on the nRF54L when
+/// [`nrf54_pin_rule`] has nothing to say - so a Constant Latency pin counts
+/// as NO. The built-in kits offer only functions this accepts.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn pin_fits(c: &NrfChip, f: &PinFunction, pp: (u8, u8)) -> bool {
+    !c.nrf54() || nrf54_pin_rule(f, pp).is_none()
+}
+
+/// A comment per signal an nRF54L15 cannot drive from the pin it is wired
+/// to: the wrong power domain, a P2 pin that is not dedicated to it, or a
+/// clock signal off a clock pin.
+///
+/// A built-in kit offers no such pairing; a definition made by hand can, and
+/// this is the only place that would say so.
 fn domain_notes(mcu: &Mcu) -> String {
     let Some(c) = chip(&mcu.family).filter(|c| c.nrf54()) else {
         return String::new();
     };
     let mut o = String::new();
     for p in mcu.iter_all_pins().filter(|p| !p.reserved) {
-        let (Some(pp), Some(sig), Some((_, Some(inst), _))) = (
-            nrf_pin(&p.name),
-            signal_name(&p.selected_function),
-            block_of(&p.selected_function),
-        ) else {
+        let (Some(pp), Some(sig)) = (nrf_pin(&p.name), signal_name(&p.selected_function)) else {
             continue;
         };
-        if matches!(p.selected_function, PinFunction::AdcChannel { .. }) || c.reaches(inst, pp.0) {
-            continue;
+        if let Some(why) = nrf54_pin_rule(&p.selected_function, pp) {
+            o.push_str(&format!(
+                "    // {sig} is on {}, which the {} cannot use for it: {why}.\n",
+                label(pp),
+                c.part
+            ));
         }
-        let home = match inst {
-            30 => "P0",
-            20..=22 => "P1",
-            _ => "P2",
-        };
-        o.push_str(&format!(
-            "    // {sig} is on {}, but on the {} its block reaches {home} only: the pin\n    // will not move. Wire it to a {home} pad.\n",
-            label(pp),
-            c.part
-        ));
     }
     o
 }
@@ -1970,8 +2081,14 @@ fn async_nfc_note(mcu: &Mcu) -> String {
     if used.is_empty() {
         return String::new();
     }
+    // The nRF54L has no UICR.NFCPINS: the pads are a register of NFCT itself.
+    let how = if chip(&mcu.family).is_some_and(|c| c.nrf54()) {
+        "has `init` turn the NFCT pads off\n    // (NFCT.PADCONFIG) on every boot, so they are GPIO from the first one.\n"
+    } else {
+        "has `init` clear UICR.NFCPINS and reset\n    // once, so they are GPIO from the second boot on, until the UICR is erased.\n"
+    };
     format!(
-        "    // {} {} the NFC antenna pins. The `nfc-pins-as-gpio` feature on the\n    // embassy-nrf line in Cargo.toml has `init` clear UICR.NFCPINS and reset\n    // once, so they are GPIO from the second boot on, until the UICR is erased.\n",
+        "    // {} {} the NFC antenna pins. The `nfc-pins-as-gpio` feature on the\n    // embassy-nrf line in Cargo.toml {how}",
         used.join(" and "),
         if used.len() == 1 { "is one of" } else { "are" }
     )
@@ -3367,7 +3484,7 @@ mod blocking_codegen {
         let files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join(dir_name);
-        let _ = std::fs::remove_dir_all(&dir);
+        project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write nrf project");
         println!("wrote {}", dir.display());
@@ -3979,7 +4096,7 @@ mod async_codegen {
             assert_eq!(names, ["watchdog.rs"], "{dir_name}");
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
-            let _ = std::fs::remove_dir_all(&dir);
+            project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf async project");
 

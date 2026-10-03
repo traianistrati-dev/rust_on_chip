@@ -90,7 +90,7 @@ pub fn reserved_role(name: &str) -> &'static str {
     } else if n.contains("(XL1") || n.contains("(XL2") {
         "The 32.768 kHz crystal. It is the LFXO the Clock tab offers, so the pin is not free for GPIO."
     } else if n.starts_with("P0.") && n.contains("(RESET)") {
-        "Pin reset, wired to the DK's RESET button. Usable as GPIO only after the UICR's PSELRESET is cleared."
+        "Pin reset, wired to the DK's RESET button. A plain GPIO while UICR.PSELRESET is erased - but embassy-nrf's init programs it as pin reset (unless built with `reset-pin-as-gpio`), and once written the UICR stays, so it is kept reserved."
     } else if n.contains("ACCESSIBILITY") {
         "P0.12, reserved by the micro:bit for accessibility hardware (switch access). The foundation asks that nothing else use it."
     } else if n == "VBUS" {

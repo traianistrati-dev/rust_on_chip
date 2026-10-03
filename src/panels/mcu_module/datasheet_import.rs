@@ -1074,6 +1074,7 @@ pub fn apply_to_form(chip: &ExtractedChip, form: &mut McuForm) -> ApplyReport {
             // A datasheet PDF carries no AF indices — that is vendor XML data.
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         });
     }
     r.pins_added = rows.len();
@@ -2683,6 +2684,7 @@ mod tests {
             imported: true,
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         }
     }
 

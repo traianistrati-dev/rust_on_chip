@@ -146,6 +146,7 @@ pub fn convert_xml_with_af(xml: &str, af: Option<&GpioAf>) -> Result<Vec<Convert
                     imported: false,
                     af: af_pairs,
                     fn_owner: Vec::new(),
+                    note: String::new(),
                 };
                 // A package position is either a NUMBER (QFP, DIP: pins along
                 // the edges) or a DESIGNATOR like "A2" (WLCSP, BGA: balls under
@@ -301,6 +302,7 @@ fn build_grid(balls: &[(usize, usize, PinRow)]) -> Option<PinGridDef> {
                 functions: parse_functions(&row.functions),
                 af: row.af.clone(),
                 fn_owner: crate::panels::mcu_module::mcu_form::owners_to_functions(&row.fn_owner),
+                note: row.note.clone(),
             },
         })
         .collect();

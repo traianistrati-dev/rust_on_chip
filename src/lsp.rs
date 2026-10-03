@@ -280,6 +280,12 @@ pub struct SymbolInfo {
     /// trait bound (those bind to the TRAIT's declaration), so an empty result
     /// here doesn't mean "unused" — these items must never be faded.
     pub in_trait_impl: bool,
+    /// What the item sits in, as `(parent SymbolKind, name)`: the TYPE of an
+    /// `impl` block (19 — `impl Node` and `impl Display for Node` both give
+    /// `Node`), a trait (11), a struct (23) or an enum (10). `None` for a
+    /// free item. Lets a text match tell `Node::value` from `Other::value`
+    /// (see `editor_panel::macro_uses`).
+    pub container: Option<(u8, String)>,
 }
 
 /// `true` for the `SymbolKind`s worth tracking (fn/method/struct/enum/const/
@@ -3806,27 +3812,49 @@ fn parse_document_symbols(result: &serde_json::Value) -> Vec<SymbolInfo> {
         name.starts_with("impl") && name.contains(" for ")
     }
 
-    fn walk(node: &serde_json::Value, out: &mut Vec<SymbolInfo>, in_trait_impl: bool) {
+    /// What this node is to its CHILDREN: the type an `impl` block is for, or
+    /// the trait / struct / enum itself. Anything else (a module, a fn body)
+    /// holds free items.
+    fn container_for_children(name: &str, kind: u8) -> Option<(u8, String)> {
+        match kind {
+            19 => crate::panels::structure_map::parse::impl_target_name(
+                name.strip_prefix("impl").unwrap_or(name),
+            )
+            .map(|t| (19, t)),
+            10 | 11 | 23 => Some((kind, name.to_owned())),
+            _ => None,
+        }
+    }
+
+    fn walk(
+        node: &serde_json::Value,
+        out: &mut Vec<SymbolInfo>,
+        in_trait_impl: bool,
+        container: &Option<(u8, String)>,
+    ) {
         let name = node["name"].as_str().unwrap_or("").to_owned();
         let kind = node["kind"].as_u64().unwrap_or(0) as u8;
         let child_in_trait_impl = in_trait_impl || is_trait_impl_symbol(&name);
+        let child_container = container_for_children(&name, kind);
 
         if let (Some(range), Some(sel)) = (node.get("range"), node.get("selectionRange")) {
-            if !name.is_empty() && is_trackable_symbol_kind(kind) {
-                if let Some(info) = symbol_from_ranges(name, kind, range, sel, in_trait_impl) {
-                    out.push(info);
-                }
+            if !name.is_empty()
+                && is_trackable_symbol_kind(kind)
+                && let Some(info) =
+                    symbol_from_ranges(name, kind, range, sel, in_trait_impl, container)
+            {
+                out.push(info);
             }
             if let Some(children) = node["children"].as_array() {
                 for c in children {
-                    walk(c, out, child_in_trait_impl);
+                    walk(c, out, child_in_trait_impl, &child_container);
                 }
             }
         } else if let Some(loc) = node.get("location") {
             // Flat SymbolInformation — no separate selection span or children.
             if !name.is_empty() && is_trackable_symbol_kind(kind) {
                 let r = &loc["range"];
-                if let Some(info) = symbol_from_ranges(name, kind, r, r, in_trait_impl) {
+                if let Some(info) = symbol_from_ranges(name, kind, r, r, in_trait_impl, container) {
                     out.push(info);
                 }
             }
@@ -3839,6 +3867,7 @@ fn parse_document_symbols(result: &serde_json::Value) -> Vec<SymbolInfo> {
         range: &serde_json::Value,
         sel: &serde_json::Value,
         in_trait_impl: bool,
+        container: &Option<(u8, String)>,
     ) -> Option<SymbolInfo> {
         Some(SymbolInfo {
             name,
@@ -3850,13 +3879,14 @@ fn parse_document_symbols(result: &serde_json::Value) -> Vec<SymbolInfo> {
             sel_line: sel["start"]["line"].as_u64()? as u32,
             sel_char: sel["start"]["character"].as_u64()? as u32,
             in_trait_impl,
+            container: container.clone(),
         })
     }
 
     let mut out = Vec::new();
     if let Some(arr) = result.as_array() {
         for node in arr {
-            walk(node, &mut out, false);
+            walk(node, &mut out, false, &None);
         }
     }
     out
@@ -4355,6 +4385,54 @@ mod document_symbol_tests {
         flag("new_parser", true, 1); // impl-for member
         flag("decode", true, 0); // impl-for member
         flag("helper", false, 0); // inherent impl member
+    }
+
+    /// Each item knows what it sits in: the impl's TYPE (trait impls too),
+    /// the trait, the struct or the enum — and a free item nothing.
+    #[test]
+    fn items_know_their_container() {
+        let result = serde_json::json!([
+            sym(
+                "impl Node",
+                19,
+                serde_json::json!([sym("value", 12, serde_json::json!([]))])
+            ),
+            sym(
+                "impl core::fmt::Display for Node",
+                19,
+                serde_json::json!([sym("fmt", 6, serde_json::json!([]))])
+            ),
+            sym(
+                "Kind",
+                10,
+                serde_json::json!([sym("Back", 22, serde_json::json!([]))])
+            ),
+            sym(
+                "Node",
+                23,
+                serde_json::json!([sym("name", 8, serde_json::json!([]))])
+            ),
+            sym(
+                "Menu",
+                11,
+                serde_json::json!([sym("show", 6, serde_json::json!([]))])
+            ),
+            sym("BACK", 14, serde_json::json!([])),
+        ]);
+        let syms = parse_document_symbols(&result);
+        let of = |name: &str| {
+            syms.iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .container
+                .clone()
+        };
+        assert_eq!(of("value"), Some((19, "Node".to_owned())));
+        assert_eq!(of("fmt"), Some((19, "Node".to_owned())));
+        assert_eq!(of("Back"), Some((10, "Kind".to_owned())));
+        assert_eq!(of("name"), Some((23, "Node".to_owned())));
+        assert_eq!(of("show"), Some((11, "Menu".to_owned())));
+        assert_eq!(of("BACK"), None);
     }
 }
 

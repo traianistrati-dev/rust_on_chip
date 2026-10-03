@@ -42,6 +42,9 @@ const REFS_RUN_STRIDE: usize = 100_000;
 struct UsageRef {
     path: String,
     line: u32,
+    /// The `macro_rules!` whose body holds this use — a site rust-analyzer
+    /// never reports, read from the text (see `macro_uses`).
+    via_macro: Option<String>,
 }
 
 /// One tracked item (fn/struct/enum/const/…) in the displayed file.
@@ -71,8 +74,31 @@ struct UsageItem {
     /// well be the live implementation behind every one of those calls.
     in_trait_impl: bool,
     /// `None` while the reference lookup for this item hasn't resolved yet
-    /// (nothing is drawn for it until it does).
+    /// (nothing is drawn for it until it does). Both sources below, merged —
+    /// see [`UsageItem::merge`].
     references: Option<Vec<UsageRef>>,
+    /// rust-analyzer's answer. The only part carried over to the next run:
+    /// the macro uses are re-read with the text, so an old run's would point
+    /// at lines an edit has moved.
+    ra_refs: Option<Vec<UsageRef>>,
+    /// Uses inside `macro_rules!` bodies, which rust-analyzer never resolves.
+    macro_refs: Vec<UsageRef>,
+}
+
+impl UsageItem {
+    /// `references` from its two sources: nothing until rust-analyzer has
+    /// answered (an item still resolving draws nothing), then its sites and
+    /// the macro bodies' together, by file and line.
+    fn merge(&mut self) {
+        self.references = self.ra_refs.as_ref().map(|ra| {
+            let mut all = ra.clone();
+            all.extend(self.macro_refs.iter().cloned());
+            // The two sources spell paths differently (rust-analyzer's URI
+            // decoding, the workspace join), so they sort by a normal form.
+            all.sort_by_cached_key(|r| (r.path.replace('\\', "/").to_lowercase(), r.line));
+            all
+        });
+    }
 }
 
 #[derive(Default)]
@@ -213,9 +239,10 @@ fn is_externally_invoked_in(name: &str, start_line: u32, lines: &[&str]) -> bool
 fn usage_item(
     s: crate::lsp::SymbolInfo,
     index: &LineIndex,
-    references: Option<Vec<UsageRef>>,
+    ra_refs: Option<Vec<UsageRef>>,
+    macro_refs: Vec<UsageRef>,
 ) -> UsageItem {
-    UsageItem {
+    let mut item = UsageItem {
         sel_ci: index.pos_to_char_idx(s.sel_line + 1, s.sel_char + 1),
         eol_ci: index.line_end_char_idx(s.sel_line + 1),
         start_ci: index.pos_to_char_idx(s.start_line + 1, s.start_char + 1),
@@ -225,8 +252,54 @@ fn usage_item(
         sel_line: s.sel_line,
         sel_char: s.sel_char,
         in_trait_impl: s.in_trait_impl,
-        references,
-    }
+        references: None,
+        ra_refs,
+        macro_refs,
+    };
+    item.merge();
+    item
+}
+
+/// The uses of the item `s` (at `start_ci`..`sel_ci` of `index`, in crate
+/// `krate`) inside the bodies of `macros`, as usage sites under `workspace`
+/// — where the popup can navigate to them like any other.
+fn macro_refs_of(
+    s: &crate::lsp::SymbolInfo,
+    index: &LineIndex,
+    krate: &str,
+    macros: &super::macro_uses::MacroIndex,
+    workspace: &std::path::Path,
+) -> Vec<UsageRef> {
+    // rust-analyzer reports a `macro_rules!` as a Function. Told apart by the
+    // code right before the name — not by the whole range, which starts at
+    // the item's doc comment and attributes: a helper documented as "called
+    // from the macro_rules body" would otherwise match only `helper!`.
+    let start = index.pos_to_char_idx(s.start_line + 1, s.start_char + 1);
+    let sel = index.pos_to_char_idx(s.sel_line + 1, s.sel_char + 1);
+    let is_macro = s.kind == 12
+        && start <= sel
+        && index
+            .text()
+            .get(index.byte_of_char(start)..index.byte_of_char(sel))
+            .and_then(|t| t.trim_end().strip_suffix('!'))
+            .and_then(|t| t.trim_end().strip_suffix("macro_rules"))
+            .is_some_and(|p| !p.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+    let shape = super::macro_uses::ItemShape {
+        name: &s.name,
+        kind: s.kind,
+        container: s.container.as_ref().map(|(k, n)| (*k, n.as_str())),
+        is_macro,
+        krate,
+    };
+    macros
+        .uses_of(&shape)
+        .into_iter()
+        .map(|u| UsageRef {
+            path: workspace.join(&u.rel).to_string_lossy().into_owned(),
+            line: u.line,
+            via_macro: Some(u.macro_name),
+        })
+        .collect()
 }
 
 /// One `unused_variables` / `unused_imports` diagnostic of the displayed file,
@@ -562,16 +635,41 @@ impl AppIde {
                 let text = self.ed.usages.pending_text.take().unwrap_or_default();
                 // Carry the previous run's resolved references over by (name,
                 // kind) so the fade/pill stays continuous while the serialized
-                // refresh below re-verifies each item one by one.
+                // refresh below re-verifies each item one by one. Only
+                // rust-analyzer's: the macro uses are re-read just below.
                 let cache: std::collections::HashMap<(String, u8), Vec<UsageRef>> =
                     std::mem::take(&mut self.ed.usages.items)
                         .into_iter()
-                        .filter_map(|it| Some(((it.name, it.kind), it.references?)))
+                        .filter_map(|it| Some(((it.name, it.kind), it.ra_refs?)))
                         .collect();
                 // Both built once for the whole reply, from the exact text its
                 // positions describe.
                 let index = LineIndex::new(&text);
                 let lines: Vec<&str> = text.lines().collect();
+                // Uses inside `macro_rules!` bodies, which rust-analyzer never
+                // resolves: read from every project file — the displayed one
+                // as this reply describes it. Once per settled run, no request.
+                let rel = self.ed.usages.rel_path.clone();
+                // A build script, `tests/`, `examples/` is its own unit: only
+                // its own macros expand into it, and none of its into the crate.
+                let macros = if !super::macro_uses::in_crate_src(&rel) {
+                    super::macro_uses::MacroIndex::of_unit(&rel, &text)
+                } else {
+                    let mut files: Vec<(&str, &str)> = vec![(rel.as_str(), text.as_str())];
+                    if rel != "src/main.rs" {
+                        files.push(("src/main.rs", self.generated_code.as_str()));
+                    }
+                    files.extend(
+                        self.project_tree
+                            .user_src_files
+                            .iter()
+                            .filter(|(r, _)| *r != rel)
+                            .map(|(r, t)| (r.as_str(), t.as_str())),
+                    );
+                    self.ed.macro_facts.index(files)
+                };
+                let krate = crate::panels::structure_map::parse::split_crate(&rel).0;
+                let workspace = crate::workspace::dir();
                 self.ed.usages.items = syms
                     .into_iter()
                     // Entry points / externally-invoked items (`fn main`, an
@@ -581,8 +679,9 @@ impl AppIde {
                     // shown as "dead code".
                     .filter(|s| !is_externally_invoked_in(&s.name, s.start_line, &lines))
                     .map(|s| {
-                        let references = cache.get(&(s.name.clone(), s.kind)).cloned();
-                        usage_item(s, &index, references)
+                        let ra_refs = cache.get(&(s.name.clone(), s.kind)).cloned();
+                        let macro_refs = macro_refs_of(&s, &index, &krate, &macros, &workspace);
+                        usage_item(s, &index, ra_refs, macro_refs)
                     })
                     .collect();
                 self.ed.usages.computed_total_chars = index.total_chars();
@@ -615,14 +714,16 @@ impl AppIde {
                 if key / REFS_RUN_STRIDE == self.ed.usages.refs_run as usize {
                     let idx = key % REFS_RUN_STRIDE;
                     if let Some(item) = self.ed.usages.items.get_mut(idx) {
-                        item.references = Some(
+                        item.ra_refs = Some(
                             locs.into_iter()
                                 .map(|r| UsageRef {
                                     path: r.path,
                                     line: r.line,
+                                    via_macro: None,
                                 })
                                 .collect(),
                         );
+                        item.merge();
                     }
                 }
             }
@@ -877,7 +978,12 @@ impl AppIde {
                         .show(ui, |ui| {
                             for r in &refs {
                                 let short = crate::app::short_path(&r.path);
-                                let label = format!("{short}:{}", r.line + 1);
+                                // A use read from a macro body says so: it is a
+                                // text match, and the line is the macro's.
+                                let label = match &r.via_macro {
+                                    Some(m) => format!("{short}:{} · in {m}!", r.line + 1),
+                                    None => format!("{short}:{}", r.line + 1),
+                                };
                                 // A real `Link`, not a click-sensing `Label`:
                                 // each row navigates, so it has to LOOK like one
                                 // — link colour, underline on hover and the
@@ -935,8 +1041,8 @@ impl AppIde {
 mod tests {
     use super::{
         LineIndex, LintSite, LintSpans, is_externally_invoked, is_externally_invoked_in,
-        push_lint_sites, unused_import_ranges, unused_import_spans_in, unused_variable_range,
-        unused_variable_ranges, usage_item, word_positions,
+        macro_refs_of, push_lint_sites, unused_import_ranges, unused_import_spans_in,
+        unused_variable_range, unused_variable_ranges, usage_item, word_positions,
     };
     use crate::build::{BuildResult, Diagnostic};
     use crate::editor::gui::text_pos::{
@@ -1247,8 +1353,9 @@ mod tests {
                         sel_line: line,
                         sel_char: col,
                         in_trait_impl: false,
+                        container: None,
                     };
-                    let item = usage_item(s.clone(), &index, None);
+                    let item = usage_item(s.clone(), &index, None, Vec::new());
                     let at = |l: u32, c: u32| lsp_pos_to_char_idx(&text, l + 1, c + 1);
                     let ctx = format!("{text:?} line {line} col {col}");
                     assert_eq!(item.sel_ci, at(s.sel_line, s.sel_char), "sel {ctx}");
@@ -1282,12 +1389,14 @@ mod tests {
             sel_line: 2,
             sel_char: 11,
             in_trait_impl: true,
+            container: None,
         };
         let refs = vec![super::UsageRef {
             path: "/p/src/main.rs".into(),
             line: 7,
+            via_macro: None,
         }];
-        let item = usage_item(s, &LineIndex::new(""), Some(refs));
+        let item = usage_item(s, &LineIndex::new(""), Some(refs), Vec::new());
         assert_eq!((item.name.as_str(), item.kind), ("run", 6));
         assert_eq!((item.sel_line, item.sel_char), (2, 11));
         assert!(item.in_trait_impl);
@@ -1298,6 +1407,101 @@ mod tests {
             (item.sel_ci, item.eol_ci, item.start_ci, item.end_ci),
             (0, 0, 0, 0)
         );
+    }
+
+    fn symbol(
+        name: &str,
+        kind: u8,
+        line: u32,
+        col: u32,
+        container: Option<(u8, &str)>,
+    ) -> crate::lsp::SymbolInfo {
+        crate::lsp::SymbolInfo {
+            name: name.into(),
+            kind,
+            start_line: line,
+            start_char: 0,
+            end_line: line,
+            end_char: col + name.len() as u32,
+            sel_line: line,
+            sel_char: col,
+            in_trait_impl: false,
+            container: container.map(|(k, n)| (k, n.to_owned())),
+        }
+    }
+
+    /// rust-analyzer's empty answer plus two uses read from a macro body: the
+    /// item has two sites, so it is neither faded nor pill-less — and nothing
+    /// shows before rust-analyzer has answered.
+    #[test]
+    fn macro_uses_join_rust_analyzers_answer() {
+        let mac = |line| super::UsageRef {
+            path: "/w/src/menu.rs".into(),
+            line,
+            via_macro: Some("mode_menu".into()),
+        };
+        let s = symbol("value", 12, 0, 0, Some((19, "Node")));
+        let mut item = usage_item(s, &LineIndex::new(""), None, vec![mac(9), mac(3)]);
+        assert!(item.references.is_none(), "still resolving draws nothing");
+        item.ra_refs = Some(Vec::new());
+        item.merge();
+        let lines: Vec<u32> = item
+            .references
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.line)
+            .collect();
+        assert_eq!(lines, [3, 9]);
+    }
+
+    /// The report, end to end: `Node::value`, used only in an invoked
+    /// macro's body, gets that body's line as a site under the workspace; the
+    /// macro itself gets its invocation inside another invoked macro.
+    #[test]
+    fn the_reported_function_gets_its_macro_body_site() {
+        let text = "impl Node {\n    pub const fn value() -> Self { todo!() }\n}\n\
+                    macro_rules! menu { () => { static A: Node = Node::value(); } }\n\
+                    menu!();\n";
+        let rel = "src/menu.rs";
+        let index = LineIndex::new(text);
+        let macros = super::super::macro_uses::MacroIndex::scan([(rel, text)]);
+        let ws = std::path::Path::new("/w");
+        let value = symbol("value", 12, 1, 17, Some((19, "Node")));
+        let refs = macro_refs_of(&value, &index, "", &macros, ws);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].line, 3);
+        assert_eq!(refs[0].via_macro.as_deref(), Some("menu"));
+        assert!(
+            refs[0].path.replace('\\', "/").ends_with("/w/src/menu.rs"),
+            "{}",
+            refs[0].path
+        );
+        let other = symbol("value", 12, 1, 17, Some((19, "Other")));
+        assert!(macro_refs_of(&other, &index, "", &macros, ws).is_empty());
+    }
+
+    /// rust-analyzer's range starts at the doc comment: one that mentions
+    /// `macro_rules` must not make a fn a macro (it would then match only
+    /// `value!`), while a real `macro_rules!` still is one.
+    #[test]
+    fn a_doc_comment_does_not_make_a_function_a_macro() {
+        let text = "impl Node {\n    /// Called from the menu macro_rules body.\n    \
+                    pub const fn value() -> Self { todo!() }\n}\n\
+                    macro_rules! menu { () => { static A: Node = Node::value(); } }\n\
+                    macro_rules! outer { () => { menu!(); } }\n\
+                    outer!();\n";
+        let index = LineIndex::new(text);
+        let macros = super::super::macro_uses::MacroIndex::scan([("src/menu.rs", text)]);
+        let ws = std::path::Path::new("/w");
+        let mut value = symbol("value", 12, 2, 17, Some((19, "Node")));
+        value.start_line = 1; // the `///` line, as rust-analyzer sends it
+        assert_eq!(macro_refs_of(&value, &index, "", &macros, ws).len(), 1);
+        let mut menu = symbol("menu", 12, 4, 13, None);
+        menu.start_char = 0; // from `macro_rules!`
+        let refs = macro_refs_of(&menu, &index, "", &macros, ws);
+        assert_eq!(refs.len(), 1, "its `menu!` in outer");
+        assert_eq!(refs[0].via_macro.as_deref(), Some("outer"));
     }
 
     // ── flycheck lint spans ──────────────────────────────────────────────────

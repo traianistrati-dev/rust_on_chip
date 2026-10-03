@@ -53,6 +53,12 @@ pub struct PinRow {
     /// Carried through the form untouched, like [`af`](Self::af): it is data
     /// about the package, not something to author by hand.
     pub fn_owner: Vec<(String, String)>,
+    /// The board's note on this pad - see
+    /// [`PinDef::note`](crate::panels::mcu_module::mcu_def::PinDef::note).
+    /// Editable from the row's note button: editing a kit must never drop what
+    /// it says about its own solder bridges, and a copy saved as another board
+    /// must be able to see them and take them out.
+    pub note: String,
 }
 
 /// The clock model offered by the form. A full graph editor is out of scope,
@@ -519,6 +525,7 @@ impl McuForm {
                     imported: false,
                     af: d.af.clone(),
                     fn_owner: Vec::new(),
+                    note: d.note.clone(),
                 })
                 .collect()
         };
@@ -760,6 +767,7 @@ impl McuForm {
                     functions: parse_functions(&r.functions),
                     af: r.af.clone(),
                     fn_owner: owners_to_functions(&r.fn_owner),
+                    note: r.note.trim().to_string(),
                 })
                 .collect()
         };
@@ -880,6 +888,7 @@ pub fn gpio_bank(prefix: &str, start_number: usize, count: usize) -> Vec<PinRow>
             imported: false,
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         })
         .collect()
 }
@@ -1435,6 +1444,7 @@ mod tests {
             imported: false,
             af: Vec::new(),
             fn_owner: Vec::new(),
+            note: String::new(),
         }];
         assert!(
             f.errors()
@@ -2126,6 +2136,34 @@ mod tests {
         let mut g = McuForm::blank();
         g.display_name = "ESP32-C3".into();
         assert!(!g.auto_fill_identity());
+    }
+
+    /// A kit's pad notes are data about its solder bridges: editing the kit in
+    /// the form must carry them through, never drop them.
+    #[test]
+    fn a_pad_note_survives_the_form() {
+        let mut def = crate::panels::mcu_module::builtins::builtin_for("nrf52840_dk").unwrap();
+        def.pins.top[0].note = "Cut SB1 to free the pad.".into();
+        let back = McuForm::from_definition(&def).to_definition();
+        assert_eq!(back.pins.top[0].note, "Cut SB1 to free the pad.");
+        assert!(back.pins.top[1].note.is_empty());
+        // And it reaches the runtime pin the panel reads.
+        let mcu = back.build_mcu();
+        assert!(mcu.iter_all_pins().any(|p| p.note == "Cut SB1 to free the pad."));
+    }
+
+    /// The note is edited in a multi-line box: a blank one saves as no note
+    /// (the `.ron` then has no `note:` line), and an edit lands trimmed.
+    #[test]
+    fn an_edited_pad_note_saves_trimmed() {
+        let def = crate::panels::mcu_module::builtins::builtin_for("nrf52840_dk").unwrap();
+        let mut form = McuForm::from_definition(&def);
+        let at = form.pins[0].iter().position(|r| !r.note.is_empty()).unwrap();
+        form.pins[0][at].note = " \n ".into();
+        form.pins[0][at + 1].note = "  Cut SB9.\n".into();
+        let back = form.to_definition();
+        assert!(back.pins.top[at].note.is_empty());
+        assert_eq!(back.pins.top[at + 1].note, "Cut SB9.");
     }
 
     /// An nRF52 name fills every line the generator reads, from the chip

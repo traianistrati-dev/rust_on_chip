@@ -34,6 +34,61 @@ const SB_GAP: f32 = 3.0;
 const MODE_H: f32 = 19.0;
 /// Side of the square close button in the list's top-right corner.
 const CLOSE_W: f32 = 18.0;
+/// A board's note on a pad: size and colour.
+const NOTE_PT: f32 = 11.0;
+const NOTE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 205, 130);
+
+/// Paint `text` wrapped to `wrap` at `pos`, cut to the rows that fit in
+/// `max_h` and ended with "…" when cut, the full text then on hover. Returns
+/// the painted height.
+///
+/// A board note can run to six lines (the nRF54L15 DK's P2.07), and the chip
+/// body shrinks with the package and with rotation: uncapped, the note pushed
+/// the function list down to a sliver.
+fn draw_note(
+    painter: &egui::Painter,
+    ui: &mut egui::Ui,
+    text: String,
+    pos: egui::Pos2,
+    wrap: f32,
+    max_h: f32,
+    id: egui::Id,
+) -> f32 {
+    let font = egui::FontId::proportional(NOTE_PT);
+    let full = painter.layout(text.clone(), font.clone(), NOTE_COLOR, wrap);
+    let galley = if full.size().y <= max_h || full.rows.is_empty() {
+        full
+    } else {
+        let row_h = full.size().y / full.rows.len() as f32;
+        let mut job = egui::text::LayoutJob::simple(text.clone(), font, NOTE_COLOR, wrap);
+        // At least one row, so a cramped body still shows there IS a note.
+        job.wrap.max_rows = ((max_h / row_h).floor() as usize).max(1);
+        painter.layout_job(job)
+    };
+    painter.galley(pos, galley.clone(), egui::Color32::WHITE);
+    if galley.elided {
+        ui.interact(
+            egui::Rect::from_min_size(pos, galley.size()),
+            id,
+            egui::Sense::hover(),
+        )
+        .on_hover_ui(|ui| {
+            ui.set_max_width(360.0);
+            ui.label(text);
+        });
+    }
+    galley.size().y
+}
+
+/// `rect` from the canvas' Scene out to the screen, where the caller's wheel
+/// test and the ⓘ window live. Scene coords ≠ screen coords as soon as the
+/// user zooms or pans.
+fn to_screen(ui: &egui::Ui, rect: egui::Rect) -> egui::Rect {
+    ui.ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .unwrap_or_default()
+        * rect
+}
 
 /// The close button in the header's top-right corner: paints it, returns whether
 /// it was clicked.
@@ -172,6 +227,22 @@ pub fn draw_pin_functions(
         );
         painter.galley(egui::pos2(left, y), galley.clone(), egui::Color32::WHITE);
         y += galley.size().y + 10.0;
+        // What the BOARD says about it - a solder bridge that frees the pad,
+        // say. Data from the definition, so it is right for this kit. It
+        // leaves room for the line under it.
+        if let Some(note) = mcu.find_pin(num).map(|p| p.note.clone()).filter(|n| !n.is_empty()) {
+            let max_h = content_rect.bottom() - 8.0 - 24.0 - y;
+            let h = draw_note(
+                painter,
+                ui,
+                note,
+                egui::pos2(left, y),
+                wrap,
+                max_h,
+                ui.id().with(("pad_note", num)),
+            );
+            y += h + 10.0;
+        }
         painter.text(
             egui::pos2(left, y),
             egui::Align2::LEFT_TOP,
@@ -183,7 +254,7 @@ pub fn draw_pin_functions(
             mcu.selected_pin = None;
             mcu.show_info = None;
         }
-        return (None, list_rect_of(content_rect, sep_y));
+        return (None, to_screen(ui, list_rect_of(content_rect, sep_y)));
     }
 
     // The drive / pull modes this backend can generate for the pin's CURRENT
@@ -200,23 +271,36 @@ pub fn draw_pin_functions(
     // ── A board pad whose function switches something on ────────────────────
     // Its list reads "GPIO Output" and nothing else, which says nothing about
     // what picking it DOES on this board - so the panel says it first.
+    // The board's own note on the pad joins it: a solder bridge, a resistor, a
+    // pin the debugger drives - things no function in the list can say.
     let mut note_h = 0.0;
-    if let Some(note) = mcu
+    let notes: Vec<&str> = mcu
         .find_pin(num)
-        .and_then(|p| crate::panels::mcu_module::pins::logic::pin::colors::switch_role(&p.name))
-    {
-        let galley = painter.layout(
-            note.to_owned(),
-            egui::FontId::proportional(11.0),
-            egui::Color32::from_rgb(230, 205, 130),
-            content_rect.width() - 24.0,
-        );
-        painter.galley(
+        .map(|p| {
+            [
+                crate::panels::mcu_module::pins::logic::pin::colors::switch_role(&p.name),
+                Some(p.note.as_str()).filter(|n| !n.is_empty()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect()
+        })
+        .unwrap_or_default();
+    if !notes.is_empty() {
+        // The list keeps its first two rows (and the mode chips under the
+        // first) in view; the note gets what is left.
+        let room = content_rect.bottom() - 8.0 - (sep_y + 12.0);
+        let min_list = funcs.len().min(2) as f32 * ITEM_H + mode_row_h;
+        let h = draw_note(
+            painter,
+            ui,
+            notes.join("\n\n"),
             egui::pos2(content_rect.left() + 12.0, sep_y + 10.0),
-            galley.clone(),
-            egui::Color32::WHITE,
+            content_rect.width() - 24.0,
+            room - min_list - 10.0,
+            ui.id().with(("pad_note", num)),
         );
-        note_h = galley.size().y + 10.0;
+        note_h = h + 10.0;
     }
 
     // ── Geometry ─────────────────────────────────────────────────────────────
@@ -294,10 +378,11 @@ pub fn draw_pin_functions(
         );
 
         // Only rows actually on screen take clicks — a scrolled-away button must
-        // not keep a hit area over the chip.
+        // not keep a hit area over the chip, and a half-scrolled one only where
+        // it is painted: above the list sits the pad's note.
         if visible {
             let btn_response = ui.interact(
-                btn_rect,
+                btn_rect.intersect(list_rect),
                 ui.id().with(("fn_btn", num, i)),
                 egui::Sense::click(),
             );
@@ -320,7 +405,7 @@ pub fn draw_pin_functions(
             }
 
             let info_response = ui.interact(
-                info_rect,
+                info_rect.intersect(list_rect),
                 ui.id().with(("info_btn", num, i)),
                 egui::Sense::click(),
             );
@@ -372,8 +457,11 @@ pub fn draw_pin_functions(
                     },
                 );
                 if r.bottom() > content_top && r.top() < content_bottom {
-                    let resp =
-                        ui.interact(r, ui.id().with(("fn_mode", num, j)), egui::Sense::click());
+                    let resp = ui.interact(
+                        r.intersect(list_rect),
+                        ui.id().with(("fn_mode", num, j)),
+                        egui::Sense::click(),
+                    );
                     if resp.hovered() {
                         list_painter.rect_stroke(
                             r,
@@ -420,15 +508,10 @@ pub fn draw_pin_functions(
         };
     }
 
-    // This all lives inside the canvas' Scene, so scene coords ≠ screen coords as
-    // soon as the user zooms or pans. Map the list rect out to screen space for
-    // the caller's wheel test — and anchor the ⓘ window there too, instead of on
-    // the scene-space chip rect (which would place it wherever the diagram is).
-    let to_global = ui
-        .ctx()
-        .layer_transform_to_global(ui.layer_id())
-        .unwrap_or_default();
-    let list_screen = to_global * list_rect;
+    // The list rect in screen space, for the caller's wheel test — and the ⓘ
+    // window anchors there too, instead of on the scene-space chip rect (which
+    // would place it wherever the diagram is).
+    let list_screen = to_screen(ui, list_rect);
 
     if let Some(func) = mcu.show_info.clone()
         && !info::draw_info_popup(

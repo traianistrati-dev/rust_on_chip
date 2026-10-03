@@ -97,15 +97,21 @@ fi
 
 # Which families this push can possibly break.
 #
-# The whole set costs about twenty minutes, and a gate that costs twenty minutes
-# is a gate people turn off — this repo already has the scar (`--no-verify`, and
-# two pushes abandoned partway on 2026-08-27). So when the change is provably
-# confined to one backend, run that backend's representative case instead.
+# A gate that costs twenty minutes is a gate people turn off - this repo has the
+# scar (`--no-verify`, and two pushes abandoned partway on 2026-08-27). So when
+# the change is provably confined to some backends, run every case of THOSE
+# families and nothing else.
 #
 # Narrowing is only safe when EVERY relevant path maps to a family. Anything
 # shared (`family.rs` holds four backends, `project_gen.rs` builds every
-# project), anything unrecognised, and any `.ron` chip definition drops back to
-# the full quick set. The default is the expensive, correct one.
+# project) and anything unrecognised drops back to the full quick set. The
+# default is the expensive, correct one.
+#
+# A built-in `.ron` maps to the families whose harnesses LOAD it - read off the
+# harnesses on 2026-10-02: the nRF, RP and ESP boards are each loaded only by
+# their own family's harnesses, and the F103C8 by the F1 harnesses and the
+# embassy one (its F1 project). Any other `.ron` - an example, a new chip - is
+# unrecognised, so it runs the quick set.
 fams=""
 narrow=1
 if [ "$changed" = "unknown" ]; then
@@ -113,18 +119,35 @@ if [ "$changed" = "unknown" ]; then
 else
     for f in $(printf '%s' "$changed" | grep -E "$RELEVANT" | sort -u); do
         case "$f" in
-            src/panels/mcu_module/codegen/rp.rs)
+            src/panels/mcu_module/codegen/rp.rs|            assets/mcus/rp*.ron)
                 fams="$fams rp" ;;
-            src/panels/mcu_module/codegen/nrf.rs)
+            src/panels/mcu_module/codegen/nrf.rs|            src/panels/mcu_module/codegen/nrf_boards.rs|            assets/mcus/nrf*.ron)
                 fams="$fams nrf" ;;
-            src/panels/mcu_module/codegen/stm32.rs|src/panels/mcu_module/codegen/rtic.rs)
+            # stm32.rs also builds the F1 project inside the embassy harness.
+            src/panels/mcu_module/codegen/stm32.rs)
+                fams="$fams f1 embassy" ;;
+            src/panels/mcu_module/codegen/rtic.rs)
                 fams="$fams f1" ;;
-            src/panels/mcu_module/codegen/embassy_async.rs|            src/panels/mcu_module/codegen/embassy_common.rs|            src/panels/mcu_module/codegen/wba.rs|            src/panels/mcu_module/codegen/watchdog_gen.rs)
+            # Not just embassy: embassy_common.rs also HOLDS the F1, ESP, N6
+            # and imported-chip harnesses, so an edit there can break any of
+            # them while the embassy case stays green.
+            src/panels/mcu_module/codegen/embassy_common.rs)
+                fams="$fams embassy f1 esp import n6" ;;
+            # watchdog_gen.rs is NOT here: it writes the nRF, RP and ESP
+            # watchdogs too, so like family.rs it is shared and runs the
+            # quick set.
+            # embassy_async.rs is the Async backend of EVERY STM32, the F1 and
+            # the imported chips included - their harnesses run through it.
+            src/panels/mcu_module/codegen/embassy_async.rs)
+                fams="$fams embassy f1 import" ;;
+            src/panels/mcu_module/codegen/wba.rs)
                 fams="$fams embassy" ;;
             src/panels/mcu_module/codegen/rcc_n6.rs)
                 fams="$fams n6" ;;
-            src/panels/mcu_module/codegen_esp_configs.rs)
+            src/panels/mcu_module/codegen_esp_configs.rs|            src/panels/mcu_module/codegen_esp.rs|            assets/mcus/esp*.ron)
                 fams="$fams esp" ;;
+            assets/mcus/stm32f103c8t6.ron)
+                fams="$fams f1 embassy" ;;
             *)
                 narrow=0 ;;
         esac
@@ -234,11 +257,21 @@ if [ -n "$verify_sha" ]; then
         # and the projects cannot end up on different volumes.
         matrix_dir="$EIDE_MATRIX_DIR"
         if [ -z "$matrix_dir" ] && [ -f "$repo_root/scripts/matrix-dir.txt" ]; then
-            matrix_dir=$(tr -d '
-' < "$repo_root/scripts/matrix-dir.txt")
+            # CR as well as LF: a file saved by Notepad ends in CRLF, and a
+            # stray CR in this path would now also reach EIDE_MATRIX_DIR,
+            # which the script takes verbatim.
+            matrix_dir=$(tr -d '\r\n' < "$repo_root/scripts/matrix-dir.txt")
         fi
         CARGO_TARGET_DIR="${matrix_dir:-${TMP:-${TEMP:-/tmp}}}/eide-hook-target"
         export CARGO_TARGET_DIR
+        # And the projects with it. The worktree has no `matrix-dir.txt` - it
+        # is gitignored - so the script, run from there, fell back to %TEMP%
+        # for the projects while the cache above sat on the matrix volume:
+        # the very split this block exists to prevent.
+        if [ -n "$matrix_dir" ]; then
+            EIDE_MATRIX_DIR="$matrix_dir"
+            export EIDE_MATRIX_DIR
+        fi
         cd "$worktree"
     else
         # Honest degradation: a worktree we cannot make is a reason to check the
@@ -265,13 +298,24 @@ if [ -n "$hook_arg" ] && ! grep -q 'string\[\]\]\$Hook' scripts/verify-codegen.p
     echo "pre-push: this revision's verify-codegen.ps1 predates -Hook - running the full set"
     hook_arg=""
 fi
+# Same reasoning, one revision later: `powershell -File` hands "embassy,f1" to
+# the script as ONE family, and a script that does not split it exits 2 with
+# "unknown family" - which refused every push touching two families. Only a
+# single family is safe with such a revision.
+case "$hook_arg" in
+    *,*)
+        if ! grep -q -- "-split ','" scripts/verify-codegen.ps1 2>/dev/null; then
+            echo "pre-push: this revision's verify-codegen.ps1 cannot take several families - running the full set"
+            hook_arg=""
+        fi ;;
+esac
 
 echo "pre-push: cross-compiling the generated projects…"
 if [ -n "$hook_arg" ]; then
-    echo "pre-push: only $hook_arg touched - one representative case each"
-    echo "pre-push: run scripts/verify-codegen.ps1 by hand for the whole matrix"
+    echo "pre-push: only $hook_arg touched - every case of those families"
+    echo "pre-push: run scripts/verify-codegen.ps1 -Full by hand for the whole matrix"
 else
-    echo "pre-push: 24 cases, about 21 minutes on a warm tree - it prints a per-case time"
+    echo "pre-push: the quick set, about ten minutes on a warm cache - it prints a per-case time"
 fi
 echo "pre-push: skip with 'git push --no-verify', or EIDE_SKIP_CODEGEN_CHECK=1"
 if command -v pwsh >/dev/null 2>&1; then

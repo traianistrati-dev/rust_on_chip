@@ -984,7 +984,7 @@ static RTIC_BACKEND: RticBackend = RticBackend;
 
 /// Whether an Async runtime has a backend for `family` — an embassy-capable
 /// STM32 family (embassy-stm32), an ESP part (esp-rtos), a Pico (embassy-rp) or
-/// an nRF52 (embassy-nrf). Drives both codegen dispatch and the System-tab
+/// an nRF part (embassy-nrf). Drives both codegen dispatch and the System-tab
 /// toggle's enabled state.
 pub fn async_supported(family: &str) -> bool {
     ASYNC_EMBASSY_BACKEND.handles(family)
@@ -1057,7 +1057,10 @@ pub fn async_details(family: &str) -> AsyncDetails {
     } else if async_is_rp(family) {
         RP_ASYNC_DETAILS
     } else if async_is_nrf(family) {
-        NRF_ASYNC_DETAILS
+        AsyncDetails {
+            example: nrf_async_example(family),
+            ..NRF_ASYNC_DETAILS
+        }
     } else {
         STM32_ASYNC_DETAILS
     }
@@ -1095,7 +1098,7 @@ const STM32_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "Applies to:",
-            "Every STM32. The F1 is on stm32f1xx-hal on every other runtime, so for it Async is also a HAL swap: USB, CAN and SDIO are not generated there, and embassy-time takes one timer (TIM4 on an F103C8) that PWM can no longer use. The Pico, the micro:bit and the ESP parts have panes of their own.",
+            "Every STM32. The F1 is on stm32f1xx-hal on every other runtime, so for it Async is also a HAL swap: USB, CAN and SDIO are not generated there, and embassy-time takes one timer (TIM4 on an F103C8) that PWM can no longer use. The Pico boards, the nRF parts and the ESP parts have panes of their own.",
         ),
     ],
     // `Irqs` last: the config file takes the binding rather than declaring
@@ -1157,7 +1160,7 @@ const NRF_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "Entry:",
-            "#[embassy_executor::main] async fn main(spawner: Spawner); embassy_nrf::init(config) starts both clocks itself, so the Clock tab is two fields of Config.",
+            "#[embassy_executor::main] async fn main(spawner: Spawner); embassy_nrf::init(config) starts both clocks itself, so the Clock tab is two fields of Config. A wired USB module sets the HFCLK source to ExternalXtal whatever the tab says.",
         ),
         (
             "USART:",
@@ -1165,23 +1168,53 @@ const NRF_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "SPI / I2C:",
-            "One form each, Spim and Twim on EasyDMA; the same handle has blocking_* methods for when you want to wait. SPIM0/TWIM0 and SPIM1/TWIM1 are one block each (TWISPI0/1): put a SPIM and a TWIM on the same one and the TWIM is not built (the module says so).",
+            "One form each, Spim and Twim on EasyDMA; the same handle has blocking_* methods for when you want to wait.",
+        ),
+        (
+            "Shared blocks:",
+            "Where the silicon has one block for several kinds, only the first of UARTE, SPIM, TWIM on it is built and the others get a comment. On an nRF52 such a block pairs a SPIM with a TWIM (TWISPI0/1; TWI0_SPI1 on the 52811), and the module panel flags the pair. On the nRF5340 UARTE, SPIM and TWIM n are all SERIALn (SPIM4 stands alone); on the nRF54L15 they are SERIAL00/20/21/22/30 (SERIAL00 has no TWIM), and the DK offers each only on its own power domain's port (SERIAL00 on P2, SERIAL20/21/22 on P1, SERIAL30 on P0); the generator flags any other pin.",
         ),
         (
             "Inputs:",
-            "An armed input becomes a task that awaits the edge and calls your hook, spawned on the main executor; the task priority selector has no effect on this chip.",
+            "An armed input becomes a task that awaits the edge and calls your hook, spawned on the main executor; the task priority selector has no effect on these chips. On the nRF54L15, P0 and P1 pins only: embassy's GPIOTE does not serve P2, so a task armed on a P2 pin waits forever.",
         ),
         (
             "Cargo.toml:",
-            "The embassy-nrf line is the chip's own (the part's feature, time-driver-rtc1, gpiote, plus nfc-pins-as-gpio on a part with NFC); adds embassy-executor 0.10 (platform-cortex-m) + embassy-time. A TWIM's RAM buffer adds static_cell. Leaving Async removes them again.",
+            "The embassy-nrf line is the chip's own: the part's feature (nrf5340-app-s and nrf54l15-app-s for the two application cores), the time driver (time-driver-rtc1, or time-driver-grtc on the nRF54L15, which has no RTC1), gpiote, plus nfc-pins-as-gpio on a part with NFC. Adds embassy-executor 0.10 (platform-cortex-m) + embassy-time. A TWIM's RAM buffer adds static_cell; a USB module adds embassy-usb and static_cell. Leaving Async removes them again.",
         ),
-        ("Applies to:", "nRF52 (the BBC micro:bit v2 today)."),
+        (
+            "Applies to:",
+            "Every nRF part here: the nRF52 family (micro:bit v2, nRF52840 DK, nRF52 DK), the nRF5340's application core and the nRF54L15 (their DKs).",
+        ),
     ],
-    // `write` is embassy-nrf's own async method on `Uarte` (the type is not
-    // embedded-io-async), which is why it is not `write_all`. Illustrative:
-    // the generator emits nothing past the init.
-    example: "let mut uarte0 = embassy_nrf::uarte::Uarte::new(p.UARTE0, p.P1_08, p.P0_06, Irqs, uarte0_cfg);\nuarte0.write(b\"hi\").await.ok();",
+    // Replaced per part by `nrf_async_example`; this one is the nRF52 DKs'.
+    example: NRF52_ASYNC_EXAMPLE,
 };
+
+// `write` is `Uarte`'s inherent async method. The type implements
+// `embedded_io_async::Write` too, but the inherent one wins and needs no
+// trait import, so the example stays a one-liner. Illustrative: the
+// generator emits nothing past the init. Each is written against the part's
+// own peripheral name and the board's VCOM pins (on the micro:bit, the UART
+// to its interface chip), RXD before TXD as the constructor takes them.
+const NRF52_ASYNC_EXAMPLE: &str = "let mut uarte0 = embassy_nrf::uarte::Uarte::new(p.UARTE0, p.P0_08, p.P0_06, Irqs, uarte0_cfg);\nuarte0.write(b\"hi\").await.ok();";
+const MICROBIT_ASYNC_EXAMPLE: &str = "let mut uarte0 = embassy_nrf::uarte::Uarte::new(p.UARTE0, p.P1_08, p.P0_06, Irqs, uarte0_cfg);\nuarte0.write(b\"hi\").await.ok();";
+const NRF5340_ASYNC_EXAMPLE: &str = "let mut uarte0 = embassy_nrf::uarte::Uarte::new(p.SERIAL0, p.P0_22, p.P0_20, Irqs, uarte0_cfg);\nuarte0.write(b\"hi\").await.ok();";
+// VCOM0 is on P1, which SERIAL20/21/22 reach and SERIAL00 does not.
+const NRF54L15_ASYNC_EXAMPLE: &str = "let mut uarte20 = embassy_nrf::uarte::Uarte::new(p.SERIAL20, p.P1_05, p.P1_04, Irqs, uarte20_cfg);\nuarte20.write(b\"hi\").await.ok();";
+
+/// The nRF pane's example for `family`. There used to be one, `p.UARTE0` on
+/// the micro:bit's P1.08, and it did not compile on three of the boards that
+/// came after: the nRF5340 and nRF54L15 have no `UARTE0` field (their UARTEs
+/// are SERIALn), and the nRF52832 has no port 1.
+fn nrf_async_example(family: &str) -> &'static str {
+    match family {
+        "nrf5340" => NRF5340_ASYNC_EXAMPLE,
+        "nrf54l15" => NRF54L15_ASYNC_EXAMPLE,
+        "nrf52833" => MICROBIT_ASYNC_EXAMPLE,
+        _ => NRF52_ASYNC_EXAMPLE,
+    }
+}
 
 /// Moved from the panel as it was, apart from the last row, which named
 /// embassy-stm32 as THE other async path when there are three.
@@ -1445,7 +1478,7 @@ pub fn async_unavailable_reason(family: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "No async backend for `{family}`: the async runtimes here cover the STM32, ESP, Pico and nRF52 families."
+        "No async backend for `{family}`: the async runtimes here cover the STM32, ESP, Pico and nRF families."
     ))
 }
 
@@ -1671,6 +1704,10 @@ mod blocking_note_tests {
         ("rp2040", "embassy_rp::"),
         ("rp235x", "embassy_rp::"),
         ("nrf52833", "embassy_nrf::"),
+        ("nrf52832", "embassy_nrf::"),
+        ("nrf52840", "embassy_nrf::"),
+        ("nrf5340", "embassy_nrf::"),
+        ("nrf54l15", "embassy_nrf::"),
         ("esp32c3", "esp_rtos::"),
     ];
 
@@ -1752,6 +1789,69 @@ mod blocking_note_tests {
         }
     }
 
+    /// The bug this exists for: one nRF example, `p.UARTE0` on P1.08, shown to
+    /// the nRF5340 and nRF54L15, which have no `UARTE0` field, and to the
+    /// nRF52832, which has no port 1. Every bundled nRF board's example names
+    /// the peripheral the generator itself uses for one of the part's UARTEs,
+    /// on pads that board has, and on the nRF54L15 a SERIAL that reaches
+    /// their port.
+    #[test]
+    fn every_nrf_example_names_its_own_uarte_and_pads() {
+        use crate::panels::mcu_module::builtins::builtin_definitions;
+        use crate::panels::mcu_module::codegen::nrf;
+
+        let mut seen = 0;
+        for d in builtin_definitions() {
+            let Some(chip) = nrf::chip(&d.family) else {
+                continue;
+            };
+            seen += 1;
+            let example = super::async_details(&d.family).example;
+            let args = example
+                .split_once("Uarte::new(")
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(args, _)| args)
+                .unwrap_or_else(|| panic!("{}: no Uarte::new in {example}", d.id));
+            let args: Vec<&str> = args.split(", ").collect();
+            let [peri, rxd, txd, "Irqs", _cfg] = args[..] else {
+                panic!("{}: unexpected arguments {args:?}", d.id);
+            };
+            let peri = peri.strip_prefix("p.").expect("a Peripherals field");
+            let inst = chip
+                .uarte
+                .iter()
+                .copied()
+                .find(|&n| nrf::serial_block(&d.family, "uarte", n).0 == peri)
+                .unwrap_or_else(|| panic!("{}: {peri} is none of its UARTEs", d.id));
+            let pads: Vec<&str> = [&d.pins.top, &d.pins.bottom, &d.pins.left, &d.pins.right]
+                .into_iter()
+                .flatten()
+                .map(|p| p.name.as_str())
+                .collect();
+            for pin in [rxd, txd] {
+                // `p.P1_05` is the pad named `P1.05 (...)`.
+                let (port, num) = pin
+                    .strip_prefix("p.P")
+                    .and_then(|s| s.split_once('_'))
+                    .expect("a pin field");
+                let pad = format!("P{port}.{num}");
+                assert!(
+                    pads.iter()
+                        .any(|n| n.split_whitespace().next() == Some(pad.as_str())),
+                    "{}: no pad {pad}",
+                    d.id
+                );
+                let port: u8 = port.parse().expect("port number");
+                assert!(
+                    chip.reaches(inst, port),
+                    "{}: {peri} cannot reach port {port}",
+                    d.id
+                );
+            }
+        }
+        assert!(seen >= 5, "the bundled nRF boards went missing: {seen}");
+    }
+
     /// Async is greyed only where no async backend exists - since the F1 got
     /// its path, that is no family this IDE ships - and the card says why.
     #[test]
@@ -1760,7 +1860,7 @@ mod blocking_note_tests {
         // Every family with a backend: nothing to explain.
         for family in [
             "stm32f1", "stm32f2", "stm32f4", "stm32g0", "stm32h5", "stm32wba", "esp32c3", "rp2040",
-            "nrf52833",
+            "nrf52833", "nrf52840", "nrf5340", "nrf54l15",
         ] {
             assert!(
                 async_unavailable_reason(family).is_none(),

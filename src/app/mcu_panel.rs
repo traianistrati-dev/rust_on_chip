@@ -4162,7 +4162,9 @@ mod no_runtime_card_text_has_a_run_of_spaces {
         async_unavailable_reason, native_unavailable_reason, rtic_unavailable_reason,
     };
 
-    const FAMILIES: &[&str] = &["stm32f1", "stm32f4", "rp2040", "nrf52833", "esp32c3"];
+    const FAMILIES: &[&str] = &[
+        "stm32f1", "stm32f4", "rp2040", "nrf52833", "nrf5340", "nrf54l15", "esp32c3",
+    ];
 
     /// Prose and subtitles: never three spaces in a row. Two is the "  ·  "
     /// separator; three is a continuation joined by hand.
@@ -4233,6 +4235,7 @@ const DETAIL_LIBS: &[&str] = &[
     "embassy-stm32",
     "embassy-rp",
     "embassy-nrf",
+    "embassy-usb",
     "esp-rtos",
     "cyw43",
     "cyw43-pio",
@@ -4395,6 +4398,8 @@ mod a_greyed_runtime_card_has_no_details_pane {
         ("rp2040", (false, true, false)),
         ("rp235x", (false, true, false)),
         ("nrf52833", (false, true, false)),
+        ("nrf5340", (false, true, false)),
+        ("nrf54l15", (false, true, false)),
         ("esp32c3", (false, true, false)),
     ];
 

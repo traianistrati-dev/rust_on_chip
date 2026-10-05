@@ -3961,7 +3961,8 @@ impl AppIde {
                 self.invalidate_project_files_cache();
             }
             // memory.x follows the flash store on an STM32: FLASH ends where the
-            // store begins, so a program that grows into it fails to link. The
+            // store begins (on an F2/F4/F7 `_stext` starts the program after
+            // it), so a program that grows into it fails to link. The
             // same decision as the generated `flash_store.rs`; a memory.x with
             // no markers is the user's and is only checked before a flash.
             let reservation = self.mcu.as_ref().and_then(|m| {

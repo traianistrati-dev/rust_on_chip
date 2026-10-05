@@ -27,7 +27,9 @@
 //!
 //! No partition table: the store is the last pages of flash, and `memory.x`'s
 //! FLASH region shrinks by exactly that much, so code that grows into the
-//! store fails to LINK ([`FlashStoreMode::MemoryX`]). Every flashing path the
+//! store fails to LINK ([`FlashStoreMode::MemoryX`]) - or, on an F2/F4/F7,
+//! the small sectors right after the vector table, with `_stext` starting the
+//! program after them ([`Layout::AfterVectors`]). Every flashing path the
 //! IDE has (cargo flash, probe-rs run, the Debug launch, OpenOCD `program`)
 //! erases only the sectors it writes, so the store survives a reflash; only a
 //! chip erase wipes it. The firmware side is embassy-stm32's blocking `Flash`,
@@ -516,10 +518,7 @@ impl FlashStoreConfig {
     /// STM32. Settings saved for the other platform (a chip changed under a
     /// project) say so, and the card's Reset fixes them.
     pub fn problems_on(&self, platform: &Platform) -> Vec<String> {
-        let Platform::Stm32 {
-            geo: g, layout, ..
-        } = platform
-        else {
+        let Platform::Stm32 { geo: g, layout, .. } = platform else {
             if self.mode == FlashStoreMode::MemoryX {
                 return vec![
                     "These settings are for an STM32's memory.x, not this chip.".to_owned(),
@@ -995,37 +994,94 @@ pub const STM32_FLASH_BASE: u32 = 0x0800_0000;
 
 /// Why an STM32 project with a flash store must not be flashed, or `None`.
 ///
-/// The store's own settings first. Then `memory.x`: the IDE's block always
-/// keeps FLASH out of the store, but a memory.x without the markers is the
-/// user's, never rewritten - and one whose FLASH runs into the store would
-/// let the program grow over the settings, or the store erase the program.
-/// Nothing to check while the store is off or not generated for the part.
+/// The store's own settings first, and a WWDG that every erase would trip
+/// ([`wwdg_problem`]; `wwdg_us` is the Configuration tab's period). Then
+/// `memory.x`: the IDE's block keeps FLASH out of the store, but a memory.x
+/// without the markers is the user's, never rewritten - and one whose FLASH
+/// runs into the store would let the program grow over the settings, or the
+/// store erase the program. Nothing to check while the store is off or not
+/// generated for the part.
 pub fn stm32_flash_block(
     memory_x: &str,
     store: Option<&FlashStoreConfig>,
     family: &str,
     part: &str,
     runtime: Runtime,
+    wwdg_us: Option<u32>,
 ) -> Option<String> {
     let store = store?;
     let p @ Platform::Stm32 { layout, .. } = platform(family, part, runtime).ok()? else {
         return None;
     };
-    let problems = store.problems_on(&p);
+    let mut problems = store.problems_on(&p);
+    problems.extend(wwdg_problem(&p, wwdg_us));
     if !problems.is_empty() {
         return Some(format!("Flash store: {}", problems.join(" ")));
     }
     memory_x_overlap(memory_x, store, layout)
 }
 
-/// The sentence for a `memory.x` that would link the program over the store,
-/// or `None`. Only a memory.x the user wrote can: the IDE's block always keeps
-/// them apart. What cannot be read is not refused on a guess.
+/// The longest one store erase keeps interrupts off, in microseconds, on
+/// [`Layout::AfterVectors`] - `None` on [`Layout::End`], whose pages erase in
+/// milliseconds.
 ///
-/// - [`Layout::End`]: FLASH must end where the store begins.
-/// - [`Layout::AfterVectors`]: FLASH must start before the store (sector 0
-///   holds the vector table), and `_stext` must start the program after it.
-pub fn memory_x_overlap(memory_x: &str, store: &FlashStoreConfig, layout: Layout) -> Option<String> {
+/// embassy-stm32 0.6 erases a sector inside a critical section, and the CPU
+/// stalls on its own instruction fetch from the flash meanwhile: nothing can
+/// feed a watchdog. It erases at x8 parallelism (`disable_blocking_write`
+/// clears PSIZE and `blocking_erase_sector` never sets it), where the F2/F4
+/// datasheets give up to 800 ms for a 16 KiB sector. Scaled by size for the
+/// F74x/F75x's 32 KiB - on the long side: the F4's 64 KiB take 2.4 s, not 3.2.
+pub fn erase_stall_us(platform: &Platform) -> Option<u32> {
+    match platform {
+        Platform::Stm32 {
+            geo,
+            layout: Layout::AfterVectors,
+            ..
+        } => Some(800_000 * (geo.head_page / (16 * 1024)).max(1)),
+        _ => None,
+    }
+}
+
+/// Why the Configuration tab's WWDG and the store cannot run together, or
+/// `None`. The WWDG starts at boot and cannot be stopped, so a period shorter
+/// than [`erase_stall_us`] resets the chip inside every erase - and the
+/// half-erased sector it leaves is erased again after the reset, forever.
+/// The IWDG is only configured (the user starts it), so the card warns about
+/// it instead.
+pub fn wwdg_problem(platform: &Platform, wwdg_us: Option<u32>) -> Option<String> {
+    let stall = erase_stall_us(platform)?;
+    let period = wwdg_us.filter(|&p| p < stall)?;
+    Some(format!(
+        concat!(
+            "The WWDG (period {} ms) cannot be fed while a sector is erased: interrupts ",
+            "are off and the CPU waits on the flash for up to {} ms, so every erase would ",
+            "reset the chip. Turn the WWDG off, or give it a period past {} ms."
+        ),
+        period / 1000,
+        stall / 1000,
+        stall / 1000
+    ))
+}
+
+/// The most room a Cortex-M vector table takes: 16 system entries and 240
+/// interrupts of 4 bytes - what FLASH must leave before an
+/// [`Layout::AfterVectors`] store.
+const VECTOR_TABLE_MAX: u64 = 0x400;
+
+/// The sentence for a `memory.x` that would link the program over the store,
+/// or `None`. What cannot be read is not refused on a guess.
+///
+/// - [`Layout::End`]: FLASH must end where the store begins. The IDE's block
+///   always does; a memory.x the user wrote may not.
+/// - [`Layout::AfterVectors`]: FLASH must start in sector 0, leaving the
+///   vector table room before the store, and `_stext` must start the program
+///   after it. Even the IDE's block can miss the first: the MCU form's flash
+///   origin moved past the store (an app behind a bootloader).
+pub fn memory_x_overlap(
+    memory_x: &str,
+    store: &FlashStoreConfig,
+    layout: Layout,
+) -> Option<String> {
     let (origin, length) = memory_x_flash(memory_x)?;
     let start = u64::from(STM32_FLASH_BASE) + u64::from(store.offset);
     let store_end = start + u64::from(store.size);
@@ -1044,12 +1100,21 @@ pub fn memory_x_overlap(memory_x: &str, store: &FlashStoreConfig, layout: Layout
                 )
             })
         }
-        Layout::AfterVectors if origin > start => Some(format!(
+        Layout::AfterVectors if origin + VECTOR_TABLE_MAX > start => Some(format!(
             concat!(
-                "memory.x: FLASH starts at 0x{:X}, past the flash store at 0x{:X} - the ",
-                "store sits right after the vector table, so FLASH must start at 0x{:08X}."
+                "memory.x: FLASH starts at 0x{:X}, which leaves the vector table no room ",
+                "before the flash store at 0x{:X}. The store takes the sectors right after ",
+                "the vector table's, so the program must start in sector 0 (0x{:08X}), not ",
+                "behind a bootloader. {}"
             ),
-            origin, start, STM32_FLASH_BASE
+            origin,
+            start,
+            STM32_FLASH_BASE,
+            if crate::panels::mcu_module::project_gen::memory_x_is_ours(memory_x) {
+                "Set the MCU form's Flash origin back, or turn the store off."
+            } else {
+                "Start FLASH there, or turn the store off."
+            }
         )),
         Layout::AfterVectors => match memory_x_symbol(memory_x, "_stext") {
             None => Some(format!(
@@ -1073,17 +1138,18 @@ pub fn memory_x_overlap(memory_x: &str, store: &FlashStoreConfig, layout: Layout
 }
 
 /// `name = <expr>;` in a linker script: `None` when it is not assigned,
-/// `Some(None)` when its value is not plain numbers (a symbol, a function).
+/// `Some(None)` when its value cannot be worked out here. The expression may
+/// use `ORIGIN(FLASH)`, `LENGTH(FLASH)` and other symbols assigned in the
+/// same script (the IDE's `_stext = _flash_store_end;`).
 fn memory_x_symbol(text: &str, name: &str) -> Option<Option<u64>> {
-    let mut clean = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("/*") {
-        clean.push_str(&rest[..at]);
-        rest = rest[at..].find("*/").map_or("", |e| &rest[at + e + 2..]);
-    }
-    clean.push_str(rest);
+    let clean = strip_ld_comments(text);
+    symbol_in(&clean, name, memory_x_flash(text), 0)
+}
+
+/// [`memory_x_symbol`] on a comment-free script, `depth` symbols deep.
+fn symbol_in(clean: &str, name: &str, flash: Option<(u64, u64)>, depth: u8) -> Option<Option<u64>> {
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
-    clean.match_indices(name).find_map(|(at, _)| {
+    let value = clean.match_indices(name).find_map(|(at, _)| {
         let before = clean[..at].chars().next_back();
         if before.is_some_and(ident) {
             return None;
@@ -1093,10 +1159,34 @@ fn memory_x_symbol(text: &str, name: &str) -> Option<Option<u64>> {
         if rhs.starts_with('=') {
             return None;
         }
-        let value = rhs.split(';').next().unwrap_or("");
-        // `PROVIDE(_stext = 0x…);` keeps its closing parenthesis.
-        Some(ld_expr(value.trim().trim_end_matches(')')))
-    })
+        let mut value = rhs.split(';').next().unwrap_or("").trim();
+        // `PROVIDE(_stext = 0x…);` keeps the call's closing parenthesis - but
+        // only that one: `ORIGIN(FLASH)` needs its own.
+        while value.ends_with(')') && value.matches(')').count() > value.matches('(').count() {
+            value = value[..value.len() - 1].trim_end();
+        }
+        Some(value)
+    })?;
+    if depth > 4 {
+        return Some(None);
+    }
+    Some(ld_expr_with(value, &|term| match term {
+        "ORIGIN(FLASH)" => flash.map(|f| f.0),
+        "LENGTH(FLASH)" => flash.map(|f| f.1),
+        symbol => symbol_in(clean, symbol, flash, depth + 1).flatten(),
+    }))
+}
+
+/// A linker script without its `/* … */` comments.
+fn strip_ld_comments(text: &str) -> String {
+    let mut clean = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("/*") {
+        clean.push_str(&rest[..at]);
+        rest = rest[at..].find("*/").map_or("", |e| &rest[at + e + 2..]);
+    }
+    clean.push_str(rest);
+    clean
 }
 
 /// memory.x's `FLASH` region as (origin, length), read the way ld reads the
@@ -1111,13 +1201,7 @@ fn memory_x_symbol(text: &str, name: &str) -> Option<Option<u64>> {
 /// `64K - 2K` as 64K here - refusing a memory.x that reserves the store
 /// exactly.
 pub fn memory_x_flash(text: &str) -> Option<(u64, u64)> {
-    let mut clean = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("/*") {
-        clean.push_str(&rest[..at]);
-        rest = rest[at..].find("*/").map_or("", |e| &rest[at + e + 2..]);
-    }
-    clean.push_str(rest);
+    let clean = strip_ld_comments(text);
     clean.lines().find_map(|line| {
         let (name, spec) = line.split_once(':')?;
         // `FLASH (rx) :`, and `MEMORY { FLASH :` on one line: the last word
@@ -1149,10 +1233,17 @@ pub fn memory_x_flash(text: &str) -> Option<(u64, u64)> {
 /// An ld expression of numbers (`0x…`, decimal, `K`/`M` suffix) joined by
 /// `+` and `-`, or `None` for anything else.
 fn ld_expr(s: &str) -> Option<u64> {
+    ld_expr_with(s, &|_| None)
+}
+
+/// [`ld_expr`] whose terms may also be names - a symbol, or a call such as
+/// `ORIGIN(FLASH)` - that `name` gives the value of, or `None`.
+fn ld_expr_with(s: &str, name: &dyn Fn(&str) -> Option<u64>) -> Option<u64> {
     let s = s.trim();
     let mut total: i128 = 0;
     let mut sign: i128 = 1;
     let mut want_term = true;
+    let word = |d: char| d.is_ascii_alphanumeric() || d == '_' || d == '.';
     let mut chars = s.char_indices().peekable();
     while let Some(&(i, c)) = chars.peek() {
         match c {
@@ -1164,18 +1255,28 @@ fn ld_expr(s: &str) -> Option<u64> {
                 want_term = true;
                 chars.next();
             }
-            _ if want_term && c.is_ascii_alphanumeric() => {
+            _ if want_term && word(c) => {
                 let mut end = i;
                 while let Some(&(j, d)) = chars.peek() {
-                    if d.is_ascii_alphanumeric() {
+                    if word(d) {
                         end = j + d.len_utf8();
                         chars.next();
                     } else {
                         break;
                     }
                 }
-                let term = crate::size::parse_ld_number(&s[i..end])?;
-                total += sign * i128::from(term);
+                // `ORIGIN(FLASH)`: the call and its argument are one term.
+                let mut term = s[i..end].to_owned();
+                if chars.peek().is_some_and(|&(_, d)| d == '(') {
+                    let open = chars.next()?.0;
+                    let close = s[open..].find(')')? + open;
+                    while chars.peek().is_some_and(|&(j, _)| j <= close) {
+                        chars.next();
+                    }
+                    term = format!("{term}({})", s[open + 1..close].trim());
+                }
+                let value = crate::size::parse_ld_number(&term).or_else(|| name(&term))?;
+                total += sign * i128::from(value);
                 want_term = false;
             }
             _ => return None,
@@ -1226,9 +1327,10 @@ pub fn project_flash_block(
     family: &str,
     part: &str,
     runtime: Runtime,
+    wwdg_us: Option<u32>,
 ) -> Option<String> {
     if family.starts_with("stm32") {
-        stm32_flash_block(memory_x, store, family, part, runtime)
+        stm32_flash_block(memory_x, store, family, part, runtime, wwdg_us)
     } else {
         flash_block(csv, store, family)
     }
@@ -1668,10 +1770,83 @@ mod tests {
             after(&format!("{plain}PROVIDE(_stext = 0x0800C000);\n")),
             None
         );
-        // A symbol cannot be evaluated here - not refused on a guess.
+        // A symbol that is not assigned here cannot be evaluated - not refused
+        // on a guess. One that is, and FLASH's own ORIGIN, are read.
         assert_eq!(after(&format!("{plain}_stext = _flash_store_end;\n")), None);
+        assert_eq!(
+            after(&format!(
+                "{plain}_flash_store_end = 0x0800C000;\n_stext = _flash_store_end;\n"
+            )),
+            None
+        );
+        assert!(
+            after(&format!(
+                "{plain}_flash_store_end = 0x08008000;\n_stext = _flash_store_end;\n"
+            ))
+            .is_some_and(|s| s.contains("inside the flash store"))
+        );
+        // Found by review: `ORIGIN(FLASH) + 16K` was "not plain numbers", so
+        // a program linked over the store passed.
+        assert!(
+            after(&format!("{plain}_stext = ORIGIN(FLASH) + 16K;\n"))
+                .is_some_and(|s| s.contains("inside the flash store"))
+        );
+        assert_eq!(
+            after(&format!("{plain}PROVIDE(_stext = ORIGIN(FLASH) + 48K);\n")),
+            None
+        );
         let late = "MEMORY { FLASH : ORIGIN = 0x08010000, LENGTH = 448K }\n_stext = 0x08010000;\n";
-        assert!(after(late).is_some_and(|s| s.contains("FLASH must start at 0x08000000")));
+        assert!(after(late).is_some_and(|s| s.contains("must start in sector 0 (0x08000000)")));
+        // Found by review: FLASH starting AT the store (an app behind a 16 KiB
+        // bootloader) passed, and its vector table landed in the store's first
+        // page. The table needs up to 1 KiB before the store.
+        let behind_boot =
+            "MEMORY { FLASH : ORIGIN = 0x08004000, LENGTH = 496K }\n_stext = 0x0800C000;\n";
+        assert!(after(behind_boot).is_some_and(|s| s.contains("no room")));
+        let tight = "MEMORY { FLASH : ORIGIN = 0x08003E00, LENGTH = 496K }\n_stext = 0x0800C000;\n";
+        assert!(after(tight).is_some_and(|s| s.contains("no room")));
+        let room = "MEMORY { FLASH : ORIGIN = 0x08003C00, LENGTH = 497K }\n_stext = 0x0800C000;\n";
+        assert_eq!(after(room), None);
+    }
+
+    /// Found by review: a sector erase keeps interrupts off for up to 800 ms,
+    /// and the WWDG - running from boot, never stopped - cannot be fed in it.
+    /// Pages of an End store erase in milliseconds: no rule there.
+    #[test]
+    fn a_wwdg_shorter_than_a_sector_erase_refuses_an_f4_store() {
+        let (g, _) = geometry("stm32f411ce").unwrap();
+        let c = FlashStoreConfig::default_after_vectors(&g);
+        let mx = concat!(
+            "MEMORY { FLASH : ORIGIN = 0x08000000, LENGTH = 512K }\n",
+            "_stext = 0x0800C000;\n"
+        );
+        let block = |wwdg| {
+            stm32_flash_block(
+                mx,
+                Some(&c),
+                "stm32f4",
+                "stm32f411ce",
+                Runtime::Blocking,
+                wwdg,
+            )
+        };
+        assert_eq!(block(None), None);
+        assert!(block(Some(41_000)).is_some_and(|s| s.contains("WWDG (period 41 ms)")));
+        assert_eq!(block(Some(900_000)), None);
+        let (f7, _) = geometry("stm32f746zg").unwrap();
+        let f7 = Platform::Stm32 {
+            hal: StmHal::Embassy,
+            geo: f7,
+            layout: Layout::AfterVectors,
+        };
+        assert_eq!(erase_stall_us(&f7), Some(1_600_000), "32 KiB sectors");
+        let (f1, _) = geometry("stm32f103c8").unwrap();
+        let end = Platform::Stm32 {
+            hal: StmHal::Embassy,
+            geo: f1,
+            layout: Layout::End,
+        };
+        assert_eq!(wwdg_problem(&end, Some(10_000)), None);
     }
 
     /// The STM32 default is two pages at the very end, and only end-of-flash
@@ -1776,8 +1951,15 @@ mod tests {
         let (g, _) = geometry("stm32f103c8").unwrap();
         let c = FlashStoreConfig::default_stm32(&g);
         let full = "MEMORY\n{\n  FLASH : ORIGIN = 0x08000000, LENGTH = 64K\n  RAM : ORIGIN = 0x20000000, LENGTH = 20K\n}\n";
-        let why = stm32_flash_block(full, Some(&c), "stm32f1", "stm32f103c8", Runtime::Blocking)
-            .expect("overlap");
+        let why = stm32_flash_block(
+            full,
+            Some(&c),
+            "stm32f1",
+            "stm32f103c8",
+            Runtime::Blocking,
+            None,
+        )
+        .expect("overlap");
         assert!(why.contains("62K"), "{why}");
         let shrunk = full.replace("64K", "62K");
         assert_eq!(
@@ -1786,17 +1968,32 @@ mod tests {
                 Some(&c),
                 "stm32f1",
                 "stm32f103c8",
-                Runtime::Blocking
+                Runtime::Blocking,
+                None
             ),
             None
         );
         // Off, or on a part it is not generated for: nothing to check.
         assert_eq!(
-            stm32_flash_block(full, None, "stm32f1", "stm32f103c8", Runtime::Blocking),
+            stm32_flash_block(
+                full,
+                None,
+                "stm32f1",
+                "stm32f103c8",
+                Runtime::Blocking,
+                None
+            ),
             None
         );
         assert_eq!(
-            stm32_flash_block(full, Some(&c), "stm32f1", "stm32f103c8", Runtime::Rtic),
+            stm32_flash_block(
+                full,
+                Some(&c),
+                "stm32f1",
+                "stm32f103c8",
+                Runtime::Rtic,
+                None
+            ),
             None
         );
         assert_eq!(

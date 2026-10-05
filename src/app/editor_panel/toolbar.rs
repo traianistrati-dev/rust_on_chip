@@ -252,6 +252,7 @@ impl AppIde {
             &mcu.family,
             crate::panels::mcu_module::flash_store::part_of(mcu),
             mcu.runtime,
+            mcu.watchdog.wwdg.map(|w| w.timeout_us),
         )
     }
 

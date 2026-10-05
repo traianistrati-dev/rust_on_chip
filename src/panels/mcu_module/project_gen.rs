@@ -4832,10 +4832,7 @@ mod flash_store_file_tests {
             "off restores it"
         );
         let theirs = "MEMORY { FLASH : ORIGIN = 0x08000000, LENGTH = 64K }\n";
-        assert_eq!(
-            splice_memory_x_store(theirs, &def, end_store()),
-            theirs
-        );
+        assert_eq!(splice_memory_x_store(theirs, &def, end_store()), theirs);
         assert!(!memory_x_is_ours(theirs) && memory_x_is_ours(&on));
     }
 
@@ -4870,6 +4867,40 @@ mod flash_store_file_tests {
         assert_eq!(
             crate::size::parse_memory_x(&body).flash.map(|f| f.length),
             Some(512 * 1024)
+        );
+        // The flash check reads this block's `_stext` through
+        // `_flash_store_end` and passes it - until the MCU form moves FLASH
+        // past the store (an app behind a bootloader), which review found the
+        // card showed clean while the link failed.
+        use crate::panels::mcu_module::flash_store::{
+            FlashStoreConfig, FlashStoreMode, memory_x_overlap,
+        };
+        let store = FlashStoreConfig {
+            mode: FlashStoreMode::MemoryX,
+            flash_size: 512 * 1024,
+            size: 0x8000,
+            offset: 0x4000,
+        };
+        let ours = |b: &str| format!("{}\n{b}{}\n", Cmt::Block.begin(), Cmt::Block.end());
+        assert_eq!(
+            memory_x_overlap(&ours(&body), &store, Layout::AfterVectors),
+            None
+        );
+        let behind_boot = ProjectDef {
+            flash_origin: "0x08010000".into(),
+            ..def.clone()
+        };
+        let moved = memory_x_body(
+            &behind_boot,
+            Some(Reservation {
+                range: 0x4000..0xC000,
+                layout: Layout::AfterVectors,
+            }),
+        );
+        assert!(
+            memory_x_overlap(&ours(&moved), &store, Layout::AfterVectors)
+                .is_some_and(|s| s.contains("MCU form's Flash origin")),
+            "{moved}"
         );
     }
 

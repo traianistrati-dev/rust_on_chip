@@ -258,8 +258,9 @@ pub fn flash_full_message(detail: &str) -> String {
          -> If \"Debug-friendly build\" is ON in the Debug tab, turn it OFF: it relaxes \
          [profile.release] to opt-level = 1, which costs several KB. That is the usual \
          cause when a project that used to link suddenly doesn't.\n\
-         -> If the Configuration tab's flash store is on (STM32), its pages are \
-         kept out of memory.x's FLASH: fewer pages leave the program more room.\n\
+         -> If the Configuration tab's flash store is on (STM32), its pages - and \
+         on an F2/F4/F7 the rest of the vector table's sector - are not the \
+         program's: fewer pages leave it more room.\n\
          -> Otherwise: drop features or dependencies, keep lto = true and \
          opt-level = \"s\"/\"z\", or move to a part with more Flash.\n\n\
          The Size button (Cargo / Flash tab) shows what is actually using the space."

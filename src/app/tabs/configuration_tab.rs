@@ -313,7 +313,9 @@ fn flash_store_card(
         // refused on (`flash_store::project_flash_block`).
         let problems = match platform {
             Platform::Esp => esp_store_body(ui, c, facts),
-            Platform::Stm32 { hal, geo } => stm32_store_body(ui, c, &geo, hal, facts),
+            Platform::Stm32 { hal, geo, layout } => {
+                stm32_store_body(ui, c, &geo, hal, layout, facts)
+            }
         };
         ui.label(dim(concat!(
             "Moving or resizing the store leaves what it held behind: the next save ",
@@ -321,7 +323,11 @@ fn flash_store_card(
         )));
         let reset_label = match platform {
             Platform::Esp => "Restore 16 KiB at the top of the flash, in a partition of its own",
-            Platform::Stm32 { .. } => "Restore the last two pages of the flash",
+            Platform::Stm32 {
+                layout: crate::panels::mcu_module::flash_store::Layout::End,
+                ..
+            } => "Restore the last two pages of the flash",
+            Platform::Stm32 { .. } => "Restore the two sectors after the vector table's",
         };
         problem_and_reset(
             ui,
@@ -546,80 +552,130 @@ fn stm32_store_body(
     c: &mut crate::panels::mcu_module::flash_store::FlashStoreConfig,
     geo: &crate::panels::mcu_module::flash_store::Geometry,
     hal: crate::panels::mcu_module::flash_store::StmHal,
+    layout: crate::panels::mcu_module::flash_store::Layout,
     facts: &StoreFacts,
 ) -> Vec<String> {
     use crate::panels::mcu_module::flash_store::{
-        self as fs, FlashStoreMode, Platform, STM32_FLASH_BASE, StmHal,
+        self as fs, FlashStoreMode, Layout, Platform, STM32_FLASH_BASE, StmHal,
     };
-    let page = geo.page.max(1);
-    ui.label(dim(format!(
-        "{}. Pages of {} KiB, {} KiB of flash in all.",
-        FlashStoreMode::MemoryX.label(),
-        page / 1024,
-        geo.size / 1024
-    )));
+    let page = geo.store_page(layout).max(1);
+    ui.label(dim(match layout {
+        Layout::End => format!(
+            "{}. Pages of {} KiB, {} KiB of flash in all.",
+            FlashStoreMode::MemoryX.label(),
+            page / 1024,
+            geo.size / 1024
+        ),
+        Layout::AfterVectors => format!(
+            concat!(
+                "This flash ends in sectors of {} KiB, so the store takes the small ones ",
+                "at its start: right after the vector table's sector, before the program ",
+                "(memory.x's _stext) - ST's AN3969 layout. Sectors of {} KiB; the rest of ",
+                "sector 0 stays unused."
+            ),
+            geo.page / 1024,
+            page / 1024
+        ),
+    }));
+    // End: up to half the flash. After the vectors: the small sectors left
+    // after sector 0.
+    let max_pages = match layout {
+        Layout::End => geo.size / 2 / page,
+        Layout::AfterVectors => geo.head_size / page - 1,
+    }
+    .max(fs::MIN_SECTORS);
     ui.horizontal(|ui| {
         ui.label("Size");
         let mut pages = c.size / page;
         let resp = ui.add(
             crate::panels::drag_value(ui, &mut pages)
-                .range(fs::MIN_SECTORS..=(geo.size / 2 / page).max(fs::MIN_SECTORS))
+                .range(fs::MIN_SECTORS..=max_pages)
                 .clamp_existing_to_range(false)
                 .speed(0.1)
-                .suffix(" pages"),
+                .suffix(match layout {
+                    Layout::End => " pages",
+                    Layout::AfterVectors => " sectors",
+                }),
         );
         if resp.changed() {
             c.mode = FlashStoreMode::MemoryX;
             c.flash_size = geo.size;
             c.size = pages * page;
-            c.offset = geo.size.saturating_sub(c.size);
+            c.offset = match layout {
+                Layout::End => geo.size.saturating_sub(c.size),
+                Layout::AfterVectors => page,
+            };
         }
         ui.label(dim(format!("{} KiB", c.size / 1024)));
     });
     let r = c.range();
+    let start = u64::from(STM32_FLASH_BASE) + u64::from(r.start);
+    let end = u64::from(STM32_FLASH_BASE) + u64::from(r.end);
     let ours = fs_memory_x_is_ours(&facts.memory_x);
-    let reserve = if ours {
+    let reserve = match (ours, layout) {
         // What memory.x really gives the program - less than the offset when
         // FLASH starts past a bootloader, or the chip was declared smaller.
-        match fs::memory_x_flash(&facts.memory_x) {
+        (true, Layout::End) => match fs::memory_x_flash(&facts.memory_x) {
             Some((_, length)) => format!(
                 "memory.x keeps it out of FLASH: {} KiB for the program.",
                 length / 1024
             ),
             None => "memory.x keeps it out of FLASH.".to_owned(),
+        },
+        (true, Layout::AfterVectors) => {
+            format!("memory.x starts the program after it, at 0x{end:08X} (_stext).")
         }
-    } else {
-        format!(
+        (false, Layout::End) => format!(
             concat!(
                 "Your own memory.x (no IDE markers) is used as it is; its FLASH must ",
                 "end at or before 0x{:08X}."
             ),
-            u64::from(STM32_FLASH_BASE) + u64::from(r.start)
-        )
+            start
+        ),
+        (false, Layout::AfterVectors) => format!(
+            concat!(
+                "Your own memory.x (no IDE markers) is used as it is; it must start the ",
+                "program after the store: `_stext = 0x{:08X};`."
+            ),
+            end
+        ),
     };
     ui.label(dim(format!(
-        "Store 0x{:08X}..0x{:08X} (offsets 0x{:X}..0x{:X}). {reserve}",
-        u64::from(STM32_FLASH_BASE) + u64::from(r.start),
-        u64::from(STM32_FLASH_BASE) + u64::from(r.end),
-        r.start,
-        r.end,
+        "Store 0x{start:08X}..0x{end:08X} (offsets 0x{:X}..0x{:X}). {reserve}",
+        r.start, r.end,
     )));
-    ui.label(dim(match hal {
-        StmHal::Embassy => "Written through embassy-stm32's blocking Flash.",
-        StmHal::F1Hal => concat!(
-            "Written through stm32f1xx-hal's flash writer, by an adapter in ",
-            "flash_store.rs. The Async runtime's embassy-stm32 reads the same data."
+    ui.label(dim(match (hal, layout) {
+        (StmHal::Embassy, Layout::End) => "Written through embassy-stm32's blocking Flash.",
+        (StmHal::Embassy, Layout::AfterVectors) => concat!(
+            "Written through embassy-stm32's blocking Flash, its first region ",
+            "(bank1_region1) - the one made of the small sectors."
+        ),
+        (StmHal::F1Hal, _) => concat!(
+            "Written through stm32f1xx-hal's flash writer, by the adapter in ",
+            "flash_store_hal.rs. The Async runtime's embassy-stm32 reads the same data."
         ),
     }));
-    ui.label(dim(concat!(
-        "Each page erase stalls the CPU for milliseconds - interrupts too, the code ",
-        "runs from the same flash. Flashing from the IDE erases only the sectors it ",
-        "writes, so the pages survive; a chip erase (probe-rs erase, --chip-erase, ",
-        "CubeProgrammer) wipes them."
-    )));
-    let mut problems = c.problems_on(&Platform::Stm32 { hal, geo: *geo });
+    ui.label(dim(match layout {
+        Layout::End => concat!(
+            "A page erase takes milliseconds, and the CPU waits while flash is written ",
+            "when the code runs from the same bank. Flashing from the IDE erases only ",
+            "the sectors it writes, so the pages survive; a chip erase (probe-rs erase, ",
+            "--chip-erase, CubeProgrammer) wipes them."
+        ),
+        Layout::AfterVectors => concat!(
+            "A sector erase takes a few hundred milliseconds, with the CPU waiting - ",
+            "save when something changed. Flashing from the IDE erases only the sectors ",
+            "it writes (the vector table's and the program's), so the store survives; a ",
+            "chip erase (probe-rs erase, --chip-erase, CubeProgrammer) wipes it."
+        ),
+    }));
+    let mut problems = c.problems_on(&Platform::Stm32 {
+        hal,
+        geo: *geo,
+        layout,
+    });
     if !ours {
-        problems.extend(fs::memory_x_overlap(&facts.memory_x, c));
+        problems.extend(fs::memory_x_overlap(&facts.memory_x, c, layout));
     }
     problems
 }

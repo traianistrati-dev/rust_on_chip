@@ -31,7 +31,7 @@
 //! `flash_store::ConfigStore::new(flash)`.
 
 use crate::panels::mcu_module::codegen::GEN_END;
-use crate::panels::mcu_module::flash_store::{FlashStoreConfig, Platform, StmHal};
+use crate::panels::mcu_module::flash_store::{FlashStoreConfig, Layout, Platform, StmHal};
 use crate::panels::mcu_module::mcu::Mcu;
 
 /// The config file's name under `src/pins/configs/`.
@@ -263,7 +263,7 @@ macro_rules! stm_gen {
         r#"// <<< GENERATED>>>
 // Flash store (from the Configuration tab) — auto-updated; edit it in the tab.
 // The bytes the store owns, as offsets from the start of flash (0x08000000):
-// the last {PAGES} pages, which memory.x keeps out of FLASH.
+// {WHERE}.
 pub const STORE_RANGE: core::ops::Range<u32> = 0x{START}..0x{END};
 // <<< GENERATED END >>>
 "#
@@ -332,6 +332,36 @@ const _: () = {
     assert!(
         STORE_RANGE.start as usize % MAX_ERASE_SIZE == 0,
         "STORE_RANGE must start on an erase unit (embassy-stm32's MAX_ERASE_SIZE)"
+    );
+};
+// <<< GENERATED END >>>
+"#
+    };
+}
+macro_rules! hal_embassy_head {
+    () => {
+        r#"// <<< GENERATED>>>
+// Flash store glue for embassy-stm32 (from the Configuration tab) — regenerated
+// whole, with the runtime; your code goes in flash_store.rs.
+//
+// This flash ends in big sectors, so the store lives in the small ones at its
+// start, right after the vector table's (embassy's first flash region). Checked
+// while building, against embassy-stm32's own facts about this chip.
+use super::flash_store::STORE_RANGE;
+
+const _: () = {
+    use embassy_stm32::flash::BANK1_REGION1;
+    assert!(
+        BANK1_REGION1.offset == 0,
+        "the first flash region must start the flash (embassy-stm32's BANK1_REGION1)"
+    );
+    assert!(
+        STORE_RANGE.start == BANK1_REGION1.erase_size,
+        "STORE_RANGE must start right after the vector table's sector"
+    );
+    assert!(
+        STORE_RANGE.end <= BANK1_REGION1.size && STORE_RANGE.end % BANK1_REGION1.erase_size == 0,
+        "STORE_RANGE must be whole sectors of the first flash region"
     );
 };
 // <<< GENERATED END >>>
@@ -490,6 +520,10 @@ const TMPL_STM32: &str = concat!(
 /// build-time checks. Generated whole.
 const HAL_EMBASSY: &str = hal_embassy!();
 
+/// The F2/F4/F7 glue on embassy-stm32 when the store sits after the vector
+/// table: the build-time checks against `BANK1_REGION1`. Generated whole.
+const HAL_EMBASSY_HEAD: &str = hal_embassy_head!();
+
 /// The STM32F1 glue on stm32f1xx-hal (Blocking, Native): the `F1Flash`
 /// adapter. Generated whole.
 const HAL_F1: &str = hal_f1!();
@@ -536,11 +570,19 @@ pub fn config_files(
                 .replace("{SUBTYPE}", &format!("{:02X}", cfg.subtype()));
             vec![(FILE.to_owned(), fill(&body))]
         }
-        Platform::Stm32 { hal, geo } => {
-            let body = TMPL_STM32.replace("{PAGES}", &(cfg.size / geo.page.max(1)).to_string());
-            let glue = match hal {
-                StmHal::Embassy => HAL_EMBASSY.to_owned(),
-                StmHal::F1Hal => HAL_F1
+        Platform::Stm32 { hal, geo, layout } => {
+            let pages = cfg.size / geo.store_page(layout).max(1);
+            let place = match layout {
+                Layout::End => format!("the last {pages} pages, which memory.x keeps out of FLASH"),
+                Layout::AfterVectors => format!(
+                    "{pages} sectors right after the vector table, before the program (_stext)"
+                ),
+            };
+            let body = TMPL_STM32.replace("{WHERE}", &place);
+            let glue = match (hal, layout) {
+                (StmHal::Embassy, Layout::End) => HAL_EMBASSY.to_owned(),
+                (StmHal::Embassy, Layout::AfterVectors) => HAL_EMBASSY_HEAD.to_owned(),
+                (StmHal::F1Hal, _) => HAL_F1
                     .replace("{PAGE_KIB}", &(geo.page / 1024).to_string())
                     .replace("{FLASH_KIB}", &(geo.size / 1024).to_string()),
             };
@@ -620,8 +662,19 @@ pub fn init_lines(cfg: Option<&FlashStoreConfig>, platform: Option<Platform>) ->
         Platform::Esp => "    let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);\n",
         Platform::Stm32 {
             hal: StmHal::Embassy,
+            layout: Layout::End,
             ..
         } => "    let mut flash = embassy_stm32::flash::Flash::new_blocking(p.FLASH);\n",
+        // F2/F4/F7: the first region alone, whose sectors are the small ones.
+        Platform::Stm32 {
+            hal: StmHal::Embassy,
+            layout: Layout::AfterVectors,
+            ..
+        } => concat!(
+            "    let mut flash = embassy_stm32::flash::Flash::new_blocking(p.FLASH)\n",
+            "        .into_blocking_regions()\n",
+            "        .bank1_region1;\n",
+        ),
         Platform::Stm32 {
             hal: StmHal::F1Hal, ..
         } => "    let mut flash = crate::pins::configs::flash_store_hal::F1Flash::new(flash);\n",
@@ -828,7 +881,11 @@ mod tests {
         let (geo, _) = geometry(part).expect("a metapac part");
         (
             FlashStoreConfig::default_stm32(&geo),
-            Some(Platform::Stm32 { hal, geo }),
+            Some(Platform::Stm32 {
+                hal,
+                geo,
+                layout: Layout::End,
+            }),
         )
     }
 

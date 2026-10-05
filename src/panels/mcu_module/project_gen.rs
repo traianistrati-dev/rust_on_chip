@@ -30,7 +30,6 @@
 
 use super::mcu_catalog::ToolchainKind;
 use super::mcu_def::ProjectDef;
-use std::ops::Range;
 use std::{fs, io, path::Path};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -2590,21 +2589,49 @@ fn cargo_config_embedded(c: &ProjectDef) -> String {
 }
 
 /// The memory.x GENERATED block with the Configuration tab's flash store
-/// kept out of FLASH: `store` is its byte range from the start of flash
-/// (`flash_store::stm32_reservation`), `None` for the plain block.
+/// kept out of the program: `store` is its byte range from the start of flash
+/// and its layout (`flash_store::stm32_reservation`), `None` for the plain
+/// block. The store's bounds become linker symbols either way.
 ///
-/// FLASH ends where the store begins, written as a literal `NNK` (the Size
-/// bar's parser reads a number, not `64K - 2K`). The store's bounds become
-/// linker symbols, and an `ASSERT` keeps them apart from FLASH, so a LENGTH
-/// edited by hand past the store fails the link instead of overwriting it.
-pub fn memory_x_body(c: &ProjectDef, store: Option<Range<u32>>) -> String {
-    use crate::panels::mcu_module::flash_store::STM32_FLASH_BASE;
-    let Some(r) = store else {
+/// - `Layout::End`: FLASH ends where the store begins, written as a literal
+///   `NNK` (the Size bar's parser reads a number, not `64K - 2K`), and an
+///   `ASSERT` keeps them apart, so a LENGTH edited by hand past the store
+///   fails the link instead of overwriting it.
+/// - `Layout::AfterVectors` (F2/F4/F7): FLASH stays whole; `_stext` starts
+///   the program after the store, which sits between the vector table and
+///   the code. cortex-m-rt's own asserts keep `_stext` inside FLASH and after
+///   the vector table; one more keeps the vector table out of the store.
+pub fn memory_x_body(
+    c: &ProjectDef,
+    store: Option<crate::panels::mcu_module::flash_store::Reservation>,
+) -> String {
+    use crate::panels::mcu_module::flash_store::{Layout, STM32_FLASH_BASE};
+    let Some(res) = store else {
         return memory_x(c);
     };
+    let r = res.range;
     let origin = crate::size::parse_ld_number(&c.flash_origin).unwrap_or(STM32_FLASH_BASE.into());
     let start = u64::from(STM32_FLASH_BASE) + u64::from(r.start);
     let end = u64::from(STM32_FLASH_BASE) + u64::from(r.end);
+    if res.layout == Layout::AfterVectors {
+        let mut out = memory_x(c);
+        out.push_str(&format!(
+            concat!(
+                "/* Flash store (Configuration tab): {kib} KiB in the small sectors right\n",
+                "   after the vector table; the program starts after it (_stext), so\n",
+                "   nothing is linked into the store. */\n",
+                "_flash_store_start = 0x{start:08X};\n",
+                "_flash_store_end = 0x{end:08X};\n",
+                "_stext = _flash_store_end;\n",
+                "ASSERT(ADDR(.vector_table) + SIZEOF(.vector_table) <= _flash_store_start,\n",
+                "       \"memory.x - the vector table runs into the flash store reserved in the Configuration tab\");\n",
+            ),
+            kib = (end - start) / 1024,
+            start = start,
+            end = end,
+        ));
+        return out;
+    }
     let full = crate::size::parse_ld_number(&c.flash_size).unwrap_or(end - origin);
     let length = full.min(start.saturating_sub(origin));
     let mut shrunk = c.clone();
@@ -2634,7 +2661,11 @@ pub fn memory_x_body(c: &ProjectDef, store: Option<Range<u32>>) -> String {
 /// one (to take it back out): a project without a store keeps its memory.x
 /// byte for byte. A memory.x with no markers is the user's - never written,
 /// only checked (`flash_store::stm32_flash_block`).
-pub fn splice_memory_x_store(existing: &str, c: &ProjectDef, store: Option<Range<u32>>) -> String {
+pub fn splice_memory_x_store(
+    existing: &str,
+    c: &ProjectDef,
+    store: Option<crate::panels::mcu_module::flash_store::Reservation>,
+) -> String {
     let (begin, end) = (Cmt::Block.begin(), Cmt::Block.end());
     let (Some(b), Some(e)) = (existing.find(begin), existing.find(end)) else {
         return existing.to_owned();
@@ -4730,6 +4761,14 @@ mod flash_store_file_tests {
     const ROWS: &str =
         "nvs, data, nvs, 0x9000, 0x6000\nflash_store, data, undefined, 0x3FC000, 0x4000\n";
 
+    /// The F103C8's default store: its last two 1 KiB pages.
+    fn end_store() -> Option<crate::panels::mcu_module::flash_store::Reservation> {
+        Some(crate::panels::mcu_module::flash_store::Reservation {
+            range: 0xF800..0x10000,
+            layout: crate::panels::mcu_module::flash_store::Layout::End,
+        })
+    }
+
     fn f103c8() -> ProjectDef {
         ProjectDef {
             pkg_name: "stm32f103c8t6".into(),
@@ -4751,7 +4790,7 @@ mod flash_store_file_tests {
     #[test]
     fn memory_x_keeps_the_store_out_of_flash() {
         let def = f103c8();
-        let body = memory_x_body(&def, Some(0xF800..0x10000));
+        let body = memory_x_body(&def, end_store());
         assert!(
             body.contains("FLASH : ORIGIN = 0x08000000, LENGTH = 62K"),
             "{body}"
@@ -4775,13 +4814,13 @@ mod flash_store_file_tests {
         let plain = gen_config(ConfigFile::MemoryX, &def, &ToolchainKind::RustEmbedded);
         let mine = format!("{plain}/* my own region */\n");
         assert_eq!(splice_memory_x_store(&mine, &def, None), mine);
-        let on = splice_memory_x_store(&mine, &def, Some(0xF800..0x10000));
+        let on = splice_memory_x_store(&mine, &def, end_store());
         assert!(
             on.contains("LENGTH = 62K") && on.contains("/* my own region */"),
             "{on}"
         );
         assert_eq!(
-            splice_memory_x_store(&on, &def, Some(0xF800..0x10000)),
+            splice_memory_x_store(&on, &def, end_store()),
             on,
             "idempotent"
         );
@@ -4792,7 +4831,7 @@ mod flash_store_file_tests {
         );
         let theirs = "MEMORY { FLASH : ORIGIN = 0x08000000, LENGTH = 64K }\n";
         assert_eq!(
-            splice_memory_x_store(theirs, &def, Some(0xF800..0x10000)),
+            splice_memory_x_store(theirs, &def, end_store()),
             theirs
         );
         assert!(!memory_x_is_ours(theirs) && memory_x_is_ours(&on));

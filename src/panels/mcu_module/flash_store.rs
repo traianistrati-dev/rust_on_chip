@@ -84,13 +84,34 @@ pub fn supported(family: &str) -> bool {
 /// pages the store needs would be 256 KiB at least.
 pub const MAX_PAGE: u32 = 16 * 1024;
 
+/// The largest sector the [`Layout::AfterVectors`] store is laid out on: the
+/// F2/F4/F72x start with four of 16 KiB, the F74x/F75x with four of 32 KiB.
+pub const MAX_HEAD_PAGE: u32 = 32 * 1024;
+
 /// What generates the store on a chip, under a runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
     /// esp-storage, reserved in an ESP-IDF partition table.
     Esp,
     /// The chip's own flash through its HAL, reserved in `memory.x`.
-    Stm32 { hal: StmHal, geo: Geometry },
+    Stm32 {
+        hal: StmHal,
+        geo: Geometry,
+        layout: Layout,
+    },
+}
+
+/// Where an STM32 store sits, and so what memory.x does about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Layout {
+    /// The last pages of flash: memory.x's FLASH ends where they begin.
+    End,
+    /// F2/F4/F7, whose flash ENDS in 128/256 KiB sectors but starts with four
+    /// small ones: the store takes the sectors right after the vector table's
+    /// (sector 0), and memory.x starts the program after them (`_stext`) - the
+    /// layout of ST's AN3969. Sector 0 keeps the vector table alone; the rest of
+    /// it is the price.
+    AfterVectors,
 }
 
 /// Which STM32 HAL writes the flash.
@@ -112,6 +133,20 @@ pub struct Geometry {
     pub page: u32,
     /// The write unit - sequential-storage's word.
     pub write: u32,
+    /// The erase unit at the START of flash, and the size of the region made
+    /// of it (embassy-stm32's `BANK1_REGION1`): 16 KiB x 4 on an F4.
+    pub head_page: u32,
+    pub head_size: u32,
+}
+
+impl Geometry {
+    /// The erase unit the store is laid out in on `layout`.
+    pub fn store_page(&self, layout: Layout) -> u32 {
+        match layout {
+            Layout::End => self.page,
+            Layout::AfterVectors => self.head_page,
+        }
+    }
 }
 
 /// The flash geometry of an STM32 part, with the table's flags, by name -
@@ -135,6 +170,8 @@ pub fn geometry(part: &str) -> Option<(Geometry, u8)> {
                 size: u32::from(kib) * 1024,
                 page: s.page,
                 write: u32::from(s.write),
+                head_page: s.head_page,
+                head_size: s.head_size,
             },
             s.flags,
         ))
@@ -270,37 +307,66 @@ pub fn platform(family: &str, part: &str, runtime: Runtime) -> Result<Platform, 
         )
         .to_owned());
     }
-    // Sectors of 32 KiB and up at the end of flash (F2/F4/F7, the H7's 128 KiB):
-    // two of them are 256 KiB or more whatever the chip's size, so they wait for
-    // the layout that uses the small sectors after the vector table.
-    if flags & geo::UNIFORM == 0 || g.page > MAX_PAGE {
-        return Err(format!(
-            concat!(
-                "This flash ends in sectors of {} KiB, and the store needs two of them - ",
-                "{} KiB. Not generated for it yet: the plan is the small sectors right ",
-                "after the vector table."
-            ),
-            g.page / 1024,
-            g.page * 2 / 1024,
-        ));
-    }
-    if u64::from(g.page) * 2 * 4 > u64::from(g.size) {
-        return Err(format!(
-            concat!(
-                "Two pages of {} KiB - the store's minimum - would be {}% of this ",
-                "{} KiB flash. Not generated for it."
-            ),
-            g.page / 1024,
-            u64::from(g.page) * 200 / u64::from(g.size),
-            g.size / 1024,
-        ));
-    }
     let hal = if fam::uses_stm32f1xx_hal(family, runtime) {
         StmHal::F1Hal
     } else {
         StmHal::Embassy
     };
-    Ok(Platform::Stm32 { hal, geo: g })
+    // Equal pages of up to 16 KiB: the last two, at the end of flash.
+    if flags & geo::UNIFORM != 0 && g.page <= MAX_PAGE {
+        if u64::from(g.page) * 2 * 4 > u64::from(g.size) {
+            return Err(format!(
+                concat!(
+                    "Two pages of {} KiB - the store's minimum - would be {}% of this ",
+                    "{} KiB flash. Not generated for it."
+                ),
+                g.page / 1024,
+                u64::from(g.page) * 200 / u64::from(g.size),
+                g.size / 1024,
+            ));
+        }
+        return Ok(Platform::Stm32 {
+            hal,
+            geo: g,
+            layout: Layout::End,
+        });
+    }
+    // F2/F4/F7: small sectors first, big ones at the end - the store goes right
+    // after the vector table's sector, through embassy's first flash region.
+    let head_sectors = g.head_size / g.head_page.max(1);
+    if flags & geo::UNIFORM == 0
+        && g.head_page <= MAX_HEAD_PAGE
+        && head_sectors >= MIN_SECTORS + 1
+        && hal == StmHal::Embassy
+    {
+        // Sector 0 (the vector table, the rest of it unused) plus two sectors.
+        let cost = u64::from(g.head_page) * u64::from(MIN_SECTORS + 1);
+        if cost * 2 > u64::from(g.size) {
+            return Err(format!(
+                concat!(
+                    "The vector table's sector and the store's two after it would be {} ",
+                    "KiB of this {} KiB flash. Not generated for it."
+                ),
+                cost / 1024,
+                g.size / 1024,
+            ));
+        }
+        return Ok(Platform::Stm32 {
+            hal,
+            geo: g,
+            layout: Layout::AfterVectors,
+        });
+    }
+    // Equal sectors of 32 KiB and up (the H7's 128 KiB): two of them are 256
+    // KiB or more, and there are no small ones to use instead.
+    Err(format!(
+        concat!(
+            "This flash erases in sectors of {} KiB, and the store needs two of them - ",
+            "{} KiB. Not generated for it."
+        ),
+        g.page / 1024,
+        g.page * 2 / 1024,
+    ))
 }
 
 /// The flash size a part most likely has when nothing better is known: the
@@ -399,11 +465,31 @@ impl FlashStoreConfig {
         }
     }
 
+    /// The default on an F2/F4/F7 ([`Layout::AfterVectors`]): the two sectors
+    /// after the vector table's - 32 KiB from 0x08004000 on an F4.
+    pub fn default_after_vectors(g: &Geometry) -> Self {
+        Self {
+            mode: FlashStoreMode::MemoryX,
+            flash_size: g.size,
+            size: MIN_SECTORS * g.head_page,
+            offset: g.head_page,
+        }
+    }
+
     /// The default for whatever `platform` the chip is on.
     pub fn default_on(platform: &Platform, family: &str) -> Self {
         match platform {
             Platform::Esp => Self::default_for(family),
-            Platform::Stm32 { geo, .. } => Self::default_stm32(geo),
+            Platform::Stm32 {
+                geo,
+                layout: Layout::End,
+                ..
+            } => Self::default_stm32(geo),
+            Platform::Stm32 {
+                geo,
+                layout: Layout::AfterVectors,
+                ..
+            } => Self::default_after_vectors(geo),
         }
     }
 
@@ -430,7 +516,10 @@ impl FlashStoreConfig {
     /// STM32. Settings saved for the other platform (a chip changed under a
     /// project) say so, and the card's Reset fixes them.
     pub fn problems_on(&self, platform: &Platform) -> Vec<String> {
-        let Platform::Stm32 { geo: g, .. } = platform else {
+        let Platform::Stm32 {
+            geo: g, layout, ..
+        } = platform
+        else {
             if self.mode == FlashStoreMode::MemoryX {
                 return vec![
                     "These settings are for an STM32's memory.x, not this chip.".to_owned(),
@@ -451,25 +540,36 @@ impl FlashStoreConfig {
                 g.size / 1024
             ));
         }
-        if !self.size.is_multiple_of(g.page) {
+        let page = g.store_page(*layout).max(1);
+        if !self.size.is_multiple_of(page) {
             out.push(format!(
                 "The store must be whole pages of {} KiB: 0x{:X} is not.",
-                g.page / 1024,
+                page / 1024,
                 self.size
             ));
         }
-        if self.size < MIN_SECTORS * g.page {
+        if self.size < MIN_SECTORS * page {
             out.push(format!(
                 "The store needs at least {MIN_SECTORS} pages ({} KiB): sequential-storage keeps one free for migration.",
-                MIN_SECTORS * g.page / 1024
+                MIN_SECTORS * page / 1024
             ));
         }
-        if u64::from(self.offset) + u64::from(self.size) != u64::from(g.size) {
-            out.push(format!(
-                "The store must end where the flash ends (0x{:X}); it ends at 0x{:X}.",
+        let end = u64::from(self.offset) + u64::from(self.size);
+        match layout {
+            Layout::End if end != u64::from(g.size) => out.push(format!(
+                "The store must end where the flash ends (0x{:X}); it ends at 0x{end:X}.",
                 g.size,
-                u64::from(self.offset) + u64::from(self.size)
-            ));
+            )),
+            Layout::AfterVectors if self.offset != g.head_page => out.push(format!(
+                "The store must start right after the vector table's sector (0x{:X}); it starts at 0x{:X}.",
+                g.head_page, self.offset,
+            )),
+            Layout::AfterVectors if end > u64::from(g.head_size) => out.push(format!(
+                "The store must stay in the first {} KiB of {} KiB sectors; it ends at 0x{end:X}.",
+                g.head_size / 1024,
+                g.head_page / 1024,
+            )),
+            _ => {}
         }
         if self.size > g.size / 2 {
             out.push(format!(
@@ -908,33 +1008,94 @@ pub fn stm32_flash_block(
     runtime: Runtime,
 ) -> Option<String> {
     let store = store?;
-    let p @ Platform::Stm32 { .. } = platform(family, part, runtime).ok()? else {
+    let p @ Platform::Stm32 { layout, .. } = platform(family, part, runtime).ok()? else {
         return None;
     };
     let problems = store.problems_on(&p);
     if !problems.is_empty() {
         return Some(format!("Flash store: {}", problems.join(" ")));
     }
-    memory_x_overlap(memory_x, store)
+    memory_x_overlap(memory_x, store, layout)
 }
 
-/// The sentence for a `memory.x` whose FLASH runs into the store, or `None`.
-/// Only a memory.x the user wrote can: the IDE's block ends FLASH where the
-/// store begins.
-pub fn memory_x_overlap(memory_x: &str, store: &FlashStoreConfig) -> Option<String> {
+/// The sentence for a `memory.x` that would link the program over the store,
+/// or `None`. Only a memory.x the user wrote can: the IDE's block always keeps
+/// them apart. What cannot be read is not refused on a guess.
+///
+/// - [`Layout::End`]: FLASH must end where the store begins.
+/// - [`Layout::AfterVectors`]: FLASH must start before the store (sector 0
+///   holds the vector table), and `_stext` must start the program after it.
+pub fn memory_x_overlap(memory_x: &str, store: &FlashStoreConfig, layout: Layout) -> Option<String> {
     let (origin, length) = memory_x_flash(memory_x)?;
     let start = u64::from(STM32_FLASH_BASE) + u64::from(store.offset);
-    let end = origin + length;
-    (end > start).then(|| {
-        format!(
+    let store_end = start + u64::from(store.size);
+    match layout {
+        Layout::End => {
+            let end = origin + length;
+            (end > start).then(|| {
+                format!(
+                    concat!(
+                        "memory.x: FLASH runs to 0x{:X}, into the flash store at 0x{:X}. Shrink ",
+                        "its LENGTH to {}K, or let the IDE keep memory.x (its GENERATED markers)."
+                    ),
+                    end,
+                    start,
+                    start.saturating_sub(origin) / 1024
+                )
+            })
+        }
+        Layout::AfterVectors if origin > start => Some(format!(
             concat!(
-                "memory.x: FLASH runs to 0x{:X}, into the flash store at 0x{:X}. Shrink its ",
-                "LENGTH to {}K, or let the IDE keep memory.x (its GENERATED markers)."
+                "memory.x: FLASH starts at 0x{:X}, past the flash store at 0x{:X} - the ",
+                "store sits right after the vector table, so FLASH must start at 0x{:08X}."
             ),
-            end,
-            start,
-            start.saturating_sub(origin) / 1024
-        )
+            origin, start, STM32_FLASH_BASE
+        )),
+        Layout::AfterVectors => match memory_x_symbol(memory_x, "_stext") {
+            None => Some(format!(
+                concat!(
+                    "memory.x: the program must start after the flash store - add ",
+                    "`_stext = 0x{:08X};`, or let the IDE keep memory.x (its GENERATED ",
+                    "markers)."
+                ),
+                store_end
+            )),
+            Some(Some(text)) if text < store_end => Some(format!(
+                concat!(
+                    "memory.x: _stext = 0x{:X} starts the program inside the flash store ",
+                    "(0x{:X}..0x{:X}); set `_stext = 0x{:08X};`."
+                ),
+                text, start, store_end, store_end
+            )),
+            Some(_) => None,
+        },
+    }
+}
+
+/// `name = <expr>;` in a linker script: `None` when it is not assigned,
+/// `Some(None)` when its value is not plain numbers (a symbol, a function).
+fn memory_x_symbol(text: &str, name: &str) -> Option<Option<u64>> {
+    let mut clean = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("/*") {
+        clean.push_str(&rest[..at]);
+        rest = rest[at..].find("*/").map_or("", |e| &rest[at + e + 2..]);
+    }
+    clean.push_str(rest);
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
+    clean.match_indices(name).find_map(|(at, _)| {
+        let before = clean[..at].chars().next_back();
+        if before.is_some_and(ident) {
+            return None;
+        }
+        let after = clean[at + name.len()..].trim_start();
+        let rhs = after.strip_prefix('=')?;
+        if rhs.starts_with('=') {
+            return None;
+        }
+        let value = rhs.split(';').next().unwrap_or("");
+        // `PROVIDE(_stext = 0x…);` keeps its closing parenthesis.
+        Some(ld_expr(value.trim().trim_end_matches(')')))
     })
 }
 
@@ -1037,9 +1198,23 @@ pub fn stm32_reservation(
     family: &str,
     part: &str,
     runtime: Runtime,
-) -> Option<Range<u32>> {
+) -> Option<Reservation> {
     let store = store.filter(|c| c.mode == FlashStoreMode::MemoryX)?;
-    matches!(platform(family, part, runtime), Ok(Platform::Stm32 { .. })).then(|| store.range())
+    match platform(family, part, runtime) {
+        Ok(Platform::Stm32 { layout, .. }) => Some(Reservation {
+            range: store.range(),
+            layout,
+        }),
+        _ => None,
+    }
+}
+
+/// What memory.x reserves for an STM32 store: its bytes from the start of
+/// flash, and how they are kept out of the program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reservation {
+    pub range: Range<u32>,
+    pub layout: Layout,
 }
 
 /// [`flash_block`] or [`stm32_flash_block`], whichever the family has - what
@@ -1430,6 +1605,7 @@ mod tests {
         let p = Platform::Stm32 {
             hal: StmHal::F1Hal,
             geo: g,
+            layout: Layout::End,
         };
         let c = FlashStoreConfig::default_stm32(&g);
         assert_eq!(c.range(), 0xF800..0x10000);
@@ -1511,9 +1687,9 @@ mod tests {
         let (g, _) = geometry("stm32f103c8").unwrap();
         let c = FlashStoreConfig::default_stm32(&g);
         let exact = "  FLASH : ORIGIN = 0x08000000, LENGTH = 64K - 2K\n";
-        assert_eq!(memory_x_overlap(exact, &c), None);
+        assert_eq!(memory_x_overlap(exact, &c, Layout::End), None);
         let past_boot = "  FLASH : ORIGIN = 0x08000000 + 16K, LENGTH = 48K\n";
-        assert!(memory_x_overlap(past_boot, &c).is_some());
+        assert!(memory_x_overlap(past_boot, &c, Layout::End).is_some());
     }
 
     /// The IDE's memory.x never overlaps; one the user wrote with FLASH up to
@@ -1548,7 +1724,10 @@ mod tests {
         );
         assert_eq!(
             stm32_reservation(Some(&c), "stm32f1", "stm32f103c8", Runtime::Blocking),
-            Some(0xF800..0x10000)
+            Some(Reservation {
+                range: 0xF800..0x10000,
+                layout: Layout::End,
+            })
         );
         assert_eq!(
             stm32_reservation(Some(&c), "stm32f1", "stm32f103c8", Runtime::Rtic),

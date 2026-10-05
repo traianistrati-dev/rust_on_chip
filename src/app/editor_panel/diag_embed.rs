@@ -190,6 +190,12 @@ impl AppIde {
                 .then(|| self.partition_table_block())
                 .flatten()
         });
+        // Only while something blocks: an idle Flash tab parses nothing more.
+        // `partition_table_repair` itself checks the block is the table's.
+        let table_fix = flash_block
+            .is_some()
+            .then(|| self.partition_table_repair())
+            .flatten();
         // Cargo-tab Build button (moved off the top toolbar on 2026-07-10).
         let mut build_go = false;
         // Cargo-tab Size button (Flash/RAM usage measurement).
@@ -408,6 +414,7 @@ impl AppIde {
                     &mut probe_flash_stop,
                     &missing_tools,
                     flash_block.as_deref(),
+                    table_fix.as_deref(),
                 );
             },
         );
@@ -665,6 +672,14 @@ impl AppIde {
         // Flash-tab Programmer-row buttons.
         if flash_scan {
             self.scan_usb();
+        }
+        // The blocked dialog's "Fix partitions.csv". It rewrites a buffer the
+        // editor may be showing, whose text was read before this panel ran -
+        // the end-of-frame write-back would put the old one back otherwise.
+        if crate::app::tabs::dfu_tab::take_partition_fix_request(ui.ctx())
+            && self.repair_partition_table()
+        {
+            *source_rewritten = true;
         }
         if flash_go {
             match self.selected_toolchain() {

@@ -184,6 +184,9 @@ impl AppIde {
                             display_code = c.clone();
                         }
                     }
+                    // The Flash tab's "Fix partitions.csv". From the field, not
+                    // `project_files`: that snapshot is from the frame's start.
+                    ProjectFileId::PartitionsCsv => display_code = self.partitions_csv.clone(),
                     _ => {}
                 }
             }

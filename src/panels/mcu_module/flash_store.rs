@@ -478,6 +478,49 @@ fn subtype_name(subtype: u8) -> &'static str {
     }
 }
 
+/// `csv` with every `data` subtype espflash would panic on (`0x99`, `0x40`...)
+/// rewritten to `undefined` - the one change that makes such a table
+/// flashable while keeping every name, offset and size. `None` when there is
+/// nothing to change. The second half says what changed, one item per row.
+///
+/// Only the subtype field moves; the spaces after it shrink to keep the
+/// columns where they were, and line endings stay as they are. A firmware
+/// that looks its partition up BY that subtype must follow (to 0x06); one
+/// that uses a fixed range, as the example project's does, is unaffected.
+pub fn repair_data_subtypes(csv: &str) -> Option<(String, Vec<String>)> {
+    const NEW: &str = "undefined";
+    let mut notes = Vec::new();
+    let lines: Vec<String> = csv
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                return line.to_owned();
+            }
+            let mut f: Vec<String> = line.split(',').map(str::to_owned).collect();
+            if f.len() < 3
+                || !is_data(&f[1].trim().to_ascii_lowercase())
+                || espflash_knows_data_subtype(&f[2].trim().to_ascii_lowercase())
+            {
+                return line.to_owned();
+            }
+            let old = f[2].trim().to_owned();
+            let lead = f[2].len() - f[2].trim_start().len();
+            let trail = &f[2][lead + old.len()..];
+            f[2] = format!("{}{NEW}{trail}", &f[2][..lead]);
+            if let Some(next) = f.get_mut(3) {
+                let spaces = next.len() - next.trim_start_matches(' ').len();
+                let cut = (NEW.len().saturating_sub(old.len())).min(spaces.saturating_sub(1));
+                next.drain(..cut);
+            }
+            notes.push(format!("line {}: '{old}' -> '{NEW}'", i + 1));
+            f.join(",")
+        })
+        .collect();
+    (!notes.is_empty()).then(|| (lines.join("\n"), notes))
+}
+
 /// Does `csv` lack the row reserving exactly `cfg`'s range? By type, subtype
 /// and range - not by name, as `verify` on the chip.
 pub fn store_row_missing(csv: &str, cfg: &FlashStoreConfig) -> bool {
@@ -533,8 +576,12 @@ pub fn flash_block(csv: &str, store: Option<&FlashStoreConfig>, family: &str) ->
         .filter(|c| c.needs_partition_table())
         .map(|c| c.flash_size);
     let problems = csv_problems(csv, known_size, store);
-    (!problems.is_empty()).then(|| format!("partitions.csv: {}", problems.join(" ")))
+    (!problems.is_empty()).then(|| format!("{TABLE_BLOCK_PREFIX} {}", problems.join(" ")))
 }
+
+/// How [`flash_block`] starts a block that is the TABLE's - the only kind
+/// the Flash tab's "Fix partitions.csv" may be offered for.
+pub const TABLE_BLOCK_PREFIX: &str = "partitions.csv:";
 
 #[cfg(test)]
 mod tests {
@@ -662,6 +709,48 @@ mod tests {
         );
         let ota = "otadata, data, ota, 0xd000, 0x2000\nota_0, app, ota_0, 0x10000, 0x100000\n";
         assert!(csv_problems(ota, None, None).is_empty());
+    }
+
+    /// The example project's own table, CRLF and no final newline as it is
+    /// on disk: the repair touches the subtype only, the result passes, and a
+    /// table with nothing espflash panics on is left alone.
+    #[test]
+    fn a_panicking_data_subtype_is_repaired_to_undefined_and_nothing_else_moves() {
+        let theirs = concat!(
+            "# Name,   Type, SubType, Offset,   Size\r\n",
+            "nvs,      data, nvs,     0x9000,   0x6000\r\n",
+            "phy_init, data, phy,     0xf000,   0x1000\r\n",
+            "factory,  app,  factory, 0x10000,  0x3E0000\r\n",
+            "cfg,      data, 0x99,    0x3F0000, 0x4000",
+        );
+        assert!(!csv_problems(theirs, None, None).is_empty());
+        let (fixed, notes) = repair_data_subtypes(theirs).expect("something to repair");
+        assert_eq!(notes, ["line 5: '0x99' -> 'undefined'"]);
+        assert!(
+            fixed.ends_with("cfg,      data, undefined, 0x3F0000, 0x4000"),
+            "{fixed:?}"
+        );
+        // Every other line, its line ending included, is byte-for-byte the same.
+        let (a, b) = (
+            theirs.rsplit_once("\r\n").unwrap(),
+            fixed.rsplit_once("\r\n").unwrap(),
+        );
+        assert_eq!(a.0, b.0);
+        assert!(
+            csv_problems(&fixed, None, None).is_empty(),
+            "{:?}",
+            csv_problems(&fixed, None, None)
+        );
+        assert_eq!(repair_data_subtypes(&fixed), None, "nothing left to repair");
+        // No spaces to give back: nothing is cut, the field just grows.
+        let tight = "x, data, 0x40,0x3F0000, 0x4000\n";
+        let (t, _) = repair_data_subtypes(tight).unwrap();
+        assert_eq!(t, "x, data, undefined,0x3F0000, 0x4000\n");
+        // An app row's bad subtype is not guessed at.
+        assert_eq!(
+            repair_data_subtypes("a, app, 0x30, 0x10000, 0x10000\n"),
+            None
+        );
     }
 
     /// The one gate every flashing path asks.

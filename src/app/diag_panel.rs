@@ -184,6 +184,9 @@ pub(super) fn show_diag_panel(
     // would crash on or that does not reserve the flash store
     // (`AppIde::partition_table_block`). `None` when nothing is wrong.
     flash_block: Option<&str>,
+    // What the Flash tab's "Fix partitions.csv" would change, when that table
+    // is the block (`AppIde::partition_table_repair`).
+    table_fix: Option<&str>,
 ) {
     // ── Tab header ────────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
@@ -748,6 +751,7 @@ pub(super) fn show_diag_panel(
                 missing_tools,
                 holder,
                 flash_block,
+                table_fix,
             );
         }
         BuildPanelTab::Rtt => {

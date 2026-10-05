@@ -113,6 +113,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0TXD: the ROM prints its boot log here at every boot by default (eFuse UART_PRINT_CONTROL can make it follow GPIO8 or switch it off) and answers UART download mode here. It is an enabled output after reset, so never tie it to another driver. Espressif suggests a 499 ohm series resistor against harmonics.",
             ),
             PinDef(
                 number: 27,
@@ -166,6 +167,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0RXD: UART0 RX by default and the receive line of the ROM\'s UART download mode (GPIO9 low and GPIO8 high at reset). Weak pull-up enabled after reset.",
             ),
             PinDef(
                 number: 26,
@@ -220,6 +222,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D+ of the USB Serial/JTAG; its USB pull-up is on from reset, so a host sees a device. Using GPIO19 or GPIO18 in esp-hal as GPIO or for any other peripheral clears the USB pad enable and that pull-up, so the ROM-log/download/JTAG port vanishes while your firmware runs; reflash by holding GPIO9 low and GPIO8 high through reset.",
             ),
             PinDef(
                 number: 25,
@@ -274,6 +277,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D- of the USB Serial/JTAG, which by default carries the ROM log, download mode and JTAG. esp-hal switches the USB pads off once GPIO18 or GPIO19 is used as GPIO or by any other peripheral, so the host loses that port while your firmware runs; reflash with GPIO9 low and GPIO8 high through reset. Drives high for about 50 us at power-up.",
             ),
         ],
         bottom: [
@@ -333,6 +337,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "MTMS (JTAG TMS) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG on GPIO18/19, so this is a free GPIO; GPIO4-7 become the JTAG port only if eFuse DIS_USB_JTAG is burned, or JTAG_SEL_ENABLE is burned and GPIO10 is low at reset.",
             ),
             PinDef(
                 number: 10,
@@ -390,6 +395,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "ADC2_CH0, the C3\'s only ADC2 channel. ADC2 is not factory-calibrated, its digital (DMA) controller can lock up on revisions v0.0-v1.1 with no fix scheduled (errata ADC-183), and ESP-IDF dropped ADC2 one-shot reads as unstable - use ADC1 on GPIO0-4. Also MTDI (JTAG TDI) of the pad JTAG, unused by default because JTAG runs over USB.",
             ),
             PinDef(
                 number: 11,
@@ -449,6 +455,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "MTCK (JTAG TCK) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG on GPIO18/19, so this is a free GPIO; GPIO4-7 become the JTAG port only if eFuse DIS_USB_JTAG is burned, or JTAG_SEL_ENABLE is burned and GPIO10 is low at reset.",
             ),
             PinDef(
                 number: 13,
@@ -502,6 +509,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "MTDO (JTAG TDO) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG on GPIO18/19, so this is a free GPIO; GPIO4-7 become the JTAG port only if eFuse DIS_USB_JTAG is burned, or JTAG_SEL_ENABLE is burned and GPIO10 is low at reset.",
             ),
             PinDef(
                 number: 14,
@@ -555,6 +563,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, floating at reset. UART0/USB download boot (GPIO9 low) needs GPIO8 HIGH, so give it a pull-up and keep loads from holding it low at reset. With eFuse UART_PRINT_CONTROL at 1 or 2, its level also turns the ROM\'s UART0 boot log on or off.",
             ),
             PinDef(
                 number: 15,
@@ -608,6 +617,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Boot strap with a weak internal pull-up: LOW at reset (with GPIO8 high) starts the ROM\'s download mode over UART0 or USB instead of your firmware. Espressif recommends an external pull-up and no large capacitor on it, or the chip may enter download mode.",
             ),
             PinDef(
                 number: 16,
@@ -738,6 +748,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "XTAL_32K_P: one leg of the optional 32.768 kHz crystal that feeds XTAL32K, an RTC_SLOW source in the Clock tab (GPIO1 is the other leg). With that crystal fitted this pad is taken - not a GPIO or ADC input.",
             ),
             PinDef(
                 number: 5,
@@ -795,6 +806,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "XTAL_32K_N: the other leg of the optional 32.768 kHz crystal for XTAL32K, an RTC_SLOW source in the Clock tab (GPIO0 is XTAL_32K_P). With that crystal fitted this pad is taken - not a GPIO or ADC input.",
             ),
             PinDef(
                 number: 6,
@@ -852,12 +864,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, latched at reset and floating by default (no internal pull). It does not choose between SPI Boot and Joint Download Boot, but Espressif recommends pulling it up because of glitches - fit a pull-up and keep loads from holding it low during reset.",
             ),
             PinDef(
                 number: 7,
                 name: "CHIP_EN",
                 reserved: true,
                 functions: [],
+                note: "Must not be left floating. Espressif recommends an RC delay on it (usually R = 10 kohm, C = 1 uF) so it goes high only after the supply rails have had at least 50 us (tSTBL) to stabilize; holding it below VIL_nRST for at least 50 us (tRST) resets the chip.",
             ),
             PinDef(
                 number: 8,
@@ -970,6 +984,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIQ, the flash data output DO (pin 24). ESP32-C3FN4/FH4/FH8X wire it to the in-package flash and Espressif says not to use it for anything else; a plain ESP32-C3 needs an external flash and this is its recommended pin; on FH4AZ/FH4X it is not bonded (NC). Treat it as taken, not as a GPIO.",
             ),
             PinDef(
                 number: 23,
@@ -1023,6 +1038,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPID, the flash data input DI (pin 23). ESP32-C3FN4/FH4/FH8X wire it to the in-package flash and Espressif says not to use it for anything else; a plain ESP32-C3 needs an external flash and this is its recommended pin; on FH4AZ/FH4X it is not bonded (NC). Treat it as taken, not as a GPIO.",
             ),
             PinDef(
                 number: 22,
@@ -1076,6 +1092,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICLK, the flash clock (pin 22). ESP32-C3FN4/FH4/FH8X wire it to the in-package flash and Espressif says not to use it for anything else; a plain ESP32-C3 needs an external flash and this is its recommended pin; on FH4AZ/FH4X it is not bonded (NC). Treat it as taken, not as a GPIO.",
             ),
             PinDef(
                 number: 21,
@@ -1129,6 +1146,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICS0, the flash chip select CS# (pin 21). ESP32-C3FN4/FH4/FH8X wire it to the in-package flash and Espressif says not to use it for anything else; a plain ESP32-C3 needs an external flash and this is its recommended pin; on FH4AZ/FH4X it is not bonded (NC). Treat it as taken, not as a GPIO.",
             ),
             PinDef(
                 number: 20,
@@ -1182,6 +1200,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIWP, the flash WP# line (pin 20). ESP32-C3FN4/FH4/FH8X wire it to the in-package flash and Espressif says not to use it for anything else; on FH4AZ/FH4X it is not bonded (NC). A plain ESP32-C3 needs external flash and this is its recommended WP# pin, a data line only in QIO/QOUT mode. Treat it as taken.",
             ),
             PinDef(
                 number: 19,
@@ -1235,12 +1254,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIHD, the flash HOLD# line (pin 19). ESP32-C3FN4/FH4/FH8X wire it to the in-package flash and Espressif says not to use it for anything else; on FH4AZ/FH4X it is not bonded (NC). A plain ESP32-C3 needs external flash and this is its recommended HOLD# pin, a data line only in QIO/QOUT mode. Treat it as taken.",
             ),
             PinDef(
                 number: 18,
                 name: "VDD_SPI",
                 reserved: true,
                 functions: [],
+                note: "The flash supply pad, not a core supply: it outputs VDD3P3_CPU through RSPI (7.5 ohm typ) to the flash, in-package or external, so VDD3P3_CPU must stay above the flash\'s minimum voltage plus that drop. It becomes GPIO11 only with an off-package flash on its own supply and eFuse VDD_SPI_AS_GPIO burned.",
             ),
             PinDef(
                 number: 17,

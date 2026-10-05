@@ -36,6 +36,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not on the 40-pin header (only test point TP4, marked do-not-use): it drives the RT6150 regulator\'s PS pin, held low by R8 (100k). Low = PFM, the default, best efficiency; HIGH = forced PWM: much less 3V3 ripple at light load, so less ripple on the ADC supply, but much worse light-load efficiency. A peripheral routed here only toggles that mode. The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 42,
@@ -52,6 +53,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Not on the 40-pin header: VBUS through R10 (5.6k) with R1 (10k) to GND, about 3.2 V from 5 V, so it reads HIGH whenever VBUS is present (USB plugged in, or 5 V fed to pin 40) and LOW otherwise. Use it as a plain input; a peripheral routed here has nothing to connect to. The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 43,
@@ -68,6 +70,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not on the 40-pin header: drives the green LED D2 through R3 (470R) to GND, so HIGH lights it. Test point TP5, between R3 and the LED, only swings from 0 V to the LED\'s forward voltage, so it is not recommended as a spare I/O. The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 44,
@@ -88,6 +91,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Not on the 40-pin header: ADC3 reads VSYS/3 from R5 (200k) / R6 (100k) with C3 (1 nF), so multiply by 3. The divider reaches the pin through N-FET Q1 (gate on 3V3), which switches off when 3V3 is off so VSYS cannot leak into the 3V3 rail through this pin\'s ADC diode. The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
         ],
         left: [
@@ -106,6 +110,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 2,
@@ -122,6 +127,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 3,
@@ -144,6 +150,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 5,
@@ -160,6 +167,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 6,
@@ -176,6 +184,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 7,
@@ -192,6 +201,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 8,
@@ -214,6 +224,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 10,
@@ -230,6 +241,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 11,
@@ -246,6 +258,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 12,
@@ -262,6 +275,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 13,
@@ -284,6 +298,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 15,
@@ -300,6 +315,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 16,
@@ -316,6 +332,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 17,
@@ -332,6 +349,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 18,
@@ -354,6 +372,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 20,
@@ -370,6 +389,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
         ],
         right: [
@@ -378,12 +398,14 @@ McuDefinition(
                 name: "VBUS",
                 reserved: true,
                 functions: [],
+                note: "Loaded by R10 (5.6k) + R1 (10k) to GND, the divider that feeds GP24, so it reads 0 V without USB. Feeds VSYS through Schottky D1 (MBR120VLSFT1G). In USB host mode, power the board by feeding 5 V into this pin; with USB as the only supply, VBUS may be shorted to VSYS to remove the diode drop.",
             ),
             PinDef(
                 number: 39,
                 name: "VSYS",
                 reserved: true,
                 functions: [],
+                note: "With USB it sits one Schottky drop (D1) below VBUS. Add another supply through its own Schottky diode or a P-FET (e.g. DMG2305UX, gate on VBUS) so neither source back-powers the other. VSYS/3 is on GP29 (ADC3), through R5 (200k) / R6 (100k).",
             ),
             PinDef(
                 number: 38,
@@ -396,6 +418,7 @@ McuDefinition(
                 name: "3V3_EN",
                 reserved: true,
                 functions: [],
+                note: "Its pull-up is R2 (100k) to VSYS, not to 3V3, so released it sits at VSYS (up to 5.5 V). Grounding it disables the RT6150 and puts it in a low-power state; FET Q1 then stops VSYS leaking into 3V3 through GP29\'s ADC diode.",
             ),
             PinDef(
                 number: 36,
@@ -408,6 +431,7 @@ McuDefinition(
                 name: "ADC_VREF",
                 reserved: true,
                 functions: [],
+                note: "3V3 reaches it through R7 (200R, 0603) and goes on to the ADC supply through R9 (1R) into C13 (2.2 uF); the ADC\'s ~150 uA draw leaves a ~30 mV offset. A 3.0 V shunt reference here (e.g. LM4040) gives a cleaner 0-3.0 V range and draws ~1.5 mA through R7; remove R7 to supply it from elsewhere.",
             ),
             PinDef(
                 number: 34,
@@ -428,6 +452,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "GP26-29, the ADC pins, have a diode to 3V3: keep the input below 3V3 + about 0.3 V, and a voltage applied while the board is unpowered leaks into the 3V3 rail (GP0-22 do not leak this way). Erratum RP2040-E11 (all steppings): DNL error peaks at codes 512, 1536, 2560 and 3584. Ground reference: AGND (pin 33), with its own analog ground plane. The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 33,
@@ -454,6 +479,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "As an ADC pin it has a diode to 3V3 (the digital-only GP0-25 do not): keep the input at or below 3V3, and a voltage applied while the board is unpowered leaks into the 3V3 rail. Erratum RP2040-E11 (B0-B2, not fixed): ADC DNL spikes at codes 512, 1536, 2560 and 3584. Ground reference: AGND, pin 33. The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 31,
@@ -474,12 +500,14 @@ McuDefinition(
                         channel: 0,
                     ),
                 ],
+                note: "As an ADC pin it has a diode to 3V3 (the digital-only GP0-25 do not): keep the input at or below 3V3, and a voltage applied while the board is unpowered leaks into the 3V3 rail. Erratum RP2040-E11 (B0-B2, not fixed): ADC DNL spikes at codes 512, 1536, 2560 and 3584. Ground reference: AGND, pin 33. The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 30,
                 name: "RUN",
                 reserved: true,
                 functions: [],
+                note: "Held high only by the RP2040\'s on-chip pull-up (about 50k to 3.3 V) - the board adds nothing on this line, so a push button from RUN to GND is a complete reset button.",
             ),
             PinDef(
                 number: 29,
@@ -496,6 +524,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 28,
@@ -518,6 +547,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 26,
@@ -534,6 +564,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 25,
@@ -550,6 +581,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 24,
@@ -566,6 +598,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 23,
@@ -588,6 +621,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
             PinDef(
                 number: 21,
@@ -604,6 +638,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "The Pico runs all I/O at 3.3 V (IOVDD = 3V3): the absolute maximum on any GPIO is IOVDD + 0.5 V, about 3.8 V, so no pin is 5 V tolerant. All GPIO and QSPI pins together may source at most 50 mA and sink at most 50 mA.",
             ),
         ],
     ),

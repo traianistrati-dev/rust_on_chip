@@ -371,6 +371,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, weak pull-down: GPIO0 low enters UART/USB download mode only if GPIO46 is also low at reset; with GPIO0 high GPIO46 is ignored. With EFUSE_UART_PRINT_CONTROL = 1 or 2 its reset level also gates the ROM\'s UART0 boot log in SPI Boot (1: high mutes it, 2: low mutes it).",
             ),
             PinDef(
                 number: 51,
@@ -674,6 +675,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, weak pull-down: sampled at reset to set the VDD_SPI flash/PSRAM supply - low = 3.3 V, high = 1.8 V from the internal LDO - unless EFUSE_VDD_SPI_FORCE is burned. With 3.3 V flash/PSRAM keep it low at reset.",
             ),
             PinDef(
                 number: 50,
@@ -977,6 +979,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0RXD after reset: the ROM\'s UART download mode receives here, through a USB-to-UART tool wired to U0TXD/U0RXD.",
             ),
             PinDef(
                 number: 49,
@@ -1280,6 +1283,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0TXD after reset: by default the ROM prints its boot log here (and over USB Serial/JTAG) and UART download mode answers on it. Firmware UART0 output also leaves here unless rerouted, so another function on this pad cuts off what a USB-to-UART bridge shows.",
             ),
             PinDef(
                 number: 48,
@@ -1583,6 +1587,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Pad JTAG TMS (MTMS), unused by default: with the eFuses unburned the S3 takes JTAG from the USB Serial/JTAG on GPIO19/20. JTAG reaches this pad only after burning EFUSE_DIS_USB_JTAG, or EFUSE_STRAP_JTAG_SEL with GPIO3 low at reset.",
             ),
             PinDef(
                 number: 47,
@@ -1886,12 +1891,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Pad JTAG TDI (MTDI), unused by default: with the eFuses unburned the S3 takes JTAG from the USB Serial/JTAG on GPIO19/20. JTAG reaches this pad only after burning EFUSE_DIS_USB_JTAG, or EFUSE_STRAP_JTAG_SEL with GPIO3 low at reset.",
             ),
             PinDef(
                 number: 46,
                 name: "VDD3P3_CPU",
                 reserved: true,
                 functions: [],
+                note: "IO supply of GPIO38-GPIO46, and of GPIO33-37 and GPIO47/48 unless EFUSE_PIN_POWER_SELECTION / IO_MUX_PAD_POWER_CTRL move them to VDD_SPI. Keep it at or below 3.3 V while eFuses are being burned - the burning circuit is sensitive to higher voltage.",
             ),
             PinDef(
                 number: 45,
@@ -2195,6 +2202,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Pad JTAG TDO (MTDO), unused by default: with the eFuses unburned the S3 takes JTAG from the USB Serial/JTAG on GPIO19/20. JTAG reaches this pad only after burning EFUSE_DIS_USB_JTAG, or EFUSE_STRAP_JTAG_SEL with GPIO3 low at reset.",
             ),
             PinDef(
                 number: 44,
@@ -2498,6 +2506,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Pad JTAG TCK (MTCK), unused by default: with the eFuses unburned the S3 takes JTAG from the USB Serial/JTAG on GPIO19/20. JTAG reaches this pad only after burning EFUSE_DIS_USB_JTAG, or EFUSE_STRAP_JTAG_SEL with GPIO3 low at reset.",
             ),
             PinDef(
                 number: 43,
@@ -3110,6 +3119,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 16,
@@ -3417,6 +3427,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 17,
@@ -3724,6 +3735,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 18,
@@ -4031,6 +4043,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 19,
@@ -4338,12 +4351,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 20,
                 name: "VDD3P3_RTC",
                 reserved: true,
                 functions: [],
+                note: "IO supply of GPIO0-GPIO21 - the only pads that can wake the chip from Deep-sleep - and, through RSPI (14 ohm typ), the source of a 3.3 V VDD_SPI: Espressif asks to keep it above 3.0 V when it feeds 3.3 V flash/PSRAM.",
             ),
             PinDef(
                 number: 21,
@@ -4651,6 +4666,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Also XTAL_32K_P: an external 32 kHz crystal for the RTC slow clock connects here and on GPIO16; where one is fitted the pad is not free. Power-up: driven LOW for about 60 us before any firmware runs.",
             ),
             PinDef(
                 number: 22,
@@ -4958,6 +4974,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Also XTAL_32K_N: an external 32 kHz crystal for the RTC slow clock connects here and on GPIO15; where one is fitted the pad is not free. Power-up: driven LOW for about 60 us before any firmware runs.",
             ),
             PinDef(
                 number: 23,
@@ -5265,6 +5282,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 24,
@@ -5572,6 +5590,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitches: the pad is driven LOW and also HIGH for about 60 us each while the chip powers up, before any firmware runs - mind loads that a short high pulse switches on.",
             ),
             PinDef(
                 number: 25,
@@ -5880,6 +5899,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D- of the USB Serial/JTAG (and OTG): USB flashing and JTAG debugging run here by default. Using GPIO19 or GPIO20 as a GPIO or peripheral signal makes esp-hal clear USB_PAD_ENABLE, and USB OTG takes the one shared PHY - either way the Serial/JTAG link drops. Power-up: one low and two high glitches of about 60 us each.",
             ),
             PinDef(
                 number: 26,
@@ -6188,6 +6208,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D+ of the USB Serial/JTAG (and OTG), with the D+ pull-up on at and after reset. Using GPIO19 or GPIO20 as a GPIO or a GPIO-matrix signal makes esp-hal clear USB_PAD_ENABLE, dropping the USB flashing/console/JTAG link; to flash again, hold GPIO0 low through a reset. Power-up: a pull-down glitch and two high glitches of about 60 us.",
             ),
             PinDef(
                 number: 27,
@@ -6794,6 +6815,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICS1, the PSRAM chip select (CE#). Wired inside the package on every S3 with in-package PSRAM (S3R2, S3RH2, S3R8, S3R8V, S3R16V, S3FH4R2), where it must not be used for anything else; otherwise the CS for an off-package PSRAM, which esp-hal fixes at GPIO26. Espressif: GPIO26-32 not recommended for other uses.",
             ),
         ],
         left: [
@@ -6820,6 +6842,7 @@ McuDefinition(
                 name: "CHIP_PU",
                 reserved: true,
                 functions: [],
+                note: "Must not float. Espressif advises an RC delay on it (usually 10 kohm, 1 uF) so it goes high at least 50 us after the 3.3 V rails are stable; a reset needs it held below VIL_nRST (0.25 x VDD3P3_RTC) for at least 50 us.",
             ),
             PinDef(
                 number: 5,
@@ -7123,6 +7146,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin (weak pull-up), latched at power-on/chip reset and to be held for 3 ms after CHIP_PU rises: low, with GPIO46 low (its default), starts download mode instead of the program in flash. Unless that is wanted, nothing may hold it low then - not even a high-value capacitor; Espressif recommends an external pull-up.",
             ),
             PinDef(
                 number: 6,
@@ -7430,6 +7454,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 7,
@@ -7737,6 +7762,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 8,
@@ -8044,6 +8070,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin for the JTAG source, read only when EFUSE_STRAP_JTAG_SEL is burned and EFUSE_DIS_PAD_JTAG/EFUSE_DIS_USB_JTAG are not (by default it is ignored and JTAG goes over USB). No pull is on at reset, so then drive it: 1 = USB JTAG, 0 = pad JTAG on GPIO39-42. Power-up: driven LOW for about 60 us before any firmware runs.",
             ),
             PinDef(
                 number: 9,
@@ -8351,6 +8378,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 10,
@@ -8658,6 +8686,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 11,
@@ -8965,6 +8994,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 12,
@@ -9272,6 +9302,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 13,
@@ -9579,6 +9610,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
             PinDef(
                 number: 14,
@@ -9886,6 +9918,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Power-up glitch: the pad is driven LOW for about 60 us while the chip powers up, before any firmware runs - mind active-low loads.",
             ),
         ],
         right: [
@@ -10191,6 +10224,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIDQS of the SPI0/1 bus in 8-line (octal) mode (DQS/DM): taken by the in-package octal PSRAM on S3R8, S3R8V and S3R16V - do not use it there. On other parts it is free unless an off-package octal flash/PSRAM is fitted.",
             ),
             PinDef(
                 number: 41,
@@ -10494,6 +10528,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIIO7 of the SPI0/1 bus in 8-line (octal) mode (DQ7): taken by the in-package octal PSRAM on S3R8, S3R8V and S3R16V - do not use it there. On other parts it is free unless an off-package octal flash/PSRAM is fitted.",
             ),
             PinDef(
                 number: 40,
@@ -10797,6 +10832,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIIO6 of the SPI0/1 bus in 8-line (octal) mode (DQ6): taken by the in-package octal PSRAM on S3R8, S3R8V and S3R16V - do not use it there. On other parts it is free unless an off-package octal flash/PSRAM is fitted.",
             ),
             PinDef(
                 number: 39,
@@ -11100,6 +11136,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIIO5 of the SPI0/1 bus in 8-line (octal) mode (DQ5): taken by the in-package octal PSRAM on S3R8, S3R8V and S3R16V - do not use it there. On other parts it is free unless an off-package octal flash/PSRAM is fitted.",
             ),
             PinDef(
                 number: 38,
@@ -11403,6 +11440,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIIO4 of the SPI0/1 bus in 8-line (octal) mode (DQ4): taken by the in-package octal PSRAM on S3R8, S3R8V and S3R16V - do not use it there. On other parts it is free unless an off-package octal flash/PSRAM is fitted.",
             ),
             PinDef(
                 number: 37,
@@ -11706,6 +11744,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "IO MUX F0 is SPICLK_P_DIFF, the positive half of a differential flash/PSRAM clock that no mode in the datasheet\'s flash/PSRAM pin map uses. It shares GPIO33-37\'s power domain (EFUSE_PIN_POWER_SELECTION, IO_MUX_PAD_POWER_CTRL): with 1.8 V octal flash/PSRAM, e.g. ESP32-S3R8V/S3R16V, it runs at 1.8 V, so a 3.3 V device on it needs a level shifter.",
             ),
             PinDef(
                 number: 36,
@@ -12009,6 +12048,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "IO MUX F0 is SPICLK_N_DIFF, the negative half of a differential flash/PSRAM clock that no mode in the datasheet\'s flash/PSRAM pin map uses. It shares GPIO33-37\'s power domain (EFUSE_PIN_POWER_SELECTION, IO_MUX_PAD_POWER_CTRL): with 1.8 V octal flash/PSRAM, e.g. ESP32-S3R8V/S3R16V, it runs at 1.8 V, so a 3.3 V device on it needs a level shifter.",
             ),
             PinDef(
                 number: 35,
@@ -12312,6 +12352,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPID: flash DI and PSRAM SI/SIO0 (DQ0 of both in octal mode). GPIO27-32 carry the SPI flash the chip boots from (inside the package on S3FN8/S3FH4R2, otherwise the recommended pins for the external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 34,
@@ -12615,6 +12656,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIQ: flash DO/IO1 and PSRAM SO/SIO1, or DQ1 of both in octal SPI mode. GPIO27-32 carry the SPI flash the chip boots from (inside the package on S3FN8/S3FH4R2, otherwise the recommended pins for an external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 33,
@@ -12918,6 +12960,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICLK: the flash and PSRAM clock. GPIO27-32 carry the SPI flash the chip boots from (inside the package on S3FN8/S3FH4R2, otherwise the recommended pins for an external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 32,
@@ -13221,6 +13264,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICS0: the flash chip select (CS#). GPIO27-32 carry the SPI flash the chip boots from (inside the package on S3FN8/S3FH4R2, otherwise the recommended pins for an external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 31,
@@ -13524,6 +13568,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIWP: flash WP#/IO2 and PSRAM SIO2, or DQ2 of both in octal SPI mode. GPIO27-32 carry the SPI flash the chip boots from (inside the package on S3FN8/S3FH4R2, otherwise the recommended pins for an external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 30,
@@ -13827,12 +13872,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIHD: flash HOLD#/IO3 and PSRAM SIO3, or DQ3 of both in octal SPI mode. GPIO27-32 carry the SPI flash the chip boots from (inside the package on S3FN8/S3FH4R2, otherwise the recommended pins for an external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 29,
                 name: "VDD_SPI",
                 reserved: true,
                 functions: [],
+                note: "Normally a supply OUTPUT for flash/PSRAM and the SPI pads GPIO26-32: 3.3 V from VDD3P3_RTC through RSPI (14 ohm typ) by default, or 1.8 V from the internal LDO (40 mA typ) when GPIO45 is high at reset. A burned EFUSE_VDD_SPI_FORCE ignores GPIO45 and EFUSE_VDD_SPI_TIEH picks the voltage. Espressif: 0.1 uF + 1 uF close to it.",
             ),
         ],
         grid: None,

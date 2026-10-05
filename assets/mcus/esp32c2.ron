@@ -40,12 +40,14 @@ McuDefinition(
                 name: "XTAL_P",
                 reserved: true,
                 functions: [],
+                note: "The C2 runs from a 26 MHz or a 40 MHz crystal, and neither a strap nor an eFuse records which: the ROM assumes 40 MHz, esp-hal 1.1 measures it at startup unless told. Chip revisions v0.0/v1.0 may fail with 40 MHz (errata XTAL-5948) - fit 26 MHz on those.",
             ),
             PinDef(
                 number: 22,
                 name: "XTAL_N",
                 reserved: true,
                 functions: [],
+                note: "The C2 runs from a 26 MHz or a 40 MHz crystal, and neither a strap nor an eFuse records which: the ROM assumes 40 MHz, esp-hal 1.1 measures it at startup unless told. Chip revisions v0.0/v1.0 may fail with 40 MHz (errata XTAL-5948) - fit 26 MHz on those.",
             ),
             PinDef(
                 number: 21,
@@ -99,6 +101,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "U0TXD: output-enabled after reset. With eFuse UART_PRINT_CONTROL left at 0 (default) the ROM prints its boot log here at reset - 115200 baud with a 40 MHz crystal, 74880 with 26 MHz - and the UART download mode answers here (the C2 has no USB). Espressif suggests a 499 ohm series resistor.",
             ),
             PinDef(
                 number: 19,
@@ -146,6 +149,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "U0RXD: UART0 RX after reset, weak pull-up on. The ROM\'s UART download mode (GPIO9 low and GPIO8 high at reset) receives here, and with no USB on the C2 this pad and GPIO20 are its serial flashing port. Espressif advises using a UART other than UART0 for application traffic.",
             ),
         ],
         bottom: [
@@ -154,6 +158,7 @@ McuDefinition(
                 name: "CHIP_EN",
                 reserved: true,
                 functions: [],
+                note: "Must not be left floating. Espressif recommends an RC delay here (R = 10 kohm, C = 1 uF) so it goes high at least 50 us after the 3.3 V rails come up; holding it below VIL_nRST (0.25 x VDD) for at least 50 us resets the chip.",
             ),
             PinDef(
                 number: 8,
@@ -205,6 +210,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "Driven LOW for about 60 us at power-up, before any code runs (Espressif\'s power-up glitch table). Do not use it for a line that must stay high from power-on, such as an active-low enable or reset of another part.",
             ),
             PinDef(
                 number: 9,
@@ -256,6 +262,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "MTMS (JTAG TMS). The C2 has no USB Serial/JTAG, so GPIO4-7 are its only JTAG port: leave them free if you want to debug with a JTAG probe.",
             ),
             PinDef(
                 number: 10,
@@ -303,6 +310,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "MTDI (JTAG TDI) - with GPIO4/6/7 the C2\'s only JTAG port, as it has no USB Serial/JTAG. Also driven LOW for about 60 us at power-up (Espressif\'s glitch table), so it cannot hold an active-low enable of another part high from power-on.",
             ),
             PinDef(
                 number: 11,
@@ -356,6 +364,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "MTCK (JTAG TCK). The C2 has no USB Serial/JTAG, so GPIO4-7 are its only JTAG port: leave them free if you want to debug with a JTAG probe.",
             ),
         ],
         left: [
@@ -427,6 +436,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "Driven LOW for about 40 us at power-up, before any code runs (Espressif\'s power-up glitch table). Do not use it for a line that must stay high from power-on, such as an active-low enable or reset of another part.",
             ),
             PinDef(
                 number: 5,
@@ -478,6 +488,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "Driven LOW for about 60 us at power-up, before any code runs (Espressif\'s power-up glitch table). Do not use it for a line that must stay high from power-on, such as an active-low enable or reset of another part.",
             ),
             PinDef(
                 number: 6,
@@ -678,6 +689,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "Boot strap with a weak internal pull-up: LOW at reset (with GPIO8 high) starts the ROM\'s UART download mode instead of your firmware. Espressif recommends an external pull-up and no large capacitor on it, or the chip may enter download mode.",
             ),
             PinDef(
                 number: 14,
@@ -725,6 +737,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "Strapping pin with no default level. UART download mode (GPIO9 low at reset) requires GPIO8 HIGH, so give it a pull-up and keep loads here from holding it low at reset. With eFuse UART_PRINT_CONTROL burned (1 or 2), its level also turns the ROM\'s boot log on U0TXD on or off.",
             ),
             PinDef(
                 number: 13,
@@ -772,6 +785,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "MTDO (JTAG TDO). The C2 has no USB Serial/JTAG, so GPIO4-7 are its only JTAG port: leave them free if you want to debug with a JTAG probe.",
             ),
         ],
         grid: None,

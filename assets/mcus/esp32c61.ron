@@ -79,6 +79,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "Strapping pin for the JTAG source, but it only counts if EFUSE_JTAG_SEL_ENABLE is burned and EFUSE_DIS_PAD_JTAG/DIS_USB_JTAG are not (all 0 by default). It floats at reset (no internal pull), so in that case an external circuit must drive it: high keeps JTAG on USB Serial/JTAG, low moves it to the MTMS/MTDI/MTCK/MTDO pads (GPIO3-6).",
             ),
             PinDef(
                 number: 35,
@@ -125,6 +126,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "U0TXD, UART0 TX by default. UART0 is the ROM\'s port for UART download and for its boot log, printed at every reset by default, so whatever is wired here sees that traffic. Espressif suggests a 499 ohm series resistor on this line.",
             ),
             PinDef(
                 number: 33,
@@ -148,6 +150,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "U0RXD, UART0 RX by default (weak pull-up after reset): the line the ROM listens on for UART download (UART0 is its download and boot-log port).",
             ),
             PinDef(
                 number: 32,
@@ -171,6 +174,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "Boot-mode strapping pin with a weak pull-up: held LOW at reset while GPIO8 is HIGH, the chip enters Joint Download Boot (UART0, USB or SDIO) instead of booting from flash. Espressif recommends an external pull-up and no high-value capacitor on it, or the chip may enter download mode.",
             ),
             PinDef(
                 number: 31,
@@ -194,6 +198,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "Strapping pin, floating by default. Download mode (GPIO9 low at reset) needs GPIO8 HIGH; GPIO8 and GPIO9 both low is an invalid combination. If eFuse UART_PRINT_CONTROL is set to 1 or 2, GPIO8\'s level at reset also turns the ROM boot log on UART0 on or off (1: printed when low, 2: printed when high).",
             ),
         ],
         bottom: [
@@ -219,6 +224,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "JTAG MTCK for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads. LP GPIO5, one of GPIO0-6 that can wake the chip from Deep-sleep.",
             ),
             PinDef(
                 number: 12,
@@ -242,6 +248,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "JTAG MTDO for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads. LP GPIO6, one of GPIO0-6 that can wake the chip from Deep-sleep.",
             ),
             PinDef(
                 number: 13,
@@ -403,6 +410,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "SPICS1 (pin 19), the PSRAM chip select: on ESP32-C61HR2/HR8 it is wired to the in-package PSRAM and cannot be used for anything else. On a part with no PSRAM (ESP32-C61HF4) Espressif\'s module datasheet says it can be used as GPIO14.",
             ),
             PinDef(
                 number: 20,
@@ -426,6 +434,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "SPICS0 (pin 20), the flash chip select. ESP32-C61HR2/HR8 have no flash inside, so this pin goes to the external boot flash; on ESP32-C61HF4 it is not connected (NC). Not a usable GPIO on any variant.",
             ),
         ],
         left: [
@@ -452,6 +461,7 @@ McuDefinition(
                 name: "CHIP_PU",
                 reserved: true,
                 functions: [],
+                note: "Must not be left floating, and must go high only after the supply rails have settled (tSTBL >= 50 us): Espressif advises an RC delay, typically 10 kohm and 1 uF, and a short CHIP_PU trace, since interference on it causes reboots.",
             ),
             PinDef(
                 number: 5,
@@ -481,6 +491,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "XTAL_32K_P: an optional external 32.768 kHz crystal for the RTC slow clock sits on GPIO0/GPIO1 and then takes both pins; an external 32 kHz oscillator takes GPIO0 alone. Unused, they are plain GPIOs. LP GPIO0 (VDDPST1 domain): only GPIO0-6 can wake the chip from Deep-sleep.",
             ),
             PinDef(
                 number: 7,
@@ -504,6 +515,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "XTAL_32K_N: the other end of the optional 32.768 kHz RTC crystal (with GPIO0); when it is fitted, both pins are taken. LP GPIO1 (VDDPST1 domain): only GPIO0-6 can wake the chip from Deep-sleep.",
             ),
             PinDef(
                 number: 8,
@@ -527,6 +539,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "LP GPIO2 (VDDPST1 domain): only GPIO0-6 can wake the chip from Deep-sleep.",
             ),
             PinDef(
                 number: 9,
@@ -550,6 +563,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "JTAG MTMS for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads. Strapping pin too: with GPIO4 (MTDI) it sets the SDIO slave\'s sampling/driving clock edge; floating by default. LP GPIO3, one of GPIO0-6 that can wake the chip from Deep-sleep.",
             ),
             PinDef(
                 number: 10,
@@ -573,6 +587,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "JTAG MTDI for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads. Strapping pin too: with GPIO3 (MTMS) it sets the SDIO slave\'s sampling/driving clock edge; floating by default. LP GPIO4, one of GPIO0-6 that can wake the chip from Deep-sleep.",
             ),
         ],
         right: [
@@ -622,6 +637,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "USB D+ of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO12 or GPIO13 any other function disables it (esp-hal clears USB_PAD_ENABLE). D+ toggles high/low at power-up; add an external pull-up if the line must start in a stable state.",
             ),
             PinDef(
                 number: 28,
@@ -646,6 +662,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "USB D- of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO12 or GPIO13 any other function disables it: esp-hal clears USB_PAD_ENABLE and the USB pulls when it sets the pin up as a GPIO or routes a peripheral to it.",
             ),
             PinDef(
                 number: 27,
@@ -669,6 +686,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "SPID (pin 27), MOSI / SIO0 of the flash/PSRAM bus: on ESP32-C61HR2/HR8 it serves the in-package PSRAM and the external boot flash; on ESP32-C61HF4 it is not connected (NC). Not a usable GPIO on any variant.",
             ),
             PinDef(
                 number: 26,
@@ -692,6 +710,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "SPICLK (pin 26), the clock of the flash/PSRAM bus: on ESP32-C61HR2/HR8 it serves the in-package PSRAM and the external boot flash; on ESP32-C61HF4 it is not connected (NC). Not a usable GPIO on any variant.",
             ),
             PinDef(
                 number: 25,
@@ -715,12 +734,14 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "SPIHD (pin 25), HOLD# / SIO3 of the flash/PSRAM bus: on ESP32-C61HR2/HR8 it serves the in-package PSRAM and the external boot flash; on ESP32-C61HF4 it is not connected (NC). Not a usable GPIO on any variant.",
             ),
             PinDef(
                 number: 24,
                 name: "VDD_SPI",
                 reserved: true,
                 functions: [],
+                note: "Supply OUTPUT for the flash/PSRAM: VDDPST2 through RSPI (typ. 3 ohm), so it sits a little below VDDPST2. Put 1 uF close to it and keep VDDPST2 at 3.0 V or more. On ESP32-C61HR2/HR8 the in-package PSRAM must be powered from it, so it can never be GPIO18; on ESP32-C61HF4 it is not connected (NC).",
             ),
             PinDef(
                 number: 23,
@@ -744,6 +765,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "SPIWP (pin 23), WP# / SIO2 of the flash/PSRAM bus: on ESP32-C61HR2/HR8 it serves the in-package PSRAM and the external boot flash; on ESP32-C61HF4 it is not connected (NC). Not a usable GPIO on any variant.",
             ),
             PinDef(
                 number: 22,
@@ -767,6 +789,7 @@ McuDefinition(
                     I2cScl(0),
                     I2cSda(0),
                 ],
+                note: "SPIQ (pin 22), MISO / SIO1 of the flash/PSRAM bus: on ESP32-C61HR2/HR8 it serves the in-package PSRAM and the external boot flash; on ESP32-C61HF4 it is not connected (NC). Not a usable GPIO on any variant.",
             ),
             PinDef(
                 number: 21,

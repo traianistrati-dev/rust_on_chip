@@ -45,6 +45,7 @@ McuDefinition(
                     CanTx,
                     I2cSda(1),
                 ],
+                note: "CAN here cannot run while USB is in use: the two share one 512-byte SRAM. Whenever I2C1 is clocked - here or on PB6/PB7 - its SMBA signal (which stays on PB5) collides with PB5 as an alternate-function output, so remapped SPI1 MOSI in master mode and TIM3_CH2 output on PB5 do not work (errata ES096 2.3.7, 2.3.8).",
             ),
             PinDef(
                 number: 45,
@@ -60,6 +61,7 @@ McuDefinition(
                     CanRx,
                     I2cScl(1),
                 ],
+                note: "CAN here cannot run while USB is in use: the two share one 512-byte SRAM. Whenever I2C1 is clocked - here or on PB6/PB7 - its SMBA signal (which stays on PB5) collides with PB5 as an alternate-function output, so remapped SPI1 MOSI in master mode and TIM3_CH2 output on PB5 do not work (errata ES096 2.3.7, 2.3.8).",
             ),
             PinDef(
                 number: 44,
@@ -80,6 +82,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "If I2C1 runs here: while it is clocked, its SMBA signal conflicts with PB5 as an alternate-function output even when SMBA is unused, so remapped SPI1 MOSI in master mode and TIM3_CH2 output on PB5 do not work (errata ES096 2.3.7, 2.3.8).",
             ),
             PinDef(
                 number: 42,
@@ -94,6 +97,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "If I2C1 runs here: while it is clocked, its SMBA signal conflicts with PB5 as an alternate-function output even when SMBA is unused, so remapped SPI1 MOSI in master mode and TIM3_CH2 output on PB5 do not work (errata ES096 2.3.7, 2.3.8).",
             ),
             PinDef(
                 number: 41,
@@ -108,6 +112,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not 5 V tolerant, unlike PB4 and PB6 beside it. While I2C1 is clocked (on PB6/PB7 or PB8/PB9), its SMBA signal conflicts with PB5 as an alternate-function output even when SMBA is unused: remapped SPI1 MOSI in master mode and TIM3_CH2 output do not work here next to I2C1 (errata ES096 2.3.7, 2.3.8).",
             ),
             PinDef(
                 number: 40,
@@ -122,6 +127,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "NJTRST of the JTAG port from reset, internal pull-up, and no GPIO until it is released (SWJ_CFG = 001 frees only this pad and keeps JTAG). When this pad is used the generated code goes further (afio.mapr.disable_jtag / SwjCfg::SwdOnly, SWJ_CFG = 010): SWD on PA13/PA14 keeps working, JTAG does not.",
             ),
             PinDef(
                 number: 39,
@@ -136,6 +142,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "JTDO of the JTAG port from reset, and no GPIO until JTAG is switched off. When this pad is used the generated code does that (afio.mapr.disable_jtag / SwjCfg::SwdOnly, SWJ_CFG = 010): SWD on PA13/PA14 keeps working, JTAG does not. A debugger that turns on SWO trace keeps it as TRACESWO.",
             ),
             PinDef(
                 number: 38,
@@ -150,6 +157,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "JTDI of the JTAG port from reset, internal pull-up, and no GPIO until JTAG is switched off. When this pad is used the generated code does that (afio.mapr.disable_jtag / SwjCfg::SwdOnly, SWJ_CFG = 010): SWD on PA13/PA14 keeps working, JTAG does not.",
             ),
             PinDef(
                 number: 37,
@@ -160,6 +168,7 @@ McuDefinition(
                     GpioOutput,
                     SwdClk,
                 ],
+                note: "SWCLK/JTCK of the debug port from reset, internal pull-down. While SWD is on, GPIO settings here have no effect. Freeing it takes AFIO_MAPR.SWJ_CFG = 100 (embassy SwjCfg::Disabled; stm32f1xx-hal 0.10 has no call for it), and then a normal probe attach fails - reflash by connecting under reset (NRST held low while attaching).",
             ),
         ],
         bottom: [
@@ -180,6 +189,7 @@ McuDefinition(
                         channel: 4,
                     ),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
             PinDef(
                 number: 14,
@@ -195,6 +205,7 @@ McuDefinition(
                     SpiNss(1),
                     UsartCk(2),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
             PinDef(
                 number: 15,
@@ -209,6 +220,7 @@ McuDefinition(
                     ),
                     SpiSck(1),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
             PinDef(
                 number: 16,
@@ -227,6 +239,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
             PinDef(
                 number: 17,
@@ -245,6 +258,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
             PinDef(
                 number: 18,
@@ -262,6 +276,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
             PinDef(
                 number: 19,
@@ -279,6 +294,7 @@ McuDefinition(
                         channel: 4,
                     ),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
             PinDef(
                 number: 20,
@@ -288,6 +304,7 @@ McuDefinition(
                     GpioInput,
                     GpioOutput,
                 ],
+                note: "BOOT1, latched with BOOT0 on the 4th SYSCLK edge after reset and again on leaving Standby: with BOOT0 high, LOW here starts the ROM bootloader and HIGH boots from SRAM. A normal GPIO afterwards. On a Blue Pill board the BOOT1 jumper ties it to 3V3 or GND through R4 (100k).",
             ),
             PinDef(
                 number: 21,
@@ -339,6 +356,7 @@ McuDefinition(
                     GpioInput,
                     GpioOutput,
                 ],
+                note: "Not 5 V tolerant. Fed through the backup-domain switch, which sinks only 3 mA: as an output use the 2 MHz speed with at most 30 pF (stm32f1xx-hal starts at 50 MHz - set_speed with IOPinSpeed::Mhz2) and never source current from it. On a Blue Pill board its LED D2 hangs here through R5 (510R) from 3V3, so LOW lights it.",
             ),
             PinDef(
                 number: 3,
@@ -348,6 +366,7 @@ McuDefinition(
                     GpioInput,
                     GpioOutput,
                 ],
+                note: "Not 5 V tolerant. The LSE crystal input OSC32_IN: GPIO only while the LSE is off, which takes priority. Fed through the backup-domain switch (3 mA sink): as an output use the 2 MHz speed with at most 30 pF (stm32f1xx-hal starts at 50 MHz) and never source current. On a Blue Pill board the 32.768 kHz crystal Y3 is wired here.",
             ),
             PinDef(
                 number: 4,
@@ -357,6 +376,7 @@ McuDefinition(
                     GpioInput,
                     GpioOutput,
                 ],
+                note: "Not 5 V tolerant. The LSE crystal output OSC32_OUT: GPIO only while the LSE is off, which takes priority. Fed through the backup-domain switch (3 mA sink): as an output use the 2 MHz speed with at most 30 pF (stm32f1xx-hal starts at 50 MHz) and never source current. On a Blue Pill board the 32.768 kHz crystal Y3 is wired here.",
             ),
             PinDef(
                 number: 5,
@@ -366,6 +386,7 @@ McuDefinition(
                     GpioInput,
                     GpioOutput,
                 ],
+                note: "OSC_IN after reset: the HSE crystal pin, which the default clock here (8 MHz HSE, PLL x9) uses. As GPIO it needs the clock on HSI plus AFIO_MAPR.PD01_REMAP set by hand, outputs only at the 50 MHz setting, and has no EXTI interrupt on this package. On a Blue Pill board the 8 MHz crystal sits here.",
             ),
             PinDef(
                 number: 6,
@@ -375,6 +396,7 @@ McuDefinition(
                     GpioInput,
                     GpioOutput,
                 ],
+                note: "OSC_OUT after reset: the HSE crystal pin, which the default clock here (8 MHz HSE, PLL x9) uses. As GPIO it needs the clock on HSI plus AFIO_MAPR.PD01_REMAP set by hand, outputs only at the 50 MHz setting, and has no EXTI interrupt on this package. On a Blue Pill board the 8 MHz crystal sits here.",
             ),
             PinDef(
                 number: 7,
@@ -411,6 +433,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15. Also the WKUP pin: with PWR_CSR.EWUP set it is forced to input pull-down and a rising edge wakes the chip from Standby.",
             ),
             PinDef(
                 number: 11,
@@ -429,6 +452,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
             PinDef(
                 number: 12,
@@ -447,6 +471,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Not 5 V tolerant: keep inputs within VDD + 0.3 V. The 5 V tolerant pads are PA8-PA15, PB2-PB4 and PB6-PB15.",
             ),
         ],
         right: [
@@ -471,6 +496,7 @@ McuDefinition(
                     GpioOutput,
                     SwdIo,
                 ],
+                note: "SWDIO/JTMS of the debug port from reset, internal pull-up. While SWD is on, GPIO settings here have no effect. Freeing it takes AFIO_MAPR.SWJ_CFG = 100 (embassy SwjCfg::Disabled; stm32f1xx-hal 0.10 has no call for it), and then a normal probe attach fails - reflash by connecting under reset (NRST held low while attaching).",
             ),
             PinDef(
                 number: 33,
@@ -483,6 +509,7 @@ McuDefinition(
                     CanTx,
                     UsartRts(1),
                 ],
+                note: "USB D+, which must be pulled up with an external 1.5 kohm resistor to 3.0-3.6 V. USB and CAN share one 512-byte SRAM, so they cannot run at the same time. On a Blue Pill board that pull-up is R10, 4.7k in the maker\'s schematic (10k on some boards), hard-wired to this pad, so it pulls PA12 up even when used as GPIO.",
             ),
             PinDef(
                 number: 32,
@@ -499,6 +526,7 @@ McuDefinition(
                         channel: 4,
                     ),
                 ],
+                note: "USB D-. USB and CAN share one 512-byte SRAM, so they cannot run at the same time - whether CAN sits on PA11/PA12 or on PB8/PB9.",
             ),
             PinDef(
                 number: 31,
@@ -513,6 +541,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "The ROM bootloader (BOOT0 high, BOOT1/PB2 low) talks on USART1: RX here, TX on PA9, 8 data bits, even parity, baud rate auto-detected - the port for flashing over serial without a probe.",
             ),
             PinDef(
                 number: 30,
@@ -527,6 +556,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "The ROM bootloader (BOOT0 high, BOOT1/PB2 low) talks on USART1: TX here, RX on PA10, 8 data bits, even parity, baud rate auto-detected - the port for flashing over serial without a probe.",
             ),
             PinDef(
                 number: 29,
@@ -584,8 +614,8 @@ McuDefinition(
                     GpioOutput,
                     SpiNss(2),
                     UsartCk(3),
-                    I2cScl(2),
                 ],
+                note: "Also I2C2_SMBA (SMBus alert) - not I2C2\'s SCL, which is PB10. Erratum ES096 2.3.6: while I2C2 is clocked, PB12 as an alternate-function output is held high, so with I2C2 in use SPI2 needs software NSS and USART3 must not run synchronous.",
             ),
         ],
     ),

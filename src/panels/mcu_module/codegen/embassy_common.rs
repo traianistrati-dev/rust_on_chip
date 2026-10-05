@@ -2164,7 +2164,8 @@ mod emit_for_manual_compile {
     /// memory.x mistake passes `cargo check`; the matrix rows build).
     ///
     /// `EIDE_STORE_CHIP` picks the part: `f103` (the built-in, default),
-    /// `g431` or `wba55` - derived from the F103's definition the way
+    /// `g431`, `wba55`, or `f411` / `f746` (the store after the vector table) -
+    /// derived from the F103's definition the way
     /// the importer would build them, as the other embassy harnesses do.
     /// `EIDE_STORE_RUNTIME` = `blocking` (default) | `native` | `async`. No
     /// pins are wired: the store's lines live in the Configuration tab's slot,
@@ -2199,7 +2200,25 @@ mod emit_for_manual_compile {
                 "1024K",
                 "128K",
             )),
-            other => panic!("EIDE_STORE_CHIP={other}: f103 | g431 | wba55"),
+            // 128 KiB sectors at the end: the store goes right after the
+            // vector table (16 KiB sectors on the F411, 32 KiB on the F746).
+            "f411" => Some((
+                "stm32f411re",
+                "STM32F411RETx",
+                "stm32f4",
+                "thumbv7em-none-eabihf",
+                "512K",
+                "128K",
+            )),
+            "f746" => Some((
+                "stm32f746zg",
+                "STM32F746ZGTx",
+                "stm32f7",
+                "thumbv7em-none-eabihf",
+                "1024K",
+                "320K",
+            )),
+            other => panic!("EIDE_STORE_CHIP={other}: f103 | g431 | wba55 | f411 | f746"),
         };
         if let Some((id, name, family, target, flash, ram)) = derived {
             def.id = id.into();
@@ -2221,10 +2240,11 @@ mod emit_for_manual_compile {
         };
         mcu.runtime = runtime;
         mcu.pending_runtime = runtime;
-        let (geo, _) = flash_store::geometry(flash_store::part_of(&mcu)).expect("a metapac part");
-        mcu.flash_store = Some(FlashStoreConfig::default_stm32(&geo));
         let platform = flash_store::platform_of(&mcu)
             .unwrap_or_else(|why| panic!("[{chip} {runtime:?}] not generated: {why}"));
+        // The card's own default for the part: the end of flash, or the
+        // sectors after the vector table.
+        mcu.flash_store = Some(FlashStoreConfig::default_on(&platform, &mcu.family));
         println!("[{chip} {runtime:?}] {platform:?}");
         assert!(matches!(platform, Platform::Stm32 { .. }));
 

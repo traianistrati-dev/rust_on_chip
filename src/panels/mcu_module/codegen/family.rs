@@ -2405,14 +2405,23 @@ mod tests {
         );
         assert_eq!(off, mcu.fresh_main_rs());
 
-        // An F411 the importer would build: sectors of 128 KiB, not generated.
+        // An F411 the importer would build: 128 KiB sectors at the end, so the
+        // store goes into the 16 KiB ones right after the vector table, through
+        // embassy's first flash region.
         let mut f4 = def.clone();
         f4.display_name = "STM32F411RETx".into();
         f4.family = "stm32f4".into();
         let mut f4 = f4.build_mcu();
-        f4.flash_store = Some(FlashStoreConfig::default_stm32(&geo));
-        assert!(!f4.fresh_main_rs().contains("flash_store"));
-        assert!(store_file(&f4).is_none());
+        let (g4, _) = geometry(&f4.name).expect("the F411RE is in the table");
+        f4.flash_store = Some(FlashStoreConfig::default_after_vectors(&g4));
+        let main = f4.fresh_main_rs();
+        assert!(main.contains(".into_blocking_regions()"), "{main}");
+        assert!(main.contains(".bank1_region1;"), "{main}");
+        let body = store_file(&f4).expect("the store's file");
+        assert!(body.contains("0x4000..0xC000;"), "{body}");
+        assert!(body.contains("right after the vector table"), "{body}");
+        let glue = file(&f4, HAL_FILE).expect("the glue file");
+        assert!(glue.contains("BANK1_REGION1.erase_size"), "{glue}");
     }
 
     /// RTIC -> X -> RTIC hands back the RTIC tail it started with: leaving

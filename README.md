@@ -339,12 +339,20 @@ is the same under both HALs and survives a runtime switch. The page size of
 every part comes from a table harvested from stm32-metapac
 (`scripts/harvest-flash-geometry.py`), and the build checks the range against
 the driver's own `FLASH_SIZE` / `MAX_ERASE_SIZE`. Every flashing path erases
-only the sectors it writes, so the settings survive a reflash. Not generated,
-with the reason on the card: F2/F4/F7 and the H7's 128 KiB sectors (two of
-them would cost 256 KiB), parts whose bank mode is set in option bytes (the
-L5 included), L4/WL (embassy-stm32 0.6 does not reset their flash data cache
-after an erase), L0/L1 (their flash erases to 0x00), the WB's radio stack, and
-RTIC for now.
+only the sectors it writes, so the settings survive a reflash.
+
+**F2/F4/F7** end in 128/256 KiB sectors, two of which would be a quarter of
+the chip or more — but they *start* with four small ones (16 KiB, 32 KiB on
+F74x). There the store takes the sectors right after the vector table's
+(0x08004000..0x0800C000 on an F411), embassy's first flash region
+(`bank1_region1`) writes it, and memory.x starts the program after it with
+`_stext` — ST's AN3969 layout; the rest of sector 0 is the price. An
+`ASSERT` keeps the vector table out of the store, and `_stext` the code.
+
+Not generated, with the reason on the card: the H7's equal 128 KiB sectors,
+parts whose bank mode is set in option bytes (the L5 included), L4/WL
+(embassy-stm32 0.6 does not reset their flash data cache after an erase),
+L0/L1 (their flash erases to 0x00), the WB's radio stack, and RTIC for now.
 
 On the **ESP32-C3** (`esp-storage`) the store lives either in a partition of its own, in a generated
 `partitions.csv` (shown in the project tree, and passed to espflash, RTT and the
@@ -451,8 +459,8 @@ compiler can tell you that text is a program. `scripts/verify-codegen.ps1` emits
 a matrix of configurations and cross-compiles each one:
 
 ```powershell
-pwsh scripts/verify-codegen.ps1             # representative subset (36 cases)
-pwsh scripts/verify-codegen.ps1 -Full       # every case (56), about 13 minutes warm
+pwsh scripts/verify-codegen.ps1             # representative subset (37 cases)
+pwsh scripts/verify-codegen.ps1 -Full       # every case (59), about 13 minutes warm
 pwsh scripts/verify-codegen.ps1 -Hook nrf   # every case of the named families
 ```
 

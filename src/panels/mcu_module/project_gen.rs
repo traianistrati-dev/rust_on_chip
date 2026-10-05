@@ -2625,6 +2625,8 @@ pub fn memory_x_body(
                 "_stext = _flash_store_end;\n",
                 "ASSERT(ADDR(.vector_table) + SIZEOF(.vector_table) <= _flash_store_start,\n",
                 "       \"memory.x - the vector table runs into the flash store reserved in the Configuration tab\");\n",
+                "ASSERT(_stext >= _flash_store_end,\n",
+                "       \"memory.x - _stext starts the program inside the flash store reserved in the Configuration tab\");\n",
             ),
             kib = (end - start) / 1024,
             start = start,
@@ -4835,6 +4837,40 @@ mod flash_store_file_tests {
             theirs
         );
         assert!(!memory_x_is_ours(theirs) && memory_x_is_ours(&on));
+    }
+
+    /// An F4's store sits after the vector table: FLASH stays whole, `_stext`
+    /// starts the program after the store, and the vector table is kept out.
+    #[test]
+    fn memory_x_starts_the_program_after_a_store_behind_the_vectors() {
+        use crate::panels::mcu_module::flash_store::{Layout, Reservation};
+        let def = ProjectDef {
+            flash_size: "512K".into(),
+            ..f103c8()
+        };
+        let body = memory_x_body(
+            &def,
+            Some(Reservation {
+                range: 0x4000..0xC000,
+                layout: Layout::AfterVectors,
+            }),
+        );
+        assert!(
+            body.contains("FLASH : ORIGIN = 0x08000000, LENGTH = 512K"),
+            "{body}"
+        );
+        assert!(body.contains("_flash_store_start = 0x08004000;"), "{body}");
+        assert!(body.contains("_flash_store_end = 0x0800C000;"), "{body}");
+        assert!(body.contains("_stext = _flash_store_end;"), "{body}");
+        assert!(body.contains("ADDR(.vector_table) + SIZEOF(.vector_table) <= _flash_store_start"));
+        assert!(
+            body.contains("ASSERT(_stext >= _flash_store_end,"),
+            "{body}"
+        );
+        assert_eq!(
+            crate::size::parse_memory_x(&body).flash.map(|f| f.length),
+            Some(512 * 1024)
+        );
     }
 
     /// An STM32 store brings only its own crates; esp-storage is an ESP's.

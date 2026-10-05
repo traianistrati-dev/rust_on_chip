@@ -445,6 +445,12 @@ $ALL_CASES = @(
     @{ n = "STM32 flash store, G431";      t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "g431"; EIDE_STORE_RUNTIME = "blocking" }; q = $true;  fam = "embassy"; lk = $true }
     @{ n = "STM32 flash store, WBA55";     t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "wba55"; EIDE_STORE_RUNTIME = "blocking" }; q = $false; fam = "embassy"; lk = $true }
     @{ n = "STM32 flash store, G431 Async"; t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "g431"; EIDE_STORE_RUNTIME = "async" };   q = $false; fam = "embassy"; lk = $true }
+    # F4/F7 end in 128/256 KiB sectors: the store sits in the small ones right
+    # after the vector table, through embassy's first flash region, and
+    # memory.x starts the program after it (`_stext`).
+    @{ n = "STM32 flash store, F411";       t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f411"; EIDE_STORE_RUNTIME = "blocking" }; q = $true;  fam = "embassy"; lk = $true }
+    @{ n = "STM32 flash store, F411 Async"; t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f411"; EIDE_STORE_RUNTIME = "async" };   q = $false; fam = "embassy"; lk = $true }
+    @{ n = "STM32 flash store, F746";       t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f746"; EIDE_STORE_RUNTIME = "blocking" }; q = $false; fam = "embassy"; lk = $true }
 
     # These two build from a REAL part in the vendor database rather than from a
     # bundled definition, which is the only way to exercise the importer's own

@@ -1578,7 +1578,33 @@ mod tests {
         // data cache around an erase.
         refused("stm32l4", "stm32l432kc", "data cache");
         refused("stm32wl", "stm32wle5jc", "data cache");
-        refused("stm32f4", "stm32f411ce", "128 KiB");
+        // F2/F4/F7 end in 128/256 KiB sectors: the store goes right after the
+        // vector table instead, in the small ones.
+        let after_vectors = |family: &str, part: &str| {
+            matches!(
+                platform(family, part, Runtime::Blocking),
+                Ok(Platform::Stm32 {
+                    hal: StmHal::Embassy,
+                    layout: Layout::AfterVectors,
+                    ..
+                })
+            )
+        };
+        assert!(after_vectors("stm32f4", "stm32f411ce"));
+        assert!(
+            after_vectors("stm32f4", "stm32f401cb"),
+            "48 of 128 KiB is fine"
+        );
+        assert!(after_vectors("stm32f2", "stm32f205rb"));
+        assert!(after_vectors("stm32f7", "stm32f746zg"), "32 KiB sectors");
+        assert!(after_vectors("stm32f7", "stm32f722ze"));
+        assert!(matches!(
+            platform("stm32f4", "stm32f411ce", Runtime::Async),
+            Ok(Platform::Stm32 {
+                layout: Layout::AfterVectors,
+                ..
+            })
+        ));
         // Found by review: uniform 128 KiB sectors passed the size rule on a
         // 2 MB H7 - 256 KiB of store all the same.
         refused("stm32h7", "stm32h743zi", "128 KiB");
@@ -1595,6 +1621,57 @@ mod tests {
         refused("stm32wb", "stm32wb55rg", "radio");
         refused("stm32h7", "stm32h7s3l8", "stub");
         refused("stm32n6", "stm32n657x0", "no internal flash");
+    }
+
+    /// An F4 ends in 128 KiB sectors: its store is the 16 KiB sectors right
+    /// after the vector table's, the program starting after them.
+    #[test]
+    fn an_f4_store_sits_after_the_vector_table() {
+        let (g, _) = geometry("stm32f411ce").unwrap();
+        assert_eq!((g.head_page, g.head_size), (16 * 1024, 64 * 1024));
+        let p = Platform::Stm32 {
+            hal: StmHal::Embassy,
+            geo: g,
+            layout: Layout::AfterVectors,
+        };
+        let c = FlashStoreConfig::default_after_vectors(&g);
+        assert_eq!(c.range(), 0x4000..0xC000);
+        assert!(c.problems_on(&p).is_empty(), "{:?}", c.problems_on(&p));
+        let three = FlashStoreConfig { size: 0xC000, ..c };
+        assert!(three.problems_on(&p).is_empty(), "sectors 1 to 3");
+        let four = FlashStoreConfig { size: 0x10000, ..c };
+        assert!(
+            four.problems_on(&p)
+                .iter()
+                .any(|s| s.contains("first 64 KiB"))
+        );
+        let moved = FlashStoreConfig {
+            offset: 0x8000,
+            ..c
+        };
+        assert!(
+            moved
+                .problems_on(&p)
+                .iter()
+                .any(|s| s.contains("right after the vector table"))
+        );
+        // A hand-written memory.x must start the program after the store.
+        let plain = "MEMORY {\n  FLASH : ORIGIN = 0x08000000, LENGTH = 512K\n}\n";
+        let after = |t: &str| memory_x_overlap(t, &c, Layout::AfterVectors);
+        assert!(after(plain).is_some_and(|s| s.contains("_stext = 0x0800C000;")));
+        assert!(
+            after(&format!("{plain}_stext = 0x08004000;\n"))
+                .is_some_and(|s| s.contains("inside the flash store"))
+        );
+        assert_eq!(after(&format!("{plain}_stext = 0x08000000 + 48K;\n")), None);
+        assert_eq!(
+            after(&format!("{plain}PROVIDE(_stext = 0x0800C000);\n")),
+            None
+        );
+        // A symbol cannot be evaluated here - not refused on a guess.
+        assert_eq!(after(&format!("{plain}_stext = _flash_store_end;\n")), None);
+        let late = "MEMORY { FLASH : ORIGIN = 0x08010000, LENGTH = 448K }\n_stext = 0x08010000;\n";
+        assert!(after(late).is_some_and(|s| s.contains("FLASH must start at 0x08000000")));
     }
 
     /// The STM32 default is two pages at the very end, and only end-of-flash

@@ -15,6 +15,7 @@ pub mod dma_map;
 pub mod embassy_async;
 pub mod embassy_common;
 pub mod family;
+pub mod flash_store_gen;
 pub mod nrf;
 pub mod nrf_boards;
 pub mod nvic;
@@ -134,6 +135,7 @@ impl Mcu {
             .backend()
             .map(|b| b.fresh_main_rs(self))
             .unwrap_or_default();
+        let code = self.seed_flash_store_tail(code);
         // Module/clock state is persisted out-of-source in `mcu.config`
         // (see `Mcu::mcu_config_text`), not as comment markers in main.rs.
         let code = common::ensure_module_models(code, &self.modules);
@@ -160,6 +162,7 @@ impl Mcu {
             .backend()
             .map(|b| b.update_main_rs(self, existing))
             .unwrap_or_else(|| existing.to_owned());
+        let code = self.seed_flash_store_tail(code);
         // Module/clock state is persisted in `mcu.config`, not in main.rs.
         let code = common::ensure_module_models(code, &self.modules);
         // The handler of an armed input calls a hook the user owns: seeded
@@ -174,6 +177,19 @@ impl Mcu {
         let code = common::with_device_comment(code, self);
         // Strict-lints exemption on the (freshly re-spliced) entry fn.
         common::strict_main_exemption(code, self.strict_lints)
+    }
+
+    /// The flash store's line at the head of the user's tail, on or off with
+    /// the Configuration-tab toggle (see `flash_store_gen::seed_tail`). Where
+    /// the store is not generated the line can only be a leftover (a chip
+    /// changed under it): it is taken off and no other family's seed is
+    /// touched. Run BEFORE the passes that append to the end of the file,
+    /// whose additions do not count as the user's.
+    fn seed_flash_store_tail(&self, code: String) -> String {
+        if !crate::panels::mcu_module::flash_store::supported(&self.family) {
+            return flash_store_gen::strip_tail_seed(code);
+        }
+        flash_store_gen::seed_tail(code, self.flash_store.is_some(), self.is_async())
     }
 
     /// Per-peripheral init module bodies for `src/pins/configs/` — `(file_name,
@@ -282,7 +298,7 @@ impl Mcu {
             if cfg.applied_pins.is_empty() {
                 continue;
             }
-            let var = super::mcu::gui::modules::custom_var_name(m);
+            let var = super::mcu::gui::modules::custom_binding_name(m);
             let struct_name = super::mcu::gui::modules::custom_struct_name(m);
             let pins: Vec<_> = cfg
                 .applied_pins
@@ -1598,6 +1614,36 @@ mod tests {
         );
         assert_contains_substring(&mcu.custom_module_inits(), "pins::configs::custom_menu_1::");
         assert_not_contains_substring(&mcu.custom_module_inits(), "custom_menu::");
+    }
+
+    /// A module named `flash` must not shadow the flash store's `flash`
+    /// binding; its file keeps the name, only the `let` moves.
+    #[test]
+    fn a_custom_module_never_takes_a_name_main_binds_itself() {
+        use super::super::mock_mcu;
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+
+        let mut mcu = mock_mcu::create_stm32f103c8tx();
+        mcu.apply_pin_function(10, PinFunction::GpioOutput);
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .unwrap();
+        *m.config.custom_label_mut() = "Flash".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = vec![10];
+            c.applied_pins = c.pins.clone();
+        }
+        let inits = mcu.custom_module_inits();
+        assert_contains_substring(&inits, "let mut flash_dev = pins::configs::custom_flash::");
+        assert_not_contains_substring(&inits, "let mut flash =");
+        assert!(
+            mcu.config_files()
+                .iter()
+                .any(|(n, _)| n == "custom_flash.rs")
+        );
     }
 
     /// The custom file carries NO GENERATED markers. With them, every

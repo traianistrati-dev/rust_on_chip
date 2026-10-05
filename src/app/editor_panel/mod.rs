@@ -353,6 +353,7 @@ impl AppIde {
             ProjectFileId::MemoryX => format!("{id_prefix}:memory_x"),
             ProjectFileId::BuildRs => format!("{id_prefix}:build_rs"),
             ProjectFileId::GitIgnore => format!("{id_prefix}:gitignore"),
+            ProjectFileId::PartitionsCsv => format!("{id_prefix}:partitions_csv"),
         };
 
         // ── LSP completion: pre-editor key consumption ───────────────
@@ -1165,7 +1166,10 @@ impl AppIde {
         // keep the stock CodeEditor. Both return a `TextEditOutput`.
         let is_rust_file = !matches!(
             displayed_file,
-            ProjectFileId::CargoToml | ProjectFileId::CargoConfig | ProjectFileId::GitIgnore
+            ProjectFileId::CargoToml
+                | ProjectFileId::CargoConfig
+                | ProjectFileId::GitIgnore
+                | ProjectFileId::PartitionsCsv
         ) && !selected_is_manifest;
         // While our LSP completion popup is open (or Ctrl+Space was just
         // pressed to open it), hide the crate's built-in keyword popup so
@@ -2114,11 +2118,13 @@ impl AppIde {
                 Some(crate::panels::mcu_module::mcu_catalog::ToolchainKind::RustEmbedded)
             );
             let user_files = &self.project_tree.user_src_files;
+            let has_partitions = !self.partitions_csv.is_empty();
             self.file_cycle.purge(|e| match e {
                 file_cycle::HistEntry::User(p) => user_files.iter().any(|(q, _)| q == p),
                 file_cycle::HistEntry::Fixed(ProjectFileId::MemoryX | ProjectFileId::BuildRs) => {
                     rust_embedded
                 }
+                file_cycle::HistEntry::Fixed(ProjectFileId::PartitionsCsv) => has_partitions,
                 file_cycle::HistEntry::Fixed(_) => true,
             });
             if let Some(entry) = self.file_cycle.begin_or_step(cycle_next_pressed) {
@@ -2279,6 +2285,7 @@ impl AppIde {
                 ProjectFileId::MemoryX => Some(&mut self.memory_x),
                 ProjectFileId::BuildRs => Some(&mut self.build_rs),
                 ProjectFileId::GitIgnore => Some(&mut self.gitignore),
+                ProjectFileId::PartitionsCsv => Some(&mut self.partitions_csv),
                 _ => None,
             };
             if let Some(slot) = slot {

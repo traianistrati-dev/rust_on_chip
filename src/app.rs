@@ -89,6 +89,10 @@ pub enum ProjectFileId {
     MemoryX,
     BuildRs,
     GitIgnore,
+    /// `partitions.csv` at the project root - the ESP-IDF partition table the
+    /// flash store's partition lives in. Present only while the store needs it
+    /// (or the user kept a hand-written one).
+    PartitionsCsv,
     /// Index into `AppIde::user_src_files`
     UserFile(usize),
 }
@@ -102,6 +106,7 @@ impl ProjectFileId {
             Self::MemoryX => "memory.x",
             Self::BuildRs => "build.rs",
             Self::GitIgnore => ".gitignore",
+            Self::PartitionsCsv => "partitions.csv",
             Self::UserFile(_) => "src/???", // resolved at call site
         }
     }
@@ -114,6 +119,7 @@ impl ProjectFileId {
             Self::MemoryX => &files.memory_x,
             Self::BuildRs => &files.build_rs,
             Self::GitIgnore => &files.gitignore,
+            Self::PartitionsCsv => &files.partitions_csv,
             Self::UserFile(_) => "", // handled separately before calling this
         }
     }
@@ -136,7 +142,9 @@ impl ProjectFileId {
             // comments — give them a syntax whose comment marker is `#` so those
             // lines render in the comment (gray) colour, matching `//` comments
             // in .rs files (same theme → same Comment token colour).
-            Self::CargoToml | Self::CargoConfig | Self::GitIgnore => Syntax::simple("#"),
+            Self::CargoToml | Self::CargoConfig | Self::GitIgnore | Self::PartitionsCsv => {
+                Syntax::simple("#")
+            }
             Self::UserFile(_) if !path.ends_with(".rs") => Syntax::simple("#"),
             // main.rs / build.rs are Rust; memory.x uses C-style `/* */`, which
             // Rust highlighting already renders as comments.
@@ -169,6 +177,7 @@ impl ProjectFileId {
             Self::MemoryX => "memory.x",
             Self::BuildRs => "build.rs",
             Self::GitIgnore => ".gitignore",
+            Self::PartitionsCsv => "partitions.csv",
             Self::UserFile(_) => return None,
         })
     }
@@ -357,6 +366,7 @@ pub fn resolve_diag_file(path: &str, user_files: &[(String, String)]) -> Option<
         "memory.x" => Some(ProjectFileId::MemoryX),
         ".cargo/config.toml" => Some(ProjectFileId::CargoConfig),
         ".gitignore" => Some(ProjectFileId::GitIgnore),
+        "partitions.csv" => Some(ProjectFileId::PartitionsCsv),
         // NOT here on purpose: `mcu.config` is the Configurator's own state and
         // `rust-toolchain.toml` is derived from the target, so neither has an
         // editor view. Both are committed, so both DO show up in the Git tab -
@@ -1487,6 +1497,12 @@ pub struct AppIde {
     memory_x: String,
     build_rs: String,
     gitignore: String,
+    /// `partitions.csv`: the flash store's partition table (Configuration
+    /// tab), spliced inside `#` GENERATED markers - or a hand-written table
+    /// with no markers, which is left exactly as it is. Empty when there is
+    /// none. Unlike `memory_x` it can be the USER's, so an empty value never
+    /// deletes a file that is not ours (see `project_gen::write_project`).
+    partitions_csv: String,
     /// Cached project files to avoid repeated cloning
     cached_project_files: Option<ProjectFiles>,
     /// Active tab in the MCU configurator
@@ -2403,6 +2419,7 @@ impl AppIde {
             memory_x: init_files.memory_x,
             build_rs: init_files.build_rs,
             gitignore: init_files.gitignore,
+            partitions_csv: String::new(),
             cached_project_files: None,
             mcu,
             active_tab: McuTab::Pins,
@@ -2553,6 +2570,7 @@ impl AppIde {
                     persisted.paths_root_relative,
                 ),
                 config_graveyard: Vec::new(),
+                kept_config_files: Vec::new(),
             },
             new_src_name: None,
             new_src_folder_name: None,
@@ -3167,6 +3185,7 @@ impl AppIde {
                 && cached.memory_x == self.memory_x
                 && cached.build_rs == self.build_rs
                 && cached.gitignore == self.gitignore
+                && cached.partitions_csv == self.partitions_csv
                 && cached.blob_source == self.project_dir
             {
                 return cached.clone();
@@ -3181,6 +3200,7 @@ impl AppIde {
             memory_x: self.memory_x.clone(),
             build_rs: self.build_rs.clone(),
             gitignore: self.gitignore.clone(),
+            partitions_csv: self.partitions_csv.clone(),
             // Derived, never edited: it says which compiler the chip needs, and
             // that is not the user's to change per project.
             rust_toolchain: self
@@ -3294,6 +3314,7 @@ impl AppIde {
             self.memory_x.clear();
             self.build_rs.clear();
             self.gitignore.clear();
+            self.partitions_csv.clear();
             self.last_saved_deps = None;
             self.invalidate_project_files_cache();
             return;
@@ -3304,6 +3325,9 @@ impl AppIde {
         self.memory_x = f.memory_x;
         self.build_rs = f.build_rs;
         self.gitignore = f.gitignore;
+        // Not from the chip: the flash store decides it, and the next
+        // regeneration writes it back when the store is on.
+        self.partitions_csv.clear();
         // Baseline the deps so a New Project auto-builds on the first Save
         // after the user's config adds libraries (USART/SPI/embassy/…).
         self.last_saved_deps = Some(project_gen::deps_fingerprint(&self.cargo_toml));
@@ -3499,6 +3523,10 @@ impl AppIde {
         // number did not see. Ticking COMP1 wrote no `configs/comp1.rs` and
         // changed no line of main.rs.
         hash_debug(&mut hasher, &mcu.comp);
+
+        // The flash store, from the same tab: it decides a GEN line, a config
+        // file, five dependencies and the partition table.
+        hash_debug(&mut hasher, &mcu.flash_store);
 
         // Device groups. A group changes no binding and no init call - but it
         // does write `device_comment` into the generated main.rs, so renaming or
@@ -3888,6 +3916,15 @@ impl AppIde {
                 .unwrap_or_default();
             let new_toml =
                 project_gen::ensure_rtic_deps(&new_toml, is_rtic, &rtic_target, &sources);
+            // The flash store (Configuration tab): needed exactly when its file
+            // is generated - the decision the ESP harness makes too.
+            use crate::panels::mcu_module::codegen::flash_store_gen;
+            let new_toml = project_gen::ensure_flash_store_deps(
+                &new_toml,
+                flash_store_gen::in_files(&config_files),
+                &esp_chip,
+                &sources,
+            );
             // Strict-lints `[lints.clippy]` block (MCU System toggle).
             let strict = self.mcu.as_ref().is_some_and(|m| m.strict_lints);
             let new_toml = project_gen::ensure_strict_lints(&new_toml, strict);
@@ -3896,6 +3933,26 @@ impl AppIde {
             let new_toml = project_gen::ensure_debug_build(&new_toml, debug_build);
             if new_toml != self.cargo_toml {
                 self.cargo_toml = new_toml;
+                self.invalidate_project_files_cache();
+            }
+            // partitions.csv follows the flash store: the IDE's block while the
+            // store has a partition of its own, nothing of ours otherwise (a
+            // hand-written table is left as it is). The runner flag goes with it,
+            // so `cargo run` flashes the same table the Flash button does.
+            let rows = self.mcu.as_ref().and_then(|m| {
+                crate::panels::mcu_module::flash_store::table_rows(
+                    m.flash_store.as_ref(),
+                    &m.family,
+                )
+            });
+            let csv = project_gen::splice_partitions_csv(&self.partitions_csv, rows.as_deref());
+            let runner = project_gen::ensure_partition_table_runner(
+                &self.cargo_config,
+                !csv.trim().is_empty(),
+            );
+            if csv != self.partitions_csv || runner != self.cargo_config {
+                self.partitions_csv = csv;
+                self.cargo_config = runner;
                 self.invalidate_project_files_cache();
             }
             // On a Runtime / Init-API Apply the config templates change wholesale
@@ -3908,6 +3965,10 @@ impl AppIde {
                 .as_ref()
                 .map(|m| m.custom_keep_prefixes())
                 .unwrap_or_default();
+            // A flash store switched off keeps its file when the user wrote in
+            // it: the `Data` there is theirs.
+            self.project_tree.kept_config_files =
+                flash_store_gen::kept_paths(&config_files, &self.project_tree.user_src_files);
             // The editor names its file by index, which a prune shifts.
             let mut selected = match self.selected_file {
                 ProjectFileId::UserFile(i) => Some(i),
@@ -3930,6 +3991,24 @@ impl AppIde {
                     m.config_regen_forced = false;
                 }
             }
+        }
+        // A store in its own partition whose table was emptied by hand gets it
+        // back now, not at the next MCU change: an empty table flashes
+        // espflash's default, whose app partition runs over the store - and a
+        // Save would delete the file the runner flag still names. One `trim`
+        // per frame; `table_rows` is `None` at once with the store off.
+        if self.partitions_csv.trim().is_empty()
+            && let Some(rows) = self.mcu.as_ref().and_then(|m| {
+                crate::panels::mcu_module::flash_store::table_rows(
+                    m.flash_store.as_ref(),
+                    &m.family,
+                )
+            })
+        {
+            self.partitions_csv = project_gen::splice_partitions_csv("", Some(&rows));
+            self.cargo_config =
+                project_gen::ensure_partition_table_runner(&self.cargo_config, true);
+            self.invalidate_project_files_cache();
         }
         // Any regen rewrites main.rs / config files / deps in the RA workspace —
         // push back the settle baseline so the post-load restart waits for the
@@ -6617,6 +6696,30 @@ mod the_state_hash_is_the_codegen_inputs {
             h(&mcu),
             "and so does changing one of its fields"
         );
+    }
+
+    /// The flash store decides a GEN line, a config file, the crates and the
+    /// partition table: switching it, moving it or changing its mode must all
+    /// regenerate.
+    #[test]
+    fn the_flash_store_reaches_the_generated_project() {
+        use crate::panels::mcu_module::flash_store::{FlashStoreConfig, FlashStoreMode};
+        let mut mcu = chip("esp32c3");
+        let off = h(&mcu);
+        mcu.flash_store = Some(FlashStoreConfig::default_for("esp32c3"));
+        let on = h(&mcu);
+        assert_ne!(off, on, "switching it on regenerates");
+        if let Some(c) = &mut mcu.flash_store {
+            c.offset -= 0x1000;
+        }
+        assert_ne!(on, h(&mcu), "moving it regenerates");
+        if let Some(c) = &mut mcu.flash_store {
+            c.mode = FlashStoreMode::Nvs;
+        }
+        let nvs = h(&mcu);
+        mcu.flash_store = None;
+        assert_ne!(nvs, h(&mcu));
+        assert_eq!(off, h(&mcu), "and off again is where it started");
     }
 
     /// `keep_manual_clock` reads this on all three STM32 paths and it decides

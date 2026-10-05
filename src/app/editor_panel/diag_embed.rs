@@ -168,7 +168,9 @@ impl AppIde {
         let can_flash = self.selected_build_cfg().is_some();
         // A bitstream the FPGA would reject turns the Flash buttons red. Looked
         // at only while the Flash tab shows, and only on a board that loads one.
-        let fpga_block = (self.build_tab == BuildPanelTab::Dfu
+        // So does a partition table that is wrong (ESP only, string checks).
+        let flash_tab_open = self.build_tab == BuildPanelTab::Dfu && !self.diag_collapsed;
+        let flash_block = (self.build_tab == BuildPanelTab::Dfu
             && !self.diag_collapsed
             && self
                 .mcu
@@ -182,7 +184,12 @@ impl AppIde {
                 .err()
                 .map(crate::panels::mcu_module::fpga_bitstream::blocking_reason)
         })
-        .flatten();
+        .flatten()
+        .or_else(|| {
+            flash_tab_open
+                .then(|| self.partition_table_block())
+                .flatten()
+        });
         // Cargo-tab Build button (moved off the top toolbar on 2026-07-10).
         let mut build_go = false;
         // Cargo-tab Size button (Flash/RAM usage measurement).
@@ -400,7 +407,7 @@ impl AppIde {
                     &mut probe_flash_go,
                     &mut probe_flash_stop,
                     &missing_tools,
-                    fpga_block.as_deref(),
+                    flash_block.as_deref(),
                 );
             },
         );

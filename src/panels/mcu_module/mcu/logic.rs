@@ -162,6 +162,7 @@ impl Mcu {
             module_notes: std::collections::BTreeMap::new(),
             watchdog: Default::default(),
             comp: Default::default(),
+            flash_store: None,
         }
     }
 
@@ -1495,6 +1496,14 @@ impl Mcu {
             }
             s.push_str(&comp);
         }
+        // The flash store (`@flashstore`) — codegen input too.
+        let flash_store = mcu_config::flashstore_section(self.flash_store.as_ref());
+        if !flash_store.is_empty() {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&flash_store);
+        }
         // Diagram rotation (`@rotation`) — view preference, same append pattern.
         let rotation = mcu_config::rotation_section(self.rotated);
         if !rotation.is_empty() {
@@ -1700,6 +1709,7 @@ impl Mcu {
         self.groups = mcu_config::parse_groups(text);
         self.watchdog = mcu_config::parse_watchdog(text);
         self.comp = mcu_config::parse_comp(text);
+        self.flash_store = mcu_config::parse_flashstore(text);
         // Interrupt edges (`@irq`) — a missing section means every input is
         // polled, which is the pre-RTIC behaviour of every existing project.
         let irqs = mcu_config::parse_irq(text);

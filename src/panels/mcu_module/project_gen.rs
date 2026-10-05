@@ -47,6 +47,11 @@ pub struct ProjectFiles {
     pub memory_x: String, // empty for EspRust
     pub build_rs: String, // empty for EspRust
     pub gitignore: String,
+    /// `partitions.csv`, the flash store's ESP-IDF partition table, or empty
+    /// when the project has none. Unlike `memory_x` an empty value does not
+    /// mean "delete the file": a hand-written table is the user's. See
+    /// [`splice_partitions_csv`] and `write_project`.
+    pub partitions_csv: String,
     /// `rust-toolchain.toml`, or empty when the default toolchain will do.
     ///
     /// Written only for Xtensa ESP32s. It is how the whole IDE builds them
@@ -177,6 +182,107 @@ fn splice_block(existing: &str, style: Cmt, body: &str) -> String {
         // written `[package]`/MEMORY/etc.
         existing.to_owned()
     }
+}
+
+/// The project's `partitions.csv` refreshed for the flash store.
+///
+/// `rows` is the store's table (`FlashStoreConfig::partition_rows`), or `None`
+/// when the store needs no table of its own - off, or on the default `nvs`
+/// partition. Then the file goes when nothing of the user's is in it. When
+/// the user added rows of their own, only the store's row goes: their rows
+/// were laid out beside the IDE's `nvs`/`phy_init`/`factory`, and a table
+/// with no app partition cannot be flashed. A table with no markers is a
+/// hand-written one and is never touched, in either direction - that
+/// includes a table the user wrote before switching the store on, which the
+/// card then checks instead.
+///
+/// `#` markers, the em dash included, parse in espflash 4.x (measured). A
+/// comment trailing a row does NOT, so nothing here ever appends one.
+pub fn splice_partitions_csv(existing: &str, rows: Option<&str>) -> String {
+    let (begin, end) = (Cmt::Hash.begin(), Cmt::Hash.end());
+    let ours = existing.contains(begin) && existing.contains(end);
+    match rows {
+        Some(rows) => splice_block(existing, Cmt::Hash, rows),
+        None if !ours => existing.to_owned(),
+        None => {
+            let (Some(b), Some(e)) = (existing.find(begin), existing.find(end)) else {
+                return existing.to_owned();
+            };
+            if b > e {
+                return existing.to_owned();
+            }
+            let rest = format!("{}{}", &existing[..b], &existing[e + end.len()..]);
+            let theirs = rest.lines().any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            });
+            if !theirs {
+                return String::new();
+            }
+            let store_row = format!("{},", crate::panels::mcu_module::flash_store::LABEL);
+            let kept: String = existing[b + begin.len()..e]
+                .trim_start_matches('\n')
+                .lines()
+                .filter(|l| !l.trim_start().starts_with(&store_row))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            splice_block(existing, Cmt::Hash, &kept)
+        }
+    }
+}
+
+/// Does the project's `partitions.csv` carry the IDE's block? Only such a file
+/// may be deleted by the IDE.
+pub fn partitions_csv_is_ours(text: &str) -> bool {
+    text.contains(Cmt::Hash.begin())
+}
+
+/// `--partition-table partitions.csv` on the `.cargo/config.toml` runner, on
+/// or off - so `cargo run` outside the IDE flashes the same table the IDE's
+/// own Flash does. Only the `runner = "espflash flash …"` line INSIDE the
+/// IDE's block is touched, and only by this exact flag: a hand-written
+/// config.toml (no markers) carries the user's own runner. Idempotent.
+pub fn ensure_partition_table_runner(cargo_config: &str, enabled: bool) -> String {
+    const FLAG: &str = " --partition-table partitions.csv";
+    let (begin, end) = (Cmt::Hash.begin(), Cmt::Hash.end());
+    let (Some(b), Some(e)) = (cargo_config.find(begin), cargo_config.find(end)) else {
+        return cargo_config.to_owned();
+    };
+    if b > e {
+        return cargo_config.to_owned();
+    }
+    let block = &cargo_config[b..e];
+    let mut changed = false;
+    let lines: Vec<String> = block
+        .split('\n')
+        .map(|l| {
+            let t = l.trim_start();
+            if !(t.starts_with("runner") && t.contains("\"espflash flash")) {
+                return l.to_owned();
+            }
+            let has = l.contains(FLAG);
+            if enabled && !has {
+                // Inside the quotes, at the end of the command.
+                if let Some(q) = l.rfind('"') {
+                    changed = true;
+                    return format!("{}{FLAG}{}", &l[..q], &l[q..]);
+                }
+            } else if !enabled && has {
+                changed = true;
+                return l.replacen(FLAG, "", 1);
+            }
+            l.to_owned()
+        })
+        .collect();
+    if !changed {
+        return cargo_config.to_owned();
+    }
+    format!(
+        "{}{}{}",
+        &cargo_config[..b],
+        lines.join("\n"),
+        &cargo_config[e..]
+    )
 }
 
 /// The five generated project files that live at the project root (outside
@@ -557,6 +663,54 @@ pub fn ensure_esp_usb_deps(cargo_toml: &str, needs_otg: bool, sources: &[&str]) 
         "usbd-serial = \"0.2\"",
         sources,
     )
+}
+
+/// The crates the Configuration tab's flash store compiles against, added or
+/// removed as one set (`needs` = its `pins/configs/flash_store.rs` is
+/// generated; see `flash_store_gen::in_files`).
+///
+/// Versions are the esp-hal ~1.1 generation, compiled together on an
+/// ESP32-C3: esp-storage 0.10 already wants esp-hal 1.2 and makes its
+/// embedded-storage impls opt-in, so it must not be picked up here.
+/// `embassy-futures` is for `block_on` on the blocking runtimes - free, since
+/// embassy-embedded-hal depends on it anyway. `esp-bootloader-esp-idf`, which
+/// `verify` reads the partition table with, is in every ESP template already.
+///
+/// A `serde` line the user wrote WITHOUT `derive` is kept as it is
+/// (`ensure_dep` never rewrites a present line), and the template's derive
+/// then fails to compile - the user's line wins over a guess.
+pub fn ensure_flash_store_deps(
+    cargo_toml: &str,
+    needs: bool,
+    chip: &str,
+    sources: &[&str],
+) -> String {
+    let lines = [
+        (
+            "esp-storage",
+            format!("esp-storage = {{ version = \"0.9\", features = [\"{chip}\"] }}"),
+        ),
+        (
+            "sequential-storage",
+            "sequential-storage = { version = \"8\", features = [\"postcard\"] }".to_owned(),
+        ),
+        (
+            "embassy-embedded-hal",
+            "embassy-embedded-hal = \"0.6\"".to_owned(),
+        ),
+        ("embedded-storage", "embedded-storage = \"0.3\"".to_owned()),
+        (
+            "serde",
+            "serde = { version = \"1\", default-features = false, features = [\"derive\"] }"
+                .to_owned(),
+        ),
+        ("embassy-futures", "embassy-futures = \"0.1\"".to_owned()),
+    ];
+    let mut s = cargo_toml.to_owned();
+    for (name, line) in lines {
+        s = ensure_dep(&s, name, needs, &line, sources);
+    }
+    s
 }
 
 /// Add or remove `embassy-usb`, the stack embassy-nrf's USB driver runs
@@ -1673,6 +1827,9 @@ pub fn build_project_files(
         // cannot.
         rust_toolchain: rust_toolchain_for(&config.target),
         gitignore: gen_config(ConfigFile::GitIgnore, config, toolchain),
+        // Not from the chip but from the flash store, which the app splices
+        // in (`splice_partitions_csv`).
+        partitions_csv: String::new(),
         blob_source: None,
     }
 }
@@ -1964,6 +2121,22 @@ pub fn write_project(
     } else {
         write_if_changed(&dest.join("memory.x"), files.memory_x.as_bytes())?;
         write_if_changed(&dest.join("build.rs"), files.build_rs.as_bytes())?;
+    }
+
+    // partitions.csv - the flash store's table. NOT the memory.x pattern: an
+    // empty value deletes only a file that is the IDE's (it carries the block),
+    // or any copy in the shared build workspace, where a table left by another
+    // project would otherwise be flashed onto this one's board. A hand-written
+    // table in the user's project is theirs.
+    let csv_path = dest.join("partitions.csv");
+    if files.partitions_csv.trim().is_empty() {
+        let ours = dest == build_workspace_dir()
+            || fs::read_to_string(&csv_path).is_ok_and(|t| partitions_csv_is_ours(&t));
+        if ours {
+            let _ = fs::remove_file(&csv_path);
+        }
+    } else {
+        write_if_changed(&csv_path, files.partitions_csv.as_bytes())?;
     }
 
     // User source files — root-relative, so this also writes the sources of
@@ -4468,5 +4641,121 @@ mod owned_crate_dir_tests {
             "another project's leftover"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod flash_store_file_tests {
+    use super::*;
+
+    const ROWS: &str =
+        "nvs, data, nvs, 0x9000, 0x6000\nflash_store, data, undefined, 0x3FC000, 0x4000\n";
+
+    /// The table is ours inside its block, gone with the store when nothing of
+    /// the user's is left, and a hand-written table is never touched.
+    #[test]
+    fn the_partition_table_follows_the_store_and_spares_a_hand_written_one() {
+        let fresh = splice_partitions_csv("", Some(ROWS));
+        assert!(partitions_csv_is_ours(&fresh), "{fresh}");
+        assert!(fresh.contains(ROWS), "{fresh}");
+        // Refreshed in place, idempotent.
+        assert_eq!(splice_partitions_csv(&fresh, Some(ROWS)), fresh);
+        let moved = splice_partitions_csv(&fresh, Some(&ROWS.replace("0x3FC000", "0x3F0000")));
+        assert!(
+            moved.contains("0x3F0000") && !moved.contains("0x3FC000"),
+            "{moved}"
+        );
+        // Off: the file empties - nothing of the user's was in it.
+        assert_eq!(splice_partitions_csv(&fresh, None), "");
+        // A row the user added below the block survives the store going off -
+        // and so do the IDE's app and nvs rows it was laid out beside; only
+        // the store's row goes.
+        let with_mine = format!("{fresh}mine, data, fat, 0x200000, 0x10000\n");
+        let left = splice_partitions_csv(&with_mine, None);
+        assert!(
+            left.contains("mine, data, fat, 0x200000, 0x10000"),
+            "{left}"
+        );
+        assert!(left.contains("nvs, data, nvs, 0x9000, 0x6000"), "{left}");
+        assert!(!left.contains("flash_store,"), "{left}");
+        assert_eq!(splice_partitions_csv(&left, None), left, "idempotent");
+        // On again, the store's row is back in the block.
+        assert!(splice_partitions_csv(&left, Some(ROWS)).contains("flash_store,"));
+        // A table with no markers is the user's, on or off.
+        let theirs = "nvs, data, nvs, 0x9000, 0x6000\ncfg, data, 0x99, 0x3F0000, 0x4000\n";
+        assert_eq!(splice_partitions_csv(theirs, Some(ROWS)), theirs);
+        assert_eq!(splice_partitions_csv(theirs, None), theirs);
+        assert!(!partitions_csv_is_ours(theirs));
+    }
+
+    /// The runner flag is added and removed inside the IDE's block only, and
+    /// a hand-written config.toml - the example project's - is left alone.
+    #[test]
+    fn the_runner_flag_follows_the_table_inside_the_ide_block_only() {
+        let begin = Cmt::Hash.begin();
+        let end = Cmt::Hash.end();
+        let cfg = format!(
+            "{begin}\n[target.riscv32imc-unknown-none-elf]\nrunner = \"espflash flash --monitor --chip esp32c3\"\n{end}\n"
+        );
+        let on = ensure_partition_table_runner(&cfg, true);
+        assert!(
+            on.contains("runner = \"espflash flash --monitor --chip esp32c3 --partition-table partitions.csv\""),
+            "{on}"
+        );
+        assert_eq!(ensure_partition_table_runner(&on, true), on, "idempotent");
+        assert_eq!(ensure_partition_table_runner(&on, false), cfg);
+        let theirs = "runner = \"espflash flash --monitor --partition-table partitions.csv\"\n";
+        assert_eq!(ensure_partition_table_runner(theirs, false), theirs);
+        assert_eq!(ensure_partition_table_runner(theirs, true), theirs);
+    }
+
+    #[test]
+    fn the_store_crates_come_and_go_as_one_set() {
+        let toml = "[package]\nname = \"x\"\n\n[dependencies]\nesp-hal = \"1\"\n";
+        let on = ensure_flash_store_deps(toml, true, "esp32c3", &[]);
+        for c in [
+            "esp-storage = { version = \"0.9\", features = [\"esp32c3\"] }",
+            "sequential-storage = { version = \"8\", features = [\"postcard\"] }",
+            "embassy-embedded-hal = \"0.6\"",
+            "embedded-storage = \"0.3\"",
+            "serde = { version = \"1\", default-features = false, features = [\"derive\"] }",
+            "embassy-futures = \"0.1\"",
+        ] {
+            assert!(on.contains(c), "{c}\n{on}");
+        }
+        assert_eq!(ensure_flash_store_deps(&on, true, "esp32c3", &[]), on);
+        assert_eq!(ensure_flash_store_deps(&on, false, "esp32c3", &[]), toml);
+        // A serde line of the user's own stays, on or off.
+        let mine = format!("{toml}serde = \"1\"\n");
+        let both = ensure_flash_store_deps(&mine, true, "esp32c3", &[]);
+        assert_eq!(both.matches("serde =").count(), 1, "{both}");
+        assert!(ensure_flash_store_deps(&both, false, "esp32c3", &[]).contains("serde = \"1\""));
+    }
+
+    /// An empty table deletes the IDE's own file and any copy in the shared
+    /// build workspace - never a hand-written table in the user's project.
+    #[test]
+    fn write_project_deletes_only_a_partition_table_that_is_ours() {
+        let root = std::env::temp_dir().join(format!("eide_pt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let files = ProjectFiles {
+            main_rs: "fn main() {}".into(),
+            cargo_toml: "[package]".into(),
+            partitions_csv: splice_partitions_csv("", Some(ROWS)),
+            ..Default::default()
+        };
+        write_project(&root, &files, &[], "", "").expect("write");
+        let csv = root.join("partitions.csv");
+        assert!(csv.is_file());
+        let off = ProjectFiles {
+            partitions_csv: String::new(),
+            ..files.clone()
+        };
+        write_project(&root, &off, &[], "", "").expect("write");
+        assert!(!csv.exists(), "ours goes with the store");
+        fs::write(&csv, "nvs, data, nvs, 0x9000, 0x6000\n").unwrap();
+        write_project(&root, &off, &[], "", "").expect("write");
+        assert!(csv.is_file(), "a hand-written table stays");
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -476,6 +476,12 @@ pub struct Mcu {
     /// `mcu.config` `@comp`; feeds `calculate_mcu_state_hash` because it is
     /// codegen input.
     pub comp: crate::panels::mcu_module::comparator::CompSettings,
+    /// The flash store from the Configuration tab: `Some` while it is switched
+    /// on. Pin-less like the watchdogs. Persisted in `mcu.config`
+    /// `@flashstore`; feeds `calculate_mcu_state_hash` because it is codegen
+    /// input - main.rs, a config file, Cargo.toml and partitions.csv all follow
+    /// it. See [`crate::panels::mcu_module::flash_store`].
+    pub flash_store: Option<crate::panels::mcu_module::flash_store::FlashStoreConfig>,
 }
 
 /// One Virtual-module undo snapshot (see [`Mcu::module_undo`]): the modules and

@@ -19,6 +19,12 @@ pub struct ProjectTreeState {
     /// with what the user wrote in it, not as a fresh template. Memory only: a
     /// new or opened project starts empty.
     pub config_graveyard: Vec<(String, String)>,
+    /// `pins/configs/` paths the sync must leave on disk although nothing
+    /// generates them any more - set by the app before each sync. Today only
+    /// a flash store the user wrote in, switched off: its `Data` is theirs.
+    /// Not declared in `configs/mod.rs`, so it is never compiled, the same as
+    /// a Custom module's older revisions.
+    pub kept_config_files: Vec<String>,
 }
 
 /// What [`ProjectTreeState::sync_config_files`] did besides splicing - what
@@ -110,6 +116,7 @@ impl ProjectTreeState {
             user_src_files: Vec::new(),
             user_src_folders: Vec::new(),
             config_graveyard: Vec::new(),
+            kept_config_files: Vec::new(),
         }
     }
 
@@ -171,6 +178,7 @@ impl ProjectTreeState {
             user_src_files: files,
             user_src_folders: folders,
             config_graveyard: Vec::new(),
+            kept_config_files: Vec::new(),
         }
     }
 
@@ -480,12 +488,13 @@ impl ProjectTreeState {
         }
 
         // 5. Rebuild mod.rs (preserve custom code outside GENERATED section).
-        // Also declare `pub mod configs;` when per-peripheral init modules exist
-        // under `pins/configs/` (synced separately by `sync_config_files`).
+        // Also declare `pub mod configs;` when `sync_config_files` keeps a
+        // `configs/mod.rs` - not merely a file under `configs/`: a kept,
+        // undeclared one (a switched-off flash store) is there without it.
         let has_configs = self
             .user_src_files
             .iter()
-            .any(|(p, _)| p.starts_with("src/pins/configs/"));
+            .any(|(p, _)| p == "src/pins/configs/mod.rs");
         let mut generated_section: String = configured
             .iter()
             .map(|(slug, ..)| format!("pub mod {slug};\n"))
@@ -581,13 +590,27 @@ impl ProjectTreeState {
         const GEN_END: &str = "// <<< GENERATED END >>>";
         const UNDER: &str = "src/pins/configs/";
         let mut report = ConfigSync::default();
+        // Files nothing generates any more that stay anyway (see the field).
+        let kept = self.kept_config_files.clone();
 
         if files.is_empty() {
-            // No configured peripherals → drop the entire configs/ subtree.
-            let gone = self.take_files(|_, p| p.starts_with(UNDER), selected);
+            // No configured peripherals → drop the entire configs/ subtree,
+            // bar a kept file. Its folder stays registered while it is there;
+            // `configs/mod.rs` goes, so `pins/mod.rs` stops declaring
+            // `configs` and the kept file is not compiled.
+            let gone = self.take_files(
+                |_, p| p.starts_with(UNDER) && !kept.iter().any(|k| k == p),
+                selected,
+            );
             self.bury(gone, &mut report);
-            self.user_src_folders
-                .retain(|f| f != DIR && !f.starts_with(UNDER));
+            let files_now = &self.user_src_files;
+            self.user_src_folders.retain(|f| {
+                if f != DIR && !f.starts_with(UNDER) {
+                    return true;
+                }
+                let inside = format!("{f}/");
+                files_now.iter().any(|(p, _)| p.starts_with(&inside))
+            });
             return report;
         }
 
@@ -643,7 +666,8 @@ impl ProjectTreeState {
                 let stem = rest.trim_end_matches(".rs");
                 !(rest == "mod.rs"
                     || active.iter().any(|a| a == stem)
-                    || (!rest.contains('/') && is_custom_stem(stem)))
+                    || (!rest.contains('/') && is_custom_stem(stem))
+                    || kept.iter().any(|k| k == path))
             },
             selected,
         );
@@ -664,10 +688,14 @@ impl ProjectTreeState {
                 continue;
             }
             // A device file's template holds nothing a Runtime changes, and
-            // everything below its markers is the user's.
+            // everything below its markers is the user's. The flash store's
+            // likewise: one template serves every runtime, and its `Data` is
+            // the user's - a Runtime Apply must not wipe it.
             let is_device = name
                 .split_once('/')
                 .is_some_and(|(_, file)| codegen::parse_device_file_name(file).is_some());
+            let runtime_free =
+                is_device || name == crate::panels::mcu_module::codegen::flash_store_gen::FILE;
             // Generated again after being pruned this session: back with the
             // user's code, and spliced (or forced) below like any file. Not a
             // device file: step 3 already chose ITS old content by device,
@@ -683,7 +711,7 @@ impl ProjectTreeState {
                 .iter_mut()
                 .find(|(p, _)| p == &file_path)
             {
-                if force && !is_device {
+                if force && !runtime_free {
                     // Template swapped (runtime / api style) → replace the whole
                     // file; the editable region carries the init that must change.
                     if *content != *body {
@@ -1672,9 +1700,21 @@ mod tests {
             "nothing to declare yet"
         );
 
+        // A file under configs/ with no configs/mod.rs (a kept, undeclared
+        // flash store) is not a module to declare: E0583 otherwise.
         state.user_src_files.push((
             "src/pins/configs/usart1.rs".to_string(),
             "pub fn init() {}".to_string(),
+        ));
+        state.sync_pin_files(&[]);
+        assert!(
+            !mod_of(&state).contains("pub mod configs;"),
+            "no configs/mod.rs -> not declared:\n{}",
+            mod_of(&state)
+        );
+        state.user_src_files.push((
+            "src/pins/configs/mod.rs".to_string(),
+            "pub mod usart1;".to_string(),
         ));
         state.sync_pin_files(&[]);
         assert!(
@@ -2655,5 +2695,89 @@ mod tests {
             match_devices(&[&grave], &[sig("same", 2, "", 0, Some(3))]),
             vec![(0, 0)]
         );
+    }
+}
+
+#[cfg(test)]
+mod flash_store_sync_tests {
+    use super::*;
+    use crate::panels::mcu_module::codegen::flash_store_gen as store_gen;
+    use crate::panels::mcu_module::flash_store::FlashStoreConfig;
+
+    fn store_files() -> Vec<(String, String)> {
+        store_gen::config_files(Some(&FlashStoreConfig::default_for("esp32c3")), "esp32c3")
+    }
+
+    fn content<'a>(tree: &'a ProjectTreeState, path: &str) -> Option<&'a str> {
+        tree.user_src_files
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, c)| c.as_str())
+    }
+
+    /// Switched off, the store's file goes when untouched, and stays - out of
+    /// `configs/mod.rs`, so never compiled - when the user wrote in it.
+    #[test]
+    fn an_edited_store_file_outlives_the_toggle_and_a_pristine_one_does_not() {
+        let path = store_gen::tree_path();
+        let mut tree = ProjectTreeState::new();
+        tree.sync_config_files(&store_files(), false, &[], &mut None);
+        assert!(content(&tree, &path).is_some());
+
+        // Off, untouched: pruned like any config file.
+        tree.kept_config_files = store_gen::kept_paths(&[], &tree.user_src_files);
+        tree.sync_config_files(&[], false, &[], &mut None);
+        assert!(content(&tree, &path).is_none());
+
+        // On again, the user's own field, then off: it stays, undeclared.
+        tree.sync_config_files(&store_files(), false, &[], &mut None);
+        for (p, c) in &mut tree.user_src_files {
+            if *p == path {
+                *c = c.replace("pub counter: u32,", "pub counter: u32,\n    pub level: u8,");
+            }
+        }
+        tree.kept_config_files = store_gen::kept_paths(&[], &tree.user_src_files);
+        tree.sync_config_files(&[], false, &[], &mut None);
+        assert!(content(&tree, &path).is_some_and(|c| c.contains("pub level: u8,")));
+        assert!(content(&tree, "src/pins/configs/mod.rs").is_none());
+        // ...and `pins/mod.rs` must not declare a `configs` with no mod.rs
+        // (E0583), although a file is still under it.
+        tree.sync_pin_files(&[]);
+        let pins = content(&tree, "src/pins/mod.rs").expect("pins/mod.rs");
+        assert!(!pins.contains("pub mod configs;"), "{pins}");
+
+        // Beside another config file it still stays, and still undeclared.
+        let other = vec![(
+            "rwdt.rs".to_owned(),
+            "// <<< GENERATED>>>\npub const X: u32 = 1;\n// <<< GENERATED END >>>\n".to_owned(),
+        )];
+        tree.kept_config_files = store_gen::kept_paths(&other, &tree.user_src_files);
+        tree.sync_config_files(&other, false, &[], &mut None);
+        assert!(content(&tree, &path).is_some());
+        let m = content(&tree, "src/pins/configs/mod.rs").expect("mod.rs");
+        assert!(
+            m.contains("pub mod rwdt;") && !m.contains("flash_store"),
+            "{m}"
+        );
+        tree.sync_pin_files(&[]);
+        let pins = content(&tree, "src/pins/mod.rs").expect("pins/mod.rs");
+        assert!(pins.contains("pub mod configs;"), "{pins}");
+    }
+
+    /// A Runtime Apply rewrites config files whole - but not this one: one
+    /// template serves every runtime, and the user's `Data` is below its
+    /// markers.
+    #[test]
+    fn a_forced_rewrite_spares_the_store_file() {
+        let path = store_gen::tree_path();
+        let mut tree = ProjectTreeState::new();
+        tree.sync_config_files(&store_files(), false, &[], &mut None);
+        for (p, c) in &mut tree.user_src_files {
+            if *p == path {
+                c.push_str("\n// MINE\n");
+            }
+        }
+        tree.sync_config_files(&store_files(), true, &[], &mut None);
+        assert!(content(&tree, &path).is_some_and(|c| c.contains("// MINE")));
     }
 }

@@ -364,11 +364,23 @@ fn esp_fresh_main_rs(mcu: &Mcu, runtime: EspRuntime) -> String {
         // NOT `watchdog_and_custom_inits()`, which the STM32 backends use: on
         // an ESP the two land in different places in `main`, so they travel as
         // two arguments.
-        &super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family, mcu.runtime),
+        &esp_tab_inits(mcu),
         // On an ESP the family key IS the chip - `esp32h2`, not a series.
         &mcu.family,
         runtime,
         mcu.dma.as_ref(),
+    )
+}
+
+/// The Configuration tab's `main.rs` lines on an ESP: the watchdogs, then the
+/// flash store. One slot, because both belong right after the scheduler
+/// start, ahead of every peripheral - a store read at boot may decide how the
+/// rest is set up.
+fn esp_tab_inits(mcu: &Mcu) -> String {
+    format!(
+        "{}{}",
+        super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family, mcu.runtime),
+        super::flash_store_gen::init_lines(mcu.flash_store.as_ref(), &mcu.family),
     )
 }
 
@@ -377,9 +389,14 @@ fn esp_fresh_main_rs(mcu: &Mcu, runtime: EspRuntime) -> String {
 /// blocking esp-hal drivers on either runtime (esp-rtos does not change how a
 /// `Uart` is built), so Async gets exactly the same files.
 fn esp_config_files(mcu: &Mcu, runtime: EspRuntime) -> Vec<(String, String)> {
-    // The watchdogs come from a TAB, not from the Pins canvas, so they are
-    // collected here rather than threaded through the pin-driven builder.
+    // The watchdogs and the flash store come from a TAB, not from the Pins
+    // canvas, so they are collected here rather than threaded through the
+    // pin-driven builder.
     let mut out = super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family, mcu.runtime);
+    out.extend(super::flash_store_gen::config_files(
+        mcu.flash_store.as_ref(),
+        &mcu.family,
+    ));
     let all = pins_of(mcu);
     let configured: Vec<&Pin> = all
         .iter()
@@ -542,7 +559,7 @@ fn esp_update_main_rs(mcu: &Mcu, existing: &str, runtime: EspRuntime) -> String 
         // NOT `watchdog_and_custom_inits()`, which the STM32 backends use: on
         // an ESP the two land in different places in `main`, so they travel as
         // two arguments.
-        &super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family, mcu.runtime),
+        &esp_tab_inits(mcu),
         // On an ESP the family key IS the chip - `esp32h2`, not a series.
         &mcu.family,
         runtime,
@@ -2222,6 +2239,105 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A project with NO pin wired still calls what the Configuration tab
+    /// configured. The "select pins" default block used to take no inits at
+    /// all: a watchdog-only project got its config file and a main.rs that
+    /// never called it - and the flash store's `flash` would have vanished too.
+    #[test]
+    fn a_project_with_no_pins_still_inits_what_the_configuration_tab_set() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::flash_store::FlashStoreConfig;
+        use crate::panels::mcu_module::watchdog::{EspWdtConfig, IwdgConfig};
+        for rt in [Runtime::Blocking, Runtime::Async] {
+            let mut esp = builtin_for("esp32c3").expect("built-in C3").build_mcu();
+            esp.runtime = rt;
+            esp.pending_runtime = rt;
+            assert!(
+                esp.fresh_main_rs().contains("Select pins"),
+                "{rt:?}: nothing wired"
+            );
+            esp.watchdog.rwdt = Some(EspWdtConfig {
+                timeout_us: 2_000_000,
+            });
+            esp.flash_store = Some(FlashStoreConfig::default_for("esp32c3"));
+            let main = esp.fresh_main_rs();
+            assert!(
+                main.contains("pins::configs::rwdt::init(peripherals.LPWR)"),
+                "{rt:?}\n{main}"
+            );
+            assert!(
+                main.contains("esp_storage::FlashStorage::new(peripherals.FLASH)"),
+                "{rt:?}\n{main}"
+            );
+        }
+        let mut f1 = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        f1.watchdog.iwdg = Some(IwdgConfig {
+            timeout_us: 2_000_000,
+        });
+        let main = f1.fresh_main_rs();
+        assert!(main.contains("Select pins"), "nothing wired:\n{main}");
+        assert!(
+            main.contains("pins::configs::iwdg::init(dp.IWDG)"),
+            "{main}"
+        );
+    }
+
+    /// The flash store, end to end on the model: on, it writes the config
+    /// file, the GEN lines and the line at the head of an untouched tail; off,
+    /// all three go. A tail the user wrote in is never touched, and a Runtime
+    /// switch still swaps the loop seed under the store line.
+    #[test]
+    fn the_flash_store_follows_its_toggle_through_main_and_the_config_files() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::codegen::flash_store_gen::{FILE, TAIL_SEED};
+        use crate::panels::mcu_module::flash_store::FlashStoreConfig;
+        let mut mcu = builtin_for("esp32c3").expect("built-in C3").build_mcu();
+        let off = mcu.fresh_main_rs();
+        mcu.flash_store = Some(FlashStoreConfig::default_for("esp32c3"));
+        let on = mcu.update_main_rs(&off);
+        assert!(on.contains(TAIL_SEED), "{on}");
+        assert!(
+            on.contains("use crate::pins::configs::flash_store;"),
+            "{on}"
+        );
+        assert_eq!(
+            on,
+            mcu.fresh_main_rs(),
+            "a switched file equals a fresh one"
+        );
+        assert!(mcu.config_files().iter().any(|(n, _)| n == FILE));
+
+        // Async and back, with the line in place: the seed under it follows.
+        mcu.runtime = Runtime::Async;
+        let on_async = mcu.update_main_rs(&on);
+        assert_eq!(on_async, mcu.fresh_main_rs(), "{on_async}");
+        mcu.runtime = Runtime::Blocking;
+        assert_eq!(mcu.update_main_rs(&on_async), on);
+
+        // Off again: the line, the GEN lines and the file go.
+        mcu.flash_store = None;
+        assert_eq!(mcu.update_main_rs(&on), off);
+        assert!(!mcu.config_files().iter().any(|(n, _)| n == FILE));
+
+        // A loop the user wrote in gets no seed - the card shows the line.
+        mcu.flash_store = Some(FlashStoreConfig::default_for("esp32c3"));
+        let mine = off.replace("// Your main loop code here.", "led.toggle();");
+        let kept = mcu.update_main_rs(&mine);
+        assert!(!kept.contains(TAIL_SEED), "{kept}");
+        assert!(
+            kept.contains("FlashStorage::new(peripherals.FLASH)"),
+            "{kept}"
+        );
+
+        // Not generated on a chip it is not supported on, even when set.
+        let mut c6 = builtin_for("esp32c6").expect("built-in C6").build_mcu();
+        c6.flash_store = Some(FlashStoreConfig::default_for("esp32c6"));
+        assert!(!c6.fresh_main_rs().contains("FlashStorage"));
+        assert!(!c6.config_files().iter().any(|(n, _)| n == FILE));
     }
 
     /// RTIC -> X -> RTIC hands back the RTIC tail it started with: leaving

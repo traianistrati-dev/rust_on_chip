@@ -1934,6 +1934,12 @@ mod emit_for_manual_compile {
                 channel: *ch,
             });
         }
+        // `EIDE_ESP_NOPINS=1` wires nothing at all: the path where main.rs's GEN
+        // block is the "select pins" default, which once dropped the watchdog
+        // inits - and would have dropped the flash store's `flash` with them.
+        if std::env::var("EIDE_ESP_NOPINS").as_deref() == Ok("1") {
+            want.clear();
+        }
         let mut taken: Vec<usize> = Vec::new();
         for func in want {
             let pick = mcu
@@ -2035,7 +2041,50 @@ mod emit_for_manual_compile {
             });
         }
 
-        let main_rs = mcu.fresh_main_rs();
+        // `EIDE_ESP_FLASHSTORE=partition|nvs` switches the Configuration tab's
+        // flash store on: the only place its template, the GEN lines and the
+        // seeded tail line meet a real esp-hal, esp-storage and sequential-storage.
+        let store = std::env::var("EIDE_ESP_FLASHSTORE").ok();
+        if let Some(mode) = &store {
+            use crate::panels::mcu_module::flash_store::{FlashStoreConfig, FlashStoreMode};
+            let mut c = FlashStoreConfig::default_for(&chip);
+            if mode == "nvs" {
+                c.mode = FlashStoreMode::Nvs;
+            }
+            mcu.flash_store = Some(c);
+        }
+
+        let mut main_rs = mcu.fresh_main_rs();
+        if store.is_some() {
+            assert!(
+                main_rs
+                    .contains("let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);"),
+                "no flash in main.rs:\n{main_rs}"
+            );
+            assert!(
+                main_rs.contains("let mut flash_store = flash_store::ConfigStore::new(flash);"),
+                "the store line was not seeded:\n{main_rs}"
+            );
+            // Use everything the template offers, as a user would: the check
+            // before the store takes the flash, then a load and a save in the
+            // loop - async or blocking, as the runtime is.
+            let seed = crate::panels::mcu_module::codegen::flash_store_gen::TAIL_SEED;
+            main_rs = main_rs.replacen(
+                seed,
+                &format!("    flash_store::verify(&mut flash).ok();\n{seed}"),
+                1,
+            );
+            let body = if mcu.runtime == Runtime::Async {
+                "let mut d = flash_store.load().await;\n        d.counter += 1;\n        flash_store.save(&d).await.ok();\n"
+            } else {
+                "let mut d = flash_store.load_blocking();\n        d.counter += 1;\n        flash_store.save_blocking(&d).ok();\n"
+            };
+            main_rs = main_rs.replacen(
+                "        // Your main loop code here.\n",
+                &format!("        // Your main loop code here.\n        {body}"),
+                1,
+            );
+        }
         if wdg {
             assert!(
                 main_rs.contains("pins::configs::rwdt::init(peripherals.LPWR)"),
@@ -2074,6 +2123,23 @@ mod emit_for_manual_compile {
             false,
             false,
             &[],
+        );
+        // The flash store's crates and table, by the decisions the app makes
+        // (`flash_store_gen::in_files`, `flash_store::table_rows`).
+        files.cargo_toml = project_gen::ensure_flash_store_deps(
+            &files.cargo_toml,
+            crate::panels::mcu_module::codegen::flash_store_gen::in_files(&configs),
+            &esp.project.probe_chip,
+            &[],
+        );
+        files.partitions_csv = project_gen::splice_partitions_csv(
+            "",
+            crate::panels::mcu_module::flash_store::table_rows(mcu.flash_store.as_ref(), &chip)
+                .as_deref(),
+        );
+        files.cargo_config = project_gen::ensure_partition_table_runner(
+            &files.cargo_config,
+            !files.partitions_csv.is_empty(),
         );
         // The legacy single address, never edited into a list - what every
         // project from before device lists holds. It is device 1 all the same,

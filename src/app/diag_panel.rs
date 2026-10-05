@@ -179,9 +179,11 @@ pub(super) fn show_diag_panel(
     // one of them are greyed out with a "install it in Tools" hint. Empty while
     // the check hasn't proven a problem, so the UI stays permissive.
     missing_tools: &[&'static str],
-    // Why the firmware must not be flashed with the FPGA bitstream it would
-    // embed - see `fpga_bitstream::preflight`. `None` when nothing is wrong.
-    fpga_block: Option<&str>,
+    // Why the project must not be flashed as it stands: the FPGA bitstream it
+    // would embed (`fpga_bitstream::preflight`), or a partition table espflash
+    // would crash on or that does not reserve the flash store
+    // (`AppIde::partition_table_block`). `None` when nothing is wrong.
+    flash_block: Option<&str>,
 ) {
     // ── Tab header ────────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
@@ -745,7 +747,7 @@ pub(super) fn show_diag_panel(
                 serial.is_connected().then(|| serial.port.as_str()),
                 missing_tools,
                 holder,
-                fpga_block,
+                flash_block,
             );
         }
         BuildPanelTab::Rtt => {

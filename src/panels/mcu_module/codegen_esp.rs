@@ -628,7 +628,7 @@ fn make_gen_section(
         .collect();
 
     if configured.is_empty() {
-        return make_default_gen_section(clock, chip, runtime);
+        return make_default_gen_section(clock, chip, runtime, wdg_inits, custom_inits);
     }
 
     // ── Feature flags ────────────────────────────────────────────────────────
@@ -1143,14 +1143,33 @@ fn make_gen_section(
 
 // ── Default generated section (no pins configured yet) ────────────────────────
 
-fn make_default_gen_section(clock: &ClockConfig, chip: &str, runtime: EspRuntime) -> String {
+/// The GEN block of a project with no pin wired yet.
+///
+/// It still carries what does not come from a pin: the Configuration tab's
+/// inits (watchdogs, the flash store) and the Custom modules. Dropping them
+/// here was a real bug - a project with only a watchdog got `rwdt.rs` and a
+/// `main.rs` that never called it. Both slots are empty on a fresh chip, which
+/// keeps that output byte-identical to before.
+fn make_default_gen_section(
+    clock: &ClockConfig,
+    chip: &str,
+    runtime: EspRuntime,
+    wdg_inits: &str,
+    custom_inits: &str,
+) -> String {
+    let custom = if custom_inits.is_empty() {
+        String::new()
+    } else {
+        format!("\n    // ── Custom modules ──\n{custom_inits}")
+    };
     format!(
         "{GEN_BEGIN}\n\
          {use_block}\
          {entry}\
              let peripherals = {init};\n\
-         {start}\n\
+         {start}{wdg_inits}\n\
              // Select pins in the MCU Configurator to generate code here.\n\
+         {custom}\
          {GEN_END}\n",
         use_block = build_use_block(
             false, false, false, false, false, false, false, false, false, false, false, runtime,

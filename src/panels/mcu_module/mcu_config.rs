@@ -42,6 +42,7 @@ const GROUP_I2C_HEADER: &str = "@groupi2c";
 const I2C_POS_HEADER: &str = "@i2cpos";
 const WATCHDOG_HEADER: &str = "@watchdog";
 const COMP_HEADER: &str = "@comp";
+const FLASHSTORE_HEADER: &str = "@flashstore";
 const LABELS_HEADER: &str = "@labels";
 const PINS_HEADER: &str = "@pins";
 const NOTES_HEADER: &str = "@modulenotes";
@@ -268,6 +269,53 @@ pub fn parse_comp(text: &str) -> crate::panels::mcu_module::comparator::CompSett
         }
     }
     out
+}
+
+/// The `@flashstore` section - the Configuration tab's flash store, absent when
+/// it is off. One line: the mode, then the flash size, the store's size and its
+/// offset, in hex:
+///
+/// ```text
+/// @flashstore
+/// partition 0x400000 0x4000 0x3FC000
+/// ```
+///
+/// All four are written in either mode, so switching to `nvs` and back gives
+/// the partition its old place.
+pub fn flashstore_section(
+    cfg: Option<&crate::panels::mcu_module::flash_store::FlashStoreConfig>,
+) -> String {
+    match cfg {
+        None => String::new(),
+        Some(c) => format!(
+            "{FLASHSTORE_HEADER}\n{} 0x{:X} 0x{:X} 0x{:X}\n",
+            c.mode.token(),
+            c.flash_size,
+            c.size,
+            c.offset
+        ),
+    }
+}
+
+/// Read `@flashstore` back; `None` when it is absent OR malformed. A store the
+/// tab cannot show must not reach the firmware, and guessing a field would
+/// move it - the same rule as `@watchdog`.
+pub fn parse_flashstore(
+    text: &str,
+) -> Option<crate::panels::mcu_module::flash_store::FlashStoreConfig> {
+    use crate::panels::mcu_module::flash_store::{FlashStoreConfig, FlashStoreMode};
+    let body = section_body(text, FLASHSTORE_HEADER)?;
+    let f: Vec<&str> = body.split_whitespace().collect();
+    let [mode, flash_size, size, offset] = f.as_slice() else {
+        return None;
+    };
+    let hex = |s: &str| u32::from_str_radix(s.strip_prefix("0x")?, 16).ok();
+    Some(FlashStoreConfig {
+        mode: FlashStoreMode::from_token(mode)?,
+        flash_size: hex(flash_size)?,
+        size: hex(size)?,
+        offset: hex(offset)?,
+    })
 }
 
 /// The strict-lints preference recorded in `@strict`; missing / anything but
@@ -1388,6 +1436,43 @@ on
         assert!(c.is_some(), "clock unaffected by the extra sections");
         // And the migration reader still finds the positions in there.
         assert_eq!(structure_config::parse_layout(&text), pos);
+    }
+}
+
+#[cfg(test)]
+mod flashstore_section_tests {
+    use super::*;
+    use crate::panels::mcu_module::flash_store::{FlashStoreConfig, FlashStoreMode};
+
+    /// Both modes round-trip, and the partition's place survives a trip
+    /// through `nvs` because all four fields are always written.
+    #[test]
+    fn the_flash_store_round_trips_in_both_modes() {
+        let c = FlashStoreConfig::default_for("esp32c3");
+        let text = flashstore_section(Some(&c));
+        assert_eq!(text, "@flashstore\npartition 0x400000 0x4000 0x3FC000\n");
+        assert_eq!(parse_flashstore(&text), Some(c));
+        let nvs = FlashStoreConfig {
+            mode: FlashStoreMode::Nvs,
+            ..c
+        };
+        assert_eq!(parse_flashstore(&flashstore_section(Some(&nvs))), Some(nvs));
+        assert_eq!(flashstore_section(None), "");
+        assert_eq!(parse_flashstore(""), None);
+    }
+
+    /// A malformed line is dropped, never defaulted: a store the tab cannot
+    /// show must not reach the firmware.
+    #[test]
+    fn a_malformed_flash_store_line_is_dropped() {
+        for bad in [
+            "@flashstore\npartition 0x400000 0x4000\n",
+            "@flashstore\nsomewhere 0x400000 0x4000 0x3FC000\n",
+            "@flashstore\npartition 4194304 0x4000 0x3FC000\n",
+            "@flashstore\npartition 0x400000 0x4000 0x3FC000 extra\n",
+        ] {
+            assert_eq!(parse_flashstore(bad), None, "{bad}");
+        }
     }
 }
 

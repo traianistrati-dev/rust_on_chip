@@ -235,16 +235,41 @@ impl AppIde {
         crate::flash_stop::request_stop(&self.esp_flash_child, &self.dfu_log, "espflash");
     }
 
+    /// Why the project's `partitions.csv` (or flash store) must not be
+    /// flashed, or `None` - `flash_store::flash_block`, asked by espflash, RTT
+    /// Run and Debug alike: all three pass the table on.
+    pub(crate) fn partition_table_block(&self) -> Option<String> {
+        let mcu = self.mcu.as_ref()?;
+        crate::panels::mcu_module::flash_store::flash_block(
+            &self.partitions_csv,
+            mcu.flash_store.as_ref(),
+            &mcu.family,
+        )
+    }
+
     /// Build `--release` and flash an ESP32 via espflash, over the selected
     /// programmer's serial port. No-op without a buildable chip config.
     pub(crate) fn flash_esp(&mut self) {
         let Some((project, _tc)) = self.selected_build_cfg() else {
             return;
         };
+        // A table espflash would crash on, or one that does not reserve the
+        // flash store, is refused here rather than flashed - the button is red
+        // already; this catches a file edited since the tab last looked.
+        if let Some(why) = self.partition_table_block() {
+            *self.espflash_state.lock().unwrap() = espflash::EspFlashState::Error(why.clone());
+            self.refuse_flash(why);
+            return;
+        }
+        let files = self.current_project_files();
+        // From THIS project's state, never from a file in the build workspace:
+        // that folder is shared by every project, and a table another one left
+        // there would be flashed onto this board.
+        let partition_table = !files.partitions_csv.trim().is_empty();
         let build_dir = crate::workspace::dir();
         if project_gen::write_project(
             &build_dir,
-            &self.current_project_files(),
+            &files,
             &self.project_tree.user_src_files,
             &self.mcu_config_text(),
             &self.structure_config_text(),
@@ -271,6 +296,7 @@ impl AppIde {
                 port,
                 Arc::clone(&self.espflash_used_port),
                 monitor_follows,
+                partition_table,
                 Arc::clone(&self.espflash_state),
                 Arc::clone(&self.dfu_log),
                 Arc::clone(&self.esp_flash_child),
@@ -597,6 +623,20 @@ impl AppIde {
         }
     }
 
+    /// What stops RTT Run and Debug from flashing, as (console line, phase
+    /// text): the FPGA bitstream, then the partition table probe-rs would be
+    /// handed (`--idf-partition-table`) - the same check the espflash path
+    /// makes.
+    fn flash_preflight(&self, files: &project_gen::ProjectFiles) -> Option<(String, String)> {
+        match fpga_bitstream::preflight(files) {
+            Err(why) => {
+                let phase = fpga_bitstream::refusal(&why);
+                Some((why, phase))
+            }
+            Ok(()) => self.partition_table_block().map(|why| (why.clone(), why)),
+        }
+    }
+
     /// Start an RTT session: write the project, then hand off to the
     /// [`crate::rtt::RttConsole`] pipeline (build --release → probe-rs
     /// run/attach). Fired from the RTT tab's buttons. No-op without a chip.
@@ -606,18 +646,17 @@ impl AppIde {
         };
         let files = self.current_project_files();
         // Run flashes the board; Attach only reads what already runs there.
-        if mode == crate::rtt::RttMode::Run {
-            if let Err(why) = fpga_bitstream::preflight(&files) {
-                self.build_tab = BuildPanelTab::Rtt;
-                self.rtt
-                    .state
-                    .lock()
-                    .unwrap()
-                    .push_plain(crate::terminal::LineKind::Notice, format!("[error] {why}"));
-                *self.rtt.phase.lock().unwrap() =
-                    crate::rtt::RttPhase::Error(fpga_bitstream::refusal(&why));
-                return;
-            }
+        if mode == crate::rtt::RttMode::Run
+            && let Some((why, phase)) = self.flash_preflight(&files)
+        {
+            self.build_tab = BuildPanelTab::Rtt;
+            self.rtt
+                .state
+                .lock()
+                .unwrap()
+                .push_plain(crate::terminal::LineKind::Notice, format!("[error] {why}"));
+            *self.rtt.phase.lock().unwrap() = crate::rtt::RttPhase::Error(phase);
+            return;
         }
         let build_dir = crate::workspace::dir();
         match project_gen::write_project(
@@ -653,15 +692,14 @@ impl AppIde {
             return;
         };
         let files = self.current_project_files();
-        if let Err(why) = fpga_bitstream::preflight(&files) {
+        if let Some((why, phase)) = self.flash_preflight(&files) {
             self.build_tab = BuildPanelTab::Debug;
             self.debugger
                 .console
                 .lock()
                 .unwrap()
                 .push_plain(crate::terminal::LineKind::Notice, format!("[error] {why}"));
-            self.debugger.state.lock().unwrap().phase =
-                crate::debugger::DebugPhase::Error(fpga_bitstream::refusal(&why));
+            self.debugger.state.lock().unwrap().phase = crate::debugger::DebugPhase::Error(phase);
             return;
         }
         let build_dir = crate::workspace::dir();
@@ -1354,6 +1392,9 @@ mod tests {
             "start_rtt",
             "start_debug",
         ];
+        // The paths that hand an ESP's partitions.csv on (espflash
+        // `--partition-table`, probe-rs `--idf-partition-table`, DAP).
+        const TABLE_CHECKS: [&str; 3] = ["flash_esp", "start_rtt", "start_debug"];
         // Measuring, profiling, sampling a running board, or an ESP (no FPGA).
         const EXEMPT: [&str; 4] = [
             "flash_esp",
@@ -1377,9 +1418,18 @@ mod tests {
             if seen.contains(&name) {
                 continue;
             }
+            // `flash_preflight` is the bitstream check plus the partition table.
+            let first = |a: &str, b: &str| match (body.find(a), body.find(b)) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (x, y) => x.or(y),
+            };
+            if TABLE_CHECKS.contains(&name.as_str()) {
+                let check = first("partition_table_block()", "self.flash_preflight(")
+                    .unwrap_or_else(|| panic!("{name} flashes without checking partitions.csv"));
+                assert!(check < write, "{name} checks the table only after writing");
+            }
             if CHECKS.contains(&name.as_str()) {
-                let check = body
-                    .find("fpga_bitstream::preflight(")
+                let check = first("fpga_bitstream::preflight(", "self.flash_preflight(")
                     .unwrap_or_else(|| panic!("{name} writes the project without the check"));
                 assert!(
                     check < write,

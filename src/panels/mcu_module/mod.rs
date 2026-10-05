@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod board_notes;
 pub mod builtins;
 pub mod chip_filter;
 pub mod chip_search;
@@ -11,6 +13,7 @@ pub mod datasheet_import;
 pub mod esp_clocks;
 pub mod esp_gen;
 pub mod esp_metadata;
+pub mod flash_store;
 pub mod fpga_bitstream;
 pub mod mcu;
 pub mod mcu_catalog;

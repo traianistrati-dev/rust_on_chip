@@ -321,6 +321,21 @@ watchdogs, configured as *durations* rather than as register fields, plus the
 which channels are taken and by whom — fed from the codegen itself, so it cannot
 drift from what is emitted.
 
+**Flash store** (ESP32-C3, both runtimes): settings kept in the chip's own
+flash. Switching it on writes `src/pins/configs/flash_store.rs` — a
+`ConfigStore` over `esp-storage` and `sequential-storage`, with `load` / `save`
+(and `_blocking` twins) and a `Data` struct of your own — hands it the flash as
+`flash` in the generated block, and seeds
+`let mut flash_store = flash_store::ConfigStore::new(flash);` into an untouched
+loop. The store lives either in a partition of its own, in a generated
+`partitions.csv` (shown in the project tree, and passed to espflash, RTT and the
+debugger, since a flash without it puts back espflash's default table, where
+the top of flash is inside the app partition), or in the default table's `nvs`
+partition, with no table at all. The card checks the table, and espflash, RTT
+Run and Debug all refuse to flash one that fails (espflash panics on a numeric
+custom subtype such as `0x99`, so the row is `data, undefined`);
+`flash_store::verify(&mut flash)` checks it on the chip.
+
 ### Virtual device modules
 Instead of wiring a peripheral pin by pin, you can drop a **device** onto the
 canvas and let the IDE do the wiring. Twenty-four kinds ship today:
@@ -417,8 +432,8 @@ compiler can tell you that text is a program. `scripts/verify-codegen.ps1` emits
 a matrix of configurations and cross-compiles each one:
 
 ```powershell
-pwsh scripts/verify-codegen.ps1             # representative subset (32 cases)
-pwsh scripts/verify-codegen.ps1 -Full       # every case (47), about 13 minutes warm
+pwsh scripts/verify-codegen.ps1             # representative subset (34 cases)
+pwsh scripts/verify-codegen.ps1 -Full       # every case (50), about 13 minutes warm
 pwsh scripts/verify-codegen.ps1 -Hook nrf   # every case of the named families
 ```
 

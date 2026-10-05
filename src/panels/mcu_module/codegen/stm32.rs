@@ -1094,7 +1094,7 @@ pub fn make_generated_section(
         gpio_native,
         custom_inits,
     ) else {
-        return make_default_gen_section(mcu_name, clock);
+        return make_default_gen_section(mcu_name, clock, custom_inits);
     };
     let GenParts {
         // `inline_handles` is an RTIC concern: `fn main` never returns here, so
@@ -1147,8 +1147,18 @@ pub fn make_generated_section(
 
 // ── Default generated section (no pins configured yet) ────────────────────────
 
-fn make_default_gen_section(mcu_name: &str, clock: &ClockConfig) -> String {
+/// The GEN block of a project with no pin wired yet - still carrying the
+/// watchdog and Custom-module inits (`custom_inits`), which come from no pin.
+/// Dropping them made a watchdog-only project call nothing it configured.
+/// Empty on a fresh chip, so that output is byte-identical to before.
+fn make_default_gen_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> String {
     let clock_chain = clock_setup_chain(clock);
+    // The same shape `gen_parts` gives these lines when pins are wired.
+    let custom = if custom_inits.is_empty() {
+        String::new()
+    } else {
+        format!("    // ── Custom modules ──\n{custom_inits}\n")
+    };
     format!(
         "{GEN_BEGIN}\n\
          // MCU: {mcu_name}\n\
@@ -1159,6 +1169,7 @@ fn make_default_gen_section(mcu_name: &str, clock: &ClockConfig) -> String {
              let mut flash = dp.FLASH.constrain();\n\
              let rcc = dp.RCC.constrain();\n\
              let clocks = {clock_chain};\n\n\
+         {custom}\
              // Select pins in the MCU Configurator to generate code here.\n\
          {GEN_END}\n"
     )

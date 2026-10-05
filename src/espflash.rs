@@ -95,6 +95,10 @@ pub fn start_flash(
     // is attached, so the first `println!` of `main` is not missed. `false`
     // keeps the standalone behaviour of resetting into the new firmware.
     monitor_follows: bool,
+    // The project has a `partitions.csv` (written into `project_dir` by
+    // `write_project`) - passed as `--partition-table`, or espflash writes its
+    // default table, in which the flash store sits inside the app partition.
+    partition_table: bool,
     state: Arc<Mutex<EspFlashState>>,
     log: Arc<Mutex<Vec<String>>>,
     // The child running right now - the build, then espflash - so the Stop
@@ -259,7 +263,7 @@ See the log for details."
         };
         // ONE list, spawned below and echoed here. They were two hand-kept
         // copies and had already drifted - see `flash_args`.
-        let args = flash_args(&chip, &port, after, &elf_path);
+        let args = flash_args(&chip, &port, after, partition_table, &elf_path);
         push_log(&log, &ctx, &format!("> espflash {}", args.join(" ")));
         if port.is_empty() {
             push_log(
@@ -575,7 +579,18 @@ pub fn read_board_info(
 ///
 /// An empty `port` passes no `--port` at all, which is how espflash is told to
 /// auto-detect.
-fn flash_args(chip: &str, port: &str, after: &str, elf: &std::path::Path) -> Vec<String> {
+///
+/// `partition_table` adds `--partition-table partitions.csv`, relative because
+/// espflash runs in the build workspace that holds it. Never `--erase-data-parts`:
+/// espflash erases only the sectors it writes, which is what keeps the flash
+/// store's data across a reflash.
+fn flash_args(
+    chip: &str,
+    port: &str,
+    after: &str,
+    partition_table: bool,
+    elf: &std::path::Path,
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["flash".into(), "--chip".into(), chip.into()];
     if !port.is_empty() {
         args.push("--port".into());
@@ -584,6 +599,10 @@ fn flash_args(chip: &str, port: &str, after: &str, elf: &std::path::Path) -> Vec
     args.push("--ignore-app-descriptor".into());
     args.push("--after".into());
     args.push(after.into());
+    if partition_table {
+        args.push("--partition-table".into());
+        args.push("partitions.csv".into());
+    }
     args.push(elf.display().to_string());
     args
 }
@@ -611,7 +630,7 @@ mod build_failure_tests {
         let elf = std::path::Path::new("target/x/release/esp32c3-project");
         let elf_s = elf.display().to_string();
 
-        let with_port = flash_args("esp32c3", "COM7", "hard-reset", elf);
+        let with_port = flash_args("esp32c3", "COM7", "hard-reset", false, elf);
         let want: Vec<String> = [
             "flash",
             "--chip",
@@ -630,18 +649,30 @@ mod build_failure_tests {
 
         // Both reset modes reach the list; the echo used to show neither.
         for after in ["hard-reset", "no-reset"] {
-            let a = flash_args("esp32", "COM3", after, elf);
+            let a = flash_args("esp32", "COM3", after, false, elf);
             assert!(a.contains(&"--after".to_owned()), "{a:?}");
             assert!(a.contains(&after.to_owned()), "{a:?}");
         }
 
         // Empty port = no --port at all, and the ELF path ends the list clean.
-        let auto = flash_args("esp32s3", "", "hard-reset", elf);
+        let auto = flash_args("esp32s3", "", "hard-reset", false, elf);
         assert!(
             !auto.iter().any(|a| a == "--port" || a == "auto"),
             "{auto:?}"
         );
         assert_eq!(auto.last().unwrap(), &elf_s);
+
+        // The flash store's table goes in just before the ELF, relative to the
+        // build workspace espflash runs in - and nothing erases data partitions.
+        let table = flash_args("esp32c3", "", "hard-reset", true, elf);
+        let at = table
+            .iter()
+            .position(|a| a == "--partition-table")
+            .expect("the flag");
+        assert_eq!(table[at + 1], "partitions.csv");
+        assert_eq!(table.last().unwrap(), &elf_s);
+        assert!(!table.iter().any(|a| a.starts_with("--erase")), "{table:?}");
+        assert!(!auto.iter().any(|a| a == "--partition-table"), "{auto:?}");
     }
 
     /// Every generated `main.rs` carries the ESP-IDF app descriptor.

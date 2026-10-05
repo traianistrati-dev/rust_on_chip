@@ -54,6 +54,7 @@ impl HistEntry {
                 ProjectFileId::MemoryX => "memory.x".into(),
                 ProjectFileId::BuildRs => "build.rs".into(),
                 ProjectFileId::GitIgnore => ".gitignore".into(),
+                ProjectFileId::PartitionsCsv => "partitions.csv".into(),
                 ProjectFileId::UserFile(_) => unreachable!("user files use HistEntry::User"),
             },
         }

@@ -292,6 +292,15 @@ $ALL_CASES = @(
     # which is not the channel number.
     @{ n = "ESP32-C3, two PWM channels";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_PWM = "0,2" }; q = $true; fam = "esp" }
 
+    # The Configuration tab's flash store: esp-storage + sequential-storage
+    # through the one template, on both runtimes (blocking wrappers vs async),
+    # with the harness using verify/load/save as a user would. The async row
+    # wires NO pin, the "select pins" default block that once dropped the
+    # tab's init lines. The nvs mode writes no partitions.csv: full only.
+    @{ n = "ESP32-C3 flash store";          t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_ESP_FLASHSTORE = "partition" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 flash store, no pins"; t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_FLASHSTORE = "partition"; EIDE_ESP_NOPINS = "1" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 flash store in nvs";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_ESP_FLASHSTORE = "nvs" }; q = $false; fam = "esp" }
+
     # The watchdogs on EVERY bundled Espressif part. The harness switches all
     # three on unless EIDE_ESP_WDG=0, so the six C3 rows above already build
     # them on both runtimes - including async, where the scheduler owns TIMG0.
@@ -459,7 +468,8 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
            "EIDE_F1_SWITCH", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
-           "EIDE_ESP_PULL", "EIDE_ESP_WDG")
+           "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
+           "EIDE_ESP_TASK_PRIO")
 
 # The hook passes its families as ONE comma-joined argument ("embassy,f1"), and
 # `powershell -File` binds that to [string[]] as a single element - it does not

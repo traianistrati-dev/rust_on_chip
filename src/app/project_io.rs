@@ -141,11 +141,13 @@ impl AppIde {
         // main.rs or no mcu.config must still clear the previous project's
         // notes rather than inherit them. `restore_module_notes` assigns.
         if let Some(mcu) = &mut self.mcu {
-            let cfg = std::fs::read_to_string(
-                root.join(crate::panels::mcu_module::mcu_config::FILE_NAME),
-            )
-            .ok();
+            use crate::panels::mcu_module::mcu_config;
+            let cfg = std::fs::read_to_string(root.join(mcu_config::FILE_NAME)).ok();
             mcu.restore_module_notes(cfg.as_deref());
+            // The flash store likewise: a same-chip open keeps the Mcu, and a
+            // default project has no mcu.config at all - it must not inherit
+            // the previous project's store and write its partitions.csv.
+            mcu.flash_store = cfg.as_deref().and_then(mcu_config::parse_flashstore);
         }
 
         // ── Restore pin state from mcu.config and src/main.rs ────────────────
@@ -252,6 +254,12 @@ impl AppIde {
             self.build_rs = load(ConfigFile::BuildRs, root.join("build.rs"));
             self.gitignore = load(ConfigFile::GitIgnore, root.join(".gitignore"));
         }
+        // partitions.csv as it is on disk - the IDE's block or a hand-written
+        // table. The next regeneration splices the block from the flash store
+        // (`splice_partitions_csv`), which never touches a marker-less table.
+        self.partitions_csv = std::fs::read_to_string(root.join("partitions.csv"))
+            .map(|t| t.replace("\r\n", "\n"))
+            .unwrap_or_default();
 
         // Remember it for "Open Recent" and for starting another window on it.
         // Here, at the END of the load: `selected_mcu_id` is settled by now, so
@@ -1336,6 +1344,9 @@ fn generated_files_snapshot(
         ("memory.x", files.memory_x),
         ("build.rs", files.build_rs),
         ("rust-toolchain.toml", files.rust_toolchain),
+        // NOT in `generated_files_that_must_be_absent`: an empty value removes
+        // only the IDE's own table, never a hand-written one.
+        ("partitions.csv", files.partitions_csv),
     ] {
         if !content.is_empty() {
             snap.push((rel.to_owned(), content));
@@ -2505,6 +2516,7 @@ mod git_snapshot_tests {
             memory_x: String::new(),
             build_rs: String::new(),
             rust_toolchain: "[toolchain]\nchannel = \"esp\"\n".into(),
+            partitions_csv: String::new(),
             blob_source: None,
         }
     }
@@ -2544,6 +2556,9 @@ mod git_snapshot_tests {
                     memory_x: String::new(),
                     build_rs: String::new(),
                     rust_toolchain: pin.clone(),
+                    // A flash store's table is committed and opens in the
+                    // editor, so it must never land in the blind set.
+                    partitions_csv: "x".into(),
                     blob_source: None,
                 });
             let mut blind: Vec<String> = files

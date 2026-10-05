@@ -87,9 +87,11 @@ pub fn show_dfu_tab(
     // and it is why `probe-rs list` can come back empty on a board that is
     // plugged in and working. See `tabs::no_probe_message`.
     holder: Option<(&str, &str)>,
-    // Why the FPGA bitstream the firmware embeds must not be flashed, if it
-    // must not. ESP has no FPGA, so only the SWD and probe-rs buttons read it.
-    fpga_block: Option<&str>,
+    // Why the project must not be flashed as it stands, if it must not: an
+    // FPGA bitstream the board would reject, or a partition table that is
+    // wrong. Each source only arises on its own boards (FPGA loaders, ESP), so
+    // every flash button can read the one value.
+    flash_block: Option<&str>,
 ) {
     let state = dfu_state.lock().unwrap().clone();
     let ocd_state = openocd_state.lock().unwrap().clone();
@@ -160,10 +162,10 @@ pub fn show_dfu_tab(
             .then(|| "no buildable chip configuration yet — set the MCU up first".to_owned())
     };
     let busy_note = || any_busy.then(|| "another flash is already running".to_owned());
-    let bad_bitstream = || fpga_block.map(str::to_owned);
+    let blocked = || flash_block.map(str::to_owned);
     let swd_reason: Option<String> = held("OpenOCD")
         .or_else(no_cfg)
-        .or_else(bad_bitstream)
+        .or_else(blocked)
         .or_else(busy_note)
         .or_else(|| {
             (!is_swd).then(|| {
@@ -174,12 +176,13 @@ pub fn show_dfu_tab(
     let esp_reason: Option<String> = super::tool_missing(missing_tools, "espflash")
         .then(|| super::needs_tool_hint("espflash"))
         .or_else(no_cfg)
+        .or_else(blocked)
         .or_else(busy_note);
     let probe_reason: Option<String> = super::tool_missing(missing_tools, "probe-rs")
         .then(|| super::needs_tool_hint("probe-rs"))
         .or_else(|| held("cargo flash"))
         .or_else(no_cfg)
-        .or_else(bad_bitstream)
+        .or_else(blocked)
         // No auto-select on this path: `cargo flash` with an ambiguous probe
         // doesn't error, it waits — so the choice is made here, up front.
         .or_else(|| {

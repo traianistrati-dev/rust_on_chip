@@ -390,6 +390,7 @@ McuDefinition(
                 name: "3V3_OUT",
                 reserved: true,
                 functions: [],
+                note: "Also feeds the CYW43439 radio, through ferrite FB8 into its VBAT supply. Infineon\'s datasheet gives 320 mA typical on VBAT while it transmits continuously at 19.5 dBm (VBAT 3.6 V), so Wi-Fi transmit bursts draw on the same SMPS output as your load here.",
             ),
             PinDef(
                 number: 35,

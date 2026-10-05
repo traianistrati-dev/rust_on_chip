@@ -3506,7 +3506,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "USB D- of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO12 or GPIO13 any other function disables it: esp-hal clears USB_PAD_ENABLE and the USB pulls when it sets the pin up as a GPIO or routes a peripheral to it.",
+                note: "USB D- of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Any other function on GPIO12 or GPIO13 disables it (esp-hal clears USB_PAD_ENABLE and the USB pulls) and the port vanishes from the PC: to flash over USB again, hold GPIO9 low (GPIO8 high) through a CHIP_PU reset.",
             ),
             PinDef(
                 number: 19,
@@ -3753,7 +3753,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "USB D+ of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO12 or GPIO13 any other function disables it (esp-hal clears USB_PAD_ENABLE). D+ fluctuates high/low at power-up; add an external pull-up if it must start at a stable high level.",
+                note: "USB D+ of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Any other function on GPIO12 or GPIO13 disables it (esp-hal clears USB_PAD_ENABLE) and the port vanishes from the PC: to flash over USB again, hold GPIO9 low (GPIO8 high) through a CHIP_PU reset. D+ fluctuates at power-up; an external pull-up holds it high.",
             ),
             PinDef(
                 number: 20,

@@ -1247,7 +1247,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
-                note: "NFC2 on the die: GPIO only after UICR.NFCPINS is cleared and the chip reset (erased = NFC, GPIO off). CODAL builds do this; embassy-nrf does with `nfc-pins-as-gpio` (else no P0_10 exists); with nrf-hal write the UICR and reset yourself. Driven opposite to pad 9 the pair leaks up to 10 uA. Nordic rates it low-frequency I/O only (up to 10 kHz).",
+                note: "NFC2: GPIO only after clearing UICR.NFCPINS and a reset. While it is NFC (erased), GPIO is off and a protection circuit shorts pads 8 and 9 together above about 2 V difference. CODAL clears it; embassy-nrf does with `nfc-pins-as-gpio` (else no P0_10); nrf-hal leaves it to you. Opposite levels leak up to 10 uA. Low-frequency I/O only (10 kHz max).",
             ),
             PinDef(
                 number: 9,
@@ -1329,7 +1329,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
-                note: "NFC1 on the die: GPIO only after UICR.NFCPINS is cleared and the chip reset (erased = NFC, GPIO off). CODAL builds do this; embassy-nrf does with `nfc-pins-as-gpio` (else no P0_09 exists); with nrf-hal write the UICR and reset yourself. Driven opposite to pad 8 the pair leaks up to 10 uA. Nordic rates it low-frequency I/O only (up to 10 kHz).",
+                note: "NFC1: GPIO only after clearing UICR.NFCPINS and a reset. While it is NFC (erased), GPIO is off and a protection circuit shorts pads 9 and 8 together above about 2 V difference. CODAL clears it; embassy-nrf does with `nfc-pins-as-gpio` (else no P0_09); nrf-hal leaves it to you. Opposite levels leak up to 10 uA. Low-frequency I/O only (10 kHz max).",
             ),
             PinDef(
                 number: 10,

@@ -1835,7 +1835,7 @@ McuDefinition(
                     ParlRxClk,
                     ParlRxValid,
                 ],
-                note: "USB D- of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO13 or GPIO14 any other function disables it: esp-hal clears USB_PAD_ENABLE and the USB pulls when it sets the pin up as a GPIO or routes a peripheral to it.",
+                note: "USB D- of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Any other function on GPIO13 or GPIO14 disables it (esp-hal clears USB_PAD_ENABLE and the USB pulls) and the port vanishes from the PC: to flash over USB again, hold GPIO28 low (GPIO27 high) through a CHIP_PU reset.",
             ),
             PinDef(
                 number: 23,
@@ -1980,7 +1980,7 @@ McuDefinition(
                     ParlRxClk,
                     ParlRxValid,
                 ],
-                note: "USB D+ of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO13 or GPIO14 any other function disables it (esp-hal clears USB_PAD_ENABLE). D+ toggles high/low at power-up; add an external pull-up if the line must start in a stable state.",
+                note: "USB D+ of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Any other function on GPIO13 or GPIO14 disables it (esp-hal clears USB_PAD_ENABLE) and the port vanishes from the PC: to flash over USB again, hold GPIO28 low (GPIO27 high) through a CHIP_PU reset. D+ fluctuates at power-up; an external pull-up holds it high.",
             ),
             PinDef(
                 number: 24,
@@ -2477,7 +2477,7 @@ McuDefinition(
                     ParlRxClk,
                     ParlRxValid,
                 ],
-                note: "JTAG MTMS for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads (except in Joint Download Boot 1 mode). Also a strapping pin, latched at reset and floating by default, but the datasheet names no boot option for it. LP GPIO2, usable in Deep-sleep.",
+                note: "JTAG MTMS for an external probe, but with no eFuses burned JTAG comes from the USB Serial/JTAG controller, not these pads (except in Joint Download Boot 1). Strapping pin, floating by default, but every documented boot mode is set by GPIO26-28 alone, so its level changes neither SPI boot nor either download mode. LP GPIO2, usable in Deep-sleep.",
             ),
             PinDef(
                 number: 12,

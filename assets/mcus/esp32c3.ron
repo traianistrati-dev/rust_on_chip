@@ -54,12 +54,14 @@ McuDefinition(
                 name: "XTAL_P",
                 reserved: true,
                 functions: [],
+                note: "Fit a 40 MHz crystal: Espressif says the C3 firmware supports no other frequency (ESP-IDF offers only 40 MHz), and esp-hal 1.1 always configures the C3 for 40 MHz. Espressif asks for a crystal accurate to +-10 ppm.",
             ),
             PinDef(
                 number: 29,
                 name: "XTAL_N",
                 reserved: true,
                 functions: [],
+                note: "Fit a 40 MHz crystal: Espressif says the C3 firmware supports no other frequency (ESP-IDF offers only 40 MHz), and esp-hal 1.1 always configures the C3 for 40 MHz. Espressif asks for a crystal accurate to +-10 ppm.",
             ),
             PinDef(
                 number: 28,
@@ -222,7 +224,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "USB D+ of the USB Serial/JTAG; its USB pull-up is on from reset, so a host sees a device. Using GPIO19 or GPIO18 in esp-hal as GPIO or for any other peripheral clears the USB pad enable and that pull-up, so the ROM-log/download/JTAG port vanishes while your firmware runs; reflash by holding GPIO9 low and GPIO8 high through reset.",
+                note: "USB D+ (USB Serial/JTAG), pulled up from reset; Espressif warns it swings high and low at power-up and advises an external pull-up for a steady level. esp-hal clears the USB pads and pull-ups once GPIO18/19 serve as GPIO or another peripheral, so the USB log/download/JTAG port is gone while firmware runs; reflash with GPIO9 low, GPIO8 high at reset.",
             ),
             PinDef(
                 number: 25,
@@ -337,7 +339,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "MTMS (JTAG TMS) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG on GPIO18/19, so this is a free GPIO; GPIO4-7 become the JTAG port only if eFuse DIS_USB_JTAG is burned, or JTAG_SEL_ENABLE is burned and GPIO10 is low at reset.",
+                note: "MTMS (JTAG TMS) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG (GPIO18/19), so this is a free GPIO; GPIO4-7 become the JTAG port only once eFuse DIS_USB_JTAG is burned (irreversible). The GPIO10 strap select (eFuse JTAG_SEL_ENABLE) in ESP-IDF v4.4\'s guide does not work: Espressif confirmed a C3 silicon bug.",
             ),
             PinDef(
                 number: 10,
@@ -455,7 +457,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "MTCK (JTAG TCK) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG on GPIO18/19, so this is a free GPIO; GPIO4-7 become the JTAG port only if eFuse DIS_USB_JTAG is burned, or JTAG_SEL_ENABLE is burned and GPIO10 is low at reset.",
+                note: "MTCK (JTAG TCK) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG (GPIO18/19), so this is a free GPIO; GPIO4-7 become the JTAG port only once eFuse DIS_USB_JTAG is burned (irreversible). The GPIO10 strap select (eFuse JTAG_SEL_ENABLE) in ESP-IDF v4.4\'s guide does not work: Espressif confirmed a C3 silicon bug.",
             ),
             PinDef(
                 number: 13,
@@ -509,7 +511,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "MTDO (JTAG TDO) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG on GPIO18/19, so this is a free GPIO; GPIO4-7 become the JTAG port only if eFuse DIS_USB_JTAG is burned, or JTAG_SEL_ENABLE is burned and GPIO10 is low at reset.",
+                note: "MTDO (JTAG TDO) of the pad JTAG. By default the C3 runs JTAG over the USB Serial/JTAG (GPIO18/19), so this is a free GPIO; GPIO4-7 become the JTAG port only once eFuse DIS_USB_JTAG is burned (irreversible). The GPIO10 strap select (eFuse JTAG_SEL_ENABLE) in ESP-IDF v4.4\'s guide does not work: Espressif confirmed a C3 silicon bug.",
             ),
             PinDef(
                 number: 14,
@@ -871,7 +873,7 @@ McuDefinition(
                 name: "CHIP_EN",
                 reserved: true,
                 functions: [],
-                note: "Must not be left floating. Espressif recommends an RC delay on it (usually R = 10 kohm, C = 1 uF) so it goes high only after the supply rails have had at least 50 us (tSTBL) to stabilize; holding it below VIL_nRST for at least 50 us (tRST) resets the chip.",
+                note: "Must not be left floating. Espressif recommends an RC delay (usually 10 kohm, 1 uF) so it rises at least 50 us after the rails; below VIL_nRST for 50 us resets the chip. On a slow or unstable supply (battery charging, solar) the RC alone may not do: the chip may not start or flash erases may fail, so Espressif advises a supervisor at about 3.0 V.",
             ),
             PinDef(
                 number: 8,

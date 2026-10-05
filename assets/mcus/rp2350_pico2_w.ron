@@ -33,7 +33,7 @@ McuDefinition(
                 name: "WL_D",
                 reserved: true,
                 functions: [],
-                note: "Also the radio\'s interrupt line: it is SDIO_CMD on the CYW43439, tied straight to SDIO_DATA2, to SDIO_DATA0 through R22 (470R) and to SDIO_DATA1 through R23 (10k). Data in, data out and IRQ share this one GPIO, so the IRQ is only checked between SPI transactions.",
+                note: "Also the radio\'s IRQ. On the CYW43439 it is SDIO_CMD (gSPI data in), tied straight to SDIO_DATA2, to SDIO_DATA0 (data out) via R22 (470R) and to SDIO_DATA1 (IRQ) via R23 (10k). DATA2 is a strap sampled at power-up that selects gSPI only when low, so GP24 must be low while WL_ON brings the radio up. IRQs can only be checked between SPI transactions.",
             ),
             PinDef(
                 number: 43,
@@ -75,7 +75,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 2,
@@ -92,7 +92,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 3,
@@ -115,7 +115,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 5,
@@ -132,7 +132,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 6,
@@ -149,7 +149,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 7,
@@ -166,7 +166,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 8,
@@ -189,7 +189,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 10,
@@ -206,7 +206,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 11,
@@ -223,7 +223,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 12,
@@ -240,7 +240,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 13,
@@ -263,7 +263,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 15,
@@ -280,7 +280,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 16,
@@ -297,7 +297,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 17,
@@ -314,7 +314,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 18,
@@ -337,7 +337,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 20,
@@ -354,7 +354,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
         ],
         right: [
@@ -390,6 +390,7 @@ McuDefinition(
                 name: "3V3_OUT",
                 reserved: true,
                 functions: [],
+                note: "Also feeds the CYW43439 radio, through ferrite FB1 into its VBAT supply. Infineon\'s datasheet gives 320 mA typical on VBAT while it transmits continuously at 19.5 dBm (VBAT 3.6 V), so Wi-Fi transmit bursts draw on the same SMPS output as your load here.",
             ),
             PinDef(
                 number: 35,
@@ -417,7 +418,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "Not 5 V tolerant, unlike GP0-22 (5.5 V while 3V3 is up): as an ADC pin it has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while 3V3 is off leaks into the 3V3 rail. Analog ground is AGND, pin 33. RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "Not 5 V tolerant, unlike GP0-22 (5.5 V while 3V3 is up): as an ADC pin it has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while 3V3 is off leaks into the 3V3 rail. Analog ground is AGND, pin 33. RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 33,
@@ -444,7 +445,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "Not 5 V tolerant, unlike GP0-22 (5.5 V while 3V3 is up): as an ADC pin it has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while 3V3 is off leaks into the 3V3 rail. Analog ground is AGND, pin 33. RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "Not 5 V tolerant, unlike GP0-22 (5.5 V while 3V3 is up): as an ADC pin it has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while 3V3 is off leaks into the 3V3 rail. Analog ground is AGND, pin 33. RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 31,
@@ -465,7 +466,7 @@ McuDefinition(
                         channel: 0,
                     ),
                 ],
-                note: "Not 5 V tolerant, unlike GP0-22 (up to 5.5 V while 3V3 is up): this pin has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while the board is unpowered leaks into the 3V3 rail. Its analog ground is AGND, pin 33. RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "Not 5 V tolerant, unlike GP0-22 (up to 5.5 V while 3V3 is up): this pin has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while the board is unpowered leaks into the 3V3 rail. Its analog ground is AGND, pin 33. RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 30,
@@ -489,7 +490,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 28,
@@ -512,7 +513,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 26,
@@ -529,7 +530,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 25,
@@ -546,7 +547,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 24,
@@ -563,7 +564,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 23,
@@ -586,7 +587,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
             PinDef(
                 number: 21,
@@ -603,7 +604,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
-                note: "RP2350 GPIO: on boards whose chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down. Use an external pull-down of 8.2k or less; the pull-up works.",
+                note: "RP2350 GPIO: if the chip is marked A2 (PCN 32 moved Pico 2 W to A4 from July 2025), erratum RP2350-E9 makes an input left between the logic levels source ~120 uA and stick near 2.2 V, too much for the internal pull-down; use an external pull-down of 8.2k or less (the pull-up works). All GPIO together may source 100 mA and sink 100 mA at most.",
             ),
         ],
     ),

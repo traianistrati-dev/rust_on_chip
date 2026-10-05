@@ -2202,7 +2202,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "Pad JTAG TDO (MTDO), unused by default: with the eFuses unburned the S3 takes JTAG from the USB Serial/JTAG on GPIO19/20. JTAG reaches this pad only after burning EFUSE_DIS_USB_JTAG, or EFUSE_STRAP_JTAG_SEL with GPIO3 low at reset.",
+                note: "Pad JTAG TDO (MTDO), unused by default: unburned eFuses send JTAG over USB (GPIO19/20); it reaches this pad only after burning EFUSE_DIS_USB_JTAG, or EFUSE_STRAP_JTAG_SEL with GPIO3 low at reset. In download mode, used to flash, the ROM drives this pad HIGH (OEN of an external USB PHY) unless EFUSE_DIS_USB_OTG_DOWNLOAD_MODE is burned.",
             ),
             PinDef(
                 number: 44,
@@ -2506,7 +2506,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "Pad JTAG TCK (MTCK), unused by default: with the eFuses unburned the S3 takes JTAG from the USB Serial/JTAG on GPIO19/20. JTAG reaches this pad only after burning EFUSE_DIS_USB_JTAG, or EFUSE_STRAP_JTAG_SEL with GPIO3 low at reset.",
+                note: "Pad JTAG TCK (MTCK), unused by default: unburned eFuses send JTAG over USB (GPIO19/20); it reaches this pad only after burning EFUSE_DIS_USB_JTAG, or EFUSE_STRAP_JTAG_SEL with GPIO3 low at reset. In download mode, used to flash, the ROM drives this pad LOW (VPO of an external USB PHY) unless EFUSE_DIS_USB_OTG_DOWNLOAD_MODE is burned.",
             ),
             PinDef(
                 number: 43,
@@ -2810,6 +2810,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "In download mode, used to flash (GPIO0 low at reset, or forced over USB), the ROM drives this pad LOW as VMO of an external USB PHY - GPIO39 LOW, GPIO40 HIGH - unless EFUSE_DIS_USB_OTG_DOWNLOAD_MODE is burned (preset only on chips dated before 2219). A device driving this pad then fights the ROM, and an active-low load turns on.",
             ),
         ],
         bottom: [
@@ -5899,7 +5900,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "USB D- of the USB Serial/JTAG (and OTG): USB flashing and JTAG debugging run here by default. Using GPIO19 or GPIO20 as a GPIO or peripheral signal makes esp-hal clear USB_PAD_ENABLE, and USB OTG takes the one shared PHY - either way the Serial/JTAG link drops. Power-up: one low and two high glitches of about 60 us each.",
+                note: "USB D- of the USB Serial/JTAG (and OTG), where USB flashing and JTAG run by default. As a GPIO or peripheral signal esp-hal clears USB_PAD_ENABLE, and USB OTG takes the one shared PHY - either way that link drops. As an ADC input it does not: the pad stays a USB data line. Power-up: one low and two high ~60 us glitches.",
             ),
             PinDef(
                 number: 26,
@@ -6208,7 +6209,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
-                note: "USB D+ of the USB Serial/JTAG (and OTG), with the D+ pull-up on at and after reset. Using GPIO19 or GPIO20 as a GPIO or a GPIO-matrix signal makes esp-hal clear USB_PAD_ENABLE, dropping the USB flashing/console/JTAG link; to flash again, hold GPIO0 low through a reset. Power-up: a pull-down glitch and two high glitches of about 60 us.",
+                note: "USB D+ of the USB Serial/JTAG (and OTG), D+ pull-up on from reset. As a GPIO or peripheral signal (GPIO19 too) esp-hal clears USB_PAD_ENABLE, dropping USB flashing/console/JTAG (recover: GPIO0 low through a reset). As an ADC input it does not: USB and its D+ pull-up stay on, pulling readings up. Power-up: a pull-down and two high ~60 us glitches.",
             ),
             PinDef(
                 number: 27,

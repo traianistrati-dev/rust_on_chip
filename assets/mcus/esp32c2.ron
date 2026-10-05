@@ -158,7 +158,7 @@ McuDefinition(
                 name: "CHIP_EN",
                 reserved: true,
                 functions: [],
-                note: "Must not be left floating. Espressif recommends an RC delay here (R = 10 kohm, C = 1 uF) so it goes high at least 50 us after the 3.3 V rails come up; holding it below VIL_nRST (0.25 x VDD) for at least 50 us resets the chip.",
+                note: "Must not be left floating. Espressif recommends an RC delay (10 kohm, 1 uF) so it rises at least 50 us after the 3.3 V rails; below VIL_nRST (0.25 x VDD) for 50 us resets the chip. On a slow or unstable supply (battery charging, solar) the RC alone may not do: the chip may not start or flash erases may fail, so Espressif advises a supervisor at about 3.0 V.",
             ),
             PinDef(
                 number: 8,

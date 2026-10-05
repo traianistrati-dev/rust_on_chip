@@ -91,10 +91,9 @@ pub fn make_generated_section(
     if body.is_empty() {
         body.push_str(NO_PINS_PLACEHOLDER);
     }
-    if !custom_inits.is_empty() {
-        body.push_str("\n    // ── Custom modules ──\n");
-        body.push_str(custom_inits);
-    }
+    // The Configuration tab's lines and the Custom modules, each part under
+    // its own header (`Mcu::watchdog_and_custom_inits`).
+    body.push_str(custom_inits);
     body.push_str(&exti_spawns(exti));
     // No fn-level `#[allow]` — the macro would drop it; the crate attribute in
     // `invariant_header` covers the unused-pin / unused-`p` cases instead.

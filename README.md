@@ -321,6 +321,48 @@ watchdogs, configured as *durations* rather than as register fields, plus the
 which channels are taken and by whom — fed from the codegen itself, so it cannot
 drift from what is emitted.
 
+**Flash store** (ESP32-C3 and STM32): settings kept in the chip's own
+flash. Switching it on writes `src/pins/configs/flash_store.rs` — a
+`ConfigStore` over `sequential-storage`, with `load` / `save` (and `_blocking`
+twins) and a `Data` struct of your own — hands it the flash as `flash` in the
+generated block, and seeds
+`let mut flash_store = flash_store::ConfigStore::new(flash);` into an untouched
+loop.
+
+On an **STM32** the store is the last pages of flash (two by default: 2 KiB on
+an F103C8), and `memory.x`'s FLASH ends where it begins — so a program that
+grows into it fails to link, and a LENGTH edited by hand past it trips an
+`ASSERT`. embassy-stm32's blocking `Flash` writes it, or on the F1's own HAL
+(Blocking, Native) a generated `F1Flash` adapter over `FlashWriter` — that
+glue lives in `flash_store_hal.rs`, regenerated whole, so your `flash_store.rs`
+is the same under both HALs and survives a runtime switch. The page size of
+every part comes from a table harvested from stm32-metapac
+(`scripts/harvest-flash-geometry.py`), and the build checks the range against
+the driver's own `FLASH_SIZE` / `MAX_ERASE_SIZE`. Every flashing path erases
+only the sectors it writes, so the settings survive a reflash.
+
+**F2/F4/F7** end in 128/256 KiB sectors, two of which would be a quarter of
+the chip or more — but they *start* with four small ones (16 KiB, 32 KiB on
+F74x). There the store takes the sectors right after the vector table's
+(0x08004000..0x0800C000 on an F411), embassy's first flash region
+(`bank1_region1`) writes it, and memory.x starts the program after it with
+`_stext` — ST's AN3969 layout; the rest of sector 0 is the price. An
+`ASSERT` keeps the vector table out of the store, and `_stext` the code.
+
+Not generated, with the reason on the card: the H7's equal 128 KiB sectors,
+parts whose bank mode is set in option bytes (the L5 included), L4/WL
+(embassy-stm32 0.6 does not reset their flash data cache after an erase),
+L0/L1 (their flash erases to 0x00), the WB's radio stack, and RTIC for now.
+
+On the **ESP32-C3** (`esp-storage`) the store lives either in a partition of its own, in a generated
+`partitions.csv` (shown in the project tree, and passed to espflash, RTT and the
+debugger, since a flash without it puts back espflash's default table, where
+the top of flash is inside the app partition), or in the default table's `nvs`
+partition, with no table at all. The card checks the table, and espflash, RTT
+Run and Debug all refuse to flash one that fails (espflash panics on a numeric
+custom subtype such as `0x99`, so the row is `data, undefined`);
+`flash_store::verify(&mut flash)` checks it on the chip.
+
 ### Virtual device modules
 Instead of wiring a peripheral pin by pin, you can drop a **device** onto the
 canvas and let the IDE do the wiring. Twenty-four kinds ship today:
@@ -417,8 +459,8 @@ compiler can tell you that text is a program. `scripts/verify-codegen.ps1` emits
 a matrix of configurations and cross-compiles each one:
 
 ```powershell
-pwsh scripts/verify-codegen.ps1             # representative subset (32 cases)
-pwsh scripts/verify-codegen.ps1 -Full       # every case (47), about 13 minutes warm
+pwsh scripts/verify-codegen.ps1             # representative subset (37 cases)
+pwsh scripts/verify-codegen.ps1 -Full       # every case (59), about 13 minutes warm
 pwsh scripts/verify-codegen.ps1 -Hook nrf   # every case of the named families
 ```
 

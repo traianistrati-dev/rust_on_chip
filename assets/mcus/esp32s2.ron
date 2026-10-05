@@ -67,6 +67,7 @@ McuDefinition(
                 name: "CHIP_PU",
                 reserved: true,
                 functions: [],
+                note: "Must not float. Espressif advises an RC delay on it (usually 10 kohm, 1 uF) so it rises at least 50 us after the supply rails are stable; a reset needs it below VIL_nRST for at least 50 us. With slow, unstable or often-cycled power the RC alone may not be enough: add a power monitor (reset) chip with a threshold near 3.0 V.",
             ),
             PinDef(
                 number: 55,
@@ -202,6 +203,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Input only: the S2 cannot drive GPIO46, yet esp-hal\'s metadata marks it as an output, so GPIO Output, TX, SCK, MOSI or PWM are offered here and drive nothing. Strapping pin, pulled down: must be low at reset for download mode; GPIO0 low with GPIO46 high is an invalid combination.",
             ),
             PinDef(
                 number: 54,
@@ -361,6 +363,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, weak pull-down: sampled at reset to set the VDD_SPI flash/PSRAM supply - low = 3.3 V, high = 1.8 V from the internal LDO - unless EFUSE_VDD_SPI_FORCE is burned. With 3.3 V flash/PSRAM (all in-package S2 memory is) keep it low at reset.",
             ),
             PinDef(
                 number: 49,
@@ -496,6 +499,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0RXD after reset: the ROM\'s UART download mode receives here, through a USB-to-UART tool wired to U0TXD/U0RXD.",
             ),
             PinDef(
                 number: 48,
@@ -631,6 +635,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0TXD after reset: the ROM prints its boot log here and UART download mode answers on it. esp-println, which the generated Cargo.toml pulls in, writes straight into UART0\'s FIFO on the S2, so any function here other than UART0 TX cuts your println! output off this pad.",
             ),
             PinDef(
                 number: 47,
@@ -766,6 +771,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG TMS (MTMS), the pad\'s IO MUX function 0 and so selected at reset: an external JTAG adapter debugs the S2 here (TCK GPIO39, TDO GPIO40, TDI GPIO41, TMS GPIO42). Giving the pad another function takes it from the debugger.",
             ),
             PinDef(
                 number: 46,
@@ -901,12 +907,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG TDI (MTDI), the pad\'s IO MUX function 0 and so selected at reset: an external JTAG adapter debugs the S2 here (TCK GPIO39, TDO GPIO40, TDI GPIO41, TMS GPIO42). Giving the pad another function takes it from the debugger.",
             ),
             PinDef(
                 number: 45,
                 name: "VDD3P3_CPU",
                 reserved: true,
                 functions: [],
+                note: "IO supply of GPIO38-GPIO46, and of GPIO33-GPIO37 unless IO_MUX_PAD_POWER_CTRL moves them to VDD_SPI. Keep it at or below 3.3 V while eFuses are being burned - the burning circuit is sensitive to higher voltage.",
             ),
             PinDef(
                 number: 44,
@@ -1042,6 +1050,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG TDO (MTDO), the pad\'s IO MUX function 0 and so selected at reset: an external JTAG adapter debugs the S2 here (TCK GPIO39, TDO GPIO40, TDI GPIO41, TMS GPIO42). Giving the pad another function takes it from the debugger.",
             ),
             PinDef(
                 number: 43,
@@ -1177,6 +1186,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG TCK (MTCK), the pad\'s IO MUX function 0 and so selected at reset: an external JTAG adapter debugs the S2 here (TCK GPIO39, TDO GPIO40, TDI GPIO41, TMS GPIO42). Giving the pad another function takes it from the debugger.",
             ),
         ],
         bottom: [
@@ -2019,6 +2029,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Also XTAL_32K_P: an external 32 kHz crystal for the RTC slow clock connects here and on GPIO16. Where one is fitted, the pad is not free.",
             ),
             PinDef(
                 number: 22,
@@ -2158,6 +2169,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Also XTAL_32K_N: an external 32 kHz crystal for the RTC slow clock connects here and on GPIO15. Where one is fitted, the pad is not free.",
             ),
             PinDef(
                 number: 23,
@@ -2444,6 +2456,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Download mode also takes serial data on this pad (U1RXD); left floating it can make downloads fail, so Espressif advises an external pull-up (10 kohm typical). Chip revision v0.0 has no internal pull-up here (erratum SYSTEM-117); v1.0 adds one.",
             ),
             PinDef(
                 number: 25,
@@ -2724,12 +2737,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D+. At power-up it fluctuates between high and low, and its high level is strong - only a robust pull-down holds it low. Where a defined start-up level matters, Espressif recommends an external pull-up.",
             ),
             PinDef(
                 number: 27,
                 name: "VDD3P3_RTC_IO",
                 reserved: true,
                 functions: [],
+                note: "IO supply of GPIO0-GPIO21. Its recommended range is 3.0-3.6 V, a higher minimum than the 2.8 V of the other 3.3 V rails, and when it feeds VDD_SPI the drop across RSPI must be allowed for.",
             ),
             PinDef(
                 number: 28,
@@ -3026,6 +3041,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, weak pull-up: low at reset (with GPIO46 low) starts download mode instead of the program in flash. Nothing may pull it low at power-up, not even a large capacitor; Espressif recommends an external pull-up.",
             ),
             PinDef(
                 number: 6,
@@ -4549,6 +4565,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIDQS of the SPI0/1 bus in 8-line (octal) mode (DQS/DM): free unless an off-package octal flash/PSRAM is fitted - all in-package S2 memory is quad SPI.",
             ),
             PinDef(
                 number: 40,
@@ -4684,6 +4701,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIIO7 of the SPI0/1 bus in 8-line (octal) mode (DQ7): free unless an off-package octal flash/PSRAM is fitted - all in-package S2 memory is quad SPI.",
             ),
             PinDef(
                 number: 39,
@@ -4819,6 +4837,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIIO6 of the SPI0/1 bus in 8-line (octal) mode (DQ6): free unless an off-package octal flash/PSRAM is fitted - all in-package S2 memory is quad SPI.",
             ),
             PinDef(
                 number: 38,
@@ -4954,6 +4973,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIIO5 of the SPI0/1 bus in 8-line (octal) mode (DQ5): free unless an off-package octal flash/PSRAM is fitted - all in-package S2 memory is quad SPI.",
             ),
             PinDef(
                 number: 37,
@@ -5089,6 +5109,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIIO4 of the SPI0/1 bus in 8-line (octal) mode (DQ4): free unless an off-package octal flash/PSRAM is fitted - all in-package S2 memory is quad SPI.",
             ),
             PinDef(
                 number: 36,
@@ -5224,6 +5245,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPID: the flash\'s DI/IO0 and the PSRAM\'s SI/SIO0. GPIO27-32 carry the SPI flash the chip boots from (inside the package on S2FH2/S2FH4/S2FN4R2, otherwise the recommended pins for the external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 35,
@@ -5359,6 +5381,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIQ: the flash\'s DO/IO1 and the PSRAM\'s SO/SIO1. GPIO27-32 carry the SPI flash the chip boots from (inside the package on S2FH2/S2FH4/S2FN4R2, otherwise the recommended pins for the external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 34,
@@ -5494,6 +5517,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICLK: the flash and PSRAM clock. GPIO27-32 carry the SPI flash the chip boots from (inside the package on S2FH2/S2FH4/S2FN4R2, otherwise the recommended pins for the external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 33,
@@ -5629,6 +5653,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICS0: the flash chip select (CS#). GPIO27-32 carry the SPI flash the chip boots from (inside the package on S2FH2/S2FH4/S2FN4R2, otherwise the recommended pins for the external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 32,
@@ -5764,6 +5789,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIWP: the flash\'s WP#/IO2 and the PSRAM\'s SIO2. GPIO27-32 carry the SPI flash the chip boots from (inside the package on S2FH2/S2FH4/S2FN4R2, otherwise the recommended pins for the external flash), plus the PSRAM if there is one. Espressif: not recommended for other uses.",
             ),
             PinDef(
                 number: 31,
@@ -5899,12 +5925,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIHD: HOLD#/IO3 of the SPI flash and SIO3 of the PSRAM, if there is one. GPIO27-32 carry the flash the chip boots from (inside the package on S2FH2/S2FH4/S2FN4R2, otherwise the recommended pins for an external flash). Espressif: not for other uses.",
             ),
             PinDef(
                 number: 30,
                 name: "VDD_SPI",
                 reserved: true,
                 functions: [],
+                note: "Normally a supply OUTPUT: it powers the flash/PSRAM and the SPI pads GPIO26-32 - by default 3.3 V from VDD3P3_RTC_IO through RSPI (5 ohm typ), or 1.8 V from the internal flash LDO (40 mA typ) when GPIO45 is high at reset or eFuses force it. Feed it from outside only once eFuses switch that regulator OFF.",
             ),
             PinDef(
                 number: 29,
@@ -6040,6 +6068,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICS1, the PSRAM chip select: wired inside the package on ESP32-S2R2 and S2FN4R2, where the pad must not be used; otherwise the recommended CS for an off-package PSRAM. Espressif rates GPIO26-32 not recommended for other uses.",
             ),
         ],
         grid: None,

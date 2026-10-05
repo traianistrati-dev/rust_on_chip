@@ -1781,6 +1781,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG MTDI for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads. Strapping pin too: with GPIO4 (MTMS) it sets the SDIO slave\'s default sampling/driving edge (a driver can override it); floating by default. LP_GPIO5, usable in Deep-sleep.",
             ),
             PinDef(
                 number: 12,
@@ -2030,6 +2031,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG MTCK for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads. Its internal pull-up is on after reset while EFUSE_DIS_PAD_JTAG = 0. LP_GPIO6, usable in Deep-sleep.",
             ),
             PinDef(
                 number: 13,
@@ -2275,6 +2277,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG TDO (MTDO) for an external probe, but with the JTAG eFuses at their default 0 the chip takes JTAG from the USB Serial/JTAG controller, not from GPIO4-7. Pad JTAG needs EFUSE_DIS_USB_JTAG burned, or EFUSE_JTAG_SEL_ENABLE burned and GPIO15 low at reset. LP_GPIO7 in the VDDPST1 domain, so it can still be controlled in Deep-sleep.",
             ),
             PinDef(
                 number: 14,
@@ -2520,6 +2523,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, floating by default. Download mode (GPIO9 low at reset) needs GPIO8 HIGH: GPIO8 = 0 with GPIO9 = 0 is an invalid combination. If EFUSE_UART_PRINT_CONTROL is 1 or 2, its level at reset also gates the ROM boot log on UART0 (1: prints when low, 2: prints when high).",
             ),
             PinDef(
                 number: 15,
@@ -2765,6 +2769,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "BOOT strapping pin with a weak pull-up: held LOW at reset with GPIO8 high, the chip enters Joint Download Boot (UART0, USB Serial/JTAG or SDIO) instead of booting from flash. Espressif recommends an external pull-up on it and no high-value capacitor, which may make the chip enter download mode.",
             ),
             PinDef(
                 number: 16,
@@ -3501,6 +3506,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D- of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO12 or GPIO13 any other function disables it: esp-hal clears USB_PAD_ENABLE and the USB pulls when it sets the pin up as a GPIO or routes a peripheral to it.",
             ),
             PinDef(
                 number: 19,
@@ -3747,6 +3753,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D+ of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO12 or GPIO13 any other function disables it (esp-hal clears USB_PAD_ENABLE). D+ fluctuates high/low at power-up; add an external pull-up if it must start at a stable high level.",
             ),
             PinDef(
                 number: 20,
@@ -3992,6 +3999,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICS0, the boot flash\'s CS#. The QFN40 ESP32-C6 has no in-package flash, so GPIO24-26 and GPIO28-30 are its external flash bus; Espressif marks them already allocated and says not to use flash pins for anything else.",
             ),
         ],
         left: [
@@ -4018,6 +4026,7 @@ McuDefinition(
                 name: "CHIP_PU",
                 reserved: true,
                 functions: [],
+                note: "Must not be left floating, and must go high only after the supply rails have settled (tSTBL >= 50 us): Espressif advises an RC delay, typically 10 kohm and 1 uF, and a short CHIP_PU trace, since interference on it causes reboots.",
             ),
             PinDef(
                 number: 5,
@@ -4273,6 +4282,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "XTAL_32K_P: an optional 32.768 kHz RTC crystal goes across GPIO0/GPIO1 and takes both pins; an external 32 kHz oscillator enters on GPIO0 alone. Without either they are plain GPIOs. LP_GPIO0 (VDDPST1): only GPIO0-7 can be used by the LP core and LP peripherals in Deep-sleep or wake the chip from it; GPIO8-30 can only hold a level.",
             ),
             PinDef(
                 number: 7,
@@ -4522,6 +4532,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "XTAL_32K_N: the other end of the optional 32.768 kHz RTC crystal (with GPIO0); fitted, both pins are taken. An external 32 kHz oscillator needs GPIO0 only. LP_GPIO1 (VDDPST1): only GPIO0-7 can be used by the LP core and LP peripherals in Deep-sleep or wake the chip from it; GPIO8-30 can only hold a level.",
             ),
             PinDef(
                 number: 8,
@@ -4771,6 +4782,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "LP_GPIO2 (VDDPST1 domain): only GPIO0-7 can be used by the LP core and LP peripherals in Deep-sleep or wake the chip from it; GPIO8-30 can only hold a latched level.",
             ),
             PinDef(
                 number: 9,
@@ -5020,6 +5032,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "LP_GPIO3 (VDDPST1 domain): only GPIO0-7 can be used by the LP core and LP peripherals in Deep-sleep or wake the chip from it; GPIO8-30 can only hold a latched level.",
             ),
             PinDef(
                 number: 10,
@@ -5269,6 +5282,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG MTMS for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads. Strapping pin too: with GPIO5 (MTDI) it sets the SDIO slave\'s default sampling/driving edge (a driver can override it); floating by default. LP_GPIO4, usable in Deep-sleep.",
             ),
         ],
         right: [
@@ -5516,6 +5530,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0RXD, UART0 RX by default (weak pull-up after reset; TX is GPIO16): in download boot mode the ROM waits here for a UART download. The ROM also downloads over USB Serial/JTAG on GPIO12/13, so this pad is not the only way to flash.",
             ),
             PinDef(
                 number: 29,
@@ -5761,6 +5776,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0TXD, UART0 TX by default. UART0 is the ROM\'s port for UART download and for its boot log, printed at every reset by default, so whatever is wired here sees that traffic. Espressif suggests a 499 ohm series resistor on this line.",
             ),
             PinDef(
                 number: 28,
@@ -6012,6 +6028,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG-source strapping pin, read at reset only if EFUSE_JTAG_SEL_ENABLE is burned (default 0) and neither EFUSE_DIS_PAD_JTAG nor EFUSE_DIS_USB_JTAG is: low = JTAG on the GPIO4-7 pads, high = USB Serial/JTAG. It has no internal pull, so then it must be driven, never left floating. Otherwise an ordinary GPIO.",
             ),
             PinDef(
                 number: 26,
@@ -6257,6 +6274,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPID, the boot flash\'s MOSI / SIO0. The QFN40 ESP32-C6 has no in-package flash, so GPIO24-26 and GPIO28-30 are its external flash bus; Espressif marks them already allocated and says not to use flash pins for anything else.",
             ),
             PinDef(
                 number: 25,
@@ -6502,6 +6520,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPICLK, the boot flash\'s clock. The QFN40 ESP32-C6 has no in-package flash, so GPIO24-26 and GPIO28-30 are its external flash bus; Espressif marks them already allocated and says not to use flash pins for anything else.",
             ),
             PinDef(
                 number: 24,
@@ -6747,12 +6766,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIHD, the boot flash\'s HOLD# / SIO3. The QFN40 ESP32-C6 has no in-package flash, so GPIO24-26 and GPIO28-30 are its external flash bus; Espressif marks them already allocated and says not to use flash pins for anything else.",
             ),
             PinDef(
                 number: 23,
                 name: "VDD_SPI",
                 reserved: true,
                 functions: [],
+                note: "By default an output: VDDPST2 feeds it through RSPI as the 3.3 V supply for the external flash, so keep VDDPST2 at 3.0 V or more and put 0.1 uF + 1 uF close to it. It works as GPIO27 only with the flash powered elsewhere and the pad switched over (eFuse VDD_SPI_AS_GPIO, or PMU_VDD_SPI_PWR_SEL_SW=1 with PMU_VDD_SPI_PWR_SW=0).",
             ),
             PinDef(
                 number: 22,
@@ -6998,6 +7019,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIWP, the boot flash\'s WP# / SIO2. The QFN40 ESP32-C6 has no in-package flash, so GPIO24-26 and GPIO28-30 are its external flash bus; Espressif marks them already allocated and says not to use flash pins for anything else.",
             ),
             PinDef(
                 number: 21,
@@ -7243,6 +7265,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPIQ, the boot flash\'s MISO / SIO1. The QFN40 ESP32-C6 has no in-package flash, so GPIO24-26 and GPIO28-30 are its external flash bus; Espressif marks them already allocated and says not to use flash pins for anything else.",
             ),
         ],
         grid: None,

@@ -56,14 +56,32 @@ impl Mcu {
     /// Watchdogs come FIRST - one that is meant to catch a hang during
     /// start-up is worth arming before the code that might hang.
     pub fn watchdog_and_custom_inits(&self) -> String {
+        // The flash store between the two: after the clocks (on the F1 it
+        // takes over the `flash` whose `acr` froze them), before the Custom
+        // modules. STM32 only - the ESP backends have their own slot.
+        let store = if self.family.starts_with("stm32") {
+            crate::panels::mcu_module::codegen::flash_store_gen::init_lines_for(self)
+        } else {
+            String::new()
+        };
+        // Each part carries its own header, so one that is absent leaves no
+        // empty heading behind (the backends used to put "Custom modules"
+        // above the whole slot, watchdogs and store included).
+        let custom = self.custom_module_inits();
+        let custom = if custom.is_empty() {
+            custom
+        } else {
+            format!("\n    // ── Custom modules ──\n{custom}")
+        };
         format!(
-            "{}{}",
+            "{}{}{}",
             crate::panels::mcu_module::codegen::watchdog_gen::init_lines(
                 &self.watchdog,
                 &self.family,
                 self.runtime,
             ),
-            self.custom_module_inits(),
+            store,
+            custom,
         )
     }
     /// Create a new MCU with the given configuration.
@@ -162,6 +180,7 @@ impl Mcu {
             module_notes: std::collections::BTreeMap::new(),
             watchdog: Default::default(),
             comp: Default::default(),
+            flash_store: None,
         }
     }
 
@@ -1495,6 +1514,14 @@ impl Mcu {
             }
             s.push_str(&comp);
         }
+        // The flash store (`@flashstore`) — codegen input too.
+        let flash_store = mcu_config::flashstore_section(self.flash_store.as_ref());
+        if !flash_store.is_empty() {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&flash_store);
+        }
         // Diagram rotation (`@rotation`) — view preference, same append pattern.
         let rotation = mcu_config::rotation_section(self.rotated);
         if !rotation.is_empty() {
@@ -1700,6 +1727,7 @@ impl Mcu {
         self.groups = mcu_config::parse_groups(text);
         self.watchdog = mcu_config::parse_watchdog(text);
         self.comp = mcu_config::parse_comp(text);
+        self.flash_store = mcu_config::parse_flashstore(text);
         // Interrupt edges (`@irq`) — a missing section means every input is
         // polled, which is the pre-RTIC behaviour of every existing project.
         let irqs = mcu_config::parse_irq(text);

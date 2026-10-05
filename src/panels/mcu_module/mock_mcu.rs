@@ -239,12 +239,10 @@ pub fn create_stm32f103c8tx() -> Mcu {
             .with_functions(vec![PinFunction::SpiMiso(2), PinFunction::UsartRts(3)]),
         // Pin 26: PB13 — SPI2_SCK, USART3_CTS, TIM1_CH1N
         Pin::new(26, "PB13").with_functions(vec![PinFunction::SpiSck(2), PinFunction::UsartCts(3)]),
-        // Pin 25: PB12 — SPI2_NSS, USART3_CK, I2C2_SMBA, TIM1_BKIN
-        Pin::new(25, "PB12").with_functions(vec![
-            PinFunction::SpiNss(2),
-            PinFunction::UsartCk(3),
-            PinFunction::I2cScl(2), // I2C2_SMBA — closest available variant
-        ]),
+        // Pin 25: PB12 — SPI2_NSS, USART3_CK, I2C2_SMBA, TIM1_BKIN. SMBA has
+        // no PinFunction, and it is NOT I2C2's SCL (that is PB10): offered
+        // as `I2cScl(2)` it generated an I2C2 on the wrong pin.
+        Pin::new(25, "PB12").with_functions(vec![PinFunction::SpiNss(2), PinFunction::UsartCk(3)]),
     ];
 
     Mcu::new(

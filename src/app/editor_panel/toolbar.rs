@@ -131,9 +131,9 @@ impl AppIde {
         let interface_cfg = openocd::interface_cfg_for_kind(&kind).to_string();
         let adapter = openocd::adapter_select_cmd(&kind, &vid_pid);
         let files = self.current_project_files();
-        if let Err(why) = fpga_bitstream::preflight(&files) {
-            *self.openocd_state.lock().unwrap() =
-                OpenOcdState::Error(fpga_bitstream::refusal(&why));
+        // The bitstream, and an STM32 flash store's settings and memory.x.
+        if let Some((why, phase)) = self.flash_preflight(&files) {
+            *self.openocd_state.lock().unwrap() = OpenOcdState::Error(phase);
             self.refuse_flash(why);
             return;
         }
@@ -172,9 +172,10 @@ impl AppIde {
             return;
         };
         let files = self.current_project_files();
-        if let Err(why) = fpga_bitstream::preflight(&files) {
+        // The bitstream, and an STM32 flash store's settings and memory.x.
+        if let Some((why, phase)) = self.flash_preflight(&files) {
             *self.probe_flash_state.lock().unwrap() =
-                crate::probe_flash::ProbeFlashState::Error(fpga_bitstream::refusal(&why));
+                crate::probe_flash::ProbeFlashState::Error(phase);
             self.refuse_flash(why);
             return;
         }
@@ -235,16 +236,86 @@ impl AppIde {
         crate::flash_stop::request_stop(&self.esp_flash_child, &self.dfu_log, "espflash");
     }
 
+    /// Why the project's `partitions.csv` (or flash store) must not be
+    /// flashed, or `None` - `flash_store::flash_block`, asked by espflash, RTT
+    /// Run and Debug alike: all three pass the table on.
+    ///
+    /// On an STM32 it is the store's settings and `memory.x` instead
+    /// (`flash_store::stm32_flash_block`): every STM32 flashing path writes
+    /// the program memory.x laid out.
+    pub(crate) fn partition_table_block(&self) -> Option<String> {
+        let mcu = self.mcu.as_ref()?;
+        crate::panels::mcu_module::flash_store::project_flash_block(
+            &self.partitions_csv,
+            &self.memory_x,
+            mcu.flash_store.as_ref(),
+            &mcu.family,
+            crate::panels::mcu_module::flash_store::part_of(mcu),
+            mcu.runtime,
+            mcu.watchdog.wwdg.map(|w| w.timeout_us),
+        )
+    }
+
+    /// What the Flash tab's "Fix partitions.csv" would change, while the TABLE
+    /// is what blocks flashing (not the store's settings, not a bitstream) and
+    /// a subtype espflash panics on is in it - or `None`. Asked only while a
+    /// block is shown, never per idle frame.
+    pub(crate) fn partition_table_repair(&self) -> Option<String> {
+        use crate::panels::mcu_module::flash_store;
+        self.partition_table_block()
+            .filter(|b| b.starts_with(flash_store::TABLE_BLOCK_PREFIX))?;
+        let (_, notes) = flash_store::repair_data_subtypes(&self.partitions_csv)?;
+        Some(notes.join("; "))
+    }
+
+    /// The Flash tab's "Fix partitions.csv": the subtypes espflash panics on
+    /// become `undefined` in the editor's copy - nothing else in the file
+    /// moves. Like any edit it reaches the project folder on Save; Flash
+    /// already uses it, since the build copy is written from the editor.
+    /// The file opens, so the change is seen, and the Flash log says what it
+    /// was. `true` when the buffer changed - the caller must then refresh an
+    /// editor showing it (see `show_editor_panel`'s `source_rewritten`).
+    pub(crate) fn repair_partition_table(&mut self) -> bool {
+        let Some((fixed, notes)) =
+            crate::panels::mcu_module::flash_store::repair_data_subtypes(&self.partitions_csv)
+        else {
+            return false;
+        };
+        self.partitions_csv = fixed;
+        self.invalidate_project_files_cache();
+        self.selected_file = ProjectFileId::PartitionsCsv;
+        let mut log = self.dfu_log.lock().unwrap();
+        log.clear();
+        log.push(format!(
+            "[OK] partitions.csv fixed in the editor ({}) - Save to keep it on disk.",
+            notes.join("; ")
+        ));
+        true
+    }
+
     /// Build `--release` and flash an ESP32 via espflash, over the selected
     /// programmer's serial port. No-op without a buildable chip config.
     pub(crate) fn flash_esp(&mut self) {
         let Some((project, _tc)) = self.selected_build_cfg() else {
             return;
         };
+        // A table espflash would crash on, or one that does not reserve the
+        // flash store, is refused here rather than flashed - the button is red
+        // already; this catches a file edited since the tab last looked.
+        if let Some(why) = self.partition_table_block() {
+            *self.espflash_state.lock().unwrap() = espflash::EspFlashState::Error(why.clone());
+            self.refuse_flash(why);
+            return;
+        }
+        let files = self.current_project_files();
+        // From THIS project's state, never from a file in the build workspace:
+        // that folder is shared by every project, and a table another one left
+        // there would be flashed onto this board.
+        let partition_table = !files.partitions_csv.trim().is_empty();
         let build_dir = crate::workspace::dir();
         if project_gen::write_project(
             &build_dir,
-            &self.current_project_files(),
+            &files,
             &self.project_tree.user_src_files,
             &self.mcu_config_text(),
             &self.structure_config_text(),
@@ -271,6 +342,7 @@ impl AppIde {
                 port,
                 Arc::clone(&self.espflash_used_port),
                 monitor_follows,
+                partition_table,
                 Arc::clone(&self.espflash_state),
                 Arc::clone(&self.dfu_log),
                 Arc::clone(&self.esp_flash_child),
@@ -597,6 +669,20 @@ impl AppIde {
         }
     }
 
+    /// What stops RTT Run and Debug from flashing, as (console line, phase
+    /// text): the FPGA bitstream, then the partition table probe-rs would be
+    /// handed (`--idf-partition-table`) - the same check the espflash path
+    /// makes.
+    fn flash_preflight(&self, files: &project_gen::ProjectFiles) -> Option<(String, String)> {
+        match fpga_bitstream::preflight(files) {
+            Err(why) => {
+                let phase = fpga_bitstream::refusal(&why);
+                Some((why, phase))
+            }
+            Ok(()) => self.partition_table_block().map(|why| (why.clone(), why)),
+        }
+    }
+
     /// Start an RTT session: write the project, then hand off to the
     /// [`crate::rtt::RttConsole`] pipeline (build --release → probe-rs
     /// run/attach). Fired from the RTT tab's buttons. No-op without a chip.
@@ -606,18 +692,17 @@ impl AppIde {
         };
         let files = self.current_project_files();
         // Run flashes the board; Attach only reads what already runs there.
-        if mode == crate::rtt::RttMode::Run {
-            if let Err(why) = fpga_bitstream::preflight(&files) {
-                self.build_tab = BuildPanelTab::Rtt;
-                self.rtt
-                    .state
-                    .lock()
-                    .unwrap()
-                    .push_plain(crate::terminal::LineKind::Notice, format!("[error] {why}"));
-                *self.rtt.phase.lock().unwrap() =
-                    crate::rtt::RttPhase::Error(fpga_bitstream::refusal(&why));
-                return;
-            }
+        if mode == crate::rtt::RttMode::Run
+            && let Some((why, phase)) = self.flash_preflight(&files)
+        {
+            self.build_tab = BuildPanelTab::Rtt;
+            self.rtt
+                .state
+                .lock()
+                .unwrap()
+                .push_plain(crate::terminal::LineKind::Notice, format!("[error] {why}"));
+            *self.rtt.phase.lock().unwrap() = crate::rtt::RttPhase::Error(phase);
+            return;
         }
         let build_dir = crate::workspace::dir();
         match project_gen::write_project(
@@ -653,15 +738,14 @@ impl AppIde {
             return;
         };
         let files = self.current_project_files();
-        if let Err(why) = fpga_bitstream::preflight(&files) {
+        if let Some((why, phase)) = self.flash_preflight(&files) {
             self.build_tab = BuildPanelTab::Debug;
             self.debugger
                 .console
                 .lock()
                 .unwrap()
                 .push_plain(crate::terminal::LineKind::Notice, format!("[error] {why}"));
-            self.debugger.state.lock().unwrap().phase =
-                crate::debugger::DebugPhase::Error(fpga_bitstream::refusal(&why));
+            self.debugger.state.lock().unwrap().phase = crate::debugger::DebugPhase::Error(phase);
             return;
         }
         let build_dir = crate::workspace::dir();
@@ -1354,6 +1438,17 @@ mod tests {
             "start_rtt",
             "start_debug",
         ];
+        // The paths that hand an ESP's partitions.csv on (espflash
+        // `--partition-table`, probe-rs `--idf-partition-table`, DAP), and
+        // every path that writes an STM32 the memory.x of a flash store
+        // (OpenOCD, cargo flash, RTT Run, Debug).
+        const TABLE_CHECKS: [&str; 5] = [
+            "flash_esp",
+            "flash_swd",
+            "flash_probe_rs",
+            "start_rtt",
+            "start_debug",
+        ];
         // Measuring, profiling, sampling a running board, or an ESP (no FPGA).
         const EXEMPT: [&str; 4] = [
             "flash_esp",
@@ -1377,9 +1472,18 @@ mod tests {
             if seen.contains(&name) {
                 continue;
             }
+            // `flash_preflight` is the bitstream check plus the partition table.
+            let first = |a: &str, b: &str| match (body.find(a), body.find(b)) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (x, y) => x.or(y),
+            };
+            if TABLE_CHECKS.contains(&name.as_str()) {
+                let check = first("partition_table_block()", "self.flash_preflight(")
+                    .unwrap_or_else(|| panic!("{name} flashes without checking partitions.csv"));
+                assert!(check < write, "{name} checks the table only after writing");
+            }
             if CHECKS.contains(&name.as_str()) {
-                let check = body
-                    .find("fpga_bitstream::preflight(")
+                let check = first("fpga_bitstream::preflight(", "self.flash_preflight(")
                     .unwrap_or_else(|| panic!("{name} writes the project without the check"));
                 assert!(
                     check < write,
@@ -1400,5 +1504,128 @@ mod tests {
                 "{name} is gone or no longer writes"
             );
         }
+    }
+}
+
+/// The reported case end to end on the app: the example project's own table
+/// blocks Flash ESP32, the repair unblocks it in the editor's copy - the
+/// copy every flash path writes the build from.
+#[cfg(test)]
+mod partition_repair_tests {
+    use crate::app::{AppIde, BuildPanelTab, ProjectFileId};
+    use eframe::egui;
+
+    /// The example project's table, as the editor holds it (LF).
+    const THEIRS: &str = concat!(
+        "# Name,   Type, SubType, Offset,   Size\n",
+        "nvs,      data, nvs,     0x9000,   0x6000\n",
+        "phy_init, data, phy,     0xf000,   0x1000\n",
+        "factory,  app,  factory, 0x10000,  0x3E0000\n",
+        "cfg,      data, 0x99,    0x3F0000, 0x4000",
+    );
+    const FIXED_ROW: &str = "cfg,      data, undefined, 0x3F0000, 0x4000";
+
+    fn esp_app(ctx: egui::Context) -> AppIde {
+        let mut app = AppIde::new(&eframe::CreationContext::_new_kittest(ctx), None, None);
+        app._fs_watcher = None;
+        app.fs_watched = None;
+        app.startup_picker = None;
+        app.selected_mcu_id = "esp32c3".to_owned();
+        app.mcu = AppIde::build_mcu_for(&app.mcu_registry, "esp32c3");
+        app.partitions_csv = THEIRS.to_owned();
+        app
+    }
+
+    #[test]
+    fn the_repair_unblocks_flashing_opens_the_file_and_says_to_save() {
+        let mut app = esp_app(egui::Context::default());
+        let block = app.partition_table_block().expect("0x99 blocks");
+        assert!(block.contains("'0x99'"), "{block}");
+        assert_eq!(
+            app.partition_table_repair().as_deref(),
+            Some("line 5: '0x99' -> 'undefined'")
+        );
+
+        assert!(app.repair_partition_table());
+        assert!(!app.repair_partition_table(), "nothing left to change");
+        assert_eq!(app.partition_table_block(), None, "flashable now");
+        assert_eq!(app.partition_table_repair(), None);
+        assert!(
+            app.current_project_files()
+                .partitions_csv
+                .ends_with(FIXED_ROW),
+            "the build copy follows the editor's"
+        );
+        assert_eq!(app.selected_file, ProjectFileId::PartitionsCsv);
+        assert!(
+            app.dfu_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("Save to keep it on disk")),
+        );
+    }
+
+    /// Found by review: with partitions.csv open in the editor - the natural
+    /// order, the dialog names line 5 - the editor's end-of-frame write-back
+    /// put the text it read at the frame's start back over the repair.
+    #[test]
+    fn the_repair_survives_an_editor_already_showing_the_file() {
+        let ctx = egui::Context::default();
+        let mut app = esp_app(ctx.clone());
+        app.selected_file = ProjectFileId::PartitionsCsv;
+        app.build_tab = BuildPanelTab::Dfu;
+        app.diag_collapsed = false;
+        let frame = |app: &mut AppIde, pass: u64| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                time: Some(pass as f64 / 30.0),
+                predicted_dt: 1.0 / 30.0,
+                ..Default::default()
+            };
+            let _ = crate::headless::run_ui(&ctx, input, |ui| {
+                let files = Some(app.current_project_files());
+                app.show_editor_panel(ui, &files);
+            });
+        };
+        for pass in 0..3 {
+            frame(&mut app, pass);
+        }
+        assert!(
+            app.partitions_csv.contains("0x99"),
+            "the editor kept it as it was"
+        );
+        // The click, as the dialog sends it, lands in the next frame.
+        crate::app::tabs::dfu_tab::request_partition_fix(&ctx);
+        for pass in 3..6 {
+            frame(&mut app, pass);
+        }
+        assert!(
+            app.partitions_csv.ends_with(FIXED_ROW),
+            "the write-back undid the repair:\n{}",
+            app.partitions_csv
+        );
+        assert_eq!(app.partition_table_block(), None);
+    }
+
+    /// A block that is not the table's - the store's own settings here - gets
+    /// no table repair, even with a 0x99 row in the table.
+    #[test]
+    fn no_table_repair_is_offered_for_a_block_that_is_not_the_table() {
+        use crate::panels::mcu_module::flash_store::FlashStoreConfig;
+        let mut app = esp_app(egui::Context::default());
+        let bad = FlashStoreConfig {
+            offset: 0,
+            ..FlashStoreConfig::default_for("esp32c3")
+        };
+        if let Some(m) = &mut app.mcu {
+            m.flash_store = Some(bad);
+        }
+        let block = app.partition_table_block().expect("blocked");
+        assert!(block.starts_with("Flash store:"), "{block}");
+        assert_eq!(app.partition_table_repair(), None);
     }
 }

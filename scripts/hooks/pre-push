@@ -146,6 +146,13 @@ else
                 fams="$fams n6" ;;
             src/panels/mcu_module/codegen_esp_configs.rs|            src/panels/mcu_module/codegen_esp.rs|            assets/mcus/esp*.ron)
                 fams="$fams esp" ;;
+            # The flash store: the ESP32-C3, and STM32 through memory.x (the
+            # F1 rows and the embassy ones). The geometry table feeds the STM32
+            # half only.
+            src/panels/mcu_module/codegen/flash_store_gen.rs|            src/panels/mcu_module/flash_store.rs)
+                fams="$fams esp f1 embassy" ;;
+            src/panels/mcu_module/stm32_flash_geometry.rs)
+                fams="$fams f1 embassy" ;;
             assets/mcus/stm32f103c8t6.ron)
                 fams="$fams f1 embassy" ;;
             *)

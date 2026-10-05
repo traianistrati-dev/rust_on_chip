@@ -261,6 +261,13 @@ $ALL_CASES = @(
     @{ n = "F1 Async -> Blocking switch";  t = "emit_f1_async_project";  e = @{ EIDE_F1_SWITCH = "back" }; q = $false; fam = "f1" }
     @{ n = "F1 RTIC";                      t = "emit_f1_rtic_project";   e = @{};                       q = $true; fam = "f1" }
     @{ n = "F1 Native";                    t = "emit_f1_native_project"; e = @{};                       q = $true; fam = "f1" }
+    # The Configuration tab's flash store on an STM32: stm32f1xx-hal behind the
+    # generated `F1Flash` adapter (Blocking, Native), embassy-stm32's `Flash` on
+    # Async and on the other families, and memory.x's FLASH cut short by the
+    # store. Linked, every one: only the linker reads memory.x and its ASSERT.
+    @{ n = "F1 flash store";               t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f103"; EIDE_STORE_RUNTIME = "blocking" }; q = $true;  fam = "f1"; lk = $true }
+    @{ n = "F1 flash store, Native";       t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f103"; EIDE_STORE_RUNTIME = "native" };   q = $false; fam = "f1"; lk = $true }
+    @{ n = "F1 flash store, Async";        t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f103"; EIDE_STORE_RUNTIME = "async" };    q = $false; fam = "f1"; lk = $true }
 
     # A different HAL and a different entry point, so a different set of ways to
     # be wrong: esp-hal bindings, and the esp-rtos scheduler on the async one.
@@ -291,6 +298,15 @@ $ALL_CASES = @(
     # return type becomes a tuple, and the duty trait addresses it by POSITION,
     # which is not the channel number.
     @{ n = "ESP32-C3, two PWM channels";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_PWM = "0,2" }; q = $true; fam = "esp" }
+
+    # The Configuration tab's flash store: esp-storage + sequential-storage
+    # through the one template, on both runtimes (blocking wrappers vs async),
+    # with the harness using verify/load/save as a user would. The async row
+    # wires NO pin, the "select pins" default block that once dropped the
+    # tab's init lines. The nvs mode writes no partitions.csv: full only.
+    @{ n = "ESP32-C3 flash store";          t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_ESP_FLASHSTORE = "partition" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 flash store, no pins"; t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_FLASHSTORE = "partition"; EIDE_ESP_NOPINS = "1" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 flash store in nvs";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_ESP_FLASHSTORE = "nvs" }; q = $false; fam = "esp" }
 
     # The watchdogs on EVERY bundled Espressif part. The harness switches all
     # three on unless EIDE_ESP_WDG=0, so the six C3 rows above already build
@@ -423,6 +439,18 @@ $ALL_CASES = @(
     # and a harness that emits less under a flag is a harness that can rot.
     @{ n = "embassy (9 projects)";         t = "emit_embassy_project";       e = @{};                       q = $true; fam = "embassy"
        only = @("eide_embassy_check_dma", "eide_embassy_check_async", "eide_embassy_check_dma_f2", "eide_wba_check_wdg") }
+    # The flash store on embassy-stm32: 2 KiB pages and 8-byte words (G431),
+    # 8 KiB pages and 16-byte words on a v8-M part (WBA55), and the Async
+    # runtime on the G431. Linked - see the F1 rows.
+    @{ n = "STM32 flash store, G431";      t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "g431"; EIDE_STORE_RUNTIME = "blocking" }; q = $true;  fam = "embassy"; lk = $true }
+    @{ n = "STM32 flash store, WBA55";     t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "wba55"; EIDE_STORE_RUNTIME = "blocking" }; q = $false; fam = "embassy"; lk = $true }
+    @{ n = "STM32 flash store, G431 Async"; t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "g431"; EIDE_STORE_RUNTIME = "async" };   q = $false; fam = "embassy"; lk = $true }
+    # F4/F7 end in 128/256 KiB sectors: the store sits in the small ones right
+    # after the vector table, through embassy's first flash region, and
+    # memory.x starts the program after it (`_stext`).
+    @{ n = "STM32 flash store, F411";       t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f411"; EIDE_STORE_RUNTIME = "blocking" }; q = $true;  fam = "embassy"; lk = $true }
+    @{ n = "STM32 flash store, F411 Async"; t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f411"; EIDE_STORE_RUNTIME = "async" };   q = $false; fam = "embassy"; lk = $true }
+    @{ n = "STM32 flash store, F746";       t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f746"; EIDE_STORE_RUNTIME = "blocking" }; q = $false; fam = "embassy"; lk = $true }
 
     # These two build from a REAL part in the vendor database rather than from a
     # bundled definition, which is the only way to exercise the importer's own
@@ -459,7 +487,8 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
            "EIDE_F1_SWITCH", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
-           "EIDE_ESP_PULL", "EIDE_ESP_WDG")
+           "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
+           "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME")
 
 # The hook passes its families as ONE comma-joined argument ("embassy,f1"), and
 # `powershell -File` binds that to [string[]] as a single element - it does not

@@ -662,6 +662,13 @@ impl AppIde {
             ".gitignore".into(),
             self.gitignore.clone(),
         ));
+        if !self.partitions_csv.is_empty() {
+            v.push((
+                ProjectFileId::PartitionsCsv,
+                "partitions.csv".into(),
+                self.partitions_csv.clone(),
+            ));
+        }
         v
     }
 
@@ -718,6 +725,7 @@ impl AppIde {
             ProjectFileId::MemoryX => self.memory_x.clone(),
             ProjectFileId::BuildRs => self.build_rs.clone(),
             ProjectFileId::GitIgnore => self.gitignore.clone(),
+            ProjectFileId::PartitionsCsv => self.partitions_csv.clone(),
             ProjectFileId::UserFile(i) => self
                 .project_tree
                 .user_src_files
@@ -736,6 +744,7 @@ impl AppIde {
             ProjectFileId::MemoryX => self.memory_x = content,
             ProjectFileId::BuildRs => self.build_rs = content,
             ProjectFileId::GitIgnore => self.gitignore = content,
+            ProjectFileId::PartitionsCsv => self.partitions_csv = content,
             ProjectFileId::UserFile(i) => {
                 if let Some(e) = self.project_tree.user_src_files.get_mut(i) {
                     e.1 = content;

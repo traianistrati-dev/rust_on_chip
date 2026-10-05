@@ -28,6 +28,9 @@ pub(crate) fn is_ide_managed(path: &str) -> bool {
             // here - and this is the file that decides whether the project
             // compiles at all.
             | "rust-toolchain.toml"
+            // The flash store's partition table: its block is rebuilt from the
+            // Configuration tab, so a git revert of it would not stick.
+            | "partitions.csv"
     ) || path == crate::panels::mcu_module::mcu_config::FILE_NAME
         || crate::project_tree::gui::generated_file_reason(path).is_some()
 }

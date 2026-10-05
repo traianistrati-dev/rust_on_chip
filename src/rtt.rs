@@ -300,14 +300,37 @@ pub(crate) fn probe_rs_failure(tail: &str, probe: Option<&str>) -> Option<String
 /// `--probe VID:PID[:Serial]` pins the session to one probe. Absent, probe-rs
 /// auto-selects - and errors when several are attached, which is why the tabs
 /// share one selector.
-fn probe_rs_args(sub: &str, chip: &str, probe: Option<&str>, elf: &std::path::Path) -> Vec<String> {
+fn probe_rs_args(
+    sub: &str,
+    chip: &str,
+    probe: Option<&str>,
+    partition_table: bool,
+    elf: &std::path::Path,
+) -> Vec<String> {
     let mut args = vec![sub.to_owned(), "--chip".to_owned(), chip.to_owned()];
     if let Some(sel) = crate::probe::selector(probe) {
         args.push("--probe".to_owned());
         args.push(sel.to_owned());
     }
+    // Only `run` flashes; `attach` writes nothing.
+    if partition_table && sub == "run" {
+        args.push("--idf-partition-table".to_owned());
+        args.push("partitions.csv".to_owned());
+    }
     args.push(elf.display().to_string());
     args
+}
+
+/// Does a probe-rs session on `chip` from `project_dir` (the build workspace)
+/// have to flash the project's own partition table?
+///
+/// An ESP flashed without it gets probe-rs's default table, in which the flash
+/// store sits inside the app partition. The file's presence is the answer
+/// because `write_project` - which every RTT / Debug session runs first -
+/// deletes a stale copy from the shared build workspace, so it is there
+/// exactly when THIS project has a table.
+pub(crate) fn idf_partition_table(chip: &str, project_dir: &std::path::Path) -> bool {
+    chip.to_ascii_lowercase().starts_with("esp") && project_dir.join("partitions.csv").is_file()
 }
 
 fn run_session(
@@ -336,7 +359,13 @@ fn run_session(
         RttMode::Run => "run",
         RttMode::Attach => "attach",
     };
-    let args = probe_rs_args(sub, chip, probe, &elf);
+    let args = probe_rs_args(
+        sub,
+        chip,
+        probe,
+        idf_partition_table(chip, project_dir),
+        &elf,
+    );
     state
         .lock()
         .unwrap()
@@ -432,13 +461,43 @@ mod tests {
     use super::probe_rs_args;
     use std::path::Path;
 
+    /// `run` flashes, so it takes the project's partition table - or probe-rs
+    /// writes its default one, with the flash store inside the app partition.
+    /// `attach` writes nothing. The answer is the build workspace's file, and
+    /// only on an ESP.
+    #[test]
+    fn run_flashes_the_projects_partition_table_and_attach_does_not() {
+        let elf = Path::new("a.elf");
+        let run = probe_rs_args("run", "esp32c3", None, true, elf);
+        let at = run
+            .iter()
+            .position(|a| a == "--idf-partition-table")
+            .expect("the flag");
+        assert_eq!(run[at + 1], "partitions.csv");
+        assert_eq!(run.last().map(String::as_str), Some("a.elf"));
+        let attach = probe_rs_args("attach", "esp32c3", None, true, elf);
+        assert!(!attach.iter().any(|a| a == "--idf-partition-table"));
+
+        let dir = std::env::temp_dir().join(format!("eide_rtt_pt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!super::idf_partition_table("esp32c3", &dir));
+        std::fs::write(
+            dir.join("partitions.csv"),
+            "nvs, data, nvs, 0x9000, 0x6000\n",
+        )
+        .unwrap();
+        assert!(super::idf_partition_table("esp32c3", &dir));
+        assert!(!super::idf_partition_table("STM32F103C8", &dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The line the console prints IS the command that runs. It used to be
     /// assembled twice, and the printed one is what a user copies to reproduce
     /// the session by hand.
     #[test]
     fn the_echoed_line_is_the_command() {
         let elf = Path::new("target/x/release/app");
-        let args = probe_rs_args("run", "esp32c6", None, elf);
+        let args = probe_rs_args("run", "esp32c6", None, false, elf);
         assert_eq!(args, ["run", "--chip", "esp32c6", "target/x/release/app"]);
         assert_eq!(
             format!("probe-rs {}", args.join(" ")),
@@ -453,13 +512,13 @@ mod tests {
     fn the_probe_selector_is_added_only_when_there_is_one() {
         let elf = Path::new("app.elf");
         for empty in [None, Some(""), Some("   ")] {
-            let args = probe_rs_args("attach", "esp32", empty, elf);
+            let args = probe_rs_args("attach", "esp32", empty, false, elf);
             assert!(
                 !args.iter().any(|a| a == "--probe"),
                 "{empty:?} produced {args:?}"
             );
         }
-        let args = probe_rs_args("attach", "esp32", Some("303a:1001"), elf);
+        let args = probe_rs_args("attach", "esp32", Some("303a:1001"), false, elf);
         assert_eq!(
             args,
             [
@@ -477,7 +536,7 @@ mod tests {
     /// it would be read as a second path.
     #[test]
     fn the_elf_stays_last() {
-        let args = probe_rs_args("run", "esp32s3", Some("1"), Path::new("a.elf"));
+        let args = probe_rs_args("run", "esp32s3", Some("1"), false, Path::new("a.elf"));
         assert_eq!(args.last().unwrap(), "a.elf");
     }
 
@@ -487,7 +546,13 @@ mod tests {
     fn every_bundled_chip_produces_one_chip_argument() {
         use crate::panels::mcu_module::builtins::builtin_definitions;
         for d in builtin_definitions() {
-            let args = probe_rs_args("run", &d.project.probe_chip, None, Path::new("a.elf"));
+            let args = probe_rs_args(
+                "run",
+                &d.project.probe_chip,
+                None,
+                false,
+                Path::new("a.elf"),
+            );
             let i = args.iter().position(|a| a == "--chip").expect("--chip");
             let name = &args[i + 1];
             assert!(!name.trim().is_empty(), "{}: empty chip name", d.id);

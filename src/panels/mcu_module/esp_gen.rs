@@ -1817,7 +1817,10 @@ mod tests {
         let pretty = PrettyConfig::default().struct_names(true);
         for id in GENERATED {
             let c = esp_metadata::load(&dir, id).unwrap_or_else(|e| panic!("{id}: {e}"));
-            let def = definition(&c).unwrap_or_else(|e| panic!("{id}: {e}"));
+            let mut def = definition(&c).unwrap_or_else(|e| panic!("{id}: {e}"));
+            // The pads' notes are not in the metadata: they come from the
+            // sourced tables, or a regeneration would wipe them.
+            crate::panels::mcu_module::board_notes::apply(&mut def);
             let text = ron::ser::to_string_pretty(&def, pretty.clone()).unwrap();
             let text = crate::panels::mcu_module::ron_text::bare_none(&text);
             let path = format!("assets/mcus/{id}.ron");

@@ -1241,6 +1241,18 @@ fn handle_response(
             if let Some(sel) = &cfg.probe {
                 launch["probe"] = json!(sel);
             }
+            // An ESP flashed without its partition table gets probe-rs's default
+            // one, in which the flash store sits inside the app partition. The
+            // build workspace holds the table exactly when THIS project has one
+            // (`write_project` deletes a stale copy there). Key shape read from
+            // probe-rs 0.29.0: `FlashingConfig.format_options` (camelCase) ->
+            // `FormatOptions.idf_options.idf_partition_table`.
+            let table = cfg.project_dir.join("partitions.csv");
+            if crate::rtt::idf_partition_table(&cfg.chip, &cfg.project_dir) {
+                launch["flashingConfig"]["formatOptions"] = json!({
+                    "idf_options": { "idf_partition_table": table.to_string_lossy() }
+                });
+            }
             wire.request("launch", launch, Pending::Launch);
         }
         Pending::Launch => {

@@ -106,7 +106,7 @@ fn field_value<'a>(spec: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// An ld number: `0x…` hex, decimal, optional `K`/`M` multiplier suffix.
-fn parse_ld_number(tok: &str) -> Option<u64> {
+pub(crate) fn parse_ld_number(tok: &str) -> Option<u64> {
     let tok = tok.trim();
     let (tok, mult) = match tok.chars().last() {
         Some('K') | Some('k') => (&tok[..tok.len() - 1], 1024u64),
@@ -245,6 +245,8 @@ pub fn parse_elf(bytes: &[u8], limits: MemLimits) -> Result<MemUsage, String> {
 
     // ── Section breakdown (best-effort — totals never depend on it) ──────────
     let mut sections = Vec::new();
+    // (name, address, size) of every ALLOC section, for the hole below.
+    let mut spans: Vec<(String, u64, u64)> = Vec::new();
     let read_section = |at: usize| -> Result<(u64, u32, u64, u64, u64), String> {
         // (name_off, type, flags, addr, size)
         if is64 {
@@ -295,6 +297,7 @@ pub fn parse_elf(bytes: &[u8], limits: MemLimits) -> Result<MemUsage, String> {
                 None => sh_flags & SHF_WRITE != 0 || sh_type == SHT_NOBITS,
             };
             let in_flash = sh_type != SHT_NOBITS;
+            spans.push((name.clone(), addr, size));
             sections.push(SectionUse {
                 name,
                 size,
@@ -304,12 +307,45 @@ pub fn parse_elf(bytes: &[u8], limits: MemLimits) -> Result<MemUsage, String> {
         }
     }
 
+    // The bar's capacity is what the PROGRAM can use: FLASH less the hole a
+    // memory.x leaves before `_stext` (the rest of sector 0 and an F2/F4/F7
+    // flash store), as an end-of-flash store's shorter LENGTH already is.
+    let limits = MemLimits {
+        flash: limits.flash.map(|f| MemRegion {
+            length: f.length.saturating_sub(hole_after_vectors(f, &spans)),
+            ..f
+        }),
+        ..limits
+    };
+
     Ok(MemUsage {
         flash_used,
         ram_used,
         limits,
         sections,
     })
+}
+
+/// The bytes in `flash` between the end of `.vector_table` and the next
+/// section: 0 in cortex-m-rt's own layout, where `.text` follows the table;
+/// the rest of sector 0 plus the store when memory.x starts the program past
+/// a Configuration-tab flash store (`_stext`). Nothing is loaded there, so the
+/// used bytes never count it, and lld still charges it to FLASH.
+fn hole_after_vectors(flash: MemRegion, spans: &[(String, u64, u64)]) -> u64 {
+    let Some(table_end) = spans
+        .iter()
+        .find(|(name, ..)| name == ".vector_table")
+        .map(|(_, addr, size)| addr + size)
+        .filter(|&end| end > flash.origin && flash.contains(end - 1))
+    else {
+        return 0;
+    };
+    spans
+        .iter()
+        .map(|&(_, addr, _)| addr)
+        .filter(|&addr| addr >= table_end && flash.contains(addr))
+        .min()
+        .map_or(0, |next| next - table_end)
 }
 
 // ── State + runner ────────────────────────────────────────────────────────────
@@ -591,6 +627,72 @@ mod tests {
         assert_eq!(u.flash_used, 0x100 + 0x20);
         assert_eq!(u.ram_used, 0x20 + 0x80);
         assert!(u.limits.flash.is_none() && u.limits.ram.is_none());
+    }
+
+    /// An ELF32 LE with `.vector_table` at the start of flash and `.text` at
+    /// `text_addr` - right after it, or past a hole (`_stext` moved).
+    fn vectors_then_text_elf(text_addr: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        push16(&mut b, 2); // e_type EXEC
+        push16(&mut b, 0x28); // e_machine ARM
+        push32(&mut b, 1); // e_version
+        push32(&mut b, 0x0800_0000); // e_entry
+        push32(&mut b, 52); // e_phoff
+        push32(&mut b, 116); // e_shoff (52 + 2 * 32)
+        push32(&mut b, 0); // e_flags
+        push16(&mut b, 52); // e_ehsize
+        push16(&mut b, 32); // e_phentsize
+        push16(&mut b, 2); // e_phnum
+        push16(&mut b, 40); // e_shentsize
+        push16(&mut b, 4); // e_shnum
+        push16(&mut b, 3); // e_shstrndx
+        for (va, size) in [(0x0800_0000, 0x188), (text_addr, 0x400)] {
+            for x in [1, 0x1000, va, va, size, size, 5, 4] {
+                push32(&mut b, x);
+            }
+        }
+        assert_eq!(b.len(), 116);
+        // shstrtab at file offset 276: "\0.vector_table\0.text\0.shstrtab\0".
+        let shdrs: [(u32, u32, u32, u32, u32, u32); 4] = [
+            (0, 0, 0, 0, 0, 0),
+            (1, 1, 0x2, 0x0800_0000, 0x1000, 0x188),
+            (15, 1, 0x6, text_addr, 0x2000, 0x400),
+            (21, 3, 0x0, 0, 276, 31),
+        ];
+        for (name, t, fl, addr, off, size) in shdrs {
+            for x in [name, t, fl, addr, off, size, 0, 0, 1, 0] {
+                push32(&mut b, x);
+            }
+        }
+        assert_eq!(b.len(), 276);
+        b.extend_from_slice(b"\0.vector_table\0.text\0.shstrtab\0");
+        b
+    }
+
+    /// Found by review: an F2/F4/F7 flash store keeps FLASH whole and moves
+    /// `_stext` past it, and the bar still offered the hole to the program -
+    /// green at 62% on a 128 KiB F401 whose next bytes would not link.
+    #[test]
+    fn the_flash_capacity_leaves_out_a_hole_before_the_program() {
+        let limits = MemLimits {
+            flash: Some(MemRegion {
+                origin: 0x0800_0000,
+                length: 512 * 1024,
+            }),
+            ram: None,
+        };
+        let packed = parse_elf(&vectors_then_text_elf(0x0800_0188), limits).unwrap();
+        assert_eq!(packed.limits.flash.unwrap().length, 512 * 1024);
+        let store = parse_elf(&vectors_then_text_elf(0x0800_C000), limits).unwrap();
+        assert_eq!(
+            store.limits.flash.unwrap().length,
+            512 * 1024 - (0xC000 - 0x188)
+        );
+        assert_eq!(store.flash_used, 0x188 + 0x400);
+        // Without memory.x there is no capacity to shrink.
+        let none = parse_elf(&vectors_then_text_elf(0x0800_C000), MemLimits::default()).unwrap();
+        assert!(none.limits.flash.is_none());
     }
 
     #[test]

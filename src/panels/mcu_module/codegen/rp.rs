@@ -2585,6 +2585,8 @@ pub(super) mod pico2_ice_board {
             bottom: row(&BOTTOM, 81 + TOP.len()),
             grid: None,
         };
+        // What the board does to each pad, from the sourced tables.
+        crate::panels::mcu_module::board_notes::apply(&mut d);
         d
     }
 

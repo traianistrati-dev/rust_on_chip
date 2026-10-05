@@ -427,6 +427,7 @@ impl AppIde {
                                 ui,
                                 &project.pkg_name,
                                 &toolchain,
+                                !self.partitions_csv.is_empty(),
                                 &mut self.selected_file,
                                 &badges,
                                 &mut self.project_tree.user_src_files,

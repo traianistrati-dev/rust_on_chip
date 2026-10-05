@@ -3489,6 +3489,9 @@ impl AppIde {
             "memory.x" => Some((ProjectFileId::MemoryX, self.memory_x.clone())),
             "build.rs" => Some((ProjectFileId::BuildRs, self.build_rs.clone())),
             ".gitignore" => Some((ProjectFileId::GitIgnore, self.gitignore.clone())),
+            "partitions.csv" if !self.partitions_csv.is_empty() => {
+                Some((ProjectFileId::PartitionsCsv, self.partitions_csv.clone()))
+            }
             _ => self
                 .project_tree
                 .user_src_files

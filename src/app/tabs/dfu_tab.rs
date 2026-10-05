@@ -87,9 +87,15 @@ pub fn show_dfu_tab(
     // and it is why `probe-rs list` can come back empty on a board that is
     // plugged in and working. See `tabs::no_probe_message`.
     holder: Option<(&str, &str)>,
-    // Why the FPGA bitstream the firmware embeds must not be flashed, if it
-    // must not. ESP has no FPGA, so only the SWD and probe-rs buttons read it.
-    fpga_block: Option<&str>,
+    // Why the project must not be flashed as it stands, if it must not: an
+    // FPGA bitstream the board would reject, or a partition table that is
+    // wrong. Each source only arises on its own boards (FPGA loaders, ESP), so
+    // every flash button can read the one value.
+    flash_block: Option<&str>,
+    // What "Fix partitions.csv" would change, when the block is a table
+    // espflash panics on (`AppIde::partition_table_repair`). The click comes
+    // back through `take_partition_fix_request`.
+    table_fix: Option<&str>,
 ) {
     let state = dfu_state.lock().unwrap().clone();
     let ocd_state = openocd_state.lock().unwrap().clone();
@@ -160,10 +166,10 @@ pub fn show_dfu_tab(
             .then(|| "no buildable chip configuration yet — set the MCU up first".to_owned())
     };
     let busy_note = || any_busy.then(|| "another flash is already running".to_owned());
-    let bad_bitstream = || fpga_block.map(str::to_owned);
+    let blocked = || flash_block.map(str::to_owned);
     let swd_reason: Option<String> = held("OpenOCD")
         .or_else(no_cfg)
-        .or_else(bad_bitstream)
+        .or_else(blocked)
         .or_else(busy_note)
         .or_else(|| {
             (!is_swd).then(|| {
@@ -174,12 +180,13 @@ pub fn show_dfu_tab(
     let esp_reason: Option<String> = super::tool_missing(missing_tools, "espflash")
         .then(|| super::needs_tool_hint("espflash"))
         .or_else(no_cfg)
+        .or_else(blocked)
         .or_else(busy_note);
     let probe_reason: Option<String> = super::tool_missing(missing_tools, "probe-rs")
         .then(|| super::needs_tool_hint("probe-rs"))
         .or_else(|| held("cargo flash"))
         .or_else(no_cfg)
-        .or_else(bad_bitstream)
+        .or_else(blocked)
         // No auto-select on this path: `cargo flash` with an ambiguous probe
         // doesn't error, it waits — so the choice is made here, up front.
         .or_else(|| {
@@ -398,7 +405,7 @@ pub fn show_dfu_tab(
 
     // A red Flash button explains itself on CLICK (see `flash_button`), so the
     // reason no longer takes a permanent line here.
-    blocked_dialog(ui);
+    blocked_dialog(ui, flash_block.zip(table_fix));
 
     // A tagged probe-rs failure (a probe that won't open, a crash) gets its
     // explanation here — the log below only holds the raw cause.
@@ -1359,13 +1366,37 @@ fn open_blocked_dialog(ui: &egui::Ui, what: &str, reason: &str) {
     ui.data_mut(|d| d.insert_temp(blocked_dialog_id(), (what.to_owned(), reason.to_owned())));
 }
 
+fn partition_fix_request_id() -> egui::Id {
+    egui::Id::new("flash_partition_fix_request")
+}
+
+/// "Fix partitions.csv" was clicked. Signalled through egui temp data, as
+/// `failure_hint`'s "Open Tools" is, so the click needs no out-parameter
+/// threaded through every tab.
+pub(crate) fn request_partition_fix(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(partition_fix_request_id(), true));
+}
+
+/// Was "Fix partitions.csv" clicked since the last call? The other half of
+/// [`request_partition_fix`].
+pub(crate) fn take_partition_fix_request(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| d.remove_temp::<bool>(partition_fix_request_id()))
+        .unwrap_or(false)
+}
+
 /// The "why can't this run" dialog — a real window on the context, so it floats
 /// above the panel that opened it.
-fn blocked_dialog(ui: &mut egui::Ui) {
+///
+/// `fix` = (the block as it stands now, what the repair would change). The
+/// "Fix partitions.csv" button is offered only while the dialog explains THAT
+/// block - not when it was opened for a missing tool, say, or the table has
+/// changed since.
+fn blocked_dialog(ui: &mut egui::Ui, fix: Option<(&str, &str)>) {
     let Some((what, reason)) = ui.data(|d| d.get_temp::<(String, String)>(blocked_dialog_id()))
     else {
         return;
     };
+    let fix = fix.filter(|(block, _)| *block == reason).map(|(_, f)| f);
     let mut open = true;
     let mut dismissed = false;
     egui::Window::new(format!("{} {what}", ph::WARNING))
@@ -1377,14 +1408,38 @@ fn blocked_dialog(ui: &mut egui::Ui) {
             ui.set_max_width(440.0);
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(format!("{what} can't run: {reason}."))
-                        .size(11.5)
-                        .color(egui::Color32::from_rgb(230, 200, 190)),
+                    // The reasons are sentences of their own, often with a
+                    // full stop already.
+                    egui::RichText::new(format!(
+                        "{what} can't run: {}.",
+                        reason.trim_end_matches('.')
+                    ))
+                    .size(11.5)
+                    .color(egui::Color32::from_rgb(230, 200, 190)),
                 )
                 .wrap(),
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
+                if let Some(change) = fix {
+                    let fix_clicked = ui
+                        .button(format!("{} Fix partitions.csv", ph::WRENCH))
+                        .on_hover_text(format!(
+                            concat!(
+                                "Change only what espflash cannot read: {}. Names, ",
+                                "offsets and sizes stay. Firmware that looks the ",
+                                "partition up by its old subtype number must use 0x06 ",
+                                "(undefined) too; one that uses a fixed range is ",
+                                "unaffected. Save keeps it on disk."
+                            ),
+                            change
+                        ))
+                        .clicked();
+                    if fix_clicked {
+                        request_partition_fix(ui.ctx());
+                        dismissed = true;
+                    }
+                }
                 if ui.button("OK").clicked() {
                     dismissed = true;
                 }
@@ -1918,5 +1973,112 @@ mod tests {
         }
         // On a wide panel the cap is what binds, not the leftover space.
         assert!((combo_width(2400.0) - 2400.0 * COMBO_MAX_FRACTION).abs() < 0.5);
+    }
+}
+
+/// The reported dead end: a red Flash ESP32 whose dialog only said "OK" about
+/// the example project's `cfg, data, 0x99` row - and said it with "..".
+#[cfg(test)]
+mod blocked_dialog_tests {
+    use super::{blocked_dialog, blocked_dialog_id, take_partition_fix_request};
+    use eframe::egui;
+
+    const WHAT: &str = "Flash ESP32";
+    const WHY: &str = "partitions.csv: Line 5: espflash cannot read the data subtype '0x99' (it stops with a panic); use 'undefined'.";
+    const FIX: &str = "line 5: '0x99' -> 'undefined'";
+
+    fn frame(
+        ctx: &egui::Context,
+        pass: u64,
+        events: Vec<egui::Event>,
+        fix: Option<(&str, &str)>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            time: Some(pass as f64 / 30.0),
+            predicted_dt: 1.0 / 30.0,
+            events,
+            ..Default::default()
+        };
+        crate::headless::run_ui(ctx, input, |ui| blocked_dialog(ui, fix))
+    }
+
+    fn painted(out: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        fn walk(s: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match s {
+                egui::Shape::Text(t) if t.galley.text().contains(needle) => {
+                    Some(t.visual_bounding_rect())
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|c| walk(&c.shape, needle))
+    }
+
+    fn click(at: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    fn open(ctx: &egui::Context, reason: &str) {
+        ctx.data_mut(|d| d.insert_temp(blocked_dialog_id(), (WHAT.to_owned(), reason.to_owned())));
+    }
+
+    #[test]
+    fn the_dialog_offers_the_repair_for_its_own_block_and_reports_the_click() {
+        let ctx = egui::Context::default();
+        open(&ctx, WHY);
+        let fix = Some((WHY, FIX));
+        let mut out = frame(&ctx, 0, vec![], fix);
+        for pass in 1..4 {
+            out = frame(&ctx, pass, vec![], fix);
+        }
+        assert!(
+            painted(&out, "'undefined'.").is_some(),
+            "the reason is shown"
+        );
+        assert!(painted(&out, "'undefined'..").is_none(), "one full stop");
+        let at = painted(&out, "Fix partitions.csv")
+            .expect("the repair is offered")
+            .center();
+        frame(&ctx, 4, click(at, true), fix);
+        frame(&ctx, 5, click(at, false), fix);
+        assert!(
+            take_partition_fix_request(&ctx),
+            "the click reaches the app"
+        );
+        assert!(!take_partition_fix_request(&ctx), "and is taken once");
+        assert!(
+            ctx.data(|d| d.get_temp::<(String, String)>(blocked_dialog_id()))
+                .is_none(),
+            "the dialog closes"
+        );
+    }
+
+    /// Opened for another reason (a missing tool), or for a table that has
+    /// changed since: no repair button.
+    #[test]
+    fn no_repair_is_offered_for_another_reason() {
+        for (reason, fix) in [("espflash is not installed", Some((WHY, FIX))), (WHY, None)] {
+            let ctx = egui::Context::default();
+            open(&ctx, reason);
+            let mut out = frame(&ctx, 0, vec![], fix);
+            for pass in 1..4 {
+                out = frame(&ctx, pass, vec![], fix);
+            }
+            assert!(painted(&out, "can't run").is_some(), "{reason}");
+            assert!(painted(&out, "Fix partitions.csv").is_none(), "{reason}");
+        }
     }
 }

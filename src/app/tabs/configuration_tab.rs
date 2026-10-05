@@ -46,8 +46,13 @@ fn human_us(us: u32) -> String {
 impl AppIde {
     /// Render the Configuration tab. Called only with a chip selected.
     pub(in crate::app) fn show_configuration_tab(&mut self, ui: &mut egui::Ui) {
+        let mut store_facts =
+            StoreFacts::of(&self.generated_code, &self.partitions_csv, &self.memory_x);
         let Some(mcu) = &mut self.mcu else { return };
+        store_facts.wwdg_us = mcu.watchdog.wwdg.map(|w| w.timeout_us);
+        store_facts.iwdg_us = mcu.watchdog.iwdg.map(|w| w.timeout_us);
         let family = mcu.family.clone();
+        let store_platform = crate::panels::mcu_module::flash_store::platform_of(mcu);
         let limits = wdg::limits_for(&family, mcu.runtime);
         // The WWDG's whole range is relative to PCLK1, so the Clock tab feeds
         // this one. 0 = no clock model → the range is unknowable, and the tab
@@ -114,10 +119,10 @@ impl AppIde {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(4.0);
-            ui.label(dim(
-                "Peripherals with no pin of their own: which DMA channels the project \
-                 uses, and the watchdogs.",
-            ));
+            ui.label(dim(concat!(
+                "Peripherals with no pin of their own: which DMA channels the project ",
+                "uses, the flash store, and the watchdogs."
+            )));
             ui.add_space(10.0);
 
             dma_card(
@@ -141,6 +146,16 @@ impl AppIde {
             }
 
             comp_cards(ui, &mut mcu.comp, &comps, comp_gen, &family, is_async);
+            ui.add_space(12.0);
+
+            // Before the watchdogs, whose section can end the tab early.
+            flash_store_card(
+                ui,
+                &mut mcu.flash_store,
+                &family,
+                &store_platform,
+                &store_facts,
+            );
             ui.add_space(12.0);
 
             let esp = wdg::is_esp(&family);
@@ -213,6 +228,514 @@ impl AppIde {
             ui.add_space(10.0);
         });
     }
+}
+
+/// What the flash store card needs to know about the files the store writes
+/// to. Taken before the tab borrows the MCU, since they live beside it.
+struct StoreFacts {
+    /// The code below main.rs's markers also moves the FLASH peripheral
+    /// (`peripherals.FLASH` on an ESP, `p.FLASH` / `dp.FLASH` on an STM32) - a
+    /// second move once the generated block takes it, which does not compile.
+    tail_takes_flash: bool,
+    /// The code below the markers builds the store already, seeded or typed.
+    tail_uses_store: bool,
+    /// The project's partitions.csv as it stands, the IDE's or the user's own.
+    csv: String,
+    /// The project's memory.x as it stands, the IDE's or the user's own.
+    memory_x: String,
+    /// The tab's own WWDG and IWDG periods, while switched on: an F2/F4/F7
+    /// sector erase outlasts them (`flash_store::erase_stall_us`).
+    wwdg_us: Option<u32>,
+    iwdg_us: Option<u32>,
+}
+
+impl StoreFacts {
+    fn of(main_rs: &str, csv: &str, memory_x: &str) -> Self {
+        let tail = main_rs
+            .find(crate::panels::mcu_module::codegen::GEN_END)
+            .map_or("", |at| &main_rs[at..]);
+        Self {
+            // `p.FLASH` also covers `dp.FLASH`.
+            tail_takes_flash: tail.contains("peripherals.FLASH") || tail.contains("p.FLASH"),
+            tail_uses_store: tail.contains("ConfigStore::new("),
+            csv: csv.to_owned(),
+            memory_x: memory_x.to_owned(),
+            wwdg_us: None,
+            iwdg_us: None,
+        }
+    }
+}
+
+/// `0x400000` as "4 MB".
+fn mb(bytes: u32) -> String {
+    format!("{} MB", bytes / 0x10_0000)
+}
+
+/// The flash store: settings kept in the chip's own flash, and what reserves
+/// the bytes they live in. See [`crate::panels::mcu_module::flash_store`].
+///
+/// Shown on every family - greyed with the reason where it is not generated
+/// yet, the house rule for a feature the chip could have. A store switched on
+/// before a chip change can still be switched off there. `platform` is
+/// `flash_store::platform` for the chip and runtime: the ESP and the STM32
+/// share the frame, the toggle and the tail of the card, and differ in what
+/// reserves the store.
+fn flash_store_card(
+    ui: &mut egui::Ui,
+    cfg: &mut Option<crate::panels::mcu_module::flash_store::FlashStoreConfig>,
+    family: &str,
+    platform: &Result<crate::panels::mcu_module::flash_store::Platform, String>,
+    facts: &StoreFacts,
+) {
+    use crate::panels::mcu_module::flash_store::{FlashStoreConfig, Layout, Platform};
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        let mut on = cfg.is_some();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(platform.is_ok() || on, |ui| {
+                if ui.checkbox(&mut on, "").changed() {
+                    *cfg = match (on, platform) {
+                        (true, Ok(p)) => Some(FlashStoreConfig::default_on(p, family)),
+                        _ => None,
+                    };
+                }
+            });
+            ui.label(egui::RichText::new(format!("{}  FLASH STORE", ph::FLOPPY_DISK)).strong());
+            ui.label(dim("settings kept in the chip's own flash"));
+        });
+        let platform = match platform {
+            Ok(p) => *p,
+            Err(why) => {
+                ui.label(dim(why.as_str()));
+                return;
+            }
+        };
+        ui.label(dim(concat!(
+            "sequential-storage keeps a small key -> value map in a flash region. ",
+            "src/pins/configs/flash_store.rs holds your Data, load() and save(); ",
+            "the generated block hands it the flash as `flash`."
+        )));
+        let Some(c) = cfg.as_mut() else { return };
+        ui.add_space(6.0);
+
+        // The settings, then what reserves the store - the checks a flash is
+        // refused on (`flash_store::project_flash_block`).
+        let problems = match platform {
+            Platform::Esp => esp_store_body(ui, c, facts),
+            Platform::Stm32 { hal, geo, layout } => {
+                stm32_store_body(ui, c, &geo, hal, layout, facts)
+            }
+        };
+        ui.label(dim(concat!(
+            "Moving or resizing the store leaves what it held behind: the next save ",
+            "starts it empty."
+        )));
+        let reset_label = match platform {
+            Platform::Esp => "Restore 16 KiB at the top of the flash, in a partition of its own",
+            Platform::Stm32 {
+                layout: Layout::End,
+                ..
+            } => "Restore the last two pages of the flash",
+            Platform::Stm32 { .. } => "Restore the two sectors after the vector table's",
+        };
+        problem_and_reset(
+            ui,
+            (!problems.is_empty()).then(|| problems.join(" ")),
+            reset_label,
+            || {
+                let flash_size = c.flash_size;
+                *c = FlashStoreConfig::default_on(&platform, family);
+                if platform == Platform::Esp {
+                    // The ESP's flash size is the user's knowledge of their
+                    // module: keep it. An STM32's comes from the part.
+                    c.flash_size = flash_size;
+                    c.offset = flash_size.saturating_sub(c.size);
+                }
+            },
+        );
+
+        if facts.tail_takes_flash {
+            let taken = match platform {
+                Platform::Esp => "peripherals.FLASH",
+                Platform::Stm32 { .. } => "the FLASH peripheral",
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    concat!(
+                        "{}  Your code below the markers also takes {}. The generated ",
+                        "block takes it now, as `flash` - use that, or the second move ",
+                        "does not compile."
+                    ),
+                    ph::WARNING,
+                    taken
+                ))
+                .size(11.0)
+                .color(egui::Color32::from_rgb(235, 150, 90)),
+            );
+        }
+        if !facts.tail_uses_store {
+            const LINE: &str = "let mut flash_store = flash_store::ConfigStore::new(flash);";
+            ui.add_space(4.0);
+            ui.label(dim(
+                "The IDE puts this line only into an untouched loop. Add it below the markers:",
+            ));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(LINE).monospace().size(11.0));
+                if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                    ui.ctx().copy_text(LINE.to_owned());
+                }
+            });
+        }
+        ui.add_space(4.0);
+        let ours = fs_memory_x_is_ours(&facts.memory_x);
+        ui.label(dim(match platform {
+            Platform::Esp => concat!(
+                "Check it on the chip: flash_store::verify(&mut flash) before ConfigStore::new ",
+                "reads the partition table the bootloader uses. Or read the table back: ",
+                "espflash read-flash 0x8000 0xC00 pt.bin, then espflash partition-table pt.bin."
+            ),
+            Platform::Stm32 {
+                layout: Layout::End,
+                ..
+            } if ours => concat!(
+                "Checked while building: memory.x ends FLASH where the store begins, so a ",
+                "program that grows into it fails to link, and a range that is not whole ",
+                "pages at the end of flash fails to compile."
+            ),
+            Platform::Stm32 {
+                layout: Layout::End,
+                ..
+            } => concat!(
+                "Checked before each flash: your memory.x's FLASH must end where the store ",
+                "begins. A range that is not whole pages at the end of flash fails to ",
+                "compile."
+            ),
+            Platform::Stm32 { .. } if ours => concat!(
+                "Checked while building: memory.x ASSERTs that the vector table ends before ",
+                "the store and that _stext starts the program after it, and a range that is ",
+                "not whole sectors right after the vector table's fails to compile."
+            ),
+            Platform::Stm32 { .. } => concat!(
+                "Checked before each flash: your memory.x's FLASH must start in sector 0 and ",
+                "its _stext at or after the store's end. A range that is not whole sectors ",
+                "right after the vector table's fails to compile."
+            ),
+        }));
+    });
+}
+
+/// The ESP half of the card: where the store lives (its own partition, or the
+/// default `nvs` one) and the partition table that reserves it. Returns the
+/// problems to show.
+fn esp_store_body(
+    ui: &mut egui::Ui,
+    c: &mut crate::panels::mcu_module::flash_store::FlashStoreConfig,
+    facts: &StoreFacts,
+) -> Vec<String> {
+    use crate::panels::mcu_module::flash_store::{self as fs, FlashStoreMode, Platform};
+    // A table the IDE does not manage: flashed as it is, only checked.
+    let own_table = !facts.csv.trim().is_empty()
+        && !crate::panels::mcu_module::project_gen::partitions_csv_is_ours(&facts.csv);
+
+    for m in [FlashStoreMode::Partition, FlashStoreMode::Nvs] {
+        ui.radio_value(&mut c.mode, m, m.label());
+    }
+    ui.add_space(4.0);
+    match c.mode {
+        FlashStoreMode::Partition | FlashStoreMode::MemoryX => {
+            ui.horizontal(|ui| {
+                ui.label("Flash size");
+                let before = c.flash_size;
+                egui::ComboBox::from_id_salt("flash_store_flash_size")
+                    .selected_text(mb(c.flash_size))
+                    .show_ui(ui, |ui| {
+                        for s in fs::FLASH_SIZES {
+                            ui.selectable_value(&mut c.flash_size, s, mb(s));
+                        }
+                    });
+                // A store at the top stays at the top of the new size.
+                if c.flash_size != before && c.offset + c.size == before {
+                    c.offset = c.flash_size.saturating_sub(c.size);
+                }
+                ui.label(dim(concat!(
+                    "not detected here - Flash tab > Read chip info (espflash ",
+                    "board-info) prints it, or check the module marking"
+                )));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Size");
+                let mut sectors = c.size / fs::SECTOR;
+                let at_top = c.offset + c.size == c.flash_size;
+                let resp = ui.add(
+                    crate::panels::drag_value(ui, &mut sectors)
+                        .range(fs::MIN_SECTORS..=256)
+                        .clamp_existing_to_range(false)
+                        .speed(0.1)
+                        .suffix(" sectors"),
+                );
+                if resp.changed() {
+                    c.size = sectors * fs::SECTOR;
+                    if at_top {
+                        c.offset = c.flash_size.saturating_sub(c.size);
+                    }
+                }
+                ui.label(dim(format!("{} KiB", c.size / 1024)));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Offset");
+                let mut at = c.offset / fs::SECTOR;
+                let resp = ui.add(
+                    crate::panels::drag_value(ui, &mut at)
+                        .range(0..=c.flash_size / fs::SECTOR)
+                        .clamp_existing_to_range(false)
+                        .speed(0.1)
+                        .custom_formatter(|n, _| format!("0x{:X}", n as u32 * fs::SECTOR))
+                        .custom_parser(|s| {
+                            let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+                            u32::from_str_radix(s, 16)
+                                .ok()
+                                .map(|v| f64::from(v / fs::SECTOR))
+                        }),
+                );
+                if resp.changed() {
+                    c.offset = at * fs::SECTOR;
+                }
+                if ui
+                    .button("Top of flash")
+                    .on_hover_text("Put the store in the last sectors of the flash")
+                    .clicked()
+                {
+                    c.offset = c.flash_size.saturating_sub(c.size);
+                }
+            });
+            let r = c.range();
+            let table = if own_table {
+                format!(
+                    concat!(
+                        "Your own partitions.csv (no IDE markers) is flashed as it ",
+                        "is; it must carry `{}`."
+                    ),
+                    fs::store_row(c)
+                )
+            } else {
+                format!(
+                    "Written into partitions.csv as `{}, data, undefined`.",
+                    fs::LABEL
+                )
+            };
+            ui.label(dim(format!(
+                "Store 0x{:X}..0x{:X}; the app partition runs 0x{:X}..0x{:X} ({} KiB). {table}",
+                r.start,
+                r.end,
+                fs::APP_OFFSET,
+                c.offset,
+                c.app_size() / 1024,
+            )));
+        }
+        FlashStoreMode::Nvs => {
+            ui.label(dim(concat!(
+                "The default table's nvs partition, 0x9000..0xF000 (24 KiB): every ",
+                "espflash table reserves it, and a flash never erases it. Its format ",
+                "is sequential-storage's, not ESP-IDF NVS - code expecting real NVS ",
+                "there (Wi-Fi, ESP-IDF) would not read it."
+            )));
+            if !facts.csv.trim().is_empty() {
+                ui.label(dim(format!(
+                    concat!(
+                        "partitions.csv is flashed instead of espflash's default ",
+                        "table, so it must keep `{}`."
+                    ),
+                    fs::store_row(c)
+                )));
+            }
+        }
+    }
+
+    // An empty table in Partition mode is one frame away from being generated.
+    let mut problems = c.problems_on(&Platform::Esp);
+    if !facts.csv.trim().is_empty() {
+        let known_size = c.needs_partition_table().then_some(c.flash_size);
+        problems.extend(fs::csv_problems(&facts.csv, known_size, Some(c)));
+        if own_table && fs::store_row_missing(&facts.csv, c) {
+            problems.push(format!(
+                concat!(
+                    "partitions.csv is your own (no IDE markers), so it is not ",
+                    "rewritten - give it the row `{}`."
+                ),
+                fs::store_row(c)
+            ));
+        }
+    }
+    problems
+}
+
+/// The STM32 half of the card: how many pages - at the end of flash, or on
+/// an F2/F4/F7 the small sectors after the vector table's - what memory.x
+/// does to keep the program out of them, and which HAL writes them. No
+/// offset: the layout fixes it. Returns the problems to show.
+fn stm32_store_body(
+    ui: &mut egui::Ui,
+    c: &mut crate::panels::mcu_module::flash_store::FlashStoreConfig,
+    geo: &crate::panels::mcu_module::flash_store::Geometry,
+    hal: crate::panels::mcu_module::flash_store::StmHal,
+    layout: crate::panels::mcu_module::flash_store::Layout,
+    facts: &StoreFacts,
+) -> Vec<String> {
+    use crate::panels::mcu_module::flash_store::{
+        self as fs, FlashStoreMode, Layout, Platform, STM32_FLASH_BASE, StmHal,
+    };
+    let page = geo.store_page(layout).max(1);
+    ui.label(dim(match layout {
+        Layout::End => format!(
+            "{}. Pages of {} KiB, {} KiB of flash in all.",
+            FlashStoreMode::MemoryX.label(),
+            page / 1024,
+            geo.size / 1024
+        ),
+        Layout::AfterVectors => format!(
+            concat!(
+                "This flash ends in sectors of {} KiB, so the store takes the small ones ",
+                "at its start: right after the vector table's sector, before the program ",
+                "(memory.x's _stext) - ST's AN3969 layout. Sectors of {} KiB; the rest of ",
+                "sector 0 stays unused."
+            ),
+            geo.page / 1024,
+            page / 1024
+        ),
+    }));
+    // End: up to half the flash. After the vectors: the small sectors left
+    // after sector 0.
+    let max_pages = match layout {
+        Layout::End => geo.size / 2 / page,
+        Layout::AfterVectors => geo.head_size / page - 1,
+    }
+    .max(fs::MIN_SECTORS);
+    ui.horizontal(|ui| {
+        ui.label("Size");
+        let mut pages = c.size / page;
+        let resp = ui.add(
+            crate::panels::drag_value(ui, &mut pages)
+                .range(fs::MIN_SECTORS..=max_pages)
+                .clamp_existing_to_range(false)
+                .speed(0.1)
+                .suffix(match layout {
+                    Layout::End => " pages",
+                    Layout::AfterVectors => " sectors",
+                }),
+        );
+        if resp.changed() {
+            c.mode = FlashStoreMode::MemoryX;
+            c.flash_size = geo.size;
+            c.size = pages * page;
+            c.offset = match layout {
+                Layout::End => geo.size.saturating_sub(c.size),
+                Layout::AfterVectors => page,
+            };
+        }
+        ui.label(dim(format!("{} KiB", c.size / 1024)));
+    });
+    let r = c.range();
+    let start = u64::from(STM32_FLASH_BASE) + u64::from(r.start);
+    let end = u64::from(STM32_FLASH_BASE) + u64::from(r.end);
+    let ours = fs_memory_x_is_ours(&facts.memory_x);
+    let reserve = match (ours, layout) {
+        // What memory.x really gives the program - less than the offset when
+        // FLASH starts past a bootloader, or the chip was declared smaller.
+        (true, Layout::End) => match fs::memory_x_flash(&facts.memory_x) {
+            Some((_, length)) => format!(
+                "memory.x keeps it out of FLASH: {} KiB for the program.",
+                length / 1024
+            ),
+            None => "memory.x keeps it out of FLASH.".to_owned(),
+        },
+        // FLASH stays whole; the program has what follows the store.
+        (true, Layout::AfterVectors) => match fs::memory_x_flash(&facts.memory_x) {
+            Some((origin, length)) if origin + length > end => format!(
+                "memory.x starts the program after it, at 0x{end:08X} (_stext): {} KiB for the program.",
+                (origin + length - end) / 1024
+            ),
+            _ => format!("memory.x starts the program after it, at 0x{end:08X} (_stext)."),
+        },
+        (false, Layout::End) => format!(
+            concat!(
+                "Your own memory.x (no IDE markers) is used as it is; its FLASH must ",
+                "end at or before 0x{:08X}."
+            ),
+            start
+        ),
+        (false, Layout::AfterVectors) => format!(
+            concat!(
+                "Your own memory.x (no IDE markers) is used as it is; it must start the ",
+                "program after the store: `_stext = 0x{:08X};`."
+            ),
+            end
+        ),
+    };
+    ui.label(dim(format!(
+        "Store 0x{start:08X}..0x{end:08X} (offsets 0x{:X}..0x{:X}). {reserve}",
+        r.start, r.end,
+    )));
+    ui.label(dim(match (hal, layout) {
+        (StmHal::Embassy, Layout::End) => "Written through embassy-stm32's blocking Flash.",
+        (StmHal::Embassy, Layout::AfterVectors) => concat!(
+            "Written through embassy-stm32's blocking Flash, its first region ",
+            "(bank1_region1) - the one made of the small sectors."
+        ),
+        (StmHal::F1Hal, _) => concat!(
+            "Written through stm32f1xx-hal's flash writer, by the adapter in ",
+            "flash_store_hal.rs. The Async runtime's embassy-stm32 reads the same data."
+        ),
+    }));
+    ui.label(dim(match layout {
+        Layout::End => concat!(
+            "A page erase takes milliseconds, and the CPU waits while flash is written ",
+            "when the code runs from the same bank. Flashing from the IDE erases only ",
+            "the sectors it writes, so the pages survive; a chip erase (probe-rs erase, ",
+            "--chip-erase, CubeProgrammer) wipes them."
+        ),
+        Layout::AfterVectors => concat!(
+            "A sector erase takes a few hundred milliseconds with interrupts off and the ",
+            "CPU waiting, so no watchdog is fed meanwhile - save when something changed. ",
+            "Flashing from the IDE erases only the sectors it writes (the vector table's ",
+            "and the program's), so the store survives; a chip erase (probe-rs erase, ",
+            "--chip-erase, CubeProgrammer) wipes it."
+        ),
+    }));
+    let platform = Platform::Stm32 {
+        hal,
+        geo: *geo,
+        layout,
+    };
+    // The IWDG is only configured - the user starts it - so a warning, not a
+    // problem; the WWDG runs from boot and is one (`fs::wwdg_problem`).
+    if let (Some(stall), Some(period)) = (fs::erase_stall_us(&platform), facts.iwdg_us)
+        && period < stall
+    {
+        ui.label(
+            egui::RichText::new(format!(
+                concat!(
+                    "{}  The IWDG's period ({} ms) is shorter than a sector erase (up to {} ms): ",
+                    "once you unleash() it, an erase resets the chip. Give it a period past {} ms."
+                ),
+                ph::WARNING,
+                period / 1000,
+                stall / 1000,
+                stall / 1000
+            ))
+            .size(11.0)
+            .color(egui::Color32::from_rgb(235, 150, 90)),
+        );
+    }
+    let mut problems = c.problems_on(&platform);
+    problems.extend(fs::wwdg_problem(&platform, facts.wwdg_us));
+    // The IDE's memory.x too: the MCU form's flash origin can move the program
+    // past an AfterVectors store.
+    problems.extend(fs::memory_x_overlap(&facts.memory_x, c, layout));
+    problems
+}
+
+/// `project_gen::memory_x_is_ours`, here so the card's body stays short.
+fn fs_memory_x_is_ours(memory_x: &str) -> bool {
+    crate::panels::mcu_module::project_gen::memory_x_is_ours(memory_x)
 }
 
 /// One duration row: a drag value in microseconds plus its human reading.

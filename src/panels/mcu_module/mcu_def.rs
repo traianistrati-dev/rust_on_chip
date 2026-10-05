@@ -60,7 +60,10 @@ pub struct PinDef {
     pub fn_owner: Vec<(PinFunction, String)>,
     /// What the BOARD does to this pad that its functions cannot say: a solder
     /// bridge that keeps it off the header, a resistor to change before NFC
-    /// pins are GPIO, the debugger driving it. Shown in the pin's panel.
+    /// pins are GPIO, the debugger driving it. On a bare chip, what its
+    /// package does: a strapping pin, the flash bus. Shown in the pin's panel.
+    /// Written by `codegen::nrf_boards` for Nordic's kits and by
+    /// `board_notes` for the other built-ins.
     ///
     /// Data, not code, because it is per board: the same `P0.09 (NFC1)` needs
     /// different resistors changed on two Nordic kits, so nothing keyed by the
@@ -514,6 +517,31 @@ mod tests {
         assert_eq!(back.name, pin.name);
         assert_eq!(back.reserved, pin.reserved);
         assert_eq!(back.available_functions, pin.available_functions);
+    }
+
+    /// PB12 is I2C2's SMBA, which has no `PinFunction`: offered as
+    /// `I2cScl(2)` it generated an I2C2 clock on the wrong pin. On the F103
+    /// I2C2's SCL is PB10 and nothing else (I2C2 has no remap).
+    #[test]
+    fn i2c2_scl_is_pb10_alone_on_the_f103s() {
+        use crate::panels::mcu_module::pins::PinFunction;
+        let defs = [
+            stm_def(),
+            ron::from_str(include_str!("../../../assets/mcus/examples/stm32f103rb.ron")).unwrap(),
+            ron::from_str(include_str!(
+                "../../../assets/mcus/examples/stm32f103_graphclock.ron"
+            ))
+            .unwrap(),
+        ];
+        for def in defs {
+            let mcu = def.build_mcu();
+            let on: Vec<String> = mcu
+                .iter_all_pins()
+                .filter(|p| p.available_functions.contains(&PinFunction::I2cScl(2)))
+                .map(|p| p.name.clone())
+                .collect();
+            assert_eq!(on, ["PB10"], "{}", def.id);
+        }
     }
 
     #[test]

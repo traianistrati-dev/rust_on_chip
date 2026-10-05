@@ -272,6 +272,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D+ of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO26 or GPIO27 any other function disables it (esp-hal clears USB_PAD_ENABLE). D+ toggles high/low at power-up; add an external pull-up if the line must start in a stable state.",
             ),
             PinDef(
                 number: 25,
@@ -472,6 +473,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "USB D- of the built-in USB Serial/JTAG controller (ROM download, boot log, default JTAG). Giving GPIO26 or GPIO27 any other function disables it: esp-hal clears USB_PAD_ENABLE and the USB pulls when it sets the pin up as a GPIO or routes a peripheral to it.",
             ),
         ],
         bottom: [
@@ -679,6 +681,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, floating by default. Download mode (GPIO9 low at reset) needs GPIO8 HIGH; GPIO8 and GPIO9 both low is invalid. If EFUSE_UART_PRINT_CONTROL is set to 1 or 2, its level at reset also turns the ROM boot log on UART on or off. LP pin (GPIO8-14, LP power domain): it can wake the chip from Deep-sleep.",
             ),
             PinDef(
                 number: 11,
@@ -878,6 +881,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "BOOT strapping pin with a weak pull-up: held LOW at reset (with GPIO8 HIGH), the chip enters Joint Download Boot (UART0 or USB Serial/JTAG) instead of booting from flash. Espressif recommends an external pull-up and no high-value capacitor on it, or the chip may enter download mode. LP pin (GPIO8-14): it can wake the chip from Deep-sleep.",
             ),
             PinDef(
                 number: 12,
@@ -1077,6 +1081,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "LP pin: GPIO8-14 are the only pads on this package that can wake the chip from Deep-sleep (EXT1 wakeup, each pin with its own level - esp-hal Ext1WakeupSource). GPIO0-5 and GPIO22-27 can wake it only from Light-sleep.",
             ),
             PinDef(
                 number: 13,
@@ -1276,6 +1281,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "LP pin: GPIO8-14 are the only pads on this package that can wake the chip from Deep-sleep (EXT1 wakeup, each pin with its own level - esp-hal Ext1WakeupSource). GPIO0-5 and GPIO22-27 can wake it only from Light-sleep.",
             ),
             PinDef(
                 number: 14,
@@ -1475,6 +1481,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Unlike GPIO8-11 (VDDPST1), its I/O is powered from VDDA_PMU/VBAT, as are the 32 kHz crystal pins GPIO13/14. LP pin: GPIO8-14 are the only pads that can wake the chip from Deep-sleep (EXT1); GPIO0-5 and GPIO22-27 wake it only from Light-sleep.",
             ),
             PinDef(
                 number: 15,
@@ -1674,6 +1681,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "XTAL_32K_P: an optional external 32.768 kHz crystal for the low-power slow clock goes across GPIO13/GPIO14, and then both pins are taken (an external 32 kHz oscillator uses this pin alone). Powered from VDDA_PMU/VBAT, not VDDPST1. LP pin: can wake the chip from Deep-sleep (EXT1).",
             ),
             PinDef(
                 number: 16,
@@ -1873,6 +1881,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "XTAL_32K_N: the other end of the optional 32.768 kHz crystal (with GPIO13); with the crystal fitted both pins are taken. Powered from VDDA_PMU/VBAT, not VDDPST1. LP pin: can wake the chip from Deep-sleep (EXT1).",
             ),
         ],
         left: [
@@ -2492,6 +2501,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG MTMS for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads.",
             ),
             PinDef(
                 number: 6,
@@ -2695,6 +2705,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG MTDO for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads.",
             ),
             PinDef(
                 number: 7,
@@ -2898,6 +2909,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG MTCK for an external probe, but with no eFuses burned the chip takes JTAG from the USB Serial/JTAG controller, not from these pads.",
             ),
             PinDef(
                 number: 8,
@@ -3101,6 +3113,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "ADC1_CH4 does not work on ESP32-H2 revisions v0.0 and v0.1 (erratum ADC-7227, fixed in v1.2): use another ADC channel on those parts. Also JTAG MTDI, though with no eFuses burned JTAG comes from the USB Serial/JTAG controller, not these pads.",
             ),
         ],
         right: [
@@ -3302,6 +3315,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin for the JTAG source, ignored unless EFUSE_JTAG_SEL_ENABLE is burned (default 0) while EFUSE_DIS_PAD_JTAG and EFUSE_DIS_USB_JTAG are 0; then low at reset = JTAG on GPIO2-GPIO5, high = USB Serial/JTAG. It has no internal pull, so in that case it must be driven, never left floating.",
             ),
             PinDef(
                 number: 23,
@@ -3501,6 +3515,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0TXD, UART0 TX by default. UART0 is the ROM\'s port for UART download and for its boot log, printed at every reset by default, so whatever is wired here sees that traffic. Espressif suggests a 499 ohm series resistor on this line.",
             ),
             PinDef(
                 number: 22,
@@ -3700,6 +3715,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "U0RXD, UART0 RX by default: the line the ROM listens on for UART download (UART0 is its download and boot-log port).",
             ),
             PinDef(
                 number: 21,
@@ -3911,18 +3927,21 @@ McuDefinition(
                 name: "VDDA_PMU",
                 reserved: true,
                 functions: [],
+                note: "On ESP32-H2 it takes 3.0-3.6 V, like VDD3P3 and VBAT, and must be stable before CHIP_EN goes high. It is also one of the two inputs (the other is VBAT) that an internal switch picks from to power the GPIO12, GPIO13 (XTAL_32K_P) and GPIO14 (XTAL_32K_N) pads.",
             ),
             PinDef(
                 number: 18,
                 name: "VBAT",
                 reserved: true,
                 functions: [],
+                note: "On ESP32-H2 VBAT is not a backup-only input: without a backup cell it is one of the analog supply pins (3.0-3.6 V) and must be stable before CHIP_EN goes high. An internal switch powers GPIO12, GPIO13 (XTAL_32K_P) and GPIO14 (XTAL_32K_N) from either VBAT or VDDA_PMU.",
             ),
             PinDef(
                 number: 17,
                 name: "CHIP_EN",
                 reserved: true,
                 functions: [],
+                note: "Must not be left floating, and must go high only after the supply rails have settled (tSTBL >= 50 us): Espressif advises an RC delay, typically 10 kohm and 1 uF, and a short CHIP_EN trace, since interference on it causes reboots.",
             ),
         ],
         grid: None,

@@ -33,6 +33,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Wired only to RGB LED D2\'s green cathode through 1k (R18): no header or connector reaches GP0, and the FPGA\'s LED is a separate one (D4). D2 is common anode, fed from 3V3 through bridged solder jumper SJ1 on the back; cutting SJ1 darkens all three colours (GP0, GP1, GP9) at once.",
             ),
             PinDef(
                 number: 82,
@@ -45,6 +46,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Wired only to RGB LED D2\'s red cathode through 1k (R17): no header or connector reaches GP1, and the FPGA\'s LED is a separate one (D4). D2 is common anode, fed from 3V3 through bridged solder jumper SJ1 on the back; cutting SJ1 darkens all three colours (GP0, GP1, GP9) at once.",
             ),
             PinDef(
                 number: 83,
@@ -57,6 +59,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Wired only to RGB LED D2\'s blue cathode through 1k (R19): no header or connector reaches GP9, and the FPGA\'s LED is a separate one (D4). D2 is common anode, fed from 3V3 through bridged solder jumper SJ1 on the back; cutting SJ1 darkens all three colours (GP0, GP1, GP9) at once.",
             ),
             PinDef(
                 number: 84,
@@ -81,6 +84,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Only on the 22-pin 0.5 mm FPC connector J6, pin 14. Unlike GP12..GP19 beside it, not an HSTX pin.",
             ),
             PinDef(
                 number: 86,
@@ -97,6 +101,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Only on the 22-pin 0.5 mm FPC connector J6, pin 15. Unlike GP12..GP19 beside it, not an HSTX pin.",
             ),
             PinDef(
                 number: 87,
@@ -113,6 +118,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Only on FPC connector J6, pin 2, paired with GP13 on pin 3; the current Rev2 design names GP12 Lane0_N and GP13 Lane0_P. GP12..GP19, the RP2350\'s HSTX pins, reach J6 as three data lanes plus a clock pair on GP16/GP17.",
             ),
             PinDef(
                 number: 88,
@@ -129,6 +135,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Only on FPC connector J6, pin 3, paired with GP12 on pin 2; the current Rev2 design names GP13 Lane0_P and GP12 Lane0_N. GP12..GP19, the RP2350\'s HSTX pins, reach J6 as three data lanes plus a clock pair on GP16/GP17.",
             ),
             PinDef(
                 number: 89,
@@ -145,6 +152,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Only on FPC connector J6, pin 5: HSTX pair Lane1_N, with GP15 as Lane1_P. J6 carries GP12..GP19, the RP2350\'s HSTX pins, as three data lanes plus a clock pair on GP16/GP17; HSTX\'s per-pin BITx registers choose which pin drives the clock, so firmware must follow this naming.",
             ),
             PinDef(
                 number: 90,
@@ -161,6 +169,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Only on FPC connector J6, pin 6: HSTX pair Lane1_P, with GP14 as Lane1_N. J6 carries GP12..GP19, the RP2350\'s HSTX pins, as three data lanes plus a clock pair on GP16/GP17; HSTX\'s per-pin BITx registers choose which pin drives the clock, so firmware must follow this naming.",
             ),
             PinDef(
                 number: 91,
@@ -177,6 +186,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Only on FPC connector J6, pin 8: HSTX clock pair Clock_N, with GP17 as Clock_P. J6 carries GP12..GP19, the RP2350\'s HSTX pins, as three data lanes plus this clock pair; HSTX\'s per-pin BITx registers choose which pin drives the clock, so set the CLK bit for GP16/GP17 to match.",
             ),
             PinDef(
                 number: 92,
@@ -193,6 +203,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Only on FPC connector J6, pin 9: HSTX clock pair Clock_P, with GP16 as Clock_N. J6 carries GP12..GP19, the RP2350\'s HSTX pins, as three data lanes plus this clock pair; HSTX\'s per-pin BITx registers choose which pin drives the clock, so set the CLK bit for GP16/GP17 to match.",
             ),
             PinDef(
                 number: 93,
@@ -209,6 +220,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Only on FPC connector J6, pin 11: HSTX pair Lane2_N, with GP19 as Lane2_P. J6 carries GP12..GP19, the RP2350\'s HSTX pins, as three data lanes plus a clock pair on GP16/GP17; HSTX\'s per-pin BITx registers choose which pin drives the clock, so firmware must follow this naming.",
             ),
             PinDef(
                 number: 94,
@@ -225,6 +237,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Only on FPC connector J6, pin 12: HSTX pair Lane2_P, with GP18 as Lane2_N. J6 carries GP12..GP19, the RP2350\'s HSTX pins, as three data lanes plus a clock pair on GP16/GP17; HSTX\'s per-pin BITx registers choose which pin drives the clock, so firmware must follow this naming.",
             ),
         ],
         left: [
@@ -259,12 +272,14 @@ McuDefinition(
                 name: "3V3_FPGA",
                 reserved: true,
                 functions: [],
+                note: "Joined to the main 3V3 by bridged solder jumper SJ6. Cut SJ6 to switch the FPGA off or feed this rail from outside, e.g. through a load switch the RP2350 controls (schematic FPGA Power Note).",
             ),
             PinDef(
                 number: 6,
                 name: "3V3_FPGA",
                 reserved: true,
                 functions: [],
+                note: "Joined to the main 3V3 by bridged solder jumper SJ6. Cut SJ6 to switch the FPGA off or feed this rail from outside, e.g. through a load switch the RP2350 controls (schematic FPGA Power Note).",
             ),
             PinDef(
                 number: 7,
@@ -353,6 +368,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Same net as iCE40 pin 11, named DEFAULT_UART_TX / DEFAULT_I2C_SCL in pico2_ice.pcf (this pad\'s UART0 RX / I2C0 SCL). Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad takes 5 V with IOVDD powered) and never let gateware drive pin 11 while the RP2350 does. Until the FPGA is configured, pin 11 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 20,
@@ -381,6 +397,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Same net as iCE40 pin 9, named DEFAULT_UART_RX / DEFAULT_I2C_SDA in pico2_ice.pcf (this pad\'s UART0 TX / I2C0 SDA). Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad takes 5 V with IOVDD powered) and never let gateware drive pin 9 while the RP2350 does. Until the FPGA is configured, pin 9 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 23,
@@ -469,12 +486,14 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "10k pull-up to 3V3 on the board (R13). The same net goes to FPC connector J6 pin 21, so a device on the flex cable shares this I2C bus.",
             ),
             PinDef(
                 number: 36,
                 name: "RUN",
                 reserved: true,
                 functions: [],
+                note: "10k pull-up (R16). The board has no reset button, so this pad is where a reset switch goes.",
             ),
             PinDef(
                 number: 37,
@@ -491,18 +510,21 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "10k pull-up to 3V3 on the board (R23). The same net goes to FPC connector J6 pin 20, so a device on the flex cable shares this I2C bus.",
             ),
             PinDef(
                 number: 38,
                 name: "BOOTSEL",
                 reserved: true,
                 functions: [],
+                note: "Net ~USB_BOOT: button SW1 to GND with a 10k pull-up (R32), joined to the flash chip select QSPI_SS through Schottky D6 and 1k (R2). Hold SW1, or short this pad (the docs\' BT pin) to GND, while powering up to get the RP2350\'s USB drive. GP42 reads the same net through 5.1k.",
             ),
             PinDef(
                 number: 39,
                 name: "ADC7 (GP47)",
                 reserved: true,
                 functions: [],
+                note: "Sized for one lithium cell (schematic note): about 4 V here gives 3.3 V at GP47. R29 (the 2.2k) also limits the current if, say, 12 V lands here; for a higher voltage add a resistor in series with it.",
             ),
             PinDef(
                 number: 40,
@@ -551,6 +573,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Same net as iCE40 pin 25. Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad takes 5 V with IOVDD powered) and never let gateware drive pin 25 while the RP2350 does. Until the FPGA is configured, pin 25 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 46,
@@ -567,6 +590,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Same net as iCE40 pin 23. Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad alone takes 5 V while IOVDD is powered) and never let gateware drive pin 23 while the RP2350 does. Until the FPGA is configured, pin 23 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 47,
@@ -583,6 +607,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Same net as iCE40 pin 19 and FPC connector J6 pin 18. Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad alone takes 5 V while IOVDD is powered) and never let gateware drive pin 19 while the RP2350 does. Until the FPGA is configured, pin 19 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 48,
@@ -599,6 +624,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Same net as iCE40 pin 18. Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad takes 5 V with IOVDD powered) and never let gateware drive pin 18 while the RP2350 does. Until the FPGA is configured, pin 18 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 49,
@@ -615,6 +641,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Same net as iCE40 pin 27 and FPC connector J6 pin 17. Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad alone takes 5 V while IOVDD is powered) and never let gateware drive pin 27 while the RP2350 does. Until the FPGA is configured, pin 27 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 50,
@@ -631,6 +658,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Same net as iCE40 pin 26. Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad alone takes 5 V while IOVDD is powered) and never let gateware drive pin 26 while the RP2350 does. Until the FPGA is configured, pin 26 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 51,
@@ -647,6 +675,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Same net as iCE40 pin 21. Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad alone takes 5 V while IOVDD is powered) and never let gateware drive pin 21 while the RP2350 does. Until the FPGA is configured, pin 21 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 52,
@@ -663,6 +692,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Reaches iCE40 pin 20, a global-buffer clock input (G3), through 27 R (R34). Keep it at 3.3 V logic (FPGA pin absolute max 3.6 V, though the RP2350 pad alone takes 5 V while IOVDD is powered) and never let gateware drive pin 20 while the RP2350 does. Until the FPGA is configured, pin 20 holds a weak pull-up (11-128 uA).",
             ),
             PinDef(
                 number: 53,
@@ -681,12 +711,14 @@ McuDefinition(
                 name: "3V3_FPGA",
                 reserved: true,
                 functions: [],
+                note: "Joined to the main 3V3 by bridged solder jumper SJ6. Cut SJ6 to switch the FPGA off or feed this rail from outside, e.g. through a load switch the RP2350 controls (schematic FPGA Power Note).",
             ),
             PinDef(
                 number: 56,
                 name: "3V3_FPGA",
                 reserved: true,
                 functions: [],
+                note: "Joined to the main 3V3 by bridged solder jumper SJ6. Cut SJ6 to switch the FPGA off or feed this rail from outside, e.g. through a load switch the RP2350 controls (schematic FPGA Power Note).",
             ),
             PinDef(
                 number: 57,
@@ -715,6 +747,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not 5 V tolerant: GP40..GP47 are the RP2350B\'s ADC pads, standard rather than fault-tolerant (FT) I/O, so the absolute maximum is IOVDD + 0.5 V, which is 3.8 V on this 3.3 V board. Nothing else on the board is wired to this header pin.",
             ),
             PinDef(
                 number: 60,
@@ -737,6 +770,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Reads button SW1 through 5.1k (R33): LOW while pressed, 10k pull-up (R32). SW1 is also the BOOTSEL button (net ~USB_BOOT, through Schottky D6 and 1k to QSPI_SS), so any function picked here still sees that pull-up and the button through R33. ADC pad: not 5 V tolerant.",
             ),
             PinDef(
                 number: 62,
@@ -889,24 +923,28 @@ McuDefinition(
                 name: "3V3",
                 reserved: true,
                 functions: [],
+                note: "Output of a 300 mA NCP115 LDO (U9) fed from VIN. It feeds the RP2350\'s I/O, QSPI, USB and analog supplies (its core regulator input VREG_VIN takes VIN directly), the flash, the PSRAM, FPC J6 pin 22 and, through SJ6, the FPGA - the header gets what they leave.",
             ),
             PinDef(
                 number: 74,
                 name: "3V3",
                 reserved: true,
                 functions: [],
+                note: "Output of a 300 mA NCP115 LDO (U9) fed from VIN. It feeds the RP2350\'s I/O, QSPI, USB and analog supplies (its core regulator input VREG_VIN takes VIN directly), the flash, the PSRAM, FPC J6 pin 22 and, through SJ6, the FPGA - the header gets what they leave.",
             ),
             PinDef(
                 number: 75,
                 name: "VBUS",
                 reserved: true,
                 functions: [],
+                note: "Feeds VIN through Schottky D5 and 350 mA polyfuse PTC1. Each USB-C CC pin has a 5.1k pull-down (device mode) through 3-pad solder jumpers JP1/JP2. For host mode cut their 1-2 trace and bridge 2-3 for 56k pull-ups to VBUS; the 5 V must then come in on this pad - D5 only conducts toward VIN.",
             ),
             PinDef(
                 number: 76,
                 name: "VIN",
                 reserved: true,
                 functions: [],
+                note: "Also the RP2350\'s core-regulator input VREG_VIN and the input of the 3.3 V LDO U9 (NCP115), both specified to 5.5 V max - stay at or below it. USB VBUS reaches this rail through Schottky D5 and 350 mA polyfuse PTC1; D5 stops a supply here from flowing back into USB.",
             ),
             PinDef(
                 number: 77,
@@ -923,6 +961,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not 5 V tolerant: GP40..GP47 are the RP2350B\'s ADC pads, standard rather than fault-tolerant (FT) I/O, so the absolute maximum is IOVDD + 0.5 V, which is 3.8 V on this 3.3 V board. Nothing else on the board is wired to this header pin.",
             ),
             PinDef(
                 number: 78,
@@ -939,6 +978,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Not 5 V tolerant: GP40..GP47 are the RP2350B\'s ADC pads, standard rather than fault-tolerant (FT) I/O, so the absolute maximum is IOVDD + 0.5 V, which is 3.8 V on this 3.3 V board. Nothing else on the board is wired to this header pin.",
             ),
             PinDef(
                 number: 79,
@@ -961,6 +1001,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Feeds the TL431 2.5 V reference through bridged jumper R31 and 1k (R12): set it HIGH when GP45 should read the reference, e.g. to calibrate the ADC. While R31 is bridged, anything above ~2.5 V on this header pin is loaded by the shunt - cut R31 to free it. ADC pad: not 5 V tolerant.",
             ),
         ],
         grid: None,

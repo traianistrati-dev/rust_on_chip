@@ -1019,6 +1019,9 @@ pub fn show_project_tree(
     ui: &mut egui::Ui,
     pkg_name: &str,
     toolchain: &ToolchainKind,
+    // The project has a `partitions.csv` (the flash store's, or the user's
+    // own) - drawn as a root row like memory.x.
+    has_partitions_csv: bool,
     selected: &mut ProjectFileId,
     // Error / warning badges of every file (cargo + rust-analyzer).
     badges: &DiagBadges,
@@ -1414,6 +1417,19 @@ pub fn show_project_tree(
                     4.0,
                     "memory.x",
                     ProjectFileId::MemoryX,
+                    selected,
+                    open_reference,
+                    goto_error,
+                    project_dir,
+                    badges,
+                );
+            }
+            if has_partitions_csv {
+                file_row(
+                    ui,
+                    4.0,
+                    "partitions.csv",
+                    ProjectFileId::PartitionsCsv,
                     selected,
                     open_reference,
                     goto_error,

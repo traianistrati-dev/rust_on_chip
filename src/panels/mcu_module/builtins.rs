@@ -273,8 +273,10 @@ mod tests {
             },
         );
 
-        for def in [&stm, &esp] {
-            let ron = ron::ser::to_string_pretty(def, pretty.clone()).unwrap();
+        for mut def in [stm, esp] {
+            // The factories carry no pad notes; the sourced tables do.
+            crate::panels::mcu_module::board_notes::apply(&mut def);
+            let ron = ron::ser::to_string_pretty(&def, pretty.clone()).unwrap();
             let ron = crate::panels::mcu_module::ron_text::bare_none(&ron);
             std::fs::write(format!("assets/mcus/{}.ron", def.id), ron).unwrap();
         }
@@ -435,7 +437,8 @@ mod tests {
             Pin::new(36, "PB15").with_functions(vec![F::SpiMosi(2)]),
             Pin::new(35, "PB14").with_functions(vec![F::SpiMiso(2), F::UsartRts(3)]),
             Pin::new(34, "PB13").with_functions(vec![F::SpiSck(2), F::UsartCts(3)]),
-            Pin::new(33, "PB12").with_functions(vec![F::SpiNss(2), F::UsartCk(3), F::I2cScl(2)]),
+            // I2C2_SMBA here, not I2C2's SCL (PB10): no `I2cScl(2)`.
+            Pin::new(33, "PB12").with_functions(vec![F::SpiNss(2), F::UsartCk(3)]),
         ];
 
         // ── TOP — pins 64..49 (left→right) ──────────────────────────

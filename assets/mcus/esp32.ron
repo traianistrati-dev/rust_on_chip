@@ -60,12 +60,14 @@ McuDefinition(
                 name: "CAP1",
                 reserved: true,
                 functions: [],
+                note: "Takes a 10 nF capacitor to GND, 10% tolerance - required for the chip to work.",
             ),
             PinDef(
                 number: 47,
                 name: "CAP2",
                 reserved: true,
                 functions: [],
+                note: "Takes a 3.3 nF capacitor in parallel with a 20 kohm resistor to CAP1. That RC only shortens the drop of the internal 1.1 V supply to about 0.7 V on entering Deep-sleep; without Deep-sleep, or if Deep-sleep current matters little, it may be left out.",
             ),
             PinDef(
                 number: 46,
@@ -606,6 +608,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "UART0 TX after reset: the ROM prints its boot log here (unless MTDO/GPIO15 is low at reset), and UART0 on GPIO1/GPIO3 is the usual flashing and log port. Espressif suggests a 499 R series resistor on it and another UART for application traffic.",
             ),
             PinDef(
                 number: 40,
@@ -865,6 +868,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "UART0 RX after reset: the ROM serial bootloader receives the firmware here when flashing over UART (TX is GPIO1). Espressif suggests keeping UART0 for download and logs and using another UART for the application.",
             ),
             PinDef(
                 number: 39,
@@ -1385,6 +1389,7 @@ McuDefinition(
                 name: "VDD3P3_CPU",
                 reserved: true,
                 functions: [],
+                note: "Supplies the I/O of GPIO1, 3, 5, 18, 19, 21, 22 and 23 and the CPU. It accepts 1.8-3.6 V where VDDA, VDD3P3 and VDD3P3_RTC need at least 2.3 V, so these eight pads can run at a lower I/O voltage than the RTC-domain pads.",
             ),
         ],
         bottom: [
@@ -1649,6 +1654,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "32K_XN: one of the two pads of the optional 32.768 kHz RTC crystal (GPIO32 is the other). With the crystal fitted and enabled as the RTC clock, both pads are switched to the RTC oscillator and neither is free; without it both are plain GPIOs.",
             ),
             PinDef(
                 number: 14,
@@ -1914,6 +1920,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "ADC2 channel: unusable while Wi-Fi is on, and with esp-hal also while BLE runs - Adc::new on ADC2 panics once the radio is up. Take an ADC1 pad (GPIO32-39) for readings with the radio.",
             ),
             PinDef(
                 number: 15,
@@ -2179,6 +2186,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "ADC2 channel: unusable while Wi-Fi is on, and with esp-hal also while BLE runs - Adc::new on ADC2 panics once the radio is up. Take an ADC1 pad (GPIO32-39) for readings with the radio.",
             ),
             PinDef(
                 number: 16,
@@ -2441,6 +2449,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "ADC2 channel: unusable while Wi-Fi is on, and with esp-hal also while BLE runs - Adc::new on ADC2 panics once the radio is up. Take an ADC1 pad (GPIO32-39) for readings with the radio.",
             ),
             PinDef(
                 number: 17,
@@ -2703,6 +2712,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG TMS after reset (MTMS), part of the GPIO12-15 port an external JTAG debugger uses; it comes out of reset with its pull-up on. ADC2: unusable while Wi-Fi is on, and with esp-hal also while BLE runs - Adc::new on ADC2 panics once the radio is up.",
             ),
             PinDef(
                 number: 18,
@@ -2965,12 +2975,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin (MTDI), internal pull-down: HIGH at reset switches VDD_SDIO, the flash supply, to 1.8 V, and a 3.3 V flash can brown out so flashing and/or booting fail. With 3.3 V flash keep it low at reset, or burn espefuse set-flash-voltage 3.3V (permanent) so it is ignored. JTAG TDI after reset. ADC2: unusable while Wi-Fi is on.",
             ),
             PinDef(
                 number: 19,
                 name: "VDD3P3_RTC",
                 reserved: true,
                 functions: [],
+                note: "Supplies the RTC-domain pads (GPIO0, 2, 4, 12-15, 25-27, 32-39), the only GPIOs still controllable in Deep-sleep (other pads can at most hold a latched level), and feeds VDD_SDIO. 2.3-3.6 V; keep it above 3.0 V when VDD_SDIO powers 3.3 V flash/PSRAM. It cannot be powered alone: bring all supplies up together.",
             ),
             PinDef(
                 number: 20,
@@ -3233,6 +3245,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "JTAG TCK after reset (MTCK): with GPIO12, 14 and 15 it is the port an external JTAG debugger uses, so a project debugged over JTAG leaves these four free. ADC2: unusable while Wi-Fi is on.",
             ),
             PinDef(
                 number: 21,
@@ -3495,6 +3508,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin (MTDO), internal pull-up: LOW at reset silences the ROM\'s boot log on U0TXD (GPIO1); with GPIO5 it also sets the SDIO slave timing. JTAG TDO after reset. ADC2: unusable while Wi-Fi is on, and with esp-hal also while BLE runs.",
             ),
             PinDef(
                 number: 22,
@@ -3757,6 +3771,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, internal pull-down: it must be LOW or floating at reset for a LOW GPIO0 to start the serial bootloader; with GPIO0 high its level is ignored. A pull-up here at reset (e.g. an SD card\'s DAT0 pull-up) blocks download mode. ADC2: unusable while Wi-Fi is on (esp-hal also locks it while Bluetooth runs).",
             ),
             PinDef(
                 number: 23,
@@ -4021,6 +4036,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, internal pull-up (about 45k): LOW at reset, with GPIO2 low, starts the ROM serial bootloader instead of the flash program - this is where a BOOT button and esptool\'s DTR auto-reset line connect. Keep large capacitors and power-up pull-downs off it. ADC2: unusable while Wi-Fi is on (esp-hal also locks it while Bluetooth runs).",
             ),
             PinDef(
                 number: 24,
@@ -4283,6 +4299,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "ADC2 channel: unusable while Wi-Fi is on, and esp-hal also refuses ADC2 while Bluetooth runs - take an ADC1 pad (GPIO32-39) for readings with the radio on.",
             ),
         ],
         left: [
@@ -4297,18 +4314,21 @@ McuDefinition(
                 name: "LNA_IN",
                 reserved: true,
                 functions: [],
+                note: "Once Wi-Fi or Bluetooth is started an antenna must be connected - Espressif warns that running without one can be unstable or damage the RF circuit. If the radio is never initialised the pin may be left floating.",
             ),
             PinDef(
                 number: 3,
                 name: "VDD3P3",
                 reserved: true,
                 functions: [],
+                note: "Analog power (2.3-3.6 V), not a digital rail. Its current can jump when the radio transmits and collapse the rail, so Espressif highly recommends a 10 uF capacitor on it, plus an LC filter against high-frequency harmonics (inductor rated preferably 500 mA or more).",
             ),
             PinDef(
                 number: 4,
                 name: "VDD3P3",
                 reserved: true,
                 functions: [],
+                note: "Analog power (2.3-3.6 V), not a digital rail. Its current can jump when the radio transmits and collapse the rail, so Espressif highly recommends a 10 uF capacitor on it, plus an LC filter against high-frequency harmonics (inductor rated preferably 500 mA or more).",
             ),
             PinDef(
                 number: 5,
@@ -4327,6 +4347,7 @@ McuDefinition(
                     SpiMiso(3),
                     CanRx,
                 ],
+                note: "Input only, no internal pull-up or pull-down (add an external resistor). Erratum GPIO-3.11: powering SAR ADC1, SAR ADC2 or the AMP pulls this input low for about 80 ns, so do not use its interrupt with the ADC, or with Wi-Fi/Bluetooth in sleep mode.",
             ),
             PinDef(
                 number: 6,
@@ -4345,6 +4366,7 @@ McuDefinition(
                     SpiMiso(3),
                     CanRx,
                 ],
+                note: "Input only: no output driver and no internal pull-up or pull-down, so a button or open-drain signal here needs an external resistor.",
             ),
             PinDef(
                 number: 7,
@@ -4363,6 +4385,7 @@ McuDefinition(
                     SpiMiso(3),
                     CanRx,
                 ],
+                note: "Input only: no output driver and no internal pull-up or pull-down, so a button or open-drain signal here needs an external resistor.",
             ),
             PinDef(
                 number: 8,
@@ -4381,12 +4404,14 @@ McuDefinition(
                     SpiMiso(3),
                     CanRx,
                 ],
+                note: "Input only, no internal pull-up or pull-down (add an external resistor). Erratum GPIO-3.11: powering SAR ADC1, SAR ADC2 or the AMP pulls this input low for about 80 ns, so do not use its interrupt with the ADC, or with Wi-Fi/Bluetooth in sleep mode.",
             ),
             PinDef(
                 number: 9,
                 name: "CHIP_PU",
                 reserved: true,
                 functions: [],
+                note: "Must not float. Espressif recommends an RC delay (R = 10k, C = 1 uF) so it goes high at least 50 us after the 3.3 V rails; at or below 0.6 V the chip is held off. On slow or unstable supplies add a supervisor resetting near 3.0 V. Where esptool\'s auto-reset is wired, the USB-UART\'s RTS drives it (DTR drives GPIO0).",
             ),
             PinDef(
                 number: 10,
@@ -4405,6 +4430,7 @@ McuDefinition(
                     SpiMiso(3),
                     CanRx,
                 ],
+                note: "Input only: no output driver and no internal pull-up or pull-down, so a button or open-drain signal here needs an external resistor.",
             ),
             PinDef(
                 number: 11,
@@ -4423,6 +4449,7 @@ McuDefinition(
                     SpiMiso(3),
                     CanRx,
                 ],
+                note: "Input only: no output driver and no internal pull-up or pull-down, so a button or open-drain signal here needs an external resistor.",
             ),
             PinDef(
                 number: 12,
@@ -4685,6 +4712,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "32K_XP: one of the two pads of the optional 32.768 kHz RTC crystal (GPIO33 is the other). With the crystal fitted and enabled as the RTC clock, both pads are switched to the RTC oscillator and neither is free; without it both are plain GPIOs.",
             ),
         ],
         right: [
@@ -5458,6 +5486,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Strapping pin, internal pull-up. Its only strapping role is the SDIO slave timing: with MTDO (GPIO15) it picks the slave\'s sampling and output edges at reset (default: rising, rising).",
             ),
             PinDef(
                 number: 33,
@@ -5715,6 +5744,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Flash data (SD_DATA_1). An ESP32 without in-package flash runs from an off-package SPI flash, by default on GPIO6-11, where this pad is IO0/DI. It is also IO0/DI of the in-package flash on ESP32-U4WDH and SIO0/SI of the in-package PSRAM on ESP32-D0WDRH2-V3. Espressif: not recommended for any other use.",
             ),
             PinDef(
                 number: 32,
@@ -5972,6 +6002,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Flash data (SD_DATA_0). An ESP32 without in-package flash runs from an off-package SPI flash, by default on GPIO6-11, where this pad is IO1/DO. It is IO2/WP# of the in-package flash on ESP32-U4WDH and SIO1/SO of the in-package PSRAM on ESP32-D0WDRH2-V3. Espressif: not recommended for any other use.",
             ),
             PinDef(
                 number: 31,
@@ -6229,6 +6260,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "SPI flash clock (chip pin SD_CLK). By default the ROM boots from an SPI flash on GPIO6-11 clocked here (the SPI_PAD_CONFIG eFuses can move it); the in-package flash of an ESP32-U4WDH and in-package PSRAM of an ESP32-D0WDRH2-V3 are clocked here too. Espressif: not recommended for any other use.",
             ),
             PinDef(
                 number: 30,
@@ -6486,6 +6518,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Flash chip select (SD_CMD). An ESP32 without in-package flash runs from an off-package SPI flash, by default on GPIO6-11, where this pad is CS#; on ESP32-U4WDH it is IO3/HOLD# of the in-package flash. Espressif: not recommended for any other use.",
             ),
             PinDef(
                 number: 29,
@@ -6743,6 +6776,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Flash data (SD_DATA_3). An ESP32 without in-package flash runs from an off-package SPI flash, by default on GPIO6-11, where this pad is IO2/WP#; on ESP32-D0WDRH2-V3 also SIO2 of the in-package PSRAM. Not recommended for other use, except on ESP32-U4WDH, whose in-package flash does not use it (ESP32-MINI-1 brings it out as IO10).",
             ),
             PinDef(
                 number: 28,
@@ -7000,6 +7034,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "Flash data (SD_DATA_2). An ESP32 without in-package flash runs from an off-package SPI flash, by default on GPIO6-11, where this pad is IO3/HOLD#; on ESP32-D0WDRH2-V3 also SIO3 of the in-package PSRAM. Not recommended for other use, except on ESP32-U4WDH, whose in-package flash does not use it (ESP32-MINI-1 brings it out as IO9).",
             ),
             PinDef(
                 number: 27,
@@ -7257,12 +7292,14 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "VDD_SDIO power domain (like GPIO6-11 and 16): its logic level follows VDD_SDIO, 1.8 V when that rail is 1.8 V. In-package flash IO1/DO on ESP32-U4WDH. External PSRAM SCLK in the certified ESP32-WROVER-E wiring, which esp-hal\'s PSRAM driver hard-codes on D0WD parts; Espressif\'s other recommended option is sharing SD_CLK.",
             ),
             PinDef(
                 number: 26,
                 name: "VDD_SDIO",
                 reserved: true,
                 functions: [],
+                note: "Normally an OUTPUT that powers the flash/PSRAM and the GPIO6-11, 16, 17 pads: 3.3 V by default (VDD3P3_RTC through about 6 R; 1 uF to GND), or 1.8 V from an internal 40 mA LDO when MTDI (GPIO12) is high at reset (then add 2k and 4.7 uF to GND). eFuses can fix either voltage or turn it off, and then it must be supplied externally.",
             ),
             PinDef(
                 number: 25,
@@ -7520,6 +7557,7 @@ McuDefinition(
                     CanTx,
                     CanRx,
                 ],
+                note: "VDD_SDIO power domain (like GPIO6-11 and 17): its logic level follows VDD_SDIO, 1.8 V when that rail is 1.8 V. In-package flash CS# on ESP32-U4WDH, in-package PSRAM CE# on ESP32-D0WDRH2-V3; for external PSRAM on D0WD parts esp-hal hard-codes CE# here (WROVER wiring). As PSRAM CE# it needs a pull-up (10k in Espressif\'s designs).",
             ),
         ],
         grid: None,

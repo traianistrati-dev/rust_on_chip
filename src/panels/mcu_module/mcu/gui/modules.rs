@@ -916,8 +916,25 @@ fn handle_preview(m: &VirtualModule, native_forced: bool) -> String {
         // the handle the user will bind: `let my_mod = MyMod::new(…)`.
         ModuleKind::Custom => {
             let name = custom_struct_name(m);
-            format!("{}: {name}", custom_var_name(m))
+            format!("{}: {name}", custom_binding_name(m))
         }
+    }
+}
+
+/// Names `main.rs` binds itself, which a Custom module's handle must not
+/// shadow: the flash store's `flash` / `flash_store`.
+const RESERVED_BINDINGS: &[&str] = &["flash", "flash_store"];
+
+/// The `let` a Custom module gets in `main.rs`: [`custom_var_name`], moved to
+/// `<name>_dev` when that is a name `main.rs` already binds. Reserved
+/// whether or not the store is on, so its toggle never renames the handle.
+/// File names keep `custom_var_name` - the user's revisions live under it.
+pub fn custom_binding_name(m: &VirtualModule) -> String {
+    let var = custom_var_name(m);
+    if RESERVED_BINDINGS.contains(&var.as_str()) {
+        format!("{var}_dev")
+    } else {
+        var
     }
 }
 

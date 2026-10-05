@@ -583,7 +583,6 @@ McuDefinition(
                     GpioOutput,
                     SpiNss(2),
                     UsartCk(3),
-                    I2cScl(2),
                 ],
             ),
         ],

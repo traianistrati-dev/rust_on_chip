@@ -36,6 +36,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not on the 40-pin header (only test point TP4, marked do-not-use): it drives the RT6150 regulator\'s PS pin, held low by R8 (100k). Low = PFM, the default and most efficient; HIGH = forced PWM, much less 3V3 ripple at light load (the datasheet\'s tip for ADC readings) but much worse light-load efficiency. Any function here only toggles that mode. RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 42,
@@ -52,6 +53,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "Not on the 40-pin header: VBUS through R10 (5.6k) with R1 (10k) to GND, about 3.2 V from 5 V, so it reads HIGH while VBUS is present (USB plugged in, or 5 V fed into pin 40) and LOW otherwise. Use it as an input; the peripheral functions listed here have no wire to reach. RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 43,
@@ -68,6 +70,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "Not on the 40-pin header: drives the green LED D2 through R3 (470R) to GND, so HIGH lights it. Test point TP5 sits between R3 and the LED; it only swings from 0 V to the LED\'s forward voltage, so the datasheet advises against using it. RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 44,
@@ -88,6 +91,7 @@ McuDefinition(
                         channel: 3,
                     ),
                 ],
+                note: "Not on the 40-pin header: ADC3 reads VSYS/3 (R5 100k on top; R6 100k and, through FET Q1, R16 100k in parallel below; C3 1 nF), so multiply by 3. Q1\'s gate is on 3V3, so with 3V3 off (3V3_EN low) it isolates the pin and VSYS cannot leak through the ADC diode into 3V3. RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
         ],
         left: [
@@ -106,6 +110,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 2,
@@ -122,6 +127,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 3,
@@ -144,6 +150,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 5,
@@ -160,6 +167,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 6,
@@ -176,6 +184,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 7,
@@ -192,6 +201,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 8,
@@ -214,6 +224,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 10,
@@ -230,6 +241,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 11,
@@ -246,6 +258,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 12,
@@ -262,6 +275,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 13,
@@ -284,6 +298,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 15,
@@ -300,6 +315,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 16,
@@ -316,6 +332,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 17,
@@ -332,6 +349,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 18,
@@ -354,6 +372,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 20,
@@ -370,6 +389,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
         ],
         right: [
@@ -378,12 +398,14 @@ McuDefinition(
                 name: "VBUS",
                 reserved: true,
                 functions: [],
+                note: "Loaded by R10 (5.6k) + R1 (10k) to GND, the divider that feeds GP24, so it reads 0 V without USB. Feeds VSYS through Schottky D1 (PMEG6010ELR). In USB host mode, power the board by feeding 5 V into this pin; with USB as the only supply, VBUS may be shorted to VSYS to remove the diode drop.",
             ),
             PinDef(
                 number: 39,
                 name: "VSYS",
                 reserved: true,
                 functions: [],
+                note: "With USB it sits one Schottky drop (D1) below VBUS. Add another supply through its own Schottky diode or a P-FET (e.g. DMG2305UX, gate on VBUS) so neither source back-powers the other. VSYS/3 is on GP29 (ADC3).",
             ),
             PinDef(
                 number: 38,
@@ -396,6 +418,7 @@ McuDefinition(
                 name: "3V3_EN",
                 reserved: true,
                 functions: [],
+                note: "Its pull-up is R2 (100k) to VSYS, not to 3V3, so released it sits at VSYS (up to 5.5 V). Grounding it disables the RT6150 regulator (U2) and puts it in a low-power state; FET Q1 then stops VSYS leaking into 3V3 through GP29\'s ADC diode.",
             ),
             PinDef(
                 number: 36,
@@ -408,6 +431,7 @@ McuDefinition(
                 name: "ADC_VREF",
                 reserved: true,
                 functions: [],
+                note: "3V3 reaches it through R7 (200R) and goes on to the ADC supply through R9 (1R) into C13; the ADC\'s ~150 uA draw leaves a ~30 mV offset. A 3.0 V shunt reference here (e.g. LM4040) gives a cleaner 0-3.0 V range and draws ~1.5 mA through R7; remove R7 to supply it from elsewhere.",
             ),
             PinDef(
                 number: 34,
@@ -428,6 +452,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "ADC2. Not 5 V tolerant, unlike GP0-22 (5.5 V while 3V3 is up): this pin has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while 3V3 is off leaks through it into the 3V3 rail. Analog ground is AGND, pin 33. RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 33,
@@ -454,6 +479,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "ADC1. Not 5 V tolerant, unlike GP0-22 (5.5 V while 3V3 is up): this pin has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while 3V3 is off leaks through it into the 3V3 rail. Analog ground is AGND, pin 33. RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 31,
@@ -474,12 +500,14 @@ McuDefinition(
                         channel: 0,
                     ),
                 ],
+                note: "ADC0. Not 5 V tolerant, unlike GP0-22 (5.5 V while 3V3 is up): this pin has a diode to 3V3, so keep it below 3V3 + 0.3 V, and a voltage applied while 3V3 is off leaks through it into the 3V3 rail. Analog ground is AGND, pin 33. RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 30,
                 name: "RUN",
                 reserved: true,
                 functions: [],
+                note: "Held high only by the RP2350\'s on-chip pull-up (about 50k to 3.3 V); the board adds nothing on this line. Holding RUN low is no power-off: the board still draws a typical 388 uA from VBUS, more than in the P1.7 low-power state (148 uA). To de-power the RP2350, pull 3V3_EN low instead.",
             ),
             PinDef(
                 number: 29,
@@ -496,6 +524,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 28,
@@ -518,6 +547,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 26,
@@ -534,6 +564,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 25,
@@ -550,6 +581,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 24,
@@ -566,6 +598,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 23,
@@ -588,6 +621,7 @@ McuDefinition(
                         channel: 2,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
             PinDef(
                 number: 21,
@@ -604,6 +638,7 @@ McuDefinition(
                         channel: 1,
                     ),
                 ],
+                note: "RP2350 A2 silicon (chip marking ends in A2), erratum E9: an input pad whose voltage sits between VIL and VIH is held near 2.2 V by ~120 uA of leakage, which the internal pull-down cannot overcome. Use an external pull-down of 8.2k or less, or enable the pad\'s input only while reading it. Pico 2 production moved to A3/A4, which fix it, in July 2025.",
             ),
         ],
     ),

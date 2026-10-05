@@ -997,9 +997,10 @@ pub(super) fn gen_parts(
     // ── Custom modules ───────────────────────────────────────────────────────
     // Last, so every pin binding and peripheral init they consume already
     // exists above.
+    // Each part (watchdogs, flash store, Custom modules) carries its own header
+    // - see `Mcu::watchdog_and_custom_inits`.
     if !custom_inits.is_empty() {
-        fn_calls.push_str("    // ── Custom modules ──\n");
-        fn_calls.push_str(custom_inits);
+        fn_calls.push_str(custom_inits.trim_start_matches('\n'));
         fn_calls.push('\n');
     }
 
@@ -1154,10 +1155,11 @@ pub fn make_generated_section(
 fn make_default_gen_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> String {
     let clock_chain = clock_setup_chain(clock);
     // The same shape `gen_parts` gives these lines when pins are wired.
+    // Each part under its own header (`Mcu::watchdog_and_custom_inits`).
     let custom = if custom_inits.is_empty() {
         String::new()
     } else {
-        format!("    // ── Custom modules ──\n{custom_inits}\n")
+        format!("{}\n", custom_inits.trim_start_matches('\n'))
     };
     format!(
         "{GEN_BEGIN}\n\
@@ -1168,6 +1170,7 @@ fn make_default_gen_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &
              let dp = pac::Peripherals::take().unwrap();\n\n\
              let mut flash = dp.FLASH.constrain();\n\
              let rcc = dp.RCC.constrain();\n\
+             #[allow(unused_variables)]\n\
              let clocks = {clock_chain};\n\n\
          {custom}\
              // Select pins in the MCU Configurator to generate code here.\n\

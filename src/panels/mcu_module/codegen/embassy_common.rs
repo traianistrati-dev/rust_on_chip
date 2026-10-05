@@ -154,10 +154,9 @@ pub fn make_generated_section(
     if body.is_empty() {
         body.push_str(NO_PINS_PLACEHOLDER);
     }
-    if !custom_inits.is_empty() {
-        body.push_str("\n    // ── Custom modules ──\n");
-        body.push_str(custom_inits);
-    }
+    // The Configuration tab's lines and the Custom modules, each part under
+    // its own header (`Mcu::watchdog_and_custom_inits`).
+    body.push_str(custom_inits);
     format!(
         "{GEN_BEGIN}\n\
          {use_line}\n\
@@ -2129,7 +2128,7 @@ mod emit_for_manual_compile {
         files.cargo_toml = project_gen::ensure_flash_store_deps(
             &files.cargo_toml,
             crate::panels::mcu_module::codegen::flash_store_gen::in_files(&configs),
-            &esp.project.probe_chip,
+            Some(&esp.project.probe_chip),
             &[],
         );
         files.partitions_csv = project_gen::splice_partitions_csv(
@@ -2157,6 +2156,150 @@ mod emit_for_manual_compile {
             .expect("write esp project");
         println!("wrote {}", dir.display());
         println!("target: {}", esp.project.target);
+    }
+
+    /// A whole STM32 project with the Configuration tab's flash store on - the
+    /// only place its template, the GEN lines, the seeded tail line and the
+    /// shrunk memory.x meet a real HAL, sequential-storage and a LINKER (a
+    /// memory.x mistake passes `cargo check`; the matrix rows build).
+    ///
+    /// `EIDE_STORE_CHIP` picks the part: `f103` (the built-in, default),
+    /// `g431` or `wba55` - derived from the F103's definition the way
+    /// the importer would build them, as the other embassy harnesses do.
+    /// `EIDE_STORE_RUNTIME` = `blocking` (default) | `native` | `async`. No
+    /// pins are wired: the store's lines live in the Configuration tab's slot,
+    /// which the "select pins" default section must carry too.
+    #[test]
+    #[ignore]
+    fn emit_stm32_store_project() {
+        warn_if_matrix_running();
+        use crate::panels::mcu_module::codegen::flash_store_gen::{TAIL_SEED, in_files};
+        use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig, Platform};
+        use crate::panels::mcu_module::mcu::model::Runtime;
+        use crate::panels::mcu_module::mcu_def::{ClockDef, build_cfg};
+
+        let chip = std::env::var("EIDE_STORE_CHIP").unwrap_or_else(|_| "f103".into());
+        let mut def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        // (id, display name, family, target, flash, RAM)
+        let derived = match chip.as_str() {
+            "f103" => None,
+            "g431" => Some((
+                "stm32g431cb",
+                "STM32G431CBUx",
+                "stm32g4",
+                "thumbv7em-none-eabihf",
+                "128K",
+                "32K",
+            )),
+            "wba55" => Some((
+                "stm32wba55cg",
+                "STM32WBA55CGUx",
+                "stm32wba",
+                "thumbv8m.main-none-eabihf",
+                "1024K",
+                "128K",
+            )),
+            other => panic!("EIDE_STORE_CHIP={other}: f103 | g431 | wba55"),
+        };
+        if let Some((id, name, family, target, flash, ram)) = derived {
+            def.id = id.into();
+            def.display_name = name.into();
+            def.family = family.into();
+            def.project.pkg_name = id.into();
+            def.project.target = target.into();
+            def.project.probe_chip = name.into();
+            def.project.flash_size = flash.into();
+            def.project.ram_size = ram.into();
+            def.project.hal_dep = stm32_pin_data::hal_dep_for_name(family, name);
+            def.clock = ClockDef::None;
+        }
+        let mut mcu = def.build_mcu();
+        let runtime = match std::env::var("EIDE_STORE_RUNTIME").as_deref() {
+            Ok("native") => Runtime::Native,
+            Ok("async") => Runtime::Async,
+            _ => Runtime::Blocking,
+        };
+        mcu.runtime = runtime;
+        mcu.pending_runtime = runtime;
+        let (geo, _) = flash_store::geometry(flash_store::part_of(&mcu)).expect("a metapac part");
+        mcu.flash_store = Some(FlashStoreConfig::default_stm32(&geo));
+        let platform = flash_store::platform_of(&mcu)
+            .unwrap_or_else(|why| panic!("[{chip} {runtime:?}] not generated: {why}"));
+        println!("[{chip} {runtime:?}] {platform:?}");
+        assert!(matches!(platform, Platform::Stm32 { .. }));
+
+        let mut main_rs = mcu.fresh_main_rs();
+        assert!(
+            main_rs.contains(TAIL_SEED),
+            "the store line was not seeded:\n{main_rs}"
+        );
+        // Use what the template offers, as a user would: a load and a save in
+        // the loop - async or blocking, as the runtime is.
+        let body = if mcu.is_async() {
+            "let mut d = flash_store.load().await;\n        d.counter += 1;\n        flash_store.save(&d).await.ok();\n"
+        } else {
+            "let mut d = flash_store.load_blocking();\n        d.counter += 1;\n        flash_store.save_blocking(&d).ok();\n"
+        };
+        main_rs = main_rs.replacen(
+            "        // Your main loop code here.\n",
+            &format!("        // Your main loop code here.\n        {body}"),
+            1,
+        );
+        assert!(
+            main_rs.contains("flash_store.save"),
+            "no loop to use it in:\n{main_rs}"
+        );
+
+        let project = build_cfg(&def, Some(&mcu));
+        let mut files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+        let configs = mcu.config_files();
+        let sources = [main_rs.as_str()];
+        // The chain `app.rs` runs, as far as a pin-less project needs it.
+        files.cargo_toml = project_gen::ensure_async_deps(
+            &files.cargo_toml,
+            mcu.is_async(),
+            project_gen::async_flavor_for(&mcu.family, ""),
+            false,
+            false,
+            false,
+            &sources,
+        );
+        files.cargo_toml = project_gen::ensure_m0_atomics(
+            &files.cargo_toml,
+            mcu.is_async(),
+            &project.target,
+            &sources,
+        );
+        files.cargo_toml = project_gen::ensure_flash_store_deps(
+            &files.cargo_toml,
+            in_files(&configs),
+            None,
+            &sources,
+        );
+        // memory.x by the decision the app makes (`flash_store::stm32_reservation`).
+        let reservation = flash_store::stm32_reservation(
+            mcu.flash_store.as_ref(),
+            &mcu.family,
+            flash_store::part_of(&mcu),
+            mcu.runtime,
+        );
+        assert!(reservation.is_some(), "nothing reserved");
+        files.memory_x = project_gen::splice_memory_x_store(&files.memory_x, &project, reservation);
+        assert!(
+            files.memory_x.contains("_flash_store_start"),
+            "{}",
+            files.memory_x
+        );
+        let user = mcu.pin_tree_files();
+        let dir = std::env::temp_dir().join(format!(
+            "eide_store_check_{chip}_{}",
+            format!("{runtime:?}").to_ascii_lowercase()
+        ));
+        project_gen::clear_project_dir_keep_target(&dir);
+        project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
+            .expect("write store project");
+        println!("wrote {}", dir.display());
+        println!("target: {}", project.target);
     }
 
     /// A whole STM32N6 project, from the vendor file to `main.rs`.

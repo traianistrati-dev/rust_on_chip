@@ -30,6 +30,7 @@
 
 use super::mcu_catalog::ToolchainKind;
 use super::mcu_def::ProjectDef;
+use std::ops::Range;
 use std::{fs, io, path::Path};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -679,17 +680,27 @@ pub fn ensure_esp_usb_deps(cargo_toml: &str, needs_otg: bool, sources: &[&str]) 
 /// A `serde` line the user wrote WITHOUT `derive` is kept as it is
 /// (`ensure_dep` never rewrites a present line), and the template's derive
 /// then fails to compile - the user's line wins over a guess.
+///
+/// `esp_chip` is the ESP's esp-storage feature, `None` on an STM32: there the
+/// flash driver is the HAL the project already has (embassy-stm32's `Flash`,
+/// or stm32f1xx-hal's `FlashWriter`), so only the store's own crates come in.
 pub fn ensure_flash_store_deps(
     cargo_toml: &str,
     needs: bool,
-    chip: &str,
+    esp_chip: Option<&str>,
     sources: &[&str],
 ) -> String {
-    let lines = [
-        (
-            "esp-storage",
-            format!("esp-storage = {{ version = \"0.9\", features = [\"{chip}\"] }}"),
+    let mut s = ensure_dep(
+        cargo_toml,
+        "esp-storage",
+        needs && esp_chip.is_some(),
+        &format!(
+            "esp-storage = {{ version = \"0.9\", features = [\"{}\"] }}",
+            esp_chip.unwrap_or_default()
         ),
+        sources,
+    );
+    let lines = [
         (
             "sequential-storage",
             "sequential-storage = { version = \"8\", features = [\"postcard\"] }".to_owned(),
@@ -706,7 +717,6 @@ pub fn ensure_flash_store_deps(
         ),
         ("embassy-futures", "embassy-futures = \"0.1\"".to_owned()),
     ];
-    let mut s = cargo_toml.to_owned();
     for (name, line) in lines {
         s = ensure_dep(&s, name, needs, &line, sources);
     }
@@ -2577,6 +2587,75 @@ fn cargo_config_embedded(c: &ProjectDef) -> String {
         target = c.target,
         chip = c.probe_chip,
     )
+}
+
+/// The memory.x GENERATED block with the Configuration tab's flash store
+/// kept out of FLASH: `store` is its byte range from the start of flash
+/// (`flash_store::stm32_reservation`), `None` for the plain block.
+///
+/// FLASH ends where the store begins, written as a literal `NNK` (the Size
+/// bar's parser reads a number, not `64K - 2K`). The store's bounds become
+/// linker symbols, and an `ASSERT` keeps them apart from FLASH, so a LENGTH
+/// edited by hand past the store fails the link instead of overwriting it.
+pub fn memory_x_body(c: &ProjectDef, store: Option<Range<u32>>) -> String {
+    use crate::panels::mcu_module::flash_store::STM32_FLASH_BASE;
+    let Some(r) = store else {
+        return memory_x(c);
+    };
+    let origin = crate::size::parse_ld_number(&c.flash_origin).unwrap_or(STM32_FLASH_BASE.into());
+    let start = u64::from(STM32_FLASH_BASE) + u64::from(r.start);
+    let end = u64::from(STM32_FLASH_BASE) + u64::from(r.end);
+    let full = crate::size::parse_ld_number(&c.flash_size).unwrap_or(end - origin);
+    let length = full.min(start.saturating_sub(origin));
+    let mut shrunk = c.clone();
+    shrunk.flash_size = format!("{}K", length / 1024);
+    let mut out = memory_x(&shrunk);
+    out.push_str(&format!(
+        concat!(
+            "/* Flash store (Configuration tab): the last {kib} KiB of flash, kept out of\n",
+            "   FLASH above, so a program that grows into it fails to link. */\n",
+            "_flash_store_start = 0x{start:08X};\n",
+            "_flash_store_end = 0x{end:08X};\n",
+            "ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= _flash_store_start,\n",
+            "       \"memory.x - FLASH overlaps the flash store reserved in the Configuration tab\");\n",
+        ),
+        kib = (end - start) / 1024,
+        start = start,
+        end = end,
+    ));
+    out
+}
+
+/// memory.x with its GENERATED block following the flash store - the
+/// `memory.x` counterpart of [`splice_partitions_csv`], run on every
+/// regeneration.
+///
+/// Rewritten only while there is a store to reserve, or the block still holds
+/// one (to take it back out): a project without a store keeps its memory.x
+/// byte for byte. A memory.x with no markers is the user's - never written,
+/// only checked (`flash_store::stm32_flash_block`).
+pub fn splice_memory_x_store(existing: &str, c: &ProjectDef, store: Option<Range<u32>>) -> String {
+    let (begin, end) = (Cmt::Block.begin(), Cmt::Block.end());
+    let (Some(b), Some(e)) = (existing.find(begin), existing.find(end)) else {
+        return existing.to_owned();
+    };
+    if b > e {
+        return existing.to_owned();
+    }
+    let reserved = existing[b..e].contains(MEMORY_X_STORE_SYMBOL);
+    if store.is_none() && !reserved {
+        return existing.to_owned();
+    }
+    splice_block(existing, Cmt::Block, &memory_x_body(c, store))
+}
+
+/// The symbol that marks a memory.x block as carrying a flash store.
+const MEMORY_X_STORE_SYMBOL: &str = "_flash_store_start";
+
+/// Does `memory.x` carry the IDE's GENERATED block? One without is the
+/// user's: never rewritten, only checked.
+pub fn memory_x_is_ours(text: &str) -> bool {
+    text.contains(Cmt::Block.begin())
 }
 
 fn memory_x(c: &ProjectDef) -> String {
@@ -4651,6 +4730,84 @@ mod flash_store_file_tests {
     const ROWS: &str =
         "nvs, data, nvs, 0x9000, 0x6000\nflash_store, data, undefined, 0x3FC000, 0x4000\n";
 
+    fn f103c8() -> ProjectDef {
+        ProjectDef {
+            pkg_name: "stm32f103c8t6".into(),
+            target: "thumbv7m-none-eabi".into(),
+            flash_origin: "0x08000000".into(),
+            flash_size: "64K".into(),
+            ram_origin: "0x20000000".into(),
+            ram_size: "20K".into(),
+            hal_dep: "stm32f1xx-hal = \"0.10\"".into(),
+            hal_dep_async: None,
+            probe_chip: "STM32F103C8".into(),
+            memory_comment: "STM32F103C8T6".into(),
+        }
+    }
+
+    /// With a store, FLASH ends where it begins (a literal the Size bar can
+    /// read), the store's bounds are linker symbols and an ASSERT keeps them
+    /// apart; without one, memory.x is the plain block.
+    #[test]
+    fn memory_x_keeps_the_store_out_of_flash() {
+        let def = f103c8();
+        let body = memory_x_body(&def, Some(0xF800..0x10000));
+        assert!(
+            body.contains("FLASH : ORIGIN = 0x08000000, LENGTH = 62K"),
+            "{body}"
+        );
+        assert!(body.contains("_flash_store_start = 0x0800F800;"), "{body}");
+        assert!(body.contains("_flash_store_end = 0x08010000;"), "{body}");
+        assert!(body.contains("ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= _flash_store_start"));
+        assert!(body.contains("the last 2 KiB of flash"));
+        let limits = crate::size::parse_memory_x(&body);
+        assert_eq!(limits.flash.map(|f| f.length), Some(62 * 1024));
+        assert_eq!(limits.ram.map(|r| r.length), Some(20 * 1024));
+        assert_eq!(memory_x_body(&def, None), memory_x(&def));
+    }
+
+    /// Spliced on every regeneration, but only while there is a store or a
+    /// trace of one: a project without a store keeps its memory.x byte for
+    /// byte, a hand-written one is never touched, and off takes it all back.
+    #[test]
+    fn memory_x_follows_the_store_and_spares_everything_else() {
+        let def = f103c8();
+        let plain = gen_config(ConfigFile::MemoryX, &def, &ToolchainKind::RustEmbedded);
+        let mine = format!("{plain}/* my own region */\n");
+        assert_eq!(splice_memory_x_store(&mine, &def, None), mine);
+        let on = splice_memory_x_store(&mine, &def, Some(0xF800..0x10000));
+        assert!(
+            on.contains("LENGTH = 62K") && on.contains("/* my own region */"),
+            "{on}"
+        );
+        assert_eq!(
+            splice_memory_x_store(&on, &def, Some(0xF800..0x10000)),
+            on,
+            "idempotent"
+        );
+        assert_eq!(
+            splice_memory_x_store(&on, &def, None),
+            mine,
+            "off restores it"
+        );
+        let theirs = "MEMORY { FLASH : ORIGIN = 0x08000000, LENGTH = 64K }\n";
+        assert_eq!(
+            splice_memory_x_store(theirs, &def, Some(0xF800..0x10000)),
+            theirs
+        );
+        assert!(!memory_x_is_ours(theirs) && memory_x_is_ours(&on));
+    }
+
+    /// An STM32 store brings only its own crates; esp-storage is an ESP's.
+    #[test]
+    fn an_stm32_store_brings_no_esp_storage() {
+        let toml = "[package]\nname = \"x\"\n\n[dependencies]\nembassy-stm32 = \"0.6\"\n";
+        let on = ensure_flash_store_deps(toml, true, None, &[]);
+        assert!(!on.contains("esp-storage"), "{on}");
+        assert!(on.contains("sequential-storage") && on.contains("embassy-embedded-hal"));
+        assert_eq!(ensure_flash_store_deps(&on, false, None, &[]), toml);
+    }
+
     /// The table is ours inside its block, gone with the store when nothing of
     /// the user's is left, and a hand-written table is never touched.
     #[test]
@@ -4712,7 +4869,7 @@ mod flash_store_file_tests {
     #[test]
     fn the_store_crates_come_and_go_as_one_set() {
         let toml = "[package]\nname = \"x\"\n\n[dependencies]\nesp-hal = \"1\"\n";
-        let on = ensure_flash_store_deps(toml, true, "esp32c3", &[]);
+        let on = ensure_flash_store_deps(toml, true, Some("esp32c3"), &[]);
         for c in [
             "esp-storage = { version = \"0.9\", features = [\"esp32c3\"] }",
             "sequential-storage = { version = \"8\", features = [\"postcard\"] }",
@@ -4723,13 +4880,18 @@ mod flash_store_file_tests {
         ] {
             assert!(on.contains(c), "{c}\n{on}");
         }
-        assert_eq!(ensure_flash_store_deps(&on, true, "esp32c3", &[]), on);
-        assert_eq!(ensure_flash_store_deps(&on, false, "esp32c3", &[]), toml);
+        assert_eq!(ensure_flash_store_deps(&on, true, Some("esp32c3"), &[]), on);
+        assert_eq!(
+            ensure_flash_store_deps(&on, false, Some("esp32c3"), &[]),
+            toml
+        );
         // A serde line of the user's own stays, on or off.
         let mine = format!("{toml}serde = \"1\"\n");
-        let both = ensure_flash_store_deps(&mine, true, "esp32c3", &[]);
+        let both = ensure_flash_store_deps(&mine, true, Some("esp32c3"), &[]);
         assert_eq!(both.matches("serde =").count(), 1, "{both}");
-        assert!(ensure_flash_store_deps(&both, false, "esp32c3", &[]).contains("serde = \"1\""));
+        assert!(
+            ensure_flash_store_deps(&both, false, Some("esp32c3"), &[]).contains("serde = \"1\"")
+        );
     }
 
     /// An empty table deletes the IDE's own file and any copy in the shared

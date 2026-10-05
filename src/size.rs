@@ -106,7 +106,7 @@ fn field_value<'a>(spec: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// An ld number: `0x…` hex, decimal, optional `K`/`M` multiplier suffix.
-fn parse_ld_number(tok: &str) -> Option<u64> {
+pub(crate) fn parse_ld_number(tok: &str) -> Option<u64> {
     let tok = tok.trim();
     let (tok, mult) = match tok.chars().last() {
         Some('K') | Some('k') => (&tok[..tok.len() - 1], 1024u64),

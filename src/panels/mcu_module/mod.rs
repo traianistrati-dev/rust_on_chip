@@ -28,6 +28,7 @@ pub mod pins;
 pub mod project_gen;
 pub mod registry;
 pub mod ron_text;
+pub mod stm32_flash_geometry;
 pub mod stm32_pin_data;
 pub mod structure_config;
 pub mod uart_baud;

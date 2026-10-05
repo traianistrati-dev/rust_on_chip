@@ -22,8 +22,24 @@
 //! The alternative with no table at all is the default table's own `nvs`
 //! partition ([`NVS_RANGE`]): reserved by every espflash table, and never
 //! erased by `espflash flash`, which erases only the sectors it writes.
+//!
+//! # STM32
+//!
+//! No partition table: the store is the last pages of flash, and `memory.x`'s
+//! FLASH region shrinks by exactly that much, so code that grows into the
+//! store fails to LINK ([`FlashStoreMode::MemoryX`]). Every flashing path the
+//! IDE has (cargo flash, probe-rs run, the Debug launch, OpenOCD `program`)
+//! erases only the sectors it writes, so the store survives a reflash; only a
+//! chip erase wipes it. The firmware side is embassy-stm32's blocking `Flash`,
+//! or on the F1's own HAL an adapter over `FlashWriter` - see
+//! [`platform`] for which, and for every part it is NOT generated on and why.
+//! The page sizes come from [`super::stm32_flash_geometry`], harvested from
+//! the metadata embassy-stm32 itself is built from.
 
 use std::ops::Range;
+
+use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+use crate::panels::mcu_module::stm32_flash_geometry as geo;
 
 /// The flash's erase unit on every ESP part (`esp_storage::FlashStorage::SECTOR_SIZE`),
 /// and the alignment a `data` partition needs.
@@ -49,37 +65,242 @@ pub const LABEL: &str = "flash_store";
 /// The flash sizes the card offers.
 pub const FLASH_SIZES: [u32; 4] = [0x20_0000, 0x40_0000, 0x80_0000, 0x100_0000];
 
-/// The families the store is generated for. ESP32-C3 first: it is the chip the
-/// feature was compiled and run against. The others have the FLASH peripheral
-/// and an esp-storage feature, but two need more than this generator writes -
-/// the ESP32 and S3 must park their second core before a write, and the ESP32
-/// refuses the Debug build's `opt-level = 1` in esp-storage's build script.
+/// The ESP families the store is generated for. ESP32-C3 first: it is the chip
+/// the feature was compiled and run against. The others have the FLASH
+/// peripheral and an esp-storage feature, but two need more than this
+/// generator writes - the ESP32 and S3 must park their second core before a
+/// write, and the ESP32 refuses the Debug build's `opt-level = 1` in
+/// esp-storage's build script.
 pub const SUPPORTED: &[&str] = &["esp32c3"];
 
-/// Is the store generated for `family`?
+/// Is the ESP version of the store (esp-storage, partitions.csv) generated
+/// for `family`? STM32 goes through [`platform`].
 pub fn supported(family: &str) -> bool {
     SUPPORTED.contains(&family)
 }
 
-/// Why the card is greyed on `family`, or `None` where it is live.
-pub fn unsupported_reason(family: &str) -> Option<&'static str> {
+/// The largest STM32 erase unit the store is laid out on: 16 KiB. Past it are
+/// only the 32/64/128/256 KiB sectors of F2/F4/F7 and the H7, where the two
+/// pages the store needs would be 256 KiB at least.
+pub const MAX_PAGE: u32 = 16 * 1024;
+
+/// What generates the store on a chip, under a runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Platform {
+    /// esp-storage, reserved in an ESP-IDF partition table.
+    Esp,
+    /// The chip's own flash through its HAL, reserved in `memory.x`.
+    Stm32 { hal: StmHal, geo: Geometry },
+}
+
+/// Which STM32 HAL writes the flash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StmHal {
+    /// embassy-stm32's blocking `Flash` - every family, the F1 on Async.
+    Embassy,
+    /// stm32f1xx-hal's `FlashWriter`, behind a generated `NorFlash` adapter -
+    /// the F1 on Blocking and Native.
+    F1Hal,
+}
+
+/// A part's flash, as far as the store needs it. Bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Geometry {
+    /// The whole flash (embassy-stm32's `FLASH_SIZE`).
+    pub size: u32,
+    /// The erase unit at the end of flash, where the store lives.
+    pub page: u32,
+    /// The write unit - sequential-storage's word.
+    pub write: u32,
+}
+
+/// The flash geometry of an STM32 part, with the table's flags, by name -
+/// `STM32G431CBUx`, `stm32f103c8t6` and `stm32g431cb` all find `stm32g431cb`
+/// (the longest table name the part's name starts with). `None` for a part
+/// stm32-metapac does not know, and for the N6, which has no internal flash.
+pub fn geometry(part: &str) -> Option<(Geometry, u8)> {
+    let slug: String = part
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    (9..=slug.len()).rev().find_map(|n| {
+        let i = geo::PARTS
+            .binary_search_by(|(name, ..)| (*name).cmp(&slug[..n]))
+            .ok()?;
+        let (_, kib, shape) = geo::PARTS[i];
+        let s = geo::SHAPES[usize::from(shape)];
+        Some((
+            Geometry {
+                size: u32::from(kib) * 1024,
+                page: s.page,
+                write: u32::from(s.write),
+            },
+            s.flags,
+        ))
+    })
+}
+
+/// The name the table knows `mcu`'s part by: its display name, or else its
+/// definition id - a chip the user renamed in the MCU form ("Blue Pill") still
+/// has `stm32f103c8t6` as its id.
+pub fn part_of(mcu: &Mcu) -> &str {
+    [mcu.name.as_str(), mcu.id.as_str()]
+        .into_iter()
+        .find(|n| geometry(n).is_some())
+        .unwrap_or(&mcu.name)
+}
+
+/// [`platform`] for `mcu`'s chip and runtime - what every caller asks.
+pub fn platform_of(mcu: &Mcu) -> Result<Platform, String> {
+    platform(&mcu.family, part_of(mcu), mcu.runtime)
+}
+
+/// How the store is generated for `part` of `family` under `runtime`, or the
+/// sentence the card shows where it is not. THE decision: the card, the
+/// generators, `memory.x` and the flash check all ask it.
+///
+/// Not on STM32 parts whose last two pages cost too much (F2/F4/F7 sectors of
+/// 128/256 KiB, the H7's 128 KiB: [`MAX_PAGE`]; or two pages over a quarter
+/// of a small flash), nor where the plain end-of-flash layout is wrong: banks
+/// chosen in the option bytes (the page size follows them, and embassy's
+/// driver panics - or on the L552xC erases the wrong page - when the
+/// project's bank setup disagrees), banks with a gap between them, the F1's
+/// XL parts (bank 2 is not driven), flash that erases to 0x00 (L0/L1), the
+/// WB's radio stack, and the lines embassy-stm32 0.6 cannot write (H7RS, U3,
+/// WB0). RTIC is left for later: the store would be one of its `Local`
+/// resources.
+pub fn platform(family: &str, part: &str, runtime: Runtime) -> Result<Platform, String> {
+    use crate::panels::mcu_module::codegen::family as fam;
     if supported(family) {
-        return None;
+        return Ok(Platform::Esp);
     }
-    Some(
-        if crate::panels::mcu_module::codegen::family::is_esp(family) {
-            concat!(
-                "Generated for the ESP32-C3 only so far. This chip has the flash and an ",
-                "esp-storage driver, but it was not compiled against it yet."
-            )
+    if fam::is_esp(family) {
+        return Err(concat!(
+            "Generated for the ESP32-C3 only so far. This chip has the flash and an ",
+            "esp-storage driver, but it was not compiled against it yet."
+        )
+        .to_owned());
+    }
+    if !family.starts_with("stm32") {
+        return Err(concat!(
+            "Generated for the ESP32-C3 and STM32 so far - this family's flash ",
+            "driver is not wired in yet."
+        )
+        .to_owned());
+    }
+    if runtime == Runtime::Rtic && fam::rtic_supported(family) {
+        return Err(concat!(
+            "Not on the RTIC runtime yet: the store would be one of the app's ",
+            "Local resources, which the generator does not write. Blocking, Native ",
+            "and Async have it."
+        )
+        .to_owned());
+    }
+    let Some((g, flags)) = geometry(part) else {
+        return Err(if family == "stm32n6" {
+            "The STM32N6 has no internal flash to keep settings in.".to_owned()
         } else {
-            concat!(
-                "Generated for the ESP32-C3 only so far (esp-storage plus an ESP-IDF ",
-                "partition table). Other families reserve flash in memory.x instead, ",
-                "which is not written yet."
+            format!(
+                "{part} is not in stm32-metapac 21's part list, so its flash page size is unknown."
             )
-        },
-    )
+        });
+    };
+    let slug = part.to_ascii_lowercase();
+    let line = |p: &str| slug.starts_with(p);
+    if line("stm32h7r") || line("stm32h7s") || line("stm32u3") || line("stm32wb0") {
+        return Err(concat!(
+            "embassy-stm32 0.6 cannot write or erase this line's flash yet (its ",
+            "driver is a stub there)."
+        )
+        .to_owned());
+    }
+    // embassy-stm32 0.6's L4/WL driver (l.rs) erases and writes with the
+    // flash's data cache left on and never resets it - g.rs, f2.rs and f4.rs
+    // do (DCEN off, DCRST, DCEN on). sequential-storage reads a page, erases
+    // or writes it, and reads it again, so it could read the cached old bytes.
+    if line("stm32l4") || line("stm32wl") {
+        return Err(concat!(
+            "embassy-stm32 0.6 does not reset this line's flash data cache after an ",
+            "erase or a write, so the store could read stale bytes back. Not ",
+            "generated for it yet."
+        )
+        .to_owned());
+    }
+    if line("stm32wb") && !line("stm32wba") {
+        return Err(concat!(
+            "The top of the WB's flash holds the radio coprocessor's stack, and ",
+            "writing next to it needs the CPU2 handshake - not generated yet."
+        )
+        .to_owned());
+    }
+    if flags & geo::ERASED_FF == 0 {
+        return Err(concat!(
+            "This flash reads 0x00 when erased, and sequential-storage needs 0xFF. ",
+            "The chip's data EEPROM would be the place - not generated yet."
+        )
+        .to_owned());
+    }
+    // The L552xC is the configurable case metapac does not mark: one 4 KiB-page
+    // bank in its data, but DBANK (with DB256K) set from the factory - two banks
+    // of 2 KiB pages. embassy's L5 erase counts 4 KiB pages and, with DBANK
+    // set, never picks bank 2 below 256 pages, so the store's last pages
+    // would erase PROGRAM flash in bank 1 (embassy-stm32 0.6 l.rs). The rest
+    // of the L5 line is marked; the family goes as one.
+    if flags & geo::CONFIGURABLE != 0 || line("stm32l5") {
+        return Err(concat!(
+            "Single or dual bank is chosen in this part's option bytes, and the page ",
+            "size follows the choice; embassy's flash driver panics, or erases the ",
+            "wrong page, when it disagrees with the project's bank setup. Not ",
+            "generated for it yet."
+        )
+        .to_owned());
+    }
+    if flags & geo::CONTIGUOUS == 0 {
+        return Err(concat!(
+            "This part's two flash banks have a gap between them, so the end of ",
+            "flash is not where FLASH_SIZE says. Not generated for it yet."
+        )
+        .to_owned());
+    }
+    if family == "stm32f1" && g.size > 512 * 1024 {
+        return Err(concat!(
+            "On an XL-density F1 the end of flash is bank 2, which the F1 drivers ",
+            "do not program. Not generated for it yet."
+        )
+        .to_owned());
+    }
+    // Sectors of 32 KiB and up at the end of flash (F2/F4/F7, the H7's 128 KiB):
+    // two of them are 256 KiB or more whatever the chip's size, so they wait for
+    // the layout that uses the small sectors after the vector table.
+    if flags & geo::UNIFORM == 0 || g.page > MAX_PAGE {
+        return Err(format!(
+            concat!(
+                "This flash ends in sectors of {} KiB, and the store needs two of them - ",
+                "{} KiB. Not generated for it yet: the plan is the small sectors right ",
+                "after the vector table."
+            ),
+            g.page / 1024,
+            g.page * 2 / 1024,
+        ));
+    }
+    if u64::from(g.page) * 2 * 4 > u64::from(g.size) {
+        return Err(format!(
+            concat!(
+                "Two pages of {} KiB - the store's minimum - would be {}% of this ",
+                "{} KiB flash. Not generated for it."
+            ),
+            g.page / 1024,
+            u64::from(g.page) * 200 / u64::from(g.size),
+            g.size / 1024,
+        ));
+    }
+    let hal = if fam::uses_stm32f1xx_hal(family, runtime) {
+        StmHal::F1Hal
+    } else {
+        StmHal::Embassy
+    };
+    Ok(Platform::Stm32 { hal, geo: g })
 }
 
 /// The flash size a part most likely has when nothing better is known: the
@@ -107,6 +328,9 @@ pub enum FlashStoreMode {
     /// not ESP-IDF's NVS - firmware or tools expecting real NVS there will not
     /// read it.
     Nvs,
+    /// STM32: the last pages of flash, kept out of `memory.x`'s FLASH region.
+    /// `offset` is from the start of flash, as embassy-stm32's `Flash` counts.
+    MemoryX,
 }
 
 impl FlashStoreMode {
@@ -115,6 +339,7 @@ impl FlashStoreMode {
         match self {
             Self::Partition => "partition",
             Self::Nvs => "nvs",
+            Self::MemoryX => "memoryx",
         }
     }
 
@@ -122,6 +347,7 @@ impl FlashStoreMode {
         match s {
             "partition" => Some(Self::Partition),
             "nvs" => Some(Self::Nvs),
+            "memoryx" => Some(Self::MemoryX),
             _ => None,
         }
     }
@@ -131,12 +357,14 @@ impl FlashStoreMode {
         match self {
             Self::Partition => "Own partition (partitions.csv)",
             Self::Nvs => "Default nvs partition (no table of its own)",
+            Self::MemoryX => "End of flash, kept out of memory.x",
         }
     }
 }
 
 /// The store's settings. `flash_size`, `size` and `offset` are bytes; `size`
-/// and `offset` only matter in [`FlashStoreMode::Partition`].
+/// and `offset` matter in [`FlashStoreMode::Partition`] and
+/// [`FlashStoreMode::MemoryX`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FlashStoreConfig {
     pub mode: FlashStoreMode,
@@ -158,10 +386,33 @@ impl FlashStoreConfig {
         }
     }
 
+    /// The default on an STM32: the last [`MIN_SECTORS`] pages - 2 KiB on an
+    /// F103C8, 4 KiB on a G431, 16 KiB on a U5. Small on purpose: an F103C8
+    /// has 64 KiB in all, and the ESP's 16 KiB would be a quarter of it.
+    pub fn default_stm32(g: &Geometry) -> Self {
+        let size = MIN_SECTORS * g.page;
+        Self {
+            mode: FlashStoreMode::MemoryX,
+            flash_size: g.size,
+            size,
+            offset: g.size - size,
+        }
+    }
+
+    /// The default for whatever `platform` the chip is on.
+    pub fn default_on(platform: &Platform, family: &str) -> Self {
+        match platform {
+            Platform::Esp => Self::default_for(family),
+            Platform::Stm32 { geo, .. } => Self::default_stm32(geo),
+        }
+    }
+
     /// The bytes the store owns.
     pub fn range(&self) -> Range<u32> {
         match self.mode {
-            FlashStoreMode::Partition => self.offset..self.offset.saturating_add(self.size),
+            FlashStoreMode::Partition | FlashStoreMode::MemoryX => {
+                self.offset..self.offset.saturating_add(self.size)
+            }
             FlashStoreMode::Nvs => NVS_RANGE,
         }
     }
@@ -169,9 +420,65 @@ impl FlashStoreConfig {
     /// The `data` subtype the store's partition carries in the table.
     pub fn subtype(&self) -> u8 {
         match self.mode {
-            FlashStoreMode::Partition => SUBTYPE_UNDEFINED,
+            FlashStoreMode::Partition | FlashStoreMode::MemoryX => SUBTYPE_UNDEFINED,
             FlashStoreMode::Nvs => SUBTYPE_NVS,
         }
+    }
+
+    /// What is wrong with the settings on `platform`, one sentence each:
+    /// [`Self::problems`] on an ESP, the page and end-of-flash rules on an
+    /// STM32. Settings saved for the other platform (a chip changed under a
+    /// project) say so, and the card's Reset fixes them.
+    pub fn problems_on(&self, platform: &Platform) -> Vec<String> {
+        let Platform::Stm32 { geo: g, .. } = platform else {
+            if self.mode == FlashStoreMode::MemoryX {
+                return vec![
+                    "These settings are for an STM32's memory.x, not this chip.".to_owned(),
+                ];
+            }
+            return self.problems();
+        };
+        if self.mode != FlashStoreMode::MemoryX {
+            return vec![
+                "These settings are for an ESP partition table, not this chip.".to_owned(),
+            ];
+        }
+        let mut out = Vec::new();
+        if self.flash_size != g.size {
+            out.push(format!(
+                "Saved for a {} KiB flash; this part has {} KiB.",
+                self.flash_size / 1024,
+                g.size / 1024
+            ));
+        }
+        if !self.size.is_multiple_of(g.page) {
+            out.push(format!(
+                "The store must be whole pages of {} KiB: 0x{:X} is not.",
+                g.page / 1024,
+                self.size
+            ));
+        }
+        if self.size < MIN_SECTORS * g.page {
+            out.push(format!(
+                "The store needs at least {MIN_SECTORS} pages ({} KiB): sequential-storage keeps one free for migration.",
+                MIN_SECTORS * g.page / 1024
+            ));
+        }
+        if u64::from(self.offset) + u64::from(self.size) != u64::from(g.size) {
+            out.push(format!(
+                "The store must end where the flash ends (0x{:X}); it ends at 0x{:X}.",
+                g.size,
+                u64::from(self.offset) + u64::from(self.size)
+            ));
+        }
+        if self.size > g.size / 2 {
+            out.push(format!(
+                "The store takes {} of {} KiB - more than half the flash, which the program needs.",
+                self.size / 1024,
+                g.size / 1024
+            ));
+        }
+        out
     }
 
     /// Does this configuration need a `partitions.csv` of its own?
@@ -189,7 +496,7 @@ impl FlashStoreConfig {
     /// means the generated table and the generated range are consistent.
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.mode == FlashStoreMode::Nvs {
+        if self.mode != FlashStoreMode::Partition {
             return out;
         }
         if !self.offset.is_multiple_of(SECTOR) || !self.size.is_multiple_of(SECTOR) {
@@ -538,7 +845,7 @@ pub fn store_row_missing(csv: &str, cfg: &FlashStoreConfig) -> bool {
 pub fn store_row(cfg: &FlashStoreConfig) -> String {
     let r = cfg.range();
     let name = match cfg.mode {
-        FlashStoreMode::Partition => LABEL,
+        FlashStoreMode::Partition | FlashStoreMode::MemoryX => LABEL,
         FlashStoreMode::Nvs => "nvs",
     };
     format!(
@@ -562,7 +869,7 @@ pub fn flash_block(csv: &str, store: Option<&FlashStoreConfig>, family: &str) ->
     }
     let store = store.filter(|_| supported(family));
     if let Some(c) = store {
-        let p = c.problems();
+        let p = c.problems_on(&Platform::Esp);
         if !p.is_empty() {
             return Some(format!("Flash store: {}", p.join(" ")));
         }
@@ -582,6 +889,175 @@ pub fn flash_block(csv: &str, store: Option<&FlashStoreConfig>, family: &str) ->
 /// How [`flash_block`] starts a block that is the TABLE's - the only kind
 /// the Flash tab's "Fix partitions.csv" may be offered for.
 pub const TABLE_BLOCK_PREFIX: &str = "partitions.csv:";
+
+/// Where every STM32's flash starts; the store's offsets count from here.
+pub const STM32_FLASH_BASE: u32 = 0x0800_0000;
+
+/// Why an STM32 project with a flash store must not be flashed, or `None`.
+///
+/// The store's own settings first. Then `memory.x`: the IDE's block always
+/// keeps FLASH out of the store, but a memory.x without the markers is the
+/// user's, never rewritten - and one whose FLASH runs into the store would
+/// let the program grow over the settings, or the store erase the program.
+/// Nothing to check while the store is off or not generated for the part.
+pub fn stm32_flash_block(
+    memory_x: &str,
+    store: Option<&FlashStoreConfig>,
+    family: &str,
+    part: &str,
+    runtime: Runtime,
+) -> Option<String> {
+    let store = store?;
+    let p @ Platform::Stm32 { .. } = platform(family, part, runtime).ok()? else {
+        return None;
+    };
+    let problems = store.problems_on(&p);
+    if !problems.is_empty() {
+        return Some(format!("Flash store: {}", problems.join(" ")));
+    }
+    memory_x_overlap(memory_x, store)
+}
+
+/// The sentence for a `memory.x` whose FLASH runs into the store, or `None`.
+/// Only a memory.x the user wrote can: the IDE's block ends FLASH where the
+/// store begins.
+pub fn memory_x_overlap(memory_x: &str, store: &FlashStoreConfig) -> Option<String> {
+    let (origin, length) = memory_x_flash(memory_x)?;
+    let start = u64::from(STM32_FLASH_BASE) + u64::from(store.offset);
+    let end = origin + length;
+    (end > start).then(|| {
+        format!(
+            concat!(
+                "memory.x: FLASH runs to 0x{:X}, into the flash store at 0x{:X}. Shrink its ",
+                "LENGTH to {}K, or let the IDE keep memory.x (its GENERATED markers)."
+            ),
+            end,
+            start,
+            start.saturating_sub(origin) / 1024
+        )
+    })
+}
+
+/// memory.x's `FLASH` region as (origin, length), read the way ld reads the
+/// forms written by hand - numbers with a `K`/`M` suffix joined by `+` and `-`
+/// (`LENGTH = 64K - 2K`, `ORIGIN = 0x08000000 + 16K`) - and only the region
+/// named exactly `FLASH`, the one cortex-m-rt links the program into.
+/// `None` when there is none, or it uses what this cannot evaluate (a symbol,
+/// `ORIGIN(...)`): then nothing is refused on a guess.
+///
+/// Not `size::parse_memory_x`: that reads the first `FLASH*` region and
+/// stops at the first space, which is all the Size bar needs and would read
+/// `64K - 2K` as 64K here - refusing a memory.x that reserves the store
+/// exactly.
+pub fn memory_x_flash(text: &str) -> Option<(u64, u64)> {
+    let mut clean = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("/*") {
+        clean.push_str(&rest[..at]);
+        rest = rest[at..].find("*/").map_or("", |e| &rest[at + e + 2..]);
+    }
+    clean.push_str(rest);
+    clean.lines().find_map(|line| {
+        let (name, spec) = line.split_once(':')?;
+        // `FLASH (rx) :`, and `MEMORY { FLASH :` on one line: the last word
+        // before the attributes.
+        let name = name.split('(').next().unwrap_or(name);
+        let name = name
+            .trim()
+            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if name != "FLASH" {
+            return None;
+        }
+        let mut origin = None;
+        let mut length = None;
+        for field in spec.split(',') {
+            let (key, value) = field.split_once('=')?;
+            let value = ld_expr(value.trim().trim_end_matches('}'))?;
+            match key.trim().to_ascii_uppercase().as_str() {
+                "ORIGIN" | "ORG" | "O" => origin = Some(value),
+                "LENGTH" | "LEN" | "L" => length = Some(value),
+                _ => return None,
+            }
+        }
+        Some((origin?, length?))
+    })
+}
+
+/// An ld expression of numbers (`0x…`, decimal, `K`/`M` suffix) joined by
+/// `+` and `-`, or `None` for anything else.
+fn ld_expr(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let mut total: i128 = 0;
+    let mut sign: i128 = 1;
+    let mut want_term = true;
+    let mut chars = s.char_indices().peekable();
+    while let Some(&(i, c)) = chars.peek() {
+        match c {
+            ' ' | '\t' => {
+                chars.next();
+            }
+            '+' | '-' if !want_term => {
+                sign = if c == '-' { -1 } else { 1 };
+                want_term = true;
+                chars.next();
+            }
+            _ if want_term && c.is_ascii_alphanumeric() => {
+                let mut end = i;
+                while let Some(&(j, d)) = chars.peek() {
+                    if d.is_ascii_alphanumeric() {
+                        end = j + d.len_utf8();
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let term = crate::size::parse_ld_number(&s[i..end])?;
+                total += sign * i128::from(term);
+                want_term = false;
+            }
+            _ => return None,
+        }
+    }
+    if want_term {
+        return None;
+    }
+    u64::try_from(total).ok()
+}
+
+/// The store's bytes, from the start of flash, that `memory.x` keeps out of
+/// FLASH - or `None` when there is no STM32 store to reserve (off, an ESP, a
+/// part or runtime it is not generated on). The same decision as the
+/// generated `flash_store.rs`, so the file's `STORE_RANGE` and memory.x
+/// always describe the same pages; settings with problems are still
+/// reserved as they are, and the flash check refuses them.
+pub fn stm32_reservation(
+    store: Option<&FlashStoreConfig>,
+    family: &str,
+    part: &str,
+    runtime: Runtime,
+) -> Option<Range<u32>> {
+    let store = store.filter(|c| c.mode == FlashStoreMode::MemoryX)?;
+    matches!(platform(family, part, runtime), Ok(Platform::Stm32 { .. })).then(|| store.range())
+}
+
+/// [`flash_block`] or [`stm32_flash_block`], whichever the family has - what
+/// every flashing path asks.
+pub fn project_flash_block(
+    csv: &str,
+    memory_x: &str,
+    store: Option<&FlashStoreConfig>,
+    family: &str,
+    part: &str,
+    runtime: Runtime,
+) -> Option<String> {
+    if family.starts_with("stm32") {
+        stm32_flash_block(memory_x, store, family, part, runtime)
+    } else {
+        flash_block(csv, store, family)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -837,17 +1313,247 @@ mod tests {
     #[test]
     fn only_the_c3_is_live_and_every_other_chip_says_why() {
         assert!(supported("esp32c3"));
-        assert_eq!(unsupported_reason("esp32c3"), None);
-        for f in [
-            "esp32", "esp32s3", "esp32c6", "stm32f1", "rp2040", "nrf52833",
+        assert_eq!(
+            platform("esp32c3", "esp32c3", Runtime::Blocking),
+            Ok(Platform::Esp)
+        );
+        for (f, part) in [
+            ("esp32", "esp32"),
+            ("esp32s3", "esp32s3"),
+            ("esp32c6", "esp32c6"),
+            ("rp2040", "rp2040"),
+            ("nrf52833", "nrf52833"),
         ] {
             assert!(!supported(f), "{f}");
             assert!(
-                unsupported_reason(f).is_some_and(|r| !r.contains("  ")),
+                platform(f, part, Runtime::Blocking).is_err_and(|r| !r.contains("  ")),
                 "{f}"
             );
         }
         assert!(LABEL.len() <= 16);
+    }
+
+    /// The table finds a part by any spelling the IDE carries for it, and
+    /// knows the facts the store is laid out by.
+    #[test]
+    fn a_part_is_found_by_its_name_however_it_is_spelled() {
+        for name in [
+            "stm32f103c8",
+            "STM32F103C8",
+            "stm32f103c8t6",
+            "STM32F103C8Tx",
+        ] {
+            let (g, flags) = geometry(name).expect(name);
+            assert_eq!((g.size, g.page, g.write), (64 * 1024, 1024, 4), "{name}");
+            assert_eq!(flags & geo::UNIFORM, geo::UNIFORM);
+        }
+        assert_eq!(geometry("STM32G431CBUx").map(|g| g.0.page), Some(2048));
+        // F071x8: 64 KiB like an F030x8, but 2 KiB pages - a size rule would miss it.
+        assert_eq!(geometry("stm32f071c8").map(|g| g.0.page), Some(2048));
+        assert_eq!(geometry("stm32f030c8").map(|g| g.0.page), Some(1024));
+        assert_eq!(geometry("stm32n657x0"), None, "no internal flash");
+        assert_eq!(geometry("stm32xyz"), None);
+    }
+
+    /// Which HAL writes the store follows the runtime; which parts get it at
+    /// all follows the flash, each refusal in a sentence.
+    #[test]
+    fn the_platform_follows_the_runtime_and_refuses_what_it_cannot_lay_out() {
+        let f1 = |rt| platform("stm32f1", "stm32f103c8t6", rt);
+        assert!(matches!(
+            f1(Runtime::Blocking),
+            Ok(Platform::Stm32 {
+                hal: StmHal::F1Hal,
+                ..
+            })
+        ));
+        assert!(matches!(
+            f1(Runtime::Native),
+            Ok(Platform::Stm32 {
+                hal: StmHal::F1Hal,
+                ..
+            })
+        ));
+        assert!(matches!(
+            f1(Runtime::Async),
+            Ok(Platform::Stm32 {
+                hal: StmHal::Embassy,
+                ..
+            })
+        ));
+        assert!(f1(Runtime::Rtic).is_err_and(|r| r.contains("RTIC")));
+        let ok = |family: &str, part: &str| {
+            matches!(
+                platform(family, part, Runtime::Blocking),
+                Ok(Platform::Stm32 {
+                    hal: StmHal::Embassy,
+                    ..
+                })
+            )
+        };
+        assert!(ok("stm32g4", "STM32G431CBUx"));
+        assert!(ok("stm32wba", "stm32wba52cg"));
+        assert!(ok("stm32g0", "stm32g071rb"));
+        assert!(ok("stm32u5", "stm32u575zi"));
+        let refused = |family: &str, part: &str, why: &str| {
+            let r = platform(family, part, Runtime::Blocking).expect_err(part);
+            assert!(r.contains(why), "{part}: {r}");
+        };
+        // Found by review: embassy's L4/WL driver never resets the flash
+        // data cache around an erase.
+        refused("stm32l4", "stm32l432kc", "data cache");
+        refused("stm32wl", "stm32wle5jc", "data cache");
+        refused("stm32f4", "stm32f411ce", "128 KiB");
+        // Found by review: uniform 128 KiB sectors passed the size rule on a
+        // 2 MB H7 - 256 KiB of store all the same.
+        refused("stm32h7", "stm32h743zi", "128 KiB");
+        // metapac gives the L552xC one 4 KiB-page bank; the chip ships dual
+        // bank with 2 KiB pages, and embassy would erase program flash.
+        refused("stm32l5", "stm32l552cc", "option bytes");
+        // Small enough a sector, too small a chip: 2 x 16 KiB of 64 KiB.
+        refused("stm32f4", "stm32f410c8", "50% of this");
+        assert!(ok("stm32f0", "stm32f030f4"), "2 x 1 KiB of 16 KiB is fine");
+        refused("stm32l0", "stm32l073rz", "0x00");
+        refused("stm32g4", "stm32g474re", "option bytes");
+        refused("stm32h7", "stm32h743vg", "gap");
+        refused("stm32f1", "stm32f103zg", "XL-density");
+        refused("stm32wb", "stm32wb55rg", "radio");
+        refused("stm32h7", "stm32h7s3l8", "stub");
+        refused("stm32n6", "stm32n657x0", "no internal flash");
+    }
+
+    /// The STM32 default is two pages at the very end, and only end-of-flash
+    /// layouts in whole pages pass.
+    #[test]
+    fn an_stm32_store_is_whole_pages_at_the_end_of_flash() {
+        let (g, _) = geometry("stm32f103c8").unwrap();
+        let p = Platform::Stm32 {
+            hal: StmHal::F1Hal,
+            geo: g,
+        };
+        let c = FlashStoreConfig::default_stm32(&g);
+        assert_eq!(c.range(), 0xF800..0x10000);
+        assert!(c.problems_on(&p).is_empty(), "{:?}", c.problems_on(&p));
+        let one = FlashStoreConfig {
+            size: 1024,
+            offset: 0xFC00,
+            ..c
+        };
+        assert!(
+            one.problems_on(&p)
+                .iter()
+                .any(|s| s.contains("at least 2 pages"))
+        );
+        let odd = FlashStoreConfig {
+            size: 0x1200,
+            offset: 0xEE00,
+            ..c
+        };
+        assert!(
+            odd.problems_on(&p)
+                .iter()
+                .any(|s| s.contains("whole pages"))
+        );
+        let low = FlashStoreConfig {
+            offset: 0x8000,
+            ..c
+        };
+        assert!(
+            low.problems_on(&p)
+                .iter()
+                .any(|s| s.contains("end where the flash ends"))
+        );
+        // Settings saved on the other platform say so.
+        assert!(
+            !FlashStoreConfig::default_for("esp32c3")
+                .problems_on(&p)
+                .is_empty()
+        );
+        assert!(!c.problems_on(&Platform::Esp).is_empty());
+        assert_eq!(
+            FlashStoreMode::from_token("memoryx"),
+            Some(FlashStoreMode::MemoryX)
+        );
+    }
+
+    /// Found by review: the Size bar's parser stops at the first space and
+    /// takes the first `FLASH*` region, which refused a memory.x reserving the
+    /// store exactly (`64K - 2K`) and missed one starting past a bootloader.
+    #[test]
+    fn memory_x_flash_reads_hand_written_expressions() {
+        let read = |t: &str| memory_x_flash(t);
+        assert_eq!(
+            read("MEMORY {\n  FLASH : ORIGIN = 0x08000000, LENGTH = 64K - 2K\n}\n"),
+            Some((0x0800_0000, 62 * 1024))
+        );
+        assert_eq!(
+            read("  FLASH (rx) : ORIGIN = 0x08000000 + 16K, LENGTH = 48K\n"),
+            Some((0x0800_4000, 48 * 1024))
+        );
+        assert_eq!(
+            read("MEMORY { FLASH : ORIGIN = 0x08000000, LENGTH = 64K }\n"),
+            Some((0x0800_0000, 64 * 1024))
+        );
+        // Only the region named FLASH counts, wherever it is listed.
+        assert_eq!(
+            read(
+                "  FLASH_STORE : ORIGIN = 0x0800F800, LENGTH = 2K\n  FLASH : ORIGIN = 0x08000000, LENGTH = 62K\n"
+            ),
+            Some((0x0800_0000, 62 * 1024))
+        );
+        // Comments are not regions; what cannot be evaluated is not guessed.
+        assert_eq!(read("/* FLASH : ORIGIN = 0, LENGTH = 1K */\n"), None);
+        assert_eq!(
+            read("  FLASH : ORIGIN = ORIGIN(BOOT), LENGTH = 64K\n"),
+            None
+        );
+        // The refusal reads the same way: `64K - 2K` reserves the F103C8's store.
+        let (g, _) = geometry("stm32f103c8").unwrap();
+        let c = FlashStoreConfig::default_stm32(&g);
+        let exact = "  FLASH : ORIGIN = 0x08000000, LENGTH = 64K - 2K\n";
+        assert_eq!(memory_x_overlap(exact, &c), None);
+        let past_boot = "  FLASH : ORIGIN = 0x08000000 + 16K, LENGTH = 48K\n";
+        assert!(memory_x_overlap(past_boot, &c).is_some());
+    }
+
+    /// The IDE's memory.x never overlaps; one the user wrote with FLASH up to
+    /// the end of the chip is refused before a flash, with the LENGTH to use.
+    #[test]
+    fn a_memory_x_whose_flash_runs_into_the_store_is_refused() {
+        let (g, _) = geometry("stm32f103c8").unwrap();
+        let c = FlashStoreConfig::default_stm32(&g);
+        let full = "MEMORY\n{\n  FLASH : ORIGIN = 0x08000000, LENGTH = 64K\n  RAM : ORIGIN = 0x20000000, LENGTH = 20K\n}\n";
+        let why = stm32_flash_block(full, Some(&c), "stm32f1", "stm32f103c8", Runtime::Blocking)
+            .expect("overlap");
+        assert!(why.contains("62K"), "{why}");
+        let shrunk = full.replace("64K", "62K");
+        assert_eq!(
+            stm32_flash_block(
+                &shrunk,
+                Some(&c),
+                "stm32f1",
+                "stm32f103c8",
+                Runtime::Blocking
+            ),
+            None
+        );
+        // Off, or on a part it is not generated for: nothing to check.
+        assert_eq!(
+            stm32_flash_block(full, None, "stm32f1", "stm32f103c8", Runtime::Blocking),
+            None
+        );
+        assert_eq!(
+            stm32_flash_block(full, Some(&c), "stm32f1", "stm32f103c8", Runtime::Rtic),
+            None
+        );
+        assert_eq!(
+            stm32_reservation(Some(&c), "stm32f1", "stm32f103c8", Runtime::Blocking),
+            Some(0xF800..0x10000)
+        );
+        assert_eq!(
+            stm32_reservation(Some(&c), "stm32f1", "stm32f103c8", Runtime::Rtic),
+            None
+        );
     }
 
     #[test]

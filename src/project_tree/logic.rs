@@ -2705,7 +2705,10 @@ mod flash_store_sync_tests {
     use crate::panels::mcu_module::flash_store::FlashStoreConfig;
 
     fn store_files() -> Vec<(String, String)> {
-        store_gen::config_files(Some(&FlashStoreConfig::default_for("esp32c3")), "esp32c3")
+        store_gen::config_files(
+            Some(&FlashStoreConfig::default_for("esp32c3")),
+            Some(crate::panels::mcu_module::flash_store::Platform::Esp),
+        )
     }
 
     fn content<'a>(tree: &'a ProjectTreeState, path: &str) -> Option<&'a str> {

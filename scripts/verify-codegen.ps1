@@ -261,6 +261,13 @@ $ALL_CASES = @(
     @{ n = "F1 Async -> Blocking switch";  t = "emit_f1_async_project";  e = @{ EIDE_F1_SWITCH = "back" }; q = $false; fam = "f1" }
     @{ n = "F1 RTIC";                      t = "emit_f1_rtic_project";   e = @{};                       q = $true; fam = "f1" }
     @{ n = "F1 Native";                    t = "emit_f1_native_project"; e = @{};                       q = $true; fam = "f1" }
+    # The Configuration tab's flash store on an STM32: stm32f1xx-hal behind the
+    # generated `F1Flash` adapter (Blocking, Native), embassy-stm32's `Flash` on
+    # Async and on the other families, and memory.x's FLASH cut short by the
+    # store. Linked, every one: only the linker reads memory.x and its ASSERT.
+    @{ n = "F1 flash store";               t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f103"; EIDE_STORE_RUNTIME = "blocking" }; q = $true;  fam = "f1"; lk = $true }
+    @{ n = "F1 flash store, Native";       t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f103"; EIDE_STORE_RUNTIME = "native" };   q = $false; fam = "f1"; lk = $true }
+    @{ n = "F1 flash store, Async";        t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "f103"; EIDE_STORE_RUNTIME = "async" };    q = $false; fam = "f1"; lk = $true }
 
     # A different HAL and a different entry point, so a different set of ways to
     # be wrong: esp-hal bindings, and the esp-rtos scheduler on the async one.
@@ -432,6 +439,12 @@ $ALL_CASES = @(
     # and a harness that emits less under a flag is a harness that can rot.
     @{ n = "embassy (9 projects)";         t = "emit_embassy_project";       e = @{};                       q = $true; fam = "embassy"
        only = @("eide_embassy_check_dma", "eide_embassy_check_async", "eide_embassy_check_dma_f2", "eide_wba_check_wdg") }
+    # The flash store on embassy-stm32: 2 KiB pages and 8-byte words (G431),
+    # 8 KiB pages and 16-byte words on a v8-M part (WBA55), and the Async
+    # runtime on the G431. Linked - see the F1 rows.
+    @{ n = "STM32 flash store, G431";      t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "g431"; EIDE_STORE_RUNTIME = "blocking" }; q = $true;  fam = "embassy"; lk = $true }
+    @{ n = "STM32 flash store, WBA55";     t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "wba55"; EIDE_STORE_RUNTIME = "blocking" }; q = $false; fam = "embassy"; lk = $true }
+    @{ n = "STM32 flash store, G431 Async"; t = "emit_stm32_store_project"; e = @{ EIDE_STORE_CHIP = "g431"; EIDE_STORE_RUNTIME = "async" };   q = $false; fam = "embassy"; lk = $true }
 
     # These two build from a REAL part in the vendor database rather than from a
     # bundled definition, which is the only way to exercise the importer's own
@@ -469,7 +482,7 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_F1_SWITCH", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
-           "EIDE_ESP_TASK_PRIO")
+           "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME")
 
 # The hook passes its families as ONE comma-joined argument ("embassy,f1"), and
 # `powershell -File` binds that to [string[]] as a single element - it does not

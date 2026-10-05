@@ -380,7 +380,7 @@ fn esp_tab_inits(mcu: &Mcu) -> String {
     format!(
         "{}{}",
         super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family, mcu.runtime),
-        super::flash_store_gen::init_lines(mcu.flash_store.as_ref(), &mcu.family),
+        super::flash_store_gen::init_lines_for(mcu),
     )
 }
 
@@ -389,14 +389,10 @@ fn esp_tab_inits(mcu: &Mcu) -> String {
 /// blocking esp-hal drivers on either runtime (esp-rtos does not change how a
 /// `Uart` is built), so Async gets exactly the same files.
 fn esp_config_files(mcu: &Mcu, runtime: EspRuntime) -> Vec<(String, String)> {
-    // The watchdogs and the flash store come from a TAB, not from the Pins
-    // canvas, so they are collected here rather than threaded through the
-    // pin-driven builder.
+    // The watchdogs come from a TAB, not from the Pins canvas, so they are
+    // collected here rather than threaded through the pin-driven builder. The
+    // flash store's file is added for every family in `Mcu::config_files`.
     let mut out = super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family, mcu.runtime);
-    out.extend(super::flash_store_gen::config_files(
-        mcu.flash_store.as_ref(),
-        &mcu.family,
-    ));
     let all = pins_of(mcu);
     let configured: Vec<&Pin> = all
         .iter()
@@ -2338,6 +2334,85 @@ mod tests {
         c6.flash_store = Some(FlashStoreConfig::default_for("esp32c6"));
         assert!(!c6.fresh_main_rs().contains("FlashStorage"));
         assert!(!c6.config_files().iter().any(|(n, _)| n == FILE));
+    }
+
+    /// An STM32F103 store: on its own HAL the adapter takes over `flash` once
+    /// the clocks are frozen; on Async embassy-stm32's `Flash` takes
+    /// `p.FLASH`; on RTIC nothing (the store would be a Local resource), and
+    /// a part whose last pages cost too much (an F411's 128 KiB sectors)
+    /// gets nothing either.
+    #[test]
+    fn the_stm32_flash_store_follows_the_runtime_and_the_part() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::codegen::flash_store_gen::{FILE, HAL_FILE, TAIL_SEED};
+        use crate::panels::mcu_module::flash_store::{FlashStoreConfig, geometry};
+        let def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        let mut mcu = def.build_mcu();
+        let (geo, _) = geometry(&mcu.name).expect("the F103C8 is in the table");
+        mcu.flash_store = Some(FlashStoreConfig::default_stm32(&geo));
+        let file = |m: &Mcu, name: &str| {
+            m.config_files()
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, b)| b)
+        };
+        let store_file = |m: &Mcu| file(m, FILE);
+
+        for rt in [Runtime::Blocking, Runtime::Native] {
+            mcu.runtime = rt;
+            let main = mcu.fresh_main_rs();
+            let freeze = main
+                .find("freeze(&mut flash.acr)")
+                .expect("the clocks freeze");
+            let adapter = main
+                .find("let mut flash = crate::pins::configs::flash_store_hal::F1Flash::new(flash);")
+                .unwrap_or_else(|| panic!("{rt:?}: no adapter line\n{main}"));
+            assert!(
+                freeze < adapter,
+                "{rt:?}: the adapter must come after the clocks"
+            );
+            assert!(main.contains("use crate::pins::configs::flash_store;"));
+            assert!(main.contains(TAIL_SEED), "{rt:?}: {main}");
+            let body = store_file(&mcu).expect("the store's file");
+            assert!(body.contains("0xF800..0x10000"), "{body}");
+            let glue = file(&mcu, HAL_FILE).expect("the glue file");
+            assert!(glue.contains("pub struct F1Flash"), "{glue}");
+        }
+
+        mcu.runtime = Runtime::Async;
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains("let mut flash = embassy_stm32::flash::Flash::new_blocking(p.FLASH);"),
+            "{main}"
+        );
+        assert!(main.contains(TAIL_SEED), "{main}");
+        let glue = file(&mcu, HAL_FILE).expect("the glue file");
+        assert!(glue.contains("MAX_ERASE_SIZE") && !glue.contains("F1Flash"));
+
+        mcu.runtime = Runtime::Rtic;
+        let main = mcu.fresh_main_rs();
+        assert!(!main.contains("flash_store"), "{main}");
+        assert!(store_file(&mcu).is_none() && file(&mcu, HAL_FILE).is_none());
+
+        // Off: nothing of it left in a Blocking main.
+        mcu.runtime = Runtime::Blocking;
+        let on = mcu.fresh_main_rs();
+        mcu.flash_store = None;
+        let off = mcu.update_main_rs(&on);
+        assert!(
+            !off.contains("flash_store") && !off.contains("F1Flash"),
+            "{off}"
+        );
+        assert_eq!(off, mcu.fresh_main_rs());
+
+        // An F411 the importer would build: sectors of 128 KiB, not generated.
+        let mut f4 = def.clone();
+        f4.display_name = "STM32F411RETx".into();
+        f4.family = "stm32f4".into();
+        let mut f4 = f4.build_mcu();
+        f4.flash_store = Some(FlashStoreConfig::default_stm32(&geo));
+        assert!(!f4.fresh_main_rs().contains("flash_store"));
+        assert!(store_file(&f4).is_none());
     }
 
     /// RTIC -> X -> RTIC hands back the RTIC tail it started with: leaving

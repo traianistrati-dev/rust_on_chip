@@ -321,13 +321,32 @@ watchdogs, configured as *durations* rather than as register fields, plus the
 which channels are taken and by whom — fed from the codegen itself, so it cannot
 drift from what is emitted.
 
-**Flash store** (ESP32-C3, both runtimes): settings kept in the chip's own
+**Flash store** (ESP32-C3 and STM32): settings kept in the chip's own
 flash. Switching it on writes `src/pins/configs/flash_store.rs` — a
-`ConfigStore` over `esp-storage` and `sequential-storage`, with `load` / `save`
-(and `_blocking` twins) and a `Data` struct of your own — hands it the flash as
-`flash` in the generated block, and seeds
+`ConfigStore` over `sequential-storage`, with `load` / `save` (and `_blocking`
+twins) and a `Data` struct of your own — hands it the flash as `flash` in the
+generated block, and seeds
 `let mut flash_store = flash_store::ConfigStore::new(flash);` into an untouched
-loop. The store lives either in a partition of its own, in a generated
+loop.
+
+On an **STM32** the store is the last pages of flash (two by default: 2 KiB on
+an F103C8), and `memory.x`'s FLASH ends where it begins — so a program that
+grows into it fails to link, and a LENGTH edited by hand past it trips an
+`ASSERT`. embassy-stm32's blocking `Flash` writes it, or on the F1's own HAL
+(Blocking, Native) a generated `F1Flash` adapter over `FlashWriter` — that
+glue lives in `flash_store_hal.rs`, regenerated whole, so your `flash_store.rs`
+is the same under both HALs and survives a runtime switch. The page size of
+every part comes from a table harvested from stm32-metapac
+(`scripts/harvest-flash-geometry.py`), and the build checks the range against
+the driver's own `FLASH_SIZE` / `MAX_ERASE_SIZE`. Every flashing path erases
+only the sectors it writes, so the settings survive a reflash. Not generated,
+with the reason on the card: F2/F4/F7 and the H7's 128 KiB sectors (two of
+them would cost 256 KiB), parts whose bank mode is set in option bytes (the
+L5 included), L4/WL (embassy-stm32 0.6 does not reset their flash data cache
+after an erase), L0/L1 (their flash erases to 0x00), the WB's radio stack, and
+RTIC for now.
+
+On the **ESP32-C3** (`esp-storage`) the store lives either in a partition of its own, in a generated
 `partitions.csv` (shown in the project tree, and passed to espflash, RTT and the
 debugger, since a flash without it puts back espflash's default table, where
 the top of flash is inside the app partition), or in the default table's `nvs`
@@ -432,8 +451,8 @@ compiler can tell you that text is a program. `scripts/verify-codegen.ps1` emits
 a matrix of configurations and cross-compiles each one:
 
 ```powershell
-pwsh scripts/verify-codegen.ps1             # representative subset (34 cases)
-pwsh scripts/verify-codegen.ps1 -Full       # every case (50), about 13 minutes warm
+pwsh scripts/verify-codegen.ps1             # representative subset (36 cases)
+pwsh scripts/verify-codegen.ps1 -Full       # every case (56), about 13 minutes warm
 pwsh scripts/verify-codegen.ps1 -Hook nrf   # every case of the named families
 ```
 

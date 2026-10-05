@@ -131,9 +131,9 @@ impl AppIde {
         let interface_cfg = openocd::interface_cfg_for_kind(&kind).to_string();
         let adapter = openocd::adapter_select_cmd(&kind, &vid_pid);
         let files = self.current_project_files();
-        if let Err(why) = fpga_bitstream::preflight(&files) {
-            *self.openocd_state.lock().unwrap() =
-                OpenOcdState::Error(fpga_bitstream::refusal(&why));
+        // The bitstream, and an STM32 flash store's settings and memory.x.
+        if let Some((why, phase)) = self.flash_preflight(&files) {
+            *self.openocd_state.lock().unwrap() = OpenOcdState::Error(phase);
             self.refuse_flash(why);
             return;
         }
@@ -172,9 +172,10 @@ impl AppIde {
             return;
         };
         let files = self.current_project_files();
-        if let Err(why) = fpga_bitstream::preflight(&files) {
+        // The bitstream, and an STM32 flash store's settings and memory.x.
+        if let Some((why, phase)) = self.flash_preflight(&files) {
             *self.probe_flash_state.lock().unwrap() =
-                crate::probe_flash::ProbeFlashState::Error(fpga_bitstream::refusal(&why));
+                crate::probe_flash::ProbeFlashState::Error(phase);
             self.refuse_flash(why);
             return;
         }
@@ -238,12 +239,19 @@ impl AppIde {
     /// Why the project's `partitions.csv` (or flash store) must not be
     /// flashed, or `None` - `flash_store::flash_block`, asked by espflash, RTT
     /// Run and Debug alike: all three pass the table on.
+    ///
+    /// On an STM32 it is the store's settings and `memory.x` instead
+    /// (`flash_store::stm32_flash_block`): every STM32 flashing path writes
+    /// the program memory.x laid out.
     pub(crate) fn partition_table_block(&self) -> Option<String> {
         let mcu = self.mcu.as_ref()?;
-        crate::panels::mcu_module::flash_store::flash_block(
+        crate::panels::mcu_module::flash_store::project_flash_block(
             &self.partitions_csv,
+            &self.memory_x,
             mcu.flash_store.as_ref(),
             &mcu.family,
+            crate::panels::mcu_module::flash_store::part_of(mcu),
+            mcu.runtime,
         )
     }
 
@@ -1430,8 +1438,16 @@ mod tests {
             "start_debug",
         ];
         // The paths that hand an ESP's partitions.csv on (espflash
-        // `--partition-table`, probe-rs `--idf-partition-table`, DAP).
-        const TABLE_CHECKS: [&str; 3] = ["flash_esp", "start_rtt", "start_debug"];
+        // `--partition-table`, probe-rs `--idf-partition-table`, DAP), and
+        // every path that writes an STM32 the memory.x of a flash store
+        // (OpenOCD, cargo flash, RTT Run, Debug).
+        const TABLE_CHECKS: [&str; 5] = [
+            "flash_esp",
+            "flash_swd",
+            "flash_probe_rs",
+            "start_rtt",
+            "start_debug",
+        ];
         // Measuring, profiling, sampling a running board, or an ESP (no FPGA).
         const EXEMPT: [&str; 4] = [
             "flash_esp",

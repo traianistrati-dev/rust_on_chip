@@ -56,14 +56,32 @@ impl Mcu {
     /// Watchdogs come FIRST - one that is meant to catch a hang during
     /// start-up is worth arming before the code that might hang.
     pub fn watchdog_and_custom_inits(&self) -> String {
+        // The flash store between the two: after the clocks (on the F1 it
+        // takes over the `flash` whose `acr` froze them), before the Custom
+        // modules. STM32 only - the ESP backends have their own slot.
+        let store = if self.family.starts_with("stm32") {
+            crate::panels::mcu_module::codegen::flash_store_gen::init_lines_for(self)
+        } else {
+            String::new()
+        };
+        // Each part carries its own header, so one that is absent leaves no
+        // empty heading behind (the backends used to put "Custom modules"
+        // above the whole slot, watchdogs and store included).
+        let custom = self.custom_module_inits();
+        let custom = if custom.is_empty() {
+            custom
+        } else {
+            format!("\n    // ── Custom modules ──\n{custom}")
+        };
         format!(
-            "{}{}",
+            "{}{}{}",
             crate::panels::mcu_module::codegen::watchdog_gen::init_lines(
                 &self.watchdog,
                 &self.family,
                 self.runtime,
             ),
-            self.custom_module_inits(),
+            store,
+            custom,
         )
     }
     /// Create a new MCU with the given configuration.

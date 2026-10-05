@@ -3917,12 +3917,17 @@ impl AppIde {
             let new_toml =
                 project_gen::ensure_rtic_deps(&new_toml, is_rtic, &rtic_target, &sources);
             // The flash store (Configuration tab): needed exactly when its file
-            // is generated - the decision the ESP harness makes too.
+            // is generated - the decision the harnesses make too. esp-storage
+            // only on an ESP; an STM32 writes its flash through its own HAL.
             use crate::panels::mcu_module::codegen::flash_store_gen;
+            let on_esp = self
+                .mcu
+                .as_ref()
+                .is_some_and(|m| crate::panels::mcu_module::flash_store::supported(&m.family));
             let new_toml = project_gen::ensure_flash_store_deps(
                 &new_toml,
                 flash_store_gen::in_files(&config_files),
-                &esp_chip,
+                on_esp.then_some(esp_chip.as_str()),
                 &sources,
             );
             // Strict-lints `[lints.clippy]` block (MCU System toggle).
@@ -3954,6 +3959,25 @@ impl AppIde {
                 self.partitions_csv = csv;
                 self.cargo_config = runner;
                 self.invalidate_project_files_cache();
+            }
+            // memory.x follows the flash store on an STM32: FLASH ends where the
+            // store begins, so a program that grows into it fails to link. The
+            // same decision as the generated `flash_store.rs`; a memory.x with
+            // no markers is the user's and is only checked before a flash.
+            let reservation = self.mcu.as_ref().and_then(|m| {
+                crate::panels::mcu_module::flash_store::stm32_reservation(
+                    m.flash_store.as_ref(),
+                    &m.family,
+                    crate::panels::mcu_module::flash_store::part_of(m),
+                    m.runtime,
+                )
+            });
+            if let Some((def, _)) = self.selected_build_cfg() {
+                let mx = project_gen::splice_memory_x_store(&self.memory_x, &def, reservation);
+                if mx != self.memory_x {
+                    self.memory_x = mx;
+                    self.invalidate_project_files_cache();
+                }
             }
             // On a Runtime / Init-API Apply the config templates change wholesale
             // (blocking ⇄ async ⇄ native init) — force a FULL rewrite so the old

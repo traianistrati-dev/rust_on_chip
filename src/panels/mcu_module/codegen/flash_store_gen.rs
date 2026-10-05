@@ -2,12 +2,26 @@
 //! the `main.rs` lines that hand it the flash, and the one line seeded below
 //! the markers.
 //!
-//! ONE template for every ESP runtime. `sequential-storage` 8 is async-only,
-//! so the store has `load`/`save` for the Async runtime and `load_blocking` /
-//! `save_blocking` (`embassy_futures::block_on` over a `BlockingAsync` that
-//! never pends) for Blocking, Native and RTIC - which all fall back to the
-//! blocking ESP backend. Both shapes were compiled for the ESP32-C3 with no
-//! warning, the tail using the store and not using it alike.
+//! ONE body for every runtime and platform. `sequential-storage` 8 is
+//! async-only, so the store has `load`/`save` for the Async runtime and
+//! `load_blocking` / `save_blocking` (`embassy_futures::block_on` over a
+//! `BlockingAsync` that never pends) for Blocking, Native and RTIC. What
+//! differs per platform ([`flash_store::Platform`]) is around that body:
+//!
+//! - **ESP**: esp-storage's `FlashStorage`, and `verify`, which reads the
+//!   ESP-IDF partition table on the chip.
+//! - **STM32, embassy-stm32**: its blocking `Flash`, and compile-time checks
+//!   of the range against embassy's own `FLASH_SIZE` / `MAX_ERASE_SIZE`.
+//! - **STM32F1, stm32f1xx-hal** (Blocking, Native): an `F1Flash` adapter that
+//!   puts the HAL's `FlashWriter` behind the `NorFlash` traits.
+//!
+//! On STM32 the reservation is `memory.x` (`project_gen::memory_x_body`), so
+//! the checks are the BUILD's: a range the driver cannot erase, or a program
+//! that grows into the store, fails to compile or to link.
+//!
+//! The templates are assembled from shared fragments (`concat!` over the
+//! macros below), so the body cannot drift between platforms - and the ESP
+//! file stays exactly what it was before the STM32 ones existed.
 //!
 //! The file lives under `pins/configs/`, not at `src/flash_store.rs`, for what
 //! that buys for free: pruning and dependency removal when the toggle goes
@@ -17,15 +31,22 @@
 //! `flash_store::ConfigStore::new(flash)`.
 
 use crate::panels::mcu_module::codegen::GEN_END;
-use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig};
+use crate::panels::mcu_module::flash_store::{FlashStoreConfig, Platform, StmHal};
+use crate::panels::mcu_module::mcu::Mcu;
 
 /// The config file's name under `src/pins/configs/`.
 pub const FILE: &str = "flash_store.rs";
 
-/// The template. Only the two constants sit inside the markers; everything
-/// below them is the user's, kept across regeneration and never force-rewritten
-/// (`project_tree::logic::sync_config_files`), since no runtime changes it.
-const TMPL: &str = r#"// <<< GENERATED>>>
+/// The STM32 glue beside it, generated whole: what differs between
+/// embassy-stm32 and stm32f1xx-hal, so the user's `FILE` is the same under
+/// both and a runtime switch never has to rewrite it.
+pub const HAL_FILE: &str = "flash_store_hal.rs";
+
+// The template fragments. Raw strings in macros, because `concat!` takes
+// literals only.
+macro_rules! esp_gen {
+    () => {
+        r#"// <<< GENERATED>>>
 // Flash store (from the Configuration tab) — auto-updated; edit it in the tab.
 // The bytes the store owns: exactly the {ROW} of the partition table,
 // which `verify` below checks on the chip.
@@ -33,7 +54,12 @@ pub const STORE_RANGE: core::ops::Range<u32> = 0x{START}..0x{END};
 // ESP-IDF `data` subtype of that partition: 0x06 undefined, 0x02 nvs.
 pub const STORE_SUBTYPE: u8 = 0x{SUBTYPE};
 // <<< GENERATED END >>>
-
+"#
+    };
+}
+macro_rules! esp_intro {
+    () => {
+        r#"
 // Everything below is editable — your changes are preserved on regeneration.
 //
 // Settings kept in the chip's own flash: `sequential-storage` keeps a small
@@ -47,7 +73,12 @@ pub const STORE_SUBTYPE: u8 = 0x{SUBTYPE};
 // A save writes flash with interrupts masked for each sector, and an erase
 // takes milliseconds: save when something changed, not in a tight loop.
 
-use core::ops::Range;
+"#
+    };
+}
+macro_rules! esp_imports {
+    () => {
+        r#"use core::ops::Range;
 
 use embassy_embedded_hal::adapter::BlockingAsync;
 use embedded_storage::Storage;
@@ -56,7 +87,12 @@ use esp_bootloader_esp_idf::partitions::{self, PARTITION_TABLE_MAX_LEN};
 use sequential_storage::cache::{Cache, Uncached};
 use sequential_storage::map::{MapConfig, MapStorage, PostcardValue};
 use serde::{Deserialize, Serialize};
-
+"#
+    };
+}
+macro_rules! common_a {
+    () => {
+        r#"
 /// Bump it whenever `Data` changes shape: a value stored by another version
 /// is ignored, and `load` returns `Data::default()` instead of misreading it.
 pub const CONFIG_VERSION: u8 = 1;
@@ -80,16 +116,36 @@ impl Default for Data {
 
 impl<'a> PostcardValue<'a> for Data {}
 
-/// The serialized `Data` must fit here (raise it with your fields). Aligned
+"#
+    };
+}
+macro_rules! esp_buf_doc {
+    () => {
+        r#"/// The serialized `Data` must fit here (raise it with your fields). Aligned
 /// to the flash's 4-byte word.
-#[repr(align(4))]
+"#
+    };
+}
+macro_rules! common_a2 {
+    () => {
+        r#"#[repr(align(4))]
 struct Buf([u8; 128]);
 
 type NoCache = Cache<Uncached, Uncached, Uncached, u8>;
 
-/// The store, over any NOR flash - `esp_storage::FlashStorage` here. It owns
+"#
+    };
+}
+macro_rules! esp_doc {
+    () => {
+        r#"/// The store, over any NOR flash - `esp_storage::FlashStorage` here. It owns
 /// the flash; call `verify` first if you want the check.
-pub struct ConfigStore<F: NorFlash> {
+"#
+    };
+}
+macro_rules! common_b {
+    () => {
+        r#"pub struct ConfigStore<F: NorFlash> {
     map: MapStorage<u8, BlockingAsync<F>, NoCache>,
 }
 
@@ -140,7 +196,12 @@ impl<F: NorFlash> ConfigStore<F> {
         embassy_futures::block_on(self.save(data))
     }
 }
-
+"#
+    };
+}
+macro_rules! esp_tail {
+    () => {
+        r#"
 /// Why `verify` refused.
 #[derive(Debug)]
 pub enum StoreError {
@@ -194,26 +255,298 @@ pub fn verify<F: Storage>(flash: &mut F) -> Result<(), StoreError> {
 /// esp-bootloader-esp-idf 0.5's `is_read_only()`: that one tests bit 0,
 /// which is `encrypted`.
 const PART_FLAG_READONLY: u32 = 1 << 1;
-"#;
+"#
+    };
+}
+macro_rules! stm_gen {
+    () => {
+        r#"// <<< GENERATED>>>
+// Flash store (from the Configuration tab) — auto-updated; edit it in the tab.
+// The bytes the store owns, as offsets from the start of flash (0x08000000):
+// the last {PAGES} pages, which memory.x keeps out of FLASH.
+pub const STORE_RANGE: core::ops::Range<u32> = 0x{START}..0x{END};
+// <<< GENERATED END >>>
+"#
+    };
+}
+macro_rules! stm_intro {
+    () => {
+        r#"
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// Settings kept in the chip's own flash: `sequential-storage` keeps a small
+// key -> value map in STORE_RANGE and spreads the writes over its pages.
+// Put what you want to keep in `Data`, then:
+//
+//     let mut data = flash_store.load_blocking();      // Async: .load().await
+//     data.counter += 1;
+//     flash_store.save_blocking(&data).ok();          // Async: .save(&data).await
+//
+// A page erase takes milliseconds, and the CPU waits while flash is written
+// when the code runs from the same bank: save when something changed, not in a
+// tight loop. Flashing from the IDE keeps these pages; a chip erase wipes them.
 
-/// `flash_store.rs` for `cfg`, or nothing when the store is off or not
-/// generated for `family`.
-pub fn config_files(cfg: Option<&FlashStoreConfig>, family: &str) -> Vec<(String, String)> {
-    let Some(cfg) = cfg.filter(|_| flash_store::supported(family)) else {
+"#
+    };
+}
+macro_rules! stm_imports {
+    () => {
+        r#"use embassy_embedded_hal::adapter::BlockingAsync;
+use embedded_storage::nor_flash::NorFlash;
+use sequential_storage::cache::{Cache, Uncached};
+use sequential_storage::map::{MapConfig, MapStorage, PostcardValue};
+use serde::{Deserialize, Serialize};
+"#
+    };
+}
+macro_rules! stm_buf_doc {
+    () => {
+        r#"/// The serialized `Data` must fit here (raise it with your fields).
+"#
+    };
+}
+macro_rules! stm_doc {
+    () => {
+        r#"/// The store, over any NOR flash - the chip's own here, as the generated
+/// block in main.rs hands it over (see flash_store_hal.rs). It owns the flash.
+"#
+    };
+}
+macro_rules! hal_embassy {
+    () => {
+        r#"// <<< GENERATED>>>
+// Flash store glue for embassy-stm32 (from the Configuration tab) — regenerated
+// whole, with the runtime; your code goes in flash_store.rs.
+//
+// Checked while building, against embassy-stm32's own facts about this chip:
+// the store ends where the flash ends and starts on an erase unit, so
+// STORE_RANGE, memory.x and the flash driver cannot disagree.
+use super::flash_store::STORE_RANGE;
+
+const _: () = {
+    use embassy_stm32::flash::{FLASH_SIZE, MAX_ERASE_SIZE};
+    assert!(
+        STORE_RANGE.end as usize == FLASH_SIZE,
+        "STORE_RANGE must end where the flash ends (embassy-stm32's FLASH_SIZE)"
+    );
+    assert!(
+        STORE_RANGE.start as usize % MAX_ERASE_SIZE == 0,
+        "STORE_RANGE must start on an erase unit (embassy-stm32's MAX_ERASE_SIZE)"
+    );
+};
+// <<< GENERATED END >>>
+"#
+    };
+}
+macro_rules! hal_f1 {
+    () => {
+        r#"// <<< GENERATED>>>
+// Flash store glue for stm32f1xx-hal (from the Configuration tab) — regenerated
+// whole, with the runtime; your code goes in flash_store.rs.
+//
+// stm32f1xx-hal has no `NorFlash` of its own: `F1Flash` puts its flash writer
+// behind the traits sequential-storage needs.
+use embedded_storage::nor_flash::{
+    ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
+};
+use stm32f1xx_hal::flash::{self, FlashSize, SectorSize};
+
+use super::flash_store::STORE_RANGE;
+
+/// This F1's page and flash size in KiB, for stm32f1xx-hal's flash writer.
+pub const PAGE_KIB: u32 = {PAGE_KIB};
+pub const FLASH_KIB: u32 = {FLASH_KIB};
+
+/// stm32f1xx-hal's flash behind the `NorFlash` traits. It owns `flash::Parts` -
+/// what `dp.FLASH.constrain()` returned, once the clocks are frozen - and
+/// opens a writer per call.
+///
+/// Words of 4 bytes, two of the F1's half-words, as embassy-stm32 writes them
+/// on the Async runtime: the stored data reads the same under either HAL.
+pub struct F1Flash {
+    parts: flash::Parts,
+}
+
+impl F1Flash {
+    pub fn new(parts: flash::Parts) -> Self {
+        Self { parts }
+    }
+
+    fn writer(&mut self) -> flash::FlashWriter<'_> {
+        self.parts.writer(PAGE, SIZE)
+    }
+}
+
+const PAGE: SectorSize = match PAGE_KIB {
+    1 => SectorSize::Sz1K,
+    2 => SectorSize::Sz2K,
+    _ => panic!("PAGE_KIB must be 1 or 2 on an STM32F1"),
+};
+
+const SIZE: FlashSize = match FLASH_KIB {
+    16 => FlashSize::Sz16K,
+    32 => FlashSize::Sz32K,
+    64 => FlashSize::Sz64K,
+    128 => FlashSize::Sz128K,
+    256 => FlashSize::Sz256K,
+    384 => FlashSize::Sz384K,
+    512 => FlashSize::Sz512K,
+    _ => panic!("FLASH_KIB is not the flash size of an STM32F1 the store supports"),
+};
+
+// The store ends where the flash ends, on a page - checked while building.
+const _: () = assert!(
+    STORE_RANGE.end == FLASH_KIB * 1024 && STORE_RANGE.start % (PAGE_KIB * 1024) == 0,
+    "STORE_RANGE must be whole pages at the end of flash"
+);
+
+/// stm32f1xx-hal's flash error, as the `NorFlash` traits report it.
+#[derive(Debug)]
+pub struct F1FlashError(pub flash::Error);
+
+impl NorFlashError for F1FlashError {
+    fn kind(&self) -> NorFlashErrorKind {
+        match self.0 {
+            flash::Error::AddressMisaligned | flash::Error::LengthNotMultiple2 => {
+                NorFlashErrorKind::NotAligned
+            }
+            flash::Error::AddressLargerThanFlash | flash::Error::LengthTooLong => {
+                NorFlashErrorKind::OutOfBounds
+            }
+            _ => NorFlashErrorKind::Other,
+        }
+    }
+}
+
+impl ErrorType for F1Flash {
+    type Error = F1FlashError;
+}
+
+impl ReadNorFlash for F1Flash {
+    // stm32f1xx-hal reads from even offsets only.
+    const READ_SIZE: usize = 2;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        let writer = self.writer();
+        let data = writer.read(offset, bytes.len()).map_err(F1FlashError)?;
+        bytes.copy_from_slice(data);
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        FLASH_KIB as usize * 1024
+    }
+}
+
+impl NorFlash for F1Flash {
+    const WRITE_SIZE: usize = 4;
+    const ERASE_SIZE: usize = PAGE_KIB as usize * 1024;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        self.writer()
+            .erase(from, (to - from) as usize)
+            .map_err(F1FlashError)
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.writer().write(offset, bytes).map_err(F1FlashError)
+    }
+}
+// <<< GENERATED END >>>
+"#
+    };
+}
+
+/// The ESP template. Only the two constants sit inside the markers; everything
+/// below them is the user's, kept across regeneration and never force-rewritten
+/// (`project_tree::logic::sync_config_files`), since no runtime changes it.
+const TMPL: &str = concat!(
+    esp_gen!(),
+    esp_intro!(),
+    esp_imports!(),
+    common_a!(),
+    esp_buf_doc!(),
+    common_a2!(),
+    esp_doc!(),
+    common_b!(),
+    esp_tail!()
+);
+
+/// The STM32 template - the same whichever HAL writes the flash, so a runtime
+/// switch (the F1 between stm32f1xx-hal and embassy-stm32) never touches the
+/// user's file: what differs lives in [`HAL_FILE`].
+const TMPL_STM32: &str = concat!(
+    stm_gen!(),
+    stm_intro!(),
+    stm_imports!(),
+    common_a!(),
+    stm_buf_doc!(),
+    common_a2!(),
+    stm_doc!(),
+    common_b!()
+);
+
+/// The STM32 glue on embassy-stm32 (every family; the F1 on Async): the
+/// build-time checks. Generated whole.
+const HAL_EMBASSY: &str = hal_embassy!();
+
+/// The STM32F1 glue on stm32f1xx-hal (Blocking, Native): the `F1Flash`
+/// adapter. Generated whole.
+const HAL_F1: &str = hal_f1!();
+
+/// Every template of the USER's file, for [`is_pristine`].
+const TEMPLATES: [&str; 2] = [TMPL, TMPL_STM32];
+
+/// The store's platform on `mcu`'s chip and runtime, `None` where it is not
+/// generated.
+fn platform_of(mcu: &Mcu) -> Option<Platform> {
+    crate::panels::mcu_module::flash_store::platform_of(mcu).ok()
+}
+
+/// The store's files for `mcu`, or nothing when it is off or not generated
+/// for the chip and runtime.
+pub fn config_files_for(mcu: &Mcu) -> Vec<(String, String)> {
+    config_files(mcu.flash_store.as_ref(), platform_of(mcu))
+}
+
+/// The store's files for `cfg` on `platform`, or nothing when the store is
+/// off or not generated (`platform` is `None`): `flash_store.rs` - the user's,
+/// below its markers - and on an STM32 [`HAL_FILE`] too, generated whole.
+pub fn config_files(
+    cfg: Option<&FlashStoreConfig>,
+    platform: Option<Platform>,
+) -> Vec<(String, String)> {
+    let (Some(cfg), Some(platform)) = (cfg, platform) else {
         return Vec::new();
     };
     let range = cfg.range();
-    let row = if cfg.needs_partition_table() {
-        "`flash_store` row"
-    } else {
-        "default `nvs` partition"
+    let fill = |t: &str| {
+        t.replace("{START}", &format!("{:X}", range.start))
+            .replace("{END}", &format!("{:X}", range.end))
     };
-    let body = TMPL
-        .replace("{ROW}", row)
-        .replace("{START}", &format!("{:X}", range.start))
-        .replace("{END}", &format!("{:X}", range.end))
-        .replace("{SUBTYPE}", &format!("{:02X}", cfg.subtype()));
-    vec![(FILE.to_owned(), body)]
+    match platform {
+        Platform::Esp => {
+            let row = if cfg.needs_partition_table() {
+                "`flash_store` row"
+            } else {
+                "default `nvs` partition"
+            };
+            let body = TMPL
+                .replace("{ROW}", row)
+                .replace("{SUBTYPE}", &format!("{:02X}", cfg.subtype()));
+            vec![(FILE.to_owned(), fill(&body))]
+        }
+        Platform::Stm32 { hal, geo } => {
+            let body = TMPL_STM32.replace("{PAGES}", &(cfg.size / geo.page.max(1)).to_string());
+            let glue = match hal {
+                StmHal::Embassy => HAL_EMBASSY.to_owned(),
+                StmHal::F1Hal => HAL_F1
+                    .replace("{PAGE_KIB}", &(geo.page / 1024).to_string())
+                    .replace("{FLASH_KIB}", &(geo.size / 1024).to_string()),
+            };
+            vec![(FILE.to_owned(), fill(&body)), (HAL_FILE.to_owned(), glue)]
+        }
+    }
 }
 
 /// Does this set of config files hold the store? THE dependency decision,
@@ -242,42 +575,67 @@ pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<
         .collect()
 }
 
-/// Is `content` still exactly the template below its markers? Then switching
-/// the store off may let it go; otherwise it holds the user's `Data` and is
-/// kept (see `ProjectTreeState::kept_config_files`).
+/// Is `content` still exactly a template below its markers - any platform's?
+/// Then switching the store off may let it go; otherwise it holds the user's
+/// `Data` and is kept (see `ProjectTreeState::kept_config_files`).
 pub fn is_pristine(content: &str) -> bool {
     let tail = |s: &str| {
         s.split_once(GEN_END_CFG)
             .map(|(_, t)| t.replace("\r\n", "\n"))
     };
-    match (tail(content), tail(TMPL)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
+    let Some(mine) = tail(content) else {
+        return false;
+    };
+    TEMPLATES.iter().any(|t| tail(t).is_some_and(|t| t == mine))
 }
 
 /// The end marker of a config file's GENERATED block (not `main.rs`'s).
 const GEN_END_CFG: &str = "// <<< GENERATED END >>>";
 
+/// The generated-block lines in `main.rs` for `mcu`'s store - see
+/// [`init_lines`].
+pub fn init_lines_for(mcu: &Mcu) -> String {
+    init_lines(mcu.flash_store.as_ref(), platform_of(mcu))
+}
+
 /// The generated-block lines in `main.rs`: the module in scope, and the flash
-/// handed over. Empty when the store is off or not generated for `family`.
+/// handed over as `flash`. Empty when the store is off or not generated.
+///
+/// - ESP: `esp_storage::FlashStorage::new(peripherals.FLASH)`.
+/// - embassy-stm32: `Flash::new_blocking(p.FLASH)` - nothing else takes
+///   `p.FLASH` there.
+/// - stm32f1xx-hal: `flash` is already `dp.FLASH.constrain()`, whose `acr`
+///   froze the clocks a few lines up; the adapter takes it over. These lines
+///   land after the clocks, in the slot the Custom modules use.
 ///
 /// `mut` and the `allow`s keep a project that has not touched the store yet
-/// warning-free, while `flash_store::verify(&mut flash)` still works. The
-/// binding is `flash`, which nothing else on ESP takes, and not `p…`/`gpio…`,
-/// which `parse_main_rs` reads as pins.
-pub fn init_lines(cfg: Option<&FlashStoreConfig>, family: &str) -> String {
-    if cfg.is_none() || !flash_store::supported(family) {
+/// warning-free, while `flash_store::verify(&mut flash)` still works on an
+/// ESP. The binding is `flash`, not `p…`/`gpio…`, which `parse_main_rs` reads
+/// as pins.
+pub fn init_lines(cfg: Option<&FlashStoreConfig>, platform: Option<Platform>) -> String {
+    let (Some(_), Some(platform)) = (cfg, platform) else {
         return String::new();
-    }
-    concat!(
-        "\n    // ── Flash store ──\n",
-        "    #[allow(unused_imports)]\n",
-        "    use crate::pins::configs::flash_store;\n",
-        "    #[allow(unused_mut, unused_variables)]\n",
-        "    let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);\n",
+    };
+    let handover = match platform {
+        Platform::Esp => "    let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);\n",
+        Platform::Stm32 {
+            hal: StmHal::Embassy,
+            ..
+        } => "    let mut flash = embassy_stm32::flash::Flash::new_blocking(p.FLASH);\n",
+        Platform::Stm32 {
+            hal: StmHal::F1Hal, ..
+        } => "    let mut flash = crate::pins::configs::flash_store_hal::F1Flash::new(flash);\n",
+    };
+    format!(
+        concat!(
+            "\n    // ── Flash store ──\n",
+            "    #[allow(unused_imports)]\n",
+            "    use crate::pins::configs::flash_store;\n",
+            "    #[allow(unused_mut, unused_variables)]\n",
+            "{}",
+        ),
+        handover
     )
-    .to_owned()
 }
 
 /// The line seeded at the head of the user's tail, with the blank line after.
@@ -352,13 +710,15 @@ mod tests {
     use crate::panels::mcu_module::codegen::common::{ASYNC_USER_TAIL, USER_TAIL};
     use crate::panels::mcu_module::flash_store::FlashStoreMode;
 
+    const ESP: Option<Platform> = Some(Platform::Esp);
+
     fn on() -> FlashStoreConfig {
         FlashStoreConfig::default_for("esp32c3")
     }
 
     #[test]
     fn the_file_carries_only_the_range_and_subtype_in_its_block() {
-        let files = config_files(Some(&on()), "esp32c3");
+        let files = config_files(Some(&on()), ESP);
         let [(name, body)] = files.as_slice() else {
             panic!("{files:?}");
         };
@@ -381,18 +741,18 @@ mod tests {
             mode: FlashStoreMode::Nvs,
             ..on()
         };
-        let body = &config_files(Some(&nvs), "esp32c3")[0].1;
+        let body = &config_files(Some(&nvs), ESP)[0].1;
         assert!(body.contains("0x9000..0xF000"), "{body}");
         assert!(body.contains("STORE_SUBTYPE: u8 = 0x02;"), "{body}");
         // Off, or on a chip it is not generated for: nothing.
-        assert!(config_files(None, "esp32c3").is_empty());
-        assert!(config_files(Some(&on()), "esp32c6").is_empty());
-        assert!(init_lines(Some(&on()), "stm32f1").is_empty());
+        assert!(config_files(None, ESP).is_empty());
+        assert!(config_files(Some(&on()), None).is_empty());
+        assert!(init_lines(Some(&on()), None).is_empty());
     }
 
     #[test]
     fn a_fresh_template_is_pristine_and_an_edited_one_is_not() {
-        let body = config_files(Some(&on()), "esp32c3").remove(0).1;
+        let body = config_files(Some(&on()), ESP).remove(0).1;
         assert!(is_pristine(&body));
         // The constants moving does not make it the user's.
         let moved = body.replace("0x3FC000..0x400000", "0x3F0000..0x3F4000");
@@ -454,12 +814,111 @@ mod tests {
 
     #[test]
     fn the_generated_lines_hand_over_the_flash_and_the_module() {
-        let lines = init_lines(Some(&on()), "esp32c3");
+        let lines = init_lines(Some(&on()), ESP);
         assert!(
             lines.contains("let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);")
         );
         assert!(lines.contains("use crate::pins::configs::flash_store;"));
         assert!(TAIL_SEED.contains("flash_store::ConfigStore::new(flash)"));
-        assert!(init_lines(None, "esp32c3").is_empty());
+        assert!(init_lines(None, ESP).is_empty());
+    }
+
+    fn stm32(part: &str, hal: StmHal) -> (FlashStoreConfig, Option<Platform>) {
+        use crate::panels::mcu_module::flash_store::geometry;
+        let (geo, _) = geometry(part).expect("a metapac part");
+        (
+            FlashStoreConfig::default_stm32(&geo),
+            Some(Platform::Stm32 { hal, geo }),
+        )
+    }
+
+    /// An F103C8 on its own HAL: the user's file holds the range alone, and
+    /// the glue file carries the page, the flash size and the adapter.
+    #[test]
+    fn the_f1_glue_carries_the_page_and_the_adapter() {
+        let (cfg, platform) = stm32("stm32f103c8", StmHal::F1Hal);
+        let files = config_files(Some(&cfg), platform);
+        let [(name, body), (glue_name, glue)] = files.as_slice() else {
+            panic!("{files:?}");
+        };
+        assert_eq!((name.as_str(), glue_name.as_str()), (FILE, HAL_FILE));
+        let (block, rest) = body.split_once(GEN_END_CFG).expect("markers");
+        assert!(
+            block.contains("STORE_RANGE: core::ops::Range<u32> = 0xF800..0x10000;"),
+            "{block}"
+        );
+        assert!(block.contains("the last 2 pages"), "{block}");
+        assert!(!block.contains("fn "), "only constants in the block");
+        assert!(
+            !rest.contains("F1Flash") && !rest.contains("esp_"),
+            "{rest}"
+        );
+        assert!(glue.contains("pub const PAGE_KIB: u32 = 1;"), "{glue}");
+        assert!(glue.contains("pub const FLASH_KIB: u32 = 64;"), "{glue}");
+        assert!(glue.contains("impl NorFlash for F1Flash"));
+        assert!(glue.trim_end().ends_with(GEN_END_CFG), "generated whole");
+        for p in ["{START}", "{END}", "{PAGES}", "{PAGE_KIB}", "{FLASH_KIB}"] {
+            assert!(!body.contains(p) && !glue.contains(p), "{p} survived");
+        }
+        assert!(is_pristine(body));
+        let lines = init_lines(Some(&cfg), platform);
+        assert!(lines.contains(
+            "let mut flash = crate::pins::configs::flash_store_hal::F1Flash::new(flash);"
+        ));
+    }
+
+    /// Everything on embassy-stm32: its blocking `Flash`, and the range
+    /// checked against embassy's own constants while building - in the glue.
+    #[test]
+    fn the_embassy_glue_checks_embassys_flash_constants() {
+        let (cfg, platform) = stm32("stm32g431cb", StmHal::Embassy);
+        let files = config_files(Some(&cfg), platform);
+        let [(_, body), (_, glue)] = files.as_slice() else {
+            panic!("{files:?}");
+        };
+        assert!(body.contains("0x1F000..0x20000;"), "{body}");
+        assert!(glue.contains("STORE_RANGE.end as usize == FLASH_SIZE"));
+        assert!(glue.contains("STORE_RANGE.start as usize % MAX_ERASE_SIZE == 0"));
+        assert!(!glue.contains("F1Flash"));
+        assert!(is_pristine(body));
+        let lines = init_lines(Some(&cfg), platform);
+        assert!(
+            lines.contains("let mut flash = embassy_stm32::flash::Flash::new_blocking(p.FLASH);")
+        );
+    }
+
+    /// Found by review: the user's file used to differ per HAL, and a runtime
+    /// switch never rewrites it - an F1 going Blocking -> Async kept the
+    /// stm32f1xx-hal adapter under an embassy manifest. Now only the glue,
+    /// generated whole, follows the HAL.
+    #[test]
+    fn the_users_file_is_the_same_whichever_hal_writes_the_flash() {
+        let (cfg, f1) = stm32("stm32f103c8", StmHal::F1Hal);
+        let (_, embassy) = stm32("stm32f103c8", StmHal::Embassy);
+        let a = config_files(Some(&cfg), f1);
+        let b = config_files(Some(&cfg), embassy);
+        assert_eq!(a[0], b[0], "flash_store.rs must not depend on the HAL");
+        assert_ne!(a[1], b[1], "the glue does");
+    }
+
+    /// The ESP file is assembled from the same fragments as the STM32 one,
+    /// and must still be exactly what it was before they existed - an older
+    /// pristine file must stay pristine, and the store's body the same on all.
+    #[test]
+    fn every_template_shares_one_body_and_the_esp_one_did_not_move() {
+        for t in TEMPLATES {
+            assert!(t.contains(common_a!()) && t.contains(common_a2!()));
+            assert!(t.contains(common_b!()));
+        }
+        assert!(
+            TMPL.starts_with("// <<< GENERATED>>>\n// Flash store (from the Configuration tab)")
+        );
+        assert!(
+            TMPL.contains(
+                "use esp_bootloader_esp_idf::partitions::{self, PARTITION_TABLE_MAX_LEN};"
+            )
+        );
+        assert!(TMPL.ends_with("const PART_FLAG_READONLY: u32 = 1 << 1;\n"));
+        assert_eq!(TMPL.len(), 6556, "the ESP template's text changed");
     }
 }

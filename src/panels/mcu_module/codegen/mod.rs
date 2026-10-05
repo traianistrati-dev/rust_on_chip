@@ -186,7 +186,7 @@ impl Mcu {
     /// touched. Run BEFORE the passes that append to the end of the file,
     /// whose additions do not count as the user's.
     fn seed_flash_store_tail(&self, code: String) -> String {
-        if !crate::panels::mcu_module::flash_store::supported(&self.family) {
+        if crate::panels::mcu_module::flash_store::platform_of(self).is_err() {
             return flash_store_gen::strip_tail_seed(code);
         }
         flash_store_gen::seed_tail(code, self.flash_store.is_some(), self.is_async())
@@ -204,6 +204,9 @@ impl Mcu {
         // over its pin types — no HAL type is named, so the same code is valid
         // on every family and on both the Portable and Native paths.
         files.extend(self.custom_module_files());
+        // The Configuration tab's flash store, on every family it is generated
+        // for (ESP and STM32 alike - `flash_store::platform` decides).
+        files.extend(flash_store_gen::config_files_for(self));
         files
             .into_iter()
             // Strict-lints: exempt each generated peripheral config module.
@@ -1644,6 +1647,11 @@ mod tests {
                 .iter()
                 .any(|(n, _)| n == "custom_flash.rs")
         );
+        // The slot titles the modules itself, right above their lines.
+        let slot = mcu.watchdog_and_custom_inits();
+        assert_contains_substring(&slot, "    // ── Custom modules ──\n    let mut flash_dev");
+        mcu.modules.clear();
+        assert_not_contains_substring(&mcu.watchdog_and_custom_inits(), "Custom modules");
     }
 
     /// The custom file carries NO GENERATED markers. With them, every
@@ -1743,7 +1751,10 @@ mod tests {
             "embassy blocking:
 {blocking}"
         );
-        assert!(blocking.contains("Custom modules"));
+        // The heading comes with the lines (`Mcu::watchdog_and_custom_inits`),
+        // not from the section: one put above the whole slot titled the
+        // watchdogs and the flash store "Custom modules" too.
+        assert!(!blocking.contains("Custom modules"), "{blocking}");
 
         // Async embassy.
         let async_ = embassy_async::make_generated_section("X", &pins, "", "", "", line, &[]);

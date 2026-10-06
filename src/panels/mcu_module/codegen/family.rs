@@ -890,11 +890,38 @@ fn async_section(mcu: &Mcu) -> String {
     {
         clock = rcc::with_swd_only(&clock);
     }
+    // ES096 2.3.10: SimplePwm's TIM1 corrupts USART1 TX on PA9. It compiles,
+    // so the comment goes right above the TIM1 PWM it is about.
+    let init_calls = match crate::panels::mcu_module::errata::f1_tim1_usart1(
+        &mcu.name,
+        &mcu.family,
+        mcu.is_async(),
+        &all,
+    ) {
+        Some(c) => {
+            let note = crate::panels::mcu_module::errata::comment(&c.text, "    ");
+            // The line's start: `let mut _pwm1` or, with break pads,
+            // `let (mut _pwm1, ...)`.
+            let calls = &periphs.init_calls;
+            let line = calls
+                .find("pins::configs::pwm1::init(")
+                .map(|i| calls[..i].rfind('\n').map_or(0, |nl| nl + 1));
+            match line {
+                Some(at) => {
+                    let mut calls = periphs.init_calls.clone();
+                    calls.insert_str(at, &note);
+                    calls
+                }
+                None => format!("{note}{}", periphs.init_calls),
+            }
+        }
+        None => periphs.init_calls.clone(),
+    };
     embassy_async::make_generated_section(
         &mcu.name,
         &gpio_pins,
         &clock,
-        &periphs.init_calls,
+        &init_calls,
         &periphs.dma_irqs,
         &mcu.watchdog_and_custom_inits(),
         &periphs.exti,

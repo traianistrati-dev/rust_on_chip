@@ -325,6 +325,17 @@ pub fn draw_io_arrows(
     // The pin the user has selected on the chip: its field group out here is
     // called out the same way as the pin itself and as a selected module box.
     let selected_pin = mcu.selected_pin;
+    // Armed inputs that hit an erratum together (the classic ESP32's interrupt
+    // groups): `(gpio, text)`, worked out once before the loop borrows `mcu`.
+    let irq_clashes: Vec<(String, String)> = crate::panels::mcu_module::errata::clashes(mcu)
+        .into_iter()
+        .flat_map(|c| {
+            c.pads
+                .into_iter()
+                .map(move |g| (g, c.text.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
     for it in items {
         // Field centre: the user's dragged offset, else the packed diamond
@@ -506,9 +517,17 @@ pub fn draw_io_arrows(
                     egui::pos2(field_rect.left(), field_rect.bottom() + 2.0),
                     egui::pos2(field_rect.right(), field_rect.bottom() + 18.0 * scale),
                 );
-                let (label, col) = match pin.irq {
-                    None => ("no IRQ".to_string(), egui::Color32::from_gray(130)),
-                    Some(e) => (
+                let clash = pin
+                    .irq
+                    .and_then(|_| irq_clashes.iter().find(|(g, _)| g == pin.gpio()))
+                    .map(|(_, text)| text.clone());
+                let (label, col) = match (pin.irq, &clash) {
+                    (None, _) => ("no IRQ".to_string(), egui::Color32::from_gray(130)),
+                    (Some(e), Some(_)) => (
+                        format!("IRQ {} !", e.label().to_ascii_lowercase()),
+                        egui::Color32::from_rgb(240, 130, 110),
+                    ),
+                    (Some(e), None) => (
                         format!("IRQ {}", e.label().to_ascii_lowercase()),
                         egui::Color32::from_rgb(235, 180, 90),
                     ),
@@ -519,6 +538,15 @@ pub fn draw_io_arrows(
                             egui::RichText::new(label).size(9.5 * scale).color(col),
                             |ui| {
                                 ui.set_min_width(140.0);
+                                if let Some(text) = &clash {
+                                    ui.set_max_width(280.0);
+                                    ui.label(
+                                        egui::RichText::new(text)
+                                            .size(9.5)
+                                            .color(egui::Color32::from_rgb(240, 130, 110)),
+                                    );
+                                    ui.separator();
+                                }
                                 ui.label(
                                     egui::RichText::new("Interrupt on")
                                         .size(10.0)
@@ -571,18 +599,23 @@ pub fn draw_io_arrows(
                     // One string per line: a raw newline inside the literal
                     // carries its indentation into the tooltip, which is how
                     // this one used to render with a gap through the middle.
-                    .on_hover_text(concat!(
-                        "Raise an interrupt on this input.\n",
-                        "ESP + Async: the pin becomes its own task, awaiting the edge.\n",
-                        "ESP + Blocking: it is parked in a static, and one shared handler asks it.\n",
-                        "STM32 + Async: it becomes an ExtiInput, and a task awaits the edge.\n",
-                        "STM32F1 + RTIC: it becomes a #[task(binds = EXTIn)].\n",
-                        "STM32F1 Blocking/Native: a #[interrupt] over a static holding the pin.
-",
-                        "RP (Pico) + Async: the pin becomes its own task, awaiting the edge.\n",
-                        "nRF (micro:bit) + Async: the pin becomes its own task, awaiting the edge.\n",
-                        "nRF (micro:bit) + Blocking: nothing is generated for it; poll the pin.",
-                    ));
+                    .on_hover_text({
+                        let how = concat!(
+                            "Raise an interrupt on this input.\n",
+                            "ESP + Async: the pin becomes its own task, awaiting the edge.\n",
+                            "ESP + Blocking: it is parked in a static, and one shared handler asks it.\n",
+                            "STM32 + Async: it becomes an ExtiInput, and a task awaits the edge.\n",
+                            "STM32F1 + RTIC: it becomes a #[task(binds = EXTIn)].\n",
+                            "STM32F1 Blocking/Native: a #[interrupt] over a static holding the pin.\n",
+                            "RP (Pico) + Async: the pin becomes its own task, awaiting the edge.\n",
+                            "nRF (micro:bit) + Async: the pin becomes its own task, awaiting the edge.\n",
+                            "nRF (micro:bit) + Blocking: nothing is generated for it; poll the pin.",
+                        );
+                        match &clash {
+                            Some(text) => format!("{text}\n\n{how}"),
+                            None => how.to_owned(),
+                        }
+                    });
                 });
             }
         }

@@ -37,6 +37,8 @@ const CLOSE_W: f32 = 18.0;
 /// A board's note on a pad: size and colour.
 const NOTE_PT: f32 = 11.0;
 const NOTE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 205, 130);
+/// An erratum the current selection runs into (`errata`).
+const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(240, 130, 110);
 
 /// Paint `text` wrapped to `wrap` at `pos`, cut to the rows that fit in
 /// `max_h` and ended with "…" when cut, the full text then on hover. Returns
@@ -52,15 +54,16 @@ fn draw_note(
     pos: egui::Pos2,
     wrap: f32,
     max_h: f32,
+    color: egui::Color32,
     id: egui::Id,
 ) -> f32 {
     let font = egui::FontId::proportional(NOTE_PT);
-    let full = painter.layout(text.clone(), font.clone(), NOTE_COLOR, wrap);
+    let full = painter.layout(text.clone(), font.clone(), color, wrap);
     let galley = if full.size().y <= max_h || full.rows.is_empty() {
         full
     } else {
         let row_h = full.size().y / full.rows.len() as f32;
-        let mut job = egui::text::LayoutJob::simple(text.clone(), font, NOTE_COLOR, wrap);
+        let mut job = egui::text::LayoutJob::simple(text.clone(), font, color, wrap);
         // At least one row, so a cramped body still shows there IS a note.
         job.wrap.max_rows = ((max_h / row_h).floor() as usize).max(1);
         painter.layout_job(job)
@@ -230,7 +233,11 @@ pub fn draw_pin_functions(
         // What the BOARD says about it - a solder bridge that frees the pad,
         // say. Data from the definition, so it is right for this kit. It
         // leaves room for the line under it.
-        if let Some(note) = mcu.find_pin(num).map(|p| p.note.clone()).filter(|n| !n.is_empty()) {
+        if let Some(note) = mcu
+            .find_pin(num)
+            .map(|p| p.note.clone())
+            .filter(|n| !n.is_empty())
+        {
             let max_h = content_rect.bottom() - 8.0 - 24.0 - y;
             let h = draw_note(
                 painter,
@@ -239,6 +246,7 @@ pub fn draw_pin_functions(
                 egui::pos2(left, y),
                 wrap,
                 max_h,
+                NOTE_COLOR,
                 ui.id().with(("pad_note", num)),
             );
             y += h + 10.0;
@@ -273,7 +281,8 @@ pub fn draw_pin_functions(
     // what picking it DOES on this board - so the panel says it first.
     // The board's own note on the pad joins it: a solder bridge, a resistor, a
     // pin the debugger drives - things no function in the list can say.
-    let mut note_h = 0.0;
+    // Ahead of both, an erratum the CURRENT selection runs into: it is about
+    // what the user just picked, so it is the first thing to read.
     let notes: Vec<&str> = mcu
         .find_pin(num)
         .map(|p| {
@@ -286,21 +295,38 @@ pub fn draw_pin_functions(
             .collect()
         })
         .unwrap_or_default();
-    if !notes.is_empty() {
-        // The list keeps its first two rows (and the mode chips under the
-        // first) in view; the note gets what is left.
-        let room = content_rect.bottom() - 8.0 - (sep_y + 12.0);
-        let min_list = funcs.len().min(2) as f32 * ITEM_H + mode_row_h;
+    let warnings = mcu
+        .find_pin(num)
+        .map(|p| crate::panels::mcu_module::errata::warnings_for(mcu, p))
+        .unwrap_or_default();
+    // The list keeps its first two rows (and the mode chips under the first)
+    // in view; the texts share what is left.
+    let room = content_rect.bottom() - 8.0 - (sep_y + 12.0);
+    let min_list = funcs.len().min(2) as f32 * ITEM_H + mode_row_h;
+    let mut budget = room - min_list - 10.0;
+    let mut note_h = 0.0;
+    for (text, color, key) in [
+        (warnings.join("\n\n"), WARN_COLOR, "pad_warn"),
+        (notes.join("\n\n"), NOTE_COLOR, "pad_note"),
+    ] {
+        if text.is_empty() {
+            continue;
+        }
         let h = draw_note(
             painter,
             ui,
-            notes.join("\n\n"),
-            egui::pos2(content_rect.left() + 12.0, sep_y + 10.0),
+            text,
+            egui::pos2(content_rect.left() + 12.0, sep_y + 10.0 + note_h),
             content_rect.width() - 24.0,
-            room - min_list - 10.0,
-            ui.id().with(("pad_note", num)),
-        );
-        note_h = h + 10.0;
+            budget,
+            color,
+            ui.id().with((key, num)),
+        ) + 8.0;
+        note_h += h;
+        budget -= h;
+    }
+    if note_h > 0.0 {
+        note_h += 2.0;
     }
 
     // ── Geometry ─────────────────────────────────────────────────────────────

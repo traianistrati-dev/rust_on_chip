@@ -789,6 +789,11 @@ fn make_gen_section(
     if !armed.is_empty() {
         body.push('\n');
         body.push_str("    // ── GPIO interrupts ──\n");
+        // The classic ESP32 loses edges when two armed inputs share an
+        // interrupt group: compiled all the same, said here.
+        for c in crate::panels::mcu_module::errata::esp32_irq_groups(chip, &configured) {
+            body.push_str(&crate::panels::mcu_module::errata::comment(&c.text, "    "));
+        }
         if runtime == EspRuntime::Async {
             body.push_str(&priority_executors(&armed));
             for (p, _, prio) in &armed {

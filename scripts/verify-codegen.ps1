@@ -445,6 +445,17 @@ $ALL_CASES = @(
     # before memory.x placed it - so `lk` is what proves this row.
     @{ n = "pico2-ice x2";                 t = "emit_pico2_ice_project";     e = @{};                       q = $true; fam = "rp"; lk = $true }
 
+    # The Configuration tab's flash store on the Raspberry Pi boards (Async:
+    # rp-hal has no flash driver): embassy-rp's blocking Flash behind RpFlash,
+    # sized by the BOARD's flash, and memory.x shrunk around the RP2040's BOOT2
+    # or beside the RP2350's image block. Linked, because only the linker reads
+    # memory.x's ASSERT. The W row meets the radio's DMA channel, the ice row
+    # the FPGA loader that sits right after the store's line.
+    @{ n = "Pico flash store, Async";      t = "emit_rp_store_project"; e = @{ EIDE_RP_STORE_BOARD = "pico" };      q = $true;  fam = "rp"; lk = $true }
+    @{ n = "Pico 2 flash store, Async";    t = "emit_rp_store_project"; e = @{ EIDE_RP_STORE_BOARD = "pico2" };     q = $true;  fam = "rp"; lk = $true }
+    @{ n = "Pico W flash store + radio";   t = "emit_rp_store_project"; e = @{ EIDE_RP_STORE_BOARD = "pico_w" };    q = $false; fam = "rp"; lk = $true }
+    @{ n = "pico2-ice flash store + FPGA"; t = "emit_rp_store_project"; e = @{ EIDE_RP_STORE_BOARD = "pico2_ice" }; q = $false; fam = "rp"; lk = $true }
+
     # ONE test, NINE projects, four targets — GPIO, async, USART, DMA on F4/F2/F7,
     # the watchdogs and WBA. Each prints its own `target:`, so they are paired
     # individually rather than forced onto one triple.
@@ -516,7 +527,7 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
-           "EIDE_ESP_IOT")
+           "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD")
 
 # The hook passes its families as ONE comma-joined argument ("embassy,f1"), and
 # `powershell -File` binds that to [string[]] as a single element - it does not

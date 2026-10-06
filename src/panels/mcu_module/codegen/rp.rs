@@ -512,6 +512,9 @@ fn section(mcu: &Mcu) -> String {
         if mcu.family == "rp2040" { "u8" } else { "u16" }
     ));
     o.push_str(&super::watchdog_gen::rp_init_lines(&mcu.watchdog, false));
+    // The flash store's slot, as on Async. Empty while `flash_store::platform`
+    // refuses Blocking (rp-hal has no flash driver).
+    o.push_str(&super::flash_store_gen::init_lines_for(mcu));
 
     o.push_str("    // Every GPIO comes from one bank, taken once.\n");
     o.push_str(&format!("    let sio = {hal}::Sio::new(pac.SIO);\n"));
@@ -4331,6 +4334,10 @@ fn async_section(mcu: &Mcu) -> String {
     // First after init, like every other family's watchdog: one meant to catch
     // a hang in start-up is worth having before the code that might hang.
     o.push_str(&super::watchdog_gen::rp_init_lines(&mcu.watchdog, true));
+    // The Configuration tab's flash store next, as on every other family. It
+    // takes `p.FLASH` alone - no DMA channel, so nothing the buses or the
+    // radio count moves. Blocking has no flash driver: nothing there yet.
+    o.push_str(&super::flash_store_gen::init_lines_for(mcu));
     // Then the FPGA, before any pin, bus or task: it blocks while it loads, and
     // it must own GP4..7 before anything else could drive them.
     if fpga {
@@ -5267,6 +5274,137 @@ mod emit_async_for_manual_compile {
             println!("target: {}", def.project.target);
         }
     }
+
+    /// A Raspberry Pi project with the Configuration tab's flash store on -
+    /// the only place its template, the `RpFlash` glue, the seeded tail line
+    /// and the shrunk memory.x meet embassy-rp, sequential-storage and the
+    /// LINKER (memory.x's ASSERT passes `cargo check`; the matrix rows build).
+    ///
+    /// `EIDE_RP_STORE_BOARD` = `pico` (default) | `pico2` | `pico_w` (the
+    /// radio's LED on, so the store and the CYW43 DMA channel meet) |
+    /// `pico2_ice` (the FPGA loader on). A UART on DMA takes channels first, to
+    /// prove the store takes none.
+    ///
+    /// %TEMP%\eide_rp_store_check_<board>
+    #[test]
+    #[ignore = "writes a project to disk for a manual cross-compile"]
+    fn emit_rp_store_project() {
+        use crate::panels::mcu_module::codegen::flash_store_gen::{TAIL_SEED, in_files};
+        use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig, Platform};
+        let board = std::env::var("EIDE_RP_STORE_BOARD").unwrap_or_else(|_| "pico".into());
+        let id = match board.as_str() {
+            "pico" => "rp2040_pico",
+            "pico2" => "rp2350_pico2",
+            "pico_w" => "rp2040_pico_w",
+            "pico2_ice" => "rp2350_pico2_ice",
+            other => panic!("EIDE_RP_STORE_BOARD={other}: pico | pico2 | pico_w | pico2_ice"),
+        };
+        let def = builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("built-in {id}"));
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Async;
+        mcu.pending_runtime = Runtime::Async;
+        let radio = id.ends_with("_w");
+        for p in mcu.iter_all_pins_mut() {
+            match p.name.as_str() {
+                n if n.starts_with("GP25") && !radio => {
+                    p.selected_function = PinFunction::GpioOutput
+                }
+                "WL_LED" => p.selected_function = PinFunction::GpioOutput,
+                "GP0" => p.selected_function = PinFunction::UsartTx(0),
+                "GP1" => p.selected_function = PinFunction::UsartRx(0),
+                n if n.starts_with("ICE_CRESET") => p.selected_function = PinFunction::GpioOutput,
+                _ => {}
+            }
+        }
+        mcu.reconcile_modules();
+        for m in &mut mcu.modules {
+            if let crate::panels::mcu_module::modules::ModuleConfig::Usart(c) = &mut m.config {
+                c.mode = crate::panels::mcu_module::modules::UsartMode::Dma;
+            }
+        }
+        mcu.watchdog.rp = Some(crate::panels::mcu_module::watchdog::RpWdtConfig {
+            timeout_us: 1_000_000,
+        });
+        let platform = flash_store::platform_of(&mcu)
+            .unwrap_or_else(|why| panic!("[{board}] not generated: {why}"));
+        assert!(matches!(platform, Platform::Rp { .. }), "{platform:?}");
+        mcu.flash_store = Some(FlashStoreConfig::default_on(&platform, &mcu.family));
+        println!("[{board}] {platform:?}");
+
+        let mut main_rs = mcu.fresh_main_rs();
+        assert!(main_rs.contains(TAIL_SEED), "not seeded:\n{main_rs}");
+        assert!(main_rs.contains("RpFlash::new(p.FLASH)"), "{main_rs}");
+        if radio {
+            assert!(
+                main_rs.contains("p.DMA_CH2,"),
+                "the radio after the UART's two:\n{main_rs}"
+            );
+        }
+        // Use what the template offers, as a user would.
+        main_rs = main_rs.replacen(
+            "        // Your main loop code here.\n",
+            concat!(
+                "        // Your main loop code here.\n",
+                "        let mut d = flash_store.load().await;\n",
+                "        d.counter += 1;\n",
+                "        flash_store.save(&d).await.ok();\n",
+            ),
+            1,
+        );
+        assert!(main_rs.contains("flash_store.save"), "no loop:\n{main_rs}");
+
+        // Through `build_cfg` and the chain `app.rs` runs, in its order.
+        let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
+        let mut files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+        let configs = mcu.config_files();
+        let sources = [main_rs.as_str()];
+        files.cargo_toml = project_gen::ensure_async_deps(
+            &files.cargo_toml,
+            true,
+            project_gen::async_flavor_for(&mcu.family, ""),
+            super::needs_async_usart(&mcu),
+            false,
+            false,
+            &sources,
+        );
+        files.cargo_toml =
+            project_gen::ensure_cyw43_deps(&files.cargo_toml, super::needs_radio(&mcu), &sources);
+        files.cargo_toml =
+            project_gen::ensure_m0_atomics(&files.cargo_toml, true, &project.target, &sources);
+        files.cargo_toml = project_gen::ensure_flash_store_deps(
+            &files.cargo_toml,
+            in_files(&configs),
+            None,
+            &sources,
+        );
+        let reservation = flash_store::memory_x_reservation(&mcu);
+        assert!(reservation.is_some(), "nothing reserved");
+        files.memory_x = project_gen::splice_memory_x_store(&files.memory_x, &project, reservation);
+        assert!(
+            files.memory_x.contains("_flash_store_start"),
+            "{}",
+            files.memory_x
+        );
+        let user = mcu.pin_tree_files();
+        let dir = std::env::temp_dir().join(format!("eide_rp_store_check_{board}"));
+        project_gen::clear_project_dir_keep_target(&dir);
+        project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
+            .expect("write rp store project");
+        if radio {
+            let fw = std::fs::metadata(dir.join("firmware").join("43439A0.bin"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            assert_eq!(fw, 231_077, "the radio's firmware shipped whole");
+        }
+        if id == "rp2350_pico2_ice" {
+            assert!(super::fpga_loader(&mcu), "the loader is on");
+        }
+        println!("wrote {}", dir.display());
+        println!("target: {}", project.target);
+    }
 }
 
 #[cfg(test)]
@@ -5411,6 +5549,113 @@ mod watchdog_rp {
             rp2040[0].1.contains("TIMEOUT_US <= 8_388_607"),
             "{}",
             rp2040[0].1
+        );
+    }
+}
+
+#[cfg(test)]
+mod flash_store_rp {
+    use crate::panels::mcu_module::builtins;
+    use crate::panels::mcu_module::codegen::flash_store_gen::{FILE, HAL_FILE, TAIL_SEED};
+    use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig};
+    use crate::panels::mcu_module::mcu::model::Runtime;
+    use crate::panels::mcu_module::pins::PinFunction;
+    use crate::panels::mcu_module::watchdog::RpWdtConfig;
+
+    fn board(id: &str, runtime: Runtime) -> super::Mcu {
+        let mut mcu = builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("built-in {id}"))
+            .build_mcu();
+        mcu.runtime = runtime;
+        mcu.pending_runtime = runtime;
+        mcu
+    }
+
+    /// On Async the store takes `p.FLASH` right after the watchdog and before
+    /// the FPGA loader, its files come, and the tail is seeded; on Blocking
+    /// (no flash driver) nothing of it is generated.
+    #[test]
+    fn the_store_follows_the_watchdog_on_async_and_is_absent_on_blocking() {
+        let mut mcu = board("rp2350_pico2_ice", Runtime::Async);
+        for p in mcu.iter_all_pins_mut() {
+            if p.name.starts_with("ICE_CRESET") {
+                p.selected_function = PinFunction::GpioOutput;
+            }
+        }
+        mcu.reconcile_modules();
+        assert!(super::fpga_loader(&mcu), "the loader is on");
+        mcu.watchdog.rp = Some(RpWdtConfig {
+            timeout_us: 1_000_000,
+        });
+        let platform = flash_store::platform_of(&mcu).expect("pico2-ice on Async");
+        mcu.flash_store = Some(FlashStoreConfig::default_on(&platform, &mcu.family));
+
+        let code = mcu.fresh_main_rs();
+        let at = |what: &str| {
+            code.find(what)
+                .unwrap_or_else(|| panic!("no {what}:\n{code}"))
+        };
+        let watchdog = at("pins::configs::watchdog::init(p.WATCHDOG)");
+        let store = at("flash_store_hal::RpFlash::new(p.FLASH);");
+        let fpga = at(super::FPGA_BODY_HEAD);
+        assert!(watchdog < store && store < fpga, "{code}");
+        assert!(code.contains(TAIL_SEED), "{code}");
+        let files = mcu.config_files();
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&FILE) && names.contains(&HAL_FILE),
+            "{names:?}"
+        );
+        let glue = &files.iter().find(|(n, _)| n == HAL_FILE).unwrap().1;
+        assert!(
+            glue.contains("pub const FLASH_SIZE: usize = 4096 * 1024;"),
+            "{glue}"
+        );
+
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+        let code = mcu.fresh_main_rs();
+        assert!(
+            !code.contains("RpFlash") && !code.contains(TAIL_SEED),
+            "{code}"
+        );
+        assert!(!mcu.config_files().iter().any(|(n, _)| n == FILE));
+    }
+
+    /// Found by review: an Async -> Blocking switch with the store on lifted
+    /// the store's line but left the ASYNC loop seed behind it (`.await` in a
+    /// blocking `main`), because the backend's swap cannot see past the line.
+    /// Through `update_main_rs`, the path a switch takes, and back again.
+    #[test]
+    fn a_runtime_switch_swaps_the_loop_seed_under_the_store_line() {
+        use crate::panels::mcu_module::codegen::common::{ASYNC_USER_TAIL, USER_TAIL};
+        let mut mcu = board("rp2040_pico", Runtime::Async);
+        let platform = flash_store::platform_of(&mcu).expect("Pico on Async");
+        mcu.flash_store = Some(FlashStoreConfig::default_on(&platform, &mcu.family));
+        let on_async = mcu.fresh_main_rs();
+        assert!(
+            on_async.contains(&format!("{TAIL_SEED}{ASYNC_USER_TAIL}")),
+            "{on_async}"
+        );
+
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+        let on_blocking = mcu.update_main_rs(&on_async);
+        assert!(
+            !on_blocking.contains(".await") && !on_blocking.contains("embassy_time"),
+            "{on_blocking}"
+        );
+        assert!(!on_blocking.contains(TAIL_SEED), "{on_blocking}");
+        assert!(on_blocking.contains(USER_TAIL), "{on_blocking}");
+
+        mcu.runtime = Runtime::Async;
+        mcu.pending_runtime = Runtime::Async;
+        let back = mcu.update_main_rs(&on_blocking);
+        assert!(
+            back.contains(&format!("{TAIL_SEED}{ASYNC_USER_TAIL}")),
+            "{back}"
         );
     }
 }

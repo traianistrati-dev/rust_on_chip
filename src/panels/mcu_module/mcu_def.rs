@@ -401,6 +401,8 @@ impl McuDefinition {
         mcu.dma = self.dma.clone();
         mcu.irq_vectors = self.irq_vectors.clone();
         mcu.board_chip = self.board_chip.clone();
+        mcu.board_flash = crate::size::parse_ld_number(&self.project.flash_size)
+            .and_then(|b| u32::try_from(b).ok());
         mcu.usart_ip = self.usart_ip.clone();
         mcu.sdmmc_ip = self.sdmmc_ip.clone();
         mcu.grid = self.pins.grid.as_ref().map(|g| PinGrid {

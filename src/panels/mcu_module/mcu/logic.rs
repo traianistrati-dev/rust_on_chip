@@ -136,6 +136,7 @@ impl Mcu {
             irq_vectors: Vec::new(),
             // A bare chip until the definition says otherwise.
             board_chip: None,
+            board_flash: None,
             usart_ip: None,
             sdmmc_ip: None,
             selected_pin: None,

@@ -186,8 +186,18 @@ impl Mcu {
     /// changed under it): it is taken off and no other family's seed is
     /// touched. Run BEFORE the passes that append to the end of the file,
     /// whose additions do not count as the user's.
+    ///
+    /// A Raspberry Pi board is the exception: its store is refused by the
+    /// RUNTIME (Blocking), not by the chip, so the seed behind the line is the
+    /// family's own and the runtime's swap still has to reach it - the backend's
+    /// own swap cannot see past the line. Review found an Async -> Blocking
+    /// switch left `.await` in a blocking `main`.
     fn seed_flash_store_tail(&self, code: String) -> String {
-        if crate::panels::mcu_module::flash_store::platform_of(self).is_err() {
+        use crate::panels::mcu_module::flash_store;
+        if flash_store::platform_of(self).is_err() {
+            if flash_store::is_rp(&self.family) {
+                return flash_store_gen::seed_tail(code, false, self.is_async());
+            }
             return flash_store_gen::strip_tail_seed(code);
         }
         flash_store_gen::seed_tail(code, self.flash_store.is_some(), self.is_async())

@@ -3986,19 +3986,17 @@ impl AppIde {
                 self.cargo_config = runner;
                 self.invalidate_project_files_cache();
             }
-            // memory.x follows the flash store on an STM32: FLASH ends where the
-            // store begins (on an F2/F4/F7 `_stext` starts the program after
-            // it), so a program that grows into it fails to link. The
-            // same decision as the generated `flash_store.rs`; a memory.x with
-            // no markers is the user's and is only checked before a flash.
-            let reservation = self.mcu.as_ref().and_then(|m| {
-                crate::panels::mcu_module::flash_store::stm32_reservation(
-                    m.flash_store.as_ref(),
-                    &m.family,
-                    crate::panels::mcu_module::flash_store::part_of(m),
-                    m.runtime,
-                )
-            });
+            // memory.x follows the flash store on an STM32 and a Raspberry Pi
+            // board: FLASH ends where the store begins (on an F2/F4/F7
+            // `_stext` starts the program after it), so a program that grows
+            // into it fails to link. The same decision as the generated
+            // `flash_store.rs`; a memory.x with no markers is the user's and is
+            // only checked before a flash (not on a Pico under Blocking, where
+            // the store's code is not generated).
+            let reservation = self
+                .mcu
+                .as_ref()
+                .and_then(crate::panels::mcu_module::flash_store::memory_x_reservation);
             if let Some((def, _)) = self.selected_build_cfg() {
                 let mx = project_gen::splice_memory_x_store(&self.memory_x, &def, reservation);
                 if mx != self.memory_x {

@@ -2362,13 +2362,8 @@ mod emit_for_manual_compile {
             None,
             &sources,
         );
-        // memory.x by the decision the app makes (`flash_store::stm32_reservation`).
-        let reservation = flash_store::stm32_reservation(
-            mcu.flash_store.as_ref(),
-            &mcu.family,
-            flash_store::part_of(&mcu),
-            mcu.runtime,
-        );
+        // memory.x by the decision the app makes (`flash_store::memory_x_reservation`).
+        let reservation = flash_store::memory_x_reservation(&mcu);
         assert!(reservation.is_some(), "nothing reserved");
         files.memory_x = project_gen::splice_memory_x_store(&files.memory_x, &project, reservation);
         assert!(

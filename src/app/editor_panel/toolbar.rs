@@ -240,19 +240,15 @@ impl AppIde {
     /// flashed, or `None` - `flash_store::flash_block`, asked by espflash, RTT
     /// Run and Debug alike: all three pass the table on.
     ///
-    /// On an STM32 it is the store's settings and `memory.x` instead
-    /// (`flash_store::stm32_flash_block`): every STM32 flashing path writes
-    /// the program memory.x laid out.
+    /// On an STM32 or a Raspberry Pi board it is the store's settings and
+    /// `memory.x` instead (`flash_store::memory_x_flash_block`): every flashing
+    /// path there writes the program memory.x laid out.
     pub(crate) fn partition_table_block(&self) -> Option<String> {
         let mcu = self.mcu.as_ref()?;
         crate::panels::mcu_module::flash_store::project_flash_block(
             &self.partitions_csv,
             &self.memory_x,
-            mcu.flash_store.as_ref(),
-            &mcu.family,
-            crate::panels::mcu_module::flash_store::part_of(mcu),
-            mcu.runtime,
-            mcu.watchdog.wwdg.map(|w| w.timeout_us),
+            mcu,
         )
     }
 

@@ -14,6 +14,9 @@
 //!   of the range against embassy's own `FLASH_SIZE` / `MAX_ERASE_SIZE`.
 //! - **STM32F1, stm32f1xx-hal** (Blocking, Native): an `F1Flash` adapter that
 //!   puts the HAL's `FlashWriter` behind the `NorFlash` traits.
+//! - **Raspberry Pi, embassy-rp** (Async): its blocking `Flash` behind an
+//!   `RpFlash` that erases one 4 KiB sector at a time, sized by the BOARD's
+//!   flash - embassy-rp cannot know it, the flash is off the chip.
 //!
 //! On STM32 the reservation is `memory.x` (`project_gen::memory_x_body`), so
 //! the checks are the BUILD's: a range the driver cannot erase, or a program
@@ -487,6 +490,132 @@ impl NorFlash for F1Flash {
     };
 }
 
+macro_rules! rp_gen {
+    () => {
+        r#"// <<< GENERATED>>>
+// Flash store (from the Configuration tab) — auto-updated; edit it in the tab.
+// The bytes the store owns, as offsets from the start of flash (0x10000000,
+// the boot block counted in): the last {SECTORS} sectors of the board's {FLASH_KIB} KiB,
+// which memory.x keeps out of FLASH.
+pub const STORE_RANGE: core::ops::Range<u32> = 0x{START}..0x{END};
+// <<< GENERATED END >>>
+"#
+    };
+}
+macro_rules! rp_intro {
+    () => {
+        r#"
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// Settings kept in the board's flash: `sequential-storage` keeps a small
+// key -> value map in STORE_RANGE and spreads the writes over its sectors.
+// Put what you want to keep in `Data`, then:
+//
+//     let mut data = flash_store.load_blocking();      // Async: .load().await
+//     data.counter += 1;
+//     flash_store.save_blocking(&data).ok();          // Async: .save(&data).await
+//
+// The program runs from this same flash, so a sector erase (up to 400 ms)
+// runs from RAM with interrupts off and nothing else running: save when
+// something changed, not in a tight loop - and from core 0 only. Flashing from
+// the IDE keeps these sectors; picotool erase or flash_nuke.uf2 wipes them.
+
+"#
+    };
+}
+macro_rules! rp_doc {
+    () => {
+        r#"/// The store, over any NOR flash - the board's own here, as the generated
+/// block in main.rs hands it over (see flash_store_hal.rs). It owns the flash.
+"#
+    };
+}
+macro_rules! hal_rp {
+    () => {
+        r#"// <<< GENERATED>>>
+// Flash store glue for embassy-rp (from the Configuration tab) — regenerated
+// whole, with the runtime; your code goes in flash_store.rs.
+//
+// embassy-rp's blocking Flash, which erases and writes from RAM with interrupts
+// off and core 1 parked. `RpFlash` erases ONE 4 KiB sector per call, so a store
+// being formatted gives interrupts back between sectors instead of holding them
+// off for all of it at once.
+use embassy_rp::flash::{Blocking, ERASE_SIZE};
+use embedded_storage::nor_flash::{
+    ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash, check_erase,
+};
+
+use super::flash_store::STORE_RANGE;
+
+/// The board's flash, in bytes. embassy-rp cannot know it - the flash is off
+/// the chip - and an offset past the real end wraps onto the boot block.
+pub const FLASH_SIZE: usize = {FLASH_KIB} * 1024;
+
+type Inner = embassy_rp::flash::Flash<'static, embassy_rp::peripherals::FLASH, Blocking, FLASH_SIZE>;
+
+/// embassy-rp's flash, erasing a sector at a time.
+pub struct RpFlash(Inner);
+
+impl RpFlash {
+    pub fn new(flash: embassy_rp::Peri<'static, embassy_rp::peripherals::FLASH>) -> Self {
+        Self(Inner::new_blocking(flash))
+    }
+}
+
+impl ErrorType for RpFlash {
+    type Error = embassy_rp::flash::Error;
+}
+
+impl ReadNorFlash for RpFlash {
+    const READ_SIZE: usize = <Inner as ReadNorFlash>::READ_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.blocking_read(offset, bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        FLASH_SIZE
+    }
+}
+
+impl NorFlash for RpFlash {
+    const WRITE_SIZE: usize = <Inner as NorFlash>::WRITE_SIZE;
+    const ERASE_SIZE: usize = <Inner as NorFlash>::ERASE_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        check_erase(self, from, to)?;
+        let mut at = from;
+        while at < to {
+            self.0.blocking_erase(at, at + ERASE_SIZE as u32)?;
+            at += ERASE_SIZE as u32;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.blocking_write(offset, bytes)
+    }
+}
+
+impl MultiwriteNorFlash for RpFlash {}
+
+// The store ends where the board's flash ends, on a sector - checked while
+// building, so STORE_RANGE, memory.x and FLASH_SIZE cannot disagree.
+const _: () = {
+    assert!(
+        STORE_RANGE.end as usize == FLASH_SIZE,
+        "STORE_RANGE must end where the board's flash ends (FLASH_SIZE)"
+    );
+    assert!(
+        STORE_RANGE.start as usize % ERASE_SIZE == 0,
+        "STORE_RANGE must start on a 4 KiB sector (embassy-rp's ERASE_SIZE)"
+    );
+};
+// <<< GENERATED END >>>
+"#
+    };
+}
+
 /// The ESP template. Only the two constants sit inside the markers; everything
 /// below them is the user's, kept across regeneration and never force-rewritten
 /// (`project_tree::logic::sync_config_files`), since no runtime changes it.
@@ -528,8 +657,26 @@ const HAL_EMBASSY_HEAD: &str = hal_embassy_head!();
 /// adapter. Generated whole.
 const HAL_F1: &str = hal_f1!();
 
+/// The Raspberry Pi template: the STM32 body under its own header and notes
+/// (a board's flash, 4 KiB sectors, the erase stall) - the code is the same,
+/// so a chip change between the two keeps compiling.
+const TMPL_RP: &str = concat!(
+    rp_gen!(),
+    rp_intro!(),
+    stm_imports!(),
+    common_a!(),
+    stm_buf_doc!(),
+    common_a2!(),
+    rp_doc!(),
+    common_b!()
+);
+
+/// The Raspberry Pi glue on embassy-rp: `RpFlash` and the build-time checks
+/// against the board's flash. Generated whole.
+const HAL_RP: &str = hal_rp!();
+
 /// Every template of the USER's file, for [`is_pristine`].
-const TEMPLATES: [&str; 2] = [TMPL, TMPL_STM32];
+const TEMPLATES: [&str; 3] = [TMPL, TMPL_STM32, TMPL_RP];
 
 /// The store's platform on `mcu`'s chip and runtime, `None` where it is not
 /// generated.
@@ -586,6 +733,14 @@ pub fn config_files(
                     .replace("{PAGE_KIB}", &(geo.page / 1024).to_string())
                     .replace("{FLASH_KIB}", &(geo.size / 1024).to_string()),
             };
+            vec![(FILE.to_owned(), fill(&body)), (HAL_FILE.to_owned(), glue)]
+        }
+        Platform::Rp { geo } => {
+            let kib = (geo.size / 1024).to_string();
+            let body = TMPL_RP
+                .replace("{SECTORS}", &(cfg.size / geo.page.max(1)).to_string())
+                .replace("{FLASH_KIB}", &kib);
+            let glue = HAL_RP.replace("{FLASH_KIB}", &kib);
             vec![(FILE.to_owned(), fill(&body)), (HAL_FILE.to_owned(), glue)]
         }
     }
@@ -649,6 +804,8 @@ pub fn init_lines_for(mcu: &Mcu) -> String {
 /// - stm32f1xx-hal: `flash` is already `dp.FLASH.constrain()`, whose `acr`
 ///   froze the clocks a few lines up; the adapter takes it over. These lines
 ///   land after the clocks, in the slot the Custom modules use.
+/// - embassy-rp: `RpFlash::new(p.FLASH)`, right after the watchdog (the RP
+///   backend has no Custom-module slot).
 ///
 /// `mut` and the `allow`s keep a project that has not touched the store yet
 /// warning-free, while `flash_store::verify(&mut flash)` still works on an
@@ -678,6 +835,10 @@ pub fn init_lines(cfg: Option<&FlashStoreConfig>, platform: Option<Platform>) ->
         Platform::Stm32 {
             hal: StmHal::F1Hal, ..
         } => "    let mut flash = crate::pins::configs::flash_store_hal::F1Flash::new(flash);\n",
+        // Blocking mode: no DMA channel, so nothing the radio or a bus counts.
+        Platform::Rp { .. } => {
+            "    let mut flash = crate::pins::configs::flash_store_hal::RpFlash::new(p.FLASH);\n"
+        }
     };
     format!(
         concat!(
@@ -956,6 +1117,62 @@ mod tests {
         let b = config_files(Some(&cfg), embassy);
         assert_eq!(a[0], b[0], "flash_store.rs must not depend on the HAL");
         assert_ne!(a[1], b[1], "the glue does");
+    }
+
+    /// A Pico 2: the user's file holds the range from 0x10000000, the glue
+    /// carries the BOARD's flash and the sector-at-a-time eraser, and the
+    /// flash is handed over in blocking mode - no DMA channel taken.
+    #[test]
+    fn the_rp_glue_carries_the_boards_flash_and_erases_a_sector_at_a_time() {
+        use crate::panels::mcu_module::flash_store::rp_platform;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let platform = rp_platform(Runtime::Async, Some(4096 * 1024)).expect("Pico 2");
+        let cfg = FlashStoreConfig::default_on(&platform, "rp235x");
+        let files = config_files(Some(&cfg), Some(platform));
+        let [(name, body), (glue_name, glue)] = files.as_slice() else {
+            panic!("{files:?}");
+        };
+        assert_eq!((name.as_str(), glue_name.as_str()), (FILE, HAL_FILE));
+        let (block, rest) = body.split_once(GEN_END_CFG).expect("markers");
+        assert!(
+            block.contains("STORE_RANGE: core::ops::Range<u32> = 0x3FE000..0x400000;"),
+            "{block}"
+        );
+        assert!(
+            block.contains("the last 2 sectors of the board's 4096 KiB"),
+            "{block}"
+        );
+        assert!(block.contains("(0x10000000,"), "{block}");
+        assert!(
+            !rest.contains("0x08000000") && !rest.contains("esp_"),
+            "{rest}"
+        );
+        assert!(
+            glue.contains("pub const FLASH_SIZE: usize = 4096 * 1024;"),
+            "{glue}"
+        );
+        assert!(glue.contains("self.0.blocking_erase(at, at + ERASE_SIZE as u32)?;"));
+        assert!(glue.contains("STORE_RANGE.end as usize == FLASH_SIZE"));
+        assert!(glue.trim_end().ends_with(GEN_END_CFG), "generated whole");
+        for p in ["{START}", "{END}", "{SECTORS}", "{FLASH_KIB}"] {
+            assert!(!body.contains(p) && !glue.contains(p), "{p} survived");
+        }
+        assert!(is_pristine(body));
+        let lines = init_lines(Some(&cfg), Some(platform));
+        assert!(
+            lines.contains(
+                "let mut flash = crate::pins::configs::flash_store_hal::RpFlash::new(p.FLASH);"
+            ),
+            "{lines}"
+        );
+        // The same code as an STM32's, under its own header and notes.
+        let (_, stm_tail) = TMPL_STM32.split_once(GEN_END_CFG).unwrap();
+        let (_, rp_tail) = TMPL_RP.split_once(GEN_END_CFG).unwrap();
+        let code = |t: &str| t.split_once("use ").map(|(_, c)| c.to_owned()).unwrap();
+        assert_eq!(
+            code(stm_tail).replace(stm_doc!(), ""),
+            code(rp_tail).replace(rp_doc!(), "")
+        );
     }
 
     /// The ESP file is assembled from the same fragments as the STM32 one,

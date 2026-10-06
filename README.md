@@ -321,8 +321,8 @@ watchdogs, configured as *durations* rather than as register fields, plus the
 which channels are taken and by whom — fed from the codegen itself, so it cannot
 drift from what is emitted.
 
-**Flash store** (ESP32-C3 and STM32): settings kept in the chip's own
-flash. Switching it on writes `src/pins/configs/flash_store.rs` — a
+**Flash store** (ESP32-C3, STM32 and the Raspberry Pi boards): settings kept in
+the flash the program runs from. Switching it on writes `src/pins/configs/flash_store.rs` — a
 `ConfigStore` over `sequential-storage`, with `load` / `save` (and `_blocking`
 twins) and a `Data` struct of your own — hands it the flash as `flash` in the
 generated block, and seeds
@@ -353,6 +353,18 @@ Not generated, with the reason on the card: the H7's equal 128 KiB sectors,
 parts whose bank mode is set in option bytes (the L5 included), L4/WL
 (embassy-stm32 0.6 does not reset their flash data cache after an erase),
 L0/L1 (their flash erases to 0x00), the WB's radio stack, and RTIC for now.
+
+On the **Raspberry Pi boards** (Pico, Pico W, Pico 2, Pico 2 W, pico2-ice) the
+store is the last 4 KiB sectors of the board's QSPI flash (two by default:
+0x101FE000.. on a Pico), sized from the board definition — the flash is off
+the chip, so nothing else knows its size, and a range past the real end would
+wrap onto the boot block. memory.x shrinks FLASH around the RP2040's BOOT2
+region or beside the RP2350's image block, with the same `ASSERT`.
+embassy-rp's blocking `Flash` writes it from RAM, wrapped in a generated
+`RpFlash` that erases one sector per call (up to 400 ms each with interrupts
+off, as the program runs from that flash), and takes no DMA channel. Async
+only for now: rp2040-hal and rp235x-hal have no flash driver. The card warns
+when the RP watchdog's period is shorter than the store's slowest save.
 
 On the **ESP32-C3** (`esp-storage`) the store lives either in a partition of its own, in a generated
 `partitions.csv` (shown in the project tree, and passed to espflash, RTT and the
@@ -491,8 +503,8 @@ compiler can tell you that text is a program. `scripts/verify-codegen.ps1` emits
 a matrix of configurations and cross-compiles each one:
 
 ```powershell
-pwsh scripts/verify-codegen.ps1             # representative subset (37 cases)
-pwsh scripts/verify-codegen.ps1 -Full       # every case (59), about 13 minutes warm
+pwsh scripts/verify-codegen.ps1             # representative subset (43 cases)
+pwsh scripts/verify-codegen.ps1 -Full       # every case (76), about 25 minutes warm
 pwsh scripts/verify-codegen.ps1 -Hook nrf   # every case of the named families
 ```
 

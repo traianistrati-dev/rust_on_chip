@@ -146,11 +146,11 @@ else
                 fams="$fams n6" ;;
             src/panels/mcu_module/codegen_esp_configs.rs|            src/panels/mcu_module/codegen_esp.rs|            assets/mcus/esp*.ron)
                 fams="$fams esp" ;;
-            # The flash store: the ESP32-C3, and STM32 through memory.x (the
-            # F1 rows and the embassy ones). The geometry table feeds the STM32
-            # half only.
+            # The flash store: the ESP32-C3, and STM32 and the Raspberry Pi
+            # boards through memory.x (the F1 rows, the embassy ones, the RP
+            # store rows). The geometry table feeds the STM32 half only.
             src/panels/mcu_module/codegen/flash_store_gen.rs|            src/panels/mcu_module/flash_store.rs)
-                fams="$fams esp f1 embassy" ;;
+                fams="$fams esp f1 embassy rp" ;;
             src/panels/mcu_module/stm32_flash_geometry.rs)
                 fams="$fams f1 embassy" ;;
             # The IoT tab: generated for the ESP chips with Wi-Fi and the two

@@ -2734,14 +2734,15 @@ fn cargo_config_embedded(c: &ProjectDef) -> String {
 }
 
 /// The memory.x GENERATED block with the Configuration tab's flash store
-/// kept out of the program: `store` is its byte range from the start of flash
-/// and its layout (`flash_store::stm32_reservation`), `None` for the plain
-/// block. The store's bounds become linker symbols either way.
+/// kept out of the program: `store` is its byte range from the start of flash,
+/// its layout and the address that start is (`flash_store::memory_x_reservation`),
+/// `None` for the plain block. The store's bounds become linker symbols either way.
 ///
 /// - `Layout::End`: FLASH ends where the store begins, written as a literal
 ///   `NNK` (the Size bar's parser reads a number, not `64K - 2K`), and an
 ///   `ASSERT` keeps them apart, so a LENGTH edited by hand past the store
-///   fails the link instead of overwriting it.
+///   fails the link instead of overwriting it. An RP2040 keeps its BOOT2
+///   region: `LENGTH = NNK - 0x100` after it, ending at the same address.
 /// - `Layout::AfterVectors` (F2/F4/F7): FLASH stays whole; `_stext` starts
 ///   the program after the store, which sits between the vector table and
 ///   the code. cortex-m-rt's own asserts keep `_stext` inside FLASH and after
@@ -2750,14 +2751,14 @@ pub fn memory_x_body(
     c: &ProjectDef,
     store: Option<crate::panels::mcu_module::flash_store::Reservation>,
 ) -> String {
-    use crate::panels::mcu_module::flash_store::{Layout, STM32_FLASH_BASE};
+    use crate::panels::mcu_module::flash_store::Layout;
     let Some(res) = store else {
         return memory_x(c);
     };
     let r = res.range;
-    let origin = crate::size::parse_ld_number(&c.flash_origin).unwrap_or(STM32_FLASH_BASE.into());
-    let start = u64::from(STM32_FLASH_BASE) + u64::from(r.start);
-    let end = u64::from(STM32_FLASH_BASE) + u64::from(r.end);
+    let origin = crate::size::parse_ld_number(&c.flash_origin).unwrap_or(res.base.into());
+    let start = u64::from(res.base) + u64::from(r.start);
+    let end = u64::from(res.base) + u64::from(r.end);
     if res.layout == Layout::AfterVectors {
         let mut out = memory_x(c);
         out.push_str(&format!(
@@ -4913,6 +4914,7 @@ mod flash_store_file_tests {
         Some(crate::panels::mcu_module::flash_store::Reservation {
             range: 0xF800..0x10000,
             layout: crate::panels::mcu_module::flash_store::Layout::End,
+            base: crate::panels::mcu_module::flash_store::STM32_FLASH_BASE,
         })
     }
 
@@ -4995,6 +4997,7 @@ mod flash_store_file_tests {
             Some(Reservation {
                 range: 0x4000..0xC000,
                 layout: Layout::AfterVectors,
+                base: crate::panels::mcu_module::flash_store::STM32_FLASH_BASE,
             }),
         );
         assert!(
@@ -5028,7 +5031,7 @@ mod flash_store_file_tests {
         };
         let ours = |b: &str| format!("{}\n{b}{}\n", Cmt::Block.begin(), Cmt::Block.end());
         assert_eq!(
-            memory_x_overlap(&ours(&body), &store, Layout::AfterVectors),
+            memory_x_overlap(&ours(&body), &store, Layout::AfterVectors, 0x0800_0000),
             None
         );
         let behind_boot = ProjectDef {
@@ -5040,13 +5043,62 @@ mod flash_store_file_tests {
             Some(Reservation {
                 range: 0x4000..0xC000,
                 layout: Layout::AfterVectors,
+                base: crate::panels::mcu_module::flash_store::STM32_FLASH_BASE,
             }),
         );
         assert!(
-            memory_x_overlap(&ours(&moved), &store, Layout::AfterVectors)
+            memory_x_overlap(&ours(&moved), &store, Layout::AfterVectors, 0x0800_0000)
                 .is_some_and(|s| s.contains("MCU form's Flash origin")),
             "{moved}"
         );
+    }
+
+    /// A Raspberry Pi board's store: FLASH ends where it begins, counted from
+    /// 0x10000000 - after the RP2040's BOOT2 region, and beside the RP2350's
+    /// image block, both kept.
+    #[test]
+    fn an_rp_store_shrinks_flash_and_keeps_the_boot_blocks() {
+        use crate::panels::mcu_module::flash_store::{
+            Layout, RP_FLASH_BASE, Reservation, memory_x_flash,
+        };
+        let def = |id: &str| {
+            crate::panels::mcu_module::builtins::builtin_definitions()
+                .into_iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("built-in {id}"))
+                .project
+        };
+        let res = |range| {
+            Some(Reservation {
+                range,
+                layout: Layout::End,
+                base: RP_FLASH_BASE,
+            })
+        };
+        let pico = memory_x_body(&def("rp2040_pico"), res(0x1F_E000..0x20_0000));
+        for want in [
+            "BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100",
+            "LENGTH = 2040K - 0x100",
+            ".boot2",
+            "_flash_store_start = 0x101FE000;",
+            "_flash_store_end = 0x10200000;",
+            "ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) <= _flash_store_start,",
+        ] {
+            assert!(pico.contains(want), "{want}:\n{pico}");
+        }
+        let (origin, length) = memory_x_flash(&pico).expect("FLASH");
+        assert_eq!(origin + length, 0x101F_E000, "FLASH ends at the store");
+        let pico2 = memory_x_body(&def("rp2350_pico2"), res(0x3F_E000..0x40_0000));
+        for want in [
+            "LENGTH = 4088K",
+            ".start_block",
+            "_flash_store_start = 0x103FE000;",
+        ] {
+            assert!(pico2.contains(want), "{want}:\n{pico2}");
+        }
+        // And the plain block when the store goes, byte for byte.
+        let plain = memory_x_body(&def("rp2040_pico"), None);
+        assert!(!plain.contains("_flash_store_start") && plain.contains("2048K - 0x100"));
     }
 
     /// An STM32 store brings only its own crates; esp-storage is an ESP's.

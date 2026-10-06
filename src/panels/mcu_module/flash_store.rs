@@ -37,6 +37,18 @@
 //! [`platform`] for which, and for every part it is NOT generated on and why.
 //! The page sizes come from [`super::stm32_flash_geometry`], harvested from
 //! the metadata embassy-stm32 itself is built from.
+//!
+//! # Raspberry Pi
+//!
+//! The same end-of-flash layout ([`Platform::Rp`]), in the board's QSPI flash:
+//! 4 KiB sectors, offsets from 0x10000000 with the RP2040's boot2 counted in.
+//! The flash is OFF the chip, so nothing but the board definition knows its
+//! size ([`Mcu::board_flash`]) - and a range past the real end would wrap onto
+//! the boot block. Written through embassy-rp's blocking `Flash`, from RAM,
+//! with interrupts off for each sector erase (up to 400 ms). Async only:
+//! rp2040-hal and rp235x-hal (Blocking) have no flash driver, only the boot
+//! ROM's raw calls. The IDE flashes these boards through probe-rs and OpenOCD,
+//! which erase only the 4 KiB sectors they write, so the store survives.
 
 use std::ops::Range;
 
@@ -101,6 +113,39 @@ pub enum Platform {
         geo: Geometry,
         layout: Layout,
     },
+    /// A Raspberry Pi board's QSPI flash through embassy-rp, reserved in
+    /// `memory.x` at the end of flash ([`Layout::End`]). `geo.size` is the
+    /// board's flash; pages are 4 KiB sectors.
+    Rp { geo: Geometry },
+}
+
+impl Platform {
+    /// The absolute address the store's offsets count from, and where it
+    /// sits - `None` on an ESP, whose store lives in a partition table.
+    pub fn memory_x(&self) -> Option<(u32, Layout)> {
+        match self {
+            Platform::Esp => None,
+            Platform::Stm32 { layout, .. } => Some((STM32_FLASH_BASE, *layout)),
+            Platform::Rp { .. } => Some((RP_FLASH_BASE, Layout::End)),
+        }
+    }
+}
+
+/// Where a Raspberry Pi's flash is mapped (XIP), and what embassy-rp's
+/// offsets count from - the RP2040's 256-byte boot2 included.
+pub const RP_FLASH_BASE: u32 = 0x1000_0000;
+
+/// The longest a 4 KiB sector erase takes on the bundled boards' flash chips:
+/// 400 ms on the W25Q16JV (Pico, Pico W) and the W25Q32JV (pico2-ice), 240 ms
+/// on the W25Q32RV of the Pico 2 and Pico 2 W (Winbond datasheets, tSE max).
+/// The checks count the slowest, 400 ms, on every board. embassy-rp keeps
+/// interrupts off for each one, and runs from this same flash, so nothing
+/// else runs either.
+pub const RP_SECTOR_ERASE_MAX_US: u32 = 400_000;
+
+/// Is `family` a Raspberry Pi board's?
+pub fn is_rp(family: &str) -> bool {
+    crate::panels::mcu_module::codegen::rp::is_rp(family)
 }
 
 /// Where an STM32 store sits, and so what memory.x does about it.
@@ -190,9 +235,52 @@ pub fn part_of(mcu: &Mcu) -> &str {
         .unwrap_or(&mcu.name)
 }
 
-/// [`platform`] for `mcu`'s chip and runtime - what every caller asks.
+/// [`platform`] for `mcu`'s chip and runtime - what every caller asks. A
+/// Raspberry Pi board also needs its flash size, which only the board
+/// definition knows ([`Mcu::board_flash`]).
 pub fn platform_of(mcu: &Mcu) -> Result<Platform, String> {
+    if is_rp(&mcu.family) {
+        return rp_platform(mcu.runtime, mcu.board_flash);
+    }
     platform(&mcu.family, part_of(mcu), mcu.runtime)
+}
+
+/// A Raspberry Pi board's store with `flash` bytes of flash, whatever the
+/// runtime - what memory.x reserves while the store is on, even on a runtime
+/// the code is not generated for (see [`memory_x_reservation`]).
+pub fn rp_geometry(flash: Option<u32>) -> Result<Geometry, String> {
+    match flash {
+        Some(size) if size >= 2 * MIN_SECTORS * SECTOR && size.is_multiple_of(SECTOR) => {
+            Ok(Geometry {
+                size,
+                page: SECTOR,
+                write: 1,
+                head_page: 0,
+                head_size: 0,
+            })
+        }
+        _ => Err(concat!(
+            "The board's flash size is unknown (its definition's flash_size), and the ",
+            "store is counted back from the end of the flash. A guess past the real chip ",
+            "would wrap onto the boot block."
+        )
+        .to_owned()),
+    }
+}
+
+/// The store on a Raspberry Pi board under `runtime`: embassy-rp's flash on
+/// Async, refused on the others with the reason.
+pub fn rp_platform(runtime: Runtime, flash: Option<u32>) -> Result<Platform, String> {
+    let geo = rp_geometry(flash)?;
+    if runtime != Runtime::Async {
+        return Err(concat!(
+            "Not on the Blocking runtime yet: rp2040-hal and rp235x-hal have no flash ",
+            "driver, only the boot ROM's raw erase and program calls, which must run from ",
+            "RAM with the flash's XIP off. Switch Runtime to Async - embassy-rp's Flash has it."
+        )
+        .to_owned());
+    }
+    Ok(Platform::Rp { geo })
 }
 
 /// How the store is generated for `part` of `family` under `runtime`, or the
@@ -221,10 +309,15 @@ pub fn platform(family: &str, part: &str, runtime: Runtime) -> Result<Platform, 
         )
         .to_owned());
     }
+    // A board's flash size is not in the part name: `platform_of` asks the
+    // board. Here, with the name alone, it is unknown.
+    if is_rp(family) {
+        return rp_platform(runtime, None);
+    }
     if !family.starts_with("stm32") {
         return Err(concat!(
-            "Generated for the ESP32-C3 and STM32 so far - this family's flash ",
-            "driver is not wired in yet."
+            "Generated for the ESP32-C3, STM32 and the Raspberry Pi boards so far - this ",
+            "family's flash driver is not wired in yet."
         )
         .to_owned());
     }
@@ -396,8 +489,9 @@ pub enum FlashStoreMode {
     /// not ESP-IDF's NVS - firmware or tools expecting real NVS there will not
     /// read it.
     Nvs,
-    /// STM32: the last pages of flash, kept out of `memory.x`'s FLASH region.
-    /// `offset` is from the start of flash, as embassy-stm32's `Flash` counts.
+    /// STM32 and Raspberry Pi: pages of the flash kept out of `memory.x`'s
+    /// program (the last ones, or an F2/F4/F7's after the vector table).
+    /// `offset` is from the start of flash, as embassy's `Flash` counts.
     MemoryX,
 }
 
@@ -457,6 +551,10 @@ impl FlashStoreConfig {
     /// The default on an STM32: the last [`MIN_SECTORS`] pages - 2 KiB on an
     /// F103C8, 4 KiB on a G431, 16 KiB on a U5. Small on purpose: an F103C8
     /// has 64 KiB in all, and the ESP's 16 KiB would be a quarter of it.
+    ///
+    /// On a Raspberry Pi board too: 8 KiB, because sequential-storage formats
+    /// a store it cannot read with ONE erase of all of it - 800 ms of a 1 s
+    /// watchdog at two sectors, 1.6 s at four.
     pub fn default_stm32(g: &Geometry) -> Self {
         let size = MIN_SECTORS * g.page;
         Self {
@@ -492,6 +590,7 @@ impl FlashStoreConfig {
                 layout: Layout::AfterVectors,
                 ..
             } => Self::default_after_vectors(geo),
+            Platform::Rp { geo } => Self::default_stm32(geo),
         }
     }
 
@@ -515,16 +614,19 @@ impl FlashStoreConfig {
 
     /// What is wrong with the settings on `platform`, one sentence each:
     /// [`Self::problems`] on an ESP, the page and end-of-flash rules on an
-    /// STM32. Settings saved for the other platform (a chip changed under a
-    /// project) say so, and the card's Reset fixes them.
+    /// STM32 or a Raspberry Pi board. Settings saved for the other platform (a
+    /// chip changed under a project) say so, and the card's Reset fixes them.
     pub fn problems_on(&self, platform: &Platform) -> Vec<String> {
-        let Platform::Stm32 { geo: g, layout, .. } = platform else {
-            if self.mode == FlashStoreMode::MemoryX {
+        let (g, layout, holder) = match platform {
+            Platform::Esp if self.mode == FlashStoreMode::MemoryX => {
                 return vec![
-                    "These settings are for an STM32's memory.x, not this chip.".to_owned(),
+                    "These settings are for a memory.x (STM32, Raspberry Pi), not this chip."
+                        .to_owned(),
                 ];
             }
-            return self.problems();
+            Platform::Esp => return self.problems(),
+            Platform::Stm32 { geo, layout, .. } => (geo, *layout, "part"),
+            Platform::Rp { geo } => (geo, Layout::End, "board"),
         };
         if self.mode != FlashStoreMode::MemoryX {
             return vec![
@@ -534,12 +636,12 @@ impl FlashStoreConfig {
         let mut out = Vec::new();
         if self.flash_size != g.size {
             out.push(format!(
-                "Saved for a {} KiB flash; this part has {} KiB.",
+                "Saved for a {} KiB flash; this {holder} has {} KiB.",
                 self.flash_size / 1024,
                 g.size / 1024
             ));
         }
-        let page = g.store_page(*layout).max(1);
+        let page = g.store_page(layout).max(1);
         if !self.size.is_multiple_of(page) {
             out.push(format!(
                 "The store must be whole pages of {} KiB: 0x{:X} is not.",
@@ -1009,20 +1111,34 @@ pub fn stm32_flash_block(
     runtime: Runtime,
     wwdg_us: Option<u32>,
 ) -> Option<String> {
-    let store = store?;
-    let p @ Platform::Stm32 { layout, .. } = platform(family, part, runtime).ok()? else {
+    let p @ Platform::Stm32 { .. } = platform(family, part, runtime).ok()? else {
         return None;
     };
-    let mut problems = store.problems_on(&p);
-    problems.extend(wwdg_problem(&p, wwdg_us));
+    memory_x_flash_block(memory_x, store, &p, wwdg_us)
+}
+
+/// [`stm32_flash_block`] on any platform whose store `memory.x` reserves -
+/// an STM32 or a Raspberry Pi board: the store's settings, the WWDG (an
+/// STM32's only), then memory.x against the store. `None` on an ESP.
+pub fn memory_x_flash_block(
+    memory_x: &str,
+    store: Option<&FlashStoreConfig>,
+    platform: &Platform,
+    wwdg_us: Option<u32>,
+) -> Option<String> {
+    let store = store?;
+    let (base, layout) = platform.memory_x()?;
+    let mut problems = store.problems_on(platform);
+    problems.extend(wwdg_problem(platform, wwdg_us));
     if !problems.is_empty() {
         return Some(format!("Flash store: {}", problems.join(" ")));
     }
-    memory_x_overlap(memory_x, store, layout)
+    memory_x_overlap(memory_x, store, layout, base)
 }
 
-/// The longest one store erase keeps interrupts off, in microseconds, on
-/// [`Layout::AfterVectors`] - `None` on [`Layout::End`], whose pages erase in
+/// The longest one store erase keeps interrupts off, in microseconds: an
+/// F2/F4/F7 sector ([`Layout::AfterVectors`]) or a Raspberry Pi board's 4 KiB
+/// one. `None` on the [`Layout::End`] STM32s, whose pages erase in
 /// milliseconds.
 ///
 /// embassy-stm32 0.6 erases a sector inside a critical section, and the CPU
@@ -1031,6 +1147,7 @@ pub fn stm32_flash_block(
 /// clears PSIZE and `blocking_erase_sector` never sets it), where the F2/F4
 /// datasheets give up to 800 ms for a 16 KiB sector. Scaled by size for the
 /// F74x/F75x's 32 KiB - on the long side: the F4's 64 KiB take 2.4 s, not 3.2.
+/// On a Raspberry Pi board: [`RP_SECTOR_ERASE_MAX_US`].
 pub fn erase_stall_us(platform: &Platform) -> Option<u32> {
     match platform {
         Platform::Stm32 {
@@ -1038,6 +1155,7 @@ pub fn erase_stall_us(platform: &Platform) -> Option<u32> {
             layout: Layout::AfterVectors,
             ..
         } => Some(800_000 * (geo.head_page / (16 * 1024)).max(1)),
+        Platform::Rp { .. } => Some(RP_SECTOR_ERASE_MAX_US),
         _ => None,
     }
 }
@@ -1047,8 +1165,12 @@ pub fn erase_stall_us(platform: &Platform) -> Option<u32> {
 /// than [`erase_stall_us`] resets the chip inside every erase - and the
 /// half-erased sector it leaves is erased again after the reset, forever.
 /// The IWDG is only configured (the user starts it), so the card warns about
-/// it instead.
+/// it instead. An STM32's only: settings carried over from one to another
+/// chip's project reach no WWDG elsewhere.
 pub fn wwdg_problem(platform: &Platform, wwdg_us: Option<u32>) -> Option<String> {
+    let Platform::Stm32 { .. } = platform else {
+        return None;
+    };
     let stall = erase_stall_us(platform)?;
     let period = wwdg_us.filter(|&p| p < stall)?;
     Some(format!(
@@ -1063,13 +1185,70 @@ pub fn wwdg_problem(platform: &Platform, wwdg_us: Option<u32>) -> Option<String>
     ))
 }
 
+/// The card's warning when a Raspberry Pi board's watchdog would reset the
+/// chip inside a save, or `None`. Not a refusal: the watchdog is configured,
+/// and the user starts it.
+///
+/// The slowest save is the first one over bytes sequential-storage cannot
+/// read (another firmware's, a store that moved): it erases EVERY sector of
+/// the store before writing, [`RP_SECTOR_ERASE_MAX_US`] each, and no task
+/// runs until it returns - so no task can feed the watchdog meanwhile. (Any
+/// other save erases one sector at most - measured over 200 000 saves.)
+///
+/// `period_max_us` is the longest period the watchdog takes on this chip and
+/// runtime (`watchdog::rp_range_us`): past it, no period covers the format,
+/// and the only way out is a smaller store.
+pub fn rp_watchdog_warning(
+    platform: &Platform,
+    store: &FlashStoreConfig,
+    period_us: Option<u32>,
+    period_max_us: u32,
+) -> Option<String> {
+    let Platform::Rp { .. } = platform else {
+        return None;
+    };
+    let sector = erase_stall_us(platform)?;
+    let sectors = (store.size / SECTOR).max(1);
+    let worst = sector.saturating_mul(sectors);
+    let period = period_us.filter(|&p| p < worst)?;
+    let head = format!(
+        concat!(
+            "The watchdog's period ({} ms) is shorter than the store's slowest save: ",
+            "formatting its {} sectors can take up to {} ms (400 ms a sector, the slowest ",
+            "bundled flash) with no task running, so once you start the watchdog that save ",
+            "can reset the chip."
+        ),
+        period / 1000,
+        sectors,
+        worst / 1000,
+    );
+    Some(if worst > period_max_us {
+        format!(
+            concat!(
+                "{} No period covers it on this chip (at most {} ms): with the watchdog on, ",
+                "keep the store at {} sectors or fewer."
+            ),
+            head,
+            period_max_us / 1000,
+            period_max_us / sector
+        )
+    } else {
+        format!(
+            "{} Give it a period past {} ms, or make the store smaller.",
+            head,
+            worst / 1000
+        )
+    })
+}
+
 /// The most room a Cortex-M vector table takes: 16 system entries and 240
 /// interrupts of 4 bytes - what FLASH must leave before an
 /// [`Layout::AfterVectors`] store.
 const VECTOR_TABLE_MAX: u64 = 0x400;
 
 /// The sentence for a `memory.x` that would link the program over the store,
-/// or `None`. What cannot be read is not refused on a guess.
+/// or `None`. What cannot be read is not refused on a guess. `base` is where
+/// the store's offsets count from ([`Platform::memory_x`]).
 ///
 /// - [`Layout::End`]: FLASH must end where the store begins. The IDE's block
 ///   always does; a memory.x the user wrote may not.
@@ -1081,9 +1260,10 @@ pub fn memory_x_overlap(
     memory_x: &str,
     store: &FlashStoreConfig,
     layout: Layout,
+    base: u32,
 ) -> Option<String> {
     let (origin, length) = memory_x_flash(memory_x)?;
-    let start = u64::from(STM32_FLASH_BASE) + u64::from(store.offset);
+    let start = u64::from(base) + u64::from(store.offset);
     let store_end = start + u64::from(store.size);
     match layout {
         Layout::End => {
@@ -1109,7 +1289,7 @@ pub fn memory_x_overlap(
             ),
             origin,
             start,
-            STM32_FLASH_BASE,
+            base,
             if crate::panels::mcu_module::project_gen::memory_x_is_ours(memory_x) {
                 "Set the MCU form's Flash origin back, or turn the store off."
             } else {
@@ -1305,34 +1485,63 @@ pub fn stm32_reservation(
         Ok(Platform::Stm32 { layout, .. }) => Some(Reservation {
             range: store.range(),
             layout,
+            base: STM32_FLASH_BASE,
         }),
         _ => None,
     }
 }
 
-/// What memory.x reserves for an STM32 store: its bytes from the start of
-/// flash, and how they are kept out of the program.
+/// What `mcu`'s memory.x keeps out of the program for its store - THE
+/// decision the app and the harnesses splice memory.x by.
+///
+/// An STM32's is [`stm32_reservation`]. A Raspberry Pi board's holds while
+/// the store is on, whatever the runtime: on Blocking the code is not
+/// generated, but the settings stay in the flash, and a program that grew
+/// over them meanwhile would leave nothing to find on the way back to Async.
+///
+/// Unlike an STM32's, only settings that fit THIS board are reserved: on
+/// Blocking nothing else would check them, and settings carried over from
+/// another chip (an STM32's 0xF800.., a Pico 2's 4 MiB end on a Pico) hold
+/// nothing of this board's - reserved as they are, they cut FLASH to a few KiB
+/// or reserve nothing at all while the card claims otherwise. A board whose
+/// flash size is unknown reserves nothing either.
+pub fn memory_x_reservation(mcu: &Mcu) -> Option<Reservation> {
+    let store = mcu.flash_store.as_ref();
+    if !is_rp(&mcu.family) {
+        return stm32_reservation(store, &mcu.family, part_of(mcu), mcu.runtime);
+    }
+    let store = store.filter(|c| c.mode == FlashStoreMode::MemoryX)?;
+    let geo = rp_geometry(mcu.board_flash).ok()?;
+    if !store.problems_on(&Platform::Rp { geo }).is_empty() {
+        return None;
+    }
+    Some(Reservation {
+        range: store.range(),
+        layout: Layout::End,
+        base: RP_FLASH_BASE,
+    })
+}
+
+/// What memory.x reserves for a store: its bytes from the start of flash, how
+/// they are kept out of the program, and the address the offsets count from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reservation {
     pub range: Range<u32>,
     pub layout: Layout,
+    pub base: u32,
 }
 
-/// [`flash_block`] or [`stm32_flash_block`], whichever the family has - what
-/// every flashing path asks.
-pub fn project_flash_block(
-    csv: &str,
-    memory_x: &str,
-    store: Option<&FlashStoreConfig>,
-    family: &str,
-    part: &str,
-    runtime: Runtime,
-    wwdg_us: Option<u32>,
-) -> Option<String> {
-    if family.starts_with("stm32") {
-        stm32_flash_block(memory_x, store, family, part, runtime, wwdg_us)
+/// [`flash_block`] or [`memory_x_flash_block`], whichever `mcu`'s family has:
+/// what every flashing path asks. On a Raspberry Pi board under a runtime the
+/// store is not generated for, nothing to check.
+pub fn project_flash_block(csv: &str, memory_x: &str, mcu: &Mcu) -> Option<String> {
+    let store = mcu.flash_store.as_ref();
+    if mcu.family.starts_with("stm32") || is_rp(&mcu.family) {
+        let platform = platform_of(mcu).ok()?;
+        let wwdg_us = mcu.watchdog.wwdg.map(|w| w.timeout_us);
+        memory_x_flash_block(memory_x, store, &platform, wwdg_us)
     } else {
-        flash_block(csv, store, family)
+        flash_block(csv, store, &mcu.family)
     }
 }
 
@@ -1759,7 +1968,7 @@ mod tests {
         );
         // A hand-written memory.x must start the program after the store.
         let plain = "MEMORY {\n  FLASH : ORIGIN = 0x08000000, LENGTH = 512K\n}\n";
-        let after = |t: &str| memory_x_overlap(t, &c, Layout::AfterVectors);
+        let after = |t: &str| memory_x_overlap(t, &c, Layout::AfterVectors, STM32_FLASH_BASE);
         assert!(after(plain).is_some_and(|s| s.contains("_stext = 0x0800C000;")));
         assert!(
             after(&format!("{plain}_stext = 0x08004000;\n"))
@@ -1939,9 +2148,12 @@ mod tests {
         let (g, _) = geometry("stm32f103c8").unwrap();
         let c = FlashStoreConfig::default_stm32(&g);
         let exact = "  FLASH : ORIGIN = 0x08000000, LENGTH = 64K - 2K\n";
-        assert_eq!(memory_x_overlap(exact, &c, Layout::End), None);
+        assert_eq!(
+            memory_x_overlap(exact, &c, Layout::End, STM32_FLASH_BASE),
+            None
+        );
         let past_boot = "  FLASH : ORIGIN = 0x08000000 + 16K, LENGTH = 48K\n";
-        assert!(memory_x_overlap(past_boot, &c, Layout::End).is_some());
+        assert!(memory_x_overlap(past_boot, &c, Layout::End, STM32_FLASH_BASE).is_some());
     }
 
     /// The IDE's memory.x never overlaps; one the user wrote with FLASH up to
@@ -2001,12 +2213,204 @@ mod tests {
             Some(Reservation {
                 range: 0xF800..0x10000,
                 layout: Layout::End,
+                base: STM32_FLASH_BASE,
             })
         );
         assert_eq!(
             stm32_reservation(Some(&c), "stm32f1", "stm32f103c8", Runtime::Rtic),
             None
         );
+    }
+
+    /// A Raspberry Pi board's store: the last 4 KiB sectors of the BOARD's
+    /// flash, on Async only, and refused where the board's size is unknown.
+    #[test]
+    fn a_pico_store_is_the_last_sectors_of_the_boards_flash_on_async() {
+        let p = rp_platform(Runtime::Async, Some(2048 * 1024)).expect("Pico on Async");
+        let Platform::Rp { geo } = p else {
+            panic!("{p:?}");
+        };
+        assert_eq!((geo.size, geo.page), (0x20_0000, 0x1000));
+        assert_eq!(p.memory_x(), Some((RP_FLASH_BASE, Layout::End)));
+        let blocking = rp_platform(Runtime::Blocking, Some(2048 * 1024)).unwrap_err();
+        assert!(
+            blocking.contains("Switch Runtime to Async") && !blocking.contains("  "),
+            "{blocking}"
+        );
+        for unknown in [None, Some(3), Some(4 * 1024)] {
+            assert!(
+                rp_platform(Runtime::Async, unknown)
+                    .is_err_and(|r| r.contains("flash size is unknown")),
+                "{unknown:?}"
+            );
+        }
+        // The part name alone never knows the board's flash.
+        assert!(platform("rp2040", "rp2040", Runtime::Async).is_err());
+
+        let c = FlashStoreConfig::default_on(&p, "rp2040");
+        assert_eq!(c.range(), 0x1F_E000..0x20_0000);
+        assert!(c.problems_on(&p).is_empty(), "{:?}", c.problems_on(&p));
+        let says = |c: FlashStoreConfig, what: &str| {
+            assert!(
+                c.problems_on(&p).iter().any(|s| s.contains(what)),
+                "{what}: {:?}",
+                c.problems_on(&p)
+            );
+        };
+        says(
+            FlashStoreConfig {
+                offset: 0x1F_D000,
+                ..c
+            },
+            "end where the flash ends",
+        );
+        says(
+            FlashStoreConfig {
+                size: 0x1000,
+                offset: 0x1F_F000,
+                ..c
+            },
+            "at least 2 pages",
+        );
+        says(
+            FlashStoreConfig {
+                size: 0x1800,
+                offset: 0x1F_E800,
+                ..c
+            },
+            "whole pages of 4 KiB",
+        );
+        says(
+            FlashStoreConfig {
+                flash_size: 0x40_0000,
+                ..c
+            },
+            "this board has 2048 KiB",
+        );
+        says(
+            FlashStoreConfig::default_for("esp32c3"),
+            "ESP partition table",
+        );
+        assert!(
+            c.problems_on(&Platform::Esp)
+                .iter()
+                .any(|s| s.contains("memory.x (STM32, Raspberry Pi)"))
+        );
+    }
+
+    /// The gate reads memory.x from 0x10000000, the RP2040's BOOT2 region
+    /// beside FLASH; the STM32 WWDG never reaches a Pico; the RP watchdog is
+    /// only warned about, against the store's whole-format erase.
+    #[test]
+    fn the_rp_gate_counts_from_0x10000000_and_warns_about_the_watchdog() {
+        let p = rp_platform(Runtime::Async, Some(2048 * 1024)).unwrap();
+        let c = FlashStoreConfig::default_on(&p, "rp2040");
+        let mx = |length: &str| {
+            format!(
+                "MEMORY {{\n    BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100\n    FLASH : ORIGIN = 0x10000000 + 0x100, LENGTH = {length} - 0x100\n}}\n"
+            )
+        };
+        assert_eq!(memory_x_flash_block(&mx("2040K"), Some(&c), &p, None), None);
+        let full = memory_x_flash_block(&mx("2048K"), Some(&c), &p, None).expect("overlap");
+        assert!(
+            full.contains("into the flash store at 0x101FE000"),
+            "{full}"
+        );
+        // A WWDG setting carried over from an STM32 project reaches no Pico.
+        assert_eq!(
+            memory_x_flash_block(&mx("2040K"), Some(&c), &p, Some(10_000)),
+            None
+        );
+        assert_eq!(wwdg_problem(&p, Some(10_000)), None);
+
+        // The RP2040's ceiling on Async: 8_388_607 us.
+        let max = crate::panels::mcu_module::watchdog::rp_range_us("rp2040", true).1;
+        let warn = |c: &FlashStoreConfig, period| rp_watchdog_warning(&p, c, period, max);
+        assert_eq!(warn(&c, Some(1_000_000)), None);
+        assert_eq!(warn(&c, None), None);
+        let short = warn(&c, Some(300_000)).expect("2 x 400 ms > 300 ms");
+        assert!(
+            short.contains("can take up to 800 ms") && short.contains("period past 800 ms"),
+            "{short}"
+        );
+        let sectors = |n: u32| FlashStoreConfig {
+            size: n * SECTOR,
+            offset: 0x20_0000 - n * SECTOR,
+            ..c
+        };
+        assert!(
+            warn(&sectors(4), Some(1_000_000))
+                .is_some_and(|s| s.contains("its 4 sectors can take up to 1600 ms"))
+        );
+        // Found by review: past the watchdog's own ceiling the warning asked
+        // for a period the card cannot take. 21 x 400 ms > 8388 ms.
+        let none_fits = warn(&sectors(21), Some(max)).expect("8400 ms > the ceiling");
+        assert!(
+            none_fits.contains("No period covers it")
+                && none_fits.contains("at most 8388 ms")
+                && none_fits.contains("20 sectors or fewer"),
+            "{none_fits}"
+        );
+        assert_eq!(warn(&sectors(20), Some(max)), None, "8000 ms fits");
+        let (g, _) = geometry("stm32g431cb").unwrap();
+        let stm = Platform::Stm32 {
+            hal: StmHal::Embassy,
+            geo: g,
+            layout: Layout::End,
+        };
+        assert_eq!(rp_watchdog_warning(&stm, &c, Some(1), max), None);
+    }
+
+    /// memory.x keeps the store out of the program on a Pico whatever the
+    /// runtime - the settings outlive a switch to Blocking - while the flash
+    /// check and the code follow the runtime.
+    #[test]
+    fn a_pico_reserves_its_store_on_every_runtime_and_checks_it_on_async() {
+        let def = crate::panels::mcu_module::builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == "rp2040_pico")
+            .expect("built-in Pico");
+        let mut mcu = def.build_mcu();
+        assert_eq!(mcu.board_flash, Some(0x20_0000), "from the definition");
+        mcu.runtime = Runtime::Async;
+        let p = platform_of(&mcu).expect("Pico on Async");
+        mcu.flash_store = Some(FlashStoreConfig::default_on(&p, &mcu.family));
+        let want = Some(Reservation {
+            range: 0x1F_E000..0x20_0000,
+            layout: Layout::End,
+            base: RP_FLASH_BASE,
+        });
+        assert_eq!(memory_x_reservation(&mcu), want);
+        let full = "MEMORY {\n  FLASH : ORIGIN = 0x10000000 + 0x100, LENGTH = 2048K - 0x100\n}\n";
+        assert!(project_flash_block("", full, &mcu).is_some());
+
+        mcu.runtime = Runtime::Blocking;
+        assert!(platform_of(&mcu).is_err());
+        assert_eq!(memory_x_reservation(&mcu), want, "kept on Blocking");
+        assert_eq!(
+            project_flash_block("", full, &mcu),
+            None,
+            "no code, no check"
+        );
+
+        // Found by review: settings carried over from another chip were
+        // reserved as they were - an F103's 0xF800.. cut a Pico's FLASH to
+        // 62 KiB, a Pico 2's end reserved nothing - unchecked on Blocking.
+        let keep = mcu.flash_store;
+        let (f103, _) = geometry("stm32f103c8").unwrap();
+        mcu.flash_store = Some(FlashStoreConfig::default_stm32(&f103));
+        assert_eq!(memory_x_reservation(&mcu), None, "an F103's settings");
+        mcu.flash_store = Some(FlashStoreConfig::default_stm32(
+            &rp_geometry(Some(0x40_0000)).unwrap(),
+        ));
+        assert_eq!(memory_x_reservation(&mcu), None, "a Pico 2's settings");
+        mcu.flash_store = keep;
+
+        let mut unknown = mcu.clone();
+        unknown.board_flash = None;
+        assert_eq!(memory_x_reservation(&unknown), None);
+        mcu.flash_store = None;
+        assert_eq!(memory_x_reservation(&mcu), None);
     }
 
     #[test]

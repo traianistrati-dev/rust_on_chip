@@ -51,8 +51,13 @@ impl AppIde {
         let Some(mcu) = &mut self.mcu else { return };
         store_facts.wwdg_us = mcu.watchdog.wwdg.map(|w| w.timeout_us);
         store_facts.iwdg_us = mcu.watchdog.iwdg.map(|w| w.timeout_us);
+        store_facts.rp_wdt_us = mcu.watchdog.rp.map(|w| w.timeout_us);
         let family = mcu.family.clone();
         let store_platform = crate::panels::mcu_module::flash_store::platform_of(mcu);
+        if store_platform.is_err() && crate::panels::mcu_module::flash_store::is_rp(&family) {
+            store_facts.rp_geo =
+                crate::panels::mcu_module::flash_store::rp_geometry(mcu.board_flash).ok();
+        }
         let limits = wdg::limits_for(&family, mcu.runtime);
         // The WWDG's whole range is relative to PCLK1, so the Clock tab feeds
         // this one. 0 = no clock model → the range is unknowable, and the tab
@@ -247,6 +252,13 @@ struct StoreFacts {
     /// sector erase outlasts them (`flash_store::erase_stall_us`).
     wwdg_us: Option<u32>,
     iwdg_us: Option<u32>,
+    /// The RP watchdog's period, while switched on - against the store's
+    /// slowest save (`flash_store::rp_watchdog_warning`).
+    rp_wdt_us: Option<u32>,
+    /// A Raspberry Pi board's flash, while the runtime does not generate its
+    /// store (Blocking): what a store left on is checked against
+    /// (`rp_store_kept`).
+    rp_geo: Option<crate::panels::mcu_module::flash_store::Geometry>,
 }
 
 impl StoreFacts {
@@ -262,6 +274,8 @@ impl StoreFacts {
             memory_x: memory_x.to_owned(),
             wwdg_us: None,
             iwdg_us: None,
+            rp_wdt_us: None,
+            rp_geo: None,
         }
     }
 }
@@ -271,7 +285,7 @@ fn mb(bytes: u32) -> String {
     format!("{} MB", bytes / 0x10_0000)
 }
 
-/// The flash store: settings kept in the chip's own flash, and what reserves
+/// The flash store: settings kept in the flash the program runs from, and what reserves
 /// the bytes they live in. See [`crate::panels::mcu_module::flash_store`].
 ///
 /// Shown on every family - greyed with the reason where it is not generated
@@ -300,12 +314,17 @@ fn flash_store_card(
                 }
             });
             ui.label(egui::RichText::new(format!("{}  FLASH STORE", ph::FLOPPY_DISK)).strong());
-            ui.label(dim("settings kept in the chip's own flash"));
+            ui.label(dim("settings kept in the flash the program runs from"));
         });
         let platform = match platform {
             Ok(p) => *p,
             Err(why) => {
                 ui.label(dim(why.as_str()));
+                // A Pico switched to Blocking with the store on: no code, but
+                // memory.x may still keep the settings out of the program.
+                if let (Some(c), Some(geo)) = (cfg.as_mut(), facts.rp_geo) {
+                    rp_store_kept(ui, c, geo, family, facts);
+                }
                 return;
             }
         };
@@ -324,6 +343,7 @@ fn flash_store_card(
             Platform::Stm32 { hal, geo, layout } => {
                 stm32_store_body(ui, c, &geo, hal, layout, facts)
             }
+            Platform::Rp { geo } => rp_store_body(ui, c, &geo, family, facts),
         };
         ui.label(dim(concat!(
             "Moving or resizing the store leaves what it held behind: the next save ",
@@ -336,6 +356,7 @@ fn flash_store_card(
                 ..
             } => "Restore the last two pages of the flash",
             Platform::Stm32 { .. } => "Restore the two sectors after the vector table's",
+            Platform::Rp { .. } => "Restore the last two sectors of the flash",
         };
         problem_and_reset(
             ui,
@@ -356,7 +377,7 @@ fn flash_store_card(
         if facts.tail_takes_flash {
             let taken = match platform {
                 Platform::Esp => "peripherals.FLASH",
-                Platform::Stm32 { .. } => "the FLASH peripheral",
+                Platform::Stm32 { .. } | Platform::Rp { .. } => "the FLASH peripheral",
             };
             ui.label(
                 egui::RichText::new(format!(
@@ -418,6 +439,16 @@ fn flash_store_card(
                 "Checked before each flash: your memory.x's FLASH must start in sector 0 and ",
                 "its _stext at or after the store's end. A range that is not whole sectors ",
                 "right after the vector table's fails to compile."
+            ),
+            Platform::Rp { .. } if ours => concat!(
+                "Checked while building: memory.x ends FLASH where the store begins, so a ",
+                "program that grows into it fails to link, and a range that does not end ",
+                "where the board's flash ends, in 4 KiB sectors, fails to compile."
+            ),
+            Platform::Rp { .. } => concat!(
+                "Checked before each flash: your memory.x's FLASH must end where the store ",
+                "begins. A range that does not end where the board's flash ends, in 4 KiB ",
+                "sectors, fails to compile."
             ),
         }));
     });
@@ -729,8 +760,162 @@ fn stm32_store_body(
     problems.extend(fs::wwdg_problem(&platform, facts.wwdg_us));
     // The IDE's memory.x too: the MCU form's flash origin can move the program
     // past an AfterVectors store.
-    problems.extend(fs::memory_x_overlap(&facts.memory_x, c, layout));
+    problems.extend(fs::memory_x_overlap(
+        &facts.memory_x,
+        c,
+        layout,
+        STM32_FLASH_BASE,
+    ));
     problems
+}
+
+/// The Raspberry Pi half of the card: how many 4 KiB sectors at the end of
+/// the board's flash, what memory.x does about them, and what a save costs
+/// on a chip that runs from that same flash. Returns the problems to show.
+fn rp_store_body(
+    ui: &mut egui::Ui,
+    c: &mut crate::panels::mcu_module::flash_store::FlashStoreConfig,
+    geo: &crate::panels::mcu_module::flash_store::Geometry,
+    family: &str,
+    facts: &StoreFacts,
+) -> Vec<String> {
+    use crate::panels::mcu_module::flash_store::{
+        self as fs, FlashStoreMode, Layout, Platform, RP_FLASH_BASE,
+    };
+    let page = geo.page.max(1);
+    ui.label(dim(format!(
+        "{}. Sectors of {} KiB, {} KiB of flash on the board.",
+        FlashStoreMode::MemoryX.label(),
+        page / 1024,
+        geo.size / 1024
+    )));
+    let max_pages = (geo.size / 2 / page).max(fs::MIN_SECTORS);
+    ui.horizontal(|ui| {
+        ui.label("Size");
+        let mut pages = c.size / page;
+        let resp = ui.add(
+            crate::panels::drag_value(ui, &mut pages)
+                .range(fs::MIN_SECTORS..=max_pages)
+                .clamp_existing_to_range(false)
+                .speed(0.1)
+                .suffix(" sectors"),
+        );
+        if resp.changed() {
+            c.mode = FlashStoreMode::MemoryX;
+            c.flash_size = geo.size;
+            c.size = pages * page;
+            c.offset = geo.size.saturating_sub(c.size);
+        }
+        ui.label(dim(format!("{} KiB", c.size / 1024)));
+    });
+    let r = c.range();
+    let start = u64::from(RP_FLASH_BASE) + u64::from(r.start);
+    let end = u64::from(RP_FLASH_BASE) + u64::from(r.end);
+    let reserve = if fs_memory_x_is_ours(&facts.memory_x) {
+        match fs::memory_x_flash(&facts.memory_x) {
+            Some((_, length)) => format!(
+                "memory.x keeps it out of FLASH: {} KiB for the program.",
+                length / 1024
+            ),
+            None => "memory.x keeps it out of FLASH.".to_owned(),
+        }
+    } else {
+        format!(
+            concat!(
+                "Your own memory.x (no IDE markers) is used as it is; its FLASH must ",
+                "end at or before 0x{:08X}."
+            ),
+            start
+        )
+    };
+    ui.label(dim(format!(
+        "Store 0x{start:08X}..0x{end:08X} (offsets 0x{:X}..0x{:X}). {reserve}",
+        r.start, r.end,
+    )));
+    ui.label(dim(concat!(
+        "Written through embassy-rp's blocking Flash (flash_store_hal.rs), from RAM, ",
+        "one 4 KiB sector per erase with interrupts off. It takes no DMA channel."
+    )));
+    ui.label(dim(concat!(
+        "The program runs from this same flash, so nothing else runs during a sector ",
+        "erase - up to 400 ms (240 ms on the Pico 2 and Pico 2 W). Save when something ",
+        "changed and the links are quiet: interrupt-driven UART RX overruns, a USB ",
+        "control transfer can miss its deadline, and a W board's radio waits. Use the ",
+        "store from core 0 only."
+    )));
+    ui.label(dim(concat!(
+        "Flashing from the IDE (Flash, RTT Run, Debug) erases only the sectors it writes, ",
+        "so the store survives; picotool erase, flash_nuke.uf2, probe-rs erase (0.31 on) ",
+        "and firmware keeping a file system at the end of flash wipe it. On an RP2350 A2, ",
+        "a UF2 built by the Pico SDK erases the last sector (erratum E10)."
+    )));
+    let platform = Platform::Rp { geo: *geo };
+    // The RP watchdog is configured, not started: a warning, not a problem.
+    // The store is generated on Async only, hence that runtime's ceiling.
+    let period_max = wdg::rp_range_us(family, true).1;
+    if let Some(why) = fs::rp_watchdog_warning(&platform, c, facts.rp_wdt_us, period_max) {
+        ui.label(
+            egui::RichText::new(format!("{}  {why}", ph::WARNING))
+                .size(11.0)
+                .color(egui::Color32::from_rgb(235, 150, 90)),
+        );
+    }
+    let mut problems = c.problems_on(&platform);
+    problems.extend(fs::memory_x_overlap(
+        &facts.memory_x,
+        c,
+        Layout::End,
+        RP_FLASH_BASE,
+    ));
+    problems
+}
+
+/// A Raspberry Pi board's store left on under a runtime it is not generated
+/// for (Blocking): what memory.x still does for the settings, as
+/// `flash_store::memory_x_reservation` decides it - settings that do not fit
+/// the board get nothing, and their problems and the Reset; a memory.x of the
+/// user's is used as it is, and nothing checks it on this runtime.
+fn rp_store_kept(
+    ui: &mut egui::Ui,
+    c: &mut crate::panels::mcu_module::flash_store::FlashStoreConfig,
+    geo: crate::panels::mcu_module::flash_store::Geometry,
+    family: &str,
+    facts: &StoreFacts,
+) {
+    use crate::panels::mcu_module::flash_store::{FlashStoreConfig, Platform, RP_FLASH_BASE};
+    let platform = Platform::Rp { geo };
+    let problems = c.problems_on(&platform);
+    if !problems.is_empty() {
+        ui.label(dim(
+            "Still on, but these settings do not fit this board, so memory.x reserves nothing for them.",
+        ));
+        problem_and_reset(
+            ui,
+            Some(problems.join(" ")),
+            "Restore the last two sectors of the flash",
+            || *c = FlashStoreConfig::default_on(&platform, family),
+        );
+        return;
+    }
+    let start = u64::from(RP_FLASH_BASE) + u64::from(c.offset);
+    ui.label(dim(if fs_memory_x_is_ours(&facts.memory_x) {
+        format!(
+            concat!(
+                "Still on: memory.x keeps its {} KiB out of the program, so the settings ",
+                "are there when you switch back. Untick it to free them."
+            ),
+            c.size / 1024
+        )
+    } else {
+        format!(
+            concat!(
+                "Still on, but memory.x is your own (no IDE markers) and nothing checks it ",
+                "on this runtime: its FLASH must end at or before 0x{:08X}, or a program ",
+                "that grows there erases the settings."
+            ),
+            start
+        )
+    }));
 }
 
 /// `project_gen::memory_x_is_ours`, here so the card's body stays short.

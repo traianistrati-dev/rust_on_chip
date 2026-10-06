@@ -231,6 +231,12 @@ pub struct Mcu {
     /// The chip on this board — see [`McuDefinition::board_chip`]. `None` for a
     /// bare part, which is what makes the diagram draw a chip instead of a PCB.
     pub board_chip: Option<String>,
+    /// The flash in bytes, from the definition's `flash_size` - the same
+    /// figure memory.x is written from. Where the flash is off-chip (the
+    /// Raspberry Pi boards) nothing else knows it: the flash store's range is
+    /// counted from it, and a range past the real chip would wrap onto the
+    /// boot block. `None` when the definition does not state it.
+    pub board_flash: Option<u32>,
     pub usart_ip: Option<String>,
     /// The chip's SDMMC IP version — the gate on WHICH constructor shape the
     /// SDMMC codegen may emit, see

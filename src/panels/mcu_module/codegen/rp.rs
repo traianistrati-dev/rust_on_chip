@@ -4017,12 +4017,10 @@ pub fn needs_radio(mcu: &Mcu) -> bool {
     radio_led(mcu) || iot_wifi(mcu).is_some()
 }
 
-/// `Some(mqtt)` when the IoT tab's Wi-Fi runs on this board's CYW43.
-fn iot_wifi(mcu: &Mcu) -> Option<bool> {
+/// What the IoT tab runs on this board's CYW43, when its Wi-Fi is on.
+fn iot_wifi(mcu: &Mcu) -> Option<crate::panels::mcu_module::iot::Active> {
     use crate::panels::mcu_module::iot::{self, Platform};
-    iot::active(mcu)
-        .filter(|a| a.platform == Platform::Cyw43)
-        .map(|a| a.mqtt)
+    iot::active(mcu).filter(|a| a.platform == Platform::Cyw43 && a.station)
 }
 
 /// The bring-up for the CYW43 radio, for its GPIO0 (the LED) and, with the
@@ -4036,7 +4034,10 @@ fn iot_wifi(mcu: &Mcu) -> Option<bool> {
 ///
 /// Returns `(irq entries, top-level items, main body)` — the task has to sit
 /// outside `main`, and the interrupt entries have to join the shared binding.
-fn radio_lines(dma: u8, iot: Option<bool>) -> (Vec<String>, String, String) {
+fn radio_lines(
+    dma: u8,
+    iot: Option<crate::panels::mcu_module::iot::Active>,
+) -> (Vec<String>, String, String) {
     let irqs = vec![
         "    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;"
             .to_owned(),
@@ -4068,7 +4069,7 @@ async fn cyw43_task(
         "_net_device"
     };
     let tail = match iot {
-        Some(mqtt) => super::iot_gen::cyw43_main_lines(mqtt),
+        Some(active) => super::iot_gen::cyw43_main_lines(active),
         None => concat!(
             "    // The LED is GPIO0 ON THE RADIO, so it is driven through `control` rather\n",
             "    // than through a pin: `wl_led.gpio_set(0, true).await` turns it on.\n",
@@ -4938,7 +4939,7 @@ mod emit_async_for_manual_compile {
     #[test]
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_rp_iot_project() {
-        use crate::panels::mcu_module::iot::{self, MqttConfig};
+        use crate::panels::mcu_module::iot::{self, MqttConfig, SntpConfig};
         for (id, dir_name) in [
             ("rp2040_pico_w", "eide_rp2040w_iot_check"),
             ("rp2350_pico2_w", "eide_rp2350w_iot_check"),
@@ -4960,6 +4961,7 @@ mod emit_async_for_manual_compile {
             let mut m = MqttConfig::for_chip(id);
             m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/+/set".into()];
             mcu.iot.mqtt = Some(m);
+            mcu.iot.sntp = Some(SntpConfig::default());
             let active = iot::active(&mcu);
             assert!(active.is_some(), "Wi-Fi on a W board on Async");
 
@@ -4971,10 +4973,13 @@ mod emit_async_for_manual_compile {
                     "        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n",
                     "        let msg = pins::configs::mqtt::incoming().await;\n",
                     "        let _ = (msg.topic.as_str(), &msg.payload[..]);\n",
+                    "        pins::configs::sntp::wait_synced().await;\n",
+                    "        let _ = (pins::configs::sntp::now_unix(), pins::configs::sntp::now_unix_ms());\n",
                 ),
                 1,
             );
             assert!(main_rs.contains("set_led(true)"), "the user loop was seeded:\n{main_rs}");
+            assert!(main_rs.contains("pins::configs::sntp::start(spawner, net_stack);"), "{main_rs}");
             assert_eq!(main_rs.matches("cyw43::new(").count(), 1, "{main_rs}");
 
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));

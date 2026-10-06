@@ -2053,39 +2053,59 @@ mod emit_for_manual_compile {
             mcu.flash_store = Some(c);
         }
 
-        // `EIDE_ESP_IOT=wifi|mqtt` switches the IoT tab on (the case sets the
-        // Async runtime too): the only place esp-radio, embassy-net and
-        // rust-mqtt meet the generated heap, spawner and files.
+        // `EIDE_ESP_IOT` switches the IoT tab on (the case sets the Async
+        // runtime too): the only place esp-radio, embassy-net, rust-mqtt and
+        // the SNTP and ESP-NOW templates meet the generated heap, spawner and
+        // files. `wifi` = the station alone, `mqtt` = station + MQTT (no
+        // `esp-now` feature, so `radio.esp_now` does not even exist),
+        // `espnow` = ESP-NOW with the station off (`hold_radio`), `all` =
+        // station + MQTT + SNTP + ESP-NOW.
         let iot_mode = std::env::var("EIDE_ESP_IOT").ok();
-        if let Some(mode) = &iot_mode {
-            use crate::panels::mcu_module::iot::MqttConfig;
-            mcu.iot.wifi = true;
-            if mode == "mqtt" {
+        if let Some(mode) = iot_mode.as_deref() {
+            use crate::panels::mcu_module::iot::{EspNowConfig, MqttConfig, SntpConfig};
+            mcu.iot.wifi = mode != "espnow";
+            if matches!(mode, "mqtt" | "all") {
                 let mut m = MqttConfig::for_chip(&chip);
                 m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/#".into()];
                 mcu.iot.mqtt = Some(m);
+            }
+            if mode == "all" {
+                mcu.iot.sntp = Some(SntpConfig::default());
+            }
+            if matches!(mode, "espnow" | "all") {
+                mcu.iot.esp_now = Some(EspNowConfig {
+                    channel: 6,
+                    peers: vec![[0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56]],
+                });
             }
             mcu.iot.ip.dhcp = mode != "mqtt";
         }
 
         let mut main_rs = mcu.fresh_main_rs();
-        if iot_mode.is_some() {
+        if let Some(mode) = iot_mode.as_deref() {
             assert!(
-                main_rs.contains("pins::configs::wifi::init(spawner, peripherals.WIFI)"),
-                "no Wi-Fi in main.rs:\n{main_rs}"
+                main_rs.contains("esp_radio::wifi::new(peripherals.WIFI"),
+                "no radio in main.rs:\n{main_rs}"
             );
-            if iot_mode.as_deref() == Some("mqtt") {
-                main_rs = main_rs.replacen(
-                    "        // Your main loop code here.\n",
-                    concat!(
-                        "        // Your main loop code here.\n",
-                        "        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n",
-                        "        let msg = pins::configs::mqtt::incoming().await;\n",
-                        "        let _ = (msg.topic.as_str(), &msg.payload[..]);\n",
-                    ),
-                    1,
-                );
+            // The user's loop calls everything the files offer, as a user
+            // would, so the API is compiled and not just declared.
+            let mut used = String::from("        // Your main loop code here.\n");
+            if matches!(mode, "mqtt" | "all") {
+                used.push_str("        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n");
+                used.push_str("        let msg = pins::configs::mqtt::incoming().await;\n");
+                used.push_str("        let _ = (msg.topic.as_str(), &msg.payload[..]);\n");
             }
+            if mode == "all" {
+                used.push_str("        pins::configs::sntp::wait_synced().await;\n");
+                used.push_str("        let _ = (pins::configs::sntp::now_unix(), pins::configs::sntp::now_unix_ms());\n");
+            }
+            if matches!(mode, "espnow" | "all") {
+                used.push_str("        let me = pins::configs::espnow::own_mac();\n");
+                used.push_str("        pins::configs::espnow::send(pins::configs::espnow::BROADCAST, &me).await.ok();\n");
+                used.push_str("        let frame = pins::configs::espnow::receive().await;\n");
+                used.push_str("        let _ = (frame.from, &frame.data[..]);\n");
+            }
+            main_rs = main_rs.replacen("        // Your main loop code here.\n", &used, 1);
         }
         if store.is_some() {
             assert!(

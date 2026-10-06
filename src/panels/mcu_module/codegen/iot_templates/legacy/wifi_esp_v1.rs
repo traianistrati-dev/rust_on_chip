@@ -13,23 +13,18 @@ use super::secrets::{WIFI_PASSWORD, WIFI_SSID};
 /// Seconds between two attempts to join the access point.
 pub const RETRY_S: u64 = 5;
 
-/// Starts the IP stack on the radio's station half, and the two tasks that
-/// keep them up. `main.rs` creates the radio (`esp_radio::wifi::new`): the
-/// same call hands out ESP-NOW, which can only be created once.
+/// Starts the radio and the IP stack, and the two tasks that keep them up.
 ///
 /// The stack it returns is `Copy`: hand it to whatever opens sockets. It has
 /// an address once `stack.wait_config_up().await` returns.
-pub fn init(
-    spawner: Spawner,
-    controller: WifiController<'static>,
-    station: Interface<'static>,
-) -> Stack<'static> {
+pub fn init(spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -> Stack<'static> {
+    let (controller, interfaces) = esp_radio::wifi::new(wifi, Default::default()).unwrap();
     // The seed only spreads TCP port numbers and sequence numbers.
     let rng = esp_hal::rng::Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
     static RESOURCES: StaticCell<StackResources<{ net::SOCKETS }>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
-        station,
+        interfaces.station,
         net::config(),
         RESOURCES.init(StackResources::new()),
         seed,
@@ -40,7 +35,6 @@ pub fn init(
 }
 
 /// Joins the access point, and joins it again whenever the link drops.
-/// Owns the controller for good: dropping it would stop the radio.
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
     let mut station = StationConfig::default()

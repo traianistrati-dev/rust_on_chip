@@ -1,5 +1,5 @@
-//! Code for the IoT tab: `src/pins/configs/{net,wifi,mqtt,secrets}.rs`, the
-//! `main.rs` lines that start them, and the credentials file's rules.
+//! Code for the IoT tab: `src/pins/configs/{net,wifi,mqtt,sntp,espnow,secrets}.rs`,
+//! the `main.rs` lines that start them, and the credentials file's rules.
 //!
 //! The editable halves of the files live in `iot_templates/` as plain Rust,
 //! byte for byte what was cross-compiled on an ESP32-C3 and a Pico W - only
@@ -11,15 +11,23 @@
 //! - `wifi.rs`: per radio - esp-radio, or the CYW43 beside a Pico W.
 //! - `mqtt.rs`: broker, client id, keep-alive, subscriptions as constants;
 //!   the one task that owns the connection, `publish()` and `incoming()`.
+//! - `sntp.rs`: server and interval as constants; the task that keeps the
+//!   clock, `now_unix()` / `now_unix_ms()` / `wait_synced()`.
+//! - `espnow.rs`: channel and peers as constants; the task that owns ESP-NOW,
+//!   `send()` / `receive()` / `own_mac()`, and `hold_radio` for ESP-NOW alone.
 //! - `secrets.rs`: SSID and passwords. Written ONCE, never spliced - the file
 //!   is the store, and the project's `.gitignore` lists it.
 
-use crate::panels::mcu_module::iot::{self, Active, IotConfig, IpConfig, MqttConfig, Platform};
+use crate::panels::mcu_module::iot::{
+    self, Active, EspNowConfig, IotConfig, IpConfig, MqttConfig, Platform, SntpConfig,
+};
 use crate::panels::mcu_module::mcu::Mcu;
 
 pub const NET: &str = "net.rs";
 pub const WIFI: &str = "wifi.rs";
 pub const MQTT: &str = "mqtt.rs";
+pub const SNTP: &str = "sntp.rs";
+pub const ESPNOW: &str = "espnow.rs";
 pub const SECRETS: &str = "secrets.rs";
 
 /// The credentials file's path in the project tree.
@@ -34,17 +42,54 @@ const WIFI_ESP_TAIL: &str = include_str!("iot_templates/wifi_esp.rs");
 const WIFI_CYW43_TAIL: &str = include_str!("iot_templates/wifi_cyw43.rs");
 const NET_TAIL: &str = include_str!("iot_templates/net.rs");
 const MQTT_TAIL: &str = include_str!("iot_templates/mqtt.rs");
+const SNTP_TAIL: &str = include_str!("iot_templates/sntp.rs");
+const ESPNOW_TAIL: &str = include_str!("iot_templates/espnow.rs");
 
-/// Every editable half, for `is_pristine`.
-const TAILS: [(&str, &str); 4] = [
+/// Editable halves an earlier version of the IDE wrote and this one no longer
+/// does, by file. A file still holding one exactly was never touched by its
+/// user, so it is moved to the current template instead of being left to fail
+/// against a `main.rs` that now calls something else - see [`upgraded`].
+///
+/// - `wifi_esp_v1`: phase 1's ESP `wifi.rs`, whose `init` took the `WIFI`
+///   peripheral itself. Phase 2 creates the radio in `main.rs`, because
+///   ESP-NOW needs the same `esp_radio::wifi::new` call's other interface.
+/// - `wifi_cyw43_v1`: phase 1's Pico W `wifi.rs`, the same code with two
+///   `loop { match .. }` that clippy reads as `while let` (`while_let_loop`).
+const LEGACY_TAILS: [(&str, &str); 2] = [
+    (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
+    (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
+];
+
+/// Every editable half, current and legacy, for `is_pristine`.
+const TAILS: [(&str, &str); 8] = [
     (WIFI, WIFI_ESP_TAIL),
     (WIFI, WIFI_CYW43_TAIL),
     (NET, NET_TAIL),
     (MQTT, MQTT_TAIL),
+    (SNTP, SNTP_TAIL),
+    (ESPNOW, ESPNOW_TAIL),
+    LEGACY_TAILS[0],
+    LEGACY_TAILS[1],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
 const GEN_END_CFG: &str = "// <<< GENERATED END >>>";
+
+/// A template as LF. `include_str!` hands over the file as it is checked out,
+/// and with `core.autocrlf` that is CRLF - while every buffer the IDE holds is
+/// LF. Unnormalised, no file would ever match its template again (no upgrade,
+/// no prune), and generated files would carry mixed line endings.
+fn lf(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+/// Is `name` one of the IoT tab's files? None of them changes with the
+/// runtime - they exist only on Async - so a Runtime Apply's forced rewrite
+/// must pass them by, as it does the flash store's: it would only wipe what
+/// the user wrote below the markers.
+pub fn runtime_free(name: &str) -> bool {
+    matches!(name, NET | WIFI | MQTT | SNTP | ESPNOW | SECRETS)
+}
 
 /// The secrets the tab edits, in the order they are written.
 pub const SECRET_NAMES: [&str; 4] = ["WIFI_SSID", "WIFI_PASSWORD", "MQTT_USERNAME", "MQTT_PASSWORD"];
@@ -69,15 +114,24 @@ pub fn config_files_for(mcu: &Mcu) -> Vec<(String, String)> {
     config_files(&mcu.iot, active)
 }
 
-/// The files for `cfg` on `active` - see [`config_files_for`].
+/// The files for `cfg` on `active` - see [`config_files_for`]. The station
+/// brings the stack and the credentials; MQTT and SNTP ride on it; ESP-NOW
+/// stands on its own.
 pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
-    let mut out = vec![
-        (NET.to_owned(), net_file(&cfg.ip)),
-        (WIFI.to_owned(), wifi_file(active.platform)),
-        (SECRETS.to_owned(), secrets_body()),
-    ];
+    let mut out = Vec::new();
+    if active.station {
+        out.push((NET.to_owned(), net_file(&cfg.ip, active)));
+        out.push((WIFI.to_owned(), wifi_file(active.platform)));
+        out.push((SECRETS.to_owned(), secrets_body()));
+    }
     if let (true, Some(m)) = (active.mqtt, &cfg.mqtt) {
         out.push((MQTT.to_owned(), mqtt_file(m)));
+    }
+    if let (true, Some(s)) = (active.sntp, &cfg.sntp) {
+        out.push((SNTP.to_owned(), sntp_file(s)));
+    }
+    if let (true, Some(n)) = (active.esp_now, &cfg.esp_now) {
+        out.push((ESPNOW.to_owned(), espnow_file(n)));
     }
     out
 }
@@ -92,7 +146,16 @@ fn bytes4(b: [u8; 4]) -> String {
     format!("[{}, {}, {}, {}]", b[0], b[1], b[2], b[3])
 }
 
-fn net_file(ip: &IpConfig) -> String {
+/// The sockets the stack must hold: DHCP and DNS, one per protocol the tab
+/// switched on, and two left for the user's own. One short and a socket
+/// panics inside smoltcp (`socket_set.rs`), at run time. Two spare, because
+/// phase 1 wrote 4 for a station without MQTT: fewer now would break code
+/// that already opens two sockets of its own.
+pub fn sockets(active: Active) -> usize {
+    4 + usize::from(active.mqtt) + usize::from(active.sntp)
+}
+
+fn net_file(ip: &IpConfig, active: Active) -> String {
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
@@ -102,11 +165,21 @@ fn net_file(ip: &IpConfig) -> String {
     o.push_str(&format!("pub const PREFIX_LEN: u8 = {};\n", ip.prefix.min(32)));
     o.push_str(&format!("pub const GATEWAY: [u8; 4] = {};\n", bytes4(ip.gateway)));
     o.push_str(&format!("pub const DNS: [u8; 4] = {};\n", bytes4(ip.dns)));
-    o.push_str("/// Sockets embassy-net can hold at once: DHCP and DNS take one each, MQTT one.\n");
-    o.push_str("pub const SOCKETS: usize = 4;\n");
+    let mut users = vec!["DHCP and DNS take one each"];
+    if active.mqtt {
+        users.push("MQTT one");
+    }
+    if active.sntp {
+        users.push("SNTP one");
+    }
+    o.push_str(&format!(
+        "/// Sockets embassy-net can hold at once: {}, and two are left for yours.\n",
+        users.join(", ")
+    ));
+    o.push_str(&format!("pub const SOCKETS: usize = {};\n", sockets(active)));
     o.push_str(GEN_END_CFG);
     o.push('\n');
-    o.push_str(NET_TAIL);
+    o.push_str(&lf(NET_TAIL));
     o
 }
 
@@ -122,7 +195,7 @@ fn wifi_file(platform: Platform) -> String {
     o.push_str("// The network name and password are in `secrets.rs`, which git ignores.\n");
     o.push_str(GEN_END_CFG);
     o.push('\n');
-    o.push_str(tail);
+    o.push_str(&lf(tail));
     o
 }
 
@@ -145,7 +218,52 @@ fn mqtt_file(m: &MqttConfig) -> String {
     o.push_str(&format!("pub const SUBSCRIBE: &[&str] = &[{}];\n", topics.join(", ")));
     o.push_str(GEN_END_CFG);
     o.push('\n');
-    o.push_str(MQTT_TAIL);
+    o.push_str(&lf(MQTT_TAIL));
+    o
+}
+
+fn sntp_file(s: &SntpConfig) -> String {
+    let mut o = String::new();
+    o.push_str(GEN_BEGIN_CFG);
+    o.push('\n');
+    o.push_str("// Network time (from the IoT tab) — auto-updated; edit it in the tab.\n");
+    o.push_str(&format!("pub const SERVER: &str = {};\n", lit(s.server.trim())));
+    o.push_str("pub const PORT: u16 = 123;\n");
+    o.push_str("/// Seconds between two synchronisations once the clock is set.\n");
+    o.push_str(&format!(
+        "pub const INTERVAL_S: u64 = {};\n",
+        s.interval_s.max(iot::MIN_SNTP_INTERVAL_S)
+    ));
+    o.push_str(GEN_END_CFG);
+    o.push('\n');
+    o.push_str(&lf(SNTP_TAIL));
+    o
+}
+
+fn espnow_file(n: &EspNowConfig) -> String {
+    let peers: Vec<String> = n
+        .peers
+        .iter()
+        .filter(|m| iot::peer_problem(m).is_none())
+        .take(iot::MAX_ESPNOW_PEERS)
+        .map(|m| {
+            let bytes: Vec<String> = m.iter().map(|b| format!("0x{b:02X}")).collect();
+            format!("[{}]", bytes.join(", "))
+        })
+        .collect();
+    let mut o = String::new();
+    o.push_str(GEN_BEGIN_CFG);
+    o.push('\n');
+    o.push_str("// ESP-NOW (from the IoT tab) — auto-updated; edit it in the tab.\n");
+    o.push_str("/// The channel ESP-NOW talks on while the Wi-Fi station is off (1..=13).\n");
+    o.push_str("/// With the station on, the radio is on the access point's channel instead.\n");
+    o.push_str(&format!("pub const CHANNEL: u8 = {};\n", n.channel.clamp(1, 13)));
+    o.push_str("/// Boards put on the peer list at start. `send` adds any other address the\n");
+    o.push_str("/// first time it is used; the list holds 20, the broadcast address among them.\n");
+    o.push_str(&format!("pub const PEERS: &[[u8; 6]] = &[{}];\n", peers.join(", ")));
+    o.push_str(GEN_END_CFG);
+    o.push('\n');
+    o.push_str(&lf(ESPNOW_TAIL));
     o
 }
 
@@ -237,13 +355,77 @@ fn is_pristine(name: &str, content: &str) -> bool {
     if name == SECRETS {
         return secrets_pristine(content);
     }
-    let Some((_, tail)) = content.split_once(GEN_END_CFG) else {
+    let Some(tail) = tail_of(content) else {
         return false;
     };
-    // The newline that ends the marker line, then the template as written.
+    TAILS.iter().any(|(n, t)| *n == name && lf(t) == tail)
+}
+
+/// What replaces `existing` when it still holds an older IDE's template:
+///
+/// - untouched (see [`LEGACY_TAILS`]): the current template, below whatever
+///   the user wrote ABOVE the generated block, which is theirs;
+/// - phase 1's ESP `wifi.rs` with the user's own edits: the same file with
+///   `init` moved to the signature `main.rs` now calls - the three lines that
+///   differ, nothing else - so their edits survive and the project compiles.
+///
+/// `None` for anything else: the usual splice of the generated block applies,
+/// and a file the user edited is never rewritten. A phase-1 `wifi.rs` edited
+/// past recognition is left too, and the IoT tab says what to change
+/// ([`phase_one_wifi_left`]).
+pub fn upgraded(name: &str, existing: &str, body: &str) -> Option<String> {
+    let tail = tail_of(existing)?;
+    if LEGACY_TAILS
+        .iter()
+        .any(|(n, t)| *n == name && lf(t) == tail)
+    {
+        let text = lf(existing);
+        let head = text.find(GEN_BEGIN_CFG).map_or("", |i| &text[..i]);
+        return Some(format!("{head}{body}"));
+    }
+    if name == WIFI {
+        return migrate_wifi_esp_v1(existing);
+    }
+    None
+}
+
+/// Phase 1's ESP `init`, which created the radio itself.
+const V1_INIT: &str =
+    "pub fn init(spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -> Stack<'static> {\n";
+const V1_NEW: &str =
+    "    let (controller, interfaces) = esp_radio::wifi::new(wifi, Default::default()).unwrap();\n";
+const V2_INIT: &str = "pub fn init(\n    spawner: Spawner,\n    controller: WifiController<'static>,\n    station: Interface<'static>,\n) -> Stack<'static> {\n";
+
+/// An edited phase-1 ESP `wifi.rs` moved to the phase-2 `init`: the signature
+/// takes the controller and the station half `main.rs` now creates, the line
+/// that created them goes, and `interfaces.station` becomes `station`. Only
+/// when all three are still there exactly as phase 1 wrote them.
+fn migrate_wifi_esp_v1(existing: &str) -> Option<String> {
+    let text = existing.replace("\r\n", "\n");
+    if text.matches(V1_INIT).count() != 1 || text.matches(V1_NEW).count() != 1 {
+        return None;
+    }
+    let out = text
+        .replacen(V1_INIT, V2_INIT, 1)
+        .replacen(V1_NEW, "", 1)
+        .replace("interfaces.station", "station");
+    // `Interface` and `WifiController` were imported in phase 1 already.
+    out.contains("Interface").then_some(out)
+}
+
+/// Is `content` a `wifi.rs` that still creates the radio itself (phase 1),
+/// edited so far that [`upgraded`] could not move it? Then `main.rs`, which
+/// creates the radio now, no longer compiles against it.
+pub fn phase_one_wifi_left(content: &str) -> bool {
+    content.contains("esp_hal::peripherals::WIFI<'static>")
+}
+
+/// The editable half of a generated file, as written: what follows the end
+/// marker's own newline, line endings normalised.
+fn tail_of(content: &str) -> Option<String> {
+    let (_, tail) = content.split_once(GEN_END_CFG)?;
     let tail = tail.replace("\r\n", "\n");
-    let tail = tail.strip_prefix('\n').unwrap_or(&tail);
-    TAILS.iter().any(|(n, t)| *n == name && *t == tail)
+    Some(tail.strip_prefix('\n').unwrap_or(&tail).to_owned())
 }
 
 /// The `pins/configs/` paths the tree must keep although `files` no longer
@@ -251,7 +433,7 @@ fn is_pristine(name: &str, content: &str) -> bool {
 /// with a password in it. A pristine one goes like any pruned config file.
 pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
-    for name in [NET, WIFI, MQTT, SECRETS] {
+    for name in [NET, WIFI, MQTT, SNTP, ESPNOW, SECRETS] {
         if files.iter().any(|(n, _)| n == name) {
             continue;
         }
@@ -281,13 +463,13 @@ const ESP_START_MARK: &str = "\n    // ── Async runtime (esp-rtos drives the
 pub fn esp_main(code: String, mcu: &Mcu) -> String {
     match iot::active(mcu) {
         Some(active) if active.platform == Platform::Esp => {
-            esp_main_with(code, mcu.iot.heap_kib, active.mqtt)
+            esp_main_with(code, mcu.iot.heap_kib, active)
         }
         _ => code,
     }
 }
 
-fn esp_main_with(code: String, heap_kib: u32, mqtt: bool) -> String {
+fn esp_main_with(code: String, heap_kib: u32, active: Active) -> String {
     use super::{GEN_BEGIN, GEN_END};
     let (Some(begin), Some(end)) = (code.find(GEN_BEGIN), code.find(GEN_END)) else {
         return code;
@@ -311,32 +493,54 @@ fn esp_main_with(code: String, heap_kib: u32, mqtt: bool) -> String {
         1,
     );
     // 3. The bring-up, last in the block: it only needs `peripherals.WIFI`.
+    //    One `esp_radio::wifi::new`: it hands out the station AND ESP-NOW,
+    //    and a second call would fail.
     block.push_str("    // ── IoT (IoT tab) ──\n");
-    if mqtt {
-        block.push_str("    let net_stack = pins::configs::wifi::init(spawner, peripherals.WIFI);\n");
-        block.push_str("    pins::configs::mqtt::start(spawner, net_stack);\n\n");
+    block.push_str(
+        "    let (wifi_controller, radio) = esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();\n",
+    );
+    if active.station {
+        block.push_str(&stack_lines(active, "wifi_controller, radio.station"));
     } else {
-        block.push_str("    // `net_stack` opens sockets: `embassy_net::tcp::TcpSocket::new(net_stack, ..)`.\n");
-        block.push_str("    #[allow(unused_variables)]\n");
-        block.push_str("    let net_stack = pins::configs::wifi::init(spawner, peripherals.WIFI);\n\n");
+        // ESP-NOW alone: someone has to keep the controller - dropping it
+        // stops the radio, and ESP-NOW with it.
+        block.push_str("    pins::configs::espnow::hold_radio(spawner, wifi_controller);\n");
     }
+    if active.esp_now {
+        block.push_str("    pins::configs::espnow::start(spawner, radio.esp_now);\n");
+    }
+    block.push('\n');
     format!("{}{block}{}", &code[..begin], &code[end..])
+}
+
+/// `wifi::init` and what runs on the stack it returns. `args` are the radio
+/// halves after `spawner`, which differ per radio.
+fn stack_lines(active: Active, args: &str) -> String {
+    let mut o = String::new();
+    if !active.mqtt && !active.sntp {
+        o.push_str("    // `net_stack` opens sockets: `embassy_net::tcp::TcpSocket::new(net_stack, ..)`.\n");
+        o.push_str("    #[allow(unused_variables)]\n");
+    }
+    o.push_str(&format!(
+        "    let net_stack = pins::configs::wifi::init(spawner, {args});\n"
+    ));
+    if active.mqtt {
+        o.push_str("    pins::configs::mqtt::start(spawner, net_stack);\n");
+    }
+    if active.sntp {
+        o.push_str("    pins::configs::sntp::start(spawner, net_stack);\n");
+    }
+    o
 }
 
 /// The Pico W lines that replace the LED's `let mut wl_led = control;` once
 /// the radio carries Wi-Fi: `control` belongs to the Wi-Fi task then.
-pub fn cyw43_main_lines(mqtt: bool) -> String {
+pub fn cyw43_main_lines(active: Active) -> String {
     let mut o = String::new();
     o.push_str("    // ── IoT (IoT tab) ──\n");
     o.push_str("    // The radio's `control` belongs to the Wi-Fi task from here on, so the LED\n");
     o.push_str("    // (GPIO0 on the radio) is switched through it: `pins::configs::wifi::set_led(true)`.\n");
-    if mqtt {
-        o.push_str("    let net_stack = pins::configs::wifi::init(spawner, net_device, control);\n");
-        o.push_str("    pins::configs::mqtt::start(spawner, net_stack);\n");
-    } else {
-        o.push_str("    #[allow(unused_variables)]\n");
-        o.push_str("    let net_stack = pins::configs::wifi::init(spawner, net_device, control);\n");
-    }
+    o.push_str(&stack_lines(active, "net_device, control"));
     o
 }
 
@@ -357,7 +561,7 @@ mod tests {
         mcu
     }
 
-    /// The four files, and MQTT's only while it is on.
+    /// The files, each only while its switch is on.
     #[test]
     fn the_files_follow_the_tab() {
         let names = |m: &Mcu| -> Vec<String> {
@@ -365,6 +569,174 @@ mod tests {
         };
         assert_eq!(names(&mcu("esp32c3", Runtime::Async, true)), ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs"]);
         assert_eq!(names(&mcu("esp32c3", Runtime::Async, false)), ["net.rs", "wifi.rs", "secrets.rs"]);
+        let mut all = mcu("esp32c3", Runtime::Async, true);
+        all.iot.sntp = Some(SntpConfig::default());
+        all.iot.esp_now = Some(EspNowConfig::default());
+        assert_eq!(
+            names(&all),
+            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "sntp.rs", "espnow.rs"]
+        );
+        // ESP-NOW alone: no stack, no credentials - and MQTT/SNTP, still ticked,
+        // have nothing to run on.
+        all.iot.wifi = false;
+        assert_eq!(names(&all), ["espnow.rs"]);
+    }
+
+    /// ESP-NOW is Espressif's: on a Pico W the switch generates nothing.
+    #[test]
+    fn esp_now_is_esp_only() {
+        let mut m = mcu("rp2040_pico_w", Runtime::Async, false);
+        m.iot.wifi = false;
+        m.iot.esp_now = Some(EspNowConfig::default());
+        assert!(config_files_for(&m).is_empty());
+        assert!(iot::active(&m).is_none());
+    }
+
+    /// One socket per protocol plus DHCP, DNS and one spare - one short is a
+    /// panic in smoltcp the first time the user opens their own.
+    #[test]
+    fn the_socket_count_follows_the_protocols() {
+        let mut m = mcu("esp32c3", Runtime::Async, false);
+        let count = |m: &Mcu| {
+            let net = config_files_for(m)
+                .into_iter()
+                .find(|(n, _)| n == NET)
+                .map(|(_, b)| b)
+                .unwrap();
+            let line = net.lines().find(|l| l.starts_with("pub const SOCKETS")).unwrap().to_owned();
+            line
+        };
+        // Never fewer than phase 1's 4: code opening two sockets keeps working.
+        assert_eq!(count(&m), "pub const SOCKETS: usize = 4;");
+        m.iot.mqtt = Some(MqttConfig::default());
+        assert_eq!(count(&m), "pub const SOCKETS: usize = 5;");
+        m.iot.sntp = Some(SntpConfig::default());
+        assert_eq!(count(&m), "pub const SOCKETS: usize = 6;");
+    }
+
+    /// The tab's ESP-NOW values reach the constants, an address that cannot be
+    /// a peer is left out, and a channel out of range is clamped.
+    #[test]
+    fn esp_now_settings_reach_the_constants() {
+        let f = espnow_file(&EspNowConfig {
+            channel: 20,
+            peers: vec![[0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56], [0xFF; 6]],
+        });
+        assert!(f.contains("pub const CHANNEL: u8 = 13;"), "{f}");
+        assert!(
+            f.contains("pub const PEERS: &[[u8; 6]] = &[[0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56]];"),
+            "{f}"
+        );
+        let empty = espnow_file(&EspNowConfig::default());
+        assert!(empty.contains("pub const PEERS: &[[u8; 6]] = &[];"), "{empty}");
+    }
+
+    #[test]
+    fn sntp_settings_reach_the_constants() {
+        let f = sntp_file(&SntpConfig {
+            server: " time.example \"x\" ".into(),
+            interval_s: 5,
+        });
+        assert!(f.contains(r#"pub const SERVER: &str = "time.example \"x\"";"#), "{f}");
+        // Public pools refuse faster polling: clamped to their minimum.
+        assert!(
+            f.contains(&format!("pub const INTERVAL_S: u64 = {};", iot::MIN_SNTP_INTERVAL_S)),
+            "{f}"
+        );
+    }
+
+    /// The ESP block in every shape: one radio, then the station and what
+    /// runs on it, then ESP-NOW - or the radio held for ESP-NOW alone.
+    #[test]
+    fn esp_main_starts_what_the_tab_switched_on() {
+        let mut m = mcu("esp32c3", Runtime::Async, true);
+        m.iot.sntp = Some(SntpConfig::default());
+        m.iot.esp_now = Some(EspNowConfig::default());
+        let code = m.fresh_main_rs();
+        let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s} missing:\n{code}"));
+        assert_eq!(code.matches("esp_radio::wifi::new(").count(), 1, "{code}");
+        assert!(at("esp_radio::wifi::new(") < at("wifi::init(spawner, wifi_controller, radio.station)"));
+        assert!(at("mqtt::start(spawner, net_stack)") < at("sntp::start(spawner, net_stack)"));
+        assert!(at("sntp::start(") < at("espnow::start(spawner, radio.esp_now)"));
+        assert!(!code.contains("hold_radio"), "the station keeps the controller:\n{code}");
+        assert!(!code.contains("#[allow(unused_variables)]\n    let net_stack"), "{code}");
+
+        m.iot.wifi = false;
+        let alone = m.fresh_main_rs();
+        assert!(alone.contains("pins::configs::espnow::hold_radio(spawner, wifi_controller);"), "{alone}");
+        assert!(alone.contains("pins::configs::espnow::start(spawner, radio.esp_now);"), "{alone}");
+        assert!(!alone.contains("net_stack"), "{alone}");
+    }
+
+    /// A phase-1 ESP `wifi.rs` nobody touched moves to the current template;
+    /// one the user edited is left alone.
+    #[test]
+    fn an_untouched_phase_one_file_is_upgraded() {
+        let old = format!(
+            "{GEN_BEGIN_CFG}\n// x\n{GEN_END_CFG}\n{}",
+            include_str!("iot_templates/legacy/wifi_esp_v1.rs")
+        );
+        let body = wifi_file(Platform::Esp);
+        assert_eq!(upgraded(WIFI, &old, &body).as_deref(), Some(body.as_str()));
+        assert_eq!(upgraded(MQTT, &old, &body), None, "only the file it was");
+        // And the current template is not "legacy".
+        assert_eq!(upgraded(WIFI, &body, &body), None);
+        // What the user wrote above the generated block stays.
+        let headed = format!("// my notes\n{old}");
+        let up = upgraded(WIFI, &headed, &body).expect("upgraded");
+        assert!(up.starts_with("// my notes\n"), "{up}");
+        assert!(up.ends_with(&lf(WIFI_ESP_TAIL)), "{up}");
+        // The same on a CRLF checkout of the template and of the file.
+        let crlf = old.replace('\n', "\r\n");
+        assert!(upgraded(WIFI, &crlf, &body).is_some());
+    }
+
+    /// An EDITED phase-1 ESP `wifi.rs` keeps the user's edits and gets the
+    /// `init` main.rs now calls; one edited past recognition is reported.
+    #[test]
+    fn an_edited_phase_one_file_is_migrated_in_place() {
+        let old = format!(
+            "{GEN_BEGIN_CFG}\n// x\n{GEN_END_CFG}\n{}",
+            include_str!("iot_templates/legacy/wifi_esp_v1.rs")
+        )
+        .replace("pub const RETRY_S: u64 = 5;", "pub const RETRY_S: u64 = 10;");
+        let body = wifi_file(Platform::Esp);
+        let up = upgraded(WIFI, &old, &body).expect("migrated");
+        assert!(up.contains("pub const RETRY_S: u64 = 10;"), "the user's edit stays:\n{up}");
+        assert!(up.contains("    controller: WifiController<'static>,\n    station: Interface<'static>,"), "{up}");
+        assert!(!up.contains("esp_radio::wifi::new("), "{up}");
+        assert!(!up.contains("interfaces.station"), "{up}");
+        assert!(!phase_one_wifi_left(&up));
+        // Migrated twice is migrated once.
+        assert_eq!(upgraded(WIFI, &up, &body), None);
+
+        let mangled = old.replace(
+            "    let (controller, interfaces) = esp_radio::wifi::new(wifi, Default::default()).unwrap();\n",
+            "    let (controller, interfaces) = esp_radio::wifi::new(wifi, my_config()).unwrap();\n",
+        );
+        assert_eq!(upgraded(WIFI, &mangled, &body), None);
+        assert!(phase_one_wifi_left(&mangled), "the tab tells the user");
+    }
+
+    /// The IoT files never change with the runtime, so a Runtime Apply's
+    /// forced rewrite must leave them to the user.
+    #[test]
+    fn every_iot_file_is_runtime_free() {
+        let mut m = mcu("esp32c3", Runtime::Async, true);
+        m.iot.sntp = Some(SntpConfig::default());
+        m.iot.esp_now = Some(EspNowConfig::default());
+        for (name, _) in config_files_for(&m) {
+            assert!(runtime_free(&name), "{name}");
+        }
+    }
+
+    /// The peer list holds 20 entries, the broadcast address among them.
+    #[test]
+    fn at_most_nineteen_peers_are_written() {
+        let peers: Vec<[u8; 6]> = (0..25u8).map(|i| [0x24, 0, 0, 0, 0, i]).collect();
+        let f = espnow_file(&EspNowConfig { channel: 1, peers });
+        let line = f.lines().find(|l| l.starts_with("pub const PEERS")).unwrap();
+        assert_eq!(line.matches("[0x24").count(), iot::MAX_ESPNOW_PEERS, "{line}");
     }
 
     /// Blocking has no driver to generate for: nothing, rather than files
@@ -395,7 +767,10 @@ mod tests {
                 .map(|(_, b)| b)
                 .unwrap()
         };
-        assert!(wifi(&mcu("esp32c3", Runtime::Async, false)).contains("esp_radio::wifi::new("));
+        // main.rs creates the radio now; wifi.rs takes its station half.
+        let esp = wifi(&mcu("esp32c3", Runtime::Async, false));
+        assert!(esp.contains("station: Interface<'static>,"), "{esp}");
+        assert!(!esp.contains("esp_radio::wifi::new("), "{esp}");
         assert!(wifi(&mcu("rp2350_pico2_w", Runtime::Async, false)).contains("cyw43::Control<'static>"));
     }
 
@@ -423,7 +798,7 @@ mod tests {
         let code = m.fresh_main_rs();
         let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s} missing:\n{code}"));
         assert!(at("esp_alloc::heap_allocator!(size: 72 * 1024);") < at("esp_rtos::start("));
-        assert!(at("esp_rtos::start(") < at("pins::configs::wifi::init(spawner, peripherals.WIFI)"));
+        assert!(at("esp_rtos::start(") < at("esp_radio::wifi::new(peripherals.WIFI"));
         assert!(at("pins::configs::mqtt::start(spawner, net_stack);") < at(super::super::GEN_END));
         assert!(code.contains("async fn main(spawner: Spawner)"), "{code}");
         assert!(!code.contains("_spawner"), "{code}");

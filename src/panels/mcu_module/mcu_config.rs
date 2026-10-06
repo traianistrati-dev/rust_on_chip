@@ -1494,6 +1494,28 @@ mod iot_section_tests {
         assert!(parse_strict(&both));
     }
 
+    /// Phase 2's switches travel with the rest: ESP-NOW's peers and channel,
+    /// SNTP's server and interval.
+    #[test]
+    fn esp_now_and_sntp_round_trip() {
+        use crate::panels::mcu_module::iot::{EspNowConfig, SntpConfig};
+        let cfg = IotConfig {
+            wifi: false,
+            esp_now: Some(EspNowConfig {
+                channel: 11,
+                peers: vec![[0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56], [0, 1, 2, 3, 4, 5]],
+            }),
+            sntp: Some(SntpConfig {
+                server: "@time.example".into(),
+                interval_s: 900,
+            }),
+            ..IotConfig::default()
+        };
+        let text = iot_section(&cfg);
+        assert_eq!(text.lines().count(), 2, "one RON line: {text}");
+        assert_eq!(parse_iot(&text), cfg);
+    }
+
     #[test]
     fn untouched_writes_nothing_and_malformed_reads_default() {
         assert_eq!(iot_section(&IotConfig::default()), "");

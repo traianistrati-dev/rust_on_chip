@@ -11,8 +11,9 @@
 //!
 //! # What reaches the code today
 //!
-//! Wi-Fi station + embassy-net + MQTT, on the ESP chips with Wi-Fi and on the
-//! Pico W / Pico 2 W. Every other link is listed with the reason it is not
+//! Wi-Fi station + embassy-net + MQTT + SNTP, on the ESP chips with Wi-Fi and
+//! on the Pico W / Pico 2 W, and ESP-NOW on the ESP chips with Wi-Fi - with or
+//! without the station. Every other link is listed with the reason it is not
 //! generated - [`availability`] is the single place that says so, and the
 //! versions behind each reason were read off crates.io, not guessed:
 //!
@@ -42,6 +43,11 @@ pub struct IotConfig {
     pub mqtt: Option<MqttConfig>,
     /// ESP only: the heap `esp_alloc::heap_allocator!` reserves.
     pub heap_kib: u32,
+    /// ESP-NOW, `Some` while it is switched on. A link of its own: it runs
+    /// beside the station or without it.
+    pub esp_now: Option<EspNowConfig>,
+    /// Network time, `Some` while it is switched on. Needs the station.
+    pub sntp: Option<SntpConfig>,
 }
 
 impl Default for IotConfig {
@@ -51,8 +57,107 @@ impl Default for IotConfig {
             ip: IpConfig::default(),
             mqtt: None,
             heap_kib: DEFAULT_HEAP_KIB,
+            esp_now: None,
+            sntp: None,
         }
     }
+}
+
+/// ESP-NOW: the channel it uses while the station is off, and the peers it
+/// may send to by address (broadcast needs no peer).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EspNowConfig {
+    /// 1..=13. With the station on, ESP-NOW is on the access point's channel
+    /// instead - the radio has one.
+    pub channel: u8,
+    pub peers: Vec<[u8; 6]>,
+}
+
+impl Default for EspNowConfig {
+    fn default() -> Self {
+        Self {
+            channel: 1,
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// The shortest resync interval the generator writes. pool.ntp.org's terms
+/// ask clients not to poll more often than this; the tab warns below it.
+pub const MIN_SNTP_INTERVAL_S: u32 = 64;
+
+/// The peers the generated `start()` can register: esp-radio's list holds 20,
+/// and the broadcast address it adds itself is one of them.
+pub const MAX_ESPNOW_PEERS: usize = 19;
+
+/// The SNTP server as written: an IPv4 literal or a DNS name; the port is
+/// NTP's own. `None` = fine.
+pub fn ntp_server_problem(host: &str) -> Option<&'static str> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Some("no server");
+    }
+    if host.contains("://") {
+        return Some("a host name or an IPv4 address, without a scheme");
+    }
+    if host.contains(':') {
+        return Some("a host alone - SNTP is always port 123");
+    }
+    None
+}
+
+/// SNTP: which server, and how often the clock is set again.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SntpConfig {
+    pub server: String,
+    pub interval_s: u32,
+}
+
+impl Default for SntpConfig {
+    fn default() -> Self {
+        Self {
+            server: "pool.ntp.org".to_owned(),
+            interval_s: 3600,
+        }
+    }
+}
+
+/// `AA:BB:CC:DD:EE:FF` (or `-`-separated) as six bytes; `None` when it is not
+/// exactly that.
+pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = text.trim().split([':', '-']).collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (b, p) in mac.iter_mut().zip(parts) {
+        if p.len() != 2 {
+            return None;
+        }
+        *b = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(mac)
+}
+
+/// Six bytes as `AA:BB:CC:DD:EE:FF`.
+pub fn fmt_mac(mac: &[u8; 6]) -> String {
+    mac.iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// What is wrong with a peer address, for the line under it. `None` = fine.
+pub fn peer_problem(mac: &[u8; 6]) -> Option<&'static str> {
+    if *mac == [0xFF; 6] {
+        return Some("that is the broadcast address - it needs no peer");
+    }
+    if mac[0] & 1 == 1 {
+        return Some("a multicast address cannot be a peer");
+    }
+    None
 }
 
 impl IotConfig {
@@ -207,20 +312,37 @@ pub fn platform_of(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Platform
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Active {
     pub platform: Platform,
+    /// The Wi-Fi station, and with it the IP stack.
+    pub station: bool,
+    /// ESP-NOW - only ever on an ESP.
+    pub esp_now: bool,
+    /// MQTT over the stack - only with the station.
     pub mqtt: bool,
+    /// SNTP over the stack - only with the station.
+    pub sntp: bool,
 }
 
-/// `Some` when Wi-Fi is on, the chip can carry it, and the runtime is Async:
+/// `Some` when a link is on, the chip can carry it, and the runtime is Async:
 /// every driver below is async-only, so a Blocking project gets nothing (the
-/// tab says why) rather than code that cannot compile.
+/// tab says why) rather than code that cannot compile. What needs the IP
+/// stack (MQTT, SNTP) is off without the station, whatever the tab holds.
 pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     use crate::panels::mcu_module::mcu::model::Runtime;
-    if !mcu.iot.wifi || !matches!(mcu.runtime, Runtime::Async) {
+    if !matches!(mcu.runtime, Runtime::Async) {
+        return None;
+    }
+    let platform = platform_of(mcu)?;
+    let station = mcu.iot.wifi;
+    let esp_now = mcu.iot.esp_now.is_some() && platform == Platform::Esp;
+    if !station && !esp_now {
         return None;
     }
     Some(Active {
-        platform: platform_of(mcu)?,
-        mqtt: mcu.iot.mqtt.is_some(),
+        platform,
+        station,
+        esp_now,
+        mqtt: station && mcu.iot.mqtt.is_some(),
+        sntp: station && mcu.iot.sntp.is_some(),
     })
 }
 
@@ -306,9 +428,7 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         ),
         Link::Wifi => NotHere("no Wi-Fi radio on this chip"),
 
-        Link::EspNow if esp_wifi => {
-            Planned("next phase: esp-radio 0.18 has it (`esp-now`), the tab does not yet")
-        }
+        Link::EspNow if esp_wifi => Ready,
         Link::EspNow => NotHere("Espressif's own protocol, on the ESP chips with Wi-Fi"),
 
         Link::Ble if family == "esp32s2" => NotHere("the ESP32-S2 has no Bluetooth radio"),
@@ -330,6 +450,12 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         ),
         Link::Thread if matches!(family, "esp32c5" | "esp32c6" | "esp32h2") => NotHere(
             "openthread 0.4 needs esp-radio 1.0 - a newer esp-hal than the ~1.1 this IDE pins",
+        ),
+        Link::Thread if family == "nrf5340" => NotHere(
+            "the 802.15.4 radio is on the network core, which this IDE does not generate",
+        ),
+        Link::Thread if matches!(family, "nrf52811" | "nrf52820" | "nrf54l15") => NotHere(
+            "the chip has an 802.15.4 radio, but no Thread stack is generated for this part",
         ),
         Link::Thread => NotHere("needs an 802.15.4 radio"),
 
@@ -373,18 +499,47 @@ mod tests {
         assert_eq!(platform("nrf52840", true), None);
     }
 
-    /// No link is both offered and refused: every chip gets exactly one answer
-    /// per link, and nothing is Ready that the generator does not emit.
+    /// Nothing is Ready that the generator does not emit: Wi-Fi where there
+    /// is a radio, ESP-NOW on the ESP chips with Wi-Fi, nothing else.
     #[test]
-    fn only_wifi_is_ready_today() {
+    fn only_wifi_and_esp_now_are_ready() {
         for family in ["esp32", "esp32s2", "esp32c6", "esp32h2", "rp2040", "nrf52840", "nrf5340", "stm32f1"] {
             for link in Link::ALL {
                 let a = availability(link, family, family == "rp2040");
-                if link != Link::Wifi {
-                    assert_ne!(a, Availability::Ready, "{family} {link:?}");
+                match link {
+                    Link::Wifi => {}
+                    Link::EspNow if ESP_WIFI.contains(&family) => {
+                        assert_eq!(a, Availability::Ready, "{family}")
+                    }
+                    _ => assert_ne!(a, Availability::Ready, "{family} {link:?}"),
                 }
             }
         }
+    }
+
+    #[test]
+    fn mac_addresses_parse_and_print() {
+        let mac = parse_mac("24:6f:28:AA:bb:01").expect("valid");
+        assert_eq!(mac, [0x24, 0x6F, 0x28, 0xAA, 0xBB, 0x01]);
+        assert_eq!(fmt_mac(&mac), "24:6F:28:AA:BB:01");
+        assert_eq!(parse_mac("24-6F-28-AA-BB-01"), Some(mac));
+        for bad in ["24:6F:28:AA:BB", "24:6F:28:AA:BB:0G", "246F28AABB01", "24:6F:28:AA:BB:001"] {
+            assert_eq!(parse_mac(bad), None, "{bad}");
+        }
+        assert!(peer_problem(&[0xFF; 6]).is_some());
+        assert!(peer_problem(&[0x01, 0, 0x5E, 0, 0, 1]).is_some());
+        assert!(peer_problem(&mac).is_none());
+    }
+
+    /// An `@iot` line written by phase 1 - no `esp_now`, no `sntp` - still
+    /// reads, with both off.
+    #[test]
+    fn a_phase_one_config_still_reads() {
+        let old = "(wifi:true,ip:(dhcp:true,address:(192,168,1,50),prefix:24,gateway:(192,168,1,1),dns:(1,1,1,1)),mqtt:None,heap_kib:72)";
+        let cfg: IotConfig = ron::from_str(old).expect("phase-1 line");
+        assert!(cfg.wifi);
+        assert_eq!(cfg.esp_now, None);
+        assert_eq!(cfg.sntp, None);
     }
 
     /// The mesh options are answered, never silently absent - that was the
@@ -412,6 +567,17 @@ mod tests {
         assert!(topic_filter_problem("home/t+").is_some());
         assert!(topic_filter_problem("").is_some());
         assert!(topic_filter_problem(&"a".repeat(65)).is_some());
+    }
+
+    #[test]
+    fn an_ntp_server_is_a_bare_host() {
+        assert_eq!(ntp_server_problem("pool.ntp.org"), None);
+        assert_eq!(ntp_server_problem("192.168.1.1"), None);
+        assert!(ntp_server_problem("ntp://pool.ntp.org").is_some());
+        assert!(ntp_server_problem("pool.ntp.org:123").is_some());
+        assert!(ntp_server_problem("").is_some());
+        // Not the broker's wording: there is no port field here.
+        assert!(!ntp_server_problem("a:1").unwrap().contains("field"));
     }
 
     #[test]

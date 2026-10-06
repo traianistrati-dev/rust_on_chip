@@ -74,7 +74,7 @@ fn every_tab_draws_on_a_pico_board() {
 /// the credentials card included once `secrets.rs` exists.
 #[test]
 fn the_iot_tab_draws_with_everything_on() {
-    use crate::panels::mcu_module::iot::MqttConfig;
+    use crate::panels::mcu_module::iot::{EspNowConfig, MqttConfig, SntpConfig};
     use crate::panels::mcu_module::mcu::model::Runtime;
     for chip in ["esp32c3", "rp2040_pico_w"] {
         let ctx = egui::Context::default();
@@ -92,6 +92,12 @@ fn the_iot_tab_draws_with_everything_on() {
         let mut m = MqttConfig::for_chip(chip);
         m.subscribe = vec!["a/#".into(), "bad/#/x".into()];
         mcu.iot.mqtt = Some(m);
+        mcu.iot.sntp = Some(SntpConfig::default());
+        // On the Pico W the switch is kept but nothing is generated for it.
+        mcu.iot.esp_now = Some(EspNowConfig {
+            channel: 99,
+            peers: vec![[0xFF; 6], [0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56]],
+        });
         mcu.iot.ip.dhcp = false;
         app.project_tree.user_src_files.push((
             crate::panels::mcu_module::codegen::iot_gen::SECRETS_PATH.to_owned(),

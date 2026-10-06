@@ -61,14 +61,20 @@ async fn connection(mut control: cyw43::Control<'static>, stack: Stack<'static>)
             // The runner raises the link a moment after the join returns.
             stack.wait_link_up().await;
             // Joined: serve the LED until the link goes down.
-            while let Either::First(on) = select(LED.wait(), stack.wait_link_down()).await {
-                control.gpio_set(0, on).await;
+            loop {
+                match select(LED.wait(), stack.wait_link_down()).await {
+                    Either::First(on) => control.gpio_set(0, on).await,
+                    Either::Second(()) => break,
+                }
             }
         }
         // Before the next attempt - and the LED still answers meanwhile.
         let mut retry = Timer::after(Duration::from_secs(RETRY_S));
-        while let Either::First(on) = select(LED.wait(), &mut retry).await {
-            control.gpio_set(0, on).await;
+        loop {
+            match select(LED.wait(), &mut retry).await {
+                Either::First(on) => control.gpio_set(0, on).await,
+                Either::Second(()) => break,
+            }
         }
     }
 }

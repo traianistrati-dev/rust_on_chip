@@ -372,22 +372,28 @@ Generated today, on the **Async** runtime: a **Wi-Fi station** on every ESP
 chip with Wi-Fi (`esp-radio` 0.18, the release on the esp-hal 1.1 line, with
 an `esp-alloc` heap set in the tab) and on the **Pico W / Pico 2 W** (the CYW43
 radio, brought up once for both the LED and the network); **embassy-net** with
-DHCP or a static address; and an **MQTT 5 client** (`rust-mqtt` 0.6). It all
-lands in `src/pins/configs/{net,wifi,mqtt}.rs`, constants from the tab in the
-generated block, the tasks below it, editable. Your code calls
-`pins::configs::mqtt::publish("topic", b"payload").await` and
-`pins::configs::mqtt::incoming().await`; one task owns the connection and
-reconnects on its own.
+DHCP or a static address; an **MQTT 5 client** (`rust-mqtt` 0.6); **SNTP**
+network time, hand-written over embassy-net's UDP socket; and **ESP-NOW** on
+the ESP chips with Wi-Fi — beside the station or on its own, on a channel and
+with a peer list set in the tab. It all lands in
+`src/pins/configs/{net,wifi,mqtt,sntp,espnow}.rs`, constants from the tab in
+the generated block, the tasks below it, editable. Your code calls
+`pins::configs::mqtt::publish("topic", b"payload").await` /
+`incoming().await`, `pins::configs::sntp::now_unix()`, and
+`pins::configs::espnow::send(BROADCAST, b"..").await` / `receive().await`;
+each protocol has one task that owns it and reconnects or resyncs on its own.
 
 The SSID and the passwords are typed in the tab but stored only in
 `src/pins/configs/secrets.rs`, which the generated `.gitignore` lists — never in
 `mcu.config`, which is committed. The file is written once and never
 regenerated.
 
-Every other link is listed with the reason it is not generated: ESP-NOW and
-BLE are planned phases, Thread is research on the nRF52840 (OpenThread is C),
-and BLE Mesh, Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to generate
-for. Port 1883 is plain TCP; TLS is not generated yet.
+Every other link is listed with the reason it is not generated: BLE is a
+planned phase, Thread is research on the nRF52840 (OpenThread is C), and BLE
+Mesh, Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to generate for —
+ESP-NOW is the mesh-capable link, and `espnow.rs` describes a flooding relay
+on top of it. Port 1883 is plain TCP and SNTP is unauthenticated UDP; TLS is
+not generated yet.
 
 ### Virtual device modules
 Instead of wiring a peripheral pin by pin, you can drop a **device** onto the

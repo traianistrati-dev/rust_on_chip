@@ -308,21 +308,27 @@ $ALL_CASES = @(
     @{ n = "ESP32-C3 flash store, no pins"; t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_FLASHSTORE = "partition"; EIDE_ESP_NOPINS = "1" }; q = $true; fam = "esp" }
     @{ n = "ESP32-C3 flash store in nvs";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_ESP_FLASHSTORE = "nvs" }; q = $false; fam = "esp" }
 
-    # The IoT tab: esp-radio 0.18 + esp-alloc + embassy-net + rust-mqtt over
-    # the generated heap, spawner and pins/configs/{net,wifi,mqtt,secrets}.rs,
-    # on top of the harness's full wiring and watchdogs. The loop publishes and
-    # awaits `incoming()`, so the API is compiled, not just declared. Each chip
-    # is its own esp-radio build (its own esp-wifi-sys blob crate); the Xtensa
-    # rows are also the ones where `alloc` in build-std matters.
+    # The IoT tab: esp-radio 0.18 + esp-alloc + embassy-net + rust-mqtt + the
+    # SNTP and ESP-NOW templates over the generated heap, spawner and
+    # pins/configs/*.rs, on top of the harness's full wiring and watchdogs. The
+    # loop calls every function the files offer, so the API is compiled, not
+    # just declared. The C3 rows are the four shapes of main.rs - station +
+    # MQTT WITHOUT the esp-now feature (no `radio.esp_now` field then), the
+    # station alone, ESP-NOW alone (`hold_radio`), and everything; the other
+    # chips build everything, each its own esp-radio and esp-wifi-sys blob
+    # crate, and the Xtensa rows are where `alloc` in build-std matters.
     @{ n = "ESP32-C3 Wi-Fi + MQTT (IoT)";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 IoT, everything on";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 ESP-NOW alone";        t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "espnow" }; q = $true; fam = "esp" }
     @{ n = "ESP32-C3 Wi-Fi only (IoT)";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "wifi" }; q = $false; fam = "esp" }
-    @{ n = "ESP32 Wi-Fi + MQTT (Xtensa)";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-S2 Wi-Fi + MQTT (Xtensa)"; t = "emit_esp32c3_project";      e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-S3 Wi-Fi + MQTT (Xtensa)"; t = "emit_esp32c3_project";      e = @{ EIDE_ESP_CHIP = "esp32s3";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-C2 Wi-Fi + MQTT";         t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-C5 Wi-Fi + MQTT";         t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c5";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-C6 Wi-Fi + MQTT";         t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c6";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-C61 Wi-Fi + MQTT";        t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c61"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
+    @{ n = "ESP32 IoT, everything (Xtensa)";    t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
+    @{ n = "ESP32 ESP-NOW alone (Xtensa)";      t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "espnow" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-S2 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-S3 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s3";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C2 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C5 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c5";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C6 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c6";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C61 IoT, everything";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c61"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
 
     # The watchdogs on EVERY bundled Espressif part. The harness switches all
     # three on unless EIDE_ESP_WDG=0, so the six C3 rows above already build
@@ -428,8 +434,8 @@ $ALL_CASES = @(
 
     # The IoT tab on both W boards: the radio up once for the LED AND the
     # network, `control` handed to the Wi-Fi task, embassy-net + rust-mqtt
-    # (bump buffer, no heap) over it. Linked, like the radio row.
-    @{ n = "Raspberry Pi Pico W Wi-Fi + MQTT x2"; t = "emit_rp_iot_project"; e = @{};                       q = $true; fam = "rp"; lk = $true }
+    # (bump buffer, no heap) + SNTP over it. Linked, like the radio row.
+    @{ n = "Raspberry Pi Pico W Wi-Fi + MQTT + SNTP x2"; t = "emit_rp_iot_project"; e = @{};                q = $true; fam = "rp"; lk = $true }
 
     # The pico2-ice, Blocking and Async: the only RP2350B board, so the only
     # rows of the FUNCSEL table past GP29 (UART1 on GP36/37, SPI0 on 32/34/35,

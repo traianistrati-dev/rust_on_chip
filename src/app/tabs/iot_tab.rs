@@ -13,7 +13,7 @@
 use crate::app::{AppIde, McuTab};
 use crate::panels::mcu_module::codegen::iot_gen;
 use crate::panels::mcu_module::iot::{
-    self, Availability, IotConfig, Link, MqttConfig, Platform,
+    self, Availability, EspNowConfig, IotConfig, Link, MqttConfig, Platform, SntpConfig,
 };
 use crate::panels::mcu_module::mcu::model::Runtime;
 use eframe::egui;
@@ -53,6 +53,13 @@ impl AppIde {
                 .filter(|c| c.text.contains("Wi-Fi"))
                 .map(|c| c.text)
                 .collect();
+            // A phase-1 ESP wifi.rs edited past what the IDE can move: main.rs
+            // creates the radio now, and its old `init` no longer fits.
+            let stale_wifi = platform == Some(Platform::Esp)
+                && self.project_tree.user_src_files.iter().any(|(p, c)| {
+                    p == "src/pins/configs/wifi.rs"
+                        && crate::panels::mcu_module::codegen::iot_gen::phase_one_wifi_left(c)
+                });
             let files = &mut self.project_tree.user_src_files;
             let mut changed = false;
 
@@ -60,7 +67,7 @@ impl AppIde {
                 ui.add_space(4.0);
                 ui.label(dim(concat!(
                     "Links and protocols, in layers: a card is live once the one below it is. ",
-                    "Wi-Fi and MQTT are generated today; every other link says why not."
+                    "Wi-Fi, ESP-NOW, MQTT and SNTP are generated today; every other link says why not."
                 )));
                 ui.add_space(8.0);
 
@@ -78,6 +85,16 @@ impl AppIde {
                 }
 
                 link_card(ui, &mut mcu.iot, &family, cyw43, platform, is_async);
+                if stale_wifi {
+                    ui.add_space(4.0);
+                    ui.label(warn(concat!(
+                        "src/pins/configs/wifi.rs still creates the radio itself (its `init` takes ",
+                        "the WIFI peripheral), and you edited it too far for the IDE to move it. ",
+                        "main.rs creates the radio now: make `init` take ",
+                        "(spawner, controller: WifiController<'static>, station: Interface<'static>), ",
+                        "or delete the file to get the current template."
+                    )));
+                }
                 for text in &radio_clashes {
                     ui.add_space(4.0);
                     ui.label(warn(text.as_str()));
@@ -110,8 +127,8 @@ impl AppIde {
     }
 }
 
-/// The links, each with its state on this chip. Only Wi-Fi has a switch: it
-/// is the one link generated today.
+/// The links, each with its state on this chip. Wi-Fi and ESP-NOW have a
+/// switch where they are generated; the rest say why not.
 fn link_card(
     ui: &mut egui::Ui,
     cfg: &mut IotConfig,
@@ -130,6 +147,15 @@ fn link_card(
                 if link == Link::Wifi && avail == Availability::Ready {
                     ui.checkbox(&mut cfg.wifi, "")
                         .on_hover_text("Generate the Wi-Fi station, the IP stack and the tasks that keep them up");
+                } else if link == Link::EspNow && avail == Availability::Ready {
+                    let mut on = cfg.esp_now.is_some();
+                    if ui
+                        .checkbox(&mut on, "")
+                        .on_hover_text("Generate ESP-NOW: send() and receive() between ESP boards, no access point")
+                        .changed()
+                    {
+                        toggle_kept(ui, &mut cfg.esp_now, on, "iot_stash_espnow");
+                    }
                 } else {
                     ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
                 }
@@ -150,7 +176,14 @@ fn link_card(
                 }
             });
         }
-        if cfg.wifi && platform.is_some() {
+        let esp_now_here = platform == Some(Platform::Esp) && cfg.esp_now.is_some();
+        if esp_now_here {
+            let station = cfg.wifi;
+            if let Some(n) = cfg.esp_now.as_mut() {
+                esp_now_body(ui, n, station);
+            }
+        }
+        if (cfg.wifi || esp_now_here) && platform.is_some() {
             ui.add_space(6.0);
             match platform {
                 Some(Platform::Esp) => {
@@ -183,6 +216,116 @@ fn link_card(
                 ui.label(dim("Kept, and generated once the runtime is Async."));
             }
         }
+    });
+}
+
+/// Switches an optional setting on or off without losing it: off keeps the
+/// last values in egui's memory for this session, on brings them back (or the
+/// defaults the first time). The project file keeps only what is on, as for
+/// every other switch.
+fn toggle_kept<T: Clone + Default + Send + Sync + 'static>(
+    ui: &egui::Ui,
+    slot: &mut Option<T>,
+    on: bool,
+    stash: &str,
+) {
+    let id = egui::Id::new(stash);
+    if on {
+        *slot = Some(ui.data_mut(|d| d.get_temp::<T>(id)).unwrap_or_default());
+    } else if let Some(old) = slot.take() {
+        ui.data_mut(|d| d.insert_temp(id, old));
+    }
+}
+
+const ESPNOW_USAGE: &str =
+    "pins::configs::espnow::send(pins::configs::espnow::BROADCAST, b\"hi\").await.ok();";
+
+/// ESP-NOW's settings: the channel while the station is off, and the peers.
+fn esp_now_body(ui: &mut egui::Ui, n: &mut EspNowConfig, station: bool) {
+    ui.indent("espnow", |ui| {
+        ui.add_space(4.0);
+        ui.add_enabled_ui(!station, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_sized([90.0, 18.0], egui::Label::new("Channel"));
+                ui.add(
+                    crate::panels::drag_value(ui, &mut n.channel)
+                        .range(1..=13)
+                        .clamp_existing_to_range(false),
+                );
+            });
+        });
+        ui.label(dim(if station {
+            "With the station on, ESP-NOW is on the access point's channel - the radio has one."
+        } else {
+            "Every board that talks to this one must be on the same channel."
+        }));
+        if !(1..=13).contains(&n.channel) {
+            ui.label(warn("a channel is 1 to 13"));
+        }
+
+        ui.add_space(4.0);
+        ui.label("Peers (send by address; broadcast needs none)");
+        let mut remove = None;
+        for (i, mac) in n.peers.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(iot::fmt_mac(mac)).monospace());
+                if ui.small_button(ph::X).on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                }
+                if let Some(p) = iot::peer_problem(mac) {
+                    ui.label(warn(format!("{p} - left out")));
+                }
+            });
+        }
+        if let Some(i) = remove {
+            n.peers.remove(i);
+        }
+        if n.peers.len() > iot::MAX_ESPNOW_PEERS {
+            ui.label(warn(format!(
+                "only the first {} are put on the list - it holds 20, the broadcast address among them",
+                iot::MAX_ESPNOW_PEERS
+            )));
+        }
+        let full = n.peers.len() >= iot::MAX_ESPNOW_PEERS;
+        let id = ui.id().with("espnow_new_peer");
+        let mut text: String = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("AA:BB:CC:DD:EE:FF")
+                    .desired_width(150.0),
+            );
+            let parsed = iot::parse_mac(&text);
+            let fresh = parsed.filter(|m| !n.peers.contains(m) && !full);
+            if ui
+                .add_enabled(fresh.is_some(), egui::Button::new(format!("{} Add peer", ph::PLUS)))
+                .on_disabled_hover_text(if full {
+                    "The list is full: 19 peers and the broadcast address. Broadcast reaches the rest."
+                } else {
+                    "Type an address that is not on the list yet"
+                })
+                .clicked()
+            {
+                if let Some(m) = fresh {
+                    n.peers.push(m);
+                    text.clear();
+                }
+            }
+            if !text.is_empty() && parsed.is_none() {
+                ui.label(dim("six hex bytes, `:`-separated"));
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(id, text));
+        ui.label(dim(concat!(
+            "A board's address: pins::configs::espnow::own_mac(). Frames are at most ",
+            "250 bytes; a mesh relays what it receives - see the comment in espnow.rs."
+        )));
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(ESPNOW_USAGE).monospace().size(11.0));
+            if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                ui.ctx().copy_text(ESPNOW_USAGE.to_owned());
+            }
+        });
     });
 }
 
@@ -319,7 +462,15 @@ fn application_card(
         let mut on = cfg.mqtt.is_some();
         ui.horizontal(|ui| {
             if ui.checkbox(&mut on, "").changed() {
-                cfg.mqtt = on.then(|| MqttConfig::for_chip(chip_id));
+                let stash = egui::Id::new("iot_stash_mqtt");
+                if on {
+                    cfg.mqtt = Some(
+                        ui.data_mut(|d| d.get_temp::<MqttConfig>(stash))
+                            .unwrap_or_else(|| MqttConfig::for_chip(chip_id)),
+                    );
+                } else {
+                    toggle_kept(ui, &mut cfg.mqtt, false, "iot_stash_mqtt");
+                }
             }
             ui.label(egui::RichText::new("MQTT").strong());
             ui.label(dim("rust-mqtt 0.6 (MQTT 5) - src/pins/configs/mqtt.rs"));
@@ -328,8 +479,19 @@ fn application_card(
             mqtt_body(ui, m);
         }
         ui.add_space(6.0);
+        let mut sntp_on = cfg.sntp.is_some();
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut sntp_on, "").changed() {
+                toggle_kept(ui, &mut cfg.sntp, sntp_on, "iot_stash_sntp");
+            }
+            ui.label(egui::RichText::new("SNTP").strong());
+            ui.label(dim("network time over UDP - src/pins/configs/sntp.rs"));
+        });
+        if let Some(s) = cfg.sntp.as_mut() {
+            sntp_body(ui, s);
+        }
+        ui.add_space(6.0);
         for (name, why) in [
-            ("SNTP (network time)", "planned with ESP-NOW: embassy-net has the UDP socket it needs"),
             ("HTTP client", "on request: reqwless runs on the same TcpSocket"),
             ("TLS (MQTT on 8883)", "planned: embedded-tls / esp-mbedtls"),
         ] {
@@ -343,6 +505,42 @@ fn application_card(
         if platform.is_none() {
             ui.label(dim("No link on this chip, so nothing above it can run."));
         }
+    });
+}
+
+const SNTP_USAGE: &str = "let unix_s = pins::configs::sntp::now_unix(); // None until the first answer";
+
+fn sntp_body(ui: &mut egui::Ui, s: &mut SntpConfig) {
+    ui.indent("sntp", |ui| {
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Server"));
+            ui.add(egui::TextEdit::singleline(&mut s.server).desired_width(200.0));
+        });
+        if let Some(p) = iot::ntp_server_problem(&s.server) {
+            ui.label(warn(p));
+        }
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Every"));
+            ui.add(
+                crate::panels::drag_value(ui, &mut s.interval_s)
+                    .range(iot::MIN_SNTP_INTERVAL_S..=86_400)
+                    .clamp_existing_to_range(false)
+                    .suffix(" s"),
+            );
+            ui.label(dim("the clock is set again this often; between, it runs on embassy-time"));
+        });
+        if !(iot::MIN_SNTP_INTERVAL_S..=86_400).contains(&s.interval_s) {
+            ui.label(warn(format!(
+                "between {} s and a day - public pools ask not to be polled faster",
+                iot::MIN_SNTP_INTERVAL_S
+            )));
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(SNTP_USAGE).monospace().size(11.0));
+            if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                ui.ctx().copy_text(SNTP_USAGE.to_owned());
+            }
+        });
     });
 }
 

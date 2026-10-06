@@ -694,8 +694,11 @@ impl ProjectTreeState {
             let is_device = name
                 .split_once('/')
                 .is_some_and(|(_, file)| codegen::parse_device_file_name(file).is_some());
-            let runtime_free =
-                is_device || name == crate::panels::mcu_module::codegen::flash_store_gen::FILE;
+            // The IoT tab's files likewise: they exist only on Async and no
+            // Runtime changes them.
+            let runtime_free = is_device
+                || name == crate::panels::mcu_module::codegen::flash_store_gen::FILE
+                || crate::panels::mcu_module::codegen::iot_gen::runtime_free(name);
             // Generated again after being pruned this session: back with the
             // user's code, and spliced (or forced) below like any file. Not a
             // device file: step 3 already chose ITS old content by device,
@@ -725,11 +728,21 @@ impl ProjectTreeState {
                     if *content != *body {
                         *content = body.clone();
                     }
-                } else if let Some(block) = extract_gen_block(body) {
-                    let existing = content.clone();
-                    let updated = splice_pin_file(&existing, &block);
-                    if *content != updated {
-                        *content = updated;
+                } else {
+                    // An IoT template an older IDE wrote: the current one, or
+                    // the user's edited file moved to the signature main.rs
+                    // now calls - then the block is spliced as for any file.
+                    if let Some(up) =
+                        crate::panels::mcu_module::codegen::iot_gen::upgraded(name, content, body)
+                    {
+                        *content = up;
+                    }
+                    if let Some(block) = extract_gen_block(body) {
+                        let existing = content.clone();
+                        let updated = splice_pin_file(&existing, &block);
+                        if *content != updated {
+                            *content = updated;
+                        }
                     }
                 }
             } else {
@@ -2807,6 +2820,30 @@ mod iot_secrets_sync_tests {
             .iter()
             .find(|(p, _)| p == iot_gen::SECRETS_PATH)
             .map(|(_, c)| c.clone())
+    }
+
+    /// A Runtime Apply forces every config file to its template - except the
+    /// IoT ones, which no runtime changes: the user's code in espnow.rs stays.
+    #[test]
+    fn a_runtime_apply_leaves_the_iot_files_to_the_user() {
+        let path = "src/pins/configs/espnow.rs";
+        let body = "// <<< GENERATED>>>\npub const CHANNEL: u8 = 1;\n// <<< GENERATED END >>>\n\nfn template() {}\n";
+        let files = vec![(iot_gen::ESPNOW.to_owned(), body.to_owned())];
+        let mut tree = ProjectTreeState::new();
+        tree.sync_config_files(&files, false, &[], &mut None);
+        for (p, c) in &mut tree.user_src_files {
+            if p == path {
+                c.push_str("fn mine() {}\n");
+            }
+        }
+        tree.sync_config_files(&files, true, &[], &mut None);
+        let kept = tree
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, c)| c.clone())
+            .unwrap();
+        assert!(kept.contains("fn mine() {}"), "{kept}");
     }
 
     /// The password typed into `secrets.rs` survives every regeneration, a

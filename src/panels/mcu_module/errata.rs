@@ -151,9 +151,9 @@ pub fn esp32_adc2_wifi(family: &str, wifi: bool, pins: &[&Pin]) -> Option<Clash>
     }
     Some(Clash {
         text: format!(
-            "ESP32: {} {} ADC2, which the Wi-Fi radio takes while it runs - and the IoT tab has \
-             Wi-Fi on. esp-hal's Adc::new on ADC2 panics once the radio is up. Take an ADC1 pad \
-             (GPIO32-39) for the reading, or switch Wi-Fi off.",
+            "ESP32: {} {} ADC2, which the Wi-Fi radio takes while it runs - and the IoT tab runs \
+             it (Wi-Fi or ESP-NOW). esp-hal's Adc::new on ADC2 panics once the radio is up. Take \
+             an ADC1 pad (GPIO32-39) for the reading, or switch the IoT tab's links off.",
             and_list(&pads),
             if pads.len() == 1 { "reads" } else { "read" }
         ),

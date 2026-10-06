@@ -974,6 +974,11 @@ pub fn ensure_cyw43_deps(cargo_toml: &str, needs_radio: bool, sources: &[&str]) 
 /// - embassy-net 0.9 (smoltcp 0.13) under both radios; rust-mqtt 0.6 on its
 ///   `TcpSocket`, with the `bump` buffer so the Pico needs no heap.
 ///
+/// - ESP-NOW is esp-radio's `esp-now` feature and nothing more. It is added
+///   only while ESP-NOW is on: with it, `esp_radio::wifi::new` always brings
+///   ESP-NOW up (and panics if it cannot), used or not.
+/// - SNTP is hand-written over embassy-net's `UdpSocket`: no crate of its own.
+///
 /// `static_cell` and `embassy-futures` are only ever ADDED here: the first is
 /// shared with the async USART and the radio, the second with the flash store,
 /// and each of those removes it when nothing needs it - running before this.
@@ -986,6 +991,8 @@ pub fn ensure_iot_deps(
     use crate::panels::mcu_module::iot::Platform;
     let on = active.is_some();
     let esp = active.is_some_and(|a| a.platform == Platform::Esp);
+    let station = active.is_some_and(|a| a.station);
+    let esp_now = active.is_some_and(|a| a.esp_now);
     let mqtt = active.is_some_and(|a| a.mqtt);
     let mut s = ensure_dep(
         cargo_toml,
@@ -1002,27 +1009,34 @@ pub fn ensure_iot_deps(
         sources,
     );
     // The scheduler side of the radio: on the existing `esp-rtos` line, which
-    // `ensure_async_deps` owns - only these two features are ours.
-    if s.lines().any(|l| is_dep_line(l, "esp-rtos")) {
-        let ends_nl = s.ends_with('\n');
-        let mut out: Vec<String> = Vec::new();
-        for line in s.lines() {
-            if is_dep_line(line, "esp-rtos") && line.contains("features = [") {
-                let l = toggle_hal_feature(line, "esp-radio", esp);
-                out.push(toggle_hal_feature(&l, "esp-alloc", esp));
-            } else {
-                out.push(line.to_owned());
-            }
+    // `ensure_async_deps` owns - only these two features are ours. And
+    // ESP-NOW, a feature on our own esp-radio line.
+    let ends_nl = s.ends_with('\n');
+    let mut out: Vec<String> = Vec::new();
+    // A feature is added to any line that needs it, but taken off only a line
+    // the IDE wrote: one the user wrote keeps what they put there.
+    for line in s.lines() {
+        let ours = is_ide_owned(line);
+        if is_dep_line(line, "esp-rtos") && line.contains("features = [") && (esp || ours) {
+            let l = toggle_hal_feature(line, "esp-radio", esp);
+            out.push(toggle_hal_feature(&l, "esp-alloc", esp));
+        } else if is_dep_line(line, "esp-radio")
+            && line.contains("features = [")
+            && (esp_now || ours)
+        {
+            out.push(toggle_esp_now(line, esp_now));
+        } else {
+            out.push(line.to_owned());
         }
-        s = out.join("\n");
-        if ends_nl {
-            s.push('\n');
-        }
+    }
+    s = out.join("\n");
+    if ends_nl {
+        s.push('\n');
     }
     s = ensure_dep(
         &s,
         "embassy-net",
-        on,
+        station,
         "embassy-net = { version = \"0.9\", features = [\"tcp\", \"udp\", \"dhcpv4\", \"dns\", \"medium-ethernet\", \"proto-ipv4\"] }",
         sources,
     );
@@ -1035,11 +1049,31 @@ pub fn ensure_iot_deps(
         "rust-mqtt = { version = \"0.6\", default-features = false, features = [\"v5\", \"bump\"] }",
         sources,
     );
-    if on {
+    if station {
         s = ensure_dep(&s, "static_cell", true, "static_cell = \"2\"", sources);
+    }
+    if on {
         s = ensure_dep(&s, "embassy-futures", true, "embassy-futures = \"0.1\"", sources);
     }
     s
+}
+
+/// The `esp-now` feature on the esp-radio line, placed after `wifi` (which it
+/// needs) so the line reads `["esp32c3", "wifi", "esp-now", "unstable"]`.
+fn toggle_esp_now(line: &str, on: bool) -> String {
+    const FEAT: &str = "\"esp-now\"";
+    if on == line.contains(FEAT) {
+        return line.to_owned();
+    }
+    if on {
+        if line.contains("\"wifi\", ") {
+            line.replacen("\"wifi\", ", "\"wifi\", \"esp-now\", ", 1)
+        } else {
+            toggle_hal_feature(line, "esp-now", true)
+        }
+    } else {
+        toggle_hal_feature(line, "esp-now", false)
+    }
 }
 
 /// `.cargo/config.toml` with `alloc` in `build-std` while `needs` - the ESP
@@ -5144,10 +5178,18 @@ mod iot_deps_tests {
     use super::*;
     use crate::panels::mcu_module::iot::{Active, Platform};
 
-    const ESP_ASYNC: &str = "[dependencies]\nesp-hal = { version = \"~1.1.0\", features = [\"esp32c3\", \"unstable\"] }\nesp-rtos = { version = \"0.3\", features = [\"esp32c3\", \"embassy\"] }\n";
+    // The esp-rtos line as `ensure_async_deps` writes it: marked as the IDE's,
+    // so the IoT features on it come and go with the tab.
+    const ESP_ASYNC: &str = "[dependencies]\nesp-hal = { version = \"~1.1.0\", features = [\"esp32c3\", \"unstable\"] }\nesp-rtos = { version = \"0.3\", features = [\"esp32c3\", \"embassy\"] }   # <rust_on_chip>\n";
 
     fn esp(mqtt: bool) -> Option<Active> {
-        Some(Active { platform: Platform::Esp, mqtt })
+        Some(Active {
+            platform: Platform::Esp,
+            station: true,
+            esp_now: false,
+            mqtt,
+            sntp: false,
+        })
     }
 
     /// On: the radio, the heap, the stack, MQTT, and the two scheduler
@@ -5193,7 +5235,13 @@ mod iot_deps_tests {
     fn the_pico_gets_no_esp_crate() {
         let pico = ensure_iot_deps(
             "[dependencies]\n",
-            Some(Active { platform: Platform::Cyw43, mqtt: true }),
+            Some(Active {
+                platform: Platform::Cyw43,
+                station: true,
+                esp_now: false,
+                mqtt: true,
+                sntp: true,
+            }),
             "",
             &[],
         );
@@ -5207,6 +5255,55 @@ mod iot_deps_tests {
         let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", &[]);
         let off = ensure_iot_deps(&on, None, "esp32c3", &["use heapless::Vec;"]);
         assert!(off.contains("heapless"), "{off}");
+    }
+
+    /// ESP-NOW is one feature, beside `wifi`, and goes with the switch. Alone,
+    /// it needs the radio and the heap but no IP stack.
+    #[test]
+    fn esp_now_is_a_feature_on_the_radio_line() {
+        let both = Some(Active {
+            platform: Platform::Esp,
+            station: true,
+            esp_now: true,
+            mqtt: false,
+            sntp: true,
+        });
+        let on = ensure_iot_deps(ESP_ASYNC, both, "esp32c3", &[]);
+        assert!(
+            on.contains("esp-radio = { version = \"0.18\", features = [\"esp32c3\", \"wifi\", \"esp-now\", \"unstable\"] }"),
+            "{on}"
+        );
+        assert_eq!(ensure_iot_deps(&on, both, "esp32c3", &[]), on, "idempotent");
+        // The feature leaves with the switch, the line stays for the station.
+        let station_only = ensure_iot_deps(&on, esp(false), "esp32c3", &[]);
+        let radio = station_only.lines().find(|l| l.starts_with("esp-radio")).unwrap();
+        assert!(!radio.contains("esp-now"), "{radio}");
+
+        let alone = Some(Active {
+            platform: Platform::Esp,
+            station: false,
+            esp_now: true,
+            mqtt: false,
+            sntp: false,
+        });
+        let a = ensure_iot_deps(ESP_ASYNC, alone, "esp32c3", &[]);
+        assert!(a.contains("\"esp-now\"") && a.contains("esp-alloc"), "{a}");
+        assert!(!a.contains("embassy-net") && !a.contains("rust-mqtt"), "{a}");
+        assert!(a.contains("embassy-sync") && a.contains("heapless"), "espnow.rs uses both:\n{a}");
+    }
+
+    /// An esp-radio line the user wrote keeps its `esp-now`, whatever the tab
+    /// says; the IDE's own line follows the switch.
+    #[test]
+    fn a_hand_written_radio_line_keeps_its_features() {
+        let mine = format!(
+            "{ESP_ASYNC}esp-radio = {{ version = \"0.18\", features = [\"esp32c3\", \"wifi\", \"esp-now\", \"unstable\"] }}\n"
+        );
+        let after = ensure_iot_deps(&mine, esp(false), "esp32c3", &[]);
+        let radio = after.lines().find(|l| l.starts_with("esp-radio")).unwrap();
+        assert!(radio.contains("\"esp-now\""), "{radio}");
+        let off = ensure_iot_deps(&mine, None, "esp32c3", &[]);
+        assert!(off.contains("\"esp-now\""), "never removed:\n{off}");
     }
 
     #[test]

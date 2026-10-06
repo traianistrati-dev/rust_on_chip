@@ -452,6 +452,9 @@ enum McuTab {
     Configuration,
     Clock,
     System,
+    /// Wi-Fi, the IP stack and MQTT: links and protocols, layered. After
+    /// System because it needs the Async runtime chosen there.
+    Iot,
     /// Module-relationship diagram of the project (parse-based, chip-agnostic).
     Structure,
     /// Algorithmic flowchart of the open file's functions (`syn`-based).
@@ -488,6 +491,7 @@ impl McuTab {
             Self::Configuration => "Configuration",
             Self::Clock => "Clock",
             Self::System => "System",
+            Self::Iot => "IoT",
             Self::Structure => "Structure",
             Self::Flow => "Flow",
             Self::Definition => "Definition",
@@ -520,6 +524,19 @@ impl McuTab {
     /// main one. Nested a level deeper it sat below the code it is read against.
     fn is_project_group(self) -> bool {
         Self::project_group_tabs(true).contains(&self)
+    }
+
+    /// The tabs the "MCU" group shows, in order - the one list the tab row
+    /// draws and the tests read, for the same reason as `project_group_tabs`.
+    fn mcu_group_tabs() -> [Self; 6] {
+        [
+            Self::Pins,
+            Self::Peripherals,
+            Self::Configuration,
+            Self::Clock,
+            Self::System,
+            Self::Iot,
+        ]
     }
 
     /// The tabs the "Project" group shows, in order.
@@ -568,14 +585,9 @@ mod tab_group_tests {
     /// chip header and the MCU group would lose its own tabs.
     #[test]
     fn the_chips_tabs_stay_out_of_the_project_group() {
-        for t in [
-            McuTab::Pins,
-            McuTab::Peripherals,
-            McuTab::Configuration,
-            McuTab::Clock,
-            McuTab::System,
-        ] {
+        for t in McuTab::mcu_group_tabs() {
             assert!(!t.is_project_group(), "{t:?} is not a Project tab");
+            assert_eq!(t.group(), Some(super::TabGroup::Mcu), "{t:?}");
         }
     }
 
@@ -3528,6 +3540,9 @@ impl AppIde {
         // file, five dependencies and the partition table.
         hash_debug(&mut hasher, &mcu.flash_store);
 
+        // The IoT tab: main.rs, four config files and the manifest follow it.
+        hash_debug(&mut hasher, &mcu.iot);
+
         // Device groups. A group changes no binding and no init call - but it
         // does write `device_comment` into the generated main.rs, so renaming or
         // refilling one has to regenerate. Without this the roster would edit a
@@ -3888,16 +3903,14 @@ impl AppIde {
                         .is_some_and(crate::panels::mcu_module::codegen::nrf::needs_static_cell),
                 &sources,
             );
-            // The CYW43 radio, on a Pico W / Pico 2 W whose WL_LED is driven.
-            // Gated on the pin rather than on the board, because a W board with
-            // the LED untouched should not carry a wifi stack it never calls.
-            let needs_radio = self.mcu.as_ref().is_some_and(|m| {
-                m.iter_all_pins().any(|p| {
-                    p.name == "WL_LED"
-                        && p.selected_function
-                            == crate::panels::mcu_module::pins::PinFunction::GpioOutput
-                })
-            });
+            // The CYW43 radio, on a Pico W / Pico 2 W whose WL_LED is driven or
+            // whose IoT tab runs Wi-Fi on it. Gated on use rather than on the
+            // board, because a W board that does neither should not carry a
+            // wifi stack it never calls. The generator asks the same function.
+            let needs_radio = self
+                .mcu
+                .as_ref()
+                .is_some_and(crate::panels::mcu_module::codegen::rp::needs_radio);
             let new_toml = project_gen::ensure_cyw43_deps(&new_toml, needs_radio, &sources);
             // Cortex-M0 async: `static_cell` needs CAS the core does not have.
             let async_target = self
@@ -3930,6 +3943,13 @@ impl AppIde {
                 on_esp.then_some(esp_chip.as_str()),
                 &sources,
             );
+            // The IoT tab's network stack: after the flash store and the radio,
+            // because it only ADDS the crates it shares with them.
+            let iot_active = self
+                .mcu
+                .as_ref()
+                .and_then(crate::panels::mcu_module::iot::active);
+            let new_toml = project_gen::ensure_iot_deps(&new_toml, iot_active, &esp_chip, &sources);
             // Strict-lints `[lints.clippy]` block (MCU System toggle).
             let strict = self.mcu.as_ref().is_some_and(|m| m.strict_lints);
             let new_toml = project_gen::ensure_strict_lints(&new_toml, strict);
@@ -3954,6 +3974,12 @@ impl AppIde {
             let runner = project_gen::ensure_partition_table_runner(
                 &self.cargo_config,
                 !csv.trim().is_empty(),
+            );
+            // esp-radio is built on `alloc`, which the Xtensa toolchain only
+            // has when `build-std` lists it.
+            let runner = project_gen::ensure_build_std_alloc(
+                &runner,
+                iot_active.is_some_and(|a| a.platform == crate::panels::mcu_module::iot::Platform::Esp),
             );
             if csv != self.partitions_csv || runner != self.cargo_config {
                 self.partitions_csv = csv;
@@ -3994,6 +4020,14 @@ impl AppIde {
             // it: the `Data` there is theirs.
             self.project_tree.kept_config_files =
                 flash_store_gen::kept_paths(&config_files, &self.project_tree.user_src_files);
+            // And an IoT file the user wrote in - above all `secrets.rs` with a
+            // password in it - when the tab is switched off.
+            self.project_tree.kept_config_files.extend(
+                crate::panels::mcu_module::codegen::iot_gen::kept_paths(
+                    &config_files,
+                    &self.project_tree.user_src_files,
+                ),
+            );
             // The editor names its file by index, which a prune shifts.
             let mut selected = match self.selected_file {
                 ProjectFileId::UserFile(i) => Some(i),

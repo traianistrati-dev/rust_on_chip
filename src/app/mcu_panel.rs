@@ -878,13 +878,7 @@ impl AppIde {
                 let mut tabs: Vec<McuTab> = if project_active {
                     McuTab::project_group_tabs(self.definition_view.is_some())
                 } else {
-                    vec![
-                        McuTab::Pins,
-                        McuTab::Peripherals,
-                        McuTab::Configuration,
-                        McuTab::Clock,
-                        McuTab::System,
-                    ]
+                    McuTab::mcu_group_tabs().to_vec()
                 };
                 for tab in tabs.drain(..) {
                     let is_active = self.active_tab == tab;
@@ -2797,6 +2791,10 @@ impl AppIde {
                     no_mcu = Some("Peripheral configuration");
                 }
                 McuTab::Configuration => self.show_configuration_tab(ui),
+                McuTab::Iot if self.mcu.is_none() => {
+                    no_mcu = Some("IoT configuration");
+                }
+                McuTab::Iot => self.show_iot_tab(ui),
                 McuTab::System => {
                     // A runtime Apply or an `@runtime` restore may have moved the
                     // HAL line since the chip was picked (the F1 swaps crates).

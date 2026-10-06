@@ -482,6 +482,12 @@ pub struct Mcu {
     /// input - main.rs, a config file, Cargo.toml and partitions.csv all follow
     /// it. See [`crate::panels::mcu_module::flash_store`].
     pub flash_store: Option<crate::panels::mcu_module::flash_store::FlashStoreConfig>,
+    /// The IoT tab: Wi-Fi, the IP settings, MQTT. Pin-less like the
+    /// watchdogs. Persisted in `mcu.config` `@iot` - WITHOUT the SSID and the
+    /// passwords, which live in the git-ignored `secrets.rs`. Feeds
+    /// `calculate_mcu_state_hash` because it is codegen input: main.rs, four
+    /// config files and the Cargo.toml all follow it.
+    pub iot: crate::panels::mcu_module::iot::IotConfig,
 }
 
 /// One Virtual-module undo snapshot (see [`Mcu::module_undo`]): the modules and

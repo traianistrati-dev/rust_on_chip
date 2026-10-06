@@ -308,6 +308,22 @@ $ALL_CASES = @(
     @{ n = "ESP32-C3 flash store, no pins"; t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_FLASHSTORE = "partition"; EIDE_ESP_NOPINS = "1" }; q = $true; fam = "esp" }
     @{ n = "ESP32-C3 flash store in nvs";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_ESP_FLASHSTORE = "nvs" }; q = $false; fam = "esp" }
 
+    # The IoT tab: esp-radio 0.18 + esp-alloc + embassy-net + rust-mqtt over
+    # the generated heap, spawner and pins/configs/{net,wifi,mqtt,secrets}.rs,
+    # on top of the harness's full wiring and watchdogs. The loop publishes and
+    # awaits `incoming()`, so the API is compiled, not just declared. Each chip
+    # is its own esp-radio build (its own esp-wifi-sys blob crate); the Xtensa
+    # rows are also the ones where `alloc` in build-std matters.
+    @{ n = "ESP32-C3 Wi-Fi + MQTT (IoT)";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 Wi-Fi only (IoT)";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "wifi" }; q = $false; fam = "esp" }
+    @{ n = "ESP32 Wi-Fi + MQTT (Xtensa)";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-S2 Wi-Fi + MQTT (Xtensa)"; t = "emit_esp32c3_project";      e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-S3 Wi-Fi + MQTT (Xtensa)"; t = "emit_esp32c3_project";      e = @{ EIDE_ESP_CHIP = "esp32s3";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C2 Wi-Fi + MQTT";         t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C5 Wi-Fi + MQTT";         t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c5";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C6 Wi-Fi + MQTT";         t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c6";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C61 Wi-Fi + MQTT";        t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c61"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $false; fam = "esp" }
+
     # The watchdogs on EVERY bundled Espressif part. The harness switches all
     # three on unless EIDE_ESP_WDG=0, so the six C3 rows above already build
     # them on both runtimes - including async, where the scheduler owns TIMG0.
@@ -410,6 +426,11 @@ $ALL_CASES = @(
     # ships, and the harness checks the SIZES, so a stub cannot pass for it.
     @{ n = "Raspberry Pi Pico W radio x2"; t = "emit_rp_radio_project";      e = @{};                       q = $true; fam = "rp"; lk = $true }
 
+    # The IoT tab on both W boards: the radio up once for the LED AND the
+    # network, `control` handed to the Wi-Fi task, embassy-net + rust-mqtt
+    # (bump buffer, no heap) over it. Linked, like the radio row.
+    @{ n = "Raspberry Pi Pico W Wi-Fi + MQTT x2"; t = "emit_rp_iot_project"; e = @{};                       q = $true; fam = "rp"; lk = $true }
+
     # The pico2-ice, Blocking and Async: the only RP2350B board, so the only
     # rows of the FUNCSEL table past GP29 (UART1 on GP36/37, SPI0 on 32/34/35,
     # PWM slice 11) and the only project on embassy-rp's `rp235xb` feature.
@@ -488,7 +509,8 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_F1_SWITCH", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
-           "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME")
+           "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
+           "EIDE_ESP_IOT")
 
 # The hook passes its families as ONE comma-joined argument ("embassy,f1"), and
 # `powershell -File` binds that to [string[]] as a single element - it does not

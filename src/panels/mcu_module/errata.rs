@@ -31,6 +31,11 @@ pub fn clashes(mcu: &Mcu) -> Vec<Clash> {
         mcu.is_async(),
         &pins,
     ));
+    out.extend(esp32_adc2_wifi(
+        &mcu.family,
+        super::iot::active(mcu).is_some(),
+        &pins,
+    ));
     out
 }
 
@@ -120,6 +125,37 @@ pub fn f1_tim1_usart1(name: &str, family: &str, is_async: bool, pins: &[&Pin]) -
              another timer, or the Blocking runtime, whose stm32f1xx-hal leaves unwired channels \
              alone.",
             and_list(&pads[..pads.len() - 1])
+        ),
+        pads,
+    })
+}
+
+/// ESP32: ADC2 belongs to the Wi-Fi radio while it runs - the same fact the
+/// ESP32 pad notes give for every ADC2 pad. With the IoT tab's Wi-Fi
+/// generated, a reading on an ADC2 pad is the conflict, and esp-hal's
+/// `Adc::new` on ADC2 panics once the radio is up, so it shows at boot rather
+/// than as a bad value. This fires only when both halves are actually chosen.
+pub fn esp32_adc2_wifi(family: &str, wifi: bool, pins: &[&Pin]) -> Option<Clash> {
+    if family != "esp32" || !wifi {
+        return None;
+    }
+    let pads: Vec<String> = pins
+        .iter()
+        .filter(|p| {
+            !p.reserved && matches!(p.selected_function, PinFunction::AdcChannel { adc: 2, .. })
+        })
+        .map(|p| p.gpio().to_owned())
+        .collect();
+    if pads.is_empty() {
+        return None;
+    }
+    Some(Clash {
+        text: format!(
+            "ESP32: {} {} ADC2, which the Wi-Fi radio takes while it runs - and the IoT tab has \
+             Wi-Fi on. esp-hal's Adc::new on ADC2 panics once the radio is up. Take an ADC1 pad \
+             (GPIO32-39) for the reading, or switch Wi-Fi off.",
+            and_list(&pads),
+            if pads.len() == 1 { "reads" } else { "read" }
         ),
         pads,
     })
@@ -370,5 +406,56 @@ mod tests {
             words.join(" "),
             text.split_whitespace().collect::<Vec<_>>().join(" ")
         );
+    }
+}
+
+#[cfg(test)]
+mod adc2_wifi_tests {
+    use super::*;
+    use crate::panels::mcu_module::mcu::model::Runtime;
+
+    fn esp32_with_adc(adc: u8) -> Mcu {
+        let mut mcu = crate::panels::mcu_module::builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == "esp32")
+            .expect("built-in esp32")
+            .build_mcu();
+        let n = mcu
+            .iter_all_pins()
+            .find(|p| {
+                !p.reserved
+                    && p.available_functions
+                        .iter()
+                        .any(|f| matches!(f, PinFunction::AdcChannel { adc: a, .. } if *a == adc))
+            })
+            .map(|p| p.number)
+            .expect("an ADC pad");
+        let pin = mcu.find_pin_mut(n).expect("pad");
+        pin.selected_function = pin
+            .available_functions
+            .iter()
+            .find(|f| matches!(f, PinFunction::AdcChannel { adc: a, .. } if *a == adc))
+            .cloned()
+            .expect("the function");
+        mcu.runtime = Runtime::Async;
+        mcu
+    }
+
+    /// ADC2 + generated Wi-Fi is the clash; ADC1, or Wi-Fi off, is not.
+    #[test]
+    fn adc2_clashes_with_wifi_only() {
+        let mut m = esp32_with_adc(2);
+        assert!(clashes(&m).iter().all(|c| !c.text.contains("ADC2")), "no Wi-Fi yet");
+        m.iot.wifi = true;
+        let c = clashes(&m);
+        assert!(c.iter().any(|c| c.text.contains("ADC2")), "{c:?}");
+
+        let mut one = esp32_with_adc(1);
+        one.iot.wifi = true;
+        assert!(clashes(&one).iter().all(|c| !c.text.contains("ADC2")));
+
+        // On Blocking nothing is generated, so nothing clashes.
+        m.runtime = Runtime::Blocking;
+        assert!(clashes(&m).iter().all(|c| !c.text.contains("ADC2")));
     }
 }

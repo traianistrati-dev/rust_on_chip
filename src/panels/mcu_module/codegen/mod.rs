@@ -16,6 +16,7 @@ pub mod embassy_async;
 pub mod embassy_common;
 pub mod family;
 pub mod flash_store_gen;
+pub mod iot_gen;
 pub mod nrf;
 pub mod nrf_boards;
 pub mod nvic;
@@ -207,6 +208,9 @@ impl Mcu {
         // The Configuration tab's flash store, on every family it is generated
         // for (ESP and STM32 alike - `flash_store::platform` decides).
         files.extend(flash_store_gen::config_files_for(self));
+        // The IoT tab's network files, on every chip whose radio it drives
+        // (`iot::active` decides - Async only, Wi-Fi on, a radio there).
+        files.extend(iot_gen::config_files_for(self));
         files
             .into_iter()
             // Strict-lints: exempt each generated peripheral config module.

@@ -706,6 +706,14 @@ impl ProjectTreeState {
             {
                 self.user_src_files.push((file_path.clone(), old));
             }
+            // The IoT tab's `secrets.rs` IS the store of the user's passwords:
+            // written when missing (or back from the graveyard just above),
+            // never spliced and never forced by a Runtime Apply.
+            if crate::panels::mcu_module::codegen::iot_gen::write_once(name)
+                && self.user_src_files.iter().any(|(p, _)| p == &file_path)
+            {
+                continue;
+            }
             if let Some((_, content)) = self
                 .user_src_files
                 .iter_mut()
@@ -2782,5 +2790,46 @@ mod flash_store_sync_tests {
         }
         tree.sync_config_files(&store_files(), true, &[], &mut None);
         assert!(content(&tree, &path).is_some_and(|c| c.contains("// MINE")));
+    }
+}
+
+#[cfg(test)]
+mod iot_secrets_sync_tests {
+    use super::*;
+    use crate::panels::mcu_module::codegen::iot_gen;
+
+    fn files() -> Vec<(String, String)> {
+        vec![(iot_gen::SECRETS.to_owned(), iot_gen::secrets_body())]
+    }
+
+    fn secrets(tree: &ProjectTreeState) -> Option<String> {
+        tree.user_src_files
+            .iter()
+            .find(|(p, _)| p == iot_gen::SECRETS_PATH)
+            .map(|(_, c)| c.clone())
+    }
+
+    /// The password typed into `secrets.rs` survives every regeneration, a
+    /// forced one (a Runtime Apply) included, and switching the tab off.
+    #[test]
+    fn the_secrets_file_is_never_rewritten() {
+        let mut tree = ProjectTreeState::new();
+        tree.sync_config_files(&files(), false, &[], &mut None);
+        let body = secrets(&tree).expect("written when missing");
+        let mine = iot_gen::write_secret(&body, "WIFI_PASSWORD", "hunter2");
+        for (p, c) in &mut tree.user_src_files {
+            if p == iot_gen::SECRETS_PATH {
+                *c = mine.clone();
+            }
+        }
+        tree.sync_config_files(&files(), false, &[], &mut None);
+        assert_eq!(secrets(&tree).as_deref(), Some(mine.as_str()), "spliced");
+        tree.sync_config_files(&files(), true, &[], &mut None);
+        assert_eq!(secrets(&tree).as_deref(), Some(mine.as_str()), "forced");
+
+        // Off: kept, because there is a password in it.
+        tree.kept_config_files = iot_gen::kept_paths(&[], &tree.user_src_files);
+        tree.sync_config_files(&[], false, &[], &mut None);
+        assert_eq!(secrets(&tree).as_deref(), Some(mine.as_str()), "kept");
     }
 }

@@ -3848,8 +3848,8 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
 
     // The radio takes one more channel, from the same counter — two drivers
     // both handed DMA_CH0 would compile and then fight at run time.
-    let radio = if radio_led(mcu) {
-        let (mut r_irqs, task, body) = radio_lines(dma);
+    let radio = if needs_radio(mcu) {
+        let (mut r_irqs, task, body) = radio_lines(dma, iot_wifi(mcu));
         take(dma, "CYW43 radio - PIO SPI", &mut uses);
         dma += 1;
         irqs.append(&mut r_irqs);
@@ -3988,7 +3988,7 @@ pub fn pio_blocks(family: &str) -> usize {
 /// even with the LED pad driven — the same asymmetry the codegen has.
 pub fn pio_uses(mcu: &Mcu) -> Vec<PioUse> {
     use crate::panels::mcu_module::mcu::model::Runtime;
-    if !matches!(mcu.runtime, Runtime::Async) || !radio_led(mcu) {
+    if !matches!(mcu.runtime, Runtime::Async) || !needs_radio(mcu) {
         return Vec::new();
     }
     vec![PioUse {
@@ -4010,7 +4010,23 @@ fn radio_led(mcu: &Mcu) -> bool {
         .any(|p| p.name == "WL_LED" && p.selected_function == PinFunction::GpioOutput)
 }
 
-/// The bring-up for the CYW43 radio, purely so its GPIO0 can drive the LED.
+/// Does the radio come up? For the LED, or for the IoT tab's Wi-Fi - one
+/// bring-up either way, since two would put two PIO SPIs on the same pins.
+/// `pub` because the app's dependency sync asks the same question.
+pub fn needs_radio(mcu: &Mcu) -> bool {
+    radio_led(mcu) || iot_wifi(mcu).is_some()
+}
+
+/// `Some(mqtt)` when the IoT tab's Wi-Fi runs on this board's CYW43.
+fn iot_wifi(mcu: &Mcu) -> Option<bool> {
+    use crate::panels::mcu_module::iot::{self, Platform};
+    iot::active(mcu)
+        .filter(|a| a.platform == Platform::Cyw43)
+        .map(|a| a.mqtt)
+}
+
+/// The bring-up for the CYW43 radio, for its GPIO0 (the LED) and, with the
+/// IoT tab's Wi-Fi on, for the network.
 ///
 /// Everything here is forced by the hardware, not chosen: the radio speaks a
 /// half-duplex SPI no SPI block on the chip can produce, so it goes through a
@@ -4020,7 +4036,7 @@ fn radio_led(mcu: &Mcu) -> bool {
 ///
 /// Returns `(irq entries, top-level items, main body)` — the task has to sit
 /// outside `main`, and the interrupt entries have to join the shared binding.
-fn radio_lines(dma: u8) -> (Vec<String>, String, String) {
+fn radio_lines(dma: u8, iot: Option<bool>) -> (Vec<String>, String, String) {
     let irqs = vec![
         "    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;"
             .to_owned(),
@@ -4043,6 +4059,24 @@ async fn cyw43_task(
 
 "
     .to_owned();
+
+    // With Wi-Fi on, the radio's network half is used and `control` moves to
+    // the Wi-Fi task; without it the LED keeps `control` to itself.
+    let net_device = if iot.is_some() {
+        "net_device"
+    } else {
+        "_net_device"
+    };
+    let tail = match iot {
+        Some(mqtt) => super::iot_gen::cyw43_main_lines(mqtt),
+        None => concat!(
+            "    // The LED is GPIO0 ON THE RADIO, so it is driven through `control` rather\n",
+            "    // than through a pin: `wl_led.gpio_set(0, true).await` turns it on.\n",
+            "    #[allow(unused_mut, unused_variables)]\n",
+            "    let mut wl_led = control;\n",
+        )
+        .to_owned(),
+    };
 
     let body = format!(
         "    // The radio's firmware, written into `firmware/` with this project. They
@@ -4076,7 +4110,7 @@ async fn cyw43_task(
 
     static RADIO_STATE: static_cell::StaticCell<cyw43::State> = static_cell::StaticCell::new();
     let state = RADIO_STATE.init(cyw43::State::new());
-    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    let ({net_device}, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
     // embassy-executor 0.10: the task FUNCTION returns the Result (the pool can
     // be exhausted), so the `unwrap` goes inside `spawn`, not after it.
     spawner.spawn(cyw43_task(runner).unwrap());
@@ -4085,11 +4119,7 @@ async fn cyw43_task(
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    // The LED is GPIO0 ON THE RADIO, so it is driven through `control` rather
-    // than through a pin: `wl_led.gpio_set(0, true).await` turns it on.
-    #[allow(unused_mut, unused_variables)]
-    let mut wl_led = control;
-"
+{tail}"
     );
 
     (irqs, task, body)
@@ -4891,6 +4921,89 @@ mod emit_async_for_manual_compile {
                 let got = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 assert_eq!(got, want, "{name}: shipped whole, not stubbed");
             }
+            println!("wrote {}", dir.display());
+            println!("target: {}", def.project.target);
+        }
+    }
+
+    /// The two W boards with the IoT tab's Wi-Fi and MQTT on: the radio comes
+    /// up once, for both the network and the LED, `control` goes to the Wi-Fi
+    /// task, and embassy-net + rust-mqtt run over it. The loop uses every call
+    /// the files offer, so each one is compiled, not just declared. Nothing here
+    /// proves a broker is reached - that needs a board and a network.
+    ///
+    /// ```text
+    /// cargo test --bin rust_on_chip emit_rp_iot_project -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes projects to disk for a manual cross-compile"]
+    fn emit_rp_iot_project() {
+        use crate::panels::mcu_module::iot::{self, MqttConfig};
+        for (id, dir_name) in [
+            ("rp2040_pico_w", "eide_rp2040w_iot_check"),
+            ("rp2350_pico2_w", "eide_rp2350w_iot_check"),
+        ] {
+            let def = builtins::builtin_definitions()
+                .into_iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("built-in {id}"));
+            let mut mcu = def.build_mcu();
+            mcu.runtime = Runtime::Async;
+            // The LED too: with Wi-Fi on it is switched through the Wi-Fi task.
+            for p in mcu.iter_all_pins_mut() {
+                if p.name == "WL_LED" {
+                    p.selected_function = PinFunction::GpioOutput;
+                }
+            }
+            mcu.reconcile_modules();
+            mcu.iot.wifi = true;
+            let mut m = MqttConfig::for_chip(id);
+            m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/+/set".into()];
+            mcu.iot.mqtt = Some(m);
+            let active = iot::active(&mcu);
+            assert!(active.is_some(), "Wi-Fi on a W board on Async");
+
+            let main_rs = mcu.fresh_main_rs().replacen(
+                "        // Your main loop code here.\n",
+                concat!(
+                    "        // Your main loop code here.\n",
+                    "        pins::configs::wifi::set_led(true);\n",
+                    "        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n",
+                    "        let msg = pins::configs::mqtt::incoming().await;\n",
+                    "        let _ = (msg.topic.as_str(), &msg.payload[..]);\n",
+                ),
+                1,
+            );
+            assert!(main_rs.contains("set_led(true)"), "the user loop was seeded:\n{main_rs}");
+            assert_eq!(main_rs.matches("cyw43::new(").count(), 1, "{main_rs}");
+
+            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
+            let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            let user: Vec<(String, String)> = mcu.pin_tree_files();
+            assert!(
+                user.iter().any(|(p, _)| p == crate::panels::mcu_module::codegen::iot_gen::SECRETS_PATH),
+                "secrets.rs is written"
+            );
+            let dir = std::env::temp_dir().join(dir_name);
+            project_gen::clear_project_dir_keep_target(&dir);
+            project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
+                .expect("write rp iot project");
+            // The manifest the app builds, call for call and in its order.
+            let toml_path = dir.join("Cargo.toml");
+            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
+            let toml = project_gen::ensure_async_deps(
+                &toml,
+                true,
+                project_gen::async_flavor_for(&mcu.family, ""),
+                super::needs_async_usart(&mcu),
+                false,
+                false,
+                &[],
+            );
+            let toml = project_gen::ensure_cyw43_deps(&toml, super::needs_radio(&mcu), &[]);
+            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
+            let toml = project_gen::ensure_iot_deps(&toml, active, "", &[]);
+            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             println!("wrote {}", dir.display());
             println!("target: {}", def.project.target);
         }

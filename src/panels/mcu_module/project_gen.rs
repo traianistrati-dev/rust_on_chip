@@ -325,11 +325,15 @@ impl ConfigFile {
             // in the Structure diagram) — it changes on every drag, so it is
             // ignored rather than committed. `mcu.config` IS committed: it is
             // real configuration.
+            // The IoT tab's `secrets.rs` holds the Wi-Fi and broker passwords,
+            // so it is never committed either - listed even before the tab is
+            // used, so the first commit after it is cannot carry them.
             ConfigFile::GitIgnore => Some((
                 Cmt::Hash,
                 format!(
-                    "/target\n{}\n",
-                    crate::panels::mcu_module::structure_config::FILE_NAME
+                    "/target\n{}\n{}\n",
+                    crate::panels::mcu_module::structure_config::FILE_NAME,
+                    crate::panels::mcu_module::codegen::iot_gen::SECRETS_IGNORE,
                 ),
             )),
         }
@@ -955,6 +959,113 @@ pub fn ensure_cyw43_deps(cargo_toml: &str, needs_radio: bool, sources: &[&str]) 
     } else {
         s
     }
+}
+
+/// The IoT tab's crates, added and removed with what `iot::active` says is
+/// generated. One call for the app and the harness alike.
+///
+/// The versions are the ones the templates were compiled with:
+/// - esp-radio 0.18 is the release on `esp-hal ~1.1` ([`ESP_HAL_REQ`]); 0.19
+///   moves to esp-hal 1.2. Its `unstable` feature needs esp-hal's, which every
+///   ESP template already has.
+/// - esp-alloc 0.10 for the heap esp-radio allocates from, and the
+///   `esp-radio` + `esp-alloc` features on the `esp-rtos` line, which hook the
+///   scheduler up to both.
+/// - embassy-net 0.9 (smoltcp 0.13) under both radios; rust-mqtt 0.6 on its
+///   `TcpSocket`, with the `bump` buffer so the Pico needs no heap.
+///
+/// `static_cell` and `embassy-futures` are only ever ADDED here: the first is
+/// shared with the async USART and the radio, the second with the flash store,
+/// and each of those removes it when nothing needs it - running before this.
+pub fn ensure_iot_deps(
+    cargo_toml: &str,
+    active: Option<crate::panels::mcu_module::iot::Active>,
+    esp_chip: &str,
+    sources: &[&str],
+) -> String {
+    use crate::panels::mcu_module::iot::Platform;
+    let on = active.is_some();
+    let esp = active.is_some_and(|a| a.platform == Platform::Esp);
+    let mqtt = active.is_some_and(|a| a.mqtt);
+    let mut s = ensure_dep(
+        cargo_toml,
+        "esp-radio",
+        esp,
+        &format!("esp-radio = {{ version = \"0.18\", features = [\"{esp_chip}\", \"wifi\", \"unstable\"] }}"),
+        sources,
+    );
+    s = ensure_dep(
+        &s,
+        "esp-alloc",
+        esp,
+        &format!("esp-alloc = {{ version = \"0.10\", features = [\"{esp_chip}\"] }}"),
+        sources,
+    );
+    // The scheduler side of the radio: on the existing `esp-rtos` line, which
+    // `ensure_async_deps` owns - only these two features are ours.
+    if s.lines().any(|l| is_dep_line(l, "esp-rtos")) {
+        let ends_nl = s.ends_with('\n');
+        let mut out: Vec<String> = Vec::new();
+        for line in s.lines() {
+            if is_dep_line(line, "esp-rtos") && line.contains("features = [") {
+                let l = toggle_hal_feature(line, "esp-radio", esp);
+                out.push(toggle_hal_feature(&l, "esp-alloc", esp));
+            } else {
+                out.push(line.to_owned());
+            }
+        }
+        s = out.join("\n");
+        if ends_nl {
+            s.push('\n');
+        }
+    }
+    s = ensure_dep(
+        &s,
+        "embassy-net",
+        on,
+        "embassy-net = { version = \"0.9\", features = [\"tcp\", \"udp\", \"dhcpv4\", \"dns\", \"medium-ethernet\", \"proto-ipv4\"] }",
+        sources,
+    );
+    s = ensure_dep(&s, "embassy-sync", on, "embassy-sync = \"0.8\"", sources);
+    s = ensure_dep(&s, "heapless", on, "heapless = \"0.9\"", sources);
+    s = ensure_dep(
+        &s,
+        "rust-mqtt",
+        mqtt,
+        "rust-mqtt = { version = \"0.6\", default-features = false, features = [\"v5\", \"bump\"] }",
+        sources,
+    );
+    if on {
+        s = ensure_dep(&s, "static_cell", true, "static_cell = \"2\"", sources);
+        s = ensure_dep(&s, "embassy-futures", true, "embassy-futures = \"0.1\"", sources);
+    }
+    s
+}
+
+/// `.cargo/config.toml` with `alloc` in `build-std` while `needs` - the ESP
+/// Wi-Fi driver is built on `alloc`, and on the Xtensa toolchain only the
+/// crates listed there exist. (A stable RISC-V toolchain ignores the table
+/// and ships `alloc` prebuilt, so the line is harmless there.)
+///
+/// Removed again only when the line is exactly what this function wrote, so a
+/// `build-std` the user extended is left alone.
+pub fn ensure_build_std_alloc(cargo_config: &str, needs: bool) -> String {
+    const PLAIN: &str = "build-std = [\"core\"]";
+    const WITH: &str = "build-std = [\"alloc\", \"core\"]";
+    let (from, to) = if needs { (PLAIN, WITH) } else { (WITH, PLAIN) };
+    if !cargo_config.lines().any(|l| l.trim() == from) {
+        return cargo_config.to_owned();
+    }
+    let ends_nl = cargo_config.ends_with('\n');
+    let mut s = cargo_config
+        .lines()
+        .map(|l| if l.trim() == from { l.replacen(from, to, 1) } else { l.to_owned() })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if ends_nl {
+        s.push('\n');
+    }
+    s
 }
 
 pub fn ensure_rtic_deps(
@@ -5025,5 +5136,104 @@ mod flash_store_file_tests {
         write_project(&root, &off, &[], "", "").expect("write");
         assert!(csv.is_file(), "a hand-written table stays");
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod iot_deps_tests {
+    use super::*;
+    use crate::panels::mcu_module::iot::{Active, Platform};
+
+    const ESP_ASYNC: &str = "[dependencies]\nesp-hal = { version = \"~1.1.0\", features = [\"esp32c3\", \"unstable\"] }\nesp-rtos = { version = \"0.3\", features = [\"esp32c3\", \"embassy\"] }\n";
+
+    fn esp(mqtt: bool) -> Option<Active> {
+        Some(Active { platform: Platform::Esp, mqtt })
+    }
+
+    /// On: the radio, the heap, the stack, MQTT, and the two scheduler
+    /// features. Off again: every line the IDE added goes, the features too.
+    #[test]
+    fn the_esp_set_comes_and_goes() {
+        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", &[]);
+        for want in [
+            "esp-radio = { version = \"0.18\", features = [\"esp32c3\", \"wifi\", \"unstable\"] }",
+            "esp-alloc = { version = \"0.10\", features = [\"esp32c3\"] }",
+            "embassy-net = ",
+            "embassy-sync = \"0.8\"",
+            "heapless = \"0.9\"",
+            "rust-mqtt = ",
+            "static_cell = \"2\"",
+            "embassy-futures = \"0.1\"",
+        ] {
+            assert!(on.contains(want), "{want} missing:\n{on}");
+        }
+        let rtos = on.lines().find(|l| l.starts_with("esp-rtos")).unwrap();
+        assert!(rtos.contains("\"esp-radio\"") && rtos.contains("\"esp-alloc\""), "{rtos}");
+        assert_eq!(ensure_iot_deps(&on, esp(true), "esp32c3", &[]), on, "idempotent");
+
+        let off = ensure_iot_deps(&on, None, "esp32c3", &[]);
+        for gone in ["esp-radio =", "esp-alloc", "embassy-net", "rust-mqtt", "heapless", "embassy-sync"] {
+            assert!(!off.contains(gone), "{gone} stayed:\n{off}");
+        }
+        let rtos = off.lines().find(|l| l.starts_with("esp-rtos")).unwrap();
+        assert!(!rtos.contains("esp-radio") && !rtos.contains("esp-alloc"), "{rtos}");
+    }
+
+    /// MQTT off: the stack stays, the client goes.
+    #[test]
+    fn mqtt_is_its_own_crate() {
+        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", &[]);
+        let wifi_only = ensure_iot_deps(&on, esp(false), "esp32c3", &[]);
+        assert!(!wifi_only.contains("rust-mqtt"), "{wifi_only}");
+        assert!(wifi_only.contains("embassy-net"), "{wifi_only}");
+    }
+
+    /// The Pico W gets the stack and no ESP crate.
+    #[test]
+    fn the_pico_gets_no_esp_crate() {
+        let pico = ensure_iot_deps(
+            "[dependencies]\n",
+            Some(Active { platform: Platform::Cyw43, mqtt: true }),
+            "",
+            &[],
+        );
+        assert!(pico.contains("embassy-net") && pico.contains("rust-mqtt"), "{pico}");
+        assert!(!pico.contains("esp-radio") && !pico.contains("esp-alloc"), "{pico}");
+    }
+
+    /// A crate the user's own code names is never taken away.
+    #[test]
+    fn a_referenced_crate_survives_the_switch() {
+        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", &[]);
+        let off = ensure_iot_deps(&on, None, "esp32c3", &["use heapless::Vec;"]);
+        assert!(off.contains("heapless"), "{off}");
+    }
+
+    #[test]
+    fn build_std_gains_alloc_and_gives_it_back() {
+        let cfg = "[unstable]\nbuild-std = [\"core\"]\n";
+        let on = ensure_build_std_alloc(cfg, true);
+        assert_eq!(on, "[unstable]\nbuild-std = [\"alloc\", \"core\"]\n");
+        assert_eq!(ensure_build_std_alloc(&on, true), on);
+        assert_eq!(ensure_build_std_alloc(&on, false), cfg);
+        // A list the user extended is theirs.
+        let mine = "build-std = [\"alloc\", \"core\", \"panic_abort\"]\n";
+        assert_eq!(ensure_build_std_alloc(mine, false), mine);
+    }
+
+    /// The `.gitignore` the IDE writes keeps the credentials out of git.
+    #[test]
+    fn the_gitignore_lists_the_secrets() {
+        let def = crate::panels::mcu_module::builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == "esp32c3")
+            .expect("built-in esp32c3");
+        let cfg = crate::panels::mcu_module::mcu_def::build_cfg(&def, None);
+        let body = gen_config(ConfigFile::GitIgnore, &cfg, &def.toolchain);
+        assert!(
+            body.lines()
+                .any(|l| l == crate::panels::mcu_module::codegen::iot_gen::SECRETS_IGNORE),
+            "{body}"
+        );
     }
 }

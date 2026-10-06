@@ -43,6 +43,7 @@ const I2C_POS_HEADER: &str = "@i2cpos";
 const WATCHDOG_HEADER: &str = "@watchdog";
 const COMP_HEADER: &str = "@comp";
 const FLASHSTORE_HEADER: &str = "@flashstore";
+const IOT_HEADER: &str = "@iot";
 const LABELS_HEADER: &str = "@labels";
 const PINS_HEADER: &str = "@pins";
 const NOTES_HEADER: &str = "@modulenotes";
@@ -316,6 +317,36 @@ pub fn parse_flashstore(
         size: hex(size)?,
         offset: hex(offset)?,
     })
+}
+
+/// The `@iot` section - the IoT tab, absent while it is untouched. One RON
+/// line, so a quoted value (a topic, a host) can never start a line with the
+/// `@` that would end the section:
+///
+/// ```text
+/// @iot
+/// (wifi:true,ip:(dhcp:true,...),mqtt:Some((host:"test.mosquitto.org",...)),heap_kib:72)
+/// ```
+///
+/// No SSID and no password: those are in `secrets.rs`, which git ignores,
+/// while this file is committed.
+pub fn iot_section(cfg: &crate::panels::mcu_module::iot::IotConfig) -> String {
+    if cfg.is_default() {
+        return String::new();
+    }
+    match ron::to_string(cfg) {
+        Ok(line) => format!("{IOT_HEADER}\n{line}\n"),
+        Err(_) => String::new(),
+    }
+}
+
+/// Read `@iot` back; the default when it is absent OR malformed - the same
+/// rule as `@watchdog`: a setting the tab cannot show must not reach the
+/// firmware.
+pub fn parse_iot(text: &str) -> crate::panels::mcu_module::iot::IotConfig {
+    section_body(text, IOT_HEADER)
+        .and_then(|body| ron::from_str(body.trim()).ok())
+        .unwrap_or_default()
 }
 
 /// The strict-lints preference recorded in `@strict`; missing / anything but
@@ -1436,6 +1467,38 @@ on
         assert!(c.is_some(), "clock unaffected by the extra sections");
         // And the migration reader still finds the positions in there.
         assert_eq!(structure_config::parse_layout(&text), pos);
+    }
+}
+
+#[cfg(test)]
+mod iot_section_tests {
+    use super::*;
+    use crate::panels::mcu_module::iot::{IotConfig, MqttConfig};
+
+    #[test]
+    fn the_iot_tab_round_trips() {
+        let cfg = IotConfig {
+            wifi: true,
+            mqtt: Some(MqttConfig {
+                host: "@broker \"x\"\nnext".into(),
+                subscribe: vec!["a/#".into(), "@b".into()],
+                ..MqttConfig::default()
+            }),
+            ..IotConfig::default()
+        };
+        let text = iot_section(&cfg);
+        assert_eq!(text.lines().count(), 2, "one RON line: {text}");
+        // A later section still parses: the `@` inside a string did not end it.
+        let both = format!("{text}@strict\non\n");
+        assert_eq!(parse_iot(&both), cfg);
+        assert!(parse_strict(&both));
+    }
+
+    #[test]
+    fn untouched_writes_nothing_and_malformed_reads_default() {
+        assert_eq!(iot_section(&IotConfig::default()), "");
+        assert_eq!(parse_iot("@iot\n(wifi:maybe)\n"), IotConfig::default());
+        assert_eq!(parse_iot(""), IotConfig::default());
     }
 }
 

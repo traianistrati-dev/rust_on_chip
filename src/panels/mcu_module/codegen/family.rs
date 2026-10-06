@@ -341,7 +341,7 @@ fn esp_fresh_main_rs(mcu: &Mcu, runtime: EspRuntime) -> String {
     let dac = modules::dac_configs(&mcu.modules);
     let can = modules::can_configs(&mcu.modules);
     let timer = modules::timer_configs(&mcu.modules);
-    codegen_esp::fresh_esp32c3_main_rs(
+    let code = codegen_esp::fresh_esp32c3_main_rs(
         &pins_of(mcu),
         &mcu.clock,
         &mcu.name,
@@ -369,7 +369,9 @@ fn esp_fresh_main_rs(mcu: &Mcu, runtime: EspRuntime) -> String {
         &mcu.family,
         runtime,
         mcu.dma.as_ref(),
-    )
+    );
+    // The IoT tab's heap, spawner and bring-up - see `iot_gen::esp_main`.
+    super::iot_gen::esp_main(code, mcu)
 }
 
 /// The Configuration tab's `main.rs` lines on an ESP: the watchdogs, then the
@@ -531,7 +533,7 @@ fn esp_update_main_rs(mcu: &Mcu, existing: &str, runtime: EspRuntime) -> String 
     let dac = modules::dac_configs(&mcu.modules);
     let can = modules::can_configs(&mcu.modules);
     let timer = modules::timer_configs(&mcu.modules);
-    codegen_esp::update_esp32c3_main_rs(
+    let code = codegen_esp::update_esp32c3_main_rs(
         existing,
         &pins_of(mcu),
         &mcu.clock,
@@ -560,7 +562,9 @@ fn esp_update_main_rs(mcu: &Mcu, existing: &str, runtime: EspRuntime) -> String 
         &mcu.family,
         runtime,
         mcu.dma.as_ref(),
-    )
+    );
+    // The IoT tab's heap, spawner and bring-up - see `iot_gen::esp_main`.
+    super::iot_gen::esp_main(code, mcu)
 }
 
 // ── Async ESP32-C3 (esp-rtos + embassy-executor) ────────────────────────────

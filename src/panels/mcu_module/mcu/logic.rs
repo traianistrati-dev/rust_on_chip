@@ -181,6 +181,7 @@ impl Mcu {
             watchdog: Default::default(),
             comp: Default::default(),
             flash_store: None,
+            iot: Default::default(),
         }
     }
 
@@ -1522,6 +1523,14 @@ impl Mcu {
             }
             s.push_str(&flash_store);
         }
+        // The IoT tab (`@iot`) - codegen input, and no secret in it.
+        let iot = mcu_config::iot_section(&self.iot);
+        if !iot.is_empty() {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&iot);
+        }
         // Diagram rotation (`@rotation`) — view preference, same append pattern.
         let rotation = mcu_config::rotation_section(self.rotated);
         if !rotation.is_empty() {
@@ -1728,6 +1737,7 @@ impl Mcu {
         self.watchdog = mcu_config::parse_watchdog(text);
         self.comp = mcu_config::parse_comp(text);
         self.flash_store = mcu_config::parse_flashstore(text);
+        self.iot = mcu_config::parse_iot(text);
         // Interrupt edges (`@irq`) — a missing section means every input is
         // polled, which is the pre-RTIC behaviour of every existing project.
         let irqs = mcu_config::parse_irq(text);

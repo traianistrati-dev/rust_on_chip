@@ -2053,7 +2053,40 @@ mod emit_for_manual_compile {
             mcu.flash_store = Some(c);
         }
 
+        // `EIDE_ESP_IOT=wifi|mqtt` switches the IoT tab on (the case sets the
+        // Async runtime too): the only place esp-radio, embassy-net and
+        // rust-mqtt meet the generated heap, spawner and files.
+        let iot_mode = std::env::var("EIDE_ESP_IOT").ok();
+        if let Some(mode) = &iot_mode {
+            use crate::panels::mcu_module::iot::MqttConfig;
+            mcu.iot.wifi = true;
+            if mode == "mqtt" {
+                let mut m = MqttConfig::for_chip(&chip);
+                m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/#".into()];
+                mcu.iot.mqtt = Some(m);
+            }
+            mcu.iot.ip.dhcp = mode != "mqtt";
+        }
+
         let mut main_rs = mcu.fresh_main_rs();
+        if iot_mode.is_some() {
+            assert!(
+                main_rs.contains("pins::configs::wifi::init(spawner, peripherals.WIFI)"),
+                "no Wi-Fi in main.rs:\n{main_rs}"
+            );
+            if iot_mode.as_deref() == Some("mqtt") {
+                main_rs = main_rs.replacen(
+                    "        // Your main loop code here.\n",
+                    concat!(
+                        "        // Your main loop code here.\n",
+                        "        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n",
+                        "        let msg = pins::configs::mqtt::incoming().await;\n",
+                        "        let _ = (msg.topic.as_str(), &msg.payload[..]);\n",
+                    ),
+                    1,
+                );
+            }
+        }
         if store.is_some() {
             assert!(
                 main_rs
@@ -2139,6 +2172,19 @@ mod emit_for_manual_compile {
         files.cargo_config = project_gen::ensure_partition_table_runner(
             &files.cargo_config,
             !files.partitions_csv.is_empty(),
+        );
+        // The IoT tab's crates and `alloc` in build-std, after the flash store
+        // as the app orders them.
+        let iot_active = crate::panels::mcu_module::iot::active(&mcu);
+        files.cargo_toml = project_gen::ensure_iot_deps(
+            &files.cargo_toml,
+            iot_active,
+            &esp.project.probe_chip,
+            &[],
+        );
+        files.cargo_config = project_gen::ensure_build_std_alloc(
+            &files.cargo_config,
+            iot_active.is_some(),
         );
         // The legacy single address, never edited into a list - what every
         // project from before device lists holds. It is device 1 all the same,

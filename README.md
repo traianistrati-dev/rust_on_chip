@@ -159,8 +159,8 @@ Blocking builds on `rp2040-hal` / `rp235x-hal`; async on `embassy-rp`.
 
 > **The W boards' LED is not on the chip.** It hangs off GPIO 0 of the CYW43
 > radio, reached through PIO — so it is **async only**, and it needs three
-> Infineon firmware blobs, which ship in `assets/cyw43-firmware/` under their own
-> license. The IDE wires all of that for you; it is called out here because
+> Infineon firmware blobs (a fourth, `43439A0_btfw.bin`, for Bluetooth), which
+> ship in `assets/cyw43-firmware/` under their own license. The IDE wires all of that for you; it is called out here because
 > "blink the LED" is otherwise the one thing that behaves differently on a W.
 
 On RP the **PWM channel is welded to the pad** — slice `(n / 2) % 8`, channel A
@@ -395,14 +395,33 @@ the generated block, the tasks below it, editable. Your code calls
 `pins::configs::espnow::send(BROADCAST, b"..").await` / `receive().await`;
 each protocol has one task that owns it and reconnects or resyncs on its own.
 
+**Bluetooth LE** is a link of its own, beside Wi-Fi or without it: a GATT
+peripheral with the **Nordic UART Service** (nRF Connect, nRF Toolbox or
+Serial Bluetooth Terminal talk to it), `pins::configs::ble::send(..).await`,
+`receive().await` and `connected()`, advertised under a name set in the tab.
+It is generated on every ESP with Bluetooth — the ESP32-H2, which has no
+Wi-Fi, included — through esp-radio and trouble-host 0.6 (with esp-radio's
+`coex` and a two-region heap beside Wi-Fi); on the Pico W / Pico 2 W through
+the CYW43's Bluetooth half and a fourth firmware blob; and on the nRF52832,
+nRF52833 and nRF52840 through Nordic's SoftDevice Controller under the MPSL
+(`nrf-sdc`, trouble-host 0.8), which takes RTC0, TIMER0, PPI 17-31 and
+interrupt priority 0 — every vector `main.rs` binds is moved to 2 (one bound
+in your own code must be moved off 0 by hand), and a crystal chosen on the
+Clock tab is held through the MPSL, which owns CLOCK. nrf-sdc builds its
+bindings with bindgen, so an nRF Bluetooth build needs libclang
+(`LIBCLANG_PATH`). Not generated, with the reason in the tab: the nRF5340 (its
+radio is on the network core), the nRF54L15 (its time driver and the MPSL share
+a GRTC channel), and an nRF with USB wired (both need CLOCK_POWER, untried on a
+board).
+
 The SSID and the passwords are typed in the tab but stored only in
 `src/pins/configs/secrets.rs`, which the generated `.gitignore` lists — never in
 `mcu.config`, which is committed. The file is written once and never
 regenerated.
 
-Every other link is listed with the reason it is not generated: BLE is a
-planned phase, Thread is research on the nRF52840 (OpenThread is C), and BLE
-Mesh, Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to generate for —
+Only what the chip's radio can carry is listed. Of that, what is not generated
+says why: Thread is research on the nRF52840 (OpenThread is C), and BLE Mesh,
+Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to generate for —
 ESP-NOW is the mesh-capable link, and `espnow.rs` describes a flooding relay
 on top of it. Port 1883 is plain TCP and SNTP is unauthenticated UDP; TLS is
 not generated yet.
@@ -895,7 +914,9 @@ And three things the dual license above does **not** cover:
   SDK redistribution include the accompanying `DEPENDENCIES` file — which is
   **not currently in the repo** and should be added from upstream. The IDE
   binary itself embeds these blobs to write them into Pico W projects, so a
-  binary release must reproduce that notice too.
+  binary release must reproduce that notice too. All four (`43439A0.bin`,
+  `43439A0_clm.bin`, `nvram_rp2040.bin`, and `43439A0_btfw.bin` for Bluetooth)
+  are byte-identical to embassy-rs/embassy's `cyw43-firmware/`.
 - **tinyVision's `pico2_ice.pcf`** (`assets/fpga-gateware/pico2-ice/`, built
   into the IDE and copied into every pico2-ice project that loads the FPGA) and
   the test bitstream

@@ -755,7 +755,7 @@ fn missing_block_notes(mcu: &Mcu) -> String {
 /// The pads are the chip's dedicated D+/D- balls, not GPIO, so nothing about
 /// them reaches a constructor: wiring them is how the user asks for the
 /// controller.
-fn usb_wired(mcu: &Mcu) -> bool {
+pub(crate) fn usb_wired(mcu: &Mcu) -> bool {
     let wired = |f: PinFunction| {
         mcu.iter_all_pins()
             .any(|p| !p.reserved && p.selected_function == f)
@@ -2584,7 +2584,140 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
 /// second reading of the pins: a TWIM that loses its block to a SPIM writes no
 /// buffer, and a separate rule would miss that.
 pub fn needs_static_cell(mcu: &Mcu) -> bool {
-    mcu.is_async() && is_nrf(&mcu.family) && async_bus_lines(mcu).static_cell
+    mcu.is_async()
+        && is_nrf(&mcu.family)
+        && (async_bus_lines(mcu).static_cell || ble_on(mcu))
+}
+
+/// Is the IoT tab's Bluetooth generated on this nRF? The MPSL and the
+/// SoftDevice Controller then take vectors, priority 0 and peripherals - see
+/// [`ble_lines`]. `pub` for the manifest (`nrf-sdc`, cortex-m's critical
+/// section), which must follow the same answer.
+pub fn ble_on(mcu: &Mcu) -> bool {
+    use crate::panels::mcu_module::iot::{self, Platform};
+    mcu.is_async()
+        && iot::active(mcu).is_some_and(|a| a.platform == Platform::Nrf && a.ble)
+}
+
+/// The MPSL's vectors on the nRF52, each with its handler: the low-priority
+/// software interrupt it pends, the clock, and the three it runs at priority 0.
+const MPSL_IRQS: [(&str, &str); 5] = [
+    ("EGU0_SWI0", "nrf_sdc::mpsl::LowPrioInterruptHandler"),
+    ("CLOCK_POWER", "nrf_sdc::mpsl::ClockInterruptHandler"),
+    ("RADIO", "nrf_sdc::mpsl::HighPrioInterruptHandler"),
+    ("TIMER0", "nrf_sdc::mpsl::HighPrioInterruptHandler"),
+    ("RTC0", "nrf_sdc::mpsl::HighPrioInterruptHandler"),
+];
+
+/// The vector an `irqs` entry binds (`"    UARTE0 => ..."` -> `UARTE0`).
+fn irq_vector(entry: &str) -> &str {
+    entry.trim().split(" =>").next().unwrap_or("").trim()
+}
+
+/// Bluetooth's lines in an Async nRF `main.rs`: `(before_init, after_init,
+/// body)`, and `irqs` gains the MPSL's vectors - into an entry the vector
+/// already has, since `bind_interrupts!` takes one entry per vector.
+///
+/// - before `embassy_nrf::init`: embassy-time and GPIOTE off priority 0, which
+///   is the radio's;
+/// - after it: every other vector `main.rs` binds off 0 as well;
+/// - last in the block: the MPSL on the LF clock `init` started, an RNG, and
+///   `ble::start` with the SoftDevice Controller's PPI channels.
+fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
+    let ours: Vec<String> = irqs
+        .iter()
+        .map(|e| irq_vector(e).to_owned())
+        .filter(|v| !MPSL_IRQS.iter().any(|(m, _)| m == v))
+        .collect();
+    for (vector, handler) in MPSL_IRQS {
+        match irqs.iter_mut().find(|e| irq_vector(e) == vector) {
+            Some(e) => {
+                let trimmed = e.trim_end().trim_end_matches(';').to_owned();
+                *e = format!("{trimmed}, {handler};");
+            }
+            None => irqs.push(format!("    {vector} => {handler};")),
+        }
+    }
+
+    let mut before = String::new();
+    before.push_str("    // Bluetooth (IoT tab): interrupt priority 0 belongs to the radio's MPSL,\n");
+    before.push_str("    // so embassy-time and GPIOTE run at 2.\n");
+    before.push_str("    config.time_interrupt_priority = embassy_nrf::interrupt::Priority::P2;\n");
+    before.push_str("    config.gpiote_interrupt_priority = embassy_nrf::interrupt::Priority::P2;\n");
+
+    let mut after = String::new();
+    if !ours.is_empty() {
+        after.push_str("    // Every vector bound above runs at 2: priority 0 is the radio's.\n");
+        after.push_str("    for irq in [\n");
+        for v in &ours {
+            after.push_str(&format!("        embassy_nrf::interrupt::{v},\n"));
+        }
+        after.push_str("    ] {\n");
+        after.push_str(
+            "        embassy_nrf::interrupt::InterruptExt::set_priority(irq, embassy_nrf::interrupt::Priority::P2);\n",
+        );
+        after.push_str("    }\n\n");
+    }
+
+    let clock = clock_choice(mcu);
+    let (source, ctiv, temp_ctiv, ppm, what) = match clock.lf {
+        LfSource::Xtal => ("MPSL_CLOCK_LF_SRC_XTAL", "0", "0", "50", "the 32.768 kHz crystal, 50 ppm"),
+        LfSource::Synth => (
+            "MPSL_CLOCK_LF_SRC_SYNTH",
+            "0",
+            "0",
+            "50",
+            "synthesized from the HF crystal, which then never stops",
+        ),
+        LfSource::Rc => (
+            "MPSL_CLOCK_LF_SRC_RC",
+            "nrf_sdc::mpsl::raw::MPSL_RECOMMENDED_RC_CTIV as u8",
+            "nrf_sdc::mpsl::raw::MPSL_RECOMMENDED_RC_TEMP_CTIV as u8",
+            "500",
+            "the RC oscillator, recalibrated by the MPSL at least every 8 s, 500 ppm",
+        ),
+    };
+    let mut body = String::new();
+    body.push_str("\n    // ── IoT (IoT tab) ──\n");
+    body.push_str("    // Bluetooth LE on Nordic's SoftDevice Controller, under the MPSL. Its LF\n");
+    body.push_str(&format!("    // clock is the one `init` started: {what}.\n"));
+    body.push_str("    let lfclk = nrf_sdc::mpsl::raw::mpsl_clock_lfclk_cfg_t {\n");
+    body.push_str(&format!("        source: nrf_sdc::mpsl::raw::{source} as u8,\n"));
+    body.push_str(&format!("        rc_ctiv: {ctiv},\n"));
+    body.push_str(&format!("        rc_temp_ctiv: {temp_ctiv},\n"));
+    body.push_str(&format!("        accuracy_ppm: {ppm},\n"));
+    body.push_str("        skip_wait_lfclk_started: false,\n");
+    body.push_str("    };\n");
+    body.push_str("    static MPSL: static_cell::StaticCell<nrf_sdc::mpsl::MultiprotocolServiceLayer<'static>> =\n");
+    body.push_str("        static_cell::StaticCell::new();\n");
+    body.push_str("    let mpsl = MPSL.init(\n");
+    body.push_str("        nrf_sdc::mpsl::MultiprotocolServiceLayer::new(\n");
+    body.push_str("            nrf_sdc::mpsl::Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31),\n");
+    body.push_str("            Irqs,\n");
+    body.push_str("            lfclk,\n");
+    body.push_str("        )\n");
+    body.push_str("        .unwrap(),\n");
+    body.push_str("    );\n");
+    // The MPSL owns CLOCK from here and starts the crystal for its radio
+    // events only; the Clock tab's crystal is held by a request never
+    // released. LFSYNTH keeps it running already.
+    if clock.hfxo && clock.lf != LfSource::Synth {
+        body.push_str("    // The Clock tab's 32 MHz crystal: the MPSL owns CLOCK now and may stop it\n");
+        body.push_str("    // between radio events, so it is requested once and never released.\n");
+        body.push_str("    core::mem::forget(mpsl.request_hfclk().await.unwrap());\n");
+    }
+    body.push_str("    static RNG:static_cell::StaticCell<embassy_nrf::rng::Rng<'static, embassy_nrf::mode::Blocking>> =\n");
+    body.push_str("        static_cell::StaticCell::new();\n");
+    body.push_str("    pins::configs::ble::start(\n");
+    body.push_str("        spawner,\n");
+    body.push_str("        mpsl,\n");
+    body.push_str("        nrf_sdc::Peripherals::new(\n");
+    body.push_str("            p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23,\n");
+    body.push_str("            p.PPI_CH24, p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,\n");
+    body.push_str("        ),\n");
+    body.push_str("        RNG.init(embassy_nrf::rng::Rng::new_blocking(p.RNG)),\n");
+    body.push_str("    );\n");
+    (before, after, body)
 }
 
 /// The module that shares `me`'s serial block, as its peripheral name.
@@ -2650,10 +2783,13 @@ pub fn shared_block_partner(
 /// The block on embassy-nrf: under the executor on Async, and under a plain
 /// `#[entry]` on Blocking for the part nrf-hal has no crate for.
 fn async_section(mcu: &Mcu) -> String {
-    let buses = async_bus_lines(mcu);
+    let mut buses = async_bus_lines(mcu);
     let (tasks, gpio) = async_gpio_lines(mcu);
+    // Bluetooth adds vectors to the binding, lines around `init` and its
+    // bring-up last in the block.
+    let ble = ble_on(mcu).then(|| ble_lines(mcu, &mut buses.irqs));
     // An armed input is the only thing here that needs the spawner.
-    let spawner = if tasks.is_empty() && !buses.spawns {
+    let spawner = if tasks.is_empty() && !buses.spawns && ble.is_none() {
         "_spawner"
     } else {
         "spawner"
@@ -2683,7 +2819,14 @@ fn async_section(mcu: &Mcu) -> String {
         o.push_str("    // embassy-nrf without an executor: nrf-hal is not used for this part, so\n    // Blocking calls the drivers' `blocking_*` methods (`blocking_write`, ...).\n");
     }
     o.push_str("    #[allow(unused_imports)]\n    use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};\n\n");
-    o.push_str(&async_clock_lines(mcu));
+    let clock = async_clock_lines(mcu);
+    match &ble {
+        Some((before, after, _)) => {
+            const INIT: &str = "    #[allow(unused_variables)]\n    let p = embassy_nrf::init(config);\n\n";
+            o.push_str(&clock.replacen(INIT, &format!("{before}{INIT}{after}"), 1));
+        }
+        None => o.push_str(&clock),
+    }
     // Only the peripheral: starting it is configuring it on this HAL.
     o.push_str(&super::watchdog_gen::nrf_init_lines(
         &mcu.watchdog,
@@ -2696,6 +2839,9 @@ fn async_section(mcu: &Mcu) -> String {
         o.push('\n');
     }
     o.push_str(&buses.body);
+    if let Some((_, _, body)) = &ble {
+        o.push_str(body);
+    }
     o.push_str(GEN_END);
     o.push('\n');
     o
@@ -4024,6 +4170,127 @@ mod async_codegen {
             }
         }
         mcu
+    }
+
+    /// Bluetooth with the Clock tab's crystal: the MPSL owns CLOCK and starts
+    /// the crystal for its own radio events, so `main.rs` holds a request for
+    /// good - after the MPSL exists - except on LFSYNTH, which keeps the
+    /// crystal running anyway.
+    #[test]
+    fn bluetooth_holds_the_clock_tabs_crystal() {
+        use crate::panels::mcu_module::iot::BleConfig;
+        let hold = "core::mem::forget(mpsl.request_hfclk().await.unwrap());";
+        let mut mcu = on_async(microbit(&[]));
+        mcu.iot.ble = Some(BleConfig::default());
+        let main = mcu.fresh_main_rs();
+        assert!(!main.contains(hold), "{main}");
+        assert!(main.contains("recalibrated by the MPSL at least every 8 s"), "{main}");
+
+        select(&mut mcu, "hfclk_src", 1);
+        let main = mcu.fresh_main_rs();
+        assert_eq!(main.matches(hold).count(), 1, "{main}");
+        assert!(main.find("MultiprotocolServiceLayer::new(").unwrap() < main.find(hold).unwrap());
+
+        select(&mut mcu, "lfclk_src", 1);
+        let main = mcu.fresh_main_rs();
+        assert!(main.contains("MPSL_CLOCK_LF_SRC_SYNTH"), "{main}");
+        assert!(!main.contains(hold), "{main}");
+    }
+
+    /// The IoT tab's Bluetooth on three nRF52 boards, for a real cross-compile
+    /// AND link (two critical sections - cortex-m's beside nrf-mpsl's - only
+    /// fail at the link): the nRF52840 DK and the nRF52832 DK (64 KiB of RAM,
+    /// the tightest) with nothing else, and the micro:bit v2 with every async
+    /// peripheral wired, so every bound vector is moved off priority 0. The
+    /// manifest goes through the app's calls in the app's order.
+    ///
+    /// ```text
+    /// cargo test --bin rust_on_chip emit_nrf_ble_project -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes projects to disk for a manual cross-compile"]
+    fn emit_nrf_ble_project() {
+        use crate::panels::mcu_module::iot::BleConfig;
+        for (id, dir_name, wired) in [
+            ("nrf52840_dk", "eide_nrf52840_ble_check", false),
+            ("nrf52832_dk", "eide_nrf52832_ble_check", false),
+            ("nrf52833_microbit_v2", "eide_nrf52833_ble_check", true),
+        ] {
+            let def = builtins::builtin_definitions()
+                .into_iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("built-in {id}"));
+            let mut mcu = if wired {
+                on_async(everything())
+            } else {
+                let mut m = def.build_mcu();
+                m.runtime = Runtime::Async;
+                m
+            };
+            // The three LF sources the MPSL is handed, and the crystal held
+            // for good: the 52840 DK on the HF crystal with the RC oscillator,
+            // the 52832 DK on the 32.768 kHz crystal, the micro:bit on LFSYNTH.
+            match id {
+                "nrf52840_dk" => select(&mut mcu, "hfclk_src", 1),
+                "nrf52832_dk" => select(&mut mcu, "lfclk_src", 2),
+                _ => {}
+            }
+            mcu.iot.ble = Some(BleConfig::default());
+            assert!(super::ble_on(&mcu), "{id}: Bluetooth is generated");
+
+            let main_rs = mcu.fresh_main_rs().replacen(
+                "        // Your main loop code here.\n",
+                concat!(
+                    "        // Your main loop code here.\n",
+                "        let packet = pins::configs::ble::receive().await;\n",
+                "        if pins::configs::ble::connected() {\n",
+                "            pins::configs::ble::send(&packet.data).await.ok();\n",
+                "        }\n",
+                ),
+                1,
+            );
+            assert!(main_rs.contains("ble::receive().await"), "the loop was seeded:\n{main_rs}");
+            assert_eq!(main_rs.contains("request_hfclk"), id == "nrf52840_dk", "{main_rs}");
+            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
+            let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            let user: Vec<(String, String)> = mcu.pin_tree_files();
+            let dir = std::env::temp_dir().join(dir_name);
+            project_gen::clear_project_dir_keep_target(&dir);
+            project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
+                .expect("write nrf ble project");
+
+            let toml_path = dir.join("Cargo.toml");
+            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
+            let sources = [main_rs.as_str()];
+            let toml = project_gen::ensure_async_deps(
+                &toml,
+                true,
+                project_gen::async_flavor_for(&mcu.family, ""),
+                false,
+                false,
+                false,
+                &sources,
+            );
+            let toml = project_gen::ensure_task_priority_deps(
+                &toml,
+                main_rs.contains("InterruptExecutor") || super::needs_static_cell(&mcu),
+                &sources,
+            );
+            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &sources);
+            let toml = project_gen::ensure_iot_deps(
+                &toml,
+                crate::panels::mcu_module::iot::active(&mcu),
+                &project.probe_chip,
+                &mcu.family,
+                &sources,
+            );
+            let toml = project_gen::ensure_mpsl_critical_section(&toml, super::ble_on(&mcu));
+            assert!(toml.contains("nrf-sdc"), "{toml}");
+            assert!(!toml.contains("critical-section-single-core"), "{toml}");
+            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
+            println!("wrote {}", dir.display());
+            println!("target: {}", def.project.target);
+        }
     }
 
     /// Two micro:bit projects on embassy-nrf, for a real cross-compile.

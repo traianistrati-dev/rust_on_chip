@@ -933,16 +933,26 @@ pub fn rtic_backend_feature(target: &str) -> &'static str {
 /// async USART path, which adds it from `ensure_async_deps` — running just
 /// before this one. Passing `needs_radio` straight through would strip it back
 /// out of every async-USART project that has no radio.
-pub fn ensure_cyw43_deps(cargo_toml: &str, needs_radio: bool, sources: &[&str]) -> String {
-    let s = ensure_dep(
-        cargo_toml,
-        "cyw43",
-        needs_radio,
-        // The radio's GPIO0 is the LED; `firmware-logs` and `bluetooth` are
-        // not on the path to it.
-        "cyw43 = \"0.7\"",
-        sources,
-    );
+pub fn ensure_cyw43_deps(
+    cargo_toml: &str,
+    needs_radio: bool,
+    bluetooth: bool,
+    sources: &[&str],
+) -> String {
+    // The `bluetooth` feature only with the IoT tab's Bluetooth: it hands out
+    // the radio's Bluetooth half, and with it on the runner polls for HCI
+    // traffic even when nothing uses it.
+    let line = if bluetooth {
+        "cyw43 = { version = \"0.7\", features = [\"bluetooth\"] }"
+    } else {
+        "cyw43 = \"0.7\""
+    };
+    let s = ensure_dep(cargo_toml, "cyw43", needs_radio, line, sources);
+    let s = if needs_radio {
+        set_owned_dep_line(&s, "cyw43", line)
+    } else {
+        s
+    };
     // Pinned together with `cyw43`: cyw43-pio 0.10 depends on embassy-rp 0.10,
     // the version the RP async template generates. A newer pair would compile
     // two embassy-rp crates into one binary.
@@ -986,21 +996,46 @@ pub fn ensure_iot_deps(
     cargo_toml: &str,
     active: Option<crate::panels::mcu_module::iot::Active>,
     esp_chip: &str,
+    family: &str,
     sources: &[&str],
 ) -> String {
-    use crate::panels::mcu_module::iot::Platform;
+    use crate::panels::mcu_module::iot::{self, Platform};
     let on = active.is_some();
     let esp = active.is_some_and(|a| a.platform == Platform::Esp);
     let station = active.is_some_and(|a| a.station);
     let esp_now = active.is_some_and(|a| a.esp_now);
     let mqtt = active.is_some_and(|a| a.mqtt);
-    let mut s = ensure_dep(
-        cargo_toml,
-        "esp-radio",
-        esp,
-        &format!("esp-radio = {{ version = \"0.18\", features = [\"{esp_chip}\", \"wifi\", \"unstable\"] }}"),
-        sources,
+    let ble = active.is_some_and(|a| a.ble);
+    // Wi-Fi on an ESP: the station or ESP-NOW; with Bluetooth too, `coex`.
+    let wifi = esp && (station || esp_now);
+    let esp_ble = esp && ble;
+    let coex = wifi && esp_ble;
+    // Bluetooth on trouble-host 0.6 (ESP, CYW43: bt-hci 0.8) or 0.8 (nRF:
+    // nrf-sdc's bt-hci 0.10). One version cannot serve both.
+    let trouble06 = ble && active.is_some_and(|a| a.platform != Platform::Nrf);
+    let nrf_feature = active
+        .filter(|a| a.ble && a.platform == Platform::Nrf)
+        .and_then(|_| iot::nrf_ble_feature(family));
+    let radio_features: Vec<&str> = [
+        Some(esp_chip),
+        wifi.then_some("wifi"),
+        esp_now.then_some("esp-now"),
+        esp_ble.then_some("ble"),
+        coex.then_some("coex"),
+        Some("unstable"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let radio_line = format!(
+        "esp-radio = {{ version = \"0.18\", features = [{}] }}",
+        radio_features
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
+    let mut s = ensure_dep(cargo_toml, "esp-radio", esp, &radio_line, sources);
     s = ensure_dep(
         &s,
         "esp-alloc",
@@ -1020,11 +1055,20 @@ pub fn ensure_iot_deps(
         if is_dep_line(line, "esp-rtos") && line.contains("features = [") && (esp || ours) {
             let l = toggle_hal_feature(line, "esp-radio", esp);
             out.push(toggle_hal_feature(&l, "esp-alloc", esp));
-        } else if is_dep_line(line, "esp-radio")
-            && line.contains("features = [")
-            && (esp_now || ours)
-        {
-            out.push(toggle_esp_now(line, esp_now));
+        } else if is_dep_line(line, "esp-radio") && line.contains("features = [") {
+            // Each feature follows its switch: added to any line, taken off only
+            // ours. `wifi` must go on an H2 - esp-radio's build script panics on
+            // it there - and `coex` only with both radios, or it warns.
+            let mut l = line.to_owned();
+            for (feature, want) in [("wifi", wifi), ("ble", esp_ble), ("coex", coex)] {
+                if want || ours {
+                    l = toggle_hal_feature(&l, feature, want);
+                }
+            }
+            if esp_now || ours {
+                l = toggle_esp_now(&l, esp_now);
+            }
+            out.push(l);
         } else {
             out.push(line.to_owned());
         }
@@ -1049,7 +1093,53 @@ pub fn ensure_iot_deps(
         "rust-mqtt = { version = \"0.6\", default-features = false, features = [\"v5\", \"bump\"] }",
         sources,
     );
-    if station {
+    // Bluetooth's host. trouble-host 0.6 locks its tables with embassy-sync
+    // 0.7, a crate apart from the 0.8 the IDE's channels use: its mutex is
+    // named through a renamed dependency, which esp-sync and cyw43 already pull
+    // in, so no new crate is built.
+    let trouble = if nrf_feature.is_some() {
+        "trouble-host = { version = \"0.8\", default-features = false, features = [\"peripheral\", \"gatt\", \"default-packet-pool\"] }"
+    } else {
+        "trouble-host = { version = \"0.6\", default-features = false, features = [\"gatt\", \"peripheral\", \"default-packet-pool\"] }"
+    };
+    let any_ble = trouble06 || nrf_feature.is_some();
+    s = ensure_dep(&s, "trouble-host", any_ble, trouble, sources);
+    if any_ble {
+        // A move between an ESP / Pico W and an nRF changes the version.
+        s = set_owned_dep_line(&s, "trouble-host", trouble);
+    }
+    s = ensure_dep(
+        &s,
+        "embassy-sync-0-7",
+        trouble06,
+        "embassy-sync-0-7 = { package = \"embassy-sync\", version = \"0.7\" }",
+        sources,
+    );
+    // The nRF's controller: the SoftDevice Controller on the MPSL, bt-hci for
+    // its vendor commands, rand_core for the RNG it is seeded from.
+    let sdc = nrf_feature.map(|f| {
+        format!("nrf-sdc = {{ version = \"0.4\", features = [\"{f}\", \"peripheral\"] }}")
+    });
+    s = ensure_dep(
+        &s,
+        "nrf-sdc",
+        sdc.is_some(),
+        sdc.as_deref().unwrap_or("nrf-sdc = \"0.4\""),
+        sources,
+    );
+    if let Some(line) = &sdc {
+        s = set_owned_dep_line(&s, "nrf-sdc", line);
+    }
+    s = ensure_dep(
+        &s,
+        "nrf-mpsl",
+        nrf_feature.is_some(),
+        "nrf-mpsl = { version = \"0.4\", features = [\"critical-section-impl\"] }",
+        sources,
+    );
+    s = ensure_dep(&s, "bt-hci", nrf_feature.is_some(), "bt-hci = \"0.10\"", sources);
+    s = ensure_dep(&s, "rand_core", nrf_feature.is_some(), "rand_core = \"0.9\"", sources);
+    if station || nrf_feature.is_some() {
         s = ensure_dep(&s, "static_cell", true, "static_cell = \"2\"", sources);
     }
     if on {
@@ -1097,6 +1187,58 @@ pub fn ensure_build_std_alloc(cargo_config: &str, needs: bool) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     if ends_nl {
+        s.push('\n');
+    }
+    s
+}
+
+/// `cargo_toml` with the IDE-owned line of `name` replaced by `line` when it
+/// differs - a feature or version switch on a line `ensure_dep` would only add
+/// or remove. A line the user wrote is left exactly as it is.
+fn set_owned_dep_line(cargo_toml: &str, name: &str, line: &str) -> String {
+    let wanted = format!("{line}   {DEP_MARKER}");
+    if !cargo_toml
+        .lines()
+        .any(|l| is_dep_line(l, name) && is_ide_owned(l) && l.trim_end() != wanted)
+    {
+        return cargo_toml.to_owned();
+    }
+    let mut s = cargo_toml
+        .lines()
+        .map(|l| {
+            if is_dep_line(l, name) && is_ide_owned(l) {
+                wanted.clone()
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if cargo_toml.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+/// `cortex-m` without `critical-section-single-core` while the nRF's MPSL
+/// runs: nrf-mpsl brings its own critical section (`critical-section-impl`),
+/// which must not be the plain interrupt mask while the radio's priority-0
+/// interrupts run, and two implementations do not link. The line sits in the
+/// generated block, whose refresh puts the feature back - so this runs on
+/// every regeneration, after the block is refreshed.
+pub fn ensure_mpsl_critical_section(cargo_toml: &str, mpsl: bool) -> String {
+    const WITH: &str = "cortex-m    = { version = \"0.7\", features = [\"critical-section-single-core\"] }";
+    const WITHOUT: &str = "cortex-m    = \"0.7\"   # the critical section is nrf-mpsl's (IoT tab: Bluetooth)";
+    let (from, to) = if mpsl { (WITH, WITHOUT) } else { (WITHOUT, WITH) };
+    if !cargo_toml.lines().any(|l| l.trim() == from) {
+        return cargo_toml.to_owned();
+    }
+    let mut s = cargo_toml
+        .lines()
+        .map(|l| if l.trim() == from { l.replacen(from, to, 1) } else { l.to_owned() })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if cargo_toml.ends_with('\n') {
         s.push('\n');
     }
     s
@@ -2004,6 +2146,12 @@ pub fn build_project_files(
 const CYW43_FW: &[u8] = include_bytes!("../../../assets/cyw43-firmware/43439A0.bin");
 const CYW43_CLM: &[u8] = include_bytes!("../../../assets/cyw43-firmware/43439A0_clm.bin");
 const CYW43_NVRAM: &[u8] = include_bytes!("../../../assets/cyw43-firmware/nvram_rp2040.bin");
+/// The radio's Bluetooth half, uploaded beside the Wi-Fi firmware when the IoT
+/// tab's Bluetooth is on (`cyw43::new_with_bluetooth`). Same source, same
+/// licence as the three above.
+const CYW43_BTFW: &[u8] = include_bytes!("../../../assets/cyw43-firmware/43439A0_btfw.bin");
+/// What `main.rs` names when it uploads [`CYW43_BTFW`].
+const CYW43_BTFW_NAME: &str = "43439A0_btfw.bin";
 const CYW43_LICENSE: &[u8] =
     include_bytes!("../../../assets/cyw43-firmware/LICENSE-permissive-binary-license-1.0.txt");
 
@@ -2031,6 +2179,11 @@ fn write_cyw43_firmware(dest: &Path, main_rs: &str) -> io::Result<()> {
         if !path.exists() {
             fs::write(path, bytes)?;
         }
+    }
+    // The Bluetooth firmware only when main.rs uploads it.
+    let bt = dir.join(CYW43_BTFW_NAME);
+    if main_rs.contains(CYW43_BTFW_NAME) && !bt.exists() {
+        fs::write(bt, CYW43_BTFW)?;
     }
     Ok(())
 }
@@ -2102,6 +2255,9 @@ fn included_blobs(main_rs: &str) -> Vec<&'static str> {
             "firmware/43439A0_clm.bin",
             "firmware/nvram_rp2040.bin",
         ]);
+        if main_rs.contains(CYW43_BTFW_NAME) {
+            out.push("firmware/43439A0_btfw.bin");
+        }
     }
     if main_rs.contains(FPGA_BITSTREAM_INCLUDE) {
         out.push("fpga/top.bin");
@@ -2115,6 +2271,7 @@ fn shipped_blob(rel: &str) -> Option<&'static [u8]> {
         "firmware/43439A0.bin" => Some(CYW43_FW),
         "firmware/43439A0_clm.bin" => Some(CYW43_CLM),
         "firmware/nvram_rp2040.bin" => Some(CYW43_NVRAM),
+        "firmware/43439A0_btfw.bin" => Some(CYW43_BTFW),
         "fpga/top.bin" => Some(FPGA_GATEWARE[0].1),
         _ => None,
     }
@@ -5241,6 +5398,7 @@ mod iot_deps_tests {
             esp_now: false,
             mqtt,
             sntp: false,
+            ble: false,
         })
     }
 
@@ -5248,7 +5406,7 @@ mod iot_deps_tests {
     /// features. Off again: every line the IDE added goes, the features too.
     #[test]
     fn the_esp_set_comes_and_goes() {
-        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", &[]);
+        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", "esp32c3", &[]);
         for want in [
             "esp-radio = { version = \"0.18\", features = [\"esp32c3\", \"wifi\", \"unstable\"] }",
             "esp-alloc = { version = \"0.10\", features = [\"esp32c3\"] }",
@@ -5263,9 +5421,9 @@ mod iot_deps_tests {
         }
         let rtos = on.lines().find(|l| l.starts_with("esp-rtos")).unwrap();
         assert!(rtos.contains("\"esp-radio\"") && rtos.contains("\"esp-alloc\""), "{rtos}");
-        assert_eq!(ensure_iot_deps(&on, esp(true), "esp32c3", &[]), on, "idempotent");
+        assert_eq!(ensure_iot_deps(&on, esp(true), "esp32c3", "esp32c3", &[]), on, "idempotent");
 
-        let off = ensure_iot_deps(&on, None, "esp32c3", &[]);
+        let off = ensure_iot_deps(&on, None, "esp32c3", "esp32c3", &[]);
         for gone in ["esp-radio =", "esp-alloc", "embassy-net", "rust-mqtt", "heapless", "embassy-sync"] {
             assert!(!off.contains(gone), "{gone} stayed:\n{off}");
         }
@@ -5276,8 +5434,8 @@ mod iot_deps_tests {
     /// MQTT off: the stack stays, the client goes.
     #[test]
     fn mqtt_is_its_own_crate() {
-        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", &[]);
-        let wifi_only = ensure_iot_deps(&on, esp(false), "esp32c3", &[]);
+        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", "esp32c3", &[]);
+        let wifi_only = ensure_iot_deps(&on, esp(false), "esp32c3", "esp32c3", &[]);
         assert!(!wifi_only.contains("rust-mqtt"), "{wifi_only}");
         assert!(wifi_only.contains("embassy-net"), "{wifi_only}");
     }
@@ -5293,8 +5451,10 @@ mod iot_deps_tests {
                 esp_now: false,
                 mqtt: true,
                 sntp: true,
+                ble: false,
             }),
             "",
+            "rp2040",
             &[],
         );
         assert!(pico.contains("embassy-net") && pico.contains("rust-mqtt"), "{pico}");
@@ -5304,8 +5464,8 @@ mod iot_deps_tests {
     /// A crate the user's own code names is never taken away.
     #[test]
     fn a_referenced_crate_survives_the_switch() {
-        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", &[]);
-        let off = ensure_iot_deps(&on, None, "esp32c3", &["use heapless::Vec;"]);
+        let on = ensure_iot_deps(ESP_ASYNC, esp(true), "esp32c3", "esp32c3", &[]);
+        let off = ensure_iot_deps(&on, None, "esp32c3", "esp32c3", &["use heapless::Vec;"]);
         assert!(off.contains("heapless"), "{off}");
     }
 
@@ -5319,15 +5479,16 @@ mod iot_deps_tests {
             esp_now: true,
             mqtt: false,
             sntp: true,
+            ble: false,
         });
-        let on = ensure_iot_deps(ESP_ASYNC, both, "esp32c3", &[]);
+        let on = ensure_iot_deps(ESP_ASYNC, both, "esp32c3", "esp32c3", &[]);
         assert!(
             on.contains("esp-radio = { version = \"0.18\", features = [\"esp32c3\", \"wifi\", \"esp-now\", \"unstable\"] }"),
             "{on}"
         );
-        assert_eq!(ensure_iot_deps(&on, both, "esp32c3", &[]), on, "idempotent");
+        assert_eq!(ensure_iot_deps(&on, both, "esp32c3", "esp32c3", &[]), on, "idempotent");
         // The feature leaves with the switch, the line stays for the station.
-        let station_only = ensure_iot_deps(&on, esp(false), "esp32c3", &[]);
+        let station_only = ensure_iot_deps(&on, esp(false), "esp32c3", "esp32c3", &[]);
         let radio = station_only.lines().find(|l| l.starts_with("esp-radio")).unwrap();
         assert!(!radio.contains("esp-now"), "{radio}");
 
@@ -5337,8 +5498,9 @@ mod iot_deps_tests {
             esp_now: true,
             mqtt: false,
             sntp: false,
+            ble: false,
         });
-        let a = ensure_iot_deps(ESP_ASYNC, alone, "esp32c3", &[]);
+        let a = ensure_iot_deps(ESP_ASYNC, alone, "esp32c3", "esp32c3", &[]);
         assert!(a.contains("\"esp-now\"") && a.contains("esp-alloc"), "{a}");
         assert!(!a.contains("embassy-net") && !a.contains("rust-mqtt"), "{a}");
         assert!(a.contains("embassy-sync") && a.contains("heapless"), "espnow.rs uses both:\n{a}");
@@ -5351,11 +5513,107 @@ mod iot_deps_tests {
         let mine = format!(
             "{ESP_ASYNC}esp-radio = {{ version = \"0.18\", features = [\"esp32c3\", \"wifi\", \"esp-now\", \"unstable\"] }}\n"
         );
-        let after = ensure_iot_deps(&mine, esp(false), "esp32c3", &[]);
+        let after = ensure_iot_deps(&mine, esp(false), "esp32c3", "esp32c3", &[]);
         let radio = after.lines().find(|l| l.starts_with("esp-radio")).unwrap();
         assert!(radio.contains("\"esp-now\""), "{radio}");
-        let off = ensure_iot_deps(&mine, None, "esp32c3", &[]);
+        let off = ensure_iot_deps(&mine, None, "esp32c3", "esp32c3", &[]);
         assert!(off.contains("\"esp-now\""), "never removed:\n{off}");
+    }
+
+    fn active(platform: Platform, station: bool, esp_now: bool, ble: bool) -> Option<Active> {
+        Some(Active {
+            platform,
+            station,
+            esp_now,
+            mqtt: false,
+            sntp: false,
+            ble,
+        })
+    }
+
+    /// The esp-radio line follows the radios: Bluetooth alone on the H2 has
+    /// no `wifi` (its build script panics on it); beside Wi-Fi it is `coex`.
+    #[test]
+    fn the_radio_line_follows_bluetooth_and_wifi() {
+        let h2 = ensure_iot_deps(
+            ESP_ASYNC,
+            active(Platform::Esp, false, false, true),
+            "esp32h2",
+            "esp32h2",
+            &[],
+        );
+        assert!(h2.contains("esp-radio = { version = \"0.18\", features = [\"esp32h2\", \"ble\", \"unstable\"] }"), "{h2}");
+        assert!(h2.contains("trouble-host = { version = \"0.6\""), "{h2}");
+        assert!(h2.contains("embassy-sync-0-7 = { package = \"embassy-sync\", version = \"0.7\" }"), "{h2}");
+        assert!(!h2.contains("embassy-net"), "{h2}");
+
+        let both = active(Platform::Esp, true, false, true);
+        let coex = ensure_iot_deps(ESP_ASYNC, both, "esp32c3", "esp32c3", &[]);
+        let radio = coex.lines().find(|l| l.starts_with("esp-radio")).unwrap();
+        for f in ["\"wifi\"", "\"ble\"", "\"coex\""] {
+            assert!(radio.contains(f), "{f}: {radio}");
+        }
+        assert_eq!(ensure_iot_deps(&coex, both, "esp32c3", "esp32c3", &[]), coex, "idempotent");
+        // Bluetooth off: ble and coex go, wifi stays.
+        let wifi = ensure_iot_deps(&coex, esp(false), "esp32c3", "esp32c3", &[]);
+        let radio = wifi.lines().find(|l| l.starts_with("esp-radio")).unwrap();
+        assert!(!radio.contains("\"ble\"") && !radio.contains("\"coex\""), "{radio}");
+        assert!(radio.contains("\"wifi\""), "{radio}");
+        assert!(!wifi.contains("trouble-host"), "{wifi}");
+
+        // Beside ESP-NOW with the station off: coex too, and no IP stack.
+        let now = ensure_iot_deps(ESP_ASYNC, active(Platform::Esp, false, true, true), "esp32c3", "esp32c3", &[]);
+        let radio = now.lines().find(|l| l.starts_with("esp-radio")).unwrap();
+        for f in ["\"wifi\"", "\"esp-now\"", "\"ble\"", "\"coex\""] {
+            assert!(radio.contains(f), "{f}: {radio}");
+        }
+        assert!(!now.contains("embassy-net"), "{now}");
+    }
+
+    /// nRF: the SoftDevice Controller's crates and trouble-host 0.8; a project
+    /// moved from an ESP to an nRF changes trouble-host's version.
+    #[test]
+    fn the_nrf_gets_its_own_bluetooth_crates() {
+        let nrf = active(Platform::Nrf, false, false, true);
+        let on = ensure_iot_deps("[dependencies]\n", nrf, "nRF52840_xxAA", "nrf52840", &[]);
+        for want in [
+            "nrf-sdc = { version = \"0.4\", features = [\"nrf52840\", \"peripheral\"] }",
+            "nrf-mpsl = { version = \"0.4\", features = [\"critical-section-impl\"] }",
+            "trouble-host = { version = \"0.8\"",
+            "bt-hci = \"0.10\"",
+            "rand_core = \"0.9\"",
+            "static_cell = \"2\"",
+        ] {
+            assert!(on.contains(want), "{want}:\n{on}");
+        }
+        assert!(!on.contains("esp-radio") && !on.contains("embassy-sync-0-7"), "{on}");
+
+        let esp = ensure_iot_deps("[dependencies]\n", active(Platform::Esp, false, false, true), "esp32c3", "esp32c3", &[]);
+        let moved = ensure_iot_deps(&esp, nrf, "nRF52840_xxAA", "nrf52840", &[]);
+        let trouble = moved.lines().find(|l| l.starts_with("trouble-host")).unwrap();
+        assert!(trouble.contains("\"0.8\""), "{trouble}");
+        assert_eq!(moved.matches("trouble-host").count(), 1, "{moved}");
+    }
+
+    /// cortex-m's critical section goes while the MPSL runs, and comes back.
+    #[test]
+    fn the_mpsl_takes_over_the_critical_section() {
+        let base = "[dependencies]\ncortex-m    = { version = \"0.7\", features = [\"critical-section-single-core\"] }\n";
+        let on = ensure_mpsl_critical_section(base, true);
+        assert!(!on.contains("critical-section-single-core"), "{on}");
+        assert_eq!(ensure_mpsl_critical_section(&on, true), on);
+        assert_eq!(ensure_mpsl_critical_section(&on, false), base);
+    }
+
+    /// cyw43's `bluetooth` feature comes and goes with the IoT tab's switch.
+    #[test]
+    fn cyw43_bluetooth_follows_the_switch() {
+        let on = ensure_cyw43_deps("[dependencies]\n", true, true, &[]);
+        assert!(on.contains("cyw43 = { version = \"0.7\", features = [\"bluetooth\"] }"), "{on}");
+        assert_eq!(ensure_cyw43_deps(&on, true, true, &[]), on);
+        let off = ensure_cyw43_deps(&on, true, false, &[]);
+        assert!(off.contains("cyw43 = \"0.7\""), "{off}");
+        assert!(!off.contains("bluetooth"), "{off}");
     }
 
     #[test]

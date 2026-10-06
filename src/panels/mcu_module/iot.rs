@@ -48,6 +48,9 @@ pub struct IotConfig {
     pub esp_now: Option<EspNowConfig>,
     /// Network time, `Some` while it is switched on. Needs the station.
     pub sntp: Option<SntpConfig>,
+    /// Bluetooth LE (a Nordic UART Service peripheral), `Some` while it is
+    /// switched on. A link of its own, beside Wi-Fi or without it.
+    pub ble: Option<BleConfig>,
 }
 
 impl Default for IotConfig {
@@ -59,8 +62,43 @@ impl Default for IotConfig {
             heap_kib: DEFAULT_HEAP_KIB,
             esp_now: None,
             sntp: None,
+            ble: None,
         }
     }
+}
+
+/// Bluetooth LE: the name the board advertises.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BleConfig {
+    pub device_name: String,
+}
+
+impl Default for BleConfig {
+    fn default() -> Self {
+        Self {
+            device_name: DEFAULT_BLE_NAME.to_owned(),
+        }
+    }
+}
+
+/// The advertised name when nobody chose one, or the chosen one cannot be.
+pub const DEFAULT_BLE_NAME: &str = "RustOnChip";
+
+/// The longest name trouble-host's GAP service takes (`gap.rs`). A longer one
+/// fails `GapConfig::build` - at boot, as a panic - so it never reaches the
+/// generated code.
+pub const MAX_BLE_NAME: usize = 22;
+
+/// What is wrong with an advertised name. `None` = fine.
+pub fn ble_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("no name - the generated code uses the default");
+    }
+    if name.len() > MAX_BLE_NAME {
+        return Some("longer than 22 bytes - the generated code uses the default");
+    }
+    None
 }
 
 /// ESP-NOW: the channel it uses while the station is off, and the peers it
@@ -276,6 +314,40 @@ pub enum Platform {
     Esp,
     /// The CYW43 radio beside the RP2040 / RP2350 on a Pico W / Pico 2 W.
     Cyw43,
+    /// Nordic's SoftDevice Controller under the MPSL: Bluetooth only.
+    Nrf,
+}
+
+/// The ESP parts with Bluetooth LE that esp-radio 0.18 drives. Not the S2
+/// (no Bluetooth); the H2 has it without Wi-Fi.
+const ESP_BT: [&str; 8] = [
+    "esp32", "esp32s3", "esp32c2", "esp32c3", "esp32c5", "esp32c6", "esp32c61", "esp32h2",
+];
+
+/// The nRF parts whose Bluetooth the generator writes: nrf-sdc 0.4 on
+/// embassy-nrf 0.11, compiled and linked on the 52832 and the 52840. Not the
+/// 54L15 (its time driver and the MPSL share a GRTC channel) nor the 5340
+/// (its radio is on the network core), see [`availability`].
+const NRF_BLE: [&str; 3] = ["nrf52832", "nrf52833", "nrf52840"];
+
+/// The radio a Bluetooth project is generated for, or `None` when the IDE does
+/// not generate Bluetooth for this chip.
+pub fn ble_platform(family: &str, cyw43: bool) -> Option<Platform> {
+    if ESP_BT.contains(&family) {
+        Some(Platform::Esp)
+    } else if cyw43 && matches!(family, "rp2040" | "rp235x") {
+        Some(Platform::Cyw43)
+    } else if NRF_BLE.contains(&family) {
+        Some(Platform::Nrf)
+    } else {
+        None
+    }
+}
+
+/// The nrf-sdc / embassy-nrf chip feature for an nRF family (`"nrf52840"`).
+/// The family key IS the feature for the parts in [`NRF_BLE`].
+pub fn nrf_ble_feature(family: &str) -> Option<&'static str> {
+    NRF_BLE.iter().copied().find(|f| *f == family)
 }
 
 /// The ESP parts with a Wi-Fi radio. The H2 has only 802.15.4 + BLE, the P4
@@ -311,6 +383,7 @@ pub fn platform_of(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Platform
 /// generator, the dependency sync and the harness all ask.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Active {
+    /// The radio: the Wi-Fi one when there is Wi-Fi, else the Bluetooth one.
     pub platform: Platform,
     /// The Wi-Fi station, and with it the IP stack.
     pub station: bool,
@@ -320,30 +393,47 @@ pub struct Active {
     pub mqtt: bool,
     /// SNTP over the stack - only with the station.
     pub sntp: bool,
+    /// Bluetooth LE.
+    pub ble: bool,
 }
 
 /// `Some` when a link is on, the chip can carry it, and the runtime is Async:
 /// every driver below is async-only, so a Blocking project gets nothing (the
 /// tab says why) rather than code that cannot compile. What needs the IP
-/// stack (MQTT, SNTP) is off without the station, whatever the tab holds.
+/// stack (MQTT, SNTP) is off without the station, whatever the tab holds -
+/// and so is any switch a project carried over from another chip still has.
 pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     use crate::panels::mcu_module::mcu::model::Runtime;
     if !matches!(mcu.runtime, Runtime::Async) {
         return None;
     }
-    let platform = platform_of(mcu)?;
-    let station = mcu.iot.wifi;
-    let esp_now = mcu.iot.esp_now.is_some() && platform == Platform::Esp;
-    if !station && !esp_now {
+    let cyw43 = has_cyw43(mcu);
+    let wifi = platform(&mcu.family, cyw43);
+    let bt = ble_platform(&mcu.family, cyw43);
+    let station = mcu.iot.wifi && wifi.is_some();
+    let esp_now = mcu.iot.esp_now.is_some() && ESP_WIFI.contains(&mcu.family.as_str());
+    let ble = mcu.iot.ble.is_some() && bt.is_some() && !nrf_ble_blocked_by_usb(mcu);
+    if !station && !esp_now && !ble {
         return None;
     }
     Some(Active {
-        platform,
+        platform: wifi.or(bt)?,
         station,
         esp_now,
         mqtt: station && mcu.iot.mqtt.is_some(),
         sntp: station && mcu.iot.sntp.is_some(),
+        ble,
     })
+}
+
+/// Bluetooth beside USB on an nRF: both bind the CLOCK_POWER vector (the MPSL
+/// runs the clocks, USB's VBUS detection the power events), and the two
+/// together have not been tried on a board. Not generated until they are; the
+/// tab says why - on either runtime, since switching to Async alone would not
+/// bring Bluetooth.
+pub fn nrf_ble_blocked_by_usb(mcu: &crate::panels::mcu_module::mcu::Mcu) -> bool {
+    NRF_BLE.contains(&mcu.family.as_str())
+        && crate::panels::mcu_module::codegen::nrf::usb_wired(mcu)
 }
 
 /// A link the tab lists.
@@ -399,6 +489,62 @@ impl Link {
     }
 }
 
+/// Can this chip's HARDWARE carry `link` at all, whatever this IDE generates?
+///
+/// The tab lists only these. An ESP-only protocol on an STM32, or Bluetooth on
+/// a Pico without the radio, is not an option with a reason - it is no option.
+/// What the chip can carry but the IDE does not generate (yet) stays listed,
+/// with [`availability`]'s reason: that is the answer to "can it do mesh?".
+pub fn chip_can_carry(link: Link, family: &str, cyw43: bool) -> bool {
+    match link {
+        Link::Wifi => platform(family, cyw43).is_some(),
+        Link::EspNow | Link::EspWifiMesh => ESP_WIFI.contains(&family),
+        Link::Ble | Link::BleMesh => has_ble_radio(family, cyw43),
+        Link::Thread | Link::Zigbee => has_ieee802154_radio(family),
+    }
+}
+
+/// A Bluetooth LE radio: every ESP but the S2, the CYW43 beside a Pico W,
+/// every nRF, and the STM32WB / WBA.
+fn has_ble_radio(family: &str, cyw43: bool) -> bool {
+    (family.starts_with("esp32") && family != "esp32s2")
+        || (cyw43 && matches!(family, "rp2040" | "rp235x"))
+        || family.starts_with("nrf")
+        || family.starts_with("stm32wb")
+}
+
+/// An IEEE 802.15.4 radio (Thread, Zigbee): the ESP32-C5/C6/H2, the nRF
+/// parts that have one (the nRF5340's is on its network core), the STM32WB.
+fn has_ieee802154_radio(family: &str) -> bool {
+    matches!(
+        family,
+        "esp32c5"
+            | "esp32c6"
+            | "esp32h2"
+            | "nrf52811"
+            | "nrf52820"
+            | "nrf52833"
+            | "nrf52840"
+            | "nrf5340"
+            | "nrf54l15"
+            | "stm32wb"
+    )
+}
+
+/// A sub-GHz radio (LoRa, (G)FSK): the STM32WL and WL3. It carries none of the
+/// links the tab lists, which the tab says rather than "no radio".
+pub fn has_subghz_radio(family: &str) -> bool {
+    matches!(family, "stm32wl" | "stm32wl3")
+}
+
+/// The links the tab lists for this chip, in the usual order.
+pub fn links_for(family: &str, cyw43: bool) -> Vec<Link> {
+    Link::ALL
+        .into_iter()
+        .filter(|l| chip_can_carry(*l, family, cyw43))
+        .collect()
+}
+
 /// Whether a link reaches the generated code on a chip.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Availability {
@@ -414,7 +560,6 @@ pub enum Availability {
 /// Whether `link` reaches the code on `family`, and if not, why.
 pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
     use Availability::{NotHere, Planned, Ready};
-    let esp = family.starts_with("esp32");
     let esp_wifi = ESP_WIFI.contains(&family);
     let nrf = family.starts_with("nrf");
     let rp = matches!(family, "rp2040" | "rp235x");
@@ -431,15 +576,17 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         Link::EspNow if esp_wifi => Ready,
         Link::EspNow => NotHere("Espressif's own protocol, on the ESP chips with Wi-Fi"),
 
+        Link::Ble if ble_platform(family, cyw43).is_some() => Ready,
         Link::Ble if family == "esp32s2" => NotHere("the ESP32-S2 has no Bluetooth radio"),
-        Link::Ble if esp => Planned("later phase: esp-radio BLE + trouble-host 0.6 (bt-hci 0.8)"),
-        Link::Ble if rp && cyw43 => {
-            Planned("later phase: cyw43 Bluetooth + trouble-host 0.6, and a fourth firmware blob")
-        }
+        Link::Ble if family == "nrf54l15" => Planned(
+            "embassy-nrf 0.11's time driver and the MPSL both use GRTC channel 11 - it builds, and would lose timer alarms on the board",
+        ),
         Link::Ble if family == "nrf5340" => NotHere(
             "the SoftDevice Controller runs on the network core, which this IDE does not generate",
         ),
-        Link::Ble if nrf => Planned("later phase: nrf-sdc 0.4 + trouble-host 0.8 (bt-hci 0.10)"),
+        Link::Ble if nrf => Planned(
+            "not tried on this part yet: the SoftDevice Controller and trouble need 20 KB of RAM",
+        ),
         Link::Ble if family.starts_with("stm32") => {
             NotHere("embassy-stm32-wpan is not published on crates.io")
         }
@@ -454,10 +601,12 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         Link::Thread if family == "nrf5340" => NotHere(
             "the 802.15.4 radio is on the network core, which this IDE does not generate",
         ),
-        Link::Thread if matches!(family, "nrf52811" | "nrf52820" | "nrf54l15") => NotHere(
+        Link::Thread if family.starts_with("stm32wb") => NotHere(
+            "the WB55 / WB35 radio runs Thread inside ST's co-processor firmware, reached through embassy-stm32-wpan - not published on crates.io (the WB15 / WB10 have no 802.15.4)",
+        ),
+        Link::Thread => NotHere(
             "the chip has an 802.15.4 radio, but no Thread stack is generated for this part",
         ),
-        Link::Thread => NotHere("needs an 802.15.4 radio"),
 
         Link::BleMesh => NotHere("no maintained no_std Rust stack"),
         Link::Zigbee => NotHere("no Rust Zigbee stack"),
@@ -500,18 +649,93 @@ mod tests {
     }
 
     /// Nothing is Ready that the generator does not emit: Wi-Fi where there
-    /// is a radio, ESP-NOW on the ESP chips with Wi-Fi, nothing else.
+    /// is a radio, ESP-NOW on the ESP chips with Wi-Fi, Bluetooth where
+    /// `ble_platform` has a radio for it, nothing else.
     #[test]
-    fn only_wifi_and_esp_now_are_ready() {
+    fn only_generated_links_are_ready() {
         for family in ["esp32", "esp32s2", "esp32c6", "esp32h2", "rp2040", "nrf52840", "nrf5340", "stm32f1"] {
             for link in Link::ALL {
                 let a = availability(link, family, family == "rp2040");
+                let cyw43 = family == "rp2040";
                 match link {
                     Link::Wifi => {}
                     Link::EspNow if ESP_WIFI.contains(&family) => {
                         assert_eq!(a, Availability::Ready, "{family}")
                     }
+                    Link::Ble => assert_eq!(
+                        a == Availability::Ready,
+                        ble_platform(family, cyw43).is_some(),
+                        "{family}"
+                    ),
                     _ => assert_ne!(a, Availability::Ready, "{family} {link:?}"),
+                }
+            }
+        }
+    }
+
+    /// Each chip lists only what its radio can carry - no ESP-only protocol on
+    /// another vendor's chip, nothing at all on a chip without a radio.
+    #[test]
+    fn the_tab_lists_only_what_the_chip_can_carry() {
+        use Link::*;
+        assert!(links_for("stm32f1", false).is_empty());
+        assert!(links_for("rp2040", false).is_empty(), "a Pico without the W");
+        assert_eq!(links_for("rp2040", true), [Wifi, Ble, BleMesh]);
+        assert_eq!(links_for("rp235x", true), [Wifi, Ble, BleMesh]);
+        assert_eq!(links_for("nrf52832", false), [Ble, BleMesh]);
+        assert_eq!(links_for("nrf52840", false), [Ble, Thread, BleMesh, Zigbee]);
+        assert_eq!(links_for("esp32c3", false), [Wifi, EspNow, Ble, BleMesh, EspWifiMesh]);
+        assert_eq!(links_for("esp32s2", false), [Wifi, EspNow, EspWifiMesh]);
+        assert_eq!(links_for("esp32h2", false), [Ble, Thread, BleMesh, Zigbee]);
+        assert_eq!(
+            links_for("esp32c6", false),
+            [Wifi, EspNow, Ble, Thread, BleMesh, Zigbee, EspWifiMesh]
+        );
+        // A sub-GHz radio carries nothing listed, and is not "no radio".
+        assert!(links_for("stm32wl", false).is_empty() && has_subghz_radio("stm32wl"));
+        assert!(links_for("stm32wl3", false).is_empty() && has_subghz_radio("stm32wl3"));
+        assert!(!has_subghz_radio("stm32f1"));
+    }
+
+    /// A listed link never gives a reason that denies the radio it was
+    /// listed for: the chip has it, so "no radio" / "needs a radio" is false.
+    #[test]
+    fn a_listed_link_never_says_the_chip_lacks_its_radio() {
+        for family in [
+            "esp32", "esp32s2", "esp32s3", "esp32c2", "esp32c3", "esp32c5", "esp32c6",
+            "esp32c61", "esp32h2", "rp2040", "rp235x", "nrf52805", "nrf52810", "nrf52811",
+            "nrf52820", "nrf52832", "nrf52833", "nrf52840", "nrf5340", "nrf54l15", "stm32wb",
+            "stm32wba", "stm32wl", "stm32wl3", "stm32f1",
+        ] {
+            for cyw43 in [false, true] {
+                for link in links_for(family, cyw43) {
+                    let why = match availability(link, family, cyw43) {
+                        Availability::Ready => continue,
+                        Availability::Planned(w) | Availability::NotHere(w) => w,
+                    };
+                    assert!(
+                        !why.starts_with("no ") || !why.contains("radio"),
+                        "{family} {link:?}: {why}"
+                    );
+                    assert!(!why.starts_with("needs an"), "{family} {link:?}: {why}");
+                }
+            }
+        }
+    }
+
+    /// What the generator emits is always among what the tab lists.
+    #[test]
+    fn everything_generated_is_listed() {
+        for family in [
+            "esp32", "esp32s2", "esp32s3", "esp32c2", "esp32c3", "esp32c5", "esp32c6",
+            "esp32c61", "esp32h2", "rp2040", "rp235x", "nrf52832", "nrf52833", "nrf52840",
+            "nrf5340", "nrf54l15", "stm32f1",
+        ] {
+            for cyw43 in [false, true] {
+                for link in Link::ALL {
+                    if availability(link, family, cyw43) == Availability::Ready {
+                        assert!(chip_can_carry(link, family, cyw43), "{family} {link:?}");
+                    }
                 }
             }
         }

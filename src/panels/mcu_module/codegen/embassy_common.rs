@@ -2059,20 +2059,26 @@ mod emit_for_manual_compile {
         // files. `wifi` = the station alone, `mqtt` = station + MQTT (no
         // `esp-now` feature, so `radio.esp_now` does not even exist),
         // `espnow` = ESP-NOW with the station off (`hold_radio`), `all` =
-        // station + MQTT + SNTP + ESP-NOW.
+        // station + MQTT + SNTP + ESP-NOW, `ble` = Bluetooth alone (the H2's
+        // only link), `ble+espnow` = Bluetooth beside ESP-NOW with the station
+        // off (`coex` with no IP stack), `ble+all` = everything at once.
         let iot_mode = std::env::var("EIDE_ESP_IOT").ok();
         if let Some(mode) = iot_mode.as_deref() {
-            use crate::panels::mcu_module::iot::{EspNowConfig, MqttConfig, SntpConfig};
-            mcu.iot.wifi = mode != "espnow";
-            if matches!(mode, "mqtt" | "all") {
+            use crate::panels::mcu_module::iot::{BleConfig, EspNowConfig, MqttConfig, SntpConfig};
+            let all = matches!(mode, "all" | "ble+all");
+            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt") || all;
+            if matches!(mode, "ble" | "ble+espnow" | "ble+all") {
+                mcu.iot.ble = Some(BleConfig::default());
+            }
+            if matches!(mode, "mqtt") || all {
                 let mut m = MqttConfig::for_chip(&chip);
                 m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/#".into()];
                 mcu.iot.mqtt = Some(m);
             }
-            if mode == "all" {
+            if all {
                 mcu.iot.sntp = Some(SntpConfig::default());
             }
-            if matches!(mode, "espnow" | "all") {
+            if matches!(mode, "espnow" | "ble+espnow") || all {
                 mcu.iot.esp_now = Some(EspNowConfig {
                     channel: 6,
                     peers: vec![[0x24, 0x0A, 0xC4, 0x12, 0x34, 0x56]],
@@ -2083,23 +2089,37 @@ mod emit_for_manual_compile {
 
         let mut main_rs = mcu.fresh_main_rs();
         if let Some(mode) = iot_mode.as_deref() {
-            assert!(
+            let all = matches!(mode, "all" | "ble+all");
+            let ble = matches!(mode, "ble" | "ble+espnow" | "ble+all");
+            assert_eq!(
                 main_rs.contains("esp_radio::wifi::new(peripherals.WIFI"),
-                "no radio in main.rs:\n{main_rs}"
+                mode != "ble",
+                "the Wi-Fi radio exactly when a Wi-Fi link is on:\n{main_rs}"
+            );
+            assert_eq!(
+                main_rs.contains("BleConnector::new(peripherals.BT"),
+                ble,
+                "the Bluetooth controller exactly when it is on:\n{main_rs}"
             );
             // The user's loop calls everything the files offer, as a user
             // would, so the API is compiled and not just declared.
             let mut used = String::from("        // Your main loop code here.\n");
-            if matches!(mode, "mqtt" | "all") {
+            if mode == "mqtt" || all {
                 used.push_str("        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n");
                 used.push_str("        let msg = pins::configs::mqtt::incoming().await;\n");
                 used.push_str("        let _ = (msg.topic.as_str(), &msg.payload[..]);\n");
             }
-            if mode == "all" {
+            if all {
                 used.push_str("        pins::configs::sntp::wait_synced().await;\n");
                 used.push_str("        let _ = (pins::configs::sntp::now_unix(), pins::configs::sntp::now_unix_ms());\n");
             }
-            if matches!(mode, "espnow" | "all") {
+            if ble {
+                used.push_str("        let packet = pins::configs::ble::receive().await;\n");
+                used.push_str("        if pins::configs::ble::connected() {\n");
+                used.push_str("            pins::configs::ble::send(&packet.data).await.ok();\n");
+                used.push_str("        }\n");
+            }
+            if matches!(mode, "espnow" | "ble+espnow") || all {
                 used.push_str("        let me = pins::configs::espnow::own_mac();\n");
                 used.push_str("        pins::configs::espnow::send(pins::configs::espnow::BROADCAST, &me).await.ok();\n");
                 used.push_str("        let frame = pins::configs::espnow::receive().await;\n");
@@ -2200,6 +2220,7 @@ mod emit_for_manual_compile {
             &files.cargo_toml,
             iot_active,
             &esp.project.probe_chip,
+            &mcu.family,
             &[],
         );
         files.cargo_config = project_gen::ensure_build_std_alloc(

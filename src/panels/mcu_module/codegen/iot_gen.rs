@@ -15,11 +15,16 @@
 //!   clock, `now_unix()` / `now_unix_ms()` / `wait_synced()`.
 //! - `espnow.rs`: channel and peers as constants; the task that owns ESP-NOW,
 //!   `send()` / `receive()` / `own_mac()`, and `hold_radio` for ESP-NOW alone.
+//! - `ble.rs`: the advertised name as a constant; a Nordic UART Service
+//!   peripheral on trouble-host, `send()` / `receive()` / `connected()`. One
+//!   editable half for the ESP and the Pico W (trouble-host 0.6, the radio as
+//!   a `Radio` type alias in the generated block), one for the nRF
+//!   (trouble-host 0.8 on the SoftDevice Controller).
 //! - `secrets.rs`: SSID and passwords. Written ONCE, never spliced - the file
 //!   is the store, and the project's `.gitignore` lists it.
 
 use crate::panels::mcu_module::iot::{
-    self, Active, EspNowConfig, IotConfig, IpConfig, MqttConfig, Platform, SntpConfig,
+    self, Active, BleConfig, EspNowConfig, IotConfig, IpConfig, MqttConfig, Platform, SntpConfig,
 };
 use crate::panels::mcu_module::mcu::Mcu;
 
@@ -28,6 +33,7 @@ pub const WIFI: &str = "wifi.rs";
 pub const MQTT: &str = "mqtt.rs";
 pub const SNTP: &str = "sntp.rs";
 pub const ESPNOW: &str = "espnow.rs";
+pub const BLE: &str = "ble.rs";
 pub const SECRETS: &str = "secrets.rs";
 
 /// The credentials file's path in the project tree.
@@ -44,6 +50,8 @@ const NET_TAIL: &str = include_str!("iot_templates/net.rs");
 const MQTT_TAIL: &str = include_str!("iot_templates/mqtt.rs");
 const SNTP_TAIL: &str = include_str!("iot_templates/sntp.rs");
 const ESPNOW_TAIL: &str = include_str!("iot_templates/espnow.rs");
+const BLE_TAIL: &str = include_str!("iot_templates/ble.rs");
+const BLE_NRF_TAIL: &str = include_str!("iot_templates/ble_nrf.rs");
 
 /// Editable halves an earlier version of the IDE wrote and this one no longer
 /// does, by file. A file still holding one exactly was never touched by its
@@ -61,7 +69,9 @@ const LEGACY_TAILS: [(&str, &str); 2] = [
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 8] = [
+const TAILS: [(&str, &str); 10] = [
+    (BLE, BLE_TAIL),
+    (BLE, BLE_NRF_TAIL),
     (WIFI, WIFI_ESP_TAIL),
     (WIFI, WIFI_CYW43_TAIL),
     (NET, NET_TAIL),
@@ -88,7 +98,7 @@ fn lf(s: &str) -> String {
 /// must pass them by, as it does the flash store's: it would only wipe what
 /// the user wrote below the markers.
 pub fn runtime_free(name: &str) -> bool {
-    matches!(name, NET | WIFI | MQTT | SNTP | ESPNOW | SECRETS)
+    matches!(name, NET | WIFI | MQTT | SNTP | ESPNOW | BLE | SECRETS)
 }
 
 /// The secrets the tab edits, in the order they are written.
@@ -132,6 +142,9 @@ pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
     }
     if let (true, Some(n)) = (active.esp_now, &cfg.esp_now) {
         out.push((ESPNOW.to_owned(), espnow_file(n)));
+    }
+    if let (true, Some(b)) = (active.ble, &cfg.ble) {
+        out.push((BLE.to_owned(), ble_file(b, active.platform)));
     }
     out
 }
@@ -187,6 +200,8 @@ fn wifi_file(platform: Platform) -> String {
     let (radio, tail) = match platform {
         Platform::Esp => ("the chip's own radio (esp-radio)", WIFI_ESP_TAIL),
         Platform::Cyw43 => ("the CYW43 radio beside the chip", WIFI_CYW43_TAIL),
+        // No Wi-Fi on an nRF: `active()` never sets `station` there.
+        Platform::Nrf => return String::new(),
     };
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
@@ -264,6 +279,41 @@ fn espnow_file(n: &EspNowConfig) -> String {
     o.push_str(GEN_END_CFG);
     o.push('\n');
     o.push_str(&lf(ESPNOW_TAIL));
+    o
+}
+
+/// `ble.rs`: the name, and on the ESP / Pico W the radio's type, which is all
+/// that differs between them - the editable half is the same text.
+fn ble_file(b: &BleConfig, platform: Platform) -> String {
+    let name = if iot::ble_name_problem(&b.device_name).is_none() {
+        b.device_name.as_str()
+    } else {
+        iot::DEFAULT_BLE_NAME
+    };
+    let mut o = String::new();
+    o.push_str(GEN_BEGIN_CFG);
+    o.push('\n');
+    o.push_str("// Bluetooth LE (from the IoT tab) — auto-updated; edit it in the tab.\n");
+    o.push_str("/// The name a phone lists the board under: 22 bytes at most.\n");
+    o.push_str(&format!("pub const DEVICE_NAME: &str = {};\n", lit(name)));
+    let tail = match platform {
+        Platform::Esp => {
+            o.push_str("/// The radio's Bluetooth half, which `main.rs` hands to `start`: the\n");
+            o.push_str("/// chip's own (esp-radio).\n");
+            o.push_str("pub type Radio = esp_radio::ble::controller::BleConnector<'static>;\n");
+            BLE_TAIL
+        }
+        Platform::Cyw43 => {
+            o.push_str("/// The radio's Bluetooth half, which `main.rs` hands to `start`: the\n");
+            o.push_str("/// CYW43 beside the chip.\n");
+            o.push_str("pub type Radio = cyw43::bluetooth::BtDriver<'static>;\n");
+            BLE_TAIL
+        }
+        Platform::Nrf => BLE_NRF_TAIL,
+    };
+    o.push_str(GEN_END_CFG);
+    o.push('\n');
+    o.push_str(&lf(tail));
     o
 }
 
@@ -361,10 +411,13 @@ fn is_pristine(name: &str, content: &str) -> bool {
     TAILS.iter().any(|(n, t)| *n == name && lf(t) == tail)
 }
 
-/// What replaces `existing` when it still holds an older IDE's template:
+/// What replaces `existing` when it still holds an older IDE's template, or
+/// another platform's:
 ///
-/// - untouched (see [`LEGACY_TAILS`]): the current template, below whatever
-///   the user wrote ABOVE the generated block, which is theirs;
+/// - untouched (see [`LEGACY_TAILS`]), or untouched but written for another
+///   radio (an ESP `ble.rs` on a project retargeted to an nRF, a Pico W
+///   `wifi.rs` on an ESP): the current template, below whatever the user wrote
+///   ABOVE the generated block, which is theirs;
 /// - phase 1's ESP `wifi.rs` with the user's own edits: the same file with
 ///   `init` moved to the signature `main.rs` now calls - the three lines that
 ///   differ, nothing else - so their edits survive and the project compiles.
@@ -375,9 +428,12 @@ fn is_pristine(name: &str, content: &str) -> bool {
 /// ([`phase_one_wifi_left`]).
 pub fn upgraded(name: &str, existing: &str, body: &str) -> Option<String> {
     let tail = tail_of(existing)?;
-    if LEGACY_TAILS
-        .iter()
-        .any(|(n, t)| *n == name && lf(t) == tail)
+    let foreign = tail_of(body).is_some_and(|want| want != tail)
+        && TAILS.iter().any(|(n, t)| *n == name && lf(t) == tail);
+    if foreign
+        || LEGACY_TAILS
+            .iter()
+            .any(|(n, t)| *n == name && lf(t) == tail)
     {
         let text = lf(existing);
         let head = text.find(GEN_BEGIN_CFG).map_or("", |i| &text[..i]);
@@ -420,6 +476,23 @@ pub fn phase_one_wifi_left(content: &str) -> bool {
     content.contains("esp_hal::peripherals::WIFI<'static>")
 }
 
+/// Is `content` the file `name` written for another radio than `platform`'s,
+/// and edited since, so [`upgraded`] left it? Then it no longer compiles
+/// against the `main.rs` this chip gets. Read off the crates each template
+/// names - the ESP and the Pico W share `ble.rs`'s editable half, so only the
+/// nRF's is told apart there.
+pub fn foreign_radio_file(name: &str, content: &str, platform: Platform) -> bool {
+    match name {
+        BLE => content.contains("nrf_sdc::") != (platform == Platform::Nrf),
+        WIFI => match platform {
+            Platform::Esp => content.contains("cyw43::"),
+            Platform::Cyw43 => content.contains("esp_radio::"),
+            Platform::Nrf => false,
+        },
+        _ => false,
+    }
+}
+
 /// The editable half of a generated file, as written: what follows the end
 /// marker's own newline, line endings normalised.
 fn tail_of(content: &str) -> Option<String> {
@@ -433,7 +506,7 @@ fn tail_of(content: &str) -> Option<String> {
 /// with a password in it. A pristine one goes like any pruned config file.
 pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
-    for name in [NET, WIFI, MQTT, SNTP, ESPNOW, SECRETS] {
+    for name in [NET, WIFI, MQTT, SNTP, ESPNOW, BLE, SECRETS] {
         if files.iter().any(|(n, _)| n == name) {
             continue;
         }
@@ -463,26 +536,55 @@ const ESP_START_MARK: &str = "\n    // ── Async runtime (esp-rtos drives the
 pub fn esp_main(code: String, mcu: &Mcu) -> String {
     match iot::active(mcu) {
         Some(active) if active.platform == Platform::Esp => {
-            esp_main_with(code, mcu.iot.heap_kib, active)
+            esp_main_with(code, mcu.iot.heap_kib, active, &mcu.family)
         }
         _ => code,
     }
 }
 
-fn esp_main_with(code: String, heap_kib: u32, active: Active) -> String {
+/// Wi-Fi (or ESP-NOW) and Bluetooth at once: coexistence, which needs esp-radio's
+/// `coex` and a larger heap.
+pub fn coex(active: Active) -> bool {
+    active.ble && (active.station || active.esp_now)
+}
+
+/// The heap lines for `active`. Bluetooth beside Wi-Fi takes two regions, the
+/// first in the RAM the bootloader used (free once the app runs): 64 + 64 KiB
+/// on the RISC-V parts, 96 + 24 on the ESP32, where 96 + 72 still links but
+/// leaves 6 KiB of stack (measured). Anything else is the tab's one region.
+pub fn esp_heap_lines(heap_kib: u32, active: Active, family: &str) -> String {
+    let mut o = String::from(
+        "\n    // ── Heap (IoT tab) ──\n    // esp-radio allocates its buffers here, so it has to exist before the\n    // scheduler starts.\n",
+    );
+    if coex(active) {
+        let (reclaimed, more, share) = if family == "esp32" {
+            (96, 24, "most")
+        } else {
+            (64, 64, "half")
+        };
+        o.push_str("    // Wi-Fi beside Bluetooth (coex) needs more: the RAM the bootloader used\n");
+        o.push_str(&format!("    // is free once the app runs, and carries {share} of it.\n"));
+        o.push_str(&format!(
+            "    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: {reclaimed} * 1024);\n"
+        ));
+        o.push_str(&format!("    esp_alloc::heap_allocator!(size: {more} * 1024);\n"));
+    } else {
+        o.push_str(&format!(
+            "    esp_alloc::heap_allocator!(size: {} * 1024);\n",
+            heap_kib.max(1)
+        ));
+    }
+    o
+}
+
+fn esp_main_with(code: String, heap_kib: u32, active: Active, family: &str) -> String {
     use super::{GEN_BEGIN, GEN_END};
     let (Some(begin), Some(end)) = (code.find(GEN_BEGIN), code.find(GEN_END)) else {
         return code;
     };
     let mut block = code[begin..end].to_owned();
     // 1. The heap, before the scheduler starts.
-    let heap = format!(
-        "\n    // ── Heap (IoT tab) ──\n\
-         \x20   // esp-radio allocates its buffers here, so it has to exist before the\n\
-         \x20   // scheduler starts.\n\
-         \x20   esp_alloc::heap_allocator!(size: {} * 1024);\n",
-        heap_kib.max(1)
-    );
+    let heap = esp_heap_lines(heap_kib, active, family);
     if let Some(at) = block.find(ESP_START_MARK) {
         block.insert_str(at, &heap);
     }
@@ -492,22 +594,31 @@ fn esp_main_with(code: String, heap_kib: u32, active: Active) -> String {
         "async fn main(spawner: Spawner)",
         1,
     );
-    // 3. The bring-up, last in the block: it only needs `peripherals.WIFI`.
-    //    One `esp_radio::wifi::new`: it hands out the station AND ESP-NOW,
-    //    and a second call would fail.
+    // 3. The bring-up, last in the block: it only needs `peripherals.BT` and
+    //    `peripherals.WIFI`. One `esp_radio::wifi::new`: it hands out the
+    //    station AND ESP-NOW, and a second call would fail.
     block.push_str("    // ── IoT (IoT tab) ──\n");
-    block.push_str(
-        "    let (wifi_controller, radio) = esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();\n",
-    );
-    if active.station {
-        block.push_str(&stack_lines(active, "wifi_controller, radio.station"));
-    } else {
-        // ESP-NOW alone: someone has to keep the controller - dropping it
-        // stops the radio, and ESP-NOW with it.
-        block.push_str("    pins::configs::espnow::hold_radio(spawner, wifi_controller);\n");
+    if active.ble {
+        block.push_str("    // Bluetooth LE: the chip's own controller, on its public address.\n");
+        block.push_str(
+            "    let ble = esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default()).unwrap();\n",
+        );
+        block.push_str("    pins::configs::ble::start(spawner, ble, None);\n");
     }
-    if active.esp_now {
-        block.push_str("    pins::configs::espnow::start(spawner, radio.esp_now);\n");
+    if active.station || active.esp_now {
+        block.push_str(
+            "    let (wifi_controller, radio) = esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();\n",
+        );
+        if active.station {
+            block.push_str(&stack_lines(active, "wifi_controller, radio.station"));
+        } else {
+            // ESP-NOW alone: someone has to keep the controller - dropping it
+            // stops the radio, and ESP-NOW with it.
+            block.push_str("    pins::configs::espnow::hold_radio(spawner, wifi_controller);\n");
+        }
+        if active.esp_now {
+            block.push_str("    pins::configs::espnow::start(spawner, radio.esp_now);\n");
+        }
     }
     block.push('\n');
     format!("{}{block}{}", &code[..begin], &code[end..])
@@ -534,13 +645,30 @@ fn stack_lines(active: Active, args: &str) -> String {
 }
 
 /// The Pico W lines that replace the LED's `let mut wl_led = control;` once
-/// the radio carries Wi-Fi: `control` belongs to the Wi-Fi task then.
+/// the radio carries Wi-Fi or Bluetooth.
+///
+/// Bluetooth first: its address is made of the radio's Wi-Fi MAC, read through
+/// `control` before Wi-Fi takes `control` for good. Without Wi-Fi, `control`
+/// stays in `main` as the LED's, as it does with no IoT at all.
 pub fn cyw43_main_lines(active: Active) -> String {
     let mut o = String::new();
     o.push_str("    // ── IoT (IoT tab) ──\n");
-    o.push_str("    // The radio's `control` belongs to the Wi-Fi task from here on, so the LED\n");
-    o.push_str("    // (GPIO0 on the radio) is switched through it: `pins::configs::wifi::set_led(true)`.\n");
-    o.push_str(&stack_lines(active, "net_device, control"));
+    if active.ble {
+        o.push_str("    // Bluetooth LE: the radio's Bluetooth half goes to the BLE task. Its address\n");
+        o.push_str("    // is made of the radio's Wi-Fi MAC, so that is read before `control` moves on.\n");
+        o.push_str("    let mac = control.address().await;\n");
+        o.push_str("    pins::configs::ble::start(spawner, bt_device, Some(mac));\n");
+    }
+    if active.station {
+        o.push_str("    // The radio's `control` belongs to the Wi-Fi task from here on, so the LED\n");
+        o.push_str("    // (GPIO0 on the radio) is switched through it: `pins::configs::wifi::set_led(true)`.\n");
+        o.push_str(&stack_lines(active, "net_device, control"));
+    } else {
+        o.push_str("    // The LED is GPIO0 ON THE RADIO, so it is driven through `control` rather\n");
+        o.push_str("    // than through a pin: `wl_led.gpio_set(0, true).await` turns it on.\n");
+        o.push_str("    #[allow(unused_mut, unused_variables)]\n");
+        o.push_str("    let mut wl_led = control;\n");
+    }
     o
 }
 
@@ -691,6 +819,37 @@ mod tests {
         assert!(upgraded(WIFI, &crlf, &body).is_some());
     }
 
+    /// A project retargeted to another radio: an untouched `ble.rs` or
+    /// `wifi.rs` of the old one becomes the new one's template, both ways,
+    /// with the user's head kept; an edited one stays and is reported.
+    #[test]
+    fn an_untouched_file_follows_the_radio_on_a_retarget() {
+        let b = BleConfig::default();
+        let esp = ble_file(&b, Platform::Esp);
+        let nrf = ble_file(&b, Platform::Nrf);
+        assert_eq!(upgraded(BLE, &esp, &nrf).as_deref(), Some(nrf.as_str()));
+        assert_eq!(upgraded(BLE, &nrf, &esp).as_deref(), Some(esp.as_str()));
+        // The ESP and the Pico W share the editable half: nothing to swap.
+        assert_eq!(upgraded(BLE, &esp, &ble_file(&b, Platform::Cyw43)), None);
+        let headed = format!("// mine\n{esp}");
+        let up = upgraded(BLE, &headed, &nrf).expect("swapped");
+        assert!(up.starts_with("// mine\n") && up.ends_with(&lf(BLE_NRF_TAIL)), "{up}");
+        assert!(!foreign_radio_file(BLE, &up, Platform::Nrf));
+
+        let (we, wc) = (wifi_file(Platform::Esp), wifi_file(Platform::Cyw43));
+        assert_eq!(upgraded(WIFI, &we, &wc).as_deref(), Some(wc.as_str()));
+        assert_eq!(upgraded(WIFI, &wc, &we).as_deref(), Some(we.as_str()));
+
+        let edited = format!("{esp}\n// my code\n");
+        assert_eq!(upgraded(BLE, &edited, &nrf), None, "an edited file stays");
+        assert!(foreign_radio_file(BLE, &edited, Platform::Nrf));
+        assert!(!foreign_radio_file(BLE, &edited, Platform::Cyw43));
+        assert!(foreign_radio_file(BLE, &nrf, Platform::Esp));
+        assert!(foreign_radio_file(WIFI, &wc, Platform::Esp));
+        assert!(foreign_radio_file(WIFI, &we, Platform::Cyw43));
+        assert!(!foreign_radio_file(WIFI, &we, Platform::Esp));
+    }
+
     /// An EDITED phase-1 ESP `wifi.rs` keeps the user's edits and gets the
     /// `init` main.rs now calls; one edited past recognition is reported.
     #[test]
@@ -837,8 +996,150 @@ mod tests {
         assert!(!off.fresh_main_rs().contains("cyw43"));
     }
 
-    /// The tab refuses a subscription longer than the template's `Message`
-    /// carries - the two numbers must be the same one.
+    fn ble_mcu(id: &str, wifi: bool) -> Mcu {
+        let mut m = mcu(id, Runtime::Async, false);
+        m.iot.wifi = wifi;
+        m.iot.ble = Some(BleConfig::default());
+        m
+    }
+
+    /// ESP Bluetooth alone: the controller, no Wi-Fi radio, the tab's heap.
+    #[test]
+    fn esp_ble_alone_starts_only_the_controller() {
+        let m = ble_mcu("esp32c3", false);
+        let code = m.fresh_main_rs();
+        assert!(code.contains("esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default()).unwrap();"), "{code}");
+        assert!(code.contains("pins::configs::ble::start(spawner, ble, None);"), "{code}");
+        assert!(!code.contains("esp_radio::wifi::new("), "{code}");
+        assert!(code.contains("esp_alloc::heap_allocator!(size: 72 * 1024);"), "{code}");
+        let names: Vec<String> = config_files_for(&m).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["ble.rs"]);
+    }
+
+    /// Beside Wi-Fi: coex's two-region heap, ESP32's own split, Bluetooth
+    /// started before the Wi-Fi radio.
+    #[test]
+    fn esp_ble_beside_wifi_takes_the_coex_heap() {
+        let c3 = ble_mcu("esp32c3", true).fresh_main_rs();
+        assert!(c3.contains("esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);"), "{c3}");
+        assert!(c3.contains("esp_alloc::heap_allocator!(size: 64 * 1024);"), "{c3}");
+        let at = |s: &str| c3.find(s).unwrap_or_else(|| panic!("{s}:\n{c3}"));
+        assert!(at("pins::configs::ble::start(") < at("esp_radio::wifi::new("));
+        let e32 = ble_mcu("esp32", true).fresh_main_rs();
+        assert!(e32.contains("#[esp_hal::ram(reclaimed)] size: 96 * 1024"), "{e32}");
+        assert!(e32.contains("esp_alloc::heap_allocator!(size: 24 * 1024);"), "{e32}");
+    }
+
+    /// Beside ESP-NOW with the station off: the coex heap, Bluetooth first,
+    /// the Wi-Fi radio held for ESP-NOW, and no IP stack.
+    #[test]
+    fn esp_ble_beside_espnow_alone_holds_the_radio() {
+        let mut m = ble_mcu("esp32c3", false);
+        m.iot.esp_now = Some(EspNowConfig::default());
+        let code = m.fresh_main_rs();
+        assert!(code.contains("#[esp_hal::ram(reclaimed)] size: 64 * 1024"), "{code}");
+        let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
+        assert!(at("pins::configs::ble::start(spawner, ble, None);") < at("esp_radio::wifi::new("));
+        assert!(code.contains("pins::configs::espnow::hold_radio(spawner, wifi_controller);"), "{code}");
+        assert!(!code.contains("net_stack"), "{code}");
+        let names: Vec<String> = config_files_for(&m).into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&BLE.to_owned()) && names.contains(&ESPNOW.to_owned()), "{names:?}");
+        assert!(!names.contains(&NET.to_owned()), "{names:?}");
+    }
+
+    /// The H2: Bluetooth with no Wi-Fi radio - a stale Wi-Fi switch from
+    /// another chip generates nothing.
+    #[test]
+    fn the_h2_gets_bluetooth_and_never_wifi() {
+        let m = ble_mcu("esp32h2", true);
+        let a = iot::active(&m).expect("BLE on the H2");
+        assert!(a.ble && !a.station, "{a:?}");
+        assert_eq!(a.platform, Platform::Esp);
+        let code = m.fresh_main_rs();
+        assert!(code.contains("BleConnector::new(peripherals.BT"), "{code}");
+        assert!(!code.contains("esp_radio::wifi::new("), "{code}");
+    }
+
+    /// The ESP and the Pico W share ble.rs's editable half; the generated
+    /// block names the radio, and a name that cannot be advertised is
+    /// replaced by the default.
+    #[test]
+    fn ble_rs_names_its_radio() {
+        let long = BleConfig {
+            device_name: "x".repeat(iot::MAX_BLE_NAME + 1),
+        };
+        let esp = ble_file(&long, Platform::Esp);
+        assert!(esp.contains("pub type Radio = esp_radio::ble::controller::BleConnector<'static>;"), "{esp}");
+        assert!(esp.contains(&format!("pub const DEVICE_NAME: &str = \"{}\";", iot::DEFAULT_BLE_NAME)), "{esp}");
+        let pico = ble_file(&BleConfig::default(), Platform::Cyw43);
+        assert!(pico.contains("pub type Radio = cyw43::bluetooth::BtDriver<'static>;"), "{pico}");
+        assert_eq!(tail_of(&esp), tail_of(&pico), "one editable half");
+        let nrf = ble_file(&BleConfig::default(), Platform::Nrf);
+        assert!(!nrf.contains("pub type Radio"), "{nrf}");
+        assert!(nrf.contains("SoftdeviceController"), "{nrf}");
+        assert!(is_pristine(BLE, &esp) && is_pristine(BLE, &nrf));
+    }
+
+    /// Pico W Bluetooth alone: the radio up once WITH its Bluetooth half, the
+    /// fourth firmware, the LED kept in main - and the address read first.
+    #[test]
+    fn the_pico_w_brings_up_bluetooth_alone() {
+        let m = ble_mcu("rp2040_pico_w", false);
+        let code = m.fresh_main_rs();
+        assert_eq!(code.matches("cyw43::new_with_bluetooth(").count(), 1, "{code}");
+        assert!(!code.contains("cyw43::new(state"), "{code}");
+        assert!(code.contains("cyw43::aligned_bytes!(\"../firmware/43439A0_btfw.bin\")"), "{code}");
+        assert!(code.contains("let (_net_device, bt_device, mut control, runner) ="), "{code}");
+        assert!(code.contains("pins::configs::ble::start(spawner, bt_device, Some(mac));"), "{code}");
+        assert!(code.contains("let mut wl_led = control;"), "{code}");
+        assert!(crate::panels::mcu_module::codegen::rp::needs_bluetooth(&m));
+        assert!(crate::panels::mcu_module::codegen::rp::needs_radio(&m));
+    }
+
+    /// With Wi-Fi too: the MAC is read before Wi-Fi takes `control`.
+    #[test]
+    fn the_pico_w_reads_its_mac_before_wifi_takes_control() {
+        let code = ble_mcu("rp2350_pico2_w", true).fresh_main_rs();
+        let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
+        assert!(at("control.address().await") < at("wifi::init(spawner, net_device, control)"));
+        assert!(code.contains("let (net_device, bt_device, mut control, runner) ="), "{code}");
+        assert!(!code.contains("wl_led"), "{code}");
+    }
+
+    /// nRF Bluetooth: the MPSL's vectors bound, priority 0 left to the radio,
+    /// the bring-up last, the spawner named.
+    #[test]
+    fn the_nrf_brings_up_the_softdevice_controller() {
+        let m = ble_mcu("nrf52840_dk", false);
+        assert!(crate::panels::mcu_module::codegen::nrf::ble_on(&m));
+        let code = m.fresh_main_rs();
+        for want in [
+            "EGU0_SWI0 => nrf_sdc::mpsl::LowPrioInterruptHandler;",
+            "CLOCK_POWER => nrf_sdc::mpsl::ClockInterruptHandler;",
+            "RADIO => nrf_sdc::mpsl::HighPrioInterruptHandler;",
+            "TIMER0 => nrf_sdc::mpsl::HighPrioInterruptHandler;",
+            "RTC0 => nrf_sdc::mpsl::HighPrioInterruptHandler;",
+            "config.time_interrupt_priority = embassy_nrf::interrupt::Priority::P2;",
+            "config.gpiote_interrupt_priority = embassy_nrf::interrupt::Priority::P2;",
+            "nrf_sdc::mpsl::MultiprotocolServiceLayer::new(",
+            "pins::configs::ble::start(",
+            "async fn main(spawner: embassy_executor::Spawner)",
+        ] {
+            assert!(code.contains(want), "{want}:\n{code}");
+        }
+        let at = |s: &str| code.find(s).unwrap();
+        assert!(at("config.time_interrupt_priority") < at("embassy_nrf::init(config)"));
+        assert!(crate::panels::mcu_module::codegen::nrf::needs_static_cell(&m));
+    }
+
+    /// The nRF5340 and the 54L15 do not get Bluetooth generated (their reasons
+    /// are in `availability`); an nRF52 with USB wired waits for it.
+    #[test]
+    fn nrf_bluetooth_where_it_is_not_generated() {
+        for id in ["nrf5340_dk", "nrf54l15_dk"] {
+            assert!(iot::active(&ble_mcu(id, false)).is_none(), "{id}");
+        }
+    }
     #[test]
     fn the_template_carries_the_topic_length_the_tab_checks() {
         let line = format!("pub const MAX_TOPIC: usize = {};", iot::MAX_TOPIC);

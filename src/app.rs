@@ -3911,7 +3911,12 @@ impl AppIde {
                 .mcu
                 .as_ref()
                 .is_some_and(crate::panels::mcu_module::codegen::rp::needs_radio);
-            let new_toml = project_gen::ensure_cyw43_deps(&new_toml, needs_radio, &sources);
+            let needs_bluetooth = self
+                .mcu
+                .as_ref()
+                .is_some_and(crate::panels::mcu_module::codegen::rp::needs_bluetooth);
+            let new_toml =
+                project_gen::ensure_cyw43_deps(&new_toml, needs_radio, needs_bluetooth, &sources);
             // Cortex-M0 async: `static_cell` needs CAS the core does not have.
             let async_target = self
                 .selected_build_cfg()
@@ -3949,7 +3954,15 @@ impl AppIde {
                 .mcu
                 .as_ref()
                 .and_then(crate::panels::mcu_module::iot::active);
-            let new_toml = project_gen::ensure_iot_deps(&new_toml, iot_active, &esp_chip, &sources);
+            let family = self.mcu.as_ref().map_or("", |m| m.family.as_str());
+            let new_toml =
+                project_gen::ensure_iot_deps(&new_toml, iot_active, &esp_chip, family, &sources);
+            // The nRF's MPSL brings its own critical section: cortex-m's goes.
+            let mpsl = self
+                .mcu
+                .as_ref()
+                .is_some_and(crate::panels::mcu_module::codegen::nrf::ble_on);
+            let new_toml = project_gen::ensure_mpsl_critical_section(&new_toml, mpsl);
             // Strict-lints `[lints.clippy]` block (MCU System toggle).
             let strict = self.mcu.as_ref().is_some_and(|m| m.strict_lints);
             let new_toml = project_gen::ensure_strict_lints(&new_toml, strict);

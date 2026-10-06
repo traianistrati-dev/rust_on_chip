@@ -3852,7 +3852,7 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
     // The radio takes one more channel, from the same counter — two drivers
     // both handed DMA_CH0 would compile and then fight at run time.
     let radio = if needs_radio(mcu) {
-        let (mut r_irqs, task, body) = radio_lines(dma, iot_wifi(mcu));
+        let (mut r_irqs, task, body) = radio_lines(dma, iot_radio(mcu));
         take(dma, "CYW43 radio - PIO SPI", &mut uses);
         dma += 1;
         irqs.append(&mut r_irqs);
@@ -4013,17 +4013,24 @@ fn radio_led(mcu: &Mcu) -> bool {
         .any(|p| p.name == "WL_LED" && p.selected_function == PinFunction::GpioOutput)
 }
 
-/// Does the radio come up? For the LED, or for the IoT tab's Wi-Fi - one
-/// bring-up either way, since two would put two PIO SPIs on the same pins.
-/// `pub` because the app's dependency sync asks the same question.
+/// Does the radio come up? For the LED, or for the IoT tab's Wi-Fi or
+/// Bluetooth - one bring-up whatever it is for, since two would put two PIO
+/// SPIs on the same pins. `pub` because the app's dependency sync asks the
+/// same question.
 pub fn needs_radio(mcu: &Mcu) -> bool {
-    radio_led(mcu) || iot_wifi(mcu).is_some()
+    radio_led(mcu) || iot_radio(mcu).is_some()
 }
 
-/// What the IoT tab runs on this board's CYW43, when its Wi-Fi is on.
-fn iot_wifi(mcu: &Mcu) -> Option<crate::panels::mcu_module::iot::Active> {
+/// Does the radio come up with its Bluetooth half (`new_with_bluetooth`, a
+/// fourth firmware, cyw43's `bluetooth` feature)? `pub` for the manifest.
+pub fn needs_bluetooth(mcu: &Mcu) -> bool {
+    iot_radio(mcu).is_some_and(|a| a.ble)
+}
+
+/// What the IoT tab runs on this board's CYW43: Wi-Fi, Bluetooth or both.
+fn iot_radio(mcu: &Mcu) -> Option<crate::panels::mcu_module::iot::Active> {
     use crate::panels::mcu_module::iot::{self, Platform};
-    iot::active(mcu).filter(|a| a.platform == Platform::Cyw43 && a.station)
+    iot::active(mcu).filter(|a| a.platform == Platform::Cyw43 && (a.station || a.ble))
 }
 
 /// The bring-up for the CYW43 radio, for its GPIO0 (the LED) and, with the
@@ -4066,10 +4073,31 @@ async fn cyw43_task(
 
     // With Wi-Fi on, the radio's network half is used and `control` moves to
     // the Wi-Fi task; without it the LED keeps `control` to itself.
-    let net_device = if iot.is_some() {
+    let net_device = if iot.is_some_and(|a| a.station) {
         "net_device"
     } else {
         "_net_device"
+    };
+    // With Bluetooth, the radio comes up with its Bluetooth half too: a fourth
+    // firmware, and the call that hands that half out.
+    let ble = iot.is_some_and(|a| a.ble);
+    let btfw = if ble {
+        concat!(
+            "    // The radio's Bluetooth half runs a firmware of its own, uploaded beside\n",
+            "    // the Wi-Fi one (IoT tab: Bluetooth LE).\n",
+            "    let btfw = cyw43::aligned_bytes!(\"../firmware/43439A0_btfw.bin\");\n",
+        )
+    } else {
+        ""
+    };
+    let bring_up = if ble {
+        format!(
+            "    let ({net_device}, bt_device, mut control, runner) =\n        cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;\n"
+        )
+    } else {
+        format!(
+            "    let ({net_device}, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;\n"
+        )
     };
     let tail = match iot {
         Some(active) => super::iot_gen::cyw43_main_lines(active),
@@ -4094,7 +4122,7 @@ async fn cyw43_task(
     let fw = cyw43::aligned_bytes!(\"../firmware/43439A0.bin\");
     let clm = cyw43::aligned_bytes!(\"../firmware/43439A0_clm.bin\");
     let nvram = cyw43::aligned_bytes!(\"../firmware/nvram_rp2040.bin\");
-
+{btfw}
     // GP23/24/25/29 are the radio's, which is why the canvas reserves them.
     let pwr = embassy_rp::gpio::Output::new(p.PIN_23, Level::Low);
     let cs = embassy_rp::gpio::Output::new(p.PIN_25, Level::High);
@@ -4114,8 +4142,7 @@ async fn cyw43_task(
 
     static RADIO_STATE: static_cell::StaticCell<cyw43::State> = static_cell::StaticCell::new();
     let state = RADIO_STATE.init(cyw43::State::new());
-    let ({net_device}, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
-    // embassy-executor 0.10: the task FUNCTION returns the Result (the pool can
+{bring_up}    // embassy-executor 0.10: the task FUNCTION returns the Result (the pool can
     // be exhausted), so the `unwrap` goes inside `spawn`, not after it.
     spawner.spawn(cyw43_task(runner).unwrap());
     control.init(clm).await;
@@ -4905,7 +4932,7 @@ mod emit_async_for_manual_compile {
                 false,
                 &[],
             );
-            let toml = project_gen::ensure_cyw43_deps(&toml, true, &[]);
+            let toml = project_gen::ensure_cyw43_deps(&toml, true, false, &[]);
             // `static_cell` holds the driver state, and on the Pico's M0 that
             // needs a CAS the core does not have. The app adds this right after
             // the same two calls; without it only the RP2350 half builds.
@@ -4946,10 +4973,14 @@ mod emit_async_for_manual_compile {
     #[test]
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_rp_iot_project() {
-        use crate::panels::mcu_module::iot::{self, MqttConfig, SntpConfig};
-        for (id, dir_name) in [
-            ("rp2040_pico_w", "eide_rp2040w_iot_check"),
-            ("rp2350_pico2_w", "eide_rp2350w_iot_check"),
+        use crate::panels::mcu_module::iot::{self, BleConfig, MqttConfig, SntpConfig};
+        // (board, folder, Wi-Fi + MQTT + SNTP, Bluetooth): the Wi-Fi shape,
+        // Wi-Fi beside Bluetooth, and Bluetooth alone with the LED in main.
+        for (id, dir_name, wifi, ble) in [
+            ("rp2040_pico_w", "eide_rp2040w_iot_check", true, false),
+            ("rp2350_pico2_w", "eide_rp2350w_iot_check", true, false),
+            ("rp2040_pico_w", "eide_rp2040w_ble_check", true, true),
+            ("rp2350_pico2_w", "eide_rp2350w_ble_check", false, true),
         ] {
             let def = builtins::builtin_definitions()
                 .into_iter()
@@ -4964,37 +4995,53 @@ mod emit_async_for_manual_compile {
                 }
             }
             mcu.reconcile_modules();
-            mcu.iot.wifi = true;
-            let mut m = MqttConfig::for_chip(id);
-            m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/+/set".into()];
-            mcu.iot.mqtt = Some(m);
-            mcu.iot.sntp = Some(SntpConfig::default());
+            mcu.iot.wifi = wifi;
+            if wifi {
+                let mut m = MqttConfig::for_chip(id);
+                m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/+/set".into()];
+                mcu.iot.mqtt = Some(m);
+                mcu.iot.sntp = Some(SntpConfig::default());
+            }
+            if ble {
+                mcu.iot.ble = Some(BleConfig::default());
+            }
             let active = iot::active(&mcu);
-            assert!(active.is_some(), "Wi-Fi on a W board on Async");
+            assert!(active.is_some(), "a link on a W board on Async");
 
-            let main_rs = mcu.fresh_main_rs().replacen(
-                "        // Your main loop code here.\n",
-                concat!(
-                    "        // Your main loop code here.\n",
-                    "        pins::configs::wifi::set_led(true);\n",
-                    "        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n",
-                    "        let msg = pins::configs::mqtt::incoming().await;\n",
-                    "        let _ = (msg.topic.as_str(), &msg.payload[..]);\n",
-                    "        pins::configs::sntp::wait_synced().await;\n",
-                    "        let _ = (pins::configs::sntp::now_unix(), pins::configs::sntp::now_unix_ms());\n",
-                ),
-                1,
-            );
-            assert!(main_rs.contains("set_led(true)"), "the user loop was seeded:\n{main_rs}");
-            assert!(main_rs.contains("pins::configs::sntp::start(spawner, net_stack);"), "{main_rs}");
-            assert_eq!(main_rs.matches("cyw43::new(").count(), 1, "{main_rs}");
+            let mut used = String::from("        // Your main loop code here.\n");
+            if wifi {
+                used.push_str("        pins::configs::wifi::set_led(true);\n");
+                used.push_str("        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n");
+                used.push_str("        let msg = pins::configs::mqtt::incoming().await;\n");
+                used.push_str("        let _ = (msg.topic.as_str(), &msg.payload[..]);\n");
+                used.push_str("        pins::configs::sntp::wait_synced().await;\n");
+                used.push_str("        let _ = (pins::configs::sntp::now_unix(), pins::configs::sntp::now_unix_ms());\n");
+            } else {
+                // Bluetooth alone: the LED stays `main`'s.
+                used.push_str("        wl_led.gpio_set(0, pins::configs::ble::connected()).await;\n");
+            }
+            if ble {
+                used.push_str("        let packet = pins::configs::ble::receive().await;\n");
+                used.push_str("        pins::configs::ble::send(&packet.data).await.ok();\n");
+            }
+            let main_rs = mcu
+                .fresh_main_rs()
+                .replacen("        // Your main loop code here.\n", &used, 1);
+            assert!(main_rs.contains(&used), "the user loop was seeded:\n{main_rs}");
+            if wifi {
+                assert!(main_rs.contains("pins::configs::sntp::start(spawner, net_stack);"), "{main_rs}");
+            }
+            let bring_up = if ble { "cyw43::new_with_bluetooth(" } else { "cyw43::new(" };
+            assert_eq!(main_rs.matches(bring_up).count(), 1, "{main_rs}");
 
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
-            assert!(
+            // The credentials go with the station: Bluetooth alone has none.
+            assert_eq!(
                 user.iter().any(|(p, _)| p == crate::panels::mcu_module::codegen::iot_gen::SECRETS_PATH),
-                "secrets.rs is written"
+                wifi,
+                "secrets.rs is written exactly with Wi-Fi"
             );
             let dir = std::env::temp_dir().join(dir_name);
             project_gen::clear_project_dir_keep_target(&dir);
@@ -5012,10 +5059,23 @@ mod emit_async_for_manual_compile {
                 false,
                 &[],
             );
-            let toml = project_gen::ensure_cyw43_deps(&toml, super::needs_radio(&mcu), &[]);
+            let toml = project_gen::ensure_cyw43_deps(
+                &toml,
+                super::needs_radio(&mcu),
+                super::needs_bluetooth(&mcu),
+                &[],
+            );
             let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
-            let toml = project_gen::ensure_iot_deps(&toml, active, "", &[]);
+            let toml = project_gen::ensure_iot_deps(&toml, active, "", &mcu.family, &[]);
             std::fs::write(&toml_path, toml).expect("write Cargo.toml");
+            // The Bluetooth firmware, whole: `write_project` lays it down when
+            // main.rs uploads it, and a stub would build just as well.
+            if ble {
+                let got = std::fs::metadata(dir.join("firmware").join("43439A0_btfw.bin"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                assert_eq!(got, 6_164, "43439A0_btfw.bin shipped whole");
+            }
             println!("wrote {}", dir.display());
             println!("target: {}", def.project.target);
         }
@@ -5370,8 +5430,12 @@ mod emit_async_for_manual_compile {
             false,
             &sources,
         );
-        files.cargo_toml =
-            project_gen::ensure_cyw43_deps(&files.cargo_toml, super::needs_radio(&mcu), &sources);
+        files.cargo_toml = project_gen::ensure_cyw43_deps(
+            &files.cargo_toml,
+            super::needs_radio(&mcu),
+            super::needs_bluetooth(&mcu),
+            &sources,
+        );
         files.cargo_toml =
             project_gen::ensure_m0_atomics(&files.cargo_toml, true, &project.target, &sources);
         files.cargo_toml = project_gen::ensure_flash_store_deps(

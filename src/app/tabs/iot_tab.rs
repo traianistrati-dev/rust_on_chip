@@ -13,7 +13,7 @@
 use crate::app::{AppIde, McuTab};
 use crate::panels::mcu_module::codegen::iot_gen;
 use crate::panels::mcu_module::iot::{
-    self, Availability, EspNowConfig, IotConfig, Link, MqttConfig, Platform, SntpConfig,
+    self, Availability, BleConfig, EspNowConfig, IotConfig, Link, MqttConfig, Platform, SntpConfig,
 };
 use crate::panels::mcu_module::mcu::model::Runtime;
 use eframe::egui;
@@ -45,6 +45,16 @@ impl AppIde {
             let chip_id = mcu.id.clone();
             let cyw43 = iot::has_cyw43(mcu);
             let platform = iot::platform(&family, cyw43);
+            // Only what this chip's radio can carry: nothing of another
+            // vendor's, nothing at all on a chip without a radio.
+            let links = iot::links_for(&family, cyw43);
+            // Bluetooth has its own set of radios (the ESP32-H2 has it with no
+            // Wi-Fi; an nRF has only it), and on an nRF it waits for USB.
+            let ble = BleFacts {
+                platform: iot::ble_platform(&family, cyw43),
+                usb_blocks: iot::nrf_ble_blocked_by_usb(mcu),
+                family: family.clone(),
+            };
             let is_async = matches!(mcu.runtime, Runtime::Async);
             // Errata the radio walks into (ESP32 ADC2): shown here as well as
             // on the pads, since this is where the switch that causes it is.
@@ -60,22 +70,60 @@ impl AppIde {
                     p == "src/pins/configs/wifi.rs"
                         && crate::panels::mcu_module::codegen::iot_gen::phase_one_wifi_left(c)
                 });
+            // A wifi.rs / ble.rs written for the radio of the chip before a
+            // retarget, and edited since, so the IDE left it: it no longer
+            // fits the main.rs this chip gets.
+            let foreign: Vec<&'static str> = [
+                (iot_gen::WIFI, platform),
+                (iot_gen::BLE, ble.platform),
+            ]
+            .into_iter()
+            .filter_map(|(name, p)| {
+                let p = p?;
+                let path = format!("src/pins/configs/{name}");
+                self.project_tree
+                    .user_src_files
+                    .iter()
+                    .any(|(f, c)| *f == path && iot_gen::foreign_radio_file(name, c, p))
+                    .then_some(name)
+            })
+            .collect();
             let files = &mut self.project_tree.user_src_files;
             let mut changed = false;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(4.0);
+                if links.is_empty() {
+                    let what = if iot::has_subghz_radio(&family) {
+                        format!(
+                            "{}'s radio is sub-GHz (LoRa, FSK), which carries none of the links \
+                             this tab generates.",
+                            mcu.name
+                        )
+                    } else {
+                        format!(
+                            "{} has no Wi-Fi, Bluetooth or 802.15.4 radio, so there is nothing to \
+                             set up here.",
+                            mcu.name
+                        )
+                    };
+                    ui.label(dim(format!(
+                        "{what} Wi-Fi, Bluetooth and the protocols over them come with an ESP32, \
+                         a Pico W or Pico 2 W, or an nRF."
+                    )));
+                    return;
+                }
                 ui.label(dim(concat!(
-                    "Links and protocols, in layers: a card is live once the one below it is. ",
-                    "Wi-Fi, ESP-NOW, MQTT and SNTP are generated today; every other link says why not."
+                    "What this chip's radio can carry, in layers: a card is live once the one ",
+                    "below it is. A link the IDE does not generate yet says why."
                 )));
                 ui.add_space(8.0);
 
-                if platform.is_some() && !is_async {
+                if (platform.is_some() || ble.platform.is_some()) && !is_async {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(warn(concat!(
-                            "Needs the Async runtime: esp-radio, cyw43 and embassy-net are ",
-                            "async-only, so nothing is generated on this one."
+                            "Needs the Async runtime: esp-radio, cyw43, embassy-net, nrf-sdc and ",
+                            "trouble-host are async-only, so nothing is generated on this one."
                         )));
                         if ui.small_button("Open System tab").clicked() {
                             go_system = true;
@@ -84,7 +132,7 @@ impl AppIde {
                     ui.add_space(8.0);
                 }
 
-                link_card(ui, &mut mcu.iot, &family, cyw43, platform, is_async);
+                link_card(ui, &mut mcu.iot, &links, &family, cyw43, platform, &ble, is_async);
                 if stale_wifi {
                     ui.add_space(4.0);
                     ui.label(warn(concat!(
@@ -93,6 +141,14 @@ impl AppIde {
                         "main.rs creates the radio now: make `init` take ",
                         "(spawner, controller: WifiController<'static>, station: Interface<'static>), ",
                         "or delete the file to get the current template."
+                    )));
+                }
+                for name in &foreign {
+                    ui.add_space(4.0);
+                    ui.label(warn(format!(
+                        "src/pins/configs/{name} was written for the radio of the chip before, and \
+                         you edited it, so the IDE left it: it does not fit this chip's main.rs. \
+                         Move your code into the current template - delete the file to get it."
                     )));
                 }
                 for text in &radio_clashes {
@@ -107,12 +163,14 @@ impl AppIde {
                     ui.add_space(12.0);
                 }
 
-                ui.add_enabled_ui(link_up, |ui| network_card(ui, &mut mcu.iot));
-                ui.add_space(12.0);
+                // The IP stack and what runs on it need the station: on a chip
+                // without Wi-Fi (an nRF, the ESP32-H2) they are no option.
+                if platform.is_some() {
+                    ui.add_enabled_ui(link_up, |ui| network_card(ui, &mut mcu.iot));
+                    ui.add_space(12.0);
 
-                ui.add_enabled_ui(link_up, |ui| {
-                    application_card(ui, &mut mcu.iot, &chip_id, platform)
-                });
+                    ui.add_enabled_ui(link_up, |ui| application_card(ui, &mut mcu.iot, &chip_id));
+                }
             });
             tree_changed = changed;
         }
@@ -127,21 +185,33 @@ impl AppIde {
     }
 }
 
-/// The links, each with its state on this chip. Wi-Fi and ESP-NOW have a
-/// switch where they are generated; the rest say why not.
+/// What the link card needs to know about Bluetooth on this chip.
+struct BleFacts {
+    /// The radio Bluetooth is generated for, `None` where it is not.
+    platform: Option<Platform>,
+    /// An nRF with USB wired: Bluetooth waits (see `iot::nrf_ble_blocked_by_usb`).
+    usb_blocks: bool,
+    family: String,
+}
+
+/// The links, each with its state on this chip. Wi-Fi, ESP-NOW and Bluetooth
+/// have a switch where they are generated; the rest say why not.
+#[allow(clippy::too_many_arguments)]
 fn link_card(
     ui: &mut egui::Ui,
     cfg: &mut IotConfig,
+    links: &[Link],
     family: &str,
     cyw43: bool,
     platform: Option<Platform>,
+    ble: &BleFacts,
     is_async: bool,
 ) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(egui::RichText::new(format!("{}  LINK", ph::SHARE_NETWORK)).strong());
         ui.label(dim("How the chip reaches the network. Mesh is a kind of link, not a protocol on top."));
         ui.add_space(4.0);
-        for link in Link::ALL {
+        for &link in links {
             let avail = iot::availability(link, family, cyw43);
             ui.horizontal(|ui| {
                 if link == Link::Wifi && avail == Availability::Ready {
@@ -156,12 +226,27 @@ fn link_card(
                     {
                         toggle_kept(ui, &mut cfg.esp_now, on, "iot_stash_espnow");
                     }
+                } else if link == Link::Ble && avail == Availability::Ready {
+                    let mut on = cfg.ble.is_some();
+                    if ui
+                        .checkbox(&mut on, "")
+                        .on_hover_text("Generate a Bluetooth LE peripheral with the Nordic UART Service: send(), receive(), connected()")
+                        .changed()
+                    {
+                        toggle_kept(ui, &mut cfg.ble, on, "iot_stash_ble");
+                    }
                 } else {
                     ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
                 }
                 ui.label(egui::RichText::new(link.label()).strong())
                     .on_hover_text(link.blurb());
+                let blocked = link == Link::Ble && ble.usb_blocks;
                 let (chip, color, why) = match avail {
+                    Availability::Ready if blocked => (
+                        "not with USB",
+                        egui::Color32::from_rgb(235, 150, 90),
+                        Some("unwire USB to generate it"),
+                    ),
                     Availability::Ready => ("generated", egui::Color32::from_rgb(120, 200, 140), None),
                     Availability::Planned(why) => {
                         ("planned", egui::Color32::from_rgb(120, 170, 230), Some(why))
@@ -183,39 +268,112 @@ fn link_card(
                 esp_now_body(ui, n, station);
             }
         }
-        if (cfg.wifi || esp_now_here) && platform.is_some() {
+        let ble_here = ble.platform.is_some() && cfg.ble.is_some();
+        let wifi_here = (cfg.wifi && platform.is_some()) || esp_now_here;
+        if ble_here {
+            if let Some(b) = cfg.ble.as_mut() {
+                ble_body(ui, b, ble, wifi_here);
+            }
+        }
+        if wifi_here || ble_here {
             ui.add_space(6.0);
-            match platform {
-                Some(Platform::Esp) => {
-                    ui.horizontal(|ui| {
-                        ui.label("Heap");
-                        ui.add(
-                            crate::panels::drag_value(ui, &mut cfg.heap_kib)
-                                .range(32..=256)
-                                .clamp_existing_to_range(false)
-                                .suffix(" KiB"),
-                        );
+            let esp_radio = (wifi_here && platform == Some(Platform::Esp))
+                || (ble_here && ble.platform == Some(Platform::Esp));
+            if esp_radio {
+                let coex = ble_here && wifi_here;
+                ui.horizontal(|ui| {
+                    ui.label("Heap");
+                    ui.add_enabled(
+                        !coex,
+                        crate::panels::drag_value(ui, &mut cfg.heap_kib)
+                            .range(32..=256)
+                            .clamp_existing_to_range(false)
+                            .suffix(" KiB"),
+                    );
+                    if coex {
+                        ui.label(dim(if ble.family == "esp32" {
+                            "Wi-Fi beside Bluetooth takes a fixed heap: 96 KiB of the bootloader's RAM + 24 KiB."
+                        } else {
+                            "Wi-Fi beside Bluetooth takes a fixed heap: 64 KiB of the bootloader's RAM + 64 KiB."
+                        }));
+                    } else {
                         ui.label(dim(format!(
                             "esp-radio allocates its buffers from it; {} KiB is what its examples use.",
                             iot::DEFAULT_HEAP_KIB
                         )));
-                    });
-                    if !(32..=256).contains(&cfg.heap_kib) {
-                        ui.label(warn("between 32 and 256 KiB"));
                     }
+                });
+                if !coex && !(32..=256).contains(&cfg.heap_kib) {
+                    ui.label(warn("between 32 and 256 KiB"));
                 }
-                Some(Platform::Cyw43) => {
-                    ui.label(dim(concat!(
-                        "The radio's `control` belongs to the Wi-Fi task, so the on-board LED is ",
-                        "switched with pins::configs::wifi::set_led(true)."
-                    )));
-                }
-                None => {}
             }
-            if !is_async {
+            if cfg.wifi && platform == Some(Platform::Cyw43) {
+                ui.label(dim(concat!(
+                    "The radio's `control` belongs to the Wi-Fi task, so the on-board LED is ",
+                    "switched with pins::configs::wifi::set_led(true)."
+                )));
+            }
+            // Bluetooth that USB blocks waits for more than the runtime.
+            if !is_async && (wifi_here || !ble.usb_blocks) {
                 ui.label(dim("Kept, and generated once the runtime is Async."));
             }
         }
+    });
+}
+
+const BLE_USAGE: &str = "pins::configs::ble::send(b\"21.5\\n\").await.ok();";
+
+/// Bluetooth's settings: the advertised name, and what the radio takes.
+fn ble_body(ui: &mut egui::Ui, b: &mut BleConfig, ble: &BleFacts, wifi: bool) {
+    ui.indent("ble", |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Name"));
+            ui.add(egui::TextEdit::singleline(&mut b.device_name).desired_width(200.0));
+        });
+        if let Some(p) = iot::ble_name_problem(&b.device_name) {
+            ui.label(warn(p));
+        }
+        ui.label(dim(concat!(
+            "A GATT peripheral with the Nordic UART Service: nRF Connect, nRF Toolbox's UART or ",
+            "Serial Bluetooth Terminal find the board by this name. One phone at a time; nothing ",
+            "is paired or encrypted."
+        )));
+        match ble.platform {
+            Some(Platform::Esp) if wifi => {
+                ui.label(dim(
+                    "Beside Wi-Fi or ESP-NOW, esp-radio's coexistence (`coex`) shares the antenna.",
+                ));
+            }
+            Some(Platform::Cyw43) => {
+                ui.label(dim(concat!(
+                    "A fourth radio firmware, 43439A0_btfw.bin, is written into firmware/ with the ",
+                    "project. The board advertises on a random static address made of the radio's MAC."
+                )));
+            }
+            Some(Platform::Nrf) => {
+                ui.label(dim(concat!(
+                    "Nordic's SoftDevice Controller under the MPSL. They take RTC0, TIMER0, TEMP, RNG, ",
+                    "PPI channels 17-31 and interrupt priority 0: every vector the generated main.rs ",
+                    "binds runs at 2, and one you bind yourself must be moved off 0 too. A debugger ",
+                    "halting the CPU stops the radio. nrf-sdc builds its bindings with bindgen: ",
+                    "the build needs libclang (LIBCLANG_PATH)."
+                )));
+                if ble.usb_blocks {
+                    ui.label(warn(concat!(
+                        "Not generated while USB is wired: both need the CLOCK_POWER vector, and the ",
+                        "two together have not been tried on a board."
+                    )));
+                }
+            }
+            _ => {}
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(BLE_USAGE).monospace().size(11.0));
+            if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                ui.ctx().copy_text(BLE_USAGE.to_owned());
+            }
+        });
     });
 }
 
@@ -450,12 +608,7 @@ fn octets(ui: &mut egui::Ui, b: &mut [u8; 4]) {
 }
 
 /// What runs over the stack: MQTT today, the rest listed.
-fn application_card(
-    ui: &mut egui::Ui,
-    cfg: &mut IotConfig,
-    chip_id: &str,
-    platform: Option<Platform>,
-) {
+fn application_card(ui: &mut egui::Ui, cfg: &mut IotConfig, chip_id: &str) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(egui::RichText::new(format!("{}  APPLICATION", ph::CLOUD)).strong());
         ui.add_space(4.0);
@@ -501,9 +654,6 @@ fn application_card(
                 ui.label(egui::RichText::new("planned").size(10.0).color(egui::Color32::from_rgb(120, 170, 230)));
                 ui.label(dim(why));
             });
-        }
-        if platform.is_none() {
-            ui.label(dim("No link on this chip, so nothing above it can run."));
         }
     });
 }

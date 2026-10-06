@@ -330,6 +330,19 @@ $ALL_CASES = @(
     @{ n = "ESP32-C6 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c6";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
     @{ n = "ESP32-C61 IoT, everything";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c61"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
 
+    # Bluetooth LE (trouble-host 0.6 over esp-radio's `ble`): alone on the C3
+    # and on the H2 - its only link, the first Async H2 build too - and beside
+    # everything else with `coex` and the two-region heap, on the C3 and the
+    # ESP32 (Xtensa), and beside ESP-NOW alone - `coex` with no IP stack, the
+    # radio held by `hold_radio` - on the C3 and the C6. Linked, since the BT
+    # controller blobs and the coex heap only show at the link.
+    @{ n = "ESP32-C3 Bluetooth LE alone";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble" }; q = $true; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C3 BLE + everything (coex)"; t = "emit_esp32c3_project";    e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble+all" }; q = $true; fam = "esp"; lk = $true }
+    @{ n = "ESP32-H2 Bluetooth LE alone";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32h2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble" }; q = $false; fam = "esp"; lk = $true }
+    @{ n = "ESP32 BLE + everything (Xtensa)"; t = "emit_esp32c3_project";     e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble+all" }; q = $false; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C3 BLE + ESP-NOW, station off"; t = "emit_esp32c3_project"; e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble+espnow" }; q = $true; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C6 BLE + ESP-NOW, station off"; t = "emit_esp32c3_project"; e = @{ EIDE_ESP_CHIP = "esp32c6"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble+espnow" }; q = $false; fam = "esp"; lk = $true }
+
     # The watchdogs on EVERY bundled Espressif part. The harness switches all
     # three on unless EIDE_ESP_WDG=0, so the six C3 rows above already build
     # them on both runtimes - including async, where the scheduler owns TIMG0.
@@ -381,6 +394,14 @@ $ALL_CASES = @(
     # from the blocking one, the path a user takes: main.rs keeps the header
     # the two runtimes share, and Cargo.toml has its HAL crate swapped.
     @{ n = "BBC micro:bit v2 async x2";    t = "emit_nrf_async_project";     e = @{};                       q = $true; fam = "nrf" }
+
+    # The IoT tab's Bluetooth on the SoftDevice Controller (nrf-sdc 0.4 under
+    # nrf-mpsl, trouble-host 0.8): the 52840 DK, the 52832 DK (64 KiB RAM) and
+    # the micro:bit with every async peripheral bound, so every vector is moved
+    # off priority 0. LINKED: cortex-m's critical section beside nrf-mpsl's
+    # only fails there. nrf-sdc-sys / nrf-mpsl-sys run bindgen, so the build
+    # needs libclang (LIBCLANG_PATH).
+    @{ n = "nRF52 Bluetooth LE x3";        t = "emit_nrf_ble_project";       e = @{};                       q = $true; fam = "nrf"; lk = $true }
 
     # The rest of the nRF52 family, TEN projects on two targets: Nordic's two
     # kits on both runtimes, and the small parts on the nRF52 DK the way the
@@ -435,7 +456,7 @@ $ALL_CASES = @(
     # The IoT tab on both W boards: the radio up once for the LED AND the
     # network, `control` handed to the Wi-Fi task, embassy-net + rust-mqtt
     # (bump buffer, no heap) + SNTP over it. Linked, like the radio row.
-    @{ n = "Raspberry Pi Pico W Wi-Fi + MQTT + SNTP x2"; t = "emit_rp_iot_project"; e = @{};                q = $true; fam = "rp"; lk = $true }
+    @{ n = "Raspberry Pi Pico W Wi-Fi/BLE x4"; t = "emit_rp_iot_project";    e = @{};                       q = $true; fam = "rp"; lk = $true }
 
     # The pico2-ice, Blocking and Async: the only RP2350B board, so the only
     # rows of the FUNCSEL table past GP29 (UART1 on GP36/37, SPI0 on 32/34/35,

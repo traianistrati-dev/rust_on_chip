@@ -403,6 +403,14 @@ $ALL_CASES = @(
     # needs libclang (LIBCLANG_PATH).
     @{ n = "nRF52 Bluetooth LE x3";        t = "emit_nrf_ble_project";       e = @{};                       q = $true; fam = "nrf"; lk = $true }
 
+    # The IoT tab's Thread (openthread 0.4 on embassy-nrf's 802.15.4 driver):
+    # the 52840 DK and the micro:bit v2, each switched over from a hard-float
+    # project the way the app does it. They build for thumbv7em-none-eabi,
+    # where openthread-sys links OpenThread prebuilt - no C compiler, CMake or
+    # libclang is set here, and none may be needed. LINKED: the archives only
+    # fail at the link.
+    @{ n = "nRF52 Thread x2";              t = "emit_nrf_thread_project";    e = @{};                       q = $true; fam = "nrf"; lk = $true }
+
     # The rest of the nRF52 family, TEN projects on two targets: Nordic's two
     # kits on both runtimes, and the small parts on the nRF52 DK the way the
     # New MCU form retargets a definition. Each part is here for what it does

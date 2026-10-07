@@ -20,11 +20,16 @@
 //!   editable half for the ESP and the Pico W (trouble-host 0.6, the radio as
 //!   a `Radio` type alias in the generated block), one for the nRF
 //!   (trouble-host 0.8 on the SoftDevice Controller).
-//! - `secrets.rs`: SSID and passwords. Written ONCE, never spliced - the file
-//!   is the store, and the project's `.gitignore` lists it.
+//! - `thread.rs`: the UDP port as a constant; an OpenThread end device on an
+//!   nRF52840 / nRF52833, `role()` / `wait_attached()` / `addresses()` /
+//!   `send_to()` / `receive()`.
+//! - `secrets.rs`: SSID and passwords, the Thread dataset. Written ONCE, never
+//!   spliced - the file is the store, and the project's `.gitignore` lists
+//!   it. A link switched on later only ADDS its missing lines ([`topped_up`]).
 
 use crate::panels::mcu_module::iot::{
     self, Active, BleConfig, EspNowConfig, IotConfig, IpConfig, MqttConfig, Platform, SntpConfig,
+    ThreadConfig,
 };
 use crate::panels::mcu_module::mcu::Mcu;
 
@@ -34,6 +39,7 @@ pub const MQTT: &str = "mqtt.rs";
 pub const SNTP: &str = "sntp.rs";
 pub const ESPNOW: &str = "espnow.rs";
 pub const BLE: &str = "ble.rs";
+pub const THREAD: &str = "thread.rs";
 pub const SECRETS: &str = "secrets.rs";
 
 /// The credentials file's path in the project tree.
@@ -52,6 +58,7 @@ const SNTP_TAIL: &str = include_str!("iot_templates/sntp.rs");
 const ESPNOW_TAIL: &str = include_str!("iot_templates/espnow.rs");
 const BLE_TAIL: &str = include_str!("iot_templates/ble.rs");
 const BLE_NRF_TAIL: &str = include_str!("iot_templates/ble_nrf.rs");
+const THREAD_NRF_TAIL: &str = include_str!("iot_templates/thread_nrf.rs");
 
 /// Editable halves an earlier version of the IDE wrote and this one no longer
 /// does, by file. A file still holding one exactly was never touched by its
@@ -69,9 +76,10 @@ const LEGACY_TAILS: [(&str, &str); 2] = [
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 10] = [
+const TAILS: [(&str, &str); 11] = [
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
+    (THREAD, THREAD_NRF_TAIL),
     (WIFI, WIFI_ESP_TAIL),
     (WIFI, WIFI_CYW43_TAIL),
     (NET, NET_TAIL),
@@ -98,18 +106,42 @@ fn lf(s: &str) -> String {
 /// must pass them by, as it does the flash store's: it would only wipe what
 /// the user wrote below the markers.
 pub fn runtime_free(name: &str) -> bool {
-    matches!(name, NET | WIFI | MQTT | SNTP | ESPNOW | BLE | SECRETS)
+    matches!(name, NET | WIFI | MQTT | SNTP | ESPNOW | BLE | THREAD | SECRETS)
 }
 
-/// The secrets the tab edits, in the order they are written.
-pub const SECRET_NAMES: [&str; 4] = ["WIFI_SSID", "WIFI_PASSWORD", "MQTT_USERNAME", "MQTT_PASSWORD"];
+/// The Wi-Fi station's secrets, in the order they are written: the network,
+/// and the broker's login (written with the station, MQTT or not).
+pub const WIFI_SECRETS: [&str; 4] = ["WIFI_SSID", "WIFI_PASSWORD", "MQTT_USERNAME", "MQTT_PASSWORD"];
 
-/// What a fresh `secrets.rs` holds: every value empty.
+/// Thread's one secret: the Active Operational Dataset, as hex TLVs. It holds
+/// the network key and the PSKc.
+pub const THREAD_DATASET: &str = "THREAD_DATASET";
+
+/// Every secret the tab edits.
+pub const SECRET_NAMES: [&str; 5] = [
+    WIFI_SECRETS[0],
+    WIFI_SECRETS[1],
+    WIFI_SECRETS[2],
+    WIFI_SECRETS[3],
+    THREAD_DATASET,
+];
+
+/// What a fresh `secrets.rs` holds for the Wi-Fi station: every value empty.
 pub fn secrets_body() -> String {
+    secrets_body_for(true, false)
+}
+
+/// What a fresh `secrets.rs` holds for the links on: the station's lines,
+/// Thread's, or both - every value empty.
+pub fn secrets_body_for(station: bool, thread: bool) -> String {
     let mut o = String::new();
     o.push_str("// Credentials for the IoT tab. This file is listed in .gitignore, so it stays\n");
     o.push_str("// on this machine: edit the values here or in the tab, never in a commit.\n");
-    for name in SECRET_NAMES {
+    let names = WIFI_SECRETS
+        .iter()
+        .filter(|_| station)
+        .chain(std::iter::once(&THREAD_DATASET).filter(|_| thread));
+    for name in names {
         o.push_str(&format!("pub const {name}: &str = \"\";\n"));
     }
     o
@@ -132,7 +164,9 @@ pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
     if active.station {
         out.push((NET.to_owned(), net_file(&cfg.ip, active)));
         out.push((WIFI.to_owned(), wifi_file(active.platform)));
-        out.push((SECRETS.to_owned(), secrets_body()));
+    }
+    if active.station || active.thread {
+        out.push((SECRETS.to_owned(), secrets_body_for(active.station, active.thread)));
     }
     if let (true, Some(m)) = (active.mqtt, &cfg.mqtt) {
         out.push((MQTT.to_owned(), mqtt_file(m)));
@@ -145,6 +179,9 @@ pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
     }
     if let (true, Some(b)) = (active.ble, &cfg.ble) {
         out.push((BLE.to_owned(), ble_file(b, active.platform)));
+    }
+    if let (true, Some(t)) = (active.thread, &cfg.thread) {
+        out.push((THREAD.to_owned(), thread_file(t)));
     }
     out
 }
@@ -317,6 +354,20 @@ fn ble_file(b: &BleConfig, platform: Platform) -> String {
     o
 }
 
+/// `thread.rs`: the UDP port. Which network is the dataset in `secrets.rs`.
+fn thread_file(t: &ThreadConfig) -> String {
+    let mut o = String::new();
+    o.push_str(GEN_BEGIN_CFG);
+    o.push('\n');
+    o.push_str("// Thread (from the IoT tab) — auto-updated; edit it in the tab.\n");
+    o.push_str("/// The UDP port `receive` listens on and `send_to` sends from.\n");
+    o.push_str(&format!("pub const UDP_PORT: u16 = {};\n", t.udp_port));
+    o.push_str(GEN_END_CFG);
+    o.push('\n');
+    o.push_str(&lf(THREAD_NRF_TAIL));
+    o
+}
+
 // ── The credentials file ─────────────────────────────────────────────────────
 
 /// A file `sync_config_files` writes when it is missing and never touches
@@ -392,11 +443,81 @@ fn unescape(lit: &str) -> Option<String> {
     Some(out)
 }
 
-/// Every secret still empty: what `secrets_body` wrote.
+/// Does `file` carry a line for `name`, whatever its value? `read_secret`
+/// cannot say: it is `None` for a missing line and for one the user turned
+/// into something other than a plain literal alike.
+///
+/// Any declaration of the name counts - `pub(crate) const`, `static`, a type
+/// of the user's own - since adding the IDE's line beside it would define the
+/// name twice.
+pub fn has_secret_line(file: &str, name: &str) -> bool {
+    file.lines().any(|l| declares(l, name))
+}
+
+/// Does `line` declare a `const` or `static` named `name`, at any visibility?
+fn declares(line: &str, name: &str) -> bool {
+    let mut l = line.trim_start();
+    if let Some(rest) = l.strip_prefix("pub") {
+        l = rest.trim_start();
+        if l.starts_with('(') {
+            let Some(close) = l.find(')') else {
+                return false;
+            };
+            l = l[close + 1..].trim_start();
+        }
+    }
+    let Some(rest) = l.strip_prefix("const ").or_else(|| l.strip_prefix("static ")) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("mut ").map_or(rest, str::trim_start);
+    rest.strip_prefix(name).is_some_and(|r| r.trim_start().starts_with(':'))
+}
+
+/// Exactly what `secrets_body_for` wrote, for whichever links: comments, and
+/// the IDE's own secret lines, every one still empty. A value, a line of the
+/// user's own or any other edit keeps the file.
 fn secrets_pristine(content: &str) -> bool {
-    SECRET_NAMES
+    let empty: Vec<String> = SECRET_NAMES
         .iter()
-        .all(|n| read_secret(content, n).is_some_and(|v| v.is_empty()))
+        .map(|n| format!("pub const {n}: &str = \"\";"))
+        .collect();
+    let mut any = false;
+    for line in content.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")) {
+        if !empty.iter().any(|e| e == line) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// `existing` with the secret lines `body` has and it lacks appended - empty,
+/// as `body` writes them - or `None` when nothing is missing. `secrets.rs` is
+/// written once, so a link switched on after it (Thread beside a station
+/// project, MQTT's names in a file from before them) would otherwise import
+/// a name that is not there. Lines already in the file are never touched.
+pub fn topped_up(existing: &str, body: &str) -> Option<String> {
+    let missing: Vec<&str> = body
+        .lines()
+        .filter(|l| {
+            SECRET_NAMES
+                .iter()
+                .any(|n| l.starts_with(&format!("pub const {n}:")) && !has_secret_line(existing, n))
+        })
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut out = existing.to_owned();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for line in missing {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// Is `content` still exactly a template below its markers? Then the IoT tab
@@ -506,7 +627,7 @@ fn tail_of(content: &str) -> Option<String> {
 /// with a password in it. A pristine one goes like any pruned config file.
 pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
-    for name in [NET, WIFI, MQTT, SNTP, ESPNOW, BLE, SECRETS] {
+    for name in [NET, WIFI, MQTT, SNTP, ESPNOW, BLE, THREAD, SECRETS] {
         if files.iter().any(|(n, _)| n == name) {
             continue;
         }
@@ -887,6 +1008,9 @@ mod tests {
         for (name, _) in config_files_for(&m) {
             assert!(runtime_free(&name), "{name}");
         }
+        for (name, _) in config_files_for(&thread_mcu("nrf52840_dk")) {
+            assert!(runtime_free(&name), "{name}");
+        }
     }
 
     /// The peer list holds 20 entries, the broadcast address among them.
@@ -1139,6 +1263,131 @@ mod tests {
         for id in ["nrf5340_dk", "nrf54l15_dk"] {
             assert!(iot::active(&ble_mcu(id, false)).is_none(), "{id}");
         }
+    }
+
+    fn thread_mcu(id: &str) -> Mcu {
+        let mut m = mcu(id, Runtime::Async, false);
+        m.iot.wifi = false;
+        m.iot.thread = Some(ThreadConfig::default());
+        m
+    }
+
+    /// Thread on an nRF52840: RADIO bound to embassy-nrf's handler, the
+    /// crystal started, the radio and an RNG handed to `thread::start` last,
+    /// the spawner named - and none of Bluetooth's MPSL.
+    #[test]
+    fn the_nrf_brings_up_thread() {
+        let m = thread_mcu("nrf52840_dk");
+        assert!(crate::panels::mcu_module::codegen::nrf::thread_on(&m));
+        let code = m.fresh_main_rs();
+        for want in [
+            "RADIO => embassy_nrf::radio::InterruptHandler<embassy_nrf::peripherals::RADIO>;",
+            "config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;",
+            "Thread (IoT tab) needs the crystal",
+            "embassy_nrf::radio::ieee802154::Radio::new(p.RADIO, Irqs),",
+            "RNG.init(embassy_nrf::rng::Rng::new_blocking(p.RNG)),",
+            "pins::configs::thread::start(",
+            "async fn main(spawner: embassy_executor::Spawner)",
+        ] {
+            assert!(code.contains(want), "{want}:\n{code}");
+        }
+        for absent in ["nrf_sdc", "Priority::P2"] {
+            assert!(!code.contains(absent), "{absent}:\n{code}");
+        }
+        let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
+        assert!(at("embassy_nrf::init(config)") < at("pins::configs::thread::start("));
+
+        let files = config_files_for(&m);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, [SECRETS, THREAD]);
+        let secrets = &files[0].1;
+        assert!(secrets.contains("pub const THREAD_DATASET: &str = \"\";"), "{secrets}");
+        assert!(!secrets.contains("WIFI_SSID"), "no Wi-Fi on an nRF:\n{secrets}");
+        let thread = &files[1].1;
+        assert!(thread.contains("pub const UDP_PORT: u16 = 1212;"), "{thread}");
+        assert!(thread.contains("use super::secrets::THREAD_DATASET;"), "{thread}");
+        // An empty dataset is "set" without error: only a complete one starts
+        // Thread, or the device would look for any parent on defaults.
+        assert!(thread.contains("&& ot.is_commissioned()"), "{thread}");
+        // A datagram longer than MAX_DATA is read whole and dropped, not cut.
+        assert!(thread.contains("let mut buf = [0u8; UDP_RX];"), "{thread}");
+        assert!(is_pristine(THREAD, thread) && is_pristine(SECRETS, secrets));
+        assert!(runtime_free(THREAD));
+    }
+
+    /// A crystal the Clock tab already chose is not "overridden"; the 52833
+    /// gets Thread too; Bluetooth beside it takes the radio.
+    #[test]
+    fn thread_follows_the_clock_tab_and_yields_to_bluetooth() {
+        let mut m = thread_mcu("nrf52833_microbit_v2");
+        assert!(m.fresh_main_rs().contains("pins::configs::thread::start("));
+        {
+            use crate::panels::mcu_module::clock::graph::model::NodeState;
+            use crate::panels::mcu_module::clock::model::ClockConfig;
+            let ClockConfig::Graph(gc) = &mut m.clock else {
+                panic!("the micro:bit carries a graph");
+            };
+            gc.graph.node_mut("hfclk_src").unwrap().state = NodeState::Index(1);
+        }
+        let code = m.fresh_main_rs();
+        assert!(code.contains("HfclkSource::ExternalXtal;"), "{code}");
+        assert!(!code.contains("Thread (IoT tab) needs the crystal"), "{code}");
+
+        m.iot.ble = Some(BleConfig::default());
+        let code = m.fresh_main_rs();
+        assert!(!code.contains("thread::start"), "{code}");
+        assert!(code.contains("pins::configs::ble::start("), "{code}");
+        let names: Vec<String> = config_files_for(&m).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, [BLE]);
+    }
+
+    /// `secrets.rs` is written once: a link switched on later adds its empty
+    /// line, and nothing the user wrote moves.
+    #[test]
+    fn a_later_link_tops_the_secrets_up() {
+        let wifi = write_secret(&secrets_body(), "WIFI_SSID", "home");
+        let thread_body = secrets_body_for(false, true);
+        let up = topped_up(&wifi, &thread_body).expect("THREAD_DATASET is missing");
+        assert!(up.starts_with(&wifi), "the old lines stay as they were:\n{up}");
+        assert!(up.ends_with("pub const THREAD_DATASET: &str = \"\";\n"), "{up}");
+        assert_eq!(read_secret(&up, "WIFI_SSID").as_deref(), Some("home"));
+        assert_eq!(topped_up(&up, &thread_body), None, "once");
+        assert_eq!(topped_up(&up, &secrets_body_for(true, true)), None);
+        // A line the user made into something else is still "there" - a
+        // second declaration would not compile (E0428).
+        for custom in [
+            "pub const THREAD_DATASET: &str = env!(\"DATASET\");\n",
+            "pub(crate) const THREAD_DATASET: &str = \"0e08\";\n",
+            "  pub static THREAD_DATASET : &str = \"0e08\";\n",
+            "const THREAD_DATASET: &'static str = \"\";\n",
+        ] {
+            assert_eq!(topped_up(custom, &thread_body), None, "{custom}");
+            assert!(has_secret_line(custom, THREAD_DATASET), "{custom}");
+        }
+        // A longer name, or one only mentioned, is not the declaration.
+        assert!(!has_secret_line("pub const THREAD_DATASET_V2: &str = \"\";", THREAD_DATASET));
+        assert!(!has_secret_line("// THREAD_DATASET: paste it here", THREAD_DATASET));
+        // No trailing newline: the line still starts on a line of its own.
+        assert!(topped_up("// mine", &thread_body).unwrap().starts_with("// mine\npub const"));
+    }
+
+    /// Pristine is "every secret line there is empty", whichever links wrote
+    /// the file - so an untouched Thread-only file may go with the switch.
+    #[test]
+    fn secrets_are_pristine_whatever_links_wrote_them() {
+        for (station, thread) in [(true, false), (false, true), (true, true)] {
+            let body = secrets_body_for(station, thread);
+            assert!(secrets_pristine(&body), "{body}");
+        }
+        let set = write_secret(&secrets_body_for(false, true), THREAD_DATASET, "0e08");
+        assert!(!secrets_pristine(&set));
+        assert!(!secrets_pristine("// nothing of ours\n"));
+        // A line of the user's own keeps the file, even beside empty ones -
+        // pruning it would lose that line with the next Save.
+        let mine = format!("{}pub const OTA_KEY: &str = \"s3cret\";\n", secrets_body_for(false, true));
+        assert!(!secrets_pristine(&mine));
+        // Lines deleted, nothing added: nothing of the user's is in it.
+        assert!(secrets_pristine("pub const WIFI_SSID: &str = \"\";\npub const WIFI_PASSWORD: &str = \"\";\n"));
     }
     #[test]
     fn the_template_carries_the_topic_length_the_tab_checks() {

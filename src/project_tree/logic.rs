@@ -711,10 +711,17 @@ impl ProjectTreeState {
             }
             // The IoT tab's `secrets.rs` IS the store of the user's passwords:
             // written when missing (or back from the graveyard just above),
-            // never spliced and never forced by a Runtime Apply.
+            // never spliced and never forced by a Runtime Apply. A link
+            // switched on since only adds its own, empty lines.
             if crate::panels::mcu_module::codegen::iot_gen::write_once(name)
-                && self.user_src_files.iter().any(|(p, _)| p == &file_path)
+                && let Some((_, content)) = self
+                    .user_src_files
+                    .iter_mut()
+                    .find(|(p, _)| p == &file_path)
             {
+                if let Some(up) = crate::panels::mcu_module::codegen::iot_gen::topped_up(content, body) {
+                    *content = up;
+                }
                 continue;
             }
             if let Some((_, content)) = self
@@ -2844,6 +2851,29 @@ mod iot_secrets_sync_tests {
             .map(|(_, c)| c.clone())
             .unwrap();
         assert!(kept.contains("fn mine() {}"), "{kept}");
+    }
+
+    /// Thread switched on in a project whose `secrets.rs` the station wrote:
+    /// the file gets THREAD_DATASET's empty line and keeps every value - on a
+    /// plain sync and on a forced one.
+    #[test]
+    fn a_later_link_adds_its_secret_line_only() {
+        let mut tree = ProjectTreeState::new();
+        tree.sync_config_files(&files(), false, &[], &mut None);
+        let mine = iot_gen::write_secret(&secrets(&tree).unwrap(), "WIFI_PASSWORD", "hunter2");
+        for (p, c) in &mut tree.user_src_files {
+            if p == iot_gen::SECRETS_PATH {
+                *c = mine.clone();
+            }
+        }
+        let both = vec![(iot_gen::SECRETS.to_owned(), iot_gen::secrets_body_for(true, true))];
+        for force in [false, true] {
+            tree.sync_config_files(&both, force, &[], &mut None);
+            let now = secrets(&tree).unwrap();
+            assert!(now.starts_with(&mine), "{now}");
+            assert_eq!(now.matches("pub const THREAD_DATASET: &str = \"\";").count(), 1, "{now}");
+            assert_eq!(iot_gen::read_secret(&now, "WIFI_PASSWORD").as_deref(), Some("hunter2"));
+        }
     }
 
     /// The password typed into `secrets.rs` survives every regeneration, a

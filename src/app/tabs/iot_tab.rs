@@ -14,6 +14,7 @@ use crate::app::{AppIde, McuTab};
 use crate::panels::mcu_module::codegen::iot_gen;
 use crate::panels::mcu_module::iot::{
     self, Availability, BleConfig, EspNowConfig, IotConfig, Link, MqttConfig, Platform, SntpConfig,
+    ThreadConfig,
 };
 use crate::panels::mcu_module::mcu::model::Runtime;
 use eframe::egui;
@@ -54,6 +55,7 @@ impl AppIde {
                 platform: iot::ble_platform(&family, cyw43),
                 usb_blocks: iot::nrf_ble_blocked_by_usb(mcu),
                 family: family.clone(),
+                thread: iot::thread_platform(&family),
             };
             let is_async = matches!(mcu.runtime, Runtime::Async);
             // Errata the radio walks into (ESP32 ADC2): shown here as well as
@@ -88,6 +90,14 @@ impl AppIde {
                     .then_some(name)
             })
             .collect();
+            // A `.cargo/config.toml` the IDE does not manage (no markers) keeps
+            // its own target: Thread on it builds hard-float, and Build then
+            // compiles OpenThread's C.
+            let thread_target_off = crate::panels::mcu_module::codegen::nrf::thread_on(mcu)
+                .then(|| crate::panels::mcu_module::project_gen::build_target(&self.cargo_config))
+                .flatten()
+                .filter(|t| *t != crate::panels::mcu_module::codegen::nrf::THREAD_TARGET)
+                .map(str::to_owned);
             let files = &mut self.project_tree.user_src_files;
             let mut changed = false;
 
@@ -119,11 +129,12 @@ impl AppIde {
                 )));
                 ui.add_space(8.0);
 
-                if (platform.is_some() || ble.platform.is_some()) && !is_async {
+                if (platform.is_some() || ble.platform.is_some() || ble.thread) && !is_async {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(warn(concat!(
-                            "Needs the Async runtime: esp-radio, cyw43, embassy-net, nrf-sdc and ",
-                            "trouble-host are async-only, so nothing is generated on this one."
+                            "Needs the Async runtime: esp-radio, cyw43, embassy-net, nrf-sdc, ",
+                            "trouble-host and openthread are async-only, so nothing is generated ",
+                            "on this one."
                         )));
                         if ui.small_button("Open System tab").clicked() {
                             go_system = true;
@@ -143,6 +154,16 @@ impl AppIde {
                         "or delete the file to get the current template."
                     )));
                 }
+                if let Some(t) = &thread_target_off {
+                    ui.add_space(4.0);
+                    ui.label(warn(format!(
+                        ".cargo/config.toml builds for {t}, and the IDE does not manage it (no \
+                         GENERATED block): Thread needs {}, the target OpenThread ships compiled \
+                         for. Set it in [build] and rename [target.{t}], or Build compiles \
+                         OpenThread's C (CMake, clang, libclang).",
+                        crate::panels::mcu_module::codegen::nrf::THREAD_TARGET
+                    )));
+                }
                 for name in &foreign {
                     ui.add_space(4.0);
                     ui.label(warn(format!(
@@ -158,8 +179,16 @@ impl AppIde {
                 ui.add_space(12.0);
 
                 let link_up = mcu.iot.wifi && platform.is_some();
-                if link_up {
-                    changed |= secrets_card(ui, files, is_async, mcu.iot.mqtt.is_some());
+                // Thread's dataset is a secret too; Bluetooth's switch wins
+                // the radio, and then Thread has nothing to join with.
+                let thread_up = ble.thread && mcu.iot.thread.is_some() && mcu.iot.ble.is_none();
+                if link_up || thread_up {
+                    let wanted = Secrets {
+                        wifi: link_up,
+                        mqtt: link_up && mcu.iot.mqtt.is_some(),
+                        thread: thread_up,
+                    };
+                    changed |= secrets_card(ui, files, is_async, wanted);
                     ui.add_space(12.0);
                 }
 
@@ -192,6 +221,9 @@ struct BleFacts {
     /// An nRF with USB wired: Bluetooth waits (see `iot::nrf_ble_blocked_by_usb`).
     usb_blocks: bool,
     family: String,
+    /// Thread is generated on this chip - on the same radio as Bluetooth, so
+    /// one at a time (see `iot::nrf_thread_blocked_by_ble`).
+    thread: bool,
 }
 
 /// The links, each with its state on this chip. Wi-Fi, ESP-NOW and Bluetooth
@@ -228,25 +260,48 @@ fn link_card(
                     }
                 } else if link == Link::Ble && avail == Availability::Ready {
                     let mut on = cfg.ble.is_some();
+                    // The radio is Thread's while it is on: switch that off first.
+                    let free = on || !(ble.thread && cfg.thread.is_some());
                     if ui
-                        .checkbox(&mut on, "")
+                        .add_enabled(free, egui::Checkbox::new(&mut on, ""))
                         .on_hover_text("Generate a Bluetooth LE peripheral with the Nordic UART Service: send(), receive(), connected()")
+                        .on_disabled_hover_text("Thread has the radio: switch it off first")
                         .changed()
                     {
                         toggle_kept(ui, &mut cfg.ble, on, "iot_stash_ble");
+                    }
+                } else if link == Link::Thread && avail == Availability::Ready {
+                    let mut on = cfg.thread.is_some();
+                    // Bluetooth's switch wins the radio; one already on can still go off.
+                    let free = on || cfg.ble.is_none();
+                    if ui
+                        .add_enabled(free, egui::Checkbox::new(&mut on, ""))
+                        .on_hover_text("Generate a Thread end device: OpenThread with UDP send_to() and receive() over IPv6")
+                        .on_disabled_hover_text("Bluetooth has the radio: switch it off first")
+                        .changed()
+                    {
+                        toggle_kept(ui, &mut cfg.thread, on, "iot_stash_thread");
                     }
                 } else {
                     ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
                 }
                 ui.label(egui::RichText::new(link.label()).strong())
                     .on_hover_text(link.blurb());
-                let blocked = link == Link::Ble && ble.usb_blocks;
+                let blocked = match link {
+                    Link::Ble if ble.thread && cfg.thread.is_some() && cfg.ble.is_none() => {
+                        Some(("not with Thread", "one radio: Thread has it"))
+                    }
+                    Link::Ble if ble.usb_blocks => Some(("not with USB", "unwire USB to generate it")),
+                    Link::Thread if cfg.ble.is_some() => {
+                        Some(("not with Bluetooth", "one radio: Bluetooth has it"))
+                    }
+                    _ => None,
+                };
                 let (chip, color, why) = match avail {
-                    Availability::Ready if blocked => (
-                        "not with USB",
-                        egui::Color32::from_rgb(235, 150, 90),
-                        Some("unwire USB to generate it"),
-                    ),
+                    Availability::Ready if blocked.is_some() => {
+                        let (chip, why) = blocked.unwrap_or_default();
+                        (chip, egui::Color32::from_rgb(235, 150, 90), Some(why))
+                    }
                     Availability::Ready => ("generated", egui::Color32::from_rgb(120, 200, 140), None),
                     Availability::Planned(why) => {
                         ("planned", egui::Color32::from_rgb(120, 170, 230), Some(why))
@@ -274,6 +329,14 @@ fn link_card(
             if let Some(b) = cfg.ble.as_mut() {
                 ble_body(ui, b, ble, wifi_here);
             }
+        }
+        let thread_here = ble.thread && cfg.thread.is_some() && cfg.ble.is_none();
+        if thread_here && let Some(th) = cfg.thread.as_mut() {
+            thread_body(ui, th);
+        }
+        if !is_async && thread_here && !(wifi_here || ble_here) {
+            ui.add_space(6.0);
+            ui.label(dim("Kept, and generated once the runtime is Async."));
         }
         if wifi_here || ble_here {
             ui.add_space(6.0);
@@ -375,6 +438,53 @@ fn ble_body(ui: &mut egui::Ui, b: &mut BleConfig, ble: &BleFacts, wifi: bool) {
             }
         });
     });
+}
+
+const THREAD_USAGE: &str =
+    "pins::configs::thread::send_to(addr, pins::configs::thread::UDP_PORT, b\"21.5\").await.ok();";
+
+/// Thread's settings: the UDP port, and what the radio takes.
+fn thread_body(ui: &mut egui::Ui, th: &mut ThreadConfig) {
+    ui.indent("thread", |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("UDP port"));
+            ui.add(crate::panels::drag_value(ui, &mut th.udp_port).range(1..=65535));
+        });
+        ui.label(dim(concat!(
+            "OpenThread 0.4 as a Minimal End Device that stays awake: it joins the network in ",
+            "THREAD_DATASET (Credentials, below) and never forms one. One UDP socket on this ",
+            "port: send_to() and receive() over IPv6; addresses() lists the link-local, ",
+            "mesh-local and border-router (OMR) ones. A Thread border router (OpenThread BR, ",
+            "Home Assistant) supplies the dataset and the route to your LAN."
+        )));
+        ui.label(dim(concat!(
+            "The radio is embassy-nrf's 802.15.4 driver with OpenThread's MAC in software: it ",
+            "acknowledges frames late (500-650 us where the standard asks 192 us), so unicasts to ",
+            "the board are retried a few times, and a sleepy device would not attach. It takes ",
+            "RADIO, RNG, the 32 MHz crystal and EGU0_SWI0 (the radio's executor, priority 7); ",
+            "settings stay in RAM, so the board joins anew on every boot."
+        )));
+        ui.label(dim(concat!(
+            "The project builds for thumbv7em-none-eabi - soft-float, the FPU unused - because ",
+            "openthread-sys ships OpenThread compiled for it and for no hard-float target: no C ",
+            "compiler, CMake or libclang needed. Not with Bluetooth: one radio."
+        )));
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(THREAD_USAGE).monospace().size(11.0));
+            if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                ui.ctx().copy_text(THREAD_USAGE.to_owned());
+            }
+        });
+    });
+}
+
+/// Which secrets the credentials card shows: the links that are on.
+#[derive(Clone, Copy)]
+struct Secrets {
+    wifi: bool,
+    mqtt: bool,
+    thread: bool,
 }
 
 /// Switches an optional setting on or off without losing it: off keeps the
@@ -493,7 +603,7 @@ fn secrets_card(
     ui: &mut egui::Ui,
     files: &mut [(String, String)],
     is_async: bool,
-    mqtt: bool,
+    wanted: Secrets,
 ) -> bool {
     let mut changed = false;
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -510,28 +620,33 @@ fn secrets_card(
             }));
             return;
         };
+        // A link switched on after the file was written, or a line the user
+        // deleted: its empty line goes back now, as the next sync would.
+        if let Some(up) = iot_gen::topped_up(body, &iot_gen::secrets_body_for(wanted.wifi, wanted.thread)) {
+            *body = up;
+            changed = true;
+        }
         ui.add_space(4.0);
-        let rows: &[(&str, &str, bool)] = if mqtt {
-            &[
-                ("WIFI_SSID", "Network (SSID)", false),
-                ("WIFI_PASSWORD", "Password", true),
-                ("MQTT_USERNAME", "Broker user", false),
-                ("MQTT_PASSWORD", "Broker password", true),
-            ]
-        } else {
-            &[
-                ("WIFI_SSID", "Network (SSID)", false),
-                ("WIFI_PASSWORD", "Password", true),
-            ]
-        };
-        for (name, label, secret) in rows {
+        let mut rows: Vec<(&str, &str, bool)> = Vec::new();
+        if wanted.wifi {
+            rows.push(("WIFI_SSID", "Network (SSID)", false));
+            rows.push(("WIFI_PASSWORD", "Password", true));
+        }
+        if wanted.mqtt {
+            rows.push(("MQTT_USERNAME", "Broker user", false));
+            rows.push(("MQTT_PASSWORD", "Broker password", true));
+        }
+        if wanted.thread {
+            rows.push((iot_gen::THREAD_DATASET, "Thread dataset", true));
+        }
+        for (name, label, secret) in &rows {
             ui.horizontal(|ui| {
                 ui.add_sized([120.0, 18.0], egui::Label::new(*label));
                 match iot_gen::read_secret(body, name) {
                     Some(mut value) => {
                         let edit = egui::TextEdit::singleline(&mut value)
                             .password(*secret)
-                            .desired_width(220.0);
+                            .desired_width(if *name == iot_gen::THREAD_DATASET { 320.0 } else { 220.0 });
                         if ui.add(edit).changed() {
                             *body = iot_gen::write_secret(body, name, &value);
                             changed = true;
@@ -545,20 +660,64 @@ fn secrets_card(
                 }
             });
         }
-        let ssid = iot_gen::read_secret(body, "WIFI_SSID").unwrap_or_default();
-        if ssid.is_empty() {
-            ui.label(warn("no network name yet - the station has nothing to join"));
-        } else if ssid.len() > 32 {
-            ui.label(warn("an SSID is at most 32 bytes"));
+        if wanted.wifi {
+            let ssid = iot_gen::read_secret(body, "WIFI_SSID").unwrap_or_default();
+            if ssid.is_empty() {
+                ui.label(warn("no network name yet - the station has nothing to join"));
+            } else if ssid.len() > 32 {
+                ui.label(warn("an SSID is at most 32 bytes"));
+            }
+            let pass = iot_gen::read_secret(body, "WIFI_PASSWORD").unwrap_or_default();
+            if pass.is_empty() {
+                ui.label(dim("No password: the network is joined as an open one."));
+            } else if !(8..=63).contains(&pass.len()) {
+                ui.label(warn("a WPA2 passphrase is 8 to 63 characters"));
+            }
         }
-        let pass = iot_gen::read_secret(body, "WIFI_PASSWORD").unwrap_or_default();
-        if pass.is_empty() {
-            ui.label(dim("No password: the network is joined as an open one."));
-        } else if !(8..=63).contains(&pass.len()) {
-            ui.label(warn("a WPA2 passphrase is 8 to 63 characters"));
+        if wanted.thread
+            && let Some(hex) = iot_gen::read_secret(body, iot_gen::THREAD_DATASET)
+        {
+            dataset_summary(ui, &hex);
         }
     });
     changed
+}
+
+/// What the pasted dataset says, so the user can see which network it is -
+/// or why it would not attach.
+fn dataset_summary(ui: &mut egui::Ui, hex: &str) {
+    if hex.trim().is_empty() {
+        ui.label(warn(concat!(
+            "no dataset yet - nothing starts. On the border router: ",
+            "`ot-ctl dataset active -x`, and paste the hex here."
+        )));
+        return;
+    }
+    match iot::decode_dataset(hex) {
+        Ok(s) => {
+            let hexs = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            let mut parts = Vec::new();
+            if let Some(n) = &s.network_name {
+                parts.push(format!("network \"{n}\""));
+            }
+            if let Some(c) = s.channel {
+                parts.push(format!("channel {c}"));
+            }
+            if let Some(p) = s.pan_id {
+                parts.push(format!("PAN 0x{p:04x}"));
+            }
+            if let Some(x) = s.ext_pan_id {
+                parts.push(format!("ext PAN {}", hexs(&x)));
+            }
+            if let Some(m) = s.mesh_local_prefix {
+                parts.push(format!("mesh-local {}", iot::fmt_mesh_local_prefix(&m)));
+            }
+            ui.label(dim(parts.join(" · ")));
+        }
+        Err(why) => {
+            ui.label(warn(format!("dataset: {why} - the board would not attach")));
+        }
+    }
 }
 
 /// The IP stack: how it gets its address.

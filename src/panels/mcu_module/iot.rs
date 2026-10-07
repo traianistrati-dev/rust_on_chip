@@ -21,8 +21,13 @@
 //! - cyw43 0.7 and esp-radio 0.18 speak `bt-hci` 0.8; nrf-sdc 0.4 speaks 0.10.
 //!   One trouble-host version cannot serve both, which is why BLE is a phase
 //!   of its own.
-//! - openthread 0.4 needs esp-radio 1.0 on an ESP - a newer esp-hal than this
-//!   IDE's - but builds against embassy-nrf 0.11, which it already uses.
+//! - openthread 0.4 builds against embassy-nrf 0.11 (and on an ESP needs
+//!   esp-radio 1.0 beta; 0.2 is the release on esp-radio 0.18). Its
+//!   openthread-sys ships OpenThread compiled for `thumbv7em-none-eabi` with
+//!   the default (`matter`) features, and for no hard-float target: a Thread
+//!   project on the nRF52840 / nRF52833 builds for that soft-float target and
+//!   needs no C compiler, CMake or libclang. On the IDE's usual `-eabihf` it
+//!   would compile OpenThread's C and C++ on every clean build.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +56,10 @@ pub struct IotConfig {
     /// Bluetooth LE (a Nordic UART Service peripheral), `Some` while it is
     /// switched on. A link of its own, beside Wi-Fi or without it.
     pub ble: Option<BleConfig>,
+    /// Thread (an OpenThread end device with UDP), `Some` while it is switched
+    /// on. nRF52840 / nRF52833 only, and never beside Bluetooth: both need the
+    /// one radio. The network's dataset is a secret, in `secrets.rs`.
+    pub thread: Option<ThreadConfig>,
 }
 
 impl Default for IotConfig {
@@ -63,8 +72,156 @@ impl Default for IotConfig {
             esp_now: None,
             sntp: None,
             ble: None,
+            thread: None,
         }
     }
+}
+
+/// Thread: the UDP port the device listens on. Which network it joins is the
+/// Active Operational Dataset in `secrets.rs` (`THREAD_DATASET`), since it
+/// carries the network key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThreadConfig {
+    pub udp_port: u16,
+}
+
+impl Default for ThreadConfig {
+    fn default() -> Self {
+        Self {
+            udp_port: DEFAULT_THREAD_PORT,
+        }
+    }
+}
+
+/// The UDP port when nobody chose one: openthread's own examples use it.
+pub const DEFAULT_THREAD_PORT: u16 = 1212;
+
+/// The longest Active Operational Dataset, in bytes (OpenThread's
+/// `OT_OPERATIONAL_DATASET_MAX_LENGTH`): 508 hex characters.
+pub const MAX_DATASET_BYTES: usize = 254;
+
+/// What a Thread dataset says, read off its TLVs - shown under the secret so
+/// the user can see which network the hex is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DatasetSummary {
+    pub network_name: Option<String>,
+    pub channel: Option<u16>,
+    pub pan_id: Option<u16>,
+    pub ext_pan_id: Option<[u8; 8]>,
+    pub mesh_local_prefix: Option<[u8; 8]>,
+    pub has_network_key: bool,
+}
+
+/// The TLV types read here (`openthread/dataset.h`, `otMeshcopTlvType`).
+const TLV_CHANNEL: u8 = 0;
+const TLV_PAN_ID: u8 = 1;
+const TLV_EXT_PAN_ID: u8 = 2;
+const TLV_NETWORK_NAME: u8 = 3;
+const TLV_NETWORK_KEY: u8 = 5;
+const TLV_MESH_LOCAL_PREFIX: u8 = 7;
+
+/// Decode an Active Operational Dataset given as hex TLVs (what a border
+/// router's `ot-ctl dataset active -x` prints), with the checks OpenThread
+/// makes before it takes one (`Dataset::ValidateTlvs`) and attaches with it
+/// (`otDatasetIsCommissioned`). `Err` says what is wrong: not hex, an odd
+/// length, too long, a TLV cut short, repeated or shorter than its type, a
+/// channel off page 0 / 11-26, a name that is not 1-16 bytes of UTF-8, or one
+/// of the five things attaching needs missing - network key, name, channel,
+/// PAN ID, extended PAN ID. The generated `thread.rs` starts nothing then.
+pub fn decode_dataset(hex: &str) -> Result<DatasetSummary, &'static str> {
+    let hex = hex.trim();
+    if hex.is_empty() {
+        return Err("empty");
+    }
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("not hex - paste what `ot-ctl dataset active -x` prints");
+    }
+    if !hex.len().is_multiple_of(2) {
+        return Err("an odd number of hex digits");
+    }
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0))
+        .collect();
+    if bytes.len() > MAX_DATASET_BYTES {
+        return Err("longer than 254 bytes");
+    }
+    let mut s = DatasetSummary::default();
+    let mut seen = [false; 256];
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(&len) = bytes.get(i + 1) else {
+            return Err("a TLV is cut short");
+        };
+        let start = i + 2;
+        let end = start + len as usize;
+        let Some(v) = bytes.get(start..end) else {
+            return Err("a TLV runs past the end");
+        };
+        let ty = bytes[i];
+        if std::mem::replace(&mut seen[ty as usize], true) {
+            return Err("a TLV appears twice");
+        }
+        // The shortest value each known type takes, as OpenThread checks it.
+        let min = match ty {
+            TLV_CHANNEL => 3,
+            TLV_PAN_ID => 2,
+            TLV_EXT_PAN_ID | TLV_MESH_LOCAL_PREFIX => 8,
+            TLV_NETWORK_KEY => 16,
+            TLV_NETWORK_NAME => 1,
+            _ => 0,
+        };
+        if v.len() < min {
+            return Err("a TLV is shorter than its type needs");
+        }
+        let eight = |v: &[u8]| <[u8; 8]>::try_from(&v[..8]).ok();
+        match ty {
+            // A page byte, then the channel: 2.4 GHz is page 0, 11 to 26.
+            TLV_CHANNEL => {
+                let channel = u16::from_be_bytes([v[1], v[2]]);
+                if v[0] != 0 || !(11..=26).contains(&channel) {
+                    return Err("a channel outside 11-26 (page 0)");
+                }
+                s.channel = Some(channel);
+            }
+            TLV_PAN_ID => s.pan_id = Some(u16::from_be_bytes([v[0], v[1]])),
+            TLV_EXT_PAN_ID => s.ext_pan_id = eight(v),
+            TLV_NETWORK_NAME => match std::str::from_utf8(v) {
+                Ok(name) if name.len() <= 16 => s.network_name = Some(name.to_owned()),
+                _ => return Err("a network name that is not 1-16 bytes of UTF-8"),
+            },
+            TLV_NETWORK_KEY => s.has_network_key = true,
+            TLV_MESH_LOCAL_PREFIX => s.mesh_local_prefix = eight(v),
+            _ => {}
+        }
+        i = end;
+    }
+    if !s.has_network_key {
+        return Err("no network key in it");
+    }
+    if s.network_name.is_none() {
+        return Err("no network name in it");
+    }
+    if s.channel.is_none() {
+        return Err("no channel in it");
+    }
+    if s.pan_id.is_none() {
+        return Err("no PAN ID in it");
+    }
+    if s.ext_pan_id.is_none() {
+        return Err("no extended PAN ID in it");
+    }
+    Ok(s)
+}
+
+/// The mesh-local prefix as IPv6 (`fd7d:4f82:32cb:0::/64`).
+pub fn fmt_mesh_local_prefix(p: &[u8; 8]) -> String {
+    let groups: Vec<String> = p
+        .chunks(2)
+        .map(|g| format!("{:x}", u16::from_be_bytes([g[0], g[1]])))
+        .collect();
+    format!("{}::/64", groups.join(":"))
 }
 
 /// Bluetooth LE: the name the board advertises.
@@ -314,7 +471,9 @@ pub enum Platform {
     Esp,
     /// The CYW43 radio beside the RP2040 / RP2350 on a Pico W / Pico 2 W.
     Cyw43,
-    /// Nordic's SoftDevice Controller under the MPSL: Bluetooth only.
+    /// An nRF52's own radio: Bluetooth (Nordic's SoftDevice Controller under
+    /// the MPSL) or Thread (OpenThread on embassy-nrf's 802.15.4 driver) -
+    /// one at a time. No Wi-Fi.
     Nrf,
 }
 
@@ -342,6 +501,18 @@ pub fn ble_platform(family: &str, cyw43: bool) -> Option<Platform> {
     } else {
         None
     }
+}
+
+/// The nRF parts whose Thread the generator writes: openthread 0.4's
+/// prebuilt MTD on embassy-nrf 0.11's 802.15.4 driver, linked on both. Not the
+/// 52811 / 52820 (OpenThread's statics alone are ~36 KB of RAM), the 5340 (its
+/// radio is on the network core) nor the 54L15 (no 802.15.4 driver in
+/// embassy-nrf 0.11), see [`availability`].
+const NRF_THREAD: [&str; 2] = ["nrf52833", "nrf52840"];
+
+/// Does the IDE generate Thread for this chip?
+pub fn thread_platform(family: &str) -> bool {
+    NRF_THREAD.contains(&family)
 }
 
 /// The nrf-sdc / embassy-nrf chip feature for an nRF family (`"nrf52840"`).
@@ -395,6 +566,8 @@ pub struct Active {
     pub sntp: bool,
     /// Bluetooth LE.
     pub ble: bool,
+    /// Thread, with OpenThread's UDP - only ever on an nRF, never with `ble`.
+    pub thread: bool,
 }
 
 /// `Some` when a link is on, the chip can carry it, and the runtime is Async:
@@ -413,7 +586,10 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     let station = mcu.iot.wifi && wifi.is_some();
     let esp_now = mcu.iot.esp_now.is_some() && ESP_WIFI.contains(&mcu.family.as_str());
     let ble = mcu.iot.ble.is_some() && bt.is_some() && !nrf_ble_blocked_by_usb(mcu);
-    if !station && !esp_now && !ble {
+    let thread = mcu.iot.thread.is_some()
+        && thread_platform(&mcu.family)
+        && !nrf_thread_blocked_by_ble(mcu);
+    if !station && !esp_now && !ble && !thread {
         return None;
     }
     Some(Active {
@@ -423,7 +599,18 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
         mqtt: station && mcu.iot.mqtt.is_some(),
         sntp: station && mcu.iot.sntp.is_some(),
         ble,
+        thread,
     })
+}
+
+/// Thread beside Bluetooth on an nRF: both drive the one RADIO (the MPSL
+/// binds its vector; embassy-nrf's 802.15.4 driver takes the peripheral), and
+/// sharing it needs Nordic's multiprotocol 802.15.4 driver, which openthread
+/// does not use. Bluetooth's switch wins - even while USB keeps Bluetooth from
+/// being generated, so unwiring USB never silently swaps the radio's owner.
+/// `false` on a chip without Thread, where there is nothing to block.
+pub fn nrf_thread_blocked_by_ble(mcu: &crate::panels::mcu_module::mcu::Mcu) -> bool {
+    thread_platform(&mcu.family) && mcu.iot.ble.is_some()
 }
 
 /// Bluetooth beside USB on an nRF: both bind the CLOCK_POWER vector (the MPSL
@@ -592,11 +779,15 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         }
         Link::Ble => NotHere("no Bluetooth radio on this chip"),
 
-        Link::Thread if matches!(family, "nrf52840" | "nrf52833") => Planned(
-            "research first: openthread 0.4 builds against embassy-nrf 0.11, but compiles OpenThread's C sources",
+        Link::Thread if thread_platform(family) => Ready,
+        Link::Thread if matches!(family, "nrf52811" | "nrf52820") => NotHere(
+            "OpenThread's prebuilt end device needs about 36 KB of static RAM; this part has 24 / 32 KB",
         ),
-        Link::Thread if matches!(family, "esp32c5" | "esp32c6" | "esp32h2") => NotHere(
-            "openthread 0.4 needs esp-radio 1.0 - a newer esp-hal than the ~1.1 this IDE pins",
+        Link::Thread if family == "nrf54l15" => NotHere(
+            "embassy-nrf 0.11 has no 802.15.4 driver for the nRF54L, and OpenThread ships no prebuilt for its target",
+        ),
+        Link::Thread if matches!(family, "esp32c5" | "esp32c6" | "esp32h2") => Planned(
+            "not generated for the ESP yet: openthread 0.2 is the release on this IDE's esp-radio 0.18 (0.3+ moved to esp-radio 1.0 beta)",
         ),
         Link::Thread if family == "nrf5340" => NotHere(
             "the 802.15.4 radio is on the network core, which this IDE does not generate",
@@ -665,6 +856,11 @@ mod tests {
                     Link::Ble => assert_eq!(
                         a == Availability::Ready,
                         ble_platform(family, cyw43).is_some(),
+                        "{family}"
+                    ),
+                    Link::Thread => assert_eq!(
+                        a == Availability::Ready,
+                        thread_platform(family),
                         "{family}"
                     ),
                     _ => assert_ne!(a, Availability::Ready, "{family} {link:?}"),
@@ -772,6 +968,10 @@ mod tests {
     fn every_mesh_link_has_a_reason() {
         for link in [Link::BleMesh, Link::Zigbee, Link::EspWifiMesh, Link::Thread] {
             for family in ["esp32c6", "nrf52840", "rp2040"] {
+                if link == Link::Thread && family == "nrf52840" {
+                    assert_eq!(availability(link, family, false), Availability::Ready);
+                    continue;
+                }
                 match availability(link, family, false) {
                     Availability::Ready => panic!("{link:?} on {family} is not generated"),
                     Availability::Planned(why) | Availability::NotHere(why) => {
@@ -780,6 +980,106 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The dataset openthread's own nRF example joins, as `ot-ctl dataset
+    /// active -x` prints it: its channel, PAN, name and key are read back; a
+    /// mangled one is refused with the reason.
+    #[test]
+    fn a_thread_dataset_decodes_and_a_broken_one_says_why() {
+        const EXAMPLE: &str = "000300001901020fd80208b566147d38e384200e080000639c5d67a3bd0510c490f58d4be0d5eaeb0f09b395d1ae17030d4e4553542d50414e2d304644380708fd7d4f8232cb00000410a7e08419ae47c177fb91bcfcec789aa50c0402a0f77835060004001fffe0";
+        let s = decode_dataset(EXAMPLE).expect("the example decodes");
+        assert_eq!(s.channel, Some(25));
+        assert_eq!(s.pan_id, Some(0x0fd8));
+        assert_eq!(s.network_name.as_deref(), Some("NEST-PAN-0FD8"));
+        assert_eq!(s.ext_pan_id, Some([0xb5, 0x66, 0x14, 0x7d, 0x38, 0xe3, 0x84, 0x20]));
+        assert!(s.has_network_key);
+        assert!(s.mesh_local_prefix.is_some());
+        // Upper case and surrounding blanks are what a terminal copy gives.
+        assert!(decode_dataset(&format!("  {}\n", EXAMPLE.to_uppercase())).is_ok());
+
+        assert_eq!(decode_dataset(""), Err("empty"));
+        assert!(decode_dataset("0e08zz").is_err(), "not hex");
+        assert!(decode_dataset(&EXAMPLE[..EXAMPLE.len() - 1]).is_err(), "odd");
+        assert!(decode_dataset(&EXAMPLE[..EXAMPLE.len() - 2]).is_err(), "cut short");
+        assert!(decode_dataset(&"00".repeat(MAX_DATASET_BYTES + 1)).is_err(), "too long");
+        // A channel alone has no key to attach with.
+        assert_eq!(decode_dataset("000300000f"), Err("no network key in it"));
+        // What OpenThread refuses, or cannot attach with, is refused here too.
+        let key = "0510c490f58d4be0d5eaeb0f09b395d1ae17";
+        let rest = "0208b566147d38e38420030d4e4553542d50414e2d30464438";
+        assert_eq!(
+            decode_dataset(&format!("0003000005{key}")),
+            Err("a channel outside 11-26 (page 0)")
+        );
+        assert_eq!(
+            decode_dataset(&format!("0003020019{key}")),
+            Err("a channel outside 11-26 (page 0)"),
+            "page 2"
+        );
+        assert_eq!(
+            decode_dataset(&format!("00030000190003000019{key}")),
+            Err("a TLV appears twice")
+        );
+        assert_eq!(
+            decode_dataset(&format!("01010f{key}")),
+            Err("a TLV is shorter than its type needs")
+        );
+        assert_eq!(
+            decode_dataset(&format!("0302ff00{key}")),
+            Err("a network name that is not 1-16 bytes of UTF-8")
+        );
+        assert_eq!(
+            decode_dataset(&format!("0003000019{key}{rest}")),
+            Err("no PAN ID in it")
+        );
+        assert_eq!(
+            fmt_mesh_local_prefix(&s.mesh_local_prefix.unwrap()),
+            "fd7d:4f82:32cb:0::/64"
+        );
+    }
+
+    /// Thread on the two parts that carry it, never beside Bluetooth (whose
+    /// switch wins, USB or not), never off Async, never on a 52832.
+    #[test]
+    fn thread_takes_the_radio_only_without_bluetooth() {
+        use crate::panels::mcu_module::builtins::builtin_definitions;
+        let build = |id: &str| {
+            let def = builtin_definitions().into_iter().find(|d| d.id == id).unwrap();
+            let mut m = def.build_mcu();
+            m.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
+            m.iot.thread = Some(ThreadConfig::default());
+            m
+        };
+        let mut dk = build("nrf52840_dk");
+        let a = active(&dk).expect("Thread alone");
+        assert!(a.thread && !a.ble && !a.station, "{a:?}");
+        assert_eq!(a.platform, Platform::Nrf);
+        assert!(!nrf_thread_blocked_by_ble(&dk));
+
+        dk.iot.ble = Some(BleConfig::default());
+        let a = active(&dk).expect("Bluetooth");
+        assert!(a.ble && !a.thread, "Bluetooth wins: {a:?}");
+        assert!(nrf_thread_blocked_by_ble(&dk));
+
+        dk.iot.ble = None;
+        dk.runtime = crate::panels::mcu_module::mcu::model::Runtime::Blocking;
+        assert_eq!(active(&dk), None);
+
+        assert!(active(&build("nrf52833_microbit_v2")).is_some_and(|a| a.thread));
+        assert_eq!(active(&build("nrf52832_dk")), None, "no Thread on a 52832");
+        assert!(!nrf_thread_blocked_by_ble(&build("nrf52832_dk")));
+    }
+
+    /// A project saved before Thread existed reads with Thread off.
+    #[test]
+    fn a_config_without_thread_still_reads() {
+        let old: IotConfig = ron::from_str("(wifi: true, ble: Some((device_name: \"x\")))").unwrap();
+        assert_eq!(old.thread, None);
+        let back: IotConfig =
+            ron::from_str(&ron::to_string(&IotConfig { thread: Some(ThreadConfig { udp_port: 5683 }), ..old.clone() }).unwrap())
+                .unwrap();
+        assert_eq!(back.thread, Some(ThreadConfig { udp_port: 5683 }));
     }
 
     #[test]

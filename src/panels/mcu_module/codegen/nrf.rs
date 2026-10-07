@@ -2040,7 +2040,10 @@ fn async_clock_lines(mcu: &Mcu) -> String {
     let c = clock_choice(mcu);
     // USB runs only from the crystal: wired, it overrides the Clock tab.
     let usb_forces_xtal = !c.hfxo && usb_wired(mcu) && mcu.is_async();
-    let hf = if c.hfxo || usb_forces_xtal {
+    // So does Thread's 802.15.4 radio, and embassy-nrf's driver for it never
+    // starts the crystal itself (the MPSL does, for Bluetooth).
+    let thread_forces_xtal = !c.hfxo && !usb_forces_xtal && thread_on(mcu);
+    let hf = if c.hfxo || usb_forces_xtal || thread_forces_xtal {
         "ExternalXtal"
     } else {
         "Internal"
@@ -2062,6 +2065,9 @@ fn async_clock_lines(mcu: &Mcu) -> String {
     }
     if usb_forces_xtal {
         o.push_str("    // The USB module needs the crystal: the Clock tab's internal choice is\n    // overridden, since USB cannot run from the RC oscillator.\n");
+    }
+    if thread_forces_xtal {
+        o.push_str("    // Thread (IoT tab) needs the crystal: the Clock tab's internal choice is\n    // overridden, since the 802.15.4 radio does not run from the RC oscillator.\n");
     }
     o.push_str("    let mut config = embassy_nrf::config::Config::default();\n");
     o.push_str(&format!(
@@ -2586,7 +2592,52 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
 pub fn needs_static_cell(mcu: &Mcu) -> bool {
     mcu.is_async()
         && is_nrf(&mcu.family)
-        && (async_bus_lines(mcu).static_cell || ble_on(mcu))
+        && (async_bus_lines(mcu).static_cell || ble_on(mcu) || thread_on(mcu))
+}
+
+/// Is the IoT tab's Thread generated on this nRF? Then `main.rs` binds RADIO,
+/// starts the crystal and hands the radio and an RNG to `thread::start` - see
+/// [`thread_lines`] - and the project builds for [`THREAD_TARGET`]. `pub` for
+/// the manifest, the build target and the harness, which must follow the same
+/// answer.
+pub fn thread_on(mcu: &Mcu) -> bool {
+    use crate::panels::mcu_module::iot::{self, Platform};
+    mcu.is_async()
+        && iot::active(mcu).is_some_and(|a| a.platform == Platform::Nrf && a.thread)
+}
+
+/// The target a Thread project builds for. openthread-sys 0.4 ships OpenThread
+/// compiled for `thumbv7em-none-eabi` (with its default features) and for no
+/// hard-float target: on the usual `-eabihf` it compiles OpenThread's C and C++
+/// on every clean build, with CMake, clang (or arm-none-eabi-gcc) and libclang
+/// installed. Soft-float costs the FPU - `f32` maths runs in software - and
+/// nothing else.
+pub const THREAD_TARGET: &str = "thumbv7em-none-eabi";
+
+/// Thread's lines in an Async nRF `main.rs`, last in the block: the RADIO's
+/// handler joins `irqs`, and `thread::start` gets the 802.15.4 radio and an
+/// RNG. Nothing moves off priority 0 - without the MPSL nothing claims it.
+fn thread_lines(irqs: &mut Vec<String>) -> String {
+    const RADIO: &str = "embassy_nrf::radio::InterruptHandler<embassy_nrf::peripherals::RADIO>";
+    match irqs.iter_mut().find(|e| irq_vector(e) == "RADIO") {
+        Some(e) => {
+            let trimmed = e.trim_end().trim_end_matches(';').to_owned();
+            *e = format!("{trimmed}, {RADIO};");
+        }
+        None => irqs.push(format!("    RADIO => {RADIO};")),
+    }
+    let mut body = String::new();
+    body.push_str("\n    // ── IoT (IoT tab) ──\n");
+    body.push_str("    // Thread: OpenThread on the 802.15.4 radio, joining the network in\n");
+    body.push_str("    // secrets.rs (THREAD_DATASET).\n");
+    body.push_str("    static RNG: static_cell::StaticCell<embassy_nrf::rng::Rng<'static, embassy_nrf::mode::Blocking>> =\n");
+    body.push_str("        static_cell::StaticCell::new();\n");
+    body.push_str("    pins::configs::thread::start(\n");
+    body.push_str("        spawner,\n");
+    body.push_str("        embassy_nrf::radio::ieee802154::Radio::new(p.RADIO, Irqs),\n");
+    body.push_str("        RNG.init(embassy_nrf::rng::Rng::new_blocking(p.RNG)),\n");
+    body.push_str("    );\n");
+    body
 }
 
 /// Is the IoT tab's Bluetooth generated on this nRF? The MPSL and the
@@ -2788,8 +2839,10 @@ fn async_section(mcu: &Mcu) -> String {
     // Bluetooth adds vectors to the binding, lines around `init` and its
     // bring-up last in the block.
     let ble = ble_on(mcu).then(|| ble_lines(mcu, &mut buses.irqs));
+    // Thread binds RADIO and starts last; never with Bluetooth (`iot::active`).
+    let thread = thread_on(mcu).then(|| thread_lines(&mut buses.irqs));
     // An armed input is the only thing here that needs the spawner.
-    let spawner = if tasks.is_empty() && !buses.spawns && ble.is_none() {
+    let spawner = if tasks.is_empty() && !buses.spawns && ble.is_none() && thread.is_none() {
         "_spawner"
     } else {
         "spawner"
@@ -2840,6 +2893,9 @@ fn async_section(mcu: &Mcu) -> String {
     }
     o.push_str(&buses.body);
     if let Some((_, _, body)) = &ble {
+        o.push_str(body);
+    }
+    if let Some(body) = &thread {
         o.push_str(body);
     }
     o.push_str(GEN_END);
@@ -4197,6 +4253,50 @@ mod async_codegen {
         assert!(!main.contains(hold), "{main}");
     }
 
+    /// Thread builds soft-float - the one target OpenThread ships compiled
+    /// for - only while it is generated, and the project's `.cargo/config.toml`
+    /// follows both ways: `[build] target` and `[target.<triple>]` together.
+    #[test]
+    fn thread_moves_the_build_to_soft_float_and_back() {
+        use crate::panels::mcu_module::iot::{BleConfig, ThreadConfig};
+        use crate::panels::mcu_module::mcu_catalog::ToolchainKind;
+        use crate::panels::mcu_module::mcu_def::build_cfg;
+        use project_gen::ConfigFile;
+        let def = builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == "nrf52840_dk")
+            .expect("built-in nrf52840_dk");
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Async;
+        let hard = build_cfg(&def, Some(&mcu));
+        assert_eq!(hard.target, "thumbv7em-none-eabihf");
+        mcu.iot.thread = Some(ThreadConfig::default());
+        let soft = build_cfg(&def, Some(&mcu));
+        assert_eq!(soft.target, super::THREAD_TARGET);
+
+        let tc = ToolchainKind::RustEmbedded;
+        let before = project_gen::gen_config(ConfigFile::CargoConfig, &hard, &tc);
+        let after = project_gen::ensure_cargo_target(&before, &soft, &tc);
+        assert!(after.contains("target = \"thumbv7em-none-eabi\"\n"), "{after}");
+        assert!(after.contains("[target.thumbv7em-none-eabi]\n"), "{after}");
+        assert!(!after.contains("eabihf"), "{after}");
+        assert_eq!(project_gen::ensure_cargo_target(&after, &soft, &tc), after, "idempotent");
+        assert_eq!(project_gen::ensure_cargo_target(&after, &hard, &tc), before, "and back");
+        // What the user wrote outside the block stays.
+        let tailed = format!("{after}\n[env]\nMY_VAR = \"1\"\n");
+        assert!(project_gen::ensure_cargo_target(&tailed, &hard, &tc).ends_with("[env]\nMY_VAR = \"1\"\n"));
+        // A hand-written config (no markers) is the user's.
+        let mine = "[build]\ntarget = \"thumbv7em-none-eabihf\"\n";
+        assert_eq!(project_gen::ensure_cargo_target(mine, &soft, &tc), mine);
+
+        // Bluetooth takes the radio: hard-float again. Blocking: no Thread.
+        mcu.iot.ble = Some(BleConfig::default());
+        assert_eq!(build_cfg(&def, Some(&mcu)).target, "thumbv7em-none-eabihf");
+        mcu.iot.ble = None;
+        mcu.runtime = Runtime::Blocking;
+        assert_eq!(build_cfg(&def, Some(&mcu)).target, "thumbv7em-none-eabihf");
+    }
+
     /// The IoT tab's Bluetooth on three nRF52 boards, for a real cross-compile
     /// AND link (two critical sections - cortex-m's beside nrf-mpsl's - only
     /// fail at the link): the nRF52840 DK and the nRF52832 DK (64 KiB of RAM,
@@ -4290,6 +4390,113 @@ mod async_codegen {
             std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             println!("wrote {}", dir.display());
             println!("target: {}", def.project.target);
+        }
+    }
+
+    /// The IoT tab's Thread on the two parts that carry it, for a real
+    /// cross-compile AND link (OpenThread's prebuilt archives only fail at the
+    /// link): the nRF52840 DK with nothing else - the Clock tab's internal
+    /// oscillator, so Thread overrides it - and the micro:bit v2 with every
+    /// async peripheral wired. Each is written the way the app has it: the
+    /// project from BEFORE the switch (hard-float), then the switch, then the
+    /// app's per-frame `.cargo/config.toml` refresh and its manifest calls in
+    /// its order. No C toolchain: the matrix row sets nothing.
+    ///
+    /// ```text
+    /// cargo test --bin rust_on_chip emit_nrf_thread_project -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes projects to disk for a manual cross-compile"]
+    fn emit_nrf_thread_project() {
+        use crate::panels::mcu_module::codegen::iot_gen;
+        use crate::panels::mcu_module::iot::ThreadConfig;
+        use crate::panels::mcu_module::mcu_def::build_cfg;
+        for (id, dir_name, wired) in [
+            ("nrf52840_dk", "eide_nrf52840_thread_check", false),
+            ("nrf52833_microbit_v2", "eide_nrf52833_thread_check", true),
+        ] {
+            let def = builtins::builtin_definitions()
+                .into_iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("built-in {id}"));
+            let mut mcu = if wired {
+                on_async(everything())
+            } else {
+                let mut m = def.build_mcu();
+                m.runtime = Runtime::Async;
+                m
+            };
+            let before = build_cfg(&def, Some(&mcu));
+            assert_eq!(before.target, "thumbv7em-none-eabihf", "{id}: hard-float before");
+            mcu.iot.thread = Some(ThreadConfig::default());
+            assert!(super::thread_on(&mcu) && !super::ble_on(&mcu), "{id}: Thread alone");
+            let project = build_cfg(&def, Some(&mcu));
+            assert_eq!(project.target, super::THREAD_TARGET, "{id}");
+
+            let main_rs = mcu.fresh_main_rs().replacen(
+                "        // Your main loop code here.\n",
+                concat!(
+                    "        // Your main loop code here.\n",
+                    "        pins::configs::thread::wait_attached().await;\n",
+                    "        let _ = (pins::configs::thread::role(), pins::configs::thread::addresses());\n",
+                    "        let d = pins::configs::thread::receive().await;\n",
+                    "        pins::configs::thread::send_to(*d.from.ip(), d.from.port(), &d.data).await.ok();\n",
+                ),
+                1,
+            );
+            assert!(main_rs.contains("thread::receive().await"), "the loop was seeded:\n{main_rs}");
+            assert!(main_rs.contains("HfclkSource::ExternalXtal;"), "{main_rs}");
+            // The project as the app had it before the switch, then the app's
+            // refresh of `.cargo/config.toml`.
+            let mut files = project_gen::build_project_files(&before, &def.toolchain, &main_rs);
+            files.cargo_config =
+                project_gen::ensure_cargo_target(&files.cargo_config, &project, &def.toolchain);
+            assert!(files.cargo_config.contains("[target.thumbv7em-none-eabi]"), "{}", files.cargo_config);
+            assert!(!files.cargo_config.contains("eabihf"), "{}", files.cargo_config);
+            let user: Vec<(String, String)> = mcu.pin_tree_files();
+            assert!(
+                user.iter().any(|(p, c)| p == iot_gen::SECRETS_PATH && c.contains("THREAD_DATASET")),
+                "{id}: secrets.rs with the dataset line"
+            );
+            assert!(user.iter().any(|(p, _)| p == "src/pins/configs/thread.rs"), "{id}");
+            let dir = std::env::temp_dir().join(dir_name);
+            project_gen::clear_project_dir_keep_target(&dir);
+            project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
+                .expect("write nrf thread project");
+
+            let toml_path = dir.join("Cargo.toml");
+            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
+            let sources = [main_rs.as_str()];
+            let toml = project_gen::ensure_async_deps(
+                &toml,
+                true,
+                project_gen::async_flavor_for(&mcu.family, ""),
+                false,
+                false,
+                false,
+                &sources,
+            );
+            let toml = project_gen::ensure_task_priority_deps(
+                &toml,
+                main_rs.contains("InterruptExecutor") || super::needs_static_cell(&mcu),
+                &sources,
+            );
+            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &sources);
+            let toml = project_gen::ensure_iot_deps(
+                &toml,
+                crate::panels::mcu_module::iot::active(&mcu),
+                &project.probe_chip,
+                &mcu.family,
+                &sources,
+            );
+            let toml = project_gen::ensure_mpsl_critical_section(&toml, super::ble_on(&mcu));
+            for want in ["openthread = ", "tinyrlibc = ", "\"executor-interrupt\"", "critical-section-single-core"] {
+                assert!(toml.contains(want), "{want}:\n{toml}");
+            }
+            assert!(!toml.contains("nrf-sdc"), "{toml}");
+            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
+            println!("wrote {}", dir.display());
+            println!("target: {}", project.target);
         }
     }
 

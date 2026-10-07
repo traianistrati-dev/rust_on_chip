@@ -153,8 +153,9 @@ else
                 fams="$fams esp f1 embassy rp" ;;
             src/panels/mcu_module/stm32_flash_geometry.rs)
                 fams="$fams f1 embassy" ;;
-            # The IoT tab: generated for the ESP chips with Wi-Fi and the two
-            # Pico W boards, nowhere else.
+            # The IoT tab: generated for the ESP chips (Wi-Fi, ESP-NOW,
+            # Bluetooth), the two Pico W boards (Wi-Fi, Bluetooth) and the
+            # nRF52 (Bluetooth, Thread), nowhere else.
             src/panels/mcu_module/codegen/iot_gen.rs|            src/panels/mcu_module/codegen/iot_templates/*|            src/panels/mcu_module/iot.rs)
                 fams="$fams esp rp nrf" ;;
             assets/mcus/stm32f103c8t6.ron)

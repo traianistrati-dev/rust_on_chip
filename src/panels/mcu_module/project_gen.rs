@@ -237,6 +237,40 @@ pub fn partitions_csv_is_ours(text: &str) -> bool {
     text.contains(Cmt::Hash.begin())
 }
 
+/// The `[build] target` a `.cargo/config.toml` names, if it names one.
+pub fn build_target(cargo_config: &str) -> Option<&str> {
+    let mut in_build = false;
+    for line in cargo_config.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_build = l == "[build]";
+        } else if in_build
+            && let Some(v) = l.strip_prefix("target").map(str::trim_start)
+            && let Some(v) = v.strip_prefix('=')
+        {
+            return Some(v.trim().trim_matches('"'));
+        }
+    }
+    None
+}
+
+/// `.cargo/config.toml` with its generated block re-spliced from `c` when it
+/// builds for another target than `c` does - the IoT tab's Thread moves an
+/// nRF52840 / nRF52833 project to soft-float and back (`mcu_def::build_cfg`).
+/// Unchanged otherwise, so whatever the other steps keep in the block (the
+/// ESP runner flags) is never reverted here; a file without the block is the
+/// user's and is left alone by the splice. The `[build] target` and the
+/// `[target.<triple>]` table move together - one without the other loses
+/// `-Tlink.x` and the link fails.
+pub fn ensure_cargo_target(cargo_config: &str, c: &ProjectDef, toolchain: &ToolchainKind) -> String {
+    if *toolchain != ToolchainKind::RustEmbedded
+        || build_target(cargo_config).is_none_or(|t| t == c.target)
+    {
+        return cargo_config.to_owned();
+    }
+    splice_config(ConfigFile::CargoConfig, cargo_config, c, toolchain)
+}
+
 /// `--partition-table partitions.csv` on the `.cargo/config.toml` runner, on
 /// or off - so `cargo run` outside the IDE flashes the same table the IDE's
 /// own Flash does. Only the `runner = "espflash flash …"` line INSIDE the
@@ -1006,6 +1040,7 @@ pub fn ensure_iot_deps(
     let esp_now = active.is_some_and(|a| a.esp_now);
     let mqtt = active.is_some_and(|a| a.mqtt);
     let ble = active.is_some_and(|a| a.ble);
+    let thread = active.is_some_and(|a| a.thread);
     // Wi-Fi on an ESP: the station or ESP-NOW; with Bluetooth too, `coex`.
     let wifi = esp && (station || esp_now);
     let esp_ble = esp && ble;
@@ -1069,6 +1104,12 @@ pub fn ensure_iot_deps(
                 l = toggle_esp_now(&l, esp_now);
             }
             out.push(l);
+        } else if is_dep_line(line, "embassy-executor")
+            && line.contains("features = [")
+            && (thread || (ours && !sources.iter().any(|s| s.contains("InterruptExecutor"))))
+        {
+            // Thread's radio runs on an InterruptExecutor of its own.
+            out.push(toggle_hal_feature(line, "executor-interrupt", thread));
         } else {
             out.push(line.to_owned());
         }
@@ -1139,7 +1180,25 @@ pub fn ensure_iot_deps(
     );
     s = ensure_dep(&s, "bt-hci", nrf_feature.is_some(), "bt-hci = \"0.10\"", sources);
     s = ensure_dep(&s, "rand_core", nrf_feature.is_some(), "rand_core = \"0.9\"", sources);
-    if station || nrf_feature.is_some() {
+    // Thread: OpenThread with its default features - the set openthread-sys
+    // ships compiled for `thumbv7em-none-eabi`; one more feature and it
+    // compiles OpenThread's C instead. tinyrlibc has the two libc functions
+    // that C calls (`strcmp`, `strstr`).
+    s = ensure_dep(
+        &s,
+        "openthread",
+        thread,
+        "openthread = { version = \"0.4\", features = [\"embassy-nrf\"] }",
+        sources,
+    );
+    s = ensure_dep(
+        &s,
+        "tinyrlibc",
+        thread,
+        "tinyrlibc = { version = \"0.5\", default-features = false, features = [\"strstr\", \"strcmp\"] }",
+        sources,
+    );
+    if station || nrf_feature.is_some() || thread {
         s = ensure_dep(&s, "static_cell", true, "static_cell = \"2\"", sources);
     }
     if on {
@@ -5399,6 +5458,7 @@ mod iot_deps_tests {
             mqtt,
             sntp: false,
             ble: false,
+            thread: false,
         })
     }
 
@@ -5452,6 +5512,7 @@ mod iot_deps_tests {
                 mqtt: true,
                 sntp: true,
                 ble: false,
+                thread: false,
             }),
             "",
             "rp2040",
@@ -5480,6 +5541,7 @@ mod iot_deps_tests {
             mqtt: false,
             sntp: true,
             ble: false,
+            thread: false,
         });
         let on = ensure_iot_deps(ESP_ASYNC, both, "esp32c3", "esp32c3", &[]);
         assert!(
@@ -5499,6 +5561,7 @@ mod iot_deps_tests {
             mqtt: false,
             sntp: false,
             ble: false,
+            thread: false,
         });
         let a = ensure_iot_deps(ESP_ASYNC, alone, "esp32c3", "esp32c3", &[]);
         assert!(a.contains("\"esp-now\"") && a.contains("esp-alloc"), "{a}");
@@ -5528,6 +5591,7 @@ mod iot_deps_tests {
             mqtt: false,
             sntp: false,
             ble,
+            thread: false,
         })
     }
 
@@ -5593,6 +5657,42 @@ mod iot_deps_tests {
         let trouble = moved.lines().find(|l| l.starts_with("trouble-host")).unwrap();
         assert!(trouble.contains("\"0.8\""), "{trouble}");
         assert_eq!(moved.matches("trouble-host").count(), 1, "{moved}");
+    }
+
+    /// Thread: OpenThread with its default features (the set openthread-sys
+    /// ships compiled), tinyrlibc, static_cell and `executor-interrupt` on the
+    /// executor line - gone again with the switch, while cortex-m's critical
+    /// section stays (no MPSL). A user's own InterruptExecutor keeps the
+    /// feature.
+    #[test]
+    fn thread_brings_openthread_and_the_interrupt_executor() {
+        const NRF_ASYNC: &str = "[dependencies]\ncortex-m    = { version = \"0.7\", features = [\"critical-section-single-core\"] }\nembassy-executor = { version = \"0.10\", features = [\"platform-cortex-m\", \"executor-thread\"] }   # <rust_on_chip>\n";
+        let thread = Some(Active {
+            thread: true,
+            ..active(Platform::Nrf, false, false, false).unwrap()
+        });
+        let on = ensure_iot_deps(NRF_ASYNC, thread, "nRF52840_xxAA", "nrf52840", &[]);
+        for want in [
+            "openthread = { version = \"0.4\", features = [\"embassy-nrf\"] }",
+            "tinyrlibc = { version = \"0.5\", default-features = false, features = [\"strstr\", \"strcmp\"] }",
+            "static_cell = \"2\"",
+            "\"executor-interrupt\", \"platform-cortex-m\", \"executor-thread\"",
+            "critical-section-single-core",
+        ] {
+            assert!(on.contains(want), "{want}:\n{on}");
+        }
+        for absent in ["nrf-sdc", "nrf-mpsl", "trouble-host", "embassy-net", "rand_core"] {
+            assert!(!on.contains(absent), "{absent}:\n{on}");
+        }
+        assert_eq!(ensure_iot_deps(&on, thread, "nRF52840_xxAA", "nrf52840", &[]), on, "idempotent");
+
+        let off = ensure_iot_deps(&on, None, "nRF52840_xxAA", "nrf52840", &[]);
+        for absent in ["openthread", "tinyrlibc", "executor-interrupt"] {
+            assert!(!off.contains(absent), "{absent}:\n{off}");
+        }
+        let mine = ["static EX: InterruptExecutor = InterruptExecutor::new();"];
+        let kept = ensure_iot_deps(&on, None, "nRF52840_xxAA", "nrf52840", &mine);
+        assert!(kept.contains("executor-interrupt"), "{kept}");
     }
 
     /// cortex-m's critical section goes while the MPSL runs, and comes back.

@@ -417,11 +417,29 @@ board).
 The SSID and the passwords are typed in the tab but stored only in
 `src/pins/configs/secrets.rs`, which the generated `.gitignore` lists — never in
 `mcu.config`, which is committed. The file is written once and never
-regenerated.
+regenerated: a link switched on later only adds its own, empty lines.
+
+**Thread** is a link of its own on the nRF52840 and nRF52833: an OpenThread
+end device (openthread 0.4 on embassy-nrf's 802.15.4 driver) that joins the
+network in `THREAD_DATASET` — the Active Operational Dataset as hex, what
+`ot-ctl dataset active -x` prints on a border router, kept in `secrets.rs` with
+the network key in it — and talks UDP over IPv6:
+`pins::configs::thread::send_to(addr, port, b"..").await`, `receive().await`,
+`addresses()`, `wait_attached().await`. A Thread project builds for
+`thumbv7em-none-eabi` (soft-float): openthread-sys ships OpenThread compiled
+for it and for no hard-float target, so no C compiler, CMake or libclang is
+needed — on `-eabihf` it would compile OpenThread's C and C++. A dataset that
+is empty or short of what attaching needs starts nothing. It is a Minimal End
+Device that stays awake; the software MAC acknowledges frames late, so
+unicasts to it are retried a few times and a sleepy device would not attach.
+Not beside Bluetooth (one radio), and not on the nRF52811/52820 (RAM), the
+nRF5340 (network core) or the nRF54L15 (no 802.15.4 driver). The ESP32-C6 /
+H2 are planned: openthread 0.2 is the release on the esp-radio 0.18 the rest
+of the tab uses (0.3+ moved to esp-radio 1.0 beta).
 
 Only what the chip's radio can carry is listed. Of that, what is not generated
-says why: Thread is research on the nRF52840 (OpenThread is C), and BLE Mesh,
-Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to generate for —
+says why: BLE Mesh, Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to
+generate for —
 ESP-NOW is the mesh-capable link, and `espnow.rs` describes a flooding relay
 on top of it. Port 1883 is plain TCP and SNTP is unauthenticated UDP; TLS is
 not generated yet.

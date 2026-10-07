@@ -3155,8 +3155,11 @@ impl AppIde {
 
     /// The selected chip's Rust target triple, for narrowing which tools the
     /// banner asks for — see [`RequiredTool::only_for_target`].
+    /// The triple the project builds for - the build config's, which Thread
+    /// moves to soft-float - so the Tools banner asks for the target the
+    /// build will really install.
     fn selected_target(&self) -> Option<String> {
-        self.selected_def().map(|d| d.project.target.clone())
+        self.selected_build_cfg().map(|(p, _)| p.target)
     }
 
     /// Owned `(project params, toolchain)` for project generation — cloned so no
@@ -3984,10 +3987,14 @@ impl AppIde {
                 )
             });
             let csv = project_gen::splice_partitions_csv(&self.partitions_csv, rows.as_deref());
-            let runner = project_gen::ensure_partition_table_runner(
-                &self.cargo_config,
-                !csv.trim().is_empty(),
-            );
+            // The build target follows the build config: Thread (IoT tab)
+            // moves an nRF52840 / nRF52833 to soft-float and back.
+            let targeted = match self.selected_build_cfg() {
+                Some((cfg, tc)) => project_gen::ensure_cargo_target(&self.cargo_config, &cfg, &tc),
+                None => self.cargo_config.clone(),
+            };
+            let runner =
+                project_gen::ensure_partition_table_runner(&targeted, !csv.trim().is_empty());
             // esp-radio is built on `alloc`, which the Xtensa toolchain only
             // has when `build-std` lists it.
             let runner = project_gen::ensure_build_std_alloc(

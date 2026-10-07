@@ -976,7 +976,14 @@ pub fn build_cfg(
     mcu: Option<&crate::panels::mcu_module::mcu::Mcu>,
 ) -> ProjectDef {
     let is_async = mcu.is_some_and(|m| m.is_async());
-    def.project.for_async(is_async).into_owned()
+    let mut out = def.project.for_async(is_async).into_owned();
+    // The IoT tab's Thread builds soft-float: OpenThread ships compiled for
+    // that target only (see `nrf::THREAD_TARGET`). Here, so the manifest's
+    // `.cargo/config.toml`, the build, the flash and the ELF all follow.
+    if mcu.is_some_and(crate::panels::mcu_module::codegen::nrf::thread_on) {
+        out.target = crate::panels::mcu_module::codegen::nrf::THREAD_TARGET.to_owned();
+    }
+    out
 }
 
 impl ProjectDef {

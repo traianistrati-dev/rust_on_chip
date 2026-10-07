@@ -70,6 +70,54 @@ fn every_tab_draws_on_a_pico_board() {
     draw_every_tab("rp2350_pico2_ice");
 }
 
+/// The IoT tab with Thread on an nRF52840: the port, the dataset row with a
+/// good dataset, a broken one and a Wi-Fi-era secrets.rs without the line -
+/// and with Bluetooth switched on beside it, both blocked chips.
+#[test]
+fn the_iot_tab_draws_thread_on_an_nrf() {
+    use crate::panels::mcu_module::codegen::iot_gen;
+    use crate::panels::mcu_module::iot::{BleConfig, ThreadConfig};
+    use crate::panels::mcu_module::mcu::model::Runtime;
+    const GOOD: &str = "000300001901020fd80208b566147d38e384200e080000639c5d67a3bd0510c490f58d4be0d5eaeb0f09b395d1ae17030d4e4553542d50414e2d304644380708fd7d4f8232cb00000410a7e08419ae47c177fb91bcfcec789aa50c0402a0f77835060004001fffe0";
+    let fresh = iot_gen::secrets_body_for(false, true);
+    for (secrets, ble) in [
+        (iot_gen::write_secret(&fresh, iot_gen::THREAD_DATASET, GOOD), false),
+        (iot_gen::write_secret(&fresh, iot_gen::THREAD_DATASET, "0e08zz"), false),
+        (iot_gen::secrets_body(), false),
+        (fresh.clone(), true),
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = AppIde::new(
+            &eframe::CreationContext::_new_kittest(ctx.clone()),
+            None,
+            None,
+        );
+        app.startup_picker = None;
+        app.selected_mcu_id = "nrf52840_dk".to_owned();
+        app.mcu = AppIde::build_mcu_for(&app.mcu_registry, "nrf52840_dk");
+        let mcu = app.mcu.as_mut().expect("built-in chip");
+        mcu.runtime = Runtime::Async;
+        mcu.iot.thread = Some(ThreadConfig::default());
+        mcu.iot.ble = ble.then(BleConfig::default);
+        app.project_tree
+            .user_src_files
+            .push((iot_gen::SECRETS_PATH.to_owned(), secrets));
+        app.active_tab = McuTab::Iot;
+        for pass in 0..3u64 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                time: Some(pass as f64 / 30.0),
+                predicted_dt: 1.0 / 30.0,
+                ..Default::default()
+            };
+            let _ = crate::headless::run_ui(&ctx, input, |ui| app.show_mcu_panel(ui));
+        }
+    }
+}
+
 /// The IoT tab with Wi-Fi and MQTT on, on both radios - every card drawn,
 /// the credentials card included once `secrets.rs` exists.
 #[test]

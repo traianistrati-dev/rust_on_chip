@@ -451,8 +451,35 @@ Only what the chip's radio can carry is listed. Of that, what is not generated
 says why: BLE Mesh, Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to
 generate for —
 ESP-NOW is the mesh-capable link, and `espnow.rs` describes a flooding relay
-on top of it. Port 1883 is plain TCP and SNTP is unauthenticated UDP; TLS is
-not generated yet.
+on top of it. SNTP is unauthenticated UDP.
+
+**MQTT over TLS** is a switch on the MQTT client, on the ESP chips and the
+Pico W / Pico 2 W: TLS 1.3 through embedded-tls — pure Rust, so nothing but
+rustc and cargo is needed on any of them. `mqtt.rs` itself never changes with
+the switch; `mqtt_link.rs` beside it is plain TCP or TLS. With TLS the broker
+must present a chain that ends in the CA of `mqtt_ca.rs` and names the server
+name (the host, unless set), and prove it holds that key; the dates are checked
+once SNTP has the time. `mqtt_ca.rs` is written once with ISRG Root X1 (Let's
+Encrypt — test.mosquitto.org on port 8886) and committed, a CA being public:
+paste your own broker's CA over it, and the tab shows whose it is, its key and
+until when. Every certificate in the chain must be signed with RSA or P-256 —
+or P-384 with the tab's "P-384 chains" (114 KiB of flash), which an ECDSA
+Let's Encrypt certificate, certbot's default, needs. The gaps in embedded-tls
+0.19 are closed in the generated code: a handshake with no certificate is
+refused, an RSA-PSS signature is taken only from an RSA key and a
+CertificateVerify only after a checked chain (each would otherwise panic it),
+every certificate after the broker's must be a CA, an encrypted record too
+short to hold anything is refused (another panic), and a TLS record is handed
+over only whole — so the MQTT loop can cancel a read — and never waited for on
+a socket that can receive no more. "Encrypt only, no check" is offered, with
+the warning it deserves; it is never the default. Not reached: brokers that
+speak only TLS 1.2 (broker.hivemq.com) or want a client certificate (AWS IoT);
+revocation is not checked. The ESP heap grows by 32 KiB for the RSA checks
+(on the S2 all of it moves to the RAM the bootloader used); a Pico gets a
+32 KiB heap and keys from its ring oscillator whitened with SHA-256. Not on the
+ESP32-C5 / C61 (no TRNG in esp-hal 1.1), nor on an ESP32 or ESP32-C2 with
+Bluetooth beside Wi-Fi (no RAM left) — and where TLS is switched on but cannot
+run, no MQTT is generated at all, never the password in clear.
 
 ### Virtual device modules
 Instead of wiring a peripheral pin by pin, you can drop a **device** onto the

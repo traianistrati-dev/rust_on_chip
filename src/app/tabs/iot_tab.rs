@@ -100,6 +100,31 @@ impl AppIde {
                 .flatten()
                 .filter(|t| *t != crate::panels::mcu_module::codegen::nrf::THREAD_TARGET)
                 .map(str::to_owned);
+            // MQTT over TLS: whether this chip can, what mqtt_ca.rs holds, and an
+            // edited mqtt.rs / mqtt_link.rs that no longer fits the switch.
+            let tls = {
+                let file = |name: &str| {
+                    let path = format!("src/pins/configs/{name}");
+                    self.project_tree
+                        .user_src_files
+                        .iter()
+                        .find(|(p, _)| *p == path)
+                        .map(|(_, c)| c.as_str())
+                };
+                let coex = mcu.iot.ble.is_some() && (mcu.iot.wifi || mcu.iot.esp_now.is_some());
+                let want = mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls);
+                TlsFacts {
+                    available: iot::tls_available(&family, coex),
+                    pico: platform == Some(Platform::Cyw43),
+                    sntp: mcu.iot.sntp.is_some(),
+                    coex,
+                    s2: family == "esp32s2",
+                    ca: file(iot_gen::MQTT_CA).map(|c| iot_gen::ca_pem_of(c).map(iot::ca_summary)),
+                    left: platform.and_then(|p| {
+                        iot_gen::mqtt_files_left(file(iot_gen::MQTT), file(iot_gen::MQTT_LINK), want, p)
+                    }),
+                }
+            };
             let files = &mut self.project_tree.user_src_files;
             let mut changed = false;
 
@@ -200,7 +225,7 @@ impl AppIde {
                     ui.add_enabled_ui(link_up, |ui| network_card(ui, &mut mcu.iot));
                     ui.add_space(12.0);
 
-                    ui.add_enabled_ui(link_up, |ui| application_card(ui, &mut mcu.iot, &chip_id));
+                    ui.add_enabled_ui(link_up, |ui| application_card(ui, &mut mcu.iot, &chip_id, &tls));
                 }
             });
             tree_changed = changed;
@@ -366,8 +391,12 @@ fn link_card(
                             .suffix(" KiB"),
                     );
                     if coex {
+                        let tls = cfg.mqtt.as_ref().is_some_and(|m| m.tls)
+                            && iot::tls_available(&ble.family, true).is_ok();
                         ui.label(dim(if ble.family == "esp32" {
                             "Wi-Fi beside Bluetooth takes a fixed heap: 96 KiB of the bootloader's RAM + 24 KiB."
+                        } else if tls {
+                            "Wi-Fi beside Bluetooth, with MQTT over TLS, takes a fixed heap: 64 KiB of the bootloader's RAM + 96 KiB."
                         } else {
                             "Wi-Fi beside Bluetooth takes a fixed heap: 64 KiB of the bootloader's RAM + 64 KiB."
                         }));
@@ -803,8 +832,27 @@ fn octets(ui: &mut egui::Ui, b: &mut [u8; 4]) {
     }
 }
 
+/// What the MQTT card needs to know about TLS on this chip and project.
+struct TlsFacts {
+    /// The chip can carry it (`iot::tls_available`); `Err` says why not.
+    available: Result<(), &'static str>,
+    /// A Pico W / Pico 2 W: TLS brings a heap.
+    pico: bool,
+    /// SNTP is on: the certificates' dates are checked.
+    sntp: bool,
+    /// Bluetooth beside Wi-Fi: the ESP heap is the fixed coex one.
+    coex: bool,
+    /// The ESP32-S2, whose whole heap moves to the reclaimed RAM with TLS.
+    s2: bool,
+    /// What mqtt_ca.rs holds, once it exists: `None` inside when CA_PEM is
+    /// not a plain string literal the tab can read.
+    ca: Option<Option<Result<iot::CaSummary, &'static str>>>,
+    /// An edited MQTT file that no longer fits the TLS switch.
+    left: Option<&'static str>,
+}
+
 /// What runs over the stack: MQTT today, the rest listed.
-fn application_card(ui: &mut egui::Ui, cfg: &mut IotConfig, chip_id: &str) {
+fn application_card(ui: &mut egui::Ui, cfg: &mut IotConfig, chip_id: &str, tls: &TlsFacts) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(egui::RichText::new(format!("{}  APPLICATION", ph::CLOUD)).strong());
         ui.add_space(4.0);
@@ -825,7 +873,7 @@ fn application_card(ui: &mut egui::Ui, cfg: &mut IotConfig, chip_id: &str) {
             ui.label(dim("rust-mqtt 0.6 (MQTT 5) - src/pins/configs/mqtt.rs"));
         });
         if let Some(m) = cfg.mqtt.as_mut() {
-            mqtt_body(ui, m);
+            mqtt_body(ui, m, tls);
         }
         ui.add_space(6.0);
         let mut sntp_on = cfg.sntp.is_some();
@@ -840,16 +888,168 @@ fn application_card(ui: &mut egui::Ui, cfg: &mut IotConfig, chip_id: &str) {
             sntp_body(ui, s);
         }
         ui.add_space(6.0);
-        for (name, why) in [
-            ("HTTP client", "on request: reqwless runs on the same TcpSocket"),
-            ("TLS (MQTT on 8883)", "planned: embedded-tls / esp-mbedtls"),
-        ] {
+        for (name, why) in [("HTTP client", "on request: reqwless runs on the same TcpSocket")] {
             ui.horizontal(|ui| {
                 ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
                 ui.label(egui::RichText::new(name).strong());
                 ui.label(egui::RichText::new("planned").size(10.0).color(egui::Color32::from_rgb(120, 170, 230)));
                 ui.label(dim(why));
             });
+        }
+    });
+}
+
+/// MQTT over TLS: the switch, the check, the name, the CA - and what each
+/// leaves unchecked.
+fn tls_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts) {
+    ui.horizontal(|ui| {
+        let mut on = m.tls;
+        let can = tls.available.is_ok();
+        if ui
+            .add_enabled(can || on, egui::Checkbox::new(&mut on, ""))
+            .on_hover_text("Encrypt the connection: TLS 1.3 (embedded-tls) in src/pins/configs/mqtt_link.rs")
+            .changed()
+        {
+            m.port = m.port_for_tls(on);
+            m.tls = on;
+        }
+        ui.label(egui::RichText::new("TLS").strong());
+        ui.label(dim("MQTT over TLS 1.3 - src/pins/configs/mqtt_link.rs, the CA in mqtt_ca.rs"));
+    });
+    if let Err(why) = tls.available {
+        if m.tls {
+            ui.label(warn(format!(
+                "TLS is not on this chip ({why}), so MQTT is not generated at all while TLS is on - never the password in clear. Switch TLS off for plain MQTT."
+            )));
+        } else {
+            ui.label(dim(format!("TLS is not on this chip: {why}.")));
+            if m.port == iot::PLAIN_PORT {
+                ui.label(warn("1883 is plain TCP: anyone on the network can read it, the password included."));
+            }
+        }
+        return;
+    }
+    if !m.tls {
+        if m.port == iot::PLAIN_PORT {
+            ui.label(warn(
+                "1883 is plain TCP: anyone on the network can read it, the password included - switch TLS on.",
+            ));
+        }
+        if let Some(left) = tls.left {
+            ui.label(warn(left));
+        }
+        return;
+    }
+    ui.indent("tls", |ui| {
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut m.verify, true, "Check the broker's certificate");
+            ui.radio_value(&mut m.verify, false, "Encrypt only - NO check");
+        });
+        if !m.verify {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  Encrypted but NOT authenticated: whoever controls the Wi-Fi, the router or DNS can pose as the broker and read the MQTT password.",
+                    ph::WARNING
+                ))
+                .size(11.0)
+                .color(egui::Color32::from_rgb(230, 90, 80)),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Server name"));
+            ui.add(
+                egui::TextEdit::singleline(&mut m.server_name)
+                    .hint_text(m.host.trim().to_owned())
+                    .desired_width(200.0),
+            );
+        });
+        ui.label(dim(
+            "The name the broker's certificate carries, sent as SNI - empty = the broker host.",
+        ));
+        if let Some(p) = iot::tls_problem(m) {
+            ui.label(warn(p));
+        }
+        // The CA is compiled in either mode, so what is wrong with it is said
+        // in both.
+        match &tls.ca {
+            Some(Some(Ok(ca))) => {
+                let key = match ca.key {
+                    iot::CaKey::Rsa => "RSA",
+                    iot::CaKey::EcP256 => "EC P-256",
+                    iot::CaKey::EcP384 => "EC P-384",
+                    iot::CaKey::EcOther => "EC (another curve)",
+                    iot::CaKey::Ed25519 => "Ed25519",
+                    iot::CaKey::Other => "another key",
+                };
+                ui.label(dim(format!(
+                    "CA: {} · {key} · valid to {} - src/pins/configs/mqtt_ca.rs; paste your broker's CA there.",
+                    ca.name, ca.not_after
+                )));
+                match ca.is_ca {
+                    Some(false) => {
+                        ui.label(warn("mqtt_ca.rs holds a certificate that is not a CA - paste the CA that signed the broker's"));
+                    }
+                    None => {
+                        ui.label(dim("An X.509 v1 certificate (no extensions): used as the trust anchor as it is."));
+                    }
+                    Some(true) => {}
+                }
+                match ca.key {
+                    iot::CaKey::EcP384 if !m.p384 => {
+                        ui.label(warn("a P-384 CA: switch \"P-384 chains\" on below, or nothing it signed is accepted"));
+                    }
+                    iot::CaKey::EcOther | iot::CaKey::Other => {
+                        ui.label(warn("embedded-tls cannot check this key's signatures: only RSA, EC P-256 and (with \"P-384 chains\") P-384"));
+                    }
+                    iot::CaKey::Ed25519 => {
+                        ui.label(warn("embedded-tls checks Ed25519 only with its `ed25519` feature, which the IDE does not turn on"));
+                    }
+                    _ => {}
+                }
+                if ca.more {
+                    ui.label(dim("More than one certificate in mqtt_ca.rs: only the first is used."));
+                }
+            }
+            Some(Some(Err(why))) => {
+                ui.label(warn(format!("mqtt_ca.rs: {why} - the build fails on it")));
+            }
+            Some(None) => {
+                ui.label(dim("mqtt_ca.rs's CA_PEM is not a plain string literal: the tab cannot read it, the build checks it."));
+            }
+            None => {
+                ui.label(dim(
+                    "mqtt_ca.rs is written with the next regeneration: ISRG Root X1 (Let's Encrypt).",
+                ));
+            }
+        }
+        if m.verify {
+            ui.label(dim(if tls.sntp {
+                "The certificates' dates are checked once SNTP has the time (up to 10 s waited for it)."
+            } else {
+                "The certificates' dates are NOT checked: there is no clock - switch SNTP on."
+            }));
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut m.p384, "P-384 chains")
+                .on_hover_text("embedded-tls's `p384` feature: about 114 KiB of flash more");
+            ui.label(dim("an ECDSA Let's Encrypt certificate (certbot's default) needs it: its issuers are P-384"));
+        });
+        ui.label(dim(concat!(
+            "TLS 1.3 only, AES-128-GCM with P-256; every certificate in the broker's chain must be signed ",
+            "with RSA or P-256 (P-384 with the switch above). broker.hivemq.com (TLS 1.2 only) and AWS IoT ",
+            "(client certificates) are out of reach; test.mosquitto.org works on 8886. Revocation is not checked."
+        )));
+        ui.label(dim(if tls.pico {
+            "On a Pico TLS brings a 32 KiB heap (the RSA checks), and keys from the ring oscillator, whitened."
+        } else if tls.coex {
+            "Beside Bluetooth the heap is fixed: 64 KiB of the bootloader's RAM + 96 KiB (32 more for the RSA checks)."
+        } else if tls.s2 {
+            "On the S2 all of the heap moves to the RAM the bootloader used (TLS's buffers fill its DRAM), 32 KiB more for the RSA checks: keep it at 104 KiB or less."
+        } else {
+            "The heap grows by 32 KiB for the RSA checks, in the RAM the bootloader used."
+        }));
+        if let Some(left) = tls.left {
+            ui.label(warn(left));
         }
     });
 }
@@ -890,7 +1090,7 @@ fn sntp_body(ui: &mut egui::Ui, s: &mut SntpConfig) {
     });
 }
 
-fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig) {
+fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts) {
     ui.indent("mqtt", |ui| {
         ui.horizontal(|ui| {
             ui.add_sized([90.0, 18.0], egui::Label::new("Broker"));
@@ -950,9 +1150,8 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig) {
         ui.label(dim("`+` matches one level, `#` the rest. What arrives comes out of incoming()."));
 
         ui.add_space(4.0);
-        if m.port == 1883 {
-            ui.label(warn("1883 is plain TCP: anyone on the network can read it. TLS is not generated yet."));
-        }
+        tls_section(ui, m, tls);
+        ui.add_space(4.0);
         ui.label(dim("From anywhere in the firmware:"));
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(MQTT_USAGE).monospace().size(11.0));

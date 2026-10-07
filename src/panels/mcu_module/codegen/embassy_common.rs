@@ -2063,23 +2063,34 @@ mod emit_for_manual_compile {
         // only link), `ble+espnow` = Bluetooth beside ESP-NOW with the station
         // off (`coex` with no IP stack), `ble+all` = everything at once,
         // `thread` = Thread alone on the 802.15.4 radio (C6, H2, C5:
-        // openthread 0.2, prebuilt OpenThread and Mbed TLS).
+        // openthread 0.2, prebuilt OpenThread and Mbed TLS), `mqtts` = the
+        // station + MQTT over TLS with no SNTP (dates unchecked). `all` and
+        // `ble+all` are over TLS wherever the chip can carry it.
         let iot_mode = std::env::var("EIDE_ESP_IOT").ok();
         if let Some(mode) = iot_mode.as_deref() {
             use crate::panels::mcu_module::iot::{
                 BleConfig, EspNowConfig, MqttConfig, SntpConfig, ThreadConfig,
             };
             let all = matches!(mode, "all" | "ble+all");
-            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt") || all;
+            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt" | "mqtts") || all;
             if matches!(mode, "ble" | "ble+espnow" | "ble+all") {
                 mcu.iot.ble = Some(BleConfig::default());
             }
             if mode == "thread" {
                 mcu.iot.thread = Some(ThreadConfig::default());
             }
-            if matches!(mode, "mqtt") || all {
+            if matches!(mode, "mqtt" | "mqtts") || all {
                 let mut m = MqttConfig::for_chip(&chip);
                 m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/#".into()];
+                // TLS where the chip can carry it: asked for anywhere else, it
+                // generates no MQTT at all (never the password in clear), and
+                // the loop below calls MQTT.
+                let coex = mode == "ble+all";
+                m.tls = (mode == "mqtts" || all)
+                    && crate::panels::mcu_module::iot::tls_available(&mcu.family, coex).is_ok();
+                // The C3's TLS row also builds embedded-tls's P-384 checks.
+                m.p384 = mode == "mqtts";
+                m.port = m.port_for_tls(m.tls);
                 mcu.iot.mqtt = Some(m);
             }
             if all {
@@ -2116,7 +2127,7 @@ mod emit_for_manual_compile {
             // The user's loop calls everything the files offer, as a user
             // would, so the API is compiled and not just declared.
             let mut used = String::from("        // Your main loop code here.\n");
-            if mode == "mqtt" || all {
+            if matches!(mode, "mqtt" | "mqtts") || all {
                 used.push_str("        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n");
                 used.push_str("        let msg = pins::configs::mqtt::incoming().await;\n");
                 used.push_str("        let _ = (msg.topic.as_str(), &msg.payload[..]);\n");
@@ -2245,6 +2256,15 @@ mod emit_for_manual_compile {
             &files.cargo_config,
             iot_active.is_some(),
         );
+        let tls = iot_active.is_some_and(|a| a.mqtt_tls);
+        if matches!(iot_mode.as_deref(), Some("mqtts")) {
+            assert!(tls, "{chip}: mqtts is MQTT over TLS");
+        }
+        if tls {
+            assert!(files.cargo_toml.contains("embedded-tls = "), "{}", files.cargo_toml);
+            assert!(files.cargo_toml.contains("embedded-io-async = "), "{}", files.cargo_toml);
+            assert!(!files.cargo_toml.contains("embedded-alloc"), "the ESP heap is esp-alloc's");
+        }
         if iot_mode.as_deref() == Some("thread") {
             for want in [
                 "openthread = { version = \"0.2\", features = [\"esp-radio\"] }",

@@ -317,18 +317,28 @@ $ALL_CASES = @(
     # station alone, ESP-NOW alone (`hold_radio`), and everything; the other
     # chips build everything, each its own esp-radio and esp-wifi-sys blob
     # crate, and the Xtensa rows are where `alloc` in build-std matters.
+    # "Everything" is MQTT over TLS (embedded-tls) wherever the chip can carry
+    # it - not the C5 / C61, no TRNG - so every chip's own RNG, heap and spin
+    # (no CAS on the C2 / C3 / S2) is built, and LINKED: TLS's buffers fit a
+    # chip's DRAM or not only at the link (the S2's heap moves to reclaimed
+    # RAM for it). `mqtts` is TLS with no SNTP (dates unchecked) and P-384
+    # chains; CMAKE naming nothing proves embedded-tls stays pure Rust.
     @{ n = "ESP32-C3 Wi-Fi + MQTT (IoT)";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtt" }; q = $true; fam = "esp" }
-    @{ n = "ESP32-C3 IoT, everything on";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 MQTT over TLS";        t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mqtts"; CMAKE = "eide-no-cmake" }; q = $true; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C3 IoT, everything on";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $true; fam = "esp"; lk = $true }
     @{ n = "ESP32-C3 ESP-NOW alone";        t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "espnow" }; q = $true; fam = "esp" }
     @{ n = "ESP32-C3 Wi-Fi only (IoT)";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "wifi" }; q = $false; fam = "esp" }
-    @{ n = "ESP32 IoT, everything (Xtensa)";    t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
+    @{ n = "ESP32 IoT, everything (Xtensa)";    t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
     @{ n = "ESP32 ESP-NOW alone (Xtensa)";      t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "espnow" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-S2 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-S3 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s3";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-C2 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-C5 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c5";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-C6 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c6";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
-    @{ n = "ESP32-C61 IoT, everything";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c61"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-S2 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
+    # Linked, the S3 gets one linker note - "a LOAD segment with RWX permissions"
+    # from esp-hal's S3 memory layout, with plain MQTT as with TLS (two lines:
+    # the note and cargo's count) - nothing the generated code can change.
+    @{ n = "ESP32-S3 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s3";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true; w = 2 }
+    @{ n = "ESP32-C2 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C5 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c5";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C6 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c6";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C61 IoT, everything";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c61"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
 
     # Bluetooth LE (trouble-host 0.6 over esp-radio's `ble`): alone on the C3
     # and on the H2 - its only link, the first Async H2 build too - and beside
@@ -475,8 +485,10 @@ $ALL_CASES = @(
 
     # The IoT tab on both W boards: the radio up once for the LED AND the
     # network, `control` handed to the Wi-Fi task, embassy-net + rust-mqtt
-    # (bump buffer, no heap) + SNTP over it. Linked, like the radio row.
-    @{ n = "Raspberry Pi Pico W Wi-Fi/BLE x4"; t = "emit_rp_iot_project";    e = @{};                       q = $true; fam = "rp"; lk = $true }
+    # (bump buffer, no heap) + SNTP over it; then MQTT over TLS on both, with
+    # the heap TLS brings and the ring oscillator whitened by SHA-256. Linked,
+    # like the radio row; CMAKE naming nothing keeps them pure Rust.
+    @{ n = "Raspberry Pi Pico W Wi-Fi/BLE/TLS x6"; t = "emit_rp_iot_project"; e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "rp"; lk = $true }
 
     # The pico2-ice, Blocking and Async: the only RP2350B board, so the only
     # rows of the FUNCSEL table past GP29 (UART1 on GP36/37, SPI0 on 32/34/35,

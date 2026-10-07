@@ -1041,6 +1041,10 @@ pub fn ensure_iot_deps(
     let mqtt = active.is_some_and(|a| a.mqtt);
     let ble = active.is_some_and(|a| a.ble);
     let thread = active.is_some_and(|a| a.thread);
+    // MQTT over TLS: embedded-tls, on every platform the station runs on.
+    let tls = active.is_some_and(|a| a.mqtt_tls);
+    let p384_chains = active.is_some_and(|a| a.mqtt_p384);
+    let tls_pico = tls && active.is_some_and(|a| a.platform == Platform::Cyw43);
     // Thread on an ESP: esp-radio's `ieee802154`, openthread 0.2 and the
     // Mbed TLS profile that links prebuilt. On an nRF: openthread 0.4 and an
     // InterruptExecutor for its radio.
@@ -1144,6 +1148,51 @@ pub fn ensure_iot_deps(
         "rust-mqtt",
         mqtt,
         "rust-mqtt = { version = \"0.6\", default-features = false, features = [\"v5\", \"bump\"] }",
+        sources,
+    );
+    // MQTT over TLS 1.3. `rsa`: every public broker probed presents an RSA
+    // chain, and without it embedded-tls does not even offer RSA signatures.
+    // `p384` with the tab's "P-384 chains" (ECDSA Let's Encrypt).
+    let p384 = tls && p384_chains;
+    let etls = if p384 {
+        "embedded-tls = { version = \"0.19\", default-features = false, features = [\"rsa\", \"p384\"] }"
+    } else {
+        "embedded-tls = { version = \"0.19\", default-features = false, features = [\"rsa\"] }"
+    };
+    s = ensure_dep(&s, "embedded-tls", tls, etls, sources);
+    if tls {
+        s = set_owned_dep_line(&s, "embedded-tls", etls);
+    }
+    // mqtt_link.rs names embedded-io-async's traits. Added, never removed:
+    // the async USART's config files use it too, and those are not `sources`.
+    if tls {
+        s = ensure_dep(&s, "embedded-io-async", true, "embedded-io-async = \"0.7\"", sources);
+    }
+    // rsa -> num-bigint-dig -> lazy_static -> spin, which needs atomic
+    // compare-and-swap: on the parts without it, through portable-atomic.
+    let no_cas = matches!(family, "esp32c2" | "esp32c3" | "esp32s2" | "rp2040");
+    s = ensure_dep(
+        &s,
+        "spin",
+        tls && no_cas,
+        "spin = { version = \"0.9\", default-features = false, features = [\"portable_atomic\"] }",
+        sources,
+    );
+    // A Pico has no heap: TLS brings one, and whitens the ring oscillator's
+    // bits with SHA-256 for its keys (rand_core 0.6 is embedded-tls's).
+    s = ensure_dep(&s, "embedded-alloc", tls_pico, "embedded-alloc = \"0.7\"", sources);
+    s = ensure_dep(
+        &s,
+        "rand_core_06",
+        tls_pico,
+        "rand_core_06 = { package = \"rand_core\", version = \"0.6\" }",
+        sources,
+    );
+    s = ensure_dep(
+        &s,
+        "sha2",
+        tls_pico,
+        "sha2 = { version = \"0.10\", default-features = false }",
         sources,
     );
     // Bluetooth's host. trouble-host 0.6 locks its tables with embassy-sync
@@ -5476,6 +5525,8 @@ mod iot_deps_tests {
             station: true,
             esp_now: false,
             mqtt,
+            mqtt_tls: false,
+            mqtt_p384: false,
             sntp: false,
             ble: false,
             thread: false,
@@ -5530,6 +5581,8 @@ mod iot_deps_tests {
                 station: true,
                 esp_now: false,
                 mqtt: true,
+                mqtt_tls: false,
+                mqtt_p384: false,
                 sntp: true,
                 ble: false,
                 thread: false,
@@ -5559,6 +5612,8 @@ mod iot_deps_tests {
             station: true,
             esp_now: true,
             mqtt: false,
+            mqtt_tls: false,
+            mqtt_p384: false,
             sntp: true,
             ble: false,
             thread: false,
@@ -5579,6 +5634,8 @@ mod iot_deps_tests {
             station: false,
             esp_now: true,
             mqtt: false,
+            mqtt_tls: false,
+            mqtt_p384: false,
             sntp: false,
             ble: false,
             thread: false,
@@ -5609,6 +5666,8 @@ mod iot_deps_tests {
             station,
             esp_now,
             mqtt: false,
+            mqtt_tls: false,
+            mqtt_p384: false,
             sntp: false,
             ble,
             thread: false,
@@ -5758,6 +5817,65 @@ mod iot_deps_tests {
         assert!(ot.contains("\"0.4\"") && ot.contains("embassy-nrf"), "{ot}");
         assert_eq!(moved.matches("openthread = ").count(), 1, "{moved}");
         assert!(!moved.contains("mbedtls-rs-sys"), "{moved}");
+    }
+
+    /// MQTT over TLS: embedded-tls with `rsa` everywhere, spin where there is
+    /// no compare-and-swap, a heap and a whitened RNG on a Pico - and all of it
+    /// gone with the switch, but embedded-io-async (shared with the USART).
+    #[test]
+    fn tls_brings_embedded_tls_and_what_each_chip_needs() {
+        let tls = |platform| {
+            Some(Active {
+                mqtt: true,
+                mqtt_tls: true,
+                ..active(platform, true, false, false).unwrap()
+            })
+        };
+        let etls = "embedded-tls = { version = \"0.19\", default-features = false, features = [\"rsa\"] }";
+        let c3 = ensure_iot_deps(ESP_ASYNC, tls(Platform::Esp), "esp32c3", "esp32c3", &[]);
+        for want in [etls, "embedded-io-async = \"0.7\"", "spin = { version = \"0.9\", default-features = false, features = [\"portable_atomic\"] }", "rust-mqtt = "] {
+            assert!(c3.contains(want), "{want}:\n{c3}");
+        }
+        for absent in ["embedded-alloc", "rand_core_06", "sha2"] {
+            assert!(!c3.contains(absent), "{absent}:\n{c3}");
+        }
+        assert_eq!(ensure_iot_deps(&c3, tls(Platform::Esp), "esp32c3", "esp32c3", &[]), c3, "idempotent");
+        let c6 = ensure_iot_deps(&ESP_ASYNC.replace("esp32c3", "esp32c6"), tls(Platform::Esp), "esp32c6", "esp32c6", &[]);
+        assert!(c6.contains(etls) && !c6.contains("spin = "), "the C6 has CAS:\n{c6}");
+
+        let pico = ensure_iot_deps("[dependencies]\n", tls(Platform::Cyw43), "", "rp2040", &[]);
+        for want in [etls, "embedded-alloc = \"0.7\"", "rand_core_06 = { package = \"rand_core\", version = \"0.6\" }", "sha2 = ", "spin = "] {
+            assert!(pico.contains(want), "{want}:\n{pico}");
+        }
+        let pico2 = ensure_iot_deps("[dependencies]\n", tls(Platform::Cyw43), "", "rp235x", &[]);
+        assert!(pico2.contains("embedded-alloc") && !pico2.contains("spin = "), "{pico2}");
+
+        // P-384 chains: the feature on the same line, and off again.
+        let p384 = Some(Active {
+            mqtt: true,
+            mqtt_tls: true,
+            mqtt_p384: true,
+            ..active(Platform::Esp, true, false, false).unwrap()
+        });
+        let with = ensure_iot_deps(&c3, p384, "esp32c3", "esp32c3", &[]);
+        assert!(with.contains("features = [\"rsa\", \"p384\"] }"), "{with}");
+        assert_eq!(with.matches("embedded-tls = ").count(), 1, "{with}");
+        assert_eq!(ensure_iot_deps(&with, tls(Platform::Esp), "esp32c3", "esp32c3", &[]), c3);
+
+        // Off: TLS's lines go, embedded-io-async stays.
+        let plain = Some(Active {
+            mqtt: true,
+            ..active(Platform::Esp, true, false, false).unwrap()
+        });
+        let off = ensure_iot_deps(&c3, plain, "esp32c3", "esp32c3", &[]);
+        for absent in ["embedded-tls", "spin = "] {
+            assert!(!off.contains(absent), "{absent}:\n{off}");
+        }
+        assert!(off.contains("embedded-io-async"), "added, never removed:\n{off}");
+        let pico_off = ensure_iot_deps(&pico, None, "", "rp2040", &[]);
+        for absent in ["embedded-tls", "embedded-alloc", "rand_core_06", "sha2 = "] {
+            assert!(!pico_off.contains(absent), "{absent}:\n{pico_off}");
+        }
     }
 
     /// cortex-m's critical section goes while the MPSL runs, and comes back.

@@ -126,6 +126,63 @@ fn the_iot_tab_draws_thread_on_an_nrf() {
     }
 }
 
+/// The IoT tab with MQTT over TLS: the check and encrypt-only, an address
+/// as the name, the CA read out of mqtt_ca.rs (and a broken one), on an ESP,
+/// a Pico W, and the C5 that cannot carry TLS.
+#[test]
+fn the_iot_tab_draws_mqtt_over_tls() {
+    use crate::panels::mcu_module::codegen::iot_gen;
+    use crate::panels::mcu_module::iot::{MqttConfig, SntpConfig};
+    use crate::panels::mcu_module::mcu::model::Runtime;
+    for (chip, verify, host, ca) in [
+        ("esp32c3", true, "test.mosquitto.org", Some(iot_gen::mqtt_ca_file())),
+        ("esp32c3", false, "192.168.1.10", None),
+        ("rp2040_pico_w", true, "broker.example.org", Some("pub const CA_PEM: &str = \"garbage\";\n".to_owned())),
+        ("esp32c5", true, "test.mosquitto.org", None),
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = AppIde::new(
+            &eframe::CreationContext::_new_kittest(ctx.clone()),
+            None,
+            None,
+        );
+        app.startup_picker = None;
+        app.selected_mcu_id = chip.to_owned();
+        app.mcu = AppIde::build_mcu_for(&app.mcu_registry, chip);
+        let mcu = app.mcu.as_mut().expect("built-in chip");
+        mcu.runtime = Runtime::Async;
+        mcu.iot.wifi = true;
+        let mut m = MqttConfig::for_chip(chip);
+        m.host = host.into();
+        m.tls = true;
+        m.verify = verify;
+        m.port = m.port_for_tls(true);
+        mcu.iot.mqtt = Some(m);
+        mcu.iot.sntp = verify.then(SntpConfig::default);
+        app.project_tree
+            .user_src_files
+            .push((iot_gen::SECRETS_PATH.to_owned(), iot_gen::secrets_body()));
+        if let Some(ca) = ca {
+            app.project_tree
+                .user_src_files
+                .push((format!("src/pins/configs/{}", iot_gen::MQTT_CA), ca));
+        }
+        app.active_tab = McuTab::Iot;
+        for pass in 0..3u64 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                time: Some(pass as f64 / 30.0),
+                predicted_dt: 1.0 / 30.0,
+                ..Default::default()
+            };
+            let _ = crate::headless::run_ui(&ctx, input, |ui| app.show_mcu_panel(ui));
+        }
+    }
+}
+
 /// The IoT tab with Wi-Fi and MQTT on, on both radios - every card drawn,
 /// the credentials card included once `secrets.rs` exists.
 #[test]

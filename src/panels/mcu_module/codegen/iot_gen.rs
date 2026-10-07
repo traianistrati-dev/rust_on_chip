@@ -11,6 +11,12 @@
 //! - `wifi.rs`: per radio - esp-radio, or the CYW43 beside a Pico W.
 //! - `mqtt.rs`: broker, client id, keep-alive, subscriptions as constants;
 //!   the one task that owns the connection, `publish()` and `incoming()`.
+//! - `mqtt_link.rs`: how `mqtt.rs` reaches the broker - plain TCP, or TLS 1.3
+//!   (embedded-tls) with the broker's certificate checked - swapped by the
+//!   tab's TLS switch, so `mqtt.rs` itself never changes with it.
+//! - `mqtt_ca.rs`: with TLS, the CA the broker's chain must end in. Written
+//!   ONCE (ISRG Root X1) and committed - a CA is public; the user pastes their
+//!   broker's own over it.
 //! - `sntp.rs`: server and interval as constants; the task that keeps the
 //!   clock, `now_unix()` / `now_unix_ms()` / `wait_synced()`.
 //! - `espnow.rs`: channel and peers as constants; the task that owns ESP-NOW,
@@ -40,6 +46,8 @@ pub const SNTP: &str = "sntp.rs";
 pub const ESPNOW: &str = "espnow.rs";
 pub const BLE: &str = "ble.rs";
 pub const THREAD: &str = "thread.rs";
+pub const MQTT_LINK: &str = "mqtt_link.rs";
+pub const MQTT_CA: &str = "mqtt_ca.rs";
 pub const SECRETS: &str = "secrets.rs";
 
 /// The credentials file's path in the project tree.
@@ -60,7 +68,12 @@ const BLE_TAIL: &str = include_str!("iot_templates/ble.rs");
 const BLE_NRF_TAIL: &str = include_str!("iot_templates/ble_nrf.rs");
 const THREAD_NRF_TAIL: &str = include_str!("iot_templates/thread_nrf.rs");
 const THREAD_ESP_TAIL: &str = include_str!("iot_templates/thread_esp.rs");
-
+const LINK_PLAIN_TAIL: &str = include_str!("iot_templates/mqtt_link_plain.rs");
+const LINK_TLS_ESP_TAIL: &str = include_str!("iot_templates/mqtt_link_tls_esp.rs");
+const LINK_TLS_CYW43_TAIL: &str = include_str!("iot_templates/mqtt_link_tls_cyw43.rs");
+/// The CA `mqtt_ca.rs` starts with: ISRG Root X1, Let's Encrypt's root (SHA-256
+/// 96:BC:EC:06:...:BD:DF:08:C6, valid to 2035-06-04).
+const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 /// Editable halves an earlier version of the IDE wrote and this one no longer
 /// does, by file. A file still holding one exactly was never touched by its
 /// user, so it is moved to the current template instead of being left to fail
@@ -74,18 +87,25 @@ const THREAD_ESP_TAIL: &str = include_str!("iot_templates/thread_esp.rs");
 /// - `thread_nrf_v1`: phase 4's nRF `thread.rs`, which dropped its OpenThread
 ///   handle when the dataset was empty - the default - and so finalized the
 ///   instance under the task running it.
-const LEGACY_TAILS: [(&str, &str); 3] = [
+/// - `mqtt_v1`: phases 1-4's `mqtt.rs`, which talked to its socket itself;
+///   `mqtt.rs` now goes through `mqtt_link.rs` (plain or TLS) and caps the
+///   packets the broker may send at its buffer.
+const LEGACY_TAILS: [(&str, &str); 4] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
     (THREAD, include_str!("iot_templates/legacy/thread_nrf_v1.rs")),
+    (MQTT, include_str!("iot_templates/legacy/mqtt_v1.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 13] = [
+const TAILS: [(&str, &str); 17] = [
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
     (THREAD, THREAD_NRF_TAIL),
     (THREAD, THREAD_ESP_TAIL),
+    (MQTT_LINK, LINK_PLAIN_TAIL),
+    (MQTT_LINK, LINK_TLS_ESP_TAIL),
+    (MQTT_LINK, LINK_TLS_CYW43_TAIL),
     (WIFI, WIFI_ESP_TAIL),
     (WIFI, WIFI_CYW43_TAIL),
     (NET, NET_TAIL),
@@ -95,6 +115,7 @@ const TAILS: [(&str, &str); 13] = [
     LEGACY_TAILS[0],
     LEGACY_TAILS[1],
     LEGACY_TAILS[2],
+    LEGACY_TAILS[3],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -113,7 +134,10 @@ fn lf(s: &str) -> String {
 /// must pass them by, as it does the flash store's: it would only wipe what
 /// the user wrote below the markers.
 pub fn runtime_free(name: &str) -> bool {
-    matches!(name, NET | WIFI | MQTT | SNTP | ESPNOW | BLE | THREAD | SECRETS)
+    matches!(
+        name,
+        NET | WIFI | MQTT | MQTT_LINK | MQTT_CA | SNTP | ESPNOW | BLE | THREAD | SECRETS
+    )
 }
 
 /// The Wi-Fi station's secrets, in the order they are written: the network,
@@ -177,6 +201,10 @@ pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
     }
     if let (true, Some(m)) = (active.mqtt, &cfg.mqtt) {
         out.push((MQTT.to_owned(), mqtt_file(m)));
+        out.push((MQTT_LINK.to_owned(), mqtt_link_file(m, active)));
+        if active.mqtt_tls {
+            out.push((MQTT_CA.to_owned(), mqtt_ca_file()));
+        }
     }
     if let (true, Some(s)) = (active.sntp, &cfg.sntp) {
         out.push((SNTP.to_owned(), sntp_file(s)));
@@ -278,6 +306,68 @@ fn mqtt_file(m: &MqttConfig) -> String {
     o.push_str(GEN_END_CFG);
     o.push('\n');
     o.push_str(&lf(MQTT_TAIL));
+    o
+}
+
+/// `mqtt_link.rs`: plain TCP, or TLS with the tab's verification, name and -
+/// with SNTP on - its clock for the certificates' dates. The editable half
+/// per radio: the RNG (and on a Pico the heap) is the chip's.
+fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
+    let mut o = String::new();
+    o.push_str(GEN_BEGIN_CFG);
+    o.push('\n');
+    if !active.mqtt_tls {
+        o.push_str("// MQTT link (from the IoT tab): plain TCP - switch TLS on in the tab.\n");
+        o.push_str(GEN_END_CFG);
+        o.push('\n');
+        o.push_str(&lf(LINK_PLAIN_TAIL));
+        return o;
+    }
+    o.push_str("// MQTT over TLS (from the IoT tab) — auto-updated; edit it in the tab.\n");
+    o.push_str("/// Check the broker's certificate: its chain must end in mqtt_ca.rs's CA and\n");
+    o.push_str("/// name SERVER_NAME. `false` = encrypted, but anyone on the path can pose as\n");
+    o.push_str("/// the broker and read the MQTT password.\n");
+    o.push_str(&format!("pub const VERIFY: bool = {};\n", m.verify));
+    o.push_str("/// The name the broker's certificate must carry, sent as SNI.\n");
+    o.push_str(&format!("pub const SERVER_NAME: &str = {};\n", lit(m.tls_name())));
+    if active.sntp {
+        o.push_str("/// The time the certificates' dates are checked against: SNTP's.\n");
+        o.push_str("fn wall_clock() -> Option<u64> {\n    super::sntp::now_unix()\n}\n");
+        o.push_str("/// Before a handshake: up to 10 s for SNTP's first answer, so the dates are\n");
+        o.push_str("/// checked from the first connection on.\n");
+        o.push_str("async fn clock_ready() {\n");
+        o.push_str("    let wait = embassy_time::Duration::from_secs(10);\n");
+        o.push_str("    let _ = embassy_time::with_timeout(wait, super::sntp::wait_synced()).await;\n");
+        o.push_str("}\n");
+    } else {
+        o.push_str("/// No wall clock - SNTP is off: the certificates' dates are NOT checked.\n");
+        o.push_str("fn wall_clock() -> Option<u64> {\n    None\n}\n");
+        o.push_str("async fn clock_ready() {}\n");
+    }
+    o.push_str(GEN_END_CFG);
+    o.push('\n');
+    o.push_str(&lf(match active.platform {
+        Platform::Cyw43 => LINK_TLS_CYW43_TAIL,
+        _ => LINK_TLS_ESP_TAIL,
+    }));
+    o
+}
+
+/// `mqtt_ca.rs` as first written: ISRG Root X1. No markers - the whole file
+/// is the user's once written (`write_once`).
+pub fn mqtt_ca_file() -> String {
+    let mut o = String::new();
+    o.push_str("//! The CA the MQTT broker's certificate chain must end in (IoT tab: MQTT over\n");
+    o.push_str("//! TLS). A CA is public: this file is committed. Paste your broker's CA here,\n");
+    o.push_str("//! as PEM - only the first certificate is used.\n");
+    o.push_str("//!\n");
+    o.push_str("//! Written with ISRG Root X1, Let's Encrypt's root (valid to 2035-06-04): it\n");
+    o.push_str("//! signs test.mosquitto.org on port 8886, and brokers with an RSA Let's\n");
+    o.push_str("//! Encrypt certificate. An ECDSA one (certbot's default) also ends here, but\n");
+    o.push_str("//! through P-384 issuers: switch \"P-384 chains\" on in the IoT tab for it.\n");
+    o.push_str("//! test.mosquitto.org's 8883 needs mosquitto.org's own CA\n");
+    o.push_str("//! (https://test.mosquitto.org/ssl/mosquitto.org.crt).\n");
+    o.push_str(&format!("pub const CA_PEM: &str = \"{}\";\n", lf(CA_ISRG_ROOT_X1).trim_end()));
     o
 }
 
@@ -385,7 +475,7 @@ fn thread_file(t: &ThreadConfig, platform: Platform) -> String {
 /// A file `sync_config_files` writes when it is missing and never touches
 /// again: the user's values live in it, nowhere else.
 pub fn write_once(name: &str) -> bool {
-    name == SECRETS
+    name == SECRETS || name == MQTT_CA
 }
 
 /// Read one secret back out of `secrets.rs`. `None` when the line is missing
@@ -538,6 +628,9 @@ fn is_pristine(name: &str, content: &str) -> bool {
     if name == SECRETS {
         return secrets_pristine(content);
     }
+    if name == MQTT_CA {
+        return lf(content) == mqtt_ca_file();
+    }
     let Some(tail) = tail_of(content) else {
         return false;
     };
@@ -609,6 +702,51 @@ pub fn phase_one_wifi_left(content: &str) -> bool {
     content.contains("esp_hal::peripherals::WIFI<'static>")
 }
 
+/// The PEM text `mqtt_ca.rs` holds: its `CA_PEM` literal. `None` when the
+/// user turned it into something the tab cannot read.
+pub fn ca_pem_of(content: &str) -> Option<&str> {
+    let at = content.find("CA_PEM")?;
+    let rest = &content[at..];
+    let open = rest.find('"')? + 1;
+    let close = open + rest[open..].find('"')?;
+    Some(&rest[open..close])
+}
+
+/// What no longer fits the tab's TLS switch, among MQTT's files the user
+/// edited (so the IDE left them): `mqtt.rs` from before `mqtt_link.rs`, which
+/// talks to its socket itself - TLS never reaches it; or a `mqtt_link.rs`
+/// plain while TLS is on, TLS while it is off (its crates are gone then), or
+/// TLS for the other radio. The warning for the tab, or `None`.
+pub fn mqtt_files_left(
+    mqtt: Option<&str>,
+    link: Option<&str>,
+    tls: bool,
+    platform: Platform,
+) -> Option<&'static str> {
+    if tls && mqtt.is_some_and(|m| !m.contains("mqtt_link")) {
+        return Some(
+            "src/pins/configs/mqtt.rs is from before TLS and talks to its socket itself, so TLS never \
+             reaches it - and you edited it, so the IDE left it. Move your changes into the current \
+             template (delete the file to get it).",
+        );
+    }
+    let link = link?;
+    let has_tls = link.contains("embedded_tls::");
+    let other_radio = match platform {
+        Platform::Esp => link.contains("embassy_rp::"),
+        Platform::Cyw43 => link.contains("esp_hal::"),
+        Platform::Nrf => false,
+    };
+    if has_tls != tls || (tls && other_radio) {
+        return Some(
+            "src/pins/configs/mqtt_link.rs was written for another TLS setting or radio, and you \
+             edited it, so the IDE left it: it does not fit this project. Delete it to get the \
+             current one.",
+        );
+    }
+    None
+}
+
 /// Is `content` the file `name` written for another radio than `platform`'s,
 /// and edited since, so [`upgraded`] left it? Then it no longer compiles
 /// against the `main.rs` this chip gets. Read off the crates each template
@@ -640,7 +778,7 @@ fn tail_of(content: &str) -> Option<String> {
 /// with a password in it. A pristine one goes like any pruned config file.
 pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
-    for name in [NET, WIFI, MQTT, SNTP, ESPNOW, BLE, THREAD, SECRETS] {
+    for name in [NET, WIFI, MQTT, MQTT_LINK, MQTT_CA, SNTP, ESPNOW, BLE, THREAD, SECRETS] {
         if files.iter().any(|(n, _)| n == name) {
             continue;
         }
@@ -690,9 +828,26 @@ pub fn esp_heap_lines(heap_kib: u32, active: Active, family: &str) -> String {
     let mut o = String::from(
         "\n    // ── Heap (IoT tab) ──\n    // esp-radio allocates its buffers here, so it has to exist before the\n    // scheduler starts.\n",
     );
+    if active.mqtt_tls && family == "esp32s2" {
+        // The S2's DRAM is full with TLS's record buffers: all of its heap goes
+        // in the RAM the bootloader used (136 KiB there), 32 KiB more for the
+        // RSA checks.
+        o.push_str("    // MQTT over TLS fills the S2's DRAM: the heap goes in the RAM the\n");
+        o.push_str("    // bootloader used, 32 KiB more for checking the broker's RSA chain.\n");
+        o.push_str(&format!(
+            "    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: {} * 1024);\n",
+            heap_kib.max(1) + 32
+        ));
+        return o;
+    }
     if coex(active) {
+        // MQTT over TLS checks the broker's RSA chain on the heap too (about
+        // 22 KB at its peak): 32 KiB more on the RISC-V parts. The ESP32 and
+        // the C2 have no room for it (`iot::tls_available`).
         let (reclaimed, more, share) = if family == "esp32" {
             (96, 24, "most")
+        } else if active.mqtt_tls {
+            (64, 96, "half")
         } else {
             (64, 64, "half")
         };
@@ -703,6 +858,11 @@ pub fn esp_heap_lines(heap_kib: u32, active: Active, family: &str) -> String {
         ));
         o.push_str(&format!("    esp_alloc::heap_allocator!(size: {more} * 1024);\n"));
     } else {
+        if active.mqtt_tls {
+            o.push_str("    // MQTT over TLS checks the broker's RSA chain on the heap (about 22 KB at\n");
+            o.push_str("    // its peak): 32 KiB more, in the RAM the bootloader used.\n");
+            o.push_str("    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 32 * 1024);\n");
+        }
         o.push_str(&format!(
             "    esp_alloc::heap_allocator!(size: {} * 1024);\n",
             heap_kib.max(1)
@@ -835,19 +995,200 @@ mod tests {
         let names = |m: &Mcu| -> Vec<String> {
             config_files_for(m).into_iter().map(|(n, _)| n).collect()
         };
-        assert_eq!(names(&mcu("esp32c3", Runtime::Async, true)), ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs"]);
+        assert_eq!(
+            names(&mcu("esp32c3", Runtime::Async, true)),
+            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "mqtt_link.rs"]
+        );
         assert_eq!(names(&mcu("esp32c3", Runtime::Async, false)), ["net.rs", "wifi.rs", "secrets.rs"]);
         let mut all = mcu("esp32c3", Runtime::Async, true);
         all.iot.sntp = Some(SntpConfig::default());
         all.iot.esp_now = Some(EspNowConfig::default());
         assert_eq!(
             names(&all),
-            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "sntp.rs", "espnow.rs"]
+            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "mqtt_link.rs", "sntp.rs", "espnow.rs"]
         );
         // ESP-NOW alone: no stack, no credentials - and MQTT/SNTP, still ticked,
         // have nothing to run on.
         all.iot.wifi = false;
         assert_eq!(names(&all), ["espnow.rs"]);
+    }
+
+    fn tls_mcu(id: &str, sntp: bool) -> Mcu {
+        let mut m = mcu(id, Runtime::Async, true);
+        if let Some(mq) = m.iot.mqtt.as_mut() {
+            mq.tls = true;
+            mq.port = mq.port_for_tls(true);
+        }
+        m.iot.sntp = sntp.then(SntpConfig::default);
+        m
+    }
+
+    /// MQTT over TLS: mqtt.rs is the same, mqtt_link.rs becomes the chip's
+    /// TLS link, mqtt_ca.rs the CA; the GENERATED block carries the check,
+    /// the name and SNTP's clock - or none.
+    #[test]
+    fn tls_swaps_the_link_and_brings_the_ca() {
+        let plain = mcu("esp32c3", Runtime::Async, true);
+        let files = config_files_for(&plain);
+        let link = &files.iter().find(|(n, _)| n == MQTT_LINK).unwrap().1;
+        assert!(link.contains("pub type Link<'s> = TcpSocket<'s>;"), "{link}");
+        assert!(!files.iter().any(|(n, _)| n == MQTT_CA));
+        let plain_mqtt = files.iter().find(|(n, _)| n == MQTT).unwrap().1.clone();
+
+        for (id, chip) in [("esp32c3", "esp_hal::rng::Trng"), ("rp2040_pico_w", "embassy_rp::clocks::RoscRng")] {
+            for sntp in [false, true] {
+                let m = tls_mcu(id, sntp);
+                let a = iot::active(&m).unwrap();
+                assert!(a.mqtt_tls, "{id}");
+                let files = config_files_for(&m);
+                let get = |n: &str| files.iter().find(|(f, _)| f == n).map(|(_, b)| b.clone());
+                let link = get(MQTT_LINK).unwrap();
+                for want in [
+                    "pub const VERIFY: bool = true;",
+                    "pub const SERVER_NAME: &str = \"test.mosquitto.org\";",
+                    "pub type Link<'s> = TlsConnection<'s, Gate<'s>, Aes128GcmSha256>;",
+                    "if !verifier.authenticated {",
+                    "CertificateEntryRef::X509(der) if is_ca(der) => {}",
+                    "use super::mqtt_ca::CA_PEM;",
+                    // The gaps embedded-tls 0.19 leaves, closed: an empty
+                    // encrypted record, an RSA-PSS signature from an EC key, a
+                    // dead socket under a half record.
+                    "if self.head[0] == 0x17 && len < 17 {",
+                    "if pss && !self.leaf_rsa {",
+                    "State::Established | State::FinWait1 | State::FinWait2",
+                    "const BEGIN: &[u8] = b\"-----BEGIN CERTIFICATE-----\";",
+                    chip,
+                ] {
+                    assert!(link.contains(want), "{id} sntp={sntp}: {want}:\n{link}");
+                }
+                assert_eq!(link.contains("super::sntp::now_unix()"), sntp, "{id}");
+                assert!(is_pristine(MQTT_LINK, &link));
+                let mq = get(MQTT).unwrap();
+                assert!(mq.contains("pub const BROKER_PORT: u16 = 8886;"), "{mq}");
+                assert_eq!(tail_of(&mq), tail_of(&plain_mqtt), "mqtt.rs's own half never changes");
+                let ca = get(MQTT_CA).unwrap();
+                assert!(ca.starts_with("//! The CA the MQTT broker's"), "{ca}");
+                assert!(ca.contains("pub const CA_PEM: &str = \"-----BEGIN CERTIFICATE-----\nMIIFazCC"), "{ca}");
+                assert!(ca.contains("-----END CERTIFICATE-----\";"), "{ca}");
+                assert!(write_once(MQTT_CA) && is_pristine(MQTT_CA, &ca) && runtime_free(MQTT_CA));
+                assert!(!is_pristine(MQTT_CA, &ca.replace("MIIFazCC", "MIIFazCD")));
+                // The SOCKETS count is the plain one: TLS runs on MQTT's socket.
+                let mut same = mcu(id, Runtime::Async, true);
+                same.iot.sntp = sntp.then(SntpConfig::default);
+                let net = config_files_for(&same).into_iter().find(|(n, _)| n == NET).map(|(_, b)| b);
+                assert_eq!(get(NET), net, "{id} sntp={sntp}");
+            }
+        }
+        // Encrypt only, and another name.
+        let mut m = tls_mcu("esp32c3", false);
+        if let Some(mq) = m.iot.mqtt.as_mut() {
+            mq.verify = false;
+            mq.server_name = "broker.example.org".into();
+        }
+        let link = config_files_for(&m).into_iter().find(|(n, _)| n == MQTT_LINK).unwrap().1;
+        assert!(link.contains("pub const VERIFY: bool = false;"), "{link}");
+        assert!(link.contains("pub const SERVER_NAME: &str = \"broker.example.org\";"), "{link}");
+    }
+
+    /// Where TLS cannot run (no TRNG on the C5 / C61) and it is asked for, no
+    /// MQTT is generated: plain MQTT to a TLS port would send the password in
+    /// clear.
+    #[test]
+    fn tls_where_the_chip_cannot_stays_plain() {
+        for id in ["esp32c5", "esp32c61"] {
+            let m = tls_mcu(id, false);
+            let a = iot::active(&m).unwrap();
+            assert!(!a.mqtt && !a.mqtt_tls, "{id}: never the password in clear to a TLS port");
+            let files = config_files_for(&m);
+            assert!(!files.iter().any(|(n, _)| n == MQTT || n == MQTT_LINK || n == MQTT_CA), "{id}");
+            // Switched off, MQTT comes back plain.
+            let mut plain = m.clone();
+            if let Some(mq) = plain.iot.mqtt.as_mut() {
+                mq.tls = false;
+            }
+            assert!(iot::active(&plain).is_some_and(|a| a.mqtt && !a.mqtt_tls), "{id}");
+        }
+    }
+
+    /// The ESP heap grows with TLS: a reclaimed 32 KiB beside the tab's one,
+    /// or 96 KiB instead of 64 beside Bluetooth on the RISC-V parts.
+    #[test]
+    fn tls_brings_heap_on_an_esp() {
+        let code = tls_mcu("esp32c3", false).fresh_main_rs();
+        assert!(code.contains("esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 32 * 1024);"), "{code}");
+        assert!(code.contains("esp_alloc::heap_allocator!(size: 72 * 1024);"), "{code}");
+        let mut coex = tls_mcu("esp32c3", false);
+        coex.iot.ble = Some(BleConfig::default());
+        let code = coex.fresh_main_rs();
+        assert!(code.contains("#[esp_hal::ram(reclaimed)] size: 64 * 1024"), "{code}");
+        assert!(code.contains("esp_alloc::heap_allocator!(size: 96 * 1024);"), "{code}");
+        // The S2: all of it in the reclaimed RAM.
+        let s2 = tls_mcu("esp32s2", false).fresh_main_rs();
+        assert!(s2.contains("esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 104 * 1024);"), "{s2}");
+        assert!(!s2.contains("esp_alloc::heap_allocator!(size:"), "{s2}");
+        // The ESP32 with coex: no TLS, and its heap as before.
+        let mut e32 = tls_mcu("esp32", false);
+        e32.iot.ble = Some(BleConfig::default());
+        let a = iot::active(&e32).unwrap();
+        assert!(!a.mqtt_tls && !a.mqtt, "TLS asked for and impossible: no MQTT at all");
+        assert!(e32.fresh_main_rs().contains("esp_alloc::heap_allocator!(size: 24 * 1024);"));
+        // Plain MQTT: nothing more.
+        let plain = mcu("esp32c3", Runtime::Async, true).fresh_main_rs();
+        assert!(!plain.contains("size: 32 * 1024"), "{plain}");
+    }
+
+    /// The CA the tab reads out of mqtt_ca.rs, and the files that no longer fit
+    /// the TLS switch after the user edited them.
+    #[test]
+    fn mqtt_files_are_read_back_for_the_tab() {
+        let ca = mqtt_ca_file();
+        assert!(ca_pem_of(&ca).is_some_and(|p| p.starts_with("-----BEGIN CERTIFICATE-----")));
+        assert!(iot::ca_summary(ca_pem_of(&ca).unwrap()).is_ok());
+        assert_eq!(ca_pem_of("pub const OTHER: u8 = 1;"), None);
+
+        let v1 = include_str!("iot_templates/legacy/mqtt_v1.rs");
+        let v2 = lf(MQTT_TAIL);
+        let plain = lf(LINK_PLAIN_TAIL);
+        let esp = lf(LINK_TLS_ESP_TAIL);
+        let pico = lf(LINK_TLS_CYW43_TAIL);
+        assert_eq!(mqtt_files_left(Some(&v2), Some(&plain), false, Platform::Esp), None);
+        assert_eq!(mqtt_files_left(Some(&v2), Some(&esp), true, Platform::Esp), None);
+        assert_eq!(mqtt_files_left(Some(&v2), Some(&pico), true, Platform::Cyw43), None);
+        assert_eq!(mqtt_files_left(Some(v1), None, false, Platform::Esp), None, "v1 still works plain");
+        assert!(mqtt_files_left(Some(v1), Some(&esp), true, Platform::Esp).is_some());
+        assert!(mqtt_files_left(Some(&v2), Some(&plain), true, Platform::Esp).is_some());
+        assert!(mqtt_files_left(Some(&v2), Some(&esp), false, Platform::Esp).is_some());
+        assert!(mqtt_files_left(Some(&v2), Some(&esp), true, Platform::Cyw43).is_some());
+        assert!(mqtt_files_left(Some(&v2), Some(&pico), true, Platform::Esp).is_some());
+    }
+
+    /// An untouched phase-1..4 mqtt.rs moves to the link-agnostic one; the
+    /// link swaps between plain and TLS, and between the ESP and the Pico,
+    /// while untouched; an edited one stays.
+    #[test]
+    fn mqtt_rs_and_its_link_follow_the_tab() {
+        let m = MqttConfig::default();
+        let v2 = mqtt_file(&m);
+        let v1 = format!(
+            "{}{}",
+            &v2[..v2.find(GEN_END_CFG).unwrap() + GEN_END_CFG.len() + 1],
+            include_str!("iot_templates/legacy/mqtt_v1.rs")
+        );
+        assert!(!v1.contains("mqtt_link"), "v1 talks to its socket itself");
+        assert_eq!(upgraded(MQTT, &v1, &v2).as_deref(), Some(v2.as_str()));
+        assert!(is_pristine(MQTT, &v1));
+
+        let plain = config_files_for(&mcu("esp32c3", Runtime::Async, true));
+        let plain = plain.iter().find(|(n, _)| n == MQTT_LINK).unwrap().1.clone();
+        let esp = config_files_for(&tls_mcu("esp32c3", false));
+        let esp = esp.iter().find(|(n, _)| n == MQTT_LINK).unwrap().1.clone();
+        let pico = config_files_for(&tls_mcu("rp2040_pico_w", false));
+        let pico = pico.iter().find(|(n, _)| n == MQTT_LINK).unwrap().1.clone();
+        assert_eq!(upgraded(MQTT_LINK, &plain, &esp).as_deref(), Some(esp.as_str()));
+        assert_eq!(upgraded(MQTT_LINK, &esp, &plain).as_deref(), Some(plain.as_str()));
+        assert_eq!(upgraded(MQTT_LINK, &esp, &pico).as_deref(), Some(pico.as_str()));
+        let edited = format!("{plain}\n// mine\n");
+        assert_eq!(upgraded(MQTT_LINK, &edited, &esp), None);
     }
 
     /// ESP-NOW is Espressif's: on a Pico W the switch generates nothing.

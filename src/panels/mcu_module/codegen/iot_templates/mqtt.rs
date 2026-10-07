@@ -7,7 +7,9 @@
 //     let msg = pins::configs::mqtt::incoming().await;   // msg.topic, msg.payload
 //
 // One task owns the connection: it reconnects on its own, and `publish` only
-// queues the message for it. Port 1883 is plain TCP - nothing is encrypted.
+// queues the message for it. How it reaches the broker - plain TCP, or TLS
+// with the broker's certificate checked - is mqtt_link.rs, which the IoT
+// tab swaps; this file stays the same either way.
 
 use core::num::NonZero;
 
@@ -19,6 +21,7 @@ use embassy_net::{IpAddress, Stack};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
+use static_cell::ConstStaticCell;
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
@@ -29,6 +32,7 @@ use rust_mqtt::client::options::{
 use rust_mqtt::config::KeepAlive;
 use rust_mqtt::types::{MqttBinary, MqttString, TopicFilter, TopicName};
 
+use super::mqtt_link::{self as link, Link, LinkBuffers};
 use super::secrets::{MQTT_PASSWORD, MQTT_USERNAME};
 
 /// Longest topic a `Message` carries.
@@ -74,15 +78,21 @@ pub fn start(spawner: Spawner, stack: Stack<'static>) {
     spawner.spawn(mqtt_task(stack).unwrap());
 }
 
+/// The link's own buffers (TLS records; nothing for plain TCP), in a static:
+/// built in place, never on the stack.
+static LINK: ConstStaticCell<LinkBuffers> = ConstStaticCell::new(LinkBuffers::new());
+
 #[embassy_executor::task]
 async fn mqtt_task(stack: Stack<'static>) -> ! {
-    let mut rx = [0u8; 1024];
+    link::init();
+    let links = LINK.take();
+    let mut rx = [0u8; link::TCP_RX];
     let mut tx = [0u8; 1024];
     let mut work = [0u8; 1024];
     loop {
         stack.wait_config_up().await;
         // `Err` is a lost or refused connection; either way, start over.
-        let _ = session(stack, &mut rx, &mut tx, &mut work).await;
+        let _ = session(stack, &mut rx, &mut tx, &mut work, links).await;
         Timer::after(Duration::from_secs(RETRY_S)).await;
     }
 }
@@ -99,7 +109,7 @@ async fn resolve(stack: Stack<'static>) -> Result<IpAddress, ()> {
     found.first().copied().ok_or(())
 }
 
-type MqttClient<'c> = Client<'c, 'c, TcpSocket<'c>, BumpBuffer<'c>, 1, 1, 1, 0, 0, 0, 0>;
+type MqttClient<'c> = Client<'c, 'c, Link<'c>, BumpBuffer<'c>, 1, 1, 1, 0, 0, 0, 0>;
 
 /// One connection, from TCP connect to the first error.
 async fn session(
@@ -107,12 +117,18 @@ async fn session(
     rx: &mut [u8],
     tx: &mut [u8],
     work: &mut [u8],
+    links: &mut LinkBuffers,
 ) -> Result<(), ()> {
     let address = resolve(stack).await?;
     let mut socket = TcpSocket::new(stack, rx, tx);
     socket.set_timeout(Some(Duration::from_secs(u64::from(KEEP_ALIVE_S) * 2)));
     socket.connect((address, BROKER_PORT)).await.map_err(drop)?;
+    // Plain TCP as it is, or the TLS handshake - awaited whole.
+    let link = link::open(socket, links).await?;
 
+    // The broker must not send a packet the work buffer cannot hold: one
+    // that does would end every connection it is sent on.
+    let max_packet = NonZero::new(u32::try_from(work.len()).unwrap_or(u32::MAX));
     let mut buffer = BumpBuffer::new(work);
     let mut client: MqttClient<'_> = Client::new(&mut buffer);
     let keep_alive = NonZero::new(KEEP_ALIVE_S).map_or(KeepAlive::Infinite, KeepAlive::Seconds);
@@ -123,8 +139,11 @@ async fn session(
     if !MQTT_PASSWORD.is_empty() {
         options = options.password(MqttBinary::try_from(MQTT_PASSWORD.as_bytes()).map_err(drop)?);
     }
+    if let Some(max) = max_packet {
+        options = options.maximum_packet_size(max);
+    }
     let id = MqttString::try_from(CLIENT_ID).map_err(drop)?;
-    client.connect(socket, &options, Some(id)).await.map_err(drop)?;
+    client.connect(link, &options, Some(id)).await.map_err(drop)?;
     reset(&mut client);
 
     for topic in SUBSCRIBE {

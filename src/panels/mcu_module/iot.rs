@@ -401,18 +401,267 @@ pub struct MqttConfig {
     pub keep_alive_s: u16,
     /// Subscribed after every connect.
     pub subscribe: Vec<String>,
+    /// MQTT over TLS 1.3 (embedded-tls): `mqtt_link.rs` wraps the socket.
+    pub tls: bool,
+    /// With TLS: check the broker's certificate against `mqtt_ca.rs` (and its
+    /// name). Off = encrypted, but anyone on the path can pose as the broker.
+    pub verify: bool,
+    /// The name the broker's certificate must carry, and the SNI; empty =
+    /// the host.
+    pub server_name: String,
+    /// With TLS: accept chains signed with P-384 - an ECDSA Let's Encrypt
+    /// certificate's issuers are (embedded-tls's `p384`, 114 KiB of flash).
+    pub p384: bool,
 }
 
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
             host: "test.mosquitto.org".to_owned(),
-            port: 1883,
+            port: PLAIN_PORT,
             client_id: "rustonchip".to_owned(),
             keep_alive_s: 60,
             subscribe: Vec::new(),
+            tls: false,
+            verify: true,
+            server_name: String::new(),
+            p384: false,
         }
     }
+}
+
+/// MQTT's own ports: plain TCP, and over TLS.
+pub const PLAIN_PORT: u16 = 1883;
+pub const TLS_PORT: u16 = 8883;
+
+/// test.mosquitto.org serves its Let's Encrypt chain - the ISRG Root X1 the
+/// IDE writes into `mqtt_ca.rs` - on 8886; its 8883 is signed by its own CA.
+const MOSQUITTO_TEST: &str = "test.mosquitto.org";
+const MOSQUITTO_LE_PORT: u16 = 8886;
+
+impl MqttConfig {
+    /// The port TLS on (`true`) or off moves to, when the port is still the
+    /// other mode's default - a port the user chose stays.
+    pub fn port_for_tls(&self, tls: bool) -> u16 {
+        let tls_default = if self.host.trim() == MOSQUITTO_TEST {
+            MOSQUITTO_LE_PORT
+        } else {
+            TLS_PORT
+        };
+        match (tls, self.port) {
+            (true, PLAIN_PORT) => tls_default,
+            (false, p) if p == TLS_PORT || p == MOSQUITTO_LE_PORT => PLAIN_PORT,
+            (_, p) => p,
+        }
+    }
+
+    /// The name the certificate is checked against and sent as SNI.
+    pub fn tls_name(&self) -> &str {
+        let name = self.server_name.trim();
+        if name.is_empty() { self.host.trim() } else { name }
+    }
+}
+
+/// The key a CA certificate carries - which signatures it makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaKey {
+    Rsa,
+    EcP256,
+    /// Checked only with "P-384 chains" (embedded-tls's `p384`).
+    EcP384,
+    /// P-521 and other curves: embedded-tls 0.19 checks none of them.
+    EcOther,
+    /// Checked only with embedded-tls's `ed25519`, which the IDE leaves off.
+    Ed25519,
+    Other,
+}
+
+/// What `mqtt_ca.rs`'s certificate says, for the line in the tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaSummary {
+    /// The subject's common name, or its organisation.
+    pub name: String,
+    /// notAfter as `YYYY-MM-DD`.
+    pub not_after: String,
+    /// basicConstraints' cA flag; `None` when there is no such extension (an
+    /// X.509 v1 root), which is still fine as the trust anchor.
+    pub is_ca: Option<bool>,
+    pub key: CaKey,
+    /// More than one certificate pasted: only the first is used.
+    pub more: bool,
+}
+
+/// One DER element at the start of `d`: (tag, contents, what follows).
+fn der(d: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, d) = d.split_first()?;
+    let (&first, mut d) = d.split_first()?;
+    let mut len = usize::from(first);
+    if first >= 0x80 {
+        let n = usize::from(first & 0x7F);
+        if n == 0 || n > 3 || d.len() < n {
+            return None;
+        }
+        len = d[..n].iter().fold(0, |l, &b| (l << 8) | usize::from(b));
+        d = &d[n..];
+    }
+    (d.len() >= len).then(|| (tag, &d[..len], &d[len..]))
+}
+
+/// The first PEM certificate's DER - as the firmware's `pem_to_der` reads it.
+pub fn pem_der(pem: &str) -> Option<Vec<u8>> {
+    let start = pem.find("-----BEGIN CERTIFICATE-----")?;
+    let body = &pem[start + "-----BEGIN CERTIFICATE-----".len()..];
+    let body = &body[..body.find("-----END CERTIFICATE-----")?];
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in body.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+        acc &= (1 << bits) - 1;
+    }
+    (out.first() == Some(&0x30)).then_some(out)
+}
+
+/// Read the CA `mqtt_ca.rs` holds (its PEM text). `Err` = not a certificate.
+pub fn ca_summary(pem: &str) -> Result<CaSummary, &'static str> {
+    const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
+    const OID_O: &[u8] = &[0x55, 0x04, 0x0A];
+    const OID_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+    const OID_EC: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+    const OID_P256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    const OID_P384: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22];
+    const OID_ED25519: &[u8] = &[0x2B, 0x65, 0x70];
+    let bad = "not a PEM certificate - paste one, BEGIN and END lines included";
+    let cert = pem_der(pem).ok_or(bad)?;
+    let (_, cert, _) = der(&cert).ok_or(bad)?;
+    let (0x30, tbs, _) = der(cert).ok_or(bad)? else {
+        return Err(bad);
+    };
+    // version [0] (optional), then 0 serial, 1 signature, 2 issuer, 3 validity,
+    // 4 subject, 5 subjectPublicKeyInfo
+    let mut rest = tbs;
+    let mut fields = Vec::new();
+    while let Some((tag, value, next)) = der(rest) {
+        fields.push((tag, value));
+        rest = next;
+    }
+    let base = usize::from(fields.first().is_some_and(|(tag, _)| *tag == 0xA0));
+    let field = |i: usize| fields.get(base + i).copied().ok_or(bad);
+    // validity: two times, UTCTime (YYMMDD...) or GeneralizedTime (YYYYMMDD...)
+    let (_, validity) = field(3)?;
+    let (_, _, after) = der(validity).ok_or(bad)?;
+    let (tag, time, _) = der(after).ok_or(bad)?;
+    let time = std::str::from_utf8(time).map_err(|_| bad)?;
+    if !time.is_ascii() {
+        return Err(bad);
+    }
+    let (year, md) = match tag {
+        0x17 if time.len() >= 6 => {
+            let yy: u32 = time[..2].parse().map_err(|_| bad)?;
+            (if yy < 50 { 2000 + yy } else { 1900 + yy }, &time[2..6])
+        }
+        0x18 if time.len() >= 8 => (time[..4].parse().map_err(|_| bad)?, &time[4..8]),
+        _ => return Err(bad),
+    };
+    let not_after = format!("{year:04}-{}-{}", &md[..2], &md[2..4]);
+    // subject: the CN, else the O
+    let (_, subject) = field(4)?;
+    let mut cn = None;
+    let mut org = None;
+    let mut rdns = subject;
+    while let Some((_, set, next)) = der(rdns) {
+        rdns = next;
+        let Some((_, atv, _)) = der(set) else { continue };
+        let Some((0x06, oid, value)) = der(atv) else { continue };
+        let Some((_, text, _)) = der(value) else { continue };
+        let text = String::from_utf8_lossy(text).into_owned();
+        if oid == OID_CN {
+            cn = Some(text);
+        } else if oid == OID_O {
+            org = Some(text);
+        }
+    }
+    let name = cn.or(org).unwrap_or_else(|| "(no name)".to_owned());
+    // the key: rsaEncryption, or an EC key on P-256 or another curve
+    let (_, spki) = field(5)?;
+    let (_, algorithm, _) = der(spki).ok_or(bad)?;
+    let (_, oid, params) = der(algorithm).ok_or(bad)?;
+    let key = if oid == OID_RSA {
+        CaKey::Rsa
+    } else if oid == OID_EC {
+        match der(params) {
+            Some((0x06, OID_P256, _)) => CaKey::EcP256,
+            Some((0x06, OID_P384, _)) => CaKey::EcP384,
+            _ => CaKey::EcOther,
+        }
+    } else if oid == OID_ED25519 {
+        CaKey::Ed25519
+    } else {
+        CaKey::Other
+    };
+    // basicConstraints (2.5.29.19) in the extensions [3]
+    let mut is_ca = None;
+    if let Some((_, extensions)) = fields.iter().find(|(tag, _)| *tag == 0xA3)
+        && let Some((_, mut list, _)) = der(extensions)
+    {
+        while let Some((_, extension, next)) = der(list) {
+            list = next;
+            let Some((0x06, oid, mut value)) = der(extension) else { continue };
+            if oid != [0x55, 0x1D, 0x13] {
+                continue;
+            }
+            if let Some((0x01, _, after)) = der(value) {
+                value = after;
+            }
+            is_ca = Some(false);
+            if let Some((0x04, octets, _)) = der(value)
+                && let Some((0x30, constraints, _)) = der(octets)
+            {
+                is_ca = Some(matches!(der(constraints), Some((0x01, [0xFF], _))));
+            }
+        }
+    }
+    let more = pem.matches("-----BEGIN CERTIFICATE-----").count() > 1;
+    Ok(CaSummary { name, not_after, is_ca, key, more })
+}
+
+/// What is wrong with the TLS settings. `None` = fine.
+pub fn tls_problem(m: &MqttConfig) -> Option<&'static str> {
+    if !m.tls {
+        return None;
+    }
+    let name = m.tls_name();
+    if m.verify && name.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Some(
+            "a certificate names DNS names, never this address: set Server name to the name in the broker's certificate",
+        );
+    }
+    if name.len() > 64 {
+        return Some("longer than 64 bytes - embedded-tls cannot check a name that long");
+    }
+    if m.port == PLAIN_PORT {
+        return Some("1883 is MQTT without TLS - TLS brokers listen on 8883 (test.mosquitto.org: 8886)");
+    }
+    let host = m.host.trim();
+    if host == "broker.hivemq.com" {
+        return Some("broker.hivemq.com speaks only TLS 1.2, and embedded-tls only TLS 1.3");
+    }
+    if host.ends_with(".azure-devices.net") {
+        return Some("Azure IoT Hub speaks MQTT 3.1.1, and rust-mqtt only MQTT 5");
+    }
+    None
 }
 
 impl MqttConfig {
@@ -574,6 +823,10 @@ pub struct Active {
     pub esp_now: bool,
     /// MQTT over the stack - only with the station.
     pub mqtt: bool,
+    /// ... over TLS - where the chip has what it takes ([`tls_available`]).
+    pub mqtt_tls: bool,
+    /// ... accepting P-384 chains.
+    pub mqtt_p384: bool,
     /// SNTP over the stack - only with the station.
     pub sntp: bool,
     /// Bluetooth LE.
@@ -605,15 +858,35 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     if !station && !esp_now && !ble && !thread {
         return None;
     }
+    let tls_ok = tls_available(&mcu.family, ble && (station || esp_now)).is_ok();
     Some(Active {
         platform: wifi.or(bt)?,
         station,
         esp_now,
-        mqtt: station && mcu.iot.mqtt.is_some(),
+        // TLS asked for where the chip cannot carry it: no MQTT at all, never
+        // the password in clear to a port that expects TLS.
+        mqtt: station && mcu.iot.mqtt.as_ref().is_some_and(|m| !m.tls || tls_ok),
+        mqtt_tls: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls) && tls_ok,
+        mqtt_p384: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls && m.p384) && tls_ok,
         sntp: station && mcu.iot.sntp.is_some(),
         ble,
         thread,
     })
+}
+
+/// Can MQTT run over TLS on `family`? `coex` = Bluetooth beside Wi-Fi.
+/// `Err` says why not:
+///
+/// - the ESP32-C5 / C61 have no TRNG in esp-hal 1.1, and TLS keys come from it;
+/// - the ESP32 and the ESP32-C2 with Bluetooth beside Wi-Fi: coexistence
+///   already takes most of their RAM (the ESP32 had 6 KiB of stack left before
+///   TLS's 30 KB; the C2 overflows its DRAM by 41 KB).
+pub fn tls_available(family: &str, coex: bool) -> Result<(), &'static str> {
+    match family {
+        "esp32c5" | "esp32c61" => Err("no TRNG in esp-hal 1.1 on this chip, and TLS's keys need one"),
+        "esp32" | "esp32c2" if coex => Err("Bluetooth beside Wi-Fi leaves this chip no RAM for TLS"),
+        _ => Ok(()),
+    }
 }
 
 /// Thread beside another link on the one 2.4 GHz radio - never generated:
@@ -1132,6 +1405,92 @@ mod tests {
         let c3 = build("esp32c3");
         assert_eq!(active(&c3), None);
         assert!(!thread_blocked(&c3));
+    }
+
+    /// The CA the IDE writes: read back as the tab shows it.
+    #[test]
+    fn the_isrg_root_reads_as_a_ca() {
+        let pem = include_str!("codegen/iot_templates/ca/isrg_root_x1.pem");
+        let ca = ca_summary(pem).expect("ISRG Root X1");
+        assert_eq!(ca.name, "ISRG Root X1");
+        assert_eq!(ca.not_after, "2035-06-04");
+        assert!(ca.is_ca == Some(true) && !ca.more);
+        assert_eq!(ca.key, CaKey::Rsa);
+        assert_eq!(pem_der(pem).map(|d| d.len()), Some(1391));
+        // CRLF, two certificates, garbage.
+        assert!(ca_summary(&pem.replace('\n', "\r\n")).is_ok());
+        assert!(ca_summary(&format!("{pem}\n{pem}")).unwrap().more);
+        assert!(ca_summary("hello").is_err());
+        // A non-ASCII time is refused, never sliced through a character.
+        let der = pem_der(pem).unwrap();
+        let at = der.windows(13).position(|w| w == b"350604110438Z").expect("notAfter");
+        let mut bent = der.clone();
+        bent[at..at + 2].copy_from_slice("é".as_bytes());
+        let b64 = {
+            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut s = String::new();
+            for c in bent.chunks(3) {
+                let n = c.iter().enumerate().fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+                for i in 0..=c.len() {
+                    s.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                }
+            }
+            s
+        };
+        let pem_bent = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
+        assert!(ca_summary(&pem_bent).is_err());
+        assert!(ca_summary("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----").is_err());
+    }
+
+    /// TLS's settings: the port follows the switch only from its default,
+    /// the name defaults to the host, and what cannot work is said.
+    #[test]
+    fn tls_settings_follow_the_switch() {
+        let mut m = MqttConfig::default();
+        assert_eq!(m.port_for_tls(true), 8886, "test.mosquitto.org's Let's Encrypt port");
+        m.host = "broker.example.org".into();
+        assert_eq!(m.port_for_tls(true), TLS_PORT);
+        m.port = 8883;
+        assert_eq!(m.port_for_tls(false), PLAIN_PORT);
+        m.port = 9999;
+        assert_eq!(m.port_for_tls(true), 9999, "a chosen port stays");
+        assert_eq!(m.port_for_tls(false), 9999);
+
+        m.port = 8883;
+        assert_eq!(tls_problem(&m), None, "TLS off");
+        m.tls = true;
+        assert_eq!(tls_problem(&m), None);
+        assert_eq!(m.tls_name(), "broker.example.org");
+        m.host = "192.168.1.10".into();
+        assert!(tls_problem(&m).is_some(), "an address cannot be checked");
+        m.server_name = "mqtt.home.lan".into();
+        assert_eq!(tls_problem(&m), None);
+        assert_eq!(m.tls_name(), "mqtt.home.lan");
+        m.verify = false;
+        m.server_name.clear();
+        assert_eq!(tls_problem(&m), None, "encrypt only: an address is fine");
+        m.port = PLAIN_PORT;
+        assert!(tls_problem(&m).is_some());
+        m.port = 8883;
+        m.host = "broker.hivemq.com".into();
+        assert!(tls_problem(&m).unwrap().contains("TLS 1.2"));
+
+        assert!(tls_available("esp32c3", false).is_ok());
+        assert!(tls_available("esp32", false).is_ok());
+        assert!(tls_available("esp32", true).is_err());
+        assert!(tls_available("esp32c3", true).is_ok());
+        assert!(tls_available("esp32c2", false).is_ok());
+        assert!(tls_available("esp32c2", true).is_err());
+        assert!(tls_available("esp32c5", false).is_err());
+        assert!(tls_available("esp32c61", false).is_err());
+        assert!(tls_available("rp2040", false).is_ok());
+    }
+
+    /// An MQTT config saved before TLS reads as plain, checked when switched on.
+    #[test]
+    fn an_mqtt_config_without_tls_still_reads() {
+        let old: MqttConfig = ron::from_str("(host: \"h\", port: 1883)").unwrap();
+        assert!(!old.tls && old.verify && old.server_name.is_empty());
     }
 
     /// A project saved before Thread existed reads with Thread off.

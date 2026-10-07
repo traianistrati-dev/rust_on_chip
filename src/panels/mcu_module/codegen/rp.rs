@@ -4974,13 +4974,16 @@ mod emit_async_for_manual_compile {
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_rp_iot_project() {
         use crate::panels::mcu_module::iot::{self, BleConfig, MqttConfig, SntpConfig};
-        // (board, folder, Wi-Fi + MQTT + SNTP, Bluetooth): the Wi-Fi shape,
-        // Wi-Fi beside Bluetooth, and Bluetooth alone with the LED in main.
-        for (id, dir_name, wifi, ble) in [
-            ("rp2040_pico_w", "eide_rp2040w_iot_check", true, false),
-            ("rp2350_pico2_w", "eide_rp2350w_iot_check", true, false),
-            ("rp2040_pico_w", "eide_rp2040w_ble_check", true, true),
-            ("rp2350_pico2_w", "eide_rp2350w_ble_check", false, true),
+        // (board, folder, Wi-Fi + MQTT + SNTP, Bluetooth, MQTT over TLS): the
+        // Wi-Fi shape, Wi-Fi beside Bluetooth, Bluetooth alone with the LED in
+        // main, and MQTT over TLS - its heap, its whitened RNG, SNTP's clock.
+        for (id, dir_name, wifi, ble, tls) in [
+            ("rp2040_pico_w", "eide_rp2040w_iot_check", true, false, false),
+            ("rp2350_pico2_w", "eide_rp2350w_iot_check", true, false, false),
+            ("rp2040_pico_w", "eide_rp2040w_ble_check", true, true, false),
+            ("rp2350_pico2_w", "eide_rp2350w_ble_check", false, true, false),
+            ("rp2040_pico_w", "eide_rp2040w_tls_check", true, false, true),
+            ("rp2350_pico2_w", "eide_rp2350w_tls_check", true, false, true),
         ] {
             let def = builtins::builtin_definitions()
                 .into_iter()
@@ -4999,6 +5002,10 @@ mod emit_async_for_manual_compile {
             if wifi {
                 let mut m = MqttConfig::for_chip(id);
                 m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/+/set".into()];
+                m.tls = tls;
+                // The Pico 2 W's TLS also builds embedded-tls's P-384 checks.
+                m.p384 = tls && id == "rp2350_pico2_w";
+                m.port = m.port_for_tls(tls);
                 mcu.iot.mqtt = Some(m);
                 mcu.iot.sntp = Some(SntpConfig::default());
             }
@@ -5007,6 +5014,7 @@ mod emit_async_for_manual_compile {
             }
             let active = iot::active(&mcu);
             assert!(active.is_some(), "a link on a W board on Async");
+            assert_eq!(active.is_some_and(|a| a.mqtt_tls), tls, "{id}: TLS exactly when asked");
 
             let mut used = String::from("        // Your main loop code here.\n");
             if wifi {
@@ -5067,6 +5075,20 @@ mod emit_async_for_manual_compile {
             );
             let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
             let toml = project_gen::ensure_iot_deps(&toml, active, "", &mcu.family, &[]);
+            if tls {
+                let link = user
+                    .iter()
+                    .find(|(p, _)| p == "src/pins/configs/mqtt_link.rs")
+                    .map(|(_, c)| c.as_str())
+                    .unwrap_or("");
+                assert!(link.contains("embassy_rp::clocks::RoscRng"), "{link}");
+                assert!(link.contains("super::sntp::now_unix()"), "{link}");
+                assert!(user.iter().any(|(p, _)| p == "src/pins/configs/mqtt_ca.rs"), "the CA");
+                for want in ["embedded-tls = ", "embedded-alloc = ", "rand_core_06 = ", "sha2 = ", "embedded-io-async = "] {
+                    assert!(toml.contains(want), "{want}:\n{toml}");
+                }
+                assert_eq!(toml.contains("spin = "), mcu.family == "rp2040", "{toml}");
+            }
             std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             // The Bluetooth firmware, whole: `write_project` lays it down when
             // main.rs uploads it, and a stub would build just as well.

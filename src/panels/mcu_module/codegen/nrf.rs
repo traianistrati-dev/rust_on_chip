@@ -1881,7 +1881,7 @@ fn periph((port, pin): (u8, u8)) -> String {
 /// the same. The small parts do not: on the 52805 and 52810 SPIM0 and TWIM0
 /// are SEPARATE blocks (`SPI0`, `TWI0`), and on the 52811 the shared one is
 /// SPIM1 with TWIM0, named `TWI0_SPI1`.
-fn serial_block(family: &str, kind: &str, n: u8) -> (String, String) {
+pub(super) fn serial_block(family: &str, kind: &str, n: u8) -> (String, String) {
     let same = |s: &str| (s.to_owned(), s.to_owned());
     match (family, kind, n) {
         // UARTE, SPIM and TWIM n are all SERIALn; SPIM4 shares nothing.

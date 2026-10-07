@@ -419,23 +419,33 @@ The SSID and the passwords are typed in the tab but stored only in
 `mcu.config`, which is committed. The file is written once and never
 regenerated: a link switched on later only adds its own, empty lines.
 
-**Thread** is a link of its own on the nRF52840 and nRF52833: an OpenThread
-end device (openthread 0.4 on embassy-nrf's 802.15.4 driver) that joins the
-network in `THREAD_DATASET` — the Active Operational Dataset as hex, what
-`ot-ctl dataset active -x` prints on a border router, kept in `secrets.rs` with
-the network key in it — and talks UDP over IPv6:
-`pins::configs::thread::send_to(addr, port, b"..").await`, `receive().await`,
-`addresses()`, `wait_attached().await`. A Thread project builds for
-`thumbv7em-none-eabi` (soft-float): openthread-sys ships OpenThread compiled
-for it and for no hard-float target, so no C compiler, CMake or libclang is
-needed — on `-eabihf` it would compile OpenThread's C and C++. A dataset that
-is empty or short of what attaching needs starts nothing. It is a Minimal End
-Device that stays awake; the software MAC acknowledges frames late, so
-unicasts to it are retried a few times and a sleepy device would not attach.
-Not beside Bluetooth (one radio), and not on the nRF52811/52820 (RAM), the
-nRF5340 (network core) or the nRF54L15 (no 802.15.4 driver). The ESP32-C6 /
-H2 are planned: openthread 0.2 is the release on the esp-radio 0.18 the rest
-of the tab uses (0.3+ moved to esp-radio 1.0 beta).
+**Thread** is a link of its own on the nRF52840 / nRF52833 and the ESP32-C6 /
+H2 / C5: an OpenThread end device that joins the network in `THREAD_DATASET` —
+the Active Operational Dataset as hex, what `ot-ctl dataset active -x` prints
+on a border router, kept in `secrets.rs` with the network key in it — and
+talks UDP over IPv6: `pins::configs::thread::send_to(addr, port, b"..").await`,
+`receive().await`, `addresses()`, `wait_attached().await`, the same on both
+vendors. A dataset that is empty or short of what attaching needs starts
+nothing. It is a Minimal End Device that stays awake, and never shares its
+radio: not beside Bluetooth, and on an ESP not beside Wi-Fi or ESP-NOW either
+— the link already switched on wins. No C compiler, CMake or libclang is
+needed on either:
+
+- **nRF** — openthread 0.4 on embassy-nrf's 802.15.4 driver. The project builds
+  for `thumbv7em-none-eabi` (soft-float): openthread-sys ships OpenThread
+  compiled for it and for no hard-float target — on `-eabihf` it would compile
+  OpenThread's C and C++. The MAC is software and acknowledges frames late, so
+  unicasts to it are retried a few times and a sleepy device would not attach.
+  Not on the nRF52811/52820 (RAM), the nRF5340 (network core) or the nRF54L15
+  (no 802.15.4 driver).
+- **ESP** — openthread 0.2, the release on the esp-radio 0.18 the rest of the
+  tab uses (0.3+ moved to esp-radio 1.0 beta), on esp-radio's `ieee802154`,
+  whose MAC acknowledges in hardware. OpenThread and Mbed TLS link prebuilt for
+  riscv32imac; the project names `mbedtls-rs-sys` itself, because its
+  prebuilt build is only the default `tls` profile and openthread-sys alone
+  asks for a smaller one, which compiles from C. esp-radio 0.18 has no
+  coexistence for 802.15.4, hence one link on the radio. openthread names the
+  C6 and H2; the C5 builds and links the same way.
 
 Only what the chip's radio can carry is listed. Of that, what is not generated
 says why: BLE Mesh, Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to

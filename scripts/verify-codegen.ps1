@@ -343,6 +343,18 @@ $ALL_CASES = @(
     @{ n = "ESP32-C3 BLE + ESP-NOW, station off"; t = "emit_esp32c3_project"; e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble+espnow" }; q = $true; fam = "esp"; lk = $true }
     @{ n = "ESP32-C6 BLE + ESP-NOW, station off"; t = "emit_esp32c3_project"; e = @{ EIDE_ESP_CHIP = "esp32c6"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble+espnow" }; q = $false; fam = "esp"; lk = $true }
 
+    # The IoT tab's Thread on the ESP parts with 802.15.4 (openthread 0.2 on
+    # esp-radio 0.18's `ieee802154`), every peripheral wired, with a real
+    # dataset so the whole attach / UDP path links. OpenThread and Mbed TLS
+    # must link PREBUILT for riscv32imac: `CMAKE` names a program that does
+    # not exist, so any build of their C - mbedtls-rs-sys's "Forcing on-the-fly
+    # build", which cargo does not print for a registry crate - fails the row
+    # on any machine, CMake installed or not. LINKED: the archives only fail
+    # at the link.
+    @{ n = "ESP32-C6 Thread";              t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c6";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "thread"; CMAKE = "eide-no-cmake" }; q = $true; fam = "esp"; lk = $true }
+    @{ n = "ESP32-H2 Thread";              t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32h2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "thread"; CMAKE = "eide-no-cmake" }; q = $false; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C5 Thread";              t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c5";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "thread"; CMAKE = "eide-no-cmake" }; q = $false; fam = "esp"; lk = $true }
+
     # The watchdogs on EVERY bundled Espressif part. The harness switches all
     # three on unless EIDE_ESP_WDG=0, so the six C3 rows above already build
     # them on both runtimes - including async, where the scheduler owns TIMG0.
@@ -406,10 +418,10 @@ $ALL_CASES = @(
     # The IoT tab's Thread (openthread 0.4 on embassy-nrf's 802.15.4 driver):
     # the 52840 DK and the micro:bit v2, each switched over from a hard-float
     # project the way the app does it. They build for thumbv7em-none-eabi,
-    # where openthread-sys links OpenThread prebuilt - no C compiler, CMake or
-    # libclang is set here, and none may be needed. LINKED: the archives only
-    # fail at the link.
-    @{ n = "nRF52 Thread x2";              t = "emit_nrf_thread_project";    e = @{};                       q = $true; fam = "nrf"; lk = $true }
+    # where openthread-sys links OpenThread prebuilt - `CMAKE` names a program
+    # that does not exist, so a build of OpenThread's C fails the row on any
+    # machine. LINKED: the archives only fail at the link.
+    @{ n = "nRF52 Thread x2";              t = "emit_nrf_thread_project";    e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "nrf"; lk = $true }
 
     # The rest of the nRF52 family, TEN projects on two targets: Nordic's two
     # kits on both runtimes, and the small parts on the nRF52 DK the way the
@@ -556,7 +568,9 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
-           "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD")
+           "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD",
+           # Not ours, but set by the Thread rows - never left for the next case.
+           "CMAKE")
 
 # The hook passes its families as ONE comma-joined argument ("embassy,f1"), and
 # `powershell -File` binds that to [string[]] as a single element - it does not

@@ -7,7 +7,7 @@
 //     let d = pins::configs::thread::receive().await;   // d.from, d.data
 //     let me = pins::configs::thread::addresses();        // link-local, mesh-local, OMR
 //
-// A Thread end device on OpenThread (openthread 0.4): it joins the network
+// A Thread end device on OpenThread (openthread 0.2): it joins the network
 // THREAD_DATASET in secrets.rs describes - the Active Operational Dataset as
 // hex, what `ot-ctl dataset active -x` prints on a border router - and never
 // forms one. With the dataset empty, refused, or short of what attaching
@@ -17,42 +17,36 @@
 // MAX_DATA is dropped. A border router routes the mesh to your LAN (an OMR
 // address in `addresses()`).
 //
-// It is a Minimal End Device that stays awake (rx-on-when-idle): it never
-// routes for others and never sleeps. The radio is embassy-nrf's 802.15.4
-// driver with OpenThread's MAC in software, which acknowledges frames late
-// (500-650 us where the standard asks 192 us): unicasts to the board are
-// retried a few times before they land, and a sleepy device would not
-// attach. OpenThread keeps its settings in RAM: the board joins anew on every
-// boot.
+// It is a Minimal End Device. The radio is the chip's own 802.15.4
+// (esp-radio's `ieee802154`), which acknowledges frames in hardware -
+// OpenThread retries unacknowledged ones in software - so OpenThread drives it
+// from the main executor. It takes IEEE802154 and the
+// RNG, and its receive queue comes from the heap. The radio is not shared:
+// no Wi-Fi, ESP-NOW or Bluetooth beside it (esp-radio 0.18 has no coexistence
+// for 802.15.4). OpenThread keeps its settings in RAM: the board joins anew on
+// every boot.
 //
-// It takes RADIO, RNG, the 32 MHz crystal (main.rs starts it) and EGU0_SWI0,
-// whose interrupt runs the radio's own executor at priority 7. The project
-// builds for thumbv7em-none-eabi - soft-float, the FPU unused - because
-// openthread-sys ships OpenThread compiled for it and for no hard-float
-// target: no C compiler, CMake or libclang is needed. Any OpenThread feature
-// beyond its defaults would bring that C build back.
+// openthread-sys and mbedtls-rs-sys link OpenThread and Mbed TLS prebuilt for
+// riscv32imac with their default features - no C compiler, CMake or libclang
+// is needed. A feature beyond those defaults (or mbedtls-rs-sys's line taken
+// out of Cargo.toml) would bring that C build back.
 
 use core::cell::RefCell;
 use core::net::{Ipv6Addr, SocketAddrV6};
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use embassy_executor::{InterruptExecutor, Spawner};
+use embassy_executor::Spawner;
 use embassy_futures::join::join3;
-use embassy_nrf::interrupt;
-use embassy_nrf::interrupt::{InterruptExt, Priority};
-use embassy_nrf::mode::Blocking;
-use embassy_nrf::rng::Rng;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::Timer;
-use openthread::nrf::{Ieee802154, NrfRadio};
-use openthread::{
-    DeviceRole, EmbassyTimeTimer, MacRadio, MacRadioResources, OpenThread, OtResources,
-    OtUdpResources, PhyRadioRunner, ProxyRadio, ProxyRadioResources, SimpleRamSettings, UdpSocket,
-};
+use esp_hal::rng::Rng;
+use openthread::esp::{EspRadio, Ieee802154};
+use openthread::{DeviceRole, OpenThread, OtResources, OtUdpResources, SimpleRamSettings, UdpSocket};
 use static_cell::StaticCell;
-// OpenThread's C code calls `strcmp` and `strstr`; tinyrlibc provides them.
+// OpenThread's C code calls a few libc functions the ROM does not provide;
+// tinyrlibc provides them.
 use tinyrlibc as _;
 
 use super::secrets::THREAD_DATASET;
@@ -141,39 +135,60 @@ pub async fn receive() -> Datagram {
     INCOMING.receive().await
 }
 
-static EXECUTOR_RADIO: InterruptExecutor = InterruptExecutor::new();
-
-#[interrupt]
-unsafe fn EGU0_SWI0() {
-    unsafe { EXECUTOR_RADIO.on_interrupt() }
+/// Does the hex dataset carry every TLV attaching needs - the five
+/// OpenThread's `otDatasetIsCommissioned` asks for (Channel 0, PAN ID 1,
+/// Extended PAN ID 2, Network Name 3, Network Key 5)? openthread 0.2 has no
+/// `is_commissioned`, so the TLVs are walked here.
+fn commissioned(hex: &str) -> bool {
+    fn nibble(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    let b = hex.trim().as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return false;
+    }
+    let byte = |i: usize| -> Option<u8> { Some((nibble(b[2 * i])? << 4) | nibble(b[2 * i + 1])?) };
+    let n = b.len() / 2;
+    let mut seen = 0u8;
+    let mut i = 0;
+    while i + 2 <= n {
+        let (Some(t), Some(len)) = (byte(i), byte(i + 1)) else {
+            return false;
+        };
+        if t <= 5 {
+            seen |= 1 << t;
+        }
+        i += 2 + len as usize;
+    }
+    i == n && seen & 0b10_1111 == 0b10_1111
 }
 
 /// Bring Thread up. Called once, by `main.rs`.
-pub fn start(spawner: Spawner, radio: Ieee802154<'static>, rng: &'static mut Rng<'static, Blocking>) {
+pub fn start(spawner: Spawner, radio: esp_hal::peripherals::IEEE802154<'static>) {
+    // The radio first: it powers the RF, which is what makes the RNG truly
+    // random - and the RNG seeds the EUI-64 and OpenThread's crypto below.
+    let radio = EspRadio::new(Ieee802154::new(radio));
+    static RNG: StaticCell<Rng> = StaticCell::new();
+    let rng = RNG.init(Rng::new());
     let mut eui64 = [0u8; 8];
-    rng.blocking_fill_bytes(&mut eui64);
+    rng.read(&mut eui64);
 
     static RES: StaticCell<OtResources> = StaticCell::new();
     static UDP: StaticCell<OtUdpResources<UDP_SOCKETS, UDP_RX>> = StaticCell::new();
     static SETTINGS_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
     static SETTINGS: StaticCell<SimpleRamSettings<'static>> = StaticCell::new();
-    static PROXY: StaticCell<ProxyRadioResources> = StaticCell::new();
 
     let settings = SETTINGS.init(SimpleRamSettings::new(SETTINGS_BUF.init([0; 1024])));
     let ot = OpenThread::new_with_udp(eui64, rng, settings, RES.init(OtResources::new()), UDP.init(OtUdpResources::new()))
         .unwrap();
 
-    let (proxy, phy) = ProxyRadio::new(PROXY.init(ProxyRadioResources::new()));
-    interrupt::EGU0_SWI0.set_priority(Priority::P7);
-    let high = EXECUTOR_RADIO.start(interrupt::EGU0_SWI0);
-    high.spawn(radio_task(phy, NrfRadio::new(radio)).unwrap());
-    spawner.spawn(ot_task(ot.clone(), proxy).unwrap());
+    spawner.spawn(ot_task(ot.clone(), radio).unwrap());
 
     // An empty dataset is "set" too (it deletes the stored one), and Thread
     // would then look for any parent on defaults: start only on a dataset
     // with everything attaching needs.
-    let up = ot.set_active_dataset_tlv_hexstr(THREAD_DATASET).is_ok()
-        && ot.is_commissioned()
+    let up = commissioned(THREAD_DATASET)
+        && ot.set_active_dataset_tlv_hexstr(THREAD_DATASET).is_ok()
         && ot.enable_ipv6(true).is_ok()
         && ot.enable_thread(true).is_ok();
     if up {
@@ -187,16 +202,8 @@ pub fn start(spawner: Spawner, radio: Ieee802154<'static>, rng: &'static mut Rng
 }
 
 #[embassy_executor::task]
-async fn ot_task(ot: OpenThread<'static>, radio: ProxyRadio<'static>) -> ! {
+async fn ot_task(ot: OpenThread<'static>, radio: EspRadio<'static>) -> ! {
     ot.run(radio).await
-}
-
-#[embassy_executor::task]
-async fn radio_task(mut runner: PhyRadioRunner<'static>, radio: NrfRadio<'static>) -> ! {
-    static MAC: StaticCell<MacRadioResources> = StaticCell::new();
-    runner
-        .run(MacRadio::new(radio, EmbassyTimeTimer, MAC.init(MacRadioResources::new())))
-        .await
 }
 
 /// The one task that owns the socket: it keeps `role()` and `addresses()`
@@ -206,7 +213,7 @@ async fn thread_task(ot: OpenThread<'static>) -> ! {
     let socket = UdpSocket::bind(ot.clone(), &SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, UDP_PORT, 0, 0)).unwrap();
     let state = async {
         loop {
-            let r = match ot.device_role() {
+            let r = match ot.net_status().role {
                 DeviceRole::Detached => 1,
                 DeviceRole::Child => 2,
                 DeviceRole::Router => 3,
@@ -230,10 +237,10 @@ async fn thread_task(ot: OpenThread<'static>) -> ! {
         // whole - and dropped - rather than cut to fit.
         let mut buf = [0u8; UDP_RX];
         loop {
-            if let Ok((len, _local, remote)) = socket.recv(&mut buf).await {
-                if let Ok(data) = heapless::Vec::from_slice(&buf[..len]) {
-                    let _ = INCOMING.try_send(Datagram { from: remote, data });
-                }
+            if let Ok((len, _local, remote)) = socket.recv(&mut buf).await
+                && let Ok(data) = heapless::Vec::from_slice(&buf[..len])
+            {
+                let _ = INCOMING.try_send(Datagram { from: remote, data });
             }
         }
     };

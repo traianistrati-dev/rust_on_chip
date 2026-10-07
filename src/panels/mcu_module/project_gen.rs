@@ -1041,6 +1041,11 @@ pub fn ensure_iot_deps(
     let mqtt = active.is_some_and(|a| a.mqtt);
     let ble = active.is_some_and(|a| a.ble);
     let thread = active.is_some_and(|a| a.thread);
+    // Thread on an ESP: esp-radio's `ieee802154`, openthread 0.2 and the
+    // Mbed TLS profile that links prebuilt. On an nRF: openthread 0.4 and an
+    // InterruptExecutor for its radio.
+    let thread_esp = thread && esp;
+    let thread_nrf = thread && active.is_some_and(|a| a.platform == Platform::Nrf);
     // Wi-Fi on an ESP: the station or ESP-NOW; with Bluetooth too, `coex`.
     let wifi = esp && (station || esp_now);
     let esp_ble = esp && ble;
@@ -1057,6 +1062,7 @@ pub fn ensure_iot_deps(
         esp_now.then_some("esp-now"),
         esp_ble.then_some("ble"),
         coex.then_some("coex"),
+        thread_esp.then_some("ieee802154"),
         Some("unstable"),
     ]
     .into_iter()
@@ -1095,7 +1101,12 @@ pub fn ensure_iot_deps(
             // ours. `wifi` must go on an H2 - esp-radio's build script panics on
             // it there - and `coex` only with both radios, or it warns.
             let mut l = line.to_owned();
-            for (feature, want) in [("wifi", wifi), ("ble", esp_ble), ("coex", coex)] {
+            for (feature, want) in [
+                ("wifi", wifi),
+                ("ble", esp_ble),
+                ("coex", coex),
+                ("ieee802154", thread_esp),
+            ] {
                 if want || ours {
                     l = toggle_hal_feature(&l, feature, want);
                 }
@@ -1106,10 +1117,11 @@ pub fn ensure_iot_deps(
             out.push(l);
         } else if is_dep_line(line, "embassy-executor")
             && line.contains("features = [")
-            && (thread || (ours && !sources.iter().any(|s| s.contains("InterruptExecutor"))))
+            && (thread_nrf || (ours && !sources.iter().any(|s| s.contains("InterruptExecutor"))))
         {
-            // Thread's radio runs on an InterruptExecutor of its own.
-            out.push(toggle_hal_feature(line, "executor-interrupt", thread));
+            // The nRF's Thread radio runs on an InterruptExecutor of its own;
+            // the ESP's is driven from the main executor.
+            out.push(toggle_hal_feature(line, "executor-interrupt", thread_nrf));
         } else {
             out.push(line.to_owned());
         }
@@ -1181,23 +1193,31 @@ pub fn ensure_iot_deps(
     s = ensure_dep(&s, "bt-hci", nrf_feature.is_some(), "bt-hci = \"0.10\"", sources);
     s = ensure_dep(&s, "rand_core", nrf_feature.is_some(), "rand_core = \"0.9\"", sources);
     // Thread: OpenThread with its default features - the set openthread-sys
-    // ships compiled for `thumbv7em-none-eabi`; one more feature and it
-    // compiles OpenThread's C instead. tinyrlibc has the two libc functions
-    // that C calls (`strcmp`, `strstr`).
-    s = ensure_dep(
-        &s,
-        "openthread",
-        thread,
-        "openthread = { version = \"0.4\", features = [\"embassy-nrf\"] }",
-        sources,
-    );
-    s = ensure_dep(
-        &s,
-        "tinyrlibc",
-        thread,
-        "tinyrlibc = { version = \"0.5\", default-features = false, features = [\"strstr\", \"strcmp\"] }",
-        sources,
-    );
+    // ships compiled (`thumbv7em-none-eabi` for 0.4 on an nRF, riscv32imac
+    // for 0.2 on an ESP); one more feature and it compiles OpenThread's C
+    // instead. A move between the two changes the version.
+    let openthread = if thread_esp {
+        "openthread = { version = \"0.2\", features = [\"esp-radio\"] }"
+    } else {
+        "openthread = { version = \"0.4\", features = [\"embassy-nrf\"] }"
+    };
+    s = ensure_dep(&s, "openthread", thread, openthread, sources);
+    if thread {
+        s = set_owned_dep_line(&s, "openthread", openthread);
+    }
+    // openthread-sys 0.2 asks mbedtls-rs-sys for a subset of its `tls`
+    // profile, and Mbed TLS is prebuilt only for `tls` exactly: naming it with
+    // its defaults makes the union `tls`. Never on an nRF, whose openthread
+    // 0.4 carries an Mbed TLS of its own - a second copy would clash.
+    s = ensure_dep(&s, "mbedtls-rs-sys", thread_esp, "mbedtls-rs-sys = \"0.1\"", sources);
+    // The libc functions OpenThread's C calls and neither target's ROM or
+    // core has: `strcmp`, `strstr` (nRF), `utoa`, `strtoul` (ESP). One line
+    // for both, so a project moved between them keeps linking.
+    let libc = "tinyrlibc = { version = \"0.5\", default-features = false, features = [\"strstr\", \"strcmp\", \"utoa\", \"strtoul\"] }";
+    s = ensure_dep(&s, "tinyrlibc", thread, libc, sources);
+    if thread {
+        s = set_owned_dep_line(&s, "tinyrlibc", libc);
+    }
     if station || nrf_feature.is_some() || thread {
         s = ensure_dep(&s, "static_cell", true, "static_cell = \"2\"", sources);
     }
@@ -5674,7 +5694,7 @@ mod iot_deps_tests {
         let on = ensure_iot_deps(NRF_ASYNC, thread, "nRF52840_xxAA", "nrf52840", &[]);
         for want in [
             "openthread = { version = \"0.4\", features = [\"embassy-nrf\"] }",
-            "tinyrlibc = { version = \"0.5\", default-features = false, features = [\"strstr\", \"strcmp\"] }",
+            "tinyrlibc = { version = \"0.5\", default-features = false, features = [\"strstr\", \"strcmp\", \"utoa\", \"strtoul\"] }",
             "static_cell = \"2\"",
             "\"executor-interrupt\", \"platform-cortex-m\", \"executor-thread\"",
             "critical-section-single-core",
@@ -5693,6 +5713,51 @@ mod iot_deps_tests {
         let mine = ["static EX: InterruptExecutor = InterruptExecutor::new();"];
         let kept = ensure_iot_deps(&on, None, "nRF52840_xxAA", "nrf52840", &mine);
         assert!(kept.contains("executor-interrupt"), "{kept}");
+    }
+
+    /// Thread on an ESP: `ieee802154` on esp-radio (and nothing of Wi-Fi),
+    /// openthread 0.2, mbedtls-rs-sys with its prebuilt `tls`, tinyrlibc - and
+    /// no `executor-interrupt`. A move to an nRF swaps openthread to 0.4 and
+    /// takes mbedtls-rs-sys away (0.4 carries its own Mbed TLS).
+    #[test]
+    fn thread_on_an_esp_brings_openthread_0_2() {
+        let c6 = ESP_ASYNC.replace("esp32c3", "esp32c6");
+        let thread = Some(Active {
+            thread: true,
+            ..active(Platform::Esp, false, false, false).unwrap()
+        });
+        let on = ensure_iot_deps(&c6, thread, "esp32c6", "esp32c6", &[]);
+        for want in [
+            "esp-radio = { version = \"0.18\", features = [\"esp32c6\", \"ieee802154\", \"unstable\"] }",
+            "openthread = { version = \"0.2\", features = [\"esp-radio\"] }",
+            "mbedtls-rs-sys = \"0.1\"",
+            "tinyrlibc = { version = \"0.5\", default-features = false, features = [\"strstr\", \"strcmp\", \"utoa\", \"strtoul\"] }",
+            "esp-alloc = ",
+            "static_cell = \"2\"",
+        ] {
+            assert!(on.contains(want), "{want}:\n{on}");
+        }
+        for absent in ["\"wifi\"", "executor-interrupt", "embassy-net", "trouble-host"] {
+            assert!(!on.contains(absent), "{absent}:\n{on}");
+        }
+        assert_eq!(ensure_iot_deps(&on, thread, "esp32c6", "esp32c6", &[]), on, "idempotent");
+
+        // Off: the Thread lines and the radio feature go.
+        let off = ensure_iot_deps(&on, None, "esp32c6", "esp32c6", &[]);
+        for absent in ["openthread", "mbedtls-rs-sys", "tinyrlibc", "ieee802154"] {
+            assert!(!off.contains(absent), "{absent}:\n{off}");
+        }
+
+        // The same project on an nRF: openthread 0.4, no mbedtls-rs-sys.
+        let nrf = Some(Active {
+            thread: true,
+            ..active(Platform::Nrf, false, false, false).unwrap()
+        });
+        let moved = ensure_iot_deps(&on, nrf, "nRF52840_xxAA", "nrf52840", &[]);
+        let ot = moved.lines().find(|l| l.starts_with("openthread")).unwrap();
+        assert!(ot.contains("\"0.4\"") && ot.contains("embassy-nrf"), "{ot}");
+        assert_eq!(moved.matches("openthread = ").count(), 1, "{moved}");
+        assert!(!moved.contains("mbedtls-rs-sys"), "{moved}");
     }
 
     /// cortex-m's critical section goes while the MPSL runs, and comes back.

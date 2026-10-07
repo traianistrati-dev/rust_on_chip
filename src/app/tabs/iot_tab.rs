@@ -78,6 +78,8 @@ impl AppIde {
             let foreign: Vec<&'static str> = [
                 (iot_gen::WIFI, platform),
                 (iot_gen::BLE, ble.platform),
+                // Thread's radio is the Bluetooth one on every Thread chip.
+                (iot_gen::THREAD, ble.platform.filter(|_| ble.thread)),
             ]
             .into_iter()
             .filter_map(|(name, p)| {
@@ -179,9 +181,9 @@ impl AppIde {
                 ui.add_space(12.0);
 
                 let link_up = mcu.iot.wifi && platform.is_some();
-                // Thread's dataset is a secret too; Bluetooth's switch wins
-                // the radio, and then Thread has nothing to join with.
-                let thread_up = ble.thread && mcu.iot.thread.is_some() && mcu.iot.ble.is_none();
+                // Thread's dataset is a secret too; another link on the radio
+                // wins it, and then Thread has nothing to join with.
+                let thread_up = ble.thread && mcu.iot.thread.is_some() && !iot::thread_blocked(mcu);
                 if link_up || thread_up {
                     let wanted = Secrets {
                         wifi: link_up,
@@ -221,8 +223,9 @@ struct BleFacts {
     /// An nRF with USB wired: Bluetooth waits (see `iot::nrf_ble_blocked_by_usb`).
     usb_blocks: bool,
     family: String,
-    /// Thread is generated on this chip - on the same radio as Bluetooth, so
-    /// one at a time (see `iot::nrf_thread_blocked_by_ble`).
+    /// Thread is generated on this chip - on the same radio as Bluetooth (and
+    /// on an ESP Wi-Fi and ESP-NOW), so one at a time (see
+    /// `iot::thread_blocked`).
     thread: bool,
 }
 
@@ -245,15 +248,23 @@ fn link_card(
         ui.add_space(4.0);
         for &link in links {
             let avail = iot::availability(link, family, cyw43);
+            // One 2.4 GHz radio: Thread takes it alone (`iot::thread_blocked`).
+            // Wi-Fi and ESP-NOW count only on an ESP with Wi-Fi.
+            let wifi_taken = platform == Some(Platform::Esp) && (cfg.wifi || cfg.esp_now.is_some());
+            let thread_holds = ble.thread && cfg.thread.is_some() && cfg.ble.is_none() && !wifi_taken;
             ui.horizontal(|ui| {
                 if link == Link::Wifi && avail == Availability::Ready {
-                    ui.checkbox(&mut cfg.wifi, "")
-                        .on_hover_text("Generate the Wi-Fi station, the IP stack and the tasks that keep them up");
+                    let free = cfg.wifi || !thread_holds;
+                    ui.add_enabled(free, egui::Checkbox::new(&mut cfg.wifi, ""))
+                        .on_hover_text("Generate the Wi-Fi station, the IP stack and the tasks that keep them up")
+                        .on_disabled_hover_text("Thread has the radio: switch it off first");
                 } else if link == Link::EspNow && avail == Availability::Ready {
                     let mut on = cfg.esp_now.is_some();
+                    let free = on || !thread_holds;
                     if ui
-                        .checkbox(&mut on, "")
+                        .add_enabled(free, egui::Checkbox::new(&mut on, ""))
                         .on_hover_text("Generate ESP-NOW: send() and receive() between ESP boards, no access point")
+                        .on_disabled_hover_text("Thread has the radio: switch it off first")
                         .changed()
                     {
                         toggle_kept(ui, &mut cfg.esp_now, on, "iot_stash_espnow");
@@ -261,7 +272,7 @@ fn link_card(
                 } else if link == Link::Ble && avail == Availability::Ready {
                     let mut on = cfg.ble.is_some();
                     // The radio is Thread's while it is on: switch that off first.
-                    let free = on || !(ble.thread && cfg.thread.is_some());
+                    let free = on || !thread_holds;
                     if ui
                         .add_enabled(free, egui::Checkbox::new(&mut on, ""))
                         .on_hover_text("Generate a Bluetooth LE peripheral with the Nordic UART Service: send(), receive(), connected()")
@@ -272,12 +283,12 @@ fn link_card(
                     }
                 } else if link == Link::Thread && avail == Availability::Ready {
                     let mut on = cfg.thread.is_some();
-                    // Bluetooth's switch wins the radio; one already on can still go off.
-                    let free = on || cfg.ble.is_none();
+                    // The links already on win the radio; Thread already on can still go off.
+                    let free = on || (cfg.ble.is_none() && !wifi_taken);
                     if ui
                         .add_enabled(free, egui::Checkbox::new(&mut on, ""))
                         .on_hover_text("Generate a Thread end device: OpenThread with UDP send_to() and receive() over IPv6")
-                        .on_disabled_hover_text("Bluetooth has the radio: switch it off first")
+                        .on_disabled_hover_text("Another link has the radio: switch it off first")
                         .changed()
                     {
                         toggle_kept(ui, &mut cfg.thread, on, "iot_stash_thread");
@@ -288,12 +299,15 @@ fn link_card(
                 ui.label(egui::RichText::new(link.label()).strong())
                     .on_hover_text(link.blurb());
                 let blocked = match link {
-                    Link::Ble if ble.thread && cfg.thread.is_some() && cfg.ble.is_none() => {
+                    Link::Ble | Link::Wifi | Link::EspNow if thread_holds => {
                         Some(("not with Thread", "one radio: Thread has it"))
                     }
                     Link::Ble if ble.usb_blocks => Some(("not with USB", "unwire USB to generate it")),
                     Link::Thread if cfg.ble.is_some() => {
                         Some(("not with Bluetooth", "one radio: Bluetooth has it"))
+                    }
+                    Link::Thread if wifi_taken => {
+                        Some(("not with Wi-Fi", "one radio: Wi-Fi or ESP-NOW has it"))
                     }
                     _ => None,
                 };
@@ -330,18 +344,16 @@ fn link_card(
                 ble_body(ui, b, ble, wifi_here);
             }
         }
-        let thread_here = ble.thread && cfg.thread.is_some() && cfg.ble.is_none();
+        let wifi_taken = platform == Some(Platform::Esp) && (cfg.wifi || cfg.esp_now.is_some());
+        let thread_here = ble.thread && cfg.thread.is_some() && cfg.ble.is_none() && !wifi_taken;
         if thread_here && let Some(th) = cfg.thread.as_mut() {
-            thread_body(ui, th);
+            thread_body(ui, th, ble);
         }
-        if !is_async && thread_here && !(wifi_here || ble_here) {
+        if wifi_here || ble_here || thread_here {
             ui.add_space(6.0);
-            ui.label(dim("Kept, and generated once the runtime is Async."));
-        }
-        if wifi_here || ble_here {
-            ui.add_space(6.0);
+            // Thread on an ESP is esp-radio too: its receive queue is on the heap.
             let esp_radio = (wifi_here && platform == Some(Platform::Esp))
-                || (ble_here && ble.platform == Some(Platform::Esp));
+                || ((ble_here || thread_here) && ble.platform == Some(Platform::Esp));
             if esp_radio {
                 let coex = ble_here && wifi_here;
                 ui.horizontal(|ui| {
@@ -377,7 +389,7 @@ fn link_card(
                 )));
             }
             // Bluetooth that USB blocks waits for more than the runtime.
-            if !is_async && (wifi_here || !ble.usb_blocks) {
+            if !is_async && (wifi_here || thread_here || !ble.usb_blocks) {
                 ui.label(dim("Kept, and generated once the runtime is Async."));
             }
         }
@@ -443,33 +455,58 @@ fn ble_body(ui: &mut egui::Ui, b: &mut BleConfig, ble: &BleFacts, wifi: bool) {
 const THREAD_USAGE: &str =
     "pins::configs::thread::send_to(addr, pins::configs::thread::UDP_PORT, b\"21.5\").await.ok();";
 
-/// Thread's settings: the UDP port, and what the radio takes.
-fn thread_body(ui: &mut egui::Ui, th: &mut ThreadConfig) {
+/// Thread's settings: the UDP port, and what the radio takes - per radio.
+fn thread_body(ui: &mut egui::Ui, th: &mut ThreadConfig, ble: &BleFacts) {
+    let esp = ble.platform == Some(Platform::Esp);
     ui.indent("thread", |ui| {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.add_sized([90.0, 18.0], egui::Label::new("UDP port"));
             ui.add(crate::panels::drag_value(ui, &mut th.udp_port).range(1..=65535));
         });
-        ui.label(dim(concat!(
-            "OpenThread 0.4 as a Minimal End Device that stays awake: it joins the network in ",
-            "THREAD_DATASET (Credentials, below) and never forms one. One UDP socket on this ",
-            "port: send_to() and receive() over IPv6; addresses() lists the link-local, ",
-            "mesh-local and border-router (OMR) ones. A Thread border router (OpenThread BR, ",
-            "Home Assistant) supplies the dataset and the route to your LAN."
+        ui.label(dim(format!(
+            "OpenThread {} as a Minimal End Device that stays awake: it joins the network in \
+             THREAD_DATASET (Credentials, below) and never forms one. One UDP socket on this \
+             port: send_to() and receive() over IPv6; addresses() lists the link-local, \
+             mesh-local and border-router (OMR) ones. A Thread border router (OpenThread BR, \
+             Home Assistant) supplies the dataset and the route to your LAN.",
+            if esp { "0.2" } else { "0.4" }
         )));
-        ui.label(dim(concat!(
-            "The radio is embassy-nrf's 802.15.4 driver with OpenThread's MAC in software: it ",
-            "acknowledges frames late (500-650 us where the standard asks 192 us), so unicasts to ",
-            "the board are retried a few times, and a sleepy device would not attach. It takes ",
-            "RADIO, RNG, the 32 MHz crystal and EGU0_SWI0 (the radio's executor, priority 7); ",
-            "settings stay in RAM, so the board joins anew on every boot."
-        )));
-        ui.label(dim(concat!(
-            "The project builds for thumbv7em-none-eabi - soft-float, the FPU unused - because ",
-            "openthread-sys ships OpenThread compiled for it and for no hard-float target: no C ",
-            "compiler, CMake or libclang needed. Not with Bluetooth: one radio."
-        )));
+        if esp {
+            ui.label(dim(concat!(
+                "The radio is the chip's own 802.15.4 (esp-radio), which acknowledges frames in ",
+                "hardware (OpenThread retries unacknowledged ones in software). It takes IEEE802154 ",
+                "and the RNG, and its receive queue comes from the heap below; settings stay in RAM, ",
+                "so the board joins anew on every boot."
+            )));
+            ui.label(dim(if ble.family == "esp32h2" {
+                "OpenThread and Mbed TLS link prebuilt for riscv32imac: no C compiler, CMake or \
+                 libclang needed. Not with Bluetooth: esp-radio 0.18 has no coexistence for 802.15.4."
+            } else {
+                "OpenThread and Mbed TLS link prebuilt for riscv32imac: no C compiler, CMake or \
+                 libclang needed. Not with Wi-Fi, ESP-NOW or Bluetooth: esp-radio 0.18 has no \
+                 coexistence for 802.15.4."
+            }));
+            if ble.family == "esp32c5" {
+                ui.label(dim(concat!(
+                    "openthread names the C6 and H2; the C5 builds and links the same way. It has ",
+                    "no TRNG: its RNG is random while the radio runs, which is when it is used."
+                )));
+            }
+        } else {
+            ui.label(dim(concat!(
+                "The radio is embassy-nrf's 802.15.4 driver with OpenThread's MAC in software: it ",
+                "acknowledges frames late (500-650 us where the standard asks 192 us), so unicasts to ",
+                "the board are retried a few times, and a sleepy device would not attach. It takes ",
+                "RADIO, RNG, the 32 MHz crystal and EGU0_SWI0 (the radio's executor, priority 7); ",
+                "settings stay in RAM, so the board joins anew on every boot."
+            )));
+            ui.label(dim(concat!(
+                "The project builds for thumbv7em-none-eabi - soft-float, the FPU unused - because ",
+                "openthread-sys ships OpenThread compiled for it and for no hard-float target: no C ",
+                "compiler, CMake or libclang needed. Not with Bluetooth: one radio."
+            )));
+        }
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(THREAD_USAGE).monospace().size(11.0));
             if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {

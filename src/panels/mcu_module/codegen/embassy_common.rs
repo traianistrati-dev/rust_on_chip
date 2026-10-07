@@ -2061,14 +2061,21 @@ mod emit_for_manual_compile {
         // `espnow` = ESP-NOW with the station off (`hold_radio`), `all` =
         // station + MQTT + SNTP + ESP-NOW, `ble` = Bluetooth alone (the H2's
         // only link), `ble+espnow` = Bluetooth beside ESP-NOW with the station
-        // off (`coex` with no IP stack), `ble+all` = everything at once.
+        // off (`coex` with no IP stack), `ble+all` = everything at once,
+        // `thread` = Thread alone on the 802.15.4 radio (C6, H2, C5:
+        // openthread 0.2, prebuilt OpenThread and Mbed TLS).
         let iot_mode = std::env::var("EIDE_ESP_IOT").ok();
         if let Some(mode) = iot_mode.as_deref() {
-            use crate::panels::mcu_module::iot::{BleConfig, EspNowConfig, MqttConfig, SntpConfig};
+            use crate::panels::mcu_module::iot::{
+                BleConfig, EspNowConfig, MqttConfig, SntpConfig, ThreadConfig,
+            };
             let all = matches!(mode, "all" | "ble+all");
             mcu.iot.wifi = matches!(mode, "wifi" | "mqtt") || all;
             if matches!(mode, "ble" | "ble+espnow" | "ble+all") {
                 mcu.iot.ble = Some(BleConfig::default());
+            }
+            if mode == "thread" {
+                mcu.iot.thread = Some(ThreadConfig::default());
             }
             if matches!(mode, "mqtt") || all {
                 let mut m = MqttConfig::for_chip(&chip);
@@ -2093,8 +2100,13 @@ mod emit_for_manual_compile {
             let ble = matches!(mode, "ble" | "ble+espnow" | "ble+all");
             assert_eq!(
                 main_rs.contains("esp_radio::wifi::new(peripherals.WIFI"),
-                mode != "ble",
+                !matches!(mode, "ble" | "thread"),
                 "the Wi-Fi radio exactly when a Wi-Fi link is on:\n{main_rs}"
+            );
+            assert_eq!(
+                main_rs.contains("pins::configs::thread::start(spawner, peripherals.IEEE802154);"),
+                mode == "thread",
+                "Thread exactly when it is on:\n{main_rs}"
             );
             assert_eq!(
                 main_rs.contains("BleConnector::new(peripherals.BT"),
@@ -2118,6 +2130,12 @@ mod emit_for_manual_compile {
                 used.push_str("        if pins::configs::ble::connected() {\n");
                 used.push_str("            pins::configs::ble::send(&packet.data).await.ok();\n");
                 used.push_str("        }\n");
+            }
+            if mode == "thread" {
+                used.push_str("        pins::configs::thread::wait_attached().await;\n");
+                used.push_str("        let _ = (pins::configs::thread::role(), pins::configs::thread::addresses());\n");
+                used.push_str("        let d = pins::configs::thread::receive().await;\n");
+                used.push_str("        pins::configs::thread::send_to(*d.from.ip(), d.from.port(), &d.data).await.ok();\n");
             }
             if matches!(mode, "espnow" | "ble+espnow") || all {
                 used.push_str("        let me = pins::configs::espnow::own_mac();\n");
@@ -2227,6 +2245,19 @@ mod emit_for_manual_compile {
             &files.cargo_config,
             iot_active.is_some(),
         );
+        if iot_mode.as_deref() == Some("thread") {
+            for want in [
+                "openthread = { version = \"0.2\", features = [\"esp-radio\"] }",
+                "mbedtls-rs-sys = \"0.1\"",
+                "\"ieee802154\"",
+                "tinyrlibc = ",
+            ] {
+                assert!(files.cargo_toml.contains(want), "{want}:\n{}", files.cargo_toml);
+            }
+            for absent in ["executor-interrupt", "\"wifi\"", "\"ble\""] {
+                assert!(!files.cargo_toml.contains(absent), "{absent}:\n{}", files.cargo_toml);
+            }
+        }
         // The legacy single address, never edited into a list - what every
         // project from before device lists holds. It is device 1 all the same,
         // and gets `device1.rs`. Set straight on the config: any edit through
@@ -2236,7 +2267,19 @@ mod emit_for_manual_compile {
                 c.address = 0x3C;
             }
         }
-        let user: Vec<(String, String)> = mcu.pin_tree_files();
+        let mut user: Vec<(String, String)> = mcu.pin_tree_files();
+        // Thread with a real dataset: an empty one makes `commissioned()` a
+        // constant false, and LTO would drop the whole attach / IPv6 / UDP
+        // path - the code a user with a dataset builds - from the link.
+        if iot_mode.as_deref() == Some("thread") {
+            use crate::panels::mcu_module::codegen::iot_gen;
+            const DATASET: &str = "000300001901020fd80208b566147d38e384200e080000639c5d67a3bd0510c490f58d4be0d5eaeb0f09b395d1ae17030d4e4553542d50414e2d304644380708fd7d4f8232cb00000410a7e08419ae47c177fb91bcfcec789aa50c0402a0f77835060004001fffe0";
+            let secrets = user
+                .iter_mut()
+                .find(|(p, _)| p == iot_gen::SECRETS_PATH)
+                .expect("secrets.rs with Thread");
+            secrets.1 = iot_gen::write_secret(&secrets.1, iot_gen::THREAD_DATASET, DATASET);
+        }
         let dir = std::env::temp_dir().join(format!("eide_esp_check_{chip}"));
         project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")

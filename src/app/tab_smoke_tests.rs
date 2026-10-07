@@ -70,9 +70,10 @@ fn every_tab_draws_on_a_pico_board() {
     draw_every_tab("rp2350_pico2_ice");
 }
 
-/// The IoT tab with Thread on an nRF52840: the port, the dataset row with a
-/// good dataset, a broken one and a Wi-Fi-era secrets.rs without the line -
-/// and with Bluetooth switched on beside it, both blocked chips.
+/// The IoT tab with Thread on an nRF52840 and the ESP32-C6 / H2 / C5: the
+/// port, the dataset row with a good dataset, a broken one and a Wi-Fi-era
+/// secrets.rs without the line - and with Bluetooth or Wi-Fi switched on
+/// beside it, the blocked chips.
 #[test]
 fn the_iot_tab_draws_thread_on_an_nrf() {
     use crate::panels::mcu_module::codegen::iot_gen;
@@ -80,11 +81,16 @@ fn the_iot_tab_draws_thread_on_an_nrf() {
     use crate::panels::mcu_module::mcu::model::Runtime;
     const GOOD: &str = "000300001901020fd80208b566147d38e384200e080000639c5d67a3bd0510c490f58d4be0d5eaeb0f09b395d1ae17030d4e4553542d50414e2d304644380708fd7d4f8232cb00000410a7e08419ae47c177fb91bcfcec789aa50c0402a0f77835060004001fffe0";
     let fresh = iot_gen::secrets_body_for(false, true);
-    for (secrets, ble) in [
-        (iot_gen::write_secret(&fresh, iot_gen::THREAD_DATASET, GOOD), false),
-        (iot_gen::write_secret(&fresh, iot_gen::THREAD_DATASET, "0e08zz"), false),
-        (iot_gen::secrets_body(), false),
-        (fresh.clone(), true),
+    for (chip, secrets, ble, wifi) in [
+        ("nrf52840_dk", iot_gen::write_secret(&fresh, iot_gen::THREAD_DATASET, GOOD), false, false),
+        ("nrf52840_dk", iot_gen::write_secret(&fresh, iot_gen::THREAD_DATASET, "0e08zz"), false, false),
+        ("nrf52840_dk", iot_gen::secrets_body(), false, false),
+        ("nrf52840_dk", fresh.clone(), true, false),
+        ("esp32c6", iot_gen::write_secret(&fresh, iot_gen::THREAD_DATASET, GOOD), false, false),
+        ("esp32c6", fresh.clone(), false, true),
+        ("esp32h2", fresh.clone(), false, true),
+        ("esp32h2", fresh.clone(), true, false),
+        ("esp32c5", fresh.clone(), false, false),
     ] {
         let ctx = egui::Context::default();
         let mut app = AppIde::new(
@@ -93,12 +99,14 @@ fn the_iot_tab_draws_thread_on_an_nrf() {
             None,
         );
         app.startup_picker = None;
-        app.selected_mcu_id = "nrf52840_dk".to_owned();
-        app.mcu = AppIde::build_mcu_for(&app.mcu_registry, "nrf52840_dk");
+        app.selected_mcu_id = chip.to_owned();
+        app.mcu = AppIde::build_mcu_for(&app.mcu_registry, chip);
         let mcu = app.mcu.as_mut().expect("built-in chip");
         mcu.runtime = Runtime::Async;
         mcu.iot.thread = Some(ThreadConfig::default());
         mcu.iot.ble = ble.then(BleConfig::default);
+        // A Wi-Fi switch beside Thread: it wins on the C6, means nothing on the H2.
+        mcu.iot.wifi = wifi;
         app.project_tree
             .user_src_files
             .push((iot_gen::SECRETS_PATH.to_owned(), secrets));

@@ -178,11 +178,6 @@ pub fn start(spawner: Spawner, radio: Ieee802154<'static>, rng: &'static mut Rng
         && ot.enable_thread(true).is_ok();
     if up {
         spawner.spawn(thread_task(ot).unwrap());
-    } else {
-        // Never dropped: `new_with_udp` counts no reference for this handle,
-        // only for `ot_task`'s clone, so dropping it would finalize the
-        // OpenThread instance under the task still running it.
-        core::mem::forget(ot);
     }
 }
 

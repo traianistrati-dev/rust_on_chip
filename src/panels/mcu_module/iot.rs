@@ -21,13 +21,17 @@
 //! - cyw43 0.7 and esp-radio 0.18 speak `bt-hci` 0.8; nrf-sdc 0.4 speaks 0.10.
 //!   One trouble-host version cannot serve both, which is why BLE is a phase
 //!   of its own.
-//! - openthread 0.4 builds against embassy-nrf 0.11 (and on an ESP needs
-//!   esp-radio 1.0 beta; 0.2 is the release on esp-radio 0.18). Its
-//!   openthread-sys ships OpenThread compiled for `thumbv7em-none-eabi` with
-//!   the default (`matter`) features, and for no hard-float target: a Thread
-//!   project on the nRF52840 / nRF52833 builds for that soft-float target and
-//!   needs no C compiler, CMake or libclang. On the IDE's usual `-eabihf` it
-//!   would compile OpenThread's C and C++ on every clean build.
+//! - openthread 0.4 builds against embassy-nrf 0.11. Its openthread-sys ships
+//!   OpenThread compiled for `thumbv7em-none-eabi` with the default (`matter`)
+//!   features, and for no hard-float target: a Thread project on the nRF52840
+//!   / nRF52833 builds for that soft-float target and needs no C compiler,
+//!   CMake or libclang. On the IDE's usual `-eabihf` it would compile
+//!   OpenThread's C and C++ on every clean build.
+//! - On an ESP, openthread 0.3+ needs esp-radio 1.0 beta; 0.2 is the release
+//!   on esp-radio 0.18. Its openthread-sys links OpenThread prebuilt for
+//!   riscv32imac (the C6, H2, C5) - and mbedtls-rs-sys links Mbed TLS
+//!   prebuilt only with its default `tls` profile, which is why a Thread
+//!   project on an ESP names mbedtls-rs-sys itself.
 
 use serde::{Deserialize, Serialize};
 
@@ -57,8 +61,9 @@ pub struct IotConfig {
     /// switched on. A link of its own, beside Wi-Fi or without it.
     pub ble: Option<BleConfig>,
     /// Thread (an OpenThread end device with UDP), `Some` while it is switched
-    /// on. nRF52840 / nRF52833 only, and never beside Bluetooth: both need the
-    /// one radio. The network's dataset is a secret, in `secrets.rs`.
+    /// on. nRF52840 / nRF52833 and ESP32-C6 / H2 / C5, and never beside
+    /// another link on the same radio - Bluetooth, and on an ESP Wi-Fi and
+    /// ESP-NOW too. The network's dataset is a secret, in `secrets.rs`.
     pub thread: Option<ThreadConfig>,
 }
 
@@ -510,9 +515,16 @@ pub fn ble_platform(family: &str, cyw43: bool) -> Option<Platform> {
 /// embassy-nrf 0.11), see [`availability`].
 const NRF_THREAD: [&str; 2] = ["nrf52833", "nrf52840"];
 
+/// The ESP parts whose Thread the generator writes: openthread 0.2 - the
+/// release on esp-radio 0.18, the IDE's - on esp-radio's `ieee802154`, linked
+/// on all three with OpenThread and Mbed TLS prebuilt for riscv32imac. The
+/// C5 is not in openthread's own list (it names the C6 and H2), and has no
+/// TRNG: its RNG is random only while a radio runs.
+const ESP_THREAD: [&str; 3] = ["esp32c6", "esp32h2", "esp32c5"];
+
 /// Does the IDE generate Thread for this chip?
 pub fn thread_platform(family: &str) -> bool {
-    NRF_THREAD.contains(&family)
+    NRF_THREAD.contains(&family) || ESP_THREAD.contains(&family)
 }
 
 /// The nrf-sdc / embassy-nrf chip feature for an nRF family (`"nrf52840"`).
@@ -566,7 +578,8 @@ pub struct Active {
     pub sntp: bool,
     /// Bluetooth LE.
     pub ble: bool,
-    /// Thread, with OpenThread's UDP - only ever on an nRF, never with `ble`.
+    /// Thread, with OpenThread's UDP - on an nRF or an ESP with 802.15.4,
+    /// never beside another link on the radio (see [`thread_blocked`]).
     pub thread: bool,
 }
 
@@ -588,7 +601,7 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     let ble = mcu.iot.ble.is_some() && bt.is_some() && !nrf_ble_blocked_by_usb(mcu);
     let thread = mcu.iot.thread.is_some()
         && thread_platform(&mcu.family)
-        && !nrf_thread_blocked_by_ble(mcu);
+        && !thread_blocked(mcu);
     if !station && !esp_now && !ble && !thread {
         return None;
     }
@@ -603,14 +616,24 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     })
 }
 
-/// Thread beside Bluetooth on an nRF: both drive the one RADIO (the MPSL
-/// binds its vector; embassy-nrf's 802.15.4 driver takes the peripheral), and
-/// sharing it needs Nordic's multiprotocol 802.15.4 driver, which openthread
-/// does not use. Bluetooth's switch wins - even while USB keeps Bluetooth from
+/// Thread beside another link on the one 2.4 GHz radio - never generated:
+///
+/// - Bluetooth, on an nRF: both drive the RADIO (the MPSL binds its vector;
+///   embassy-nrf's 802.15.4 driver takes the peripheral), and sharing it needs
+///   Nordic's multiprotocol 802.15.4 driver, which openthread does not use.
+/// - Bluetooth, Wi-Fi or ESP-NOW, on an ESP: esp-radio 0.18 has no
+///   coexistence for 802.15.4 ("things will break"), and its build script
+///   refuses `ieee802154` beside `wifi`.
+///
+/// The other link's switch wins - Bluetooth's even while USB keeps it from
 /// being generated, so unwiring USB never silently swaps the radio's owner.
-/// `false` on a chip without Thread, where there is nothing to block.
-pub fn nrf_thread_blocked_by_ble(mcu: &crate::panels::mcu_module::mcu::Mcu) -> bool {
-    thread_platform(&mcu.family) && mcu.iot.ble.is_some()
+/// A Wi-Fi switch a project carried over from a chip with Wi-Fi blocks
+/// nothing on one without (the H2). `false` on a chip without Thread.
+pub fn thread_blocked(mcu: &crate::panels::mcu_module::mcu::Mcu) -> bool {
+    let family = mcu.family.as_str();
+    let wifi = (mcu.iot.wifi && platform(family, has_cyw43(mcu)).is_some())
+        || (mcu.iot.esp_now.is_some() && ESP_WIFI.contains(&family));
+    thread_platform(family) && (mcu.iot.ble.is_some() || wifi)
 }
 
 /// Bluetooth beside USB on an nRF: both bind the CLOCK_POWER vector (the MPSL
@@ -785,9 +808,6 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         ),
         Link::Thread if family == "nrf54l15" => NotHere(
             "embassy-nrf 0.11 has no 802.15.4 driver for the nRF54L, and OpenThread ships no prebuilt for its target",
-        ),
-        Link::Thread if matches!(family, "esp32c5" | "esp32c6" | "esp32h2") => Planned(
-            "not generated for the ESP yet: openthread 0.2 is the release on this IDE's esp-radio 0.18 (0.3+ moved to esp-radio 1.0 beta)",
         ),
         Link::Thread if family == "nrf5340" => NotHere(
             "the 802.15.4 radio is on the network core, which this IDE does not generate",
@@ -968,7 +988,7 @@ mod tests {
     fn every_mesh_link_has_a_reason() {
         for link in [Link::BleMesh, Link::Zigbee, Link::EspWifiMesh, Link::Thread] {
             for family in ["esp32c6", "nrf52840", "rp2040"] {
-                if link == Link::Thread && family == "nrf52840" {
+                if link == Link::Thread && family != "rp2040" {
                     assert_eq!(availability(link, family, false), Availability::Ready);
                     continue;
                 }
@@ -1055,12 +1075,12 @@ mod tests {
         let a = active(&dk).expect("Thread alone");
         assert!(a.thread && !a.ble && !a.station, "{a:?}");
         assert_eq!(a.platform, Platform::Nrf);
-        assert!(!nrf_thread_blocked_by_ble(&dk));
+        assert!(!thread_blocked(&dk));
 
         dk.iot.ble = Some(BleConfig::default());
         let a = active(&dk).expect("Bluetooth");
         assert!(a.ble && !a.thread, "Bluetooth wins: {a:?}");
-        assert!(nrf_thread_blocked_by_ble(&dk));
+        assert!(thread_blocked(&dk));
 
         dk.iot.ble = None;
         dk.runtime = crate::panels::mcu_module::mcu::model::Runtime::Blocking;
@@ -1068,7 +1088,50 @@ mod tests {
 
         assert!(active(&build("nrf52833_microbit_v2")).is_some_and(|a| a.thread));
         assert_eq!(active(&build("nrf52832_dk")), None, "no Thread on a 52832");
-        assert!(!nrf_thread_blocked_by_ble(&build("nrf52832_dk")));
+        assert!(!thread_blocked(&build("nrf52832_dk")));
+    }
+
+    /// Thread on an ESP: the C6, H2 and C5, alone on the radio - Bluetooth,
+    /// Wi-Fi or ESP-NOW switched on keeps it off, and a Wi-Fi switch carried
+    /// over to the H2 (no Wi-Fi) blocks nothing.
+    #[test]
+    fn thread_on_an_esp_takes_the_radio_alone() {
+        use crate::panels::mcu_module::builtins::builtin_definitions;
+        let build = |id: &str| {
+            let def = builtin_definitions().into_iter().find(|d| d.id == id).unwrap();
+            let mut m = def.build_mcu();
+            m.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
+            m.iot.thread = Some(ThreadConfig::default());
+            m
+        };
+        for id in ["esp32c6", "esp32h2", "esp32c5"] {
+            let m = build(id);
+            let a = active(&m).unwrap_or_else(|| panic!("{id}: Thread alone"));
+            assert!(a.thread && !a.station && !a.ble && !a.esp_now, "{id}: {a:?}");
+            assert_eq!(a.platform, Platform::Esp, "{id}");
+            assert_eq!(availability(Link::Thread, &m.family, false), Availability::Ready);
+        }
+        let mut c6 = build("esp32c6");
+        c6.iot.wifi = true;
+        let a = active(&c6).unwrap();
+        assert!(a.station && !a.thread, "Wi-Fi wins: {a:?}");
+        c6.iot.wifi = false;
+        c6.iot.esp_now = Some(EspNowConfig::default());
+        assert!(active(&c6).is_some_and(|a| a.esp_now && !a.thread));
+        c6.iot.esp_now = None;
+        c6.iot.ble = Some(BleConfig::default());
+        assert!(active(&c6).is_some_and(|a| a.ble && !a.thread));
+
+        let mut h2 = build("esp32h2");
+        h2.iot.wifi = true;
+        assert!(!thread_blocked(&h2), "the H2 has no Wi-Fi to block with");
+        assert!(active(&h2).is_some_and(|a| a.thread && !a.station));
+        h2.iot.ble = Some(BleConfig::default());
+        assert!(active(&h2).is_some_and(|a| a.ble && !a.thread));
+        // No 802.15.4 on the C3: nothing to generate, nothing blocked.
+        let c3 = build("esp32c3");
+        assert_eq!(active(&c3), None);
+        assert!(!thread_blocked(&c3));
     }
 
     /// A project saved before Thread existed reads with Thread off.

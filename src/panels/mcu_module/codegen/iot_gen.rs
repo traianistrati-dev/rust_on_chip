@@ -59,6 +59,7 @@ const ESPNOW_TAIL: &str = include_str!("iot_templates/espnow.rs");
 const BLE_TAIL: &str = include_str!("iot_templates/ble.rs");
 const BLE_NRF_TAIL: &str = include_str!("iot_templates/ble_nrf.rs");
 const THREAD_NRF_TAIL: &str = include_str!("iot_templates/thread_nrf.rs");
+const THREAD_ESP_TAIL: &str = include_str!("iot_templates/thread_esp.rs");
 
 /// Editable halves an earlier version of the IDE wrote and this one no longer
 /// does, by file. A file still holding one exactly was never touched by its
@@ -70,16 +71,21 @@ const THREAD_NRF_TAIL: &str = include_str!("iot_templates/thread_nrf.rs");
 ///   ESP-NOW needs the same `esp_radio::wifi::new` call's other interface.
 /// - `wifi_cyw43_v1`: phase 1's Pico W `wifi.rs`, the same code with two
 ///   `loop { match .. }` that clippy reads as `while let` (`while_let_loop`).
-const LEGACY_TAILS: [(&str, &str); 2] = [
+/// - `thread_nrf_v1`: phase 4's nRF `thread.rs`, which dropped its OpenThread
+///   handle when the dataset was empty - the default - and so finalized the
+///   instance under the task running it.
+const LEGACY_TAILS: [(&str, &str); 3] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
+    (THREAD, include_str!("iot_templates/legacy/thread_nrf_v1.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 11] = [
+const TAILS: [(&str, &str); 13] = [
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
     (THREAD, THREAD_NRF_TAIL),
+    (THREAD, THREAD_ESP_TAIL),
     (WIFI, WIFI_ESP_TAIL),
     (WIFI, WIFI_CYW43_TAIL),
     (NET, NET_TAIL),
@@ -88,6 +94,7 @@ const TAILS: [(&str, &str); 11] = [
     (ESPNOW, ESPNOW_TAIL),
     LEGACY_TAILS[0],
     LEGACY_TAILS[1],
+    LEGACY_TAILS[2],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -181,7 +188,7 @@ pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
         out.push((BLE.to_owned(), ble_file(b, active.platform)));
     }
     if let (true, Some(t)) = (active.thread, &cfg.thread) {
-        out.push((THREAD.to_owned(), thread_file(t)));
+        out.push((THREAD.to_owned(), thread_file(t, active.platform)));
     }
     out
 }
@@ -355,7 +362,9 @@ fn ble_file(b: &BleConfig, platform: Platform) -> String {
 }
 
 /// `thread.rs`: the UDP port. Which network is the dataset in `secrets.rs`.
-fn thread_file(t: &ThreadConfig) -> String {
+/// The editable half per radio: openthread 0.4 on an nRF, 0.2 on an ESP -
+/// the same API for the user's code.
+fn thread_file(t: &ThreadConfig, platform: Platform) -> String {
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
@@ -364,7 +373,10 @@ fn thread_file(t: &ThreadConfig) -> String {
     o.push_str(&format!("pub const UDP_PORT: u16 = {};\n", t.udp_port));
     o.push_str(GEN_END_CFG);
     o.push('\n');
-    o.push_str(&lf(THREAD_NRF_TAIL));
+    o.push_str(&lf(match platform {
+        Platform::Esp => THREAD_ESP_TAIL,
+        _ => THREAD_NRF_TAIL,
+    }));
     o
 }
 
@@ -605,6 +617,7 @@ pub fn phase_one_wifi_left(content: &str) -> bool {
 pub fn foreign_radio_file(name: &str, content: &str, platform: Platform) -> bool {
     match name {
         BLE => content.contains("nrf_sdc::") != (platform == Platform::Nrf),
+        THREAD => content.contains("openthread::nrf::") != (platform == Platform::Nrf),
         WIFI => match platform {
             Platform::Esp => content.contains("cyw43::"),
             Platform::Cyw43 => content.contains("esp_radio::"),
@@ -715,10 +728,16 @@ fn esp_main_with(code: String, heap_kib: u32, active: Active, family: &str) -> S
         "async fn main(spawner: Spawner)",
         1,
     );
-    // 3. The bring-up, last in the block: it only needs `peripherals.BT` and
-    //    `peripherals.WIFI`. One `esp_radio::wifi::new`: it hands out the
-    //    station AND ESP-NOW, and a second call would fail.
+    // 3. The bring-up, last in the block: it only needs `peripherals.BT`,
+    //    `peripherals.WIFI` and `peripherals.IEEE802154`. One
+    //    `esp_radio::wifi::new`: it hands out the station AND ESP-NOW, and a
+    //    second call would fail. Thread is never beside them (`iot::active`).
     block.push_str("    // ── IoT (IoT tab) ──\n");
+    if active.thread {
+        block.push_str("    // Thread: OpenThread on the 802.15.4 radio, joining the network in\n");
+        block.push_str("    // secrets.rs (THREAD_DATASET).\n");
+        block.push_str("    pins::configs::thread::start(spawner, peripherals.IEEE802154);\n");
+    }
     if active.ble {
         block.push_str("    // Bluetooth LE: the chip's own controller, on its public address.\n");
         block.push_str(
@@ -1311,8 +1330,82 @@ mod tests {
         assert!(thread.contains("&& ot.is_commissioned()"), "{thread}");
         // A datagram longer than MAX_DATA is read whole and dropped, not cut.
         assert!(thread.contains("let mut buf = [0u8; UDP_RX];"), "{thread}");
+        // With no dataset the handle is kept, not dropped under `ot_task`.
+        assert!(thread.contains("core::mem::forget(ot);"), "{thread}");
         assert!(is_pristine(THREAD, thread) && is_pristine(SECRETS, secrets));
         assert!(runtime_free(THREAD));
+    }
+
+    /// Thread on an ESP: `thread::start` with the 802.15.4 peripheral, last in
+    /// the block, after the heap its receive queue needs - and nothing of the
+    /// nRF's (no InterruptExecutor, whose name alone would bring
+    /// `executor-interrupt` back) nor of Wi-Fi or Bluetooth.
+    #[test]
+    fn the_esp_brings_up_thread() {
+        for id in ["esp32c6", "esp32h2", "esp32c5"] {
+            let m = thread_mcu(id);
+            // The nRF's soft-float switch is the nRF's: an ESP keeps riscv32imac.
+            assert!(!crate::panels::mcu_module::codegen::nrf::thread_on(&m), "{id}");
+            let code = m.fresh_main_rs();
+            for want in [
+                "pins::configs::thread::start(spawner, peripherals.IEEE802154);",
+                "esp_alloc::heap_allocator!(size: 72 * 1024);",
+                "async fn main(spawner: Spawner)",
+            ] {
+                assert!(code.contains(want), "{id}: {want}:\n{code}");
+            }
+            for absent in ["esp_radio::wifi::new(", "BleConnector", "EGU0_SWI0", "InterruptExecutor"] {
+                assert!(!code.contains(absent), "{id}: {absent}:\n{code}");
+            }
+            let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
+            assert!(at("esp_alloc::heap_allocator!") < at("pins::configs::thread::start("));
+
+            let files = config_files_for(&m);
+            let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, [SECRETS, THREAD], "{id}");
+            let thread = &files[1].1;
+            for want in [
+                "use openthread::esp::{EspRadio, Ieee802154};",
+                "pub fn start(spawner: Spawner, radio: esp_hal::peripherals::IEEE802154<'static>)",
+                "commissioned(THREAD_DATASET)",
+                "core::mem::forget(ot);",
+                "pub const UDP_PORT: u16 = 1212;",
+            ] {
+                assert!(thread.contains(want), "{id}: {want}:\n{thread}");
+            }
+            for absent in ["InterruptExecutor", "openthread::nrf::", "EGU0_SWI0"] {
+                assert!(!thread.contains(absent), "{id}: {absent}");
+            }
+            assert!(is_pristine(THREAD, thread));
+            assert!(!foreign_radio_file(THREAD, thread, Platform::Esp));
+            assert!(foreign_radio_file(THREAD, thread, Platform::Nrf));
+        }
+        // The radio is created before the RNG is read: it powers the RF.
+        let t = lf(THREAD_ESP_TAIL);
+        assert!(t.find("Ieee802154::new(radio)").unwrap() < t.find("rng.read(").unwrap());
+    }
+
+    /// A project retargeted between an nRF and an ESP: an untouched thread.rs
+    /// becomes the other radio's, both ways; phase 4's nRF template (the one
+    /// that dropped its handle) becomes the current one; an edited file stays.
+    #[test]
+    fn thread_rs_follows_the_radio_and_the_fix() {
+        let t = ThreadConfig::default();
+        let nrf = thread_file(&t, Platform::Nrf);
+        let esp = thread_file(&t, Platform::Esp);
+        assert_eq!(upgraded(THREAD, &nrf, &esp).as_deref(), Some(esp.as_str()));
+        assert_eq!(upgraded(THREAD, &esp, &nrf).as_deref(), Some(nrf.as_str()));
+        let v1 = format!(
+            "{GEN_BEGIN_CFG}\npub const UDP_PORT: u16 = 1212;\n{GEN_END_CFG}\n{}",
+            include_str!("iot_templates/legacy/thread_nrf_v1.rs")
+        );
+        assert!(!v1.contains("core::mem::forget(ot)"), "v1 is the one without the fix");
+        let up = upgraded(THREAD, &v1, &nrf).expect("phase 4's template is moved");
+        assert!(up.contains("core::mem::forget(ot);"), "{up}");
+        assert!(is_pristine(THREAD, &v1), "an untouched v1 may go with the switch");
+        let edited = format!("{esp}\n// mine\n");
+        assert_eq!(upgraded(THREAD, &edited, &nrf), None);
+        assert!(foreign_radio_file(THREAD, &edited, Platform::Nrf));
     }
 
     /// A crystal the Clock tab already chose is not "overridden"; the 52833

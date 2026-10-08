@@ -69,8 +69,49 @@ const BLE_NRF_TAIL: &str = include_str!("iot_templates/ble_nrf.rs");
 const THREAD_NRF_TAIL: &str = include_str!("iot_templates/thread_nrf.rs");
 const THREAD_ESP_TAIL: &str = include_str!("iot_templates/thread_esp.rs");
 const LINK_PLAIN_TAIL: &str = include_str!("iot_templates/mqtt_link_plain.rs");
-const LINK_TLS_ESP_TAIL: &str = include_str!("iot_templates/mqtt_link_tls_esp.rs");
-const LINK_TLS_CYW43_TAIL: &str = include_str!("iot_templates/mqtt_link_tls_cyw43.rs");
+/// A TLS link: the radio's half, then the certificate checks - which the
+/// IoT tab's "Test from this PC" compiles too (`tls_check`), so the PC checks
+/// a broker exactly as the board will.
+const LINK_TLS_ESP_TAIL: &str = concat!(
+    include_str!("iot_templates/mqtt_link_tls_esp.rs"),
+    include_str!("iot_templates/tls_verify.rs")
+);
+const LINK_TLS_CYW43_TAIL: &str = concat!(
+    include_str!("iot_templates/mqtt_link_tls_cyw43.rs"),
+    include_str!("iot_templates/tls_verify.rs")
+);
+/// The certificate checks alone, for the PC's check.
+pub const TLS_VERIFY: &str = include_str!("iot_templates/tls_verify.rs");
+
+/// The IoT tab's "Test from this PC": a small host program the IDE builds
+/// once and runs, with the same embedded-tls (`std` for the PC, `p384` so it
+/// can say whether the board needs it) and the same certificate checks
+/// (`tls_verify.rs`) the firmware compiles.
+pub fn tls_check_files() -> Vec<(&'static str, String)> {
+    const CARGO_TOML: &str = "\
+[package]
+name = \"rustonchip-tls-check\"
+version = \"0.1.0\"
+edition = \"2024\"
+publish = false
+
+# Its own workspace: never a member of whatever folder holds it.
+[workspace]
+
+[dependencies]
+embedded-tls = { version = \"0.19\", default-features = false, features = [\"std\", \"rsa\", \"p384\"] }
+embedded-io-adapters = { version = \"0.7\", features = [\"std\"] }
+rand_core = { version = \"0.6\", features = [\"getrandom\"] }
+
+[profile.release]
+opt-level = 2
+";
+    vec![
+        ("Cargo.toml", CARGO_TOML.to_owned()),
+        ("src/main.rs", lf(include_str!("iot_templates/tls_check_main.rs"))),
+        ("src/tls_verify.rs", lf(TLS_VERIFY)),
+    ]
+}
 /// The CA `mqtt_ca.rs` starts with: ISRG Root X1, Let's Encrypt's root (SHA-256
 /// 96:BC:EC:06:...:BD:DF:08:C6, valid to 2035-06-04).
 const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
@@ -90,15 +131,19 @@ const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 /// - `mqtt_v1`: phases 1-4's `mqtt.rs`, which talked to its socket itself;
 ///   `mqtt.rs` now goes through `mqtt_link.rs` (plain or TLS) and caps the
 ///   packets the broker may send at its buffer.
-const LEGACY_TAILS: [(&str, &str); 4] = [
+/// - `mqtt_link_tls_*_v1`: the first TLS links, the same code with the
+///   certificate checks inline - now a block shared with "Test from this PC".
+const LEGACY_TAILS: [(&str, &str); 6] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
     (THREAD, include_str!("iot_templates/legacy/thread_nrf_v1.rs")),
     (MQTT, include_str!("iot_templates/legacy/mqtt_v1.rs")),
+    (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_esp_v1.rs")),
+    (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v1.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 17] = [
+const TAILS: [(&str, &str); 19] = [
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
     (THREAD, THREAD_NRF_TAIL),
@@ -116,6 +161,8 @@ const TAILS: [(&str, &str); 17] = [
     LEGACY_TAILS[1],
     LEGACY_TAILS[2],
     LEGACY_TAILS[3],
+    LEGACY_TAILS[4],
+    LEGACY_TAILS[5],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";

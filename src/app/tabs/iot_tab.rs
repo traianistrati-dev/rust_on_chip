@@ -120,6 +120,17 @@ impl AppIde {
                     coex,
                     s2: family == "esp32s2",
                     ca: file(iot_gen::MQTT_CA).map(|c| iot_gen::ca_pem_of(c).map(iot::ca_summary)),
+                    // What "Test from this PC" sends: mqtt_ca.rs's CA (the one
+                    // it will be written with, until it is), and the login.
+                    ca_der: iot_gen::ca_pem_of(
+                        file(iot_gen::MQTT_CA).map_or(iot_gen::mqtt_ca_file(), str::to_owned).as_str(),
+                    )
+                    .and_then(iot::pem_der),
+                    // No secrets.rs yet = it will be written with an empty login.
+                    user: file(iot_gen::SECRETS)
+                        .map_or(Some(String::new()), |s| iot_gen::read_secret(s, "MQTT_USERNAME")),
+                    password: file(iot_gen::SECRETS)
+                        .map_or(Some(String::new()), |s| iot_gen::read_secret(s, "MQTT_PASSWORD")),
                     left: platform.and_then(|p| {
                         iot_gen::mqtt_files_left(file(iot_gen::MQTT), file(iot_gen::MQTT_LINK), want, p)
                     }),
@@ -849,6 +860,12 @@ struct TlsFacts {
     ca: Option<Option<Result<iot::CaSummary, &'static str>>>,
     /// An edited MQTT file that no longer fits the TLS switch.
     left: Option<&'static str>,
+    /// The CA as DER, for "Test from this PC".
+    ca_der: Option<Vec<u8>>,
+    /// The broker login from secrets.rs, for the same: `None` when the line
+    /// is not a plain string the tab can read.
+    user: Option<String>,
+    password: Option<String>,
 }
 
 /// What runs over the stack: MQTT today, the rest listed.
@@ -888,14 +905,12 @@ fn application_card(ui: &mut egui::Ui, cfg: &mut IotConfig, chip_id: &str, tls: 
             sntp_body(ui, s);
         }
         ui.add_space(6.0);
-        for (name, why) in [("HTTP client", "on request: reqwless runs on the same TcpSocket")] {
-            ui.horizontal(|ui| {
-                ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
-                ui.label(egui::RichText::new(name).strong());
-                ui.label(egui::RichText::new("planned").size(10.0).color(egui::Color32::from_rgb(120, 170, 230)));
-                ui.label(dim(why));
-            });
-        }
+        ui.horizontal(|ui| {
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
+            ui.label(egui::RichText::new("HTTP client").strong());
+            ui.label(egui::RichText::new("planned").size(10.0).color(egui::Color32::from_rgb(120, 170, 230)));
+            ui.label(dim("on request: reqwless runs on the same TcpSocket"));
+        });
     });
 }
 
@@ -1051,7 +1066,94 @@ fn tls_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts) {
         if let Some(left) = tls.left {
             ui.label(warn(left));
         }
+        test_from_pc(ui, m, tls);
     });
+}
+
+/// "Test from this PC": the board's own certificate checks, built into a small
+/// program and run here against the broker - then the CONNECT (`tls_check`).
+fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
+    use crate::panels::mcu_module::tls_check::{self, Request, Shared, State};
+    let id = egui::Id::new("iot_tls_check");
+    let shared: Option<Shared> = ui.data_mut(|d| d.get_temp::<Shared>(id));
+    let state = shared
+        .as_ref()
+        .and_then(|s| s.lock().ok().map(|s| s.clone()))
+        .unwrap_or_default();
+    let busy = matches!(state, State::Building | State::Connecting);
+    let request = tls.ca_der.clone().map(|ca| Request {
+        host: m.host.trim().to_owned(),
+        port: m.port,
+        server_name: m.tls_name().to_owned(),
+        verify: m.verify,
+        ca,
+        client_id: m.client_id.clone(),
+        user: tls.user.clone().unwrap_or_default(),
+        password: tls.password.clone().unwrap_or_default(),
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let can = !busy && request.is_some() && iot::host_problem(&m.host).is_none();
+        if ui
+            .add_enabled(can, egui::Button::new(format!("{} Test from this PC", ph::PLUGS_CONNECTED)))
+            .on_hover_text(
+                "Connect to the broker from this PC with the board's own certificate checks, then send the MQTT CONNECT",
+            )
+            .clicked()
+            && let Some(request) = request.clone()
+        {
+            let started = tls_check::start(request, ui.ctx().clone());
+            ui.data_mut(|d| d.insert_temp(id, started));
+        }
+        match &state {
+            State::Building => {
+                ui.spinner();
+                ui.label(dim("Building the checker - about a minute the first time, seconds after."));
+            }
+            State::Connecting => {
+                ui.spinner();
+                ui.label(dim("Connecting to the broker ..."));
+            }
+            _ => {}
+        }
+    });
+    if request.is_none() {
+        ui.label(dim("mqtt_ca.rs holds no certificate the checker can use."));
+    }
+    let State::Done { ok, summary, steps, p384, tested } = &state else {
+        return;
+    };
+    if m.verify && (tls.user.is_none() || tls.password.is_none()) {
+        ui.label(dim(
+            "MQTT_USERNAME or MQTT_PASSWORD in secrets.rs is not a plain string: the test sends it empty.",
+        ));
+    }
+    let now = request.as_ref().map(|r| r.tested().fingerprint);
+    if now != Some(tested.fingerprint) {
+        ui.label(dim(format!("For {} - the settings have changed since.", tested.key)));
+    }
+    for step in steps {
+        ui.label(dim(format!("{}  {step}", ph::CHECK)));
+    }
+    if *ok {
+        ui.label(
+            egui::RichText::new(format!("{}  {summary}", ph::CHECK_CIRCLE))
+                .size(11.0)
+                .color(egui::Color32::from_rgb(120, 200, 140)),
+        );
+    } else {
+        ui.label(warn(summary.as_str()));
+    }
+    if *p384 && !m.p384 {
+        ui.label(warn(
+            "the broker's chain is signed with P-384: this PC checks it, the board only with \"P-384 chains\" on",
+        ));
+    }
+    if *ok && tested.verify && !tls.sntp {
+        ui.label(dim(
+            "The dates were checked by this PC's clock; the board checks them only with SNTP on.",
+        ));
+    }
 }
 
 const SNTP_USAGE: &str = "let unix_s = pins::configs::sntp::now_unix(); // None until the first answer";

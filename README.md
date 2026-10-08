@@ -472,7 +472,12 @@ every certificate after the broker's must be a CA, an encrypted record too
 short to hold anything is refused (another panic), and a TLS record is handed
 over only whole — so the MQTT loop can cancel a read — and never waited for on
 a socket that can receive no more. "Encrypt only, no check" is offered, with
-the warning it deserves; it is never the default. Not reached: brokers that
+the warning it deserves; it is never the default. **Test from this PC** runs
+those same checks — the very text of the firmware's `mqtt_link.rs`, built into
+a small program with your own cargo (about a minute the first time, seconds
+after; nothing of it in the IDE's dependencies) — against the broker, then the
+MQTT 5 CONNECT with the login from `secrets.rs`, and says what failed: the
+CA, the name, the dates, P-384, TLS 1.2, the password. Not reached: brokers that
 speak only TLS 1.2 (broker.hivemq.com) or want a client certificate (AWS IoT);
 revocation is not checked. The ESP heap grows by 32 KiB for the RSA checks
 (on the S2 all of it moves to the RAM the bootloader used); a Pico gets a

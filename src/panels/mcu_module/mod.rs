@@ -32,6 +32,7 @@ pub mod registry;
 pub mod ron_text;
 pub mod stm32_flash_geometry;
 pub mod stm32_pin_data;
+pub mod tls_check;
 pub mod structure_config;
 pub mod uart_baud;
 pub mod watchdog;

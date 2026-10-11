@@ -12,8 +12,9 @@
 //!   ([`next_word_boundary`] / [`prev_word_boundary`]), where identifiers,
 //!   punctuation and spaces are separate classes — so a jump stops AT the `:`;
 //! - Alt+Left / Alt+Right (+Shift to select) → the same, except that inside
-//!   an identifier it stops at every `_` ([`next_subword_boundary`] /
-//!   [`prev_subword_boundary`]): `THRESHOLD_HOLD_MAX_VAL` one part a press.
+//!   an identifier it stops at every `_` and every case change
+//!   ([`next_subword_boundary`] / [`prev_subword_boundary`]):
+//!   `THRESHOLD_HOLD_MAX_VAL` and `Ssd1306Async` one part a press.
 
 use crate::app::AppIde;
 use crate::editor::gui::text_pos::{GalleyRows, LineIndex};
@@ -187,11 +188,40 @@ pub(super) fn prev_word_boundary(chars: &[char], i: usize) -> usize {
     j
 }
 
+/// An identifier char that belongs to a part: anything but the `_` that
+/// separates parts.
+fn is_part_char(c: char) -> bool {
+    is_ident(c) && c != '_'
+}
+
+/// Whether a new part starts AT `k` inside a run of part chars — a case
+/// change, the way Rust's own names are built:
+///
+/// - lower → Upper: `value|Bool`, `get|HTTP`;
+/// - the last capital of a capital run, or a capital after digits, when a
+///   lowercase letter follows it: `HTTP|Server`, `Ssd1306|Async`, `u32|Value`.
+///
+/// So a name in capitals never splits (`THRESHOLD`, `USART1`, `I2C`), and
+/// neither does `u32` or `Value32`: digits join the part they follow.
+fn part_starts_at(chars: &[char], k: usize) -> bool {
+    let (Some(&prev), Some(&c)) = (k.checked_sub(1).and_then(|p| chars.get(p)), chars.get(k))
+    else {
+        return false;
+    };
+    if !is_part_char(prev) || !c.is_uppercase() {
+        return false;
+    }
+    let next_lower = chars.get(k + 1).is_some_and(|n| n.is_lowercase());
+    prev.is_lowercase() || ((prev.is_uppercase() || prev.is_numeric()) && next_lower)
+}
+
 /// Caret target one identifier PART to the right of `i` (Alt+Right): inside an
-/// identifier the jump stops before every `_`, so `|THRESHOLD_HOLD_MIN_VAL`
-/// goes `THRESHOLD|`, `THRESHOLD_HOLD|`, … one part per press. The `_` (or a
-/// run of them) is crossed on the way to the next part. Anywhere else —
-/// spaces, punctuation, a line end — it is exactly [`next_word_boundary`].
+/// identifier the jump stops before every `_` and at every case change (see
+/// [`part_starts_at`]), so `|THRESHOLD_HOLD_MIN_VAL` goes `THRESHOLD|`,
+/// `THRESHOLD_HOLD|`, … and `|ValueBool` goes `Value|`, `ValueBool|`. The
+/// `_` (or a run of them) is crossed on the way to the next part. Anywhere
+/// else — spaces, punctuation, a line end — it is exactly
+/// [`next_word_boundary`].
 pub(super) fn next_subword_boundary(chars: &[char], i: usize) -> usize {
     let n = chars.len();
     let mut k = i.min(n);
@@ -204,15 +234,19 @@ pub(super) fn next_subword_boundary(chars: &[char], i: usize) -> usize {
     while k < n && chars[k] == '_' {
         k += 1;
     }
-    while k < n && is_ident(chars[k]) && chars[k] != '_' {
+    if k < n && is_part_char(chars[k]) {
         k += 1;
+        while k < n && is_part_char(chars[k]) && !part_starts_at(chars, k) {
+            k += 1;
+        }
     }
     k
 }
 
 /// Caret target one identifier PART to the left of `i` (Alt+Left) — the
-/// mirror of [`next_subword_boundary`]: it stops just after every `_`, at the
-/// start of a part, so `…_MIN_VAL|` goes `…_MIN_|VAL`, then `…_|MIN_VAL`.
+/// mirror of [`next_subword_boundary`]: it stops at the start of a part, just
+/// after a `_` or at a case change, so `…_MIN_VAL|` goes `…_MIN_|VAL`, then
+/// `…_|MIN_VAL`, and `ValueBool|` goes `Value|Bool`.
 pub(super) fn prev_subword_boundary(chars: &[char], i: usize) -> usize {
     let mut k = i.min(chars.len());
     while k > 0 && class_of(chars[k - 1]) == Class::Space {
@@ -224,8 +258,11 @@ pub(super) fn prev_subword_boundary(chars: &[char], i: usize) -> usize {
     while k > 0 && chars[k - 1] == '_' {
         k -= 1;
     }
-    while k > 0 && is_ident(chars[k - 1]) && chars[k - 1] != '_' {
+    while k > 0 && is_part_char(chars[k - 1]) {
         k -= 1;
+        if part_starts_at(chars, k) {
+            break;
+        }
     }
     k
 }
@@ -473,6 +510,59 @@ mod tests {
         let nl = src.find('\n').unwrap();
         assert_eq!(walk_parts(src, nl, 1, true), "\n", "a line end stops it");
         assert_eq!(walk_parts(src, nl + 1, 1, false), "\n");
+    }
+
+    /// Case changes split parts too, both ways — Rust's type names are
+    /// UpperCamel, so `ValueBool` is two parts and `Ssd1306Async` two.
+    #[test]
+    fn a_part_jump_stops_at_case_changes() {
+        for (name, parts) in [
+            ("ValueBool", &["Value", "Bool"][..]),
+            ("valueBool", &["value", "Bool"]),
+            ("HTTPServer", &["HTTP", "Server"]),
+            ("getHTTPResponse", &["get", "HTTP", "Response"]),
+            ("Ssd1306Async", &["Ssd1306", "Async"]),
+            ("u32Value", &["u32", "Value"]),
+            ("I2cInterface", &["I2c", "Interface"]),
+        ] {
+            let src = format!("{name}(");
+            let mut ends = Vec::new();
+            let mut at = 0;
+            for _ in parts {
+                at = next_subword_boundary(&src.chars().collect::<Vec<_>>(), at);
+                ends.push(at);
+            }
+            let mut start = 0;
+            let got: Vec<&str> = ends
+                .iter()
+                .map(|&e| {
+                    let p = &src[start..e];
+                    start = e;
+                    p
+                })
+                .collect();
+            assert_eq!(got, parts, "right through {name}");
+            let back: Vec<&str> = (1..=parts.len())
+                .map(|n| walk_parts(&src, name.len(), n, false))
+                .collect();
+            let want: Vec<String> = (1..=parts.len())
+                .map(|n| parts[parts.len() - n..].concat())
+                .collect();
+            assert_eq!(back, want, "left through {name}");
+        }
+    }
+
+    /// Names in capitals, and digits after any part, never split.
+    #[test]
+    fn capitals_and_digits_stay_whole() {
+        for name in ["THRESHOLD", "USART1", "I2C", "u32", "Value32", "ID", "x"] {
+            let src = format!("{name} ");
+            assert_eq!(walk_parts(&src, 0, 1, true), name);
+            assert_eq!(walk_parts(&src, name.len(), 1, false), name);
+        }
+        let src = "I2C1_EV";
+        assert_eq!(walk_parts(src, 0, 1, true), "I2C1");
+        assert_eq!(walk_parts(src, 0, 2, true), "I2C1_EV");
     }
 
     #[test]

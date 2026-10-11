@@ -747,6 +747,7 @@ the chip's data.
 | `Ctrl+U` | Toggle UPPER / lower case of the selection, or of the identifier under the caret (every cursor) |
 | `Ctrl+Shift+X` | Cut the whole line(s) — plain `Ctrl+X` still cuts the selection |
 | `Ctrl+←` / `Ctrl+→` | Word movement (add `Shift` to select) |
+| `Alt+←` / `Alt+→` | Move by identifier part, stopping at every `_` — `THRESHOLD` of `THRESHOLD_HOLD_MAX_VAL` (add `Shift` to select) |
 | `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | Add / remove a cursor (multi-cursor) |
 | `Ctrl+[` / `Ctrl+]` | Select the innermost `{ … }` block around the caret and copy it |
 | `Ctrl+Shift+Q` | Fold / unfold the whole file |

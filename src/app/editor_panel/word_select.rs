@@ -10,7 +10,10 @@
 //! - double-click → the `[A-Za-z0-9_]*` run around the clicked position;
 //! - Ctrl+Left / Ctrl+Right (+Shift to select) → class-based word movement
 //!   ([`next_word_boundary`] / [`prev_word_boundary`]), where identifiers,
-//!   punctuation and spaces are separate classes — so a jump stops AT the `:`.
+//!   punctuation and spaces are separate classes — so a jump stops AT the `:`;
+//! - Alt+Left / Alt+Right (+Shift to select) → the same, except that inside
+//!   an identifier it stops at every `_` ([`next_subword_boundary`] /
+//!   [`prev_subword_boundary`]): `THRESHOLD_HOLD_MAX_VAL` one part a press.
 
 use crate::app::AppIde;
 use crate::editor::gui::text_pos::{GalleyRows, LineIndex};
@@ -18,6 +21,16 @@ use eframe::egui;
 
 fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// One word-wise caret move, taken from the keyboard before the editor saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WordMove {
+    pub(super) right: bool,
+    /// Shift held: the selection grows or shrinks from its anchor.
+    pub(super) extend: bool,
+    /// Alt rather than Ctrl: one identifier part (`_`-separated), not a word.
+    pub(super) part: bool,
 }
 
 /// The rects [`AppIde::highlight_selected_word`] fills for the selection
@@ -174,6 +187,49 @@ pub(super) fn prev_word_boundary(chars: &[char], i: usize) -> usize {
     j
 }
 
+/// Caret target one identifier PART to the right of `i` (Alt+Right): inside an
+/// identifier the jump stops before every `_`, so `|THRESHOLD_HOLD_MIN_VAL`
+/// goes `THRESHOLD|`, `THRESHOLD_HOLD|`, … one part per press. The `_` (or a
+/// run of them) is crossed on the way to the next part. Anywhere else —
+/// spaces, punctuation, a line end — it is exactly [`next_word_boundary`].
+pub(super) fn next_subword_boundary(chars: &[char], i: usize) -> usize {
+    let n = chars.len();
+    let mut k = i.min(n);
+    while k < n && class_of(chars[k]) == Class::Space {
+        k += 1;
+    }
+    if k >= n || class_of(chars[k]) != Class::Ident {
+        return next_word_boundary(chars, i);
+    }
+    while k < n && chars[k] == '_' {
+        k += 1;
+    }
+    while k < n && is_ident(chars[k]) && chars[k] != '_' {
+        k += 1;
+    }
+    k
+}
+
+/// Caret target one identifier PART to the left of `i` (Alt+Left) — the
+/// mirror of [`next_subword_boundary`]: it stops just after every `_`, at the
+/// start of a part, so `…_MIN_VAL|` goes `…_MIN_|VAL`, then `…_|MIN_VAL`.
+pub(super) fn prev_subword_boundary(chars: &[char], i: usize) -> usize {
+    let mut k = i.min(chars.len());
+    while k > 0 && class_of(chars[k - 1]) == Class::Space {
+        k -= 1;
+    }
+    if k == 0 || class_of(chars[k - 1]) != Class::Ident {
+        return prev_word_boundary(chars, i);
+    }
+    while k > 0 && chars[k - 1] == '_' {
+        k -= 1;
+    }
+    while k > 0 && is_ident(chars[k - 1]) && chars[k - 1] != '_' {
+        k -= 1;
+    }
+    k
+}
+
 /// The identifier run `[start, end)` around char index `idx`: the char at the
 /// index, or — clicking just past a word's last char — the one before it.
 /// `None` when neither side is an identifier char (punctuation / whitespace) —
@@ -228,9 +284,11 @@ impl AppIde {
         st.store(ui.ctx(), editor_resp.response.id);
     }
 
-    /// Apply a Ctrl(+Shift)+Left/Right word move that was consumed before the
-    /// editor (so egui's UAX#29 jump never ran). `extend` keeps the anchor —
-    /// that's the Shift variant, which grows/shrinks the selection.
+    /// Apply a word move that was consumed before the editor (so egui's UAX#29
+    /// jump never ran): Ctrl(+Shift)+Left/Right by whole words, or
+    /// Alt(+Shift)+Left/Right by identifier parts when `part` is set. `extend`
+    /// keeps the anchor — that's the Shift variant, which grows/shrinks the
+    /// selection.
     ///
     /// Like the double-click fix, the new cursor is stored for NEXT frame: the
     /// widget already rendered with the old one. The key press repaints anyway,
@@ -240,19 +298,20 @@ impl AppIde {
         ui: &egui::Ui,
         editor_resp: &egui::text_edit::TextEditOutput,
         display_code: &str,
-        right: bool,
-        extend: bool,
+        mv: WordMove,
     ) {
         let Some(range) = editor_resp.state.cursor.char_range() else {
             return; // editor not focused / no caret yet
         };
         let chars: Vec<char> = display_code.chars().collect();
         let cur = range.primary.index.0.min(chars.len());
-        let target = if right {
-            next_word_boundary(&chars, cur)
-        } else {
-            prev_word_boundary(&chars, cur)
+        let target = match (mv.right, mv.part) {
+            (true, false) => next_word_boundary(&chars, cur),
+            (false, false) => prev_word_boundary(&chars, cur),
+            (true, true) => next_subword_boundary(&chars, cur),
+            (false, true) => prev_subword_boundary(&chars, cur),
         };
+        let extend = mv.extend;
         let primary = egui::text::CCursor::new(target);
         // `CCursorRange::two(min, max)` assigns by position, but here the moved
         // end must stay `primary` (Shift+arrow grows FROM the anchor either
@@ -279,7 +338,10 @@ impl AppIde {
 
 #[cfg(test)]
 mod tests {
-    use super::{ident_run_at, next_word_boundary, prev_word_boundary};
+    use super::{
+        ident_run_at, next_subword_boundary, next_word_boundary, prev_subword_boundary,
+        prev_word_boundary,
+    };
     use eframe::egui;
 
     fn run(text: &str, idx: usize) -> Option<(usize, usize)> {
@@ -351,6 +413,75 @@ mod tests {
         // Backwards from the start of line 2 lands at the line end, not inside
         // line 1's last word.
         assert_eq!(walk(src, nl + 1, 1, false), "\n");
+    }
+
+    /// [`walk`], by identifier parts (Alt+Shift+Right/Left).
+    fn walk_parts(text: &str, from: usize, steps: usize, right: bool) -> &str {
+        let chars: Vec<char> = text.chars().collect();
+        let mut at = from;
+        for _ in 0..steps {
+            at = if right {
+                next_subword_boundary(&chars, at)
+            } else {
+                prev_subword_boundary(&chars, at)
+            };
+        }
+        let (a, b) = if right { (from, at) } else { (at, from) };
+        &text[a..b]
+    }
+
+    /// The reported case: from the start of the name, each press takes one
+    /// more `_`-separated part — `THRESHOLD` first, without its `_` — and
+    /// back from the end the same parts come off one at a time.
+    #[test]
+    fn a_part_jump_stops_at_every_underscore() {
+        let src = "THRESHOLD_HOLD_MAX_VAL:f32 = 90;";
+        assert_eq!(walk_parts(src, 0, 1, true), "THRESHOLD");
+        assert_eq!(walk_parts(src, 0, 2, true), "THRESHOLD_HOLD");
+        assert_eq!(walk_parts(src, 0, 3, true), "THRESHOLD_HOLD_MAX");
+        assert_eq!(walk_parts(src, 0, 4, true), "THRESHOLD_HOLD_MAX_VAL");
+        assert_eq!(
+            walk_parts(src, 0, 5, true),
+            "THRESHOLD_HOLD_MAX_VAL:",
+            "then as Ctrl"
+        );
+        let end = src.find(':').unwrap();
+        assert_eq!(walk_parts(src, end, 1, false), "VAL");
+        assert_eq!(walk_parts(src, end, 2, false), "MAX_VAL");
+        assert_eq!(walk_parts(src, end, 3, false), "HOLD_MAX_VAL");
+        assert_eq!(walk_parts(src, end, 4, false), "THRESHOLD_HOLD_MAX_VAL");
+    }
+
+    /// Outside an identifier, and on one without `_`, a part jump is a word
+    /// jump; leading and doubled underscores are crossed with the next part.
+    #[test]
+    fn a_part_jump_elsewhere_is_a_word_jump() {
+        let src = "pub const Node: u32_value = _unused + a__b;\nx";
+        assert_eq!(walk_parts(src, 0, 1, true), "pub");
+        assert_eq!(walk_parts(src, 0, 2, true), "pub const");
+        assert_eq!(walk_parts(src, 0, 3, true), "pub const Node");
+        let u = src.find("u32").unwrap();
+        assert_eq!(walk_parts(src, u, 1, true), "u32");
+        assert_eq!(walk_parts(src, u, 2, true), "u32_value");
+        let lead = src.find("_unused").unwrap();
+        assert_eq!(walk_parts(src, lead, 1, true), "_unused");
+        let ab = src.find("a__b").unwrap();
+        assert_eq!(walk_parts(src, ab, 1, true), "a");
+        assert_eq!(walk_parts(src, ab, 2, true), "a__b");
+        assert_eq!(walk_parts(src, ab + 4, 1, false), "b");
+        assert_eq!(walk_parts(src, ab + 4, 2, false), "a__b");
+        let nl = src.find('\n').unwrap();
+        assert_eq!(walk_parts(src, nl, 1, true), "\n", "a line end stops it");
+        assert_eq!(walk_parts(src, nl + 1, 1, false), "\n");
+    }
+
+    #[test]
+    fn a_part_jump_clamps_at_the_buffer_edges() {
+        let chars: Vec<char> = "a_b".chars().collect();
+        assert_eq!(next_subword_boundary(&chars, 3), 3);
+        assert_eq!(next_subword_boundary(&chars, 9), 3);
+        assert_eq!(prev_subword_boundary(&chars, 0), 0);
+        assert_eq!(prev_subword_boundary(&[], 0), 0);
     }
 
     #[test]

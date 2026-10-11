@@ -863,28 +863,43 @@ impl AppIde {
         let mut cycle_next_pressed = nav_kbd_active
             && !cycle_prev_pressed
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab));
-        // Ctrl+Left / Ctrl+Right (+Shift = select) → word movement.
+        // Ctrl+Left / Ctrl+Right (+Shift = select) → word movement;
+        // Alt+Left / Alt+Right (+Shift) → one identifier PART, stopping at
+        // every `_` (`THRESHOLD|_HOLD_MAX_VAL`).
         // Consumed BEFORE the editor so egui's own word jump never
         // runs: it segments with UAX#29, where `:` is a MidLetter, so
         // `name:Type` is ONE word and the jump swallowed both sides
-        // (see `word_select`). The Shift variants are checked first —
+        // (see `word_select`) — and egui takes Alt+arrow for that same
+        // jump (Option on a Mac). The Shift variants are checked first —
         // `consume_key` is Shift-lenient (see the multi-cursor note).
-        let word_move: Option<(bool, bool)> = if !editor_kbd_active {
+        // The Definition tab's Alt+arrow Back / Forward applies only
+        // while IT holds the keyboard, which this editor then does not.
+        let word_move: Option<word_select::WordMove> = if !editor_kbd_active {
             None
         } else {
             ui.input_mut(|i| {
-                let cs = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
-                if i.consume_key(cs, egui::Key::ArrowRight) {
-                    Some((true, true))
-                } else if i.consume_key(cs, egui::Key::ArrowLeft) {
-                    Some((false, true))
-                } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight) {
-                    Some((true, false))
-                } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft) {
-                    Some((false, false))
-                } else {
-                    None
-                }
+                use egui::Modifiers as M;
+                [
+                    (M::CTRL | M::SHIFT, true, false),
+                    (M::CTRL, false, false),
+                    (M::ALT | M::SHIFT, true, true),
+                    (M::ALT, false, true),
+                ]
+                .into_iter()
+                .find_map(|(mods, extend, part)| {
+                    let right = if i.consume_key(mods, egui::Key::ArrowRight) {
+                        true
+                    } else if i.consume_key(mods, egui::Key::ArrowLeft) {
+                        false
+                    } else {
+                        return None;
+                    };
+                    Some(word_select::WordMove {
+                        right,
+                        extend,
+                        part,
+                    })
+                })
             })
         };
         // Ctrl+Up / Ctrl+Down → move the selected lines up / down.
@@ -1645,10 +1660,11 @@ impl AppIde {
             // glues `name:Type` into one "word" via the `:` MidLetter rule)
             // with the plain identifier run under the pointer.
             self.fix_double_click_selection(ui, &editor_resp, &display_code);
-            // Ctrl(+Shift)+Left/Right: our own word jump, for the same
-            // reason — the keys were consumed before the editor rendered.
-            if let Some((right, extend)) = word_move {
-                self.apply_word_move(ui, &editor_resp, &display_code, right, extend);
+            // Ctrl / Alt (+Shift) + Left/Right: our own word and word-part
+            // jumps, for the same reason — the keys were consumed before
+            // the editor rendered.
+            if let Some(mv) = word_move {
+                self.apply_word_move(ui, &editor_resp, &display_code, mv);
             }
             self.highlight_selected_word(
                 &editor_resp,

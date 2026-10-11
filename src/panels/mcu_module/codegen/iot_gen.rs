@@ -49,6 +49,7 @@ pub const THREAD: &str = "thread.rs";
 pub const MQTT_LINK: &str = "mqtt_link.rs";
 pub const MQTT_CA: &str = "mqtt_ca.rs";
 pub const SECRETS: &str = "secrets.rs";
+pub const PANIC: &str = "panic.rs";
 
 /// The credentials file's path in the project tree.
 pub const SECRETS_PATH: &str = "src/pins/configs/secrets.rs";
@@ -69,6 +70,9 @@ const BLE_NRF_TAIL: &str = include_str!("iot_templates/ble_nrf.rs");
 const THREAD_NRF_TAIL: &str = include_str!("iot_templates/thread_nrf.rs");
 const THREAD_ESP_TAIL: &str = include_str!("iot_templates/thread_esp.rs");
 const LINK_PLAIN_TAIL: &str = include_str!("iot_templates/mqtt_link_plain.rs");
+/// "Restart on panic": one editable half for every platform - the record,
+/// the wait, the report - over a generated block with the chip's pieces.
+const PANIC_TAIL: &str = include_str!("iot_templates/panic.rs");
 /// A TLS link: the radio's half, then the certificate checks - which the
 /// IoT tab's "Test from this PC" compiles too (`tls_check`), so the PC checks
 /// a broker exactly as the board will.
@@ -143,7 +147,8 @@ const LEGACY_TAILS: [(&str, &str); 6] = [
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 19] = [
+const TAILS: [(&str, &str); 20] = [
+    (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
     (THREAD, THREAD_NRF_TAIL),
@@ -183,7 +188,7 @@ fn lf(s: &str) -> String {
 pub fn runtime_free(name: &str) -> bool {
     matches!(
         name,
-        NET | WIFI | MQTT | MQTT_LINK | MQTT_CA | SNTP | ESPNOW | BLE | THREAD | SECRETS
+        NET | WIFI | MQTT | MQTT_LINK | MQTT_CA | SNTP | ESPNOW | BLE | THREAD | SECRETS | PANIC
     )
 }
 
@@ -231,7 +236,12 @@ pub fn config_files_for(mcu: &Mcu) -> Vec<(String, String)> {
     let Some(active) = iot::active(mcu) else {
         return Vec::new();
     };
-    config_files(&mcu.iot, active)
+    let mut files = config_files(&mcu.iot, active);
+    // Last, so the other files keep their places in the list.
+    if active.panic {
+        files.push((PANIC.to_owned(), panic_file(mcu, active)));
+    }
+    files
 }
 
 /// The files for `cfg` on `active` - see [`config_files_for`]. The station
@@ -825,7 +835,7 @@ fn tail_of(content: &str) -> Option<String> {
 /// with a password in it. A pristine one goes like any pruned config file.
 pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
-    for name in [NET, WIFI, MQTT, MQTT_LINK, MQTT_CA, SNTP, ESPNOW, BLE, THREAD, SECRETS] {
+    for name in [NET, WIFI, MQTT, MQTT_LINK, MQTT_CA, SNTP, ESPNOW, BLE, THREAD, SECRETS, PANIC] {
         if files.iter().any(|(n, _)| n == name) {
             continue;
         }
@@ -838,6 +848,452 @@ pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<
         }
     }
     out
+}
+
+// ── Restart on panic ─────────────────────────────────────────────────────────
+
+/// Does a USART module use the ESP's UART0? Then it is the user's line, and
+/// "Restart on panic" prints nothing on it (esp-println's fallback port).
+fn esp_uart0_taken(mcu: &Mcu) -> bool {
+    use crate::panels::mcu_module::PinFunction;
+    mcu.iter_all_pins()
+        .filter(|p| !p.reserved)
+        .any(|p| matches!(p.selected_function, PinFunction::UsartRx(0) | PinFunction::UsartTx(0)))
+}
+
+/// The `publish` panic.rs's MQTT report calls, as mqtt.rs's template has it:
+/// the tab warns when an edited mqtt.rs no longer does.
+pub const MQTT_PUBLISH_SIGNATURE: &str =
+    "pub async fn publish(topic: &str, payload: &[u8]) -> Result<(), PublishError>";
+
+/// Is the chip's USB Serial/JTAG the user's (its pads wired, not as OTG)?
+/// esp-println would write there too once a host is attached.
+fn esp_usb_jtag_taken(mcu: &Mcu) -> bool {
+    use crate::panels::mcu_module::PinFunction;
+    use crate::panels::mcu_module::codegen_esp::{has_usb_otg, has_usb_serial_jtag};
+    let pads = mcu
+        .iter_all_pins()
+        .filter(|p| !p.reserved)
+        .any(|p| matches!(p.selected_function, PinFunction::UsbDm | PinFunction::UsbDp));
+    let otg = super::family::esp_usb_configs(mcu)
+        .get(&1)
+        .is_some_and(|c| c.role.is_otg())
+        && has_usb_otg(&mcu.family);
+    pads && !otg && has_usb_serial_jtag(&mcu.family)
+}
+
+/// Where the panic report goes on `mcu`, for the tab's note: the serial
+/// port, MQTT, or nowhere but `last()`.
+pub fn panic_sinks(mcu: &Mcu, active: Active) -> (bool, Option<String>) {
+    let serial =
+        active.platform == Platform::Esp && !esp_uart0_taken(mcu) && !esp_usb_jtag_taken(mcu);
+    let mqtt = active
+        .mqtt
+        .then(|| mcu.iot.mqtt.as_ref().map(iot::panic_topic))
+        .flatten();
+    (serial, mqtt)
+}
+
+/// `panic.rs`: the chip's pieces of "Restart on panic" - where the record
+/// lives, how the chip waits and restarts, where the report goes - above
+/// the tail every platform shares.
+fn panic_file(mcu: &Mcu, active: Active) -> String {
+    let (serial, topic) = panic_sinks(mcu, active);
+    let mut o = String::new();
+    o.push_str(GEN_BEGIN_CFG);
+    o.push('\n');
+    o.push_str("// Restart on panic (from the IoT tab) — auto-updated; switch it off in the tab.\n");
+    match active.platform {
+        Platform::Esp => o.push_str(&esp_panic_pieces(&mcu.family)),
+        Platform::Cyw43 => o.push_str(RP_PANIC_PIECES),
+        Platform::Nrf => o.push_str(NRF_PANIC_PIECES),
+    }
+    if serial {
+        o.push_str("/// At the panic: the serial port (esp-println).\n");
+        o.push_str("fn announce(text: &str, wait_ms: u32) {\n");
+        o.push_str("    esp_println::println!(\"panic: {text} - restarting in {wait_ms} ms\");\n");
+        o.push_str("}\n");
+    } else {
+        o.push_str("/// At the panic: nothing to print on.\n");
+        o.push_str("fn announce(_text: &str, _wait_ms: u32) {}\n");
+    }
+    let spawner = if topic.is_some() { "spawner" } else { "_spawner" };
+    let report = if serial || topic.is_some() { "report" } else { "_report" };
+    o.push_str(match (serial, topic.is_some()) {
+        (true, true) => "/// At the next boot: the serial port, and MQTT once it connects.\n",
+        (true, false) => "/// At the next boot: the serial port.\n",
+        (false, true) => "/// At the next boot: MQTT, once it connects.\n",
+        (false, false) => "/// At the next boot: nowhere by itself - `last()` has it for your code.\n",
+    });
+    o.push_str(&format!(
+        "fn report_at_boot({spawner}: embassy_executor::Spawner, {report}: Report) {{\n"
+    ));
+    if serial {
+        o.push_str("    esp_println::println!(\"{report}\");\n");
+    }
+    if topic.is_some() {
+        o.push_str("    if let Ok(task) = report_task(report) {\n");
+        o.push_str("        spawner.spawn(task);\n");
+        o.push_str("    }\n");
+    }
+    o.push_str("}\n");
+    if let Some(topic) = &topic {
+        o.push_str("/// The report's MQTT topic. QoS 0 and not retained: a client subscribed\n");
+        o.push_str("/// when the next connection is up sees it.\n");
+        o.push_str(&format!("pub const REPORT_TOPIC: &str = {};\n", lit(topic)));
+        o.push_str("#[embassy_executor::task]\n");
+        o.push_str("async fn report_task(report: Report) {\n");
+        o.push_str("    let mut text: heapless::String<256> = heapless::String::new();\n");
+        o.push_str("    let _ = write!(text, \"{report}\");\n");
+        o.push_str("    let _ = super::mqtt::publish(REPORT_TOPIC, text.as_bytes()).await;\n");
+        o.push_str("}\n");
+    }
+    o.push_str(GEN_END_CFG);
+    o.push('\n');
+    o.push_str(&lf(PANIC_TAIL));
+    o
+}
+
+/// The ESP's record, wait and restart. The record goes in RTC memory, which
+/// a software reset keeps and esp-hal clears at power-on: RTC SLOW on the
+/// dual-core parts (RTC FAST is the first core's alone), RTC FAST on the
+/// RISC-V ones. The C2 and C61 have neither: RAM no start-up code clears,
+/// with room after it for a stack that overflows into it.
+fn esp_panic_pieces(family: &str) -> String {
+    let mut o = String::new();
+    let rtc = match family {
+        "esp32" | "esp32s2" | "esp32s3" => Some("rtc_slow"),
+        "esp32c3" | "esp32c5" | "esp32c6" | "esp32h2" => Some("rtc_fast"),
+        _ => None,
+    };
+    if let Some(region) = rtc {
+        o.push_str(&format!(
+            "/// The record: RTC {} memory, which a software reset keeps and a\n/// power-on clears.\n",
+            if region == "rtc_slow" { "SLOW" } else { "FAST" }
+        ));
+        o.push_str(&format!("#[esp_hal::ram(unstable({region}, persistent))]\n"));
+        o.push_str("static mut RECORD: [u32; RECORD_WORDS] = [0; RECORD_WORDS];\n");
+        o.push_str("fn record() -> *mut [u32; RECORD_WORDS] {\n");
+        o.push_str("    &raw mut RECORD\n");
+        o.push_str("}\n");
+    } else {
+        o.push_str("/// The record: RAM no start-up code clears (this chip has no RTC memory).\n");
+        o.push_str("#[unsafe(link_section = \".noinit.rustonchip_panic\")]\n");
+        o.push_str("static mut RECORD: core::mem::MaybeUninit<[u32; RECORD_WORDS]> = core::mem::MaybeUninit::uninit();\n");
+        o.push_str("/// Linked after the record, before the stack: an overflowing stack's panic\n");
+        o.push_str("/// runs here rather than over the record.\n");
+        o.push_str("#[unsafe(link_section = \".uninit.rustonchip_panic\")]\n");
+        o.push_str("static mut ROOM: core::mem::MaybeUninit<[u8; 1536]> = core::mem::MaybeUninit::uninit();\n");
+        o.push_str("fn record() -> *mut [u32; RECORD_WORDS] {\n");
+        o.push_str("    core::hint::black_box(&raw const ROOM);\n");
+        o.push_str("    (&raw mut RECORD).cast()\n");
+        o.push_str("}\n");
+    }
+    o.push_str(ESP_PANIC_PIECES);
+    o
+}
+
+const ESP_PANIC_PIECES: &str = "\
+/// Interrupts off on this core, for good: nothing else runs while it waits.
+fn interrupts_off() {
+    // SAFETY: never released - the chip restarts.
+    let _ = unsafe { critical_section::acquire() };
+}
+fn uptime_ms() -> u64 {
+    esp_hal::time::Instant::now().duration_since_epoch().as_millis()
+}
+fn wait_ms(ms: u32) {
+    // Before esp_hal::init its timer may not run yet: then no wait at all.
+    // (`black_box`: an empty loop is optimised away, and the two readings
+    // would fall in the same microsecond.)
+    let t0 = esp_hal::time::Instant::now();
+    for i in 0..10_000u32 {
+        core::hint::black_box(i);
+    }
+    if esp_hal::time::Instant::now() != t0 {
+        esp_hal::delay::Delay::new().delay_millis(ms);
+    }
+}
+fn reset() -> ! {
+    esp_hal::system::software_reset()
+}
+/// Can the record be this boot's: a software reset - `reset()`'s - or a
+/// watchdog that cut the wait short? Not power, the reset button or a new
+/// firmware flashed over USB, which leave RTC memory as it was.
+fn restart_kept() -> bool {
+    matches!(
+        esp_hal::system::reset_reason().map(|r| r as u32),
+        Some(0x03 | 0x0C | 0x07 | 0x08 | 0x09 | 0x0B | 0x0D | 0x10 | 0x11 | 0x12)
+    )
+}
+";
+
+/// The Pico W's: RAM no start-up code clears (`.uninit`), the core reset.
+const RP_PANIC_PIECES: &str = "\
+/// The record: RAM no start-up code clears. A software reset keeps it; at
+/// power-on it holds noise, which the checksum turns away.
+#[unsafe(link_section = \".uninit.rustonchip_panic\")]
+static mut RECORD: core::mem::MaybeUninit<[u32; RECORD_WORDS]> = core::mem::MaybeUninit::uninit();
+fn record() -> *mut [u32; RECORD_WORDS] {
+    (&raw mut RECORD).cast()
+}
+/// Interrupts off, for good: nothing else runs while it waits.
+fn interrupts_off() {
+    cortex_m::interrupt::disable();
+}
+fn uptime_ms() -> u64 {
+    embassy_time::Instant::now().as_millis()
+}
+fn wait_ms(ms: u32) {
+    // A watchdog left running would end the wait early, and its reset clears
+    // the RAM the record is in.
+    // SAFETY: nothing else uses the watchdog any more.
+    embassy_rp::watchdog::Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() }).stop();
+    // Before embassy_rp::init the timer is held in reset: then no wait at all.
+    let t0 = embassy_time::Instant::now();
+    cortex_m::asm::delay(10_000);
+    if embassy_time::Instant::now() != t0 {
+        embassy_time::block_for(embassy_time::Duration::from_millis(u64::from(ms)));
+    }
+}
+fn reset() -> ! {
+    cortex_m::peripheral::SCB::sys_reset()
+}
+/// Can the record be this boot's? A core reset says nothing of its cause
+/// here: the record's mark (this firmware's) and checksum decide alone.
+fn restart_kept() -> bool {
+    true
+}
+";
+
+/// The nRF52's: RAM a soft reset keeps (`.uninit`), the wait counted in CPU
+/// cycles - embassy-time's clock needs an interrupt to move on.
+const NRF_PANIC_PIECES: &str = "\
+/// The record: RAM no start-up code clears. A soft reset keeps it; at
+/// power-on it holds noise, which the checksum turns away.
+#[unsafe(link_section = \".uninit.rustonchip_panic\")]
+static mut RECORD: core::mem::MaybeUninit<[u32; RECORD_WORDS]> = core::mem::MaybeUninit::uninit();
+fn record() -> *mut [u32; RECORD_WORDS] {
+    (&raw mut RECORD).cast()
+}
+/// Interrupts off, for good: nothing else runs while it waits.
+fn interrupts_off() {
+    cortex_m::interrupt::disable();
+}
+fn uptime_ms() -> u64 {
+    embassy_time::Instant::now().as_millis()
+}
+fn wait_ms(ms: u32) {
+    // In CPU cycles (64 MHz): embassy-time's clock needs an interrupt.
+    // SAFETY: only the cycle counter is touched, with interrupts off.
+    let mut core = unsafe { cortex_m::Peripherals::steal() };
+    core.DCB.enable_trace();
+    core.DWT.enable_cycle_counter();
+    for _ in 0..ms {
+        // A watchdog started before the panic keeps running through a soft
+        // reset: fed, the wait ends in the restart rather than in its reset,
+        // which may corrupt the RAM the record is in.
+        for n in 0..8 {
+            // SAFETY: a reload request; a register the watchdog does not use
+            // ignores it.
+            unsafe { embassy_nrf::wdt::WatchdogHandle::steal::<embassy_nrf::peripherals::WDT>(n) }.pet();
+        }
+        let t0 = cortex_m::peripheral::DWT::cycle_count();
+        while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0) < 64_000 {}
+    }
+}
+fn reset() -> ! {
+    cortex_m::peripheral::SCB::sys_reset()
+}
+/// Can the record be this boot's? A core reset says nothing of its cause
+/// here: the record's mark (this firmware's) and checksum decide alone.
+fn restart_kept() -> bool {
+    true
+}
+";
+
+/// The comment above the handler "Restart on panic" puts in main.rs's header.
+const PANIC_HANDLER_NOTE: &str =
+    "// Restart on panic (IoT tab): src/pins/configs/panic.rs does the work.\n";
+/// The handler itself.
+const PANIC_HANDLER_ITEM: &str = concat!(
+    "#[panic_handler]\n",
+    "fn panic(info: &core::panic::PanicInfo) -> ! {\n",
+    "    crate::pins::configs::panic::restart(info)\n",
+    "}\n",
+);
+/// The Cortex-M families' own handler: panic-halt's.
+const PANIC_HALT_LINE: &str = "use panic_halt as _;\n";
+
+/// What main.rs's header holds for a panic handler.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PanicHeader {
+    /// The family's own halting one, as the IDE writes it.
+    Halt,
+    /// "Restart on panic"'s, as the IDE writes it.
+    Restart,
+    /// Anything else: the user's own (`panic_probe`, a handler that prints),
+    /// or an edited copy. The IDE leaves it.
+    Other,
+}
+
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect()
+}
+
+/// The `#[panic_handler]` item in `head`: from its attribute's line through
+/// the newline after the closing brace.
+fn handler_item(head: &str) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut offset = 0;
+    let mut comment = 0usize;
+    for line in head.split_inclusive('\n') {
+        if comment == 0 && line.trim() == "#[panic_handler]" {
+            start = Some(offset);
+            break;
+        }
+        comment = block_comment_depth(comment, line);
+        offset += line.len();
+    }
+    let start = start?;
+    let open = start + head.get(start..)?.find('{')?;
+    let mut depth = 0usize;
+    for (i, c) in head.get(open..)?.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = open + i + 1;
+                    let end = if head.get(end..)?.starts_with('\n') { end + 1 } else { end };
+                    return Some((start, end));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `use panic_halt as _;` on a line of its own, with no attribute over it
+/// (a `#[cfg(..)]` would then govern whatever replaced it).
+fn halt_line(head: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut above = "";
+    let mut comment = 0usize;
+    for line in head.split_inclusive('\n') {
+        if comment == 0
+            && line.trim() == PANIC_HALT_LINE.trim()
+            && !above.trim_start().starts_with("#[")
+        {
+            return Some((offset, offset + line.len()));
+        }
+        comment = block_comment_depth(comment, line);
+        if !line.trim().is_empty() {
+            above = line;
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The `/* */` nesting after `line`, from `depth` before it - so a handler
+/// commented out in the header is not taken for the live one. Text after a
+/// `//` does not count.
+fn block_comment_depth(depth: usize, line: &str) -> usize {
+    let code = if depth == 0 {
+        line.find("//").map_or(line, |i| &line[..i])
+    } else {
+        line
+    };
+    let opened = depth + code.matches("/*").count();
+    opened.saturating_sub(code.matches("*/").count())
+}
+
+/// The start of the handler's note when the line above `start` is it.
+fn with_note(head: &str, start: usize) -> usize {
+    let above = head.get(..start).unwrap_or("");
+    let line_start = above.trim_end_matches('\n').rfind('\n').map_or(0, |i| i + 1);
+    match above.get(line_start..) {
+        Some(line) if line.trim() == PANIC_HANDLER_NOTE.trim() => line_start,
+        _ => start,
+    }
+}
+
+/// The part of `main_rs` above the generated block - its header.
+fn header_of(main_rs: &str) -> &str {
+    main_rs.find(super::GEN_BEGIN).map_or(main_rs, |i| &main_rs[..i])
+}
+
+/// Does `main_rs`'s header still call into panic.rs (the tab's warning once
+/// it is switched off)? The generated block's `start` line does not count.
+pub fn header_calls_panic(main_rs: &str) -> bool {
+    header_of(main_rs).contains("pins::configs::panic::")
+}
+
+/// What `main_rs`'s header holds for a panic handler (the tab's warnings).
+pub fn panic_header(main_rs: &str) -> PanicHeader {
+    let head = header_of(main_rs);
+    match handler_item(head) {
+        Some((s, e)) => {
+            let item = squash(&head[s..e]);
+            if item == squash(crate::panels::mcu_module::codegen_esp::PANIC_HALT) {
+                PanicHeader::Halt
+            } else if item == squash(PANIC_HANDLER_ITEM) {
+                PanicHeader::Restart
+            } else {
+                PanicHeader::Other
+            }
+        }
+        None if halt_line(head).is_some() => PanicHeader::Halt,
+        None => PanicHeader::Other,
+    }
+}
+
+/// `code` (a main.rs) with its header's panic handler as the IoT tab says:
+/// "Restart on panic"'s while it is in effect, the family's own halt
+/// otherwise (switched off, the runtime Blocking, every link off). The header
+/// is the user's: only a handler exactly as the IDE writes one is swapped -
+/// whitespace aside - and anything else is left, for the tab to point out.
+pub fn panic_main(code: String, mcu: &Mcu) -> String {
+    let Some(begin) = code.find(super::GEN_BEGIN) else {
+        return code;
+    };
+    let head = &code[..begin];
+    let halt = crate::panels::mcu_module::codegen_esp::PANIC_HALT;
+    let swap = if iot::active(mcu).is_some_and(|a| a.panic) {
+        match handler_item(head) {
+            Some((s, e)) if squash(&head[s..e]) == squash(halt) => Some((s, e)),
+            Some(_) => None,
+            None => halt_line(head),
+        }
+        .map(|span| (span, format!("{PANIC_HANDLER_NOTE}{PANIC_HANDLER_ITEM}")))
+    } else {
+        handler_item(head)
+            .filter(|&(s, e)| squash(&head[s..e]) == squash(PANIC_HANDLER_ITEM))
+            .map(|(s, e)| {
+                let back = if mcu.family.starts_with("esp32") { halt } else { PANIC_HALT_LINE };
+                ((with_note(head, s), e), back.to_owned())
+            })
+    };
+    match swap {
+        Some(((s, e), with)) => format!("{}{with}{}", &code[..s], &code[e..]),
+        None => code,
+    }
+}
+
+/// The line main.rs calls right after the HAL is up, while "Restart on
+/// panic" is in effect: a panic before this boot is reported now. Empty
+/// otherwise.
+pub fn panic_start_lines(mcu: &Mcu) -> String {
+    if !iot::active(mcu).is_some_and(|a| a.panic) {
+        return String::new();
+    }
+    concat!(
+        "    // Restart on panic (IoT tab): a panic that restarted the chip is reported now.\n",
+        "    pins::configs::panic::start(spawner);\n",
+    )
+    .to_owned()
 }
 
 // ── main.rs ──────────────────────────────────────────────────────────────────
@@ -855,9 +1311,32 @@ const ESP_START_MARK: &str = "\n    // ── Async runtime (esp-rtos drives the
 pub fn esp_main(code: String, mcu: &Mcu) -> String {
     match iot::active(mcu) {
         Some(active) if active.platform == Platform::Esp => {
-            esp_main_with(code, mcu.iot.heap_kib, active, &mcu.family)
+            let code = esp_main_with(code, mcu.iot.heap_kib, active, &mcu.family);
+            esp_panic_start(code, &panic_start_lines(mcu))
         }
         _ => code,
+    }
+}
+
+/// The ESP's line of the scheduler start the panic report follows: the
+/// report needs the spawner running, nothing else.
+const ESP_RTOS_START: &str = "    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);\n";
+
+/// `lines` right after the scheduler starts, inside the generated block.
+fn esp_panic_start(code: String, lines: &str) -> String {
+    use super::{GEN_BEGIN, GEN_END};
+    if lines.is_empty() {
+        return code;
+    }
+    let (Some(begin), Some(end)) = (code.find(GEN_BEGIN), code.find(GEN_END)) else {
+        return code;
+    };
+    match code[begin..end].find(ESP_RTOS_START) {
+        Some(at) => {
+            let at = begin + at + ESP_RTOS_START.len();
+            format!("{}{lines}{}", &code[..at], &code[at..])
+        }
+        None => code,
     }
 }
 
@@ -1044,19 +1523,25 @@ mod tests {
         };
         assert_eq!(
             names(&mcu("esp32c3", Runtime::Async, true)),
-            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "mqtt_link.rs"]
+            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "mqtt_link.rs", "panic.rs"]
         );
-        assert_eq!(names(&mcu("esp32c3", Runtime::Async, false)), ["net.rs", "wifi.rs", "secrets.rs"]);
+        assert_eq!(
+            names(&mcu("esp32c3", Runtime::Async, false)),
+            ["net.rs", "wifi.rs", "secrets.rs", "panic.rs"]
+        );
         let mut all = mcu("esp32c3", Runtime::Async, true);
         all.iot.sntp = Some(SntpConfig::default());
         all.iot.esp_now = Some(EspNowConfig::default());
         assert_eq!(
             names(&all),
-            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "mqtt_link.rs", "sntp.rs", "espnow.rs"]
+            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "mqtt_link.rs", "sntp.rs", "espnow.rs", "panic.rs"]
         );
         // ESP-NOW alone: no stack, no credentials - and MQTT/SNTP, still ticked,
         // have nothing to run on.
         all.iot.wifi = false;
+        assert_eq!(names(&all), ["espnow.rs", "panic.rs"]);
+        // Restart on panic switched off: its file goes.
+        all.iot.restart_on_panic = false;
         assert_eq!(names(&all), ["espnow.rs"]);
     }
 
@@ -1544,7 +2029,7 @@ mod tests {
         assert!(!code.contains("esp_radio::wifi::new("), "{code}");
         assert!(code.contains("esp_alloc::heap_allocator!(size: 72 * 1024);"), "{code}");
         let names: Vec<String> = config_files_for(&m).into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, ["ble.rs"]);
+        assert_eq!(names, ["ble.rs", "panic.rs"]);
     }
 
     /// Beside Wi-Fi: coex's two-region heap, ESP32's own split, Bluetooth
@@ -1706,7 +2191,7 @@ mod tests {
 
         let files = config_files_for(&m);
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, [SECRETS, THREAD]);
+        assert_eq!(names, [SECRETS, THREAD, PANIC]);
         let secrets = &files[0].1;
         assert!(secrets.contains("pub const THREAD_DATASET: &str = \"\";"), "{secrets}");
         assert!(!secrets.contains("WIFI_SSID"), "no Wi-Fi on an nRF:\n{secrets}");
@@ -1750,7 +2235,7 @@ mod tests {
 
             let files = config_files_for(&m);
             let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-            assert_eq!(names, [SECRETS, THREAD], "{id}");
+            assert_eq!(names, [SECRETS, THREAD, PANIC], "{id}");
             let thread = &files[1].1;
             for want in [
                 "use openthread::esp::{EspRadio, Ieee802154};",
@@ -1819,7 +2304,7 @@ mod tests {
         assert!(!code.contains("thread::start"), "{code}");
         assert!(code.contains("pins::configs::ble::start("), "{code}");
         let names: Vec<String> = config_files_for(&m).into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, [BLE]);
+        assert_eq!(names, [BLE, PANIC]);
     }
 
     /// `secrets.rs` is written once: a link switched on later adds its empty
@@ -1920,5 +2405,183 @@ mod tests {
         assert!(kept.contains(&SECRETS_PATH.to_owned()), "{kept:?}");
         assert!(kept.contains(&"src/pins/configs/mqtt.rs".to_owned()), "{kept:?}");
         assert!(kept_paths(&files, &tree).is_empty(), "nothing to keep while generated");
+    }
+
+    // ── Restart on panic ──────────────────────────────────────────────────
+
+    /// The ESP's header handler, as the IDE writes it, before and after.
+    fn esp_header(handler: &str) -> String {
+        format!(
+            "{}\n#![no_std]\n#![no_main]\n\npub mod pins;\n\nesp_bootloader_esp_idf::esp_app_desc!();\n{handler}\n{}\n    // block\n{}\n",
+            crate::panels::mcu_module::codegen::AUTOGEN_BANNER,
+            super::super::GEN_BEGIN,
+            super::super::GEN_END,
+        )
+    }
+
+    /// On: the halting handler becomes the restart's; off again: back, byte
+    /// for byte. Every IoT chip, both kinds of header.
+    #[test]
+    fn the_header_handler_follows_the_switch() {
+        let halt = crate::panels::mcu_module::codegen_esp::PANIC_HALT;
+        for id in ["esp32c3", "esp32", "esp32s3", "esp32c2", "rp2040_pico_w", "nrf52840_dk"] {
+            let mut m = if id.starts_with("nrf") {
+                let mut m = mcu(id, Runtime::Async, false);
+                m.iot.wifi = false;
+                m.iot.ble = Some(BleConfig::default());
+                m
+            } else {
+                mcu(id, Runtime::Async, true)
+            };
+            assert!(m.iot.restart_on_panic, "a new setup restarts");
+            let fresh = m.fresh_main_rs();
+            assert_eq!(panic_header(&fresh), PanicHeader::Restart, "{id}:\n{fresh}");
+            assert!(fresh.contains("pins::configs::panic::restart(info)"), "{id}");
+            assert!(fresh.contains("pins::configs::panic::start(spawner);"), "{id}:\n{fresh}");
+            assert!(!fresh.contains("use panic_halt as _;"), "{id}:\n{fresh}");
+            // Idempotent.
+            assert_eq!(m.update_main_rs(&fresh), fresh, "{id}");
+            // Off: the family's own halt, the start line gone.
+            m.iot.restart_on_panic = false;
+            let off = m.update_main_rs(&fresh);
+            assert_eq!(panic_header(&off), PanicHeader::Halt, "{id}:\n{off}");
+            assert!(!off.contains("pins::configs::panic"), "{id}:\n{off}");
+            assert!(!off.contains("Restart on panic (IoT tab)"), "{id}:\n{off}");
+            assert_eq!(off, m.fresh_main_rs(), "{id}: off is what a fresh file holds");
+            if id.starts_with("esp") {
+                assert!(off.contains(halt), "{id}");
+            } else {
+                assert!(off.contains("use panic_halt as _;"), "{id}");
+            }
+            // On again: the same file as before.
+            m.iot.restart_on_panic = true;
+            assert_eq!(m.update_main_rs(&off), fresh, "{id}");
+            // Blocking: no IoT, the halt comes back.
+            m.runtime = Runtime::Blocking;
+            let blocking = m.update_main_rs(&fresh);
+            assert_eq!(panic_header(&blocking), PanicHeader::Halt, "{id}:\n{blocking}");
+        }
+    }
+
+    /// The user's own handler - rustfmt'd copies aside - is never touched.
+    #[test]
+    fn a_handler_the_user_wrote_is_left_alone() {
+        let m = mcu("esp32c3", Runtime::Async, true);
+        // rustfmt's copy of the IDE's halt: swapped like the original.
+        let fmt = esp_header("#[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! {\n    loop {}\n}\n");
+        assert_eq!(panic_header(&panic_main(fmt, &m)), PanicHeader::Restart);
+        // One that prints first: left.
+        let own = esp_header(
+            "#[panic_handler]\nfn panic(info: &core::panic::PanicInfo) -> ! {\n    esp_println::println!(\"{info}\");\n    loop {}\n}\n",
+        );
+        assert_eq!(panic_main(own.clone(), &m), own);
+        assert_eq!(panic_header(&own), PanicHeader::Other);
+        // An edited restart handler is left when switched off, too.
+        let mut off = m.clone();
+        off.iot.restart_on_panic = false;
+        let edited = esp_header(
+            "#[panic_handler]\nfn panic(info: &core::panic::PanicInfo) -> ! {\n    esp_println::println!(\"{info}\");\n    pins::configs::panic::restart(info)\n}\n",
+        );
+        assert_eq!(panic_main(edited.clone(), &off), edited);
+        // A copy commented out is not the live one.
+        let commented = esp_header(&format!(
+            "/*\n{}*/\n#[panic_handler]\nfn panic(info: &core::panic::PanicInfo) -> ! {{\n    loop {{}}\n}}\n",
+            crate::panels::mcu_module::codegen_esp::PANIC_HALT
+        ));
+        assert_eq!(panic_header(&commented), PanicHeader::Other);
+        assert_eq!(panic_main(commented.clone(), &m), commented);
+        // panic-halt under an attribute: the attribute would govern the new item.
+        let gated = format!(
+            "#![no_std]\n#[cfg(not(test))]\nuse panic_halt as _;\n{}\n{}\n",
+            super::super::GEN_BEGIN,
+            super::super::GEN_END
+        );
+        let mut pico = mcu("rp2040_pico_w", Runtime::Async, true);
+        assert_eq!(panic_main(gated.clone(), &pico), gated);
+        // ... and an inline one is swapped.
+        let plain = gated.replace("#[cfg(not(test))]\n", "");
+        assert_eq!(panic_header(&panic_main(plain.clone(), &pico)), PanicHeader::Restart);
+        pico.iot.restart_on_panic = false;
+        assert_eq!(panic_main(plain.clone(), &pico), plain);
+    }
+
+    /// Every chip's panic.rs: the record where a software reset keeps it, the
+    /// report where the build has a way out.
+    #[test]
+    fn panic_rs_has_the_chips_pieces() {
+        let file = |m: &Mcu| -> String {
+            config_files_for(m)
+                .into_iter()
+                .find(|(n, _)| n == PANIC)
+                .map(|(_, b)| b)
+                .unwrap_or_else(|| panic!("no panic.rs for {}", m.family))
+        };
+        for (id, want) in [
+            ("esp32c3", "#[esp_hal::ram(unstable(rtc_fast, persistent))]"),
+            ("esp32c6", "#[esp_hal::ram(unstable(rtc_fast, persistent))]"),
+            ("esp32", "#[esp_hal::ram(unstable(rtc_slow, persistent))]"),
+            ("esp32s3", "#[esp_hal::ram(unstable(rtc_slow, persistent))]"),
+            ("esp32c2", "#[unsafe(link_section = \".noinit.rustonchip_panic\")]"),
+            ("esp32c61", "#[unsafe(link_section = \".noinit.rustonchip_panic\")]"),
+        ] {
+            let body = file(&mcu(id, Runtime::Async, true));
+            assert!(body.contains(want), "{id}:\n{body}");
+            assert!(body.contains("esp_hal::system::software_reset()"), "{id}");
+            assert!(body.contains("esp_println::println!(\"{report}\");"), "{id}: the serial port");
+            assert!(body.contains("pub const REPORT_TOPIC: &str = \"rustonchip-"), "{id}: MQTT");
+            assert!(body.contains("super::mqtt::publish(REPORT_TOPIC, text.as_bytes())"), "{id}");
+            assert!(is_pristine(PANIC, &body), "{id}");
+        }
+        // No MQTT: no topic, no task.
+        let plain = file(&mcu("esp32c3", Runtime::Async, false));
+        assert!(!plain.contains("REPORT_TOPIC") && !plain.contains("report_task"), "{plain}");
+        assert!(plain.contains("fn report_at_boot(_spawner: embassy_executor::Spawner, report: Report)"));
+        // UART0 is the user's: nothing printed on it.
+        let mut uart = mcu("esp32c3", Runtime::Async, false);
+        let pad = uart
+            .iter_all_pins()
+            .find(|p| !p.reserved)
+            .map(|p| p.number)
+            .unwrap();
+        uart.apply_saved_pins_by_number(&[(pad, crate::panels::mcu_module::PinFunction::UsartTx(0))]);
+        let quiet = file(&uart);
+        assert!(!quiet.contains("esp_println"), "{quiet}");
+        assert!(quiet.contains("fn report_at_boot(_spawner: embassy_executor::Spawner, _report: Report)"), "{quiet}");
+        // The Pico W and the nRF: `.uninit`, a core reset.
+        let pico = file(&mcu("rp2040_pico_w", Runtime::Async, true));
+        assert!(pico.contains(".uninit.rustonchip_panic") && pico.contains("SCB::sys_reset()"), "{pico}");
+        assert!(pico.contains("Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() }).stop();"));
+        let mut nrf = mcu("nrf52840_dk", Runtime::Async, false);
+        nrf.iot.wifi = false;
+        nrf.iot.ble = Some(BleConfig::default());
+        let nrf = file(&nrf);
+        assert!(nrf.contains("DWT::cycle_count()") && nrf.contains("WatchdogHandle::steal"), "{nrf}");
+        assert!(nrf.contains("fn report_at_boot(_spawner: embassy_executor::Spawner, _report: Report)"), "{nrf}");
+    }
+
+    /// The signature the tab checks is the template's.
+    #[test]
+    fn the_publish_signature_is_the_templates() {
+        assert!(lf(MQTT_TAIL).contains(MQTT_PUBLISH_SIGNATURE));
+    }
+
+    /// panic.rs as the tree re-splices it is still the IDE's: switched off,
+    /// it goes; edited, it stays.
+    #[test]
+    fn panic_rs_stays_pristine_through_a_splice() {
+        let m = mcu("esp32c3", Runtime::Async, true);
+        let body = config_files_for(&m)
+            .into_iter()
+            .find(|(n, _)| n == PANIC)
+            .map(|(_, b)| b)
+            .unwrap();
+        let (block, tail) = body.split_once(GEN_END_CFG).unwrap();
+        let spliced = format!("{block}{GEN_END_CFG}\n\n{}", tail.trim_start());
+        assert!(is_pristine(PANIC, &spliced));
+        let tree = vec![("src/pins/configs/panic.rs".to_owned(), spliced.clone())];
+        assert!(kept_paths(&[], &tree).is_empty());
+        let edited = vec![("src/pins/configs/panic.rs".to_owned(), spliced.replace("1_000;", "500;"))];
+        assert_eq!(kept_paths(&[], &edited), ["src/pins/configs/panic.rs"]);
+        assert!(runtime_free(PANIC));
     }
 }

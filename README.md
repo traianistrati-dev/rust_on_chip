@@ -395,6 +395,19 @@ the generated block, the tasks below it, editable. Your code calls
 `pins::configs::espnow::send(BROADCAST, b"..").await` / `receive().await`;
 each protocol has one task that owns it and reconnects or resyncs on its own.
 
+**Restart on panic** (on for a new setup, on every IoT chip) makes a panic
+restart the chip instead of halting it: `src/pins/configs/panic.rs` writes
+the panic's place and message into RAM a software reset keeps (RTC memory on
+an ESP that has it, RAM no start-up code clears on the ESP32-C2/C61, the Pico
+W and the nRF), waits — 1 s, doubling with each panic in a row up to a minute, so a
+panic on every boot does not hammer the network — and restarts. The next boot
+reports it on the serial port (ESP), on MQTT (`<client id>/panic`, QoS 0, once
+the next connection is up) and to your code through
+`pins::configs::panic::last()`. It is the one setting that edits `main.rs`
+above the markers: the panic handler there, and only while it is still the
+IDE's own — a handler you wrote is left, and the tab says what to call. It
+covers panics, not hard faults or hangs: those need the watchdog.
+
 **Bluetooth LE** is a link of its own, beside Wi-Fi or without it: a GATT
 peripheral with the **Nordic UART Service** (nRF Connect, nRF Toolbox or
 Serial Bluetooth Terminal talk to it), `pins::configs::ble::send(..).await`,
@@ -464,14 +477,18 @@ Encrypt — test.mosquitto.org on port 8886) and committed, a CA being public:
 paste your own broker's CA over it, and the tab shows whose it is, its key and
 until when. Every certificate in the chain must be signed with RSA or P-256 —
 or P-384 with the tab's "P-384 chains" (114 KiB of flash), which an ECDSA
-Let's Encrypt certificate, certbot's default, needs. The gaps in embedded-tls
+Let's Encrypt certificate, certbot's default, needs. These gaps in embedded-tls
 0.19 are closed in the generated code: a handshake with no certificate is
 refused, an RSA-PSS signature is taken only from an RSA key and a
 CertificateVerify only after a checked chain (each would otherwise panic it),
 every certificate after the broker's must be a CA, an encrypted record too
 short to hold anything is refused (another panic), and a TLS record is handed
 over only whole — so the MQTT loop can cancel a read — and never waited for on
-a socket that can receive no more. "Encrypt only, no check" is offered, with
+a socket that can receive no more. Some panics remain reachable — an RSA
+signature large enough to exhaust the heap before it is checked, a handshake
+message after the handshake, an RSA key the `rsa` crate refuses — and with
+**Restart on panic** each one costs a restart, not the board. "Encrypt only,
+no check" is offered, with
 the warning it deserves; it is never the default. **Test from this PC** runs
 those same checks — the very text of the firmware's `mqtt_link.rs`, built into
 a small program with your own cargo (about a minute the first time, seconds

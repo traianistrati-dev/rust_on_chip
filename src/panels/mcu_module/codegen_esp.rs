@@ -565,6 +565,10 @@ fn refresh_hal_line(head: &str, mcu_name: &str, runtime: EspRuntime) -> String {
     out
 }
 
+/// The header's panic handler as written: it halts. "Restart on panic" (IoT
+/// tab) swaps exactly this for its own and back (`iot_gen::panic_main`).
+pub const PANIC_HALT: &str = "#[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! {\nloop {}\n}\n";
+
 fn invariant_header(mcu_name: &str, id: &str, runtime: EspRuntime) -> String {
     format!(
         "{AUTOGEN_LINE}\n\
@@ -575,10 +579,7 @@ fn invariant_header(mcu_name: &str, id: &str, runtime: EspRuntime) -> String {
          pub mod pins;\n\n\
          \n\n\
          esp_bootloader_esp_idf::esp_app_desc!();\n\
-         #[panic_handler]\n\
-         fn panic(_: &core::panic::PanicInfo) -> ! {{\n\
-             loop {{}}\n\
-         }}\n\n\
+         {PANIC_HALT}\n\
          ",
         hal = hal_line(mcu_name, runtime),
         id_line = mcu_id_marker_line(id),

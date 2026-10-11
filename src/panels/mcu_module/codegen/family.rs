@@ -313,7 +313,7 @@ fn esp_lcd_configs(mcu: &Mcu) -> BTreeMap<u8, LcdCamModuleConfig> {
 /// the role DEFAULTS to Serial/JTAG, which the S2 has no driver for, so a
 /// project that never opened the panel would emit "pads only" for a chip whose
 /// OTG controller is sitting right there.
-fn esp_usb_configs(mcu: &Mcu) -> BTreeMap<u8, UsbModuleConfig> {
+pub(crate) fn esp_usb_configs(mcu: &Mcu) -> BTreeMap<u8, UsbModuleConfig> {
     let roles = UsbRole::options(&mcu.family);
     let mut usb = modules::usb_configs(&mcu.modules);
     for cfg in usb.values_mut() {

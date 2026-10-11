@@ -100,6 +100,39 @@ impl AppIde {
                 .flatten()
                 .filter(|t| *t != crate::panels::mcu_module::codegen::nrf::THREAD_TARGET)
                 .map(str::to_owned);
+            // Restart on panic: what this build reports to, and what main.rs's
+            // header holds for a panic handler.
+            let panic = {
+                let src = |path: &str| {
+                    self.project_tree
+                        .user_src_files
+                        .iter()
+                        .find(|(p, _)| p == path)
+                        .map(|(_, c)| c.as_str())
+                };
+                let active = iot::active(mcu);
+                // main.rs is the editor's buffer, not a file of the tree.
+                let main_rs = self.generated_code.as_str();
+                PanicFacts {
+                    is_async,
+                    links: mcu.iot.wifi
+                        || mcu.iot.esp_now.is_some()
+                        || mcu.iot.ble.is_some()
+                        || mcu.iot.thread.is_some(),
+                    active: active.is_some(),
+                    sinks: active.map(|a| iot_gen::panic_sinks(mcu, a)),
+                    header: (!main_rs.is_empty()).then(|| iot_gen::panic_header(main_rs)),
+                    calls_restart: iot_gen::header_calls_panic(main_rs),
+                    publish_moved: active.is_some_and(|a| a.mqtt)
+                        && src("src/pins/configs/mqtt.rs")
+                            .is_some_and(|c| !c.contains(iot_gen::MQTT_PUBLISH_SIGNATURE)),
+                    public_broker: mcu
+                        .iot
+                        .mqtt
+                        .as_ref()
+                        .is_some_and(|m| m.host.trim().eq_ignore_ascii_case("test.mosquitto.org")),
+                }
+            };
             // MQTT over TLS: whether this chip can, what mqtt_ca.rs holds, and an
             // edited mqtt.rs / mqtt_link.rs that no longer fits the switch.
             let tls = {
@@ -214,6 +247,10 @@ impl AppIde {
                     ui.add_space(4.0);
                     ui.label(warn(text.as_str()));
                 }
+                if panic.links {
+                    ui.add_space(8.0);
+                    restart_row(ui, &mut mcu.iot.restart_on_panic, &panic);
+                }
                 ui.add_space(12.0);
 
                 let link_up = mcu.iot.wifi && platform.is_some();
@@ -250,6 +287,124 @@ impl AppIde {
             self.active_tab = McuTab::System;
         }
     }
+}
+
+/// What "Restart on panic" needs to know about this build.
+struct PanicFacts {
+    /// The runtime is Async.
+    is_async: bool,
+    /// A link is ticked: the row is drawn.
+    links: bool,
+    /// The IoT code is generated (Async, a link the chip can carry).
+    active: bool,
+    /// Where the report goes: the serial port, the MQTT topic.
+    sinks: Option<(bool, Option<String>)>,
+    /// What main.rs's header holds for a panic handler.
+    header: Option<iot_gen::PanicHeader>,
+    /// main.rs still calls into panic.rs.
+    calls_restart: bool,
+    /// An edited mqtt.rs whose `publish` panic.rs's report no longer fits.
+    publish_moved: bool,
+    /// The broker anyone can read.
+    public_broker: bool,
+}
+
+const PANIC_USAGE: &str =
+    "if let Some(r) = pins::configs::panic::last() { /* r.count, r.text() */ }";
+
+/// "Restart on panic", for every link: the switch, where the report goes,
+/// and what it does not cover.
+fn restart_row(ui: &mut egui::Ui, on: &mut bool, facts: &PanicFacts) {
+    ui.horizontal(|ui| {
+        ui.checkbox(on, "").on_hover_text(
+            "A panic restarts the chip instead of halting it, and is reported at the next boot",
+        );
+        ui.label(egui::RichText::new("Restart on panic").strong());
+        ui.label(dim("src/pins/configs/panic.rs"));
+    });
+    if !*on {
+        if facts.calls_restart {
+            ui.label(warn(concat!(
+                "main.rs still calls pins::configs::panic, which is not generated now: put back ",
+                "`use panic_halt as _;` (an ESP: the `loop {}` handler) in place of the handler ",
+                "that calls it."
+            )));
+        }
+        return;
+    }
+    ui.indent("iot_restart_on_panic", |ui| {
+        ui.label(dim(concat!(
+            "A panic restarts the chip. The wait before the restart doubles with each panic in ",
+            "a row - 1 s, 2 s ... 1 min - and starts over after 10 min without one, so a panic on ",
+            "every boot does not hammer the network. Its place and message survive the restart."
+        )));
+        match &facts.sinks {
+            None => {
+                ui.label(dim(if facts.is_async {
+                    "Kept, and generated with the first link above this chip generates."
+                } else {
+                    "Kept, and generated once the runtime is Async."
+                }));
+            }
+            Some((serial, topic)) => {
+                if *serial {
+                    ui.label(dim("Reported on the serial port, at the panic and again at the next boot."));
+                }
+                if let Some(topic) = topic {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(dim("And on MQTT, topic"));
+                        ui.label(egui::RichText::new(topic.as_str()).monospace().size(11.0));
+                        if ui.small_button(ph::COPY).on_hover_text("Copy the topic").clicked() {
+                            ui.ctx().copy_text(topic.clone());
+                        }
+                    });
+                    ui.label(dim(if *serial {
+                        "QoS 0 and not retained, once the next connection is up: a panic that \
+                         comes back while connecting (a TLS handshake) is never sent - the serial \
+                         port or last() has it."
+                    } else {
+                        "QoS 0 and not retained, once the next connection is up: a panic that \
+                         comes back while connecting (a TLS handshake) is never sent - only \
+                         last() has it."
+                    }));
+                    if facts.public_broker {
+                        ui.label(warn(
+                            "test.mosquitto.org is public: anyone can read the report on that topic.",
+                        ));
+                    }
+                }
+                if !*serial && topic.is_none() {
+                    ui.label(dim(concat!(
+                        "Nothing reports it by itself on this build: read pins::configs::panic::last() ",
+                        "and send it on a link of yours."
+                    )));
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(PANIC_USAGE).monospace().size(11.0));
+            if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                ui.ctx().copy_text(PANIC_USAGE.to_owned());
+            }
+        });
+        ui.label(dim(concat!(
+            "Panics only: a hard fault or a hang needs the watchdog (Configuration tab). Under a ",
+            "debugger it restarts too - untick it to keep the chip halted where it panicked."
+        )));
+        if facts.active && facts.header == Some(iot_gen::PanicHeader::Other) {
+            ui.label(warn(concat!(
+                "main.rs has a panic handler of its own, which the IDE leaves alone: call ",
+                "pins::configs::panic::restart(info) from it - or put back the IDE's ",
+                "(`use panic_halt as _;`, on an ESP the `loop {}` one) for the IDE to swap."
+            )));
+        }
+        if facts.publish_moved {
+            ui.label(warn(format!(
+                "src/pins/configs/mqtt.rs no longer has `{}`, which panic.rs's report calls.",
+                iot_gen::MQTT_PUBLISH_SIGNATURE
+            )));
+        }
+    });
 }
 
 /// What the link card needs to know about Bluetooth on this chip.

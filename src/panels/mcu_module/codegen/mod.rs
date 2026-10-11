@@ -136,6 +136,8 @@ impl Mcu {
             .backend()
             .map(|b| b.fresh_main_rs(self))
             .unwrap_or_default();
+        // The header's panic handler: the IoT tab's restart, or the halt.
+        let code = iot_gen::panic_main(code, self);
         let code = self.seed_flash_store_tail(code);
         // Module/clock state is persisted out-of-source in `mcu.config`
         // (see `Mcu::mcu_config_text`), not as comment markers in main.rs.
@@ -163,6 +165,8 @@ impl Mcu {
             .backend()
             .map(|b| b.update_main_rs(self, existing))
             .unwrap_or_else(|| existing.to_owned());
+        // The header's panic handler: the IoT tab's restart, or the halt.
+        let code = iot_gen::panic_main(code, self);
         let code = self.seed_flash_store_tail(code);
         // Module/clock state is persisted in `mcu.config`, not in main.rs.
         let code = common::ensure_module_models(code, &self.modules);

@@ -4358,6 +4358,9 @@ fn async_section(mcu: &Mcu) -> String {
     o.push_str("    // embassy-rp brings up the clocks itself. On RP2040 it also supplies the\n");
     o.push_str("    // second-stage bootloader, which the blocking HAL makes you declare.\n");
     o.push_str("    let p = embassy_rp::init(Default::default());\n\n");
+    // A panic that restarted the chip (IoT tab), reported before anything
+    // else could panic again.
+    o.push_str(&super::iot_gen::panic_start_lines(mcu));
     // First after init, like every other family's watchdog: one meant to catch
     // a hang in start-up is worth having before the code that might hang.
     o.push_str(&super::watchdog_gen::rp_init_lines(&mcu.watchdog, true));

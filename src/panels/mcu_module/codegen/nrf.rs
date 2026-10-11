@@ -2880,6 +2880,9 @@ fn async_section(mcu: &Mcu) -> String {
         }
         None => o.push_str(&clock),
     }
+    // A panic that restarted the chip (IoT tab), reported before anything
+    // else could panic again.
+    o.push_str(&super::iot_gen::panic_start_lines(mcu));
     // Only the peripheral: starting it is configuring it on this HAL.
     o.push_str(&super::watchdog_gen::nrf_init_lines(
         &mcu.watchdog,

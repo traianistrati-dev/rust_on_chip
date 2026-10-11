@@ -5530,6 +5530,7 @@ mod iot_deps_tests {
             sntp: false,
             ble: false,
             thread: false,
+            panic: false,
         })
     }
 
@@ -5586,6 +5587,7 @@ mod iot_deps_tests {
                 sntp: true,
                 ble: false,
                 thread: false,
+                panic: false,
             }),
             "",
             "rp2040",
@@ -5617,6 +5619,7 @@ mod iot_deps_tests {
             sntp: true,
             ble: false,
             thread: false,
+            panic: false,
         });
         let on = ensure_iot_deps(ESP_ASYNC, both, "esp32c3", "esp32c3", &[]);
         assert!(
@@ -5639,6 +5642,7 @@ mod iot_deps_tests {
             sntp: false,
             ble: false,
             thread: false,
+            panic: false,
         });
         let a = ensure_iot_deps(ESP_ASYNC, alone, "esp32c3", "esp32c3", &[]);
         assert!(a.contains("\"esp-now\"") && a.contains("esp-alloc"), "{a}");
@@ -5671,6 +5675,7 @@ mod iot_deps_tests {
             sntp: false,
             ble,
             thread: false,
+            panic: false,
         })
     }
 

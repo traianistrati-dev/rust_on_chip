@@ -65,6 +65,13 @@ pub struct IotConfig {
     /// another link on the same radio - Bluetooth, and on an ESP Wi-Fi and
     /// ESP-NOW too. The network's dataset is a secret, in `secrets.rs`.
     pub thread: Option<ThreadConfig>,
+    /// A panic restarts the chip (`src/pins/configs/panic.rs`) instead of
+    /// halting it. On for a new setup; an `@iot` line written before the
+    /// switch existed reads `false` (the field's own default), so a project
+    /// already in use keeps halting - its main.rs header is the user's, and
+    /// the IDE edits it only once the box is ticked.
+    #[serde(default)]
+    pub restart_on_panic: bool,
 }
 
 impl Default for IotConfig {
@@ -78,6 +85,7 @@ impl Default for IotConfig {
             sntp: None,
             ble: None,
             thread: None,
+            restart_on_panic: true,
         }
     }
 }
@@ -679,6 +687,31 @@ impl MqttConfig {
 /// the template, so the tab can refuse a subscription the code would drop.
 pub const MAX_TOPIC: usize = 64;
 
+/// The topic "Restart on panic" reports on: `<client id>/panic`, made a valid
+/// MQTT topic NAME whatever the client id holds - `+` and `#` are wildcards
+/// there, a leading `$` is the broker's own namespace, and a `Message` holds
+/// 64 bytes. An empty client id (every board alike) gets `rustonchip/panic`.
+pub fn panic_topic(m: &MqttConfig) -> String {
+    const SUFFIX: &str = "/panic";
+    let id: String = m
+        .client_id
+        .chars()
+        .map(|c| if matches!(c, '+' | '#') || c.is_control() { '_' } else { c })
+        .collect();
+    let mut id = id
+        .trim()
+        .trim_start_matches(['/', '$', ' '])
+        .trim_end_matches('/')
+        .to_owned();
+    while id.len() > MAX_TOPIC - SUFFIX.len() {
+        id.pop();
+    }
+    if id.is_empty() {
+        id = "rustonchip".to_owned();
+    }
+    format!("{id}{SUFFIX}")
+}
+
 /// What is wrong with an MQTT setting, for the line under the field. `None`
 /// = fine. These are the checks `rust-mqtt` would otherwise fail AT RUN TIME:
 /// an empty or wildcard topic name, a filter whose `#` is not last.
@@ -834,6 +867,9 @@ pub struct Active {
     /// Thread, with OpenThread's UDP - on an nRF or an ESP with 802.15.4,
     /// never beside another link on the radio (see [`thread_blocked`]).
     pub thread: bool,
+    /// Restart on panic: `src/pins/configs/panic.rs`, the handler in main.rs's
+    /// header and the boot report.
+    pub panic: bool,
 }
 
 /// `Some` when a link is on, the chip can carry it, and the runtime is Async:
@@ -871,6 +907,7 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
         sntp: station && mcu.iot.sntp.is_some(),
         ble,
         thread,
+        panic: mcu.iot.restart_on_panic,
     })
 }
 
@@ -1104,6 +1141,43 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report's topic is always a topic name a `Message` can carry.
+    #[test]
+    fn the_panic_topic_is_a_valid_topic_name() {
+        let topic = |id: &str| {
+            panic_topic(&MqttConfig {
+                client_id: id.into(),
+                ..MqttConfig::default()
+            })
+        };
+        assert_eq!(topic("rustonchip-esp32c3"), "rustonchip-esp32c3/panic");
+        assert_eq!(topic(""), "rustonchip/panic");
+        assert_eq!(topic("  "), "rustonchip/panic");
+        assert_eq!(topic("a+b#c"), "a_b_c/panic");
+        assert_eq!(topic("$SYS"), "SYS/panic");
+        assert_eq!(topic("/x/"), "x/panic");
+        assert_eq!(topic("/$SYS/x"), "SYS/x/panic");
+        assert_eq!(topic(" /$share/g/t"), "share/g/t/panic");
+        let long = topic(&"é".repeat(60));
+        assert!(long.len() <= MAX_TOPIC && long.ends_with("/panic"), "{long}");
+        for id in ["", "a+b#c", "$SYS", "/x/", &"z".repeat(90)] {
+            let t = topic(id);
+            assert!(t.len() <= MAX_TOPIC, "{t}");
+            assert!(!t.contains(['+', '#']) && !t.starts_with('$'), "{t}");
+        }
+    }
+
+    /// A new setup restarts on panic; an `@iot` line from before the switch
+    /// keeps halting - the IDE does not edit a header the user has not asked
+    /// it to.
+    #[test]
+    fn restart_on_panic_is_on_only_for_a_new_setup() {
+        assert!(IotConfig::default().restart_on_panic);
+        let old: IotConfig = ron::from_str("(wifi: true, heap_kib: 72)").unwrap();
+        assert!(!old.restart_on_panic);
+        assert!(!old.is_default(), "persisted, so it stays off");
+    }
 
     /// Every ESP with a Wi-Fi radio is Ready; the H2 says why it is not.
     #[test]

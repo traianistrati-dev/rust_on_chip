@@ -1070,39 +1070,92 @@ fn pin_chip(
     let button = egui::Button::new(title)
         .fill(chip_fill(color, assigned.is_some()))
         .stroke(stroke);
+    // The band colour: one step up the theme's greys. Read HERE, outside the
+    // menu - egui's `menu_style` makes this very fill transparent inside it.
+    let band = ui.visuals().widgets.inactive.weak_bg_fill;
     let (resp, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
         ui.set_min_width(150.0);
-        for opt in &pe.options {
-            let mark = if opt.assigned {
-                format!("{} ", ph::CHECK)
-            } else {
-                "    ".to_string()
-            };
-            let col = if opt.assigned {
-                color
-            } else {
-                egui::Color32::from_rgb(205, 205, 215)
-            };
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new(format!("{mark}{}", opt.label))
-                            .size(11.0)
-                            .color(col),
+        // Every other peripheral instance sits on a band (TIM0 shaded, TIM1
+        // plain, TIM2 shaded, ...), so a long list reads as groups. Painted
+        // BEHIND the rows: a placeholder now, the rectangle once the menu's
+        // width is known.
+        let runs = group_runs(&pe.options);
+        let mut bands = Vec::new();
+        for (i, run) in runs.iter().enumerate() {
+            let slot = run_shaded(i, runs.len()).then(|| ui.painter().add(egui::Shape::Noop));
+            let top = ui.cursor().top();
+            for opt in &pe.options[run.clone()] {
+                let mark = if opt.assigned {
+                    format!("{} ", ph::CHECK)
+                } else {
+                    "    ".to_string()
+                };
+                let col = if opt.assigned {
+                    color
+                } else {
+                    egui::Color32::from_rgb(205, 205, 215)
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("{mark}{}", opt.label))
+                                .size(11.0)
+                                .color(col),
+                        )
+                        .frame(false),
                     )
-                    .frame(false),
-                )
-                .clicked()
-            {
-                *pending = Some(click_action(pe.pin_num, opt));
-                ui.close();
+                    .clicked()
+                {
+                    *pending = Some(click_action(pe.pin_num, opt));
+                    ui.close();
+                }
             }
+            if let Some(slot) = slot {
+                bands.push((slot, top, ui.min_rect().bottom()));
+            }
+        }
+        let x = ui.min_rect().x_range();
+        for (slot, top, bottom) in bands {
+            let rect = egui::Rect::from_x_y_ranges(x, top..=bottom).expand2(egui::vec2(2.0, 1.0));
+            ui.painter()
+                .set(slot, egui::Shape::rect_filled(rect, 3.0, band));
         }
     });
     resp.on_hover_text(format!(
         "{} (pin {})\n{}\npick a signal",
         pe.pin_name, pe.pin_num, note
     ));
+}
+
+/// The peripheral instance a signal option belongs to, read from its label:
+/// the first word (`TIM0  CH2  (PWM)` -> `TIM0`, `GPIO Input` -> `GPIO`), cut
+/// at the first underscore for a datasheet signal name (`COMP1_INP` ->
+/// `COMP1`) - the same rule as [`signal_peripheral`].
+fn option_group(label: &str) -> &str {
+    signal_peripheral(label.split_whitespace().next().unwrap_or(label))
+}
+
+/// A signal menu's options as runs of one peripheral instance each, in their
+/// own order - the groups its alternate bands separate. Nothing is reordered:
+/// an instance whose options are not next to each other makes two runs.
+fn group_runs(options: &[PinOption]) -> Vec<std::ops::Range<usize>> {
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, o) in options.iter().enumerate() {
+        match runs.last_mut() {
+            Some(r) if option_group(&options[r.start].label) == option_group(&o.label) => {
+                r.end = i + 1;
+            }
+            _ => runs.push(i..i + 1),
+        }
+    }
+    runs
+}
+
+/// Is run `index` of `count` on a band? Every other one, the first included -
+/// and none when the menu holds a single instance, where a band would
+/// separate nothing.
+fn run_shaded(index: usize, count: usize) -> bool {
+    count > 1 && index.is_multiple_of(2)
 }
 
 /// Chip background: category colour when assigned, neutral otherwise.
@@ -2043,5 +2096,165 @@ mod filter_tests {
     fn case_and_spacing_do_not_matter() {
         assert_eq!(filter_categories(cats(), "  Pa9 ").len(), 1);
         assert_eq!(filter_categories(cats(), "SpI").len(), 1);
+    }
+}
+
+/// The signal menu's alternate bands: one group per peripheral instance.
+#[cfg(test)]
+mod menu_band_tests {
+    use super::*;
+
+    fn options(labels: &[&str]) -> Vec<PinOption> {
+        labels
+            .iter()
+            .map(|l| PinOption {
+                func: PinFunction::Unset,
+                label: (*l).to_owned(),
+                assigned: false,
+            })
+            .collect()
+    }
+
+    /// The menu the request showed: four timers of four channels each, on a
+    /// micro:bit pad. TIM0 and TIM2 get the band, TIM1 and TIM3 do not.
+    #[test]
+    fn four_timers_make_four_groups_and_every_other_one_is_shaded() {
+        let labels: Vec<String> = (0..4)
+            .flat_map(|t| (0..4).map(move |c| format!("TIM{t}  CH{c}  (PWM)")))
+            .collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let runs = group_runs(&options(&refs));
+        assert_eq!(runs, vec![0..4, 4..8, 8..12, 12..16]);
+        let shaded: Vec<bool> = (0..runs.len()).map(|i| run_shaded(i, runs.len())).collect();
+        assert_eq!(shaded, vec![true, false, true, false]);
+    }
+
+    /// The instance is the label's first word, cut at an underscore for a
+    /// datasheet signal name.
+    #[test]
+    fn the_group_is_the_peripheral_instance() {
+        assert_eq!(option_group("TIM0  CH2  (PWM)"), "TIM0");
+        assert_eq!(option_group("TIM1  CH1N  (PWM)"), "TIM1");
+        assert_eq!(option_group("USART2  TX"), "USART2");
+        assert_eq!(option_group("ADC1  IN5"), "ADC1");
+        assert_eq!(option_group("GPIO Output"), "GPIO");
+        assert_eq!(option_group("COMP1_INP"), "COMP1");
+        assert_eq!(option_group("RTC"), "RTC");
+    }
+
+    /// One instance is one group, and a band would separate nothing.
+    #[test]
+    fn a_single_instance_gets_no_band() {
+        let runs = group_runs(&options(&["GPIO Input", "GPIO Output"]));
+        assert_eq!(runs, vec![0..2]);
+        assert!(!run_shaded(0, runs.len()));
+        let runs = group_runs(&options(&["COMP1_INP", "COMP1_INM", "COMP2_INP"]));
+        assert_eq!(runs, vec![0..2, 2..3]);
+    }
+
+    /// The bands as egui really paints them: the menu opened by a click in a
+    /// headless frame and its shapes read back - one rectangle of the band
+    /// colour behind TIM0's rows and one behind TIM2's, painted before them,
+    /// and nothing behind TIM1's or TIM3's.
+    #[test]
+    fn the_open_menu_paints_a_band_behind_every_other_timer() {
+        fn flatten<'a>(s: &'a egui::Shape, out: &mut Vec<&'a egui::Shape>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| flatten(s, out)),
+                s => out.push(s),
+            }
+        }
+        let labels: Vec<String> = (0..4)
+            .flat_map(|t| (0..4).map(move |c| format!("TIM{t}  CH{c}  (PWM)")))
+            .collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let pe = PinEntry {
+            pin_num: 19,
+            pin_name: "P0.26".into(),
+            cost: 1,
+            options: options(&refs),
+        };
+        let ctx = egui::Context::default();
+        // The popup fades in, and a faded band is another colour: no animation.
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        let chip = std::cell::Cell::new(egui::Rect::NOTHING);
+        let frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            crate::headless::run_ui(&ctx, input, |ui| {
+                let mut pending = None;
+                pin_chip(ui, egui::Color32::YELLOW, &pe, &mut pending);
+                chip.set(ui.min_rect());
+            })
+        };
+        frame(Vec::new());
+        let at = chip.get().center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(at), button(true)]);
+        frame(vec![button(false)]);
+        frame(Vec::new());
+        let out = frame(Vec::new());
+
+        let band = ctx.global_style().visuals.widgets.inactive.weak_bg_fill;
+        let mut shapes = Vec::new();
+        for cs in &out.shapes {
+            flatten(&cs.shape, &mut shapes);
+        }
+        let bands: Vec<(usize, egui::Rect)> = shapes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                egui::Shape::Rect(r) if r.fill == band => Some((i, r.rect)),
+                _ => None,
+            })
+            .collect();
+        let rows: Vec<(usize, egui::Rect, String)> = shapes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                egui::Shape::Text(t) if t.galley.text().contains("TIM") => Some((
+                    i,
+                    s.visual_bounding_rect(),
+                    t.galley.text().trim().to_owned(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 16, "the menu is open with every option");
+        assert_eq!(bands.len(), 2, "two bands: {bands:?}");
+        for (i, rect, text) in &rows {
+            let under: Vec<usize> = bands
+                .iter()
+                .filter(|(_, b)| b.contains(rect.center()))
+                .map(|(bi, _)| *bi)
+                .collect();
+            if text.starts_with("TIM0") || text.starts_with("TIM2") {
+                assert!(
+                    under.len() == 1 && under[0] < *i,
+                    "{text}: a band behind it"
+                );
+            } else {
+                assert!(under.is_empty(), "{text}: no band");
+            }
+        }
+    }
+
+    /// Nothing is reordered: an instance split by another makes two runs.
+    #[test]
+    fn the_options_keep_their_order() {
+        let runs = group_runs(&options(&["SPI1  SCK", "SPI2  SCK", "SPI1  MOSI"]));
+        assert_eq!(runs, vec![0..1, 1..2, 2..3]);
+        assert!(group_runs(&[]).is_empty());
     }
 }

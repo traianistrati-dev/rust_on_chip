@@ -22,6 +22,7 @@ use crate::panels::mcu_module::Mcu;
 use crate::panels::mcu_module::Pin;
 use crate::panels::mcu_module::PinFunction;
 use crate::panels::mcu_module::pins::logic::pin::colors::switch_role;
+use crate::panels::mcu_module::pins::logic::pin_function::display::{instance_runs, run_shaded};
 use eframe::egui;
 use egui_phosphor::regular as ph;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1127,35 +1128,12 @@ fn pin_chip(
     ));
 }
 
-/// The peripheral instance a signal option belongs to, read from its label:
-/// the first word (`TIM0  CH2  (PWM)` -> `TIM0`, `GPIO Input` -> `GPIO`), cut
-/// at the first underscore for a datasheet signal name (`COMP1_INP` ->
-/// `COMP1`) - the same rule as [`signal_peripheral`].
-fn option_group(label: &str) -> &str {
-    signal_peripheral(label.split_whitespace().next().unwrap_or(label))
-}
-
-/// A signal menu's options as runs of one peripheral instance each, in their
-/// own order - the groups its alternate bands separate. Nothing is reordered:
-/// an instance whose options are not next to each other makes two runs.
+/// A signal menu's options as runs of one peripheral instance each - the
+/// groups its alternate bands separate, by the rule the Pins tab's list
+/// shares (`pin_function::display::instance_runs`).
 fn group_runs(options: &[PinOption]) -> Vec<std::ops::Range<usize>> {
-    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
-    for (i, o) in options.iter().enumerate() {
-        match runs.last_mut() {
-            Some(r) if option_group(&options[r.start].label) == option_group(&o.label) => {
-                r.end = i + 1;
-            }
-            _ => runs.push(i..i + 1),
-        }
-    }
-    runs
-}
-
-/// Is run `index` of `count` on a band? Every other one, the first included -
-/// and none when the menu holds a single instance, where a band would
-/// separate nothing.
-fn run_shaded(index: usize, count: usize) -> bool {
-    count > 1 && index.is_multiple_of(2)
+    let labels: Vec<&str> = options.iter().map(|o| o.label.as_str()).collect();
+    instance_runs(&labels)
 }
 
 /// Chip background: category colour when assigned, neutral otherwise.
@@ -2129,29 +2107,6 @@ mod menu_band_tests {
         assert_eq!(shaded, vec![true, false, true, false]);
     }
 
-    /// The instance is the label's first word, cut at an underscore for a
-    /// datasheet signal name.
-    #[test]
-    fn the_group_is_the_peripheral_instance() {
-        assert_eq!(option_group("TIM0  CH2  (PWM)"), "TIM0");
-        assert_eq!(option_group("TIM1  CH1N  (PWM)"), "TIM1");
-        assert_eq!(option_group("USART2  TX"), "USART2");
-        assert_eq!(option_group("ADC1  IN5"), "ADC1");
-        assert_eq!(option_group("GPIO Output"), "GPIO");
-        assert_eq!(option_group("COMP1_INP"), "COMP1");
-        assert_eq!(option_group("RTC"), "RTC");
-    }
-
-    /// One instance is one group, and a band would separate nothing.
-    #[test]
-    fn a_single_instance_gets_no_band() {
-        let runs = group_runs(&options(&["GPIO Input", "GPIO Output"]));
-        assert_eq!(runs, vec![0..2]);
-        assert!(!run_shaded(0, runs.len()));
-        let runs = group_runs(&options(&["COMP1_INP", "COMP1_INM", "COMP2_INP"]));
-        assert_eq!(runs, vec![0..2, 2..3]);
-    }
-
     /// The bands as egui really paints them: the menu opened by a click in a
     /// headless frame and its shapes read back - one rectangle of the band
     /// colour behind TIM0's rows and one behind TIM2's, painted before them,
@@ -2248,13 +2203,5 @@ mod menu_band_tests {
                 assert!(under.is_empty(), "{text}: no band");
             }
         }
-    }
-
-    /// Nothing is reordered: an instance split by another makes two runs.
-    #[test]
-    fn the_options_keep_their_order() {
-        let runs = group_runs(&options(&["SPI1  SCK", "SPI2  SCK", "SPI1  MOSI"]));
-        assert_eq!(runs, vec![0..1, 1..2, 2..3]);
-        assert!(group_runs(&[]).is_empty());
     }
 }

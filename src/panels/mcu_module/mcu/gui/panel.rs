@@ -18,6 +18,7 @@ use super::info;
 use crate::panels::mcu_module::mcu::model::Mcu;
 use crate::panels::mcu_module::pins::logic::pin::GpioMode;
 use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+use crate::panels::mcu_module::pins::logic::pin_function::display::{instance_runs, run_shaded};
 use eframe::egui;
 
 /// Width of the trailing ⓘ button.
@@ -39,6 +40,10 @@ const NOTE_PT: f32 = 11.0;
 const NOTE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 205, 130);
 /// An erratum the current selection runs into (`errata`).
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(240, 130, 110);
+/// The band behind every other peripheral instance's rows: a step lighter
+/// than the body under it, whichever it is (a chip's grey, a board's green),
+/// and still darker than the rows themselves.
+const BAND_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(12, 12, 12, 12);
 
 /// Paint `text` wrapped to `wrap` at `pos`, cut to the rows that fit in
 /// `max_h` and ended with "…" when cut, the full text then on hover. Returns
@@ -364,9 +369,25 @@ pub fn draw_pin_functions(
     let mut toggle_info: Option<PinFunction> = None;
     let show_info = mcu.show_info.clone();
 
+    // Every other peripheral instance on a band (TIM0 shaded, TIM1 plain,
+    // TIM2 shaded, ...), grouped as the Peripherals tab's menu groups them.
+    // Slots taken BEFORE the rows, so the bands paint behind them; filled
+    // once the rows' places are known.
+    let labels: Vec<String> = funcs.iter().map(PinFunction::label).collect();
+    let runs = instance_runs(&labels);
+    let band_slots: Vec<(std::ops::Range<usize>, egui::layers::ShapeIdx)> = runs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| run_shaded(*i, runs.len()))
+        .map(|(_, run)| (run.clone(), list_painter.add(egui::Shape::Noop)))
+        .collect();
+    // Each row's top and bottom, the mode chips under the active one included.
+    let mut row_spans: Vec<(f32, f32)> = Vec::with_capacity(funcs.len());
+
     for (i, func) in funcs.iter().enumerate() {
         let btn_rect =
             egui::Rect::from_min_size(egui::pos2(btn_x, btn_y), egui::vec2(btn_w, BTN_H));
+        row_spans.push((btn_rect.top(), btn_rect.bottom()));
         let info_rect = egui::Rect::from_min_size(
             egui::pos2(btn_x + btn_w + GAP, btn_y),
             egui::vec2(INFO_BTN_W, BTN_H),
@@ -501,8 +522,21 @@ pub fn draw_pin_functions(
                     }
                 }
             }
+            if let Some(span) = row_spans.last_mut() {
+                span.1 = btn_y + MODE_H;
+            }
             btn_y += mode_row_h;
         }
+    }
+    // Half the gap between two rows on either side, so neighbouring groups
+    // meet in the middle of it; across the function AND its ⓘ.
+    let band_x = (btn_x - 4.0)..=(btn_x + btn_w + GAP + INFO_BTN_W + 4.0);
+    for (run, slot) in band_slots {
+        let half_gap = (ITEM_H - BTN_H) / 2.0;
+        let top = row_spans[run.start].0 - half_gap;
+        let bottom = row_spans[run.end - 1].1 + half_gap;
+        let rect = egui::Rect::from_x_y_ranges(band_x.clone(), top..=bottom);
+        list_painter.set(slot, egui::Shape::rect_filled(rect, 6.0, BAND_FILL));
     }
 
     // ── Apply ────────────────────────────────────────────────────────────────
@@ -554,4 +588,100 @@ pub fn draw_pin_functions(
     }
 
     (changed, list_screen)
+}
+
+/// The list's instance bands as egui really paints them.
+#[cfg(test)]
+mod instance_band_tests {
+    use super::*;
+
+    /// The micro:bit pad the request came from, P0.26: a frame painted
+    /// headless and its shapes read back. Every row of a shaded instance has a
+    /// band behind it, painted before it; no row of the others has one.
+    #[test]
+    fn every_other_instance_sits_on_a_band_behind_its_rows() {
+        fn flatten<'a>(s: &'a egui::Shape, out: &mut Vec<&'a egui::Shape>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| flatten(s, out)),
+                s => out.push(s),
+            }
+        }
+        let mut mcu = crate::panels::mcu_module::builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == "nrf52833_microbit_v2")
+            .expect("built-in micro:bit v2")
+            .build_mcu();
+        let num = mcu
+            .iter_all_pins()
+            .find(|p| p.name.starts_with("P0.26"))
+            .expect("P0.26")
+            .number;
+        mcu.selected_pin = Some(num);
+        let (_, funcs, _) = selectable_functions(&mcu, num).expect("functions");
+        let labels: Vec<String> = funcs.iter().map(PinFunction::label).collect();
+        let runs = instance_runs(&labels);
+        assert!(
+            labels.iter().filter(|l| l.starts_with("TIM")).count() == 16 && runs.len() >= 4,
+            "{labels:?}"
+        );
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 3000.0),
+            )),
+            ..Default::default()
+        };
+        let out = crate::headless::run_ui(&ctx, input, |ui| {
+            let painter = ui.painter().clone();
+            // Tall enough for every row, so nothing is scrolled away.
+            let body = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 2900.0));
+            draw_pin_functions(&mut mcu, &painter, ui, body);
+        });
+        let mut shapes = Vec::new();
+        for cs in &out.shapes {
+            flatten(&cs.shape, &mut shapes);
+        }
+        let bands: Vec<(usize, egui::Rect)> = shapes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                egui::Shape::Rect(r) if r.fill == BAND_FILL => Some((i, r.rect)),
+                _ => None,
+            })
+            .collect();
+        let shaded = (0..runs.len())
+            .filter(|&i| run_shaded(i, runs.len()))
+            .count();
+        assert_eq!(bands.len(), shaded, "one band per shaded instance");
+        for (ri, run) in runs.iter().enumerate() {
+            for f in &funcs[run.clone()] {
+                let text = f.list_label();
+                let (ti, rect) = shapes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, s)| match s {
+                        egui::Shape::Text(t) if t.galley.text() == text => {
+                            Some((i, s.visual_bounding_rect()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("no row for {text}"));
+                let under: Vec<usize> = bands
+                    .iter()
+                    .filter(|(_, b)| b.contains(rect.center()))
+                    .map(|(bi, _)| *bi)
+                    .collect();
+                if run_shaded(ri, runs.len()) {
+                    assert!(
+                        under.len() == 1 && under[0] < ti,
+                        "{text}: a band behind it"
+                    );
+                } else {
+                    assert!(under.is_empty(), "{text}: no band");
+                }
+            }
+        }
+    }
 }

@@ -18,6 +18,46 @@ pub fn sai_block(block: u8) -> &'static str {
     if block == 1 { "A" } else { "B" }
 }
 
+// ── Grouping a pin's functions by peripheral instance ───────────────────────
+//
+// Both lists of a pin's functions - the Peripherals tab's signal menu and the
+// Pins tab's in-chip list - shade every other instance (TIM0 on a band, TIM1
+// plain, TIM2 on a band, ...), so a long list reads as groups. One rule here,
+// so the two lists cannot group differently.
+
+/// The peripheral instance a function's `label()` names: its first word
+/// (`TIM0  CH2  (PWM)` -> `TIM0`, `GPIO Output` -> `GPIO`), cut at the first
+/// underscore for a datasheet signal name (`COMP1_INP` -> `COMP1`).
+pub fn label_instance(label: &str) -> &str {
+    let word = label.split_whitespace().next().unwrap_or(label);
+    word.split('_').next().unwrap_or(word)
+}
+
+/// `labels` as runs of consecutive entries naming one instance, in their own
+/// order. Nothing is reordered: an instance whose entries are not next to
+/// each other makes two runs.
+pub fn instance_runs<S: AsRef<str>>(labels: &[S]) -> Vec<std::ops::Range<usize>> {
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        match runs.last_mut() {
+            Some(r)
+                if label_instance(labels[r.start].as_ref()) == label_instance(label.as_ref()) =>
+            {
+                r.end = i + 1;
+            }
+            _ => runs.push(i..i + 1),
+        }
+    }
+    runs
+}
+
+/// Is run `index` of `count` on a band? Every other one, the first included -
+/// and none when the list holds a single instance, where a band would
+/// separate nothing.
+pub fn run_shaded(index: usize, count: usize) -> bool {
+    count > 1 && index.is_multiple_of(2)
+}
+
 impl PinFunction {
     /// Short, filesystem-safe token for the selected function, used as the
     /// suffix of a generated pin file name (`pin<n>_<name>_<token>.rs`, e.g.
@@ -619,6 +659,55 @@ mod list_label_tests {
         // It never bites, because a tag is only ever compared with the name
         // of the SAME function: `list_label` reads both off `self`. Recording
         // it so nobody reuses the predicate somewhere it could.
+    }
+}
+
+/// The grouping both pin lists shade by.
+#[cfg(test)]
+mod instance_group_tests {
+    use super::{instance_runs, label_instance, run_shaded};
+
+    /// The instance is the label's first word, cut at an underscore for a
+    /// datasheet signal name.
+    #[test]
+    fn the_group_is_the_peripheral_instance() {
+        assert_eq!(label_instance("TIM0  CH2  (PWM)"), "TIM0");
+        assert_eq!(label_instance("TIM1  CH1N  (PWM)"), "TIM1");
+        assert_eq!(label_instance("USART2  TX"), "USART2");
+        assert_eq!(label_instance("ADC1  IN5"), "ADC1");
+        assert_eq!(label_instance("GPIO Output"), "GPIO");
+        assert_eq!(label_instance("COMP1_INP"), "COMP1");
+        assert_eq!(label_instance("RTC"), "RTC");
+    }
+
+    /// Four timers of four channels: four groups, TIM0 and TIM2 shaded.
+    #[test]
+    fn four_timers_make_four_groups_and_every_other_one_is_shaded() {
+        let labels: Vec<String> = (0..4)
+            .flat_map(|t| (0..4).map(move |c| format!("TIM{t}  CH{c}  (PWM)")))
+            .collect();
+        let runs = instance_runs(&labels);
+        assert_eq!(runs, vec![0..4, 4..8, 8..12, 12..16]);
+        let shaded: Vec<bool> = (0..runs.len()).map(|i| run_shaded(i, runs.len())).collect();
+        assert_eq!(shaded, vec![true, false, true, false]);
+    }
+
+    /// One instance is one group, and a band would separate nothing.
+    #[test]
+    fn a_single_instance_gets_no_band() {
+        let runs = instance_runs(&["GPIO Input", "GPIO Output"]);
+        assert_eq!(runs, vec![0..2]);
+        assert!(!run_shaded(0, runs.len()));
+        let runs = instance_runs(&["COMP1_INP", "COMP1_INM", "COMP2_INP"]);
+        assert_eq!(runs, vec![0..2, 2..3]);
+    }
+
+    /// Nothing is reordered: an instance split by another makes two runs.
+    #[test]
+    fn the_entries_keep_their_order() {
+        let runs = instance_runs(&["SPI1  SCK", "SPI2  SCK", "SPI1  MOSI"]);
+        assert_eq!(runs, vec![0..1, 1..2, 2..3]);
+        assert!(instance_runs::<&str>(&[]).is_empty());
     }
 }
 

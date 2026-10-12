@@ -574,6 +574,8 @@ impl AppIde {
         });
         match super::clone_project_dialog::copy_tree(&src, &dest) {
             Ok(n) => {
+                // A copy is another board: not the original's client key.
+                super::clone_project_dialog::forget_identity(&dest);
                 let dir = dest
                     .file_name()
                     .and_then(|n| n.to_str())

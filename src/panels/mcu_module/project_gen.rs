@@ -1168,6 +1168,23 @@ pub fn ensure_iot_deps(
     if tls {
         s = ensure_dep(&s, "embedded-io-async", true, "embedded-io-async = \"0.7\"", sources);
     }
+    // The client certificate's signature: mqtt_link.rs names p256's types and
+    // ecdsa's RFC 6979 signing. Both are embedded-tls's own versions, so no
+    // crate is added to the build - only named.
+    s = ensure_dep(
+        &s,
+        "p256",
+        tls,
+        "p256 = { version = \"0.13\", default-features = false, features = [\"ecdsa\"] }",
+        sources,
+    );
+    s = ensure_dep(
+        &s,
+        "ecdsa",
+        tls,
+        "ecdsa = { version = \"0.16\", default-features = false, features = [\"hazmat\", \"rfc6979\"] }",
+        sources,
+    );
     // rsa -> num-bigint-dig -> lazy_static -> spin, which needs atomic
     // compare-and-swap: on the parts without it, through portable-atomic.
     let no_cas = matches!(family, "esp32c2" | "esp32c3" | "esp32s2" | "rp2040");
@@ -5527,6 +5544,7 @@ mod iot_deps_tests {
             mqtt,
             mqtt_tls: false,
             mqtt_p384: false,
+            mqtt_client_cert: false,
             sntp: false,
             ble: false,
             thread: false,
@@ -5584,6 +5602,7 @@ mod iot_deps_tests {
                 mqtt: true,
                 mqtt_tls: false,
                 mqtt_p384: false,
+                mqtt_client_cert: false,
                 sntp: true,
                 ble: false,
                 thread: false,
@@ -5616,6 +5635,7 @@ mod iot_deps_tests {
             mqtt: false,
             mqtt_tls: false,
             mqtt_p384: false,
+            mqtt_client_cert: false,
             sntp: true,
             ble: false,
             thread: false,
@@ -5639,6 +5659,7 @@ mod iot_deps_tests {
             mqtt: false,
             mqtt_tls: false,
             mqtt_p384: false,
+            mqtt_client_cert: false,
             sntp: false,
             ble: false,
             thread: false,
@@ -5672,6 +5693,7 @@ mod iot_deps_tests {
             mqtt: false,
             mqtt_tls: false,
             mqtt_p384: false,
+            mqtt_client_cert: false,
             sntp: false,
             ble,
             thread: false,

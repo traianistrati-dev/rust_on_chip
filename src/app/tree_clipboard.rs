@@ -24,6 +24,7 @@ impl AppIde {
 
         let mut files = Vec::new();
         let mut skipped_binary = 0usize;
+        let mut skipped_secrets = false;
         for (path, content) in &self.project_tree.user_src_files {
             let rest = if req.kind == ClipKind::File {
                 if path != &req.path {
@@ -35,6 +36,12 @@ impl AppIde {
             } else {
                 continue;
             };
+            // The staging folder is shared and outlives the copy; secrets.rs
+            // holds passwords and the client key.
+            if path == crate::panels::mcu_module::codegen::iot_gen::SECRETS_PATH {
+                skipped_secrets = true;
+                continue;
+            }
             // A file the tree model could not read as text is an empty string
             // here (see `logic::scan_src_dir`). Copying it would silently
             // produce a 0-byte file at the far end, so it is counted out loud
@@ -72,11 +79,14 @@ impl AppIde {
                 // on purpose: if it lands in a text editor it is a harmless
                 // one-line marker, not a wall of source.
                 ctx.copy_text(clipboard::token_for(&id));
-                let skipped = if skipped_binary > 0 {
+                let mut skipped = if skipped_binary > 0 {
                     format!(", {skipped_binary} non-text skipped")
                 } else {
                     String::new()
                 };
+                if skipped_secrets {
+                    skipped.push_str(", secrets.rs left out");
+                }
                 set_tree_notice(
                     ctx,
                     format!(

@@ -494,9 +494,29 @@ those same checks — the very text of the firmware's `mqtt_link.rs`, built into
 a small program with your own cargo (about a minute the first time, seconds
 after; nothing of it in the IDE's dependencies) — against the broker, then the
 MQTT 5 CONNECT with the login from `secrets.rs`, and says what failed: the
-CA, the name, the dates, P-384, TLS 1.2, the password. Not reached: brokers that
-speak only TLS 1.2 (broker.hivemq.com) or want a client certificate (AWS IoT);
-revocation is not checked. The ESP heap grows by 32 KiB for the RSA checks
+CA, the name, the dates, P-384, TLS 1.2, the password. `mqtt_ca.rs` may hold
+several CAs, and the broker's chain may end in any of them, anywhere above its
+certificate — a cross-signed chain such as AWS IoT's, which runs past Amazon
+Root CA 1 to Starfield's roots, still ends in it; "Use a known CA" writes
+Let's Encrypt's, Amazon's (Root CA 1 and 3) or mosquitto.org's.
+
+**Client certificate** (mutual TLS, P-256 only): the board presents its own
+certificate when the broker asks — AWS IoT always does — and signs the
+handshake with its key, one scalar multiplication (about half a second on an
+RP2040, tens of milliseconds elsewhere) and no heap. **Generate key + CSR**
+makes the key in the "Test from this PC" helper and writes it straight into
+`secrets.rs`; the certificate request is shown to copy or save — for AWS,
+`aws iot create-certificate-from-csr` — and the certificate that comes back is
+pasted or loaded into the tab. The firmware reads both at compile time: a key
+that is not P-256, or a certificate that is not the key's own (checked when
+the key carries its public half, as every key the tab makes does; otherwise
+"Test from this PC" finds it), stops the build with a message saying so, and
+while either is empty the board connects without one. The key never reaches `mcu.config`, the IDE's saved window state, the
+tree's clipboard or a cloned project. AWS IoT needs TLS 1.3 switched on for the
+endpoint (the tab shows the one CLI line) and is reached on 8883, or on 443
+with the ALPN the board then sends. "Test from this PC" sends the same
+certificate and says whether the broker asked for it. Not reached: brokers
+that speak only TLS 1.2 (broker.hivemq.com); revocation is not checked. The ESP heap grows by 32 KiB for the RSA checks
 (on the S2 all of it moves to the RAM the bootloader used); a Pico gets a
 32 KiB heap and keys from its ring oscillator whitened with SHA-256. Not on the
 ESP32-C5 / C61 (no TRNG in esp-hal 1.1), nor on an ESP32 or ESP32-C2 with

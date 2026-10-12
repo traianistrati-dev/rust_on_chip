@@ -51,6 +51,28 @@ fn default_clone_dest(project_dir: &Path) -> String {
     cand.to_string_lossy().into_owned()
 }
 
+/// A copy is another board: the client certificate and its key stay with
+/// the original (two boards with one identity throw each other off the
+/// broker). The other secrets are copied.
+pub(super) fn forget_identity(dest: &Path) {
+    use crate::panels::mcu_module::codegen::iot_gen;
+    let path = dest.join(iot_gen::SECRETS_PATH);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut out = text.clone();
+    for name in iot_gen::CLIENT_SECRETS {
+        let prefix = format!("pub const {name}: &str = ");
+        let present = out.lines().any(|l| l.trim_start().starts_with(&prefix));
+        if present && iot_gen::read_secret(&out, name).as_deref() != Some("") {
+            out = iot_gen::write_secret(&out, name, "");
+        }
+    }
+    if out != text {
+        let _ = std::fs::write(&path, out);
+    }
+}
+
 /// Recursively copy `src` into `dst`, skipping any `target/` or `.git/` dir
 /// (build artifacts + version history — the latter per the feature's scope).
 /// Creates `dst` + parents. Returns the number of files copied.
@@ -98,11 +120,13 @@ impl AppIde {
         if dest.starts_with(src) {
             return Err("The destination is inside the project — pick a folder outside it.".into());
         }
-        copy_tree(src, dest).map_err(|e| {
+        let copied = copy_tree(src, dest).map_err(|e| {
             // Best-effort: leave a half-copy rather than deleting — the user picked
             // the path, and deleting on error is riskier than an orphan folder.
             format!("Copy failed: {e}")
-        })
+        })?;
+        forget_identity(dest);
+        Ok(copied)
     }
 
     /// Render the Clone-project modal (no-op when closed).

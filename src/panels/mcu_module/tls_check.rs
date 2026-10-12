@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 
 use crate::panels::mcu_module::codegen::iot_gen;
 
-/// What to test: the tab's settings, the CA of `mqtt_ca.rs`, and the
+/// What to test: the tab's settings, the CAs of `mqtt_ca.rs`, and the
 /// credentials of `secrets.rs` (sent only after the certificate checked out).
+/// No `Debug`: it carries the password and the client key.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Request {
     pub host: String,
@@ -28,6 +29,12 @@ pub struct Request {
     pub client_id: String,
     pub user: String,
     pub password: String,
+    /// AWS IoT's ALPN (port 443).
+    pub alpn: bool,
+    /// The client certificate and its key, as PEM - empty: none. The checker
+    /// reads them with the board's own code.
+    pub client_cert: String,
+    pub client_key: String,
 }
 
 impl Request {
@@ -141,6 +148,9 @@ pub fn stdin_lines(r: &Request) -> String {
         r.client_id.as_bytes(),
         r.user.as_bytes(),
         r.password.as_bytes(),
+        if r.alpn { b"1".as_slice() } else { b"0".as_slice() },
+        r.client_cert.as_bytes(),
+        r.client_key.as_bytes(),
     ] {
         o.push_str(&hex(field));
         o.push('\n');
@@ -180,25 +190,20 @@ fn failed(summary: impl Into<String>, tested: &Tested) -> State {
     }
 }
 
-fn run(request: &Request, shared: &Shared, ctx: &egui::Context) -> State {
-    let tested = request.tested();
+/// The checker, written (only what changed: cargo then has nothing to
+/// rebuild) and built: its executable.
+fn build_checker() -> Result<PathBuf, String> {
     let dir = dir();
-    // The sources, rewritten only when the IDE's differ: cargo then has
-    // nothing to rebuild.
     for (name, body) in iot_gen::tls_check_files() {
         let path = dir.join(name);
         if std::fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
             continue;
         }
-        let written = path
-            .parent()
+        path.parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, &body));
-        if let Err(e) = written {
-            return failed(format!("the checker could not be written to {}: {e}", dir.display()), &tested);
-        }
+            .and_then(|()| std::fs::write(&path, &body))
+            .map_err(|e| format!("the checker could not be written to {}: {e}", dir.display()))?;
     }
-
     // Run FROM the checker's folder: cargo and rustup look for their config
     // and `rust-toolchain.toml` from the working directory, and a firmware
     // project's (thumb target, build-std) must not apply here.
@@ -215,37 +220,36 @@ fn run(request: &Request, shared: &Shared, ctx: &egui::Context) -> State {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     match build.output() {
-        Err(e) => return failed(format!("cargo could not be started: {e}"), &tested),
+        Err(e) => return Err(format!("cargo could not be started: {e}")),
         Ok(out) if !out.status.success() => {
             let err = String::from_utf8_lossy(&out.stderr);
             let tail: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).rev().take(3).collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();
-            return failed(format!("the checker did not build: {}", tail.join(" / ")), &tested);
+            return Err(format!("the checker did not build: {}", tail.join(" / ")));
         }
         Ok(_) => {}
     }
-    if let Ok(mut s) = shared.lock() {
-        *s = State::Connecting;
-    }
-    ctx.request_repaint();
-
-    let exe = dir
+    Ok(dir
         .join("target")
         .join(host.as_deref().unwrap_or(""))
         .join("release")
         .join("rustonchip-tls-check")
-        .with_extension(std::env::consts::EXE_EXTENSION);
-    let mut check = Command::new(&exe);
+        .with_extension(std::env::consts::EXE_EXTENSION))
+}
+
+/// Runs the checker with `args`, `input` on its stdin; what it printed. A
+/// minute at most: a broker that never answers must not leave the tab
+/// waiting for ever.
+fn run_checker(exe: &Path, args: &[&str], input: &str) -> Result<String, String> {
+    let mut check = Command::new(exe);
     crate::build::no_window_raw(&mut check)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = match check.spawn() {
-        Ok(c) => c,
-        Err(e) => return failed(format!("the checker could not be started: {e}"), &tested),
-    };
+    let mut child = check.spawn().map_err(|e| format!("the checker could not be started: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_lines(request).as_bytes());
+        let _ = stdin.write_all(input.as_bytes());
     }
     let mut stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
@@ -255,7 +259,6 @@ fn run(request: &Request, shared: &Shared, ctx: &egui::Context) -> State {
         }
         s
     });
-    // A broker that never answers must not leave the tab waiting for ever.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match child.try_wait() {
@@ -264,12 +267,122 @@ fn run(request: &Request, shared: &Shared, ctx: &egui::Context) -> State {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return failed("no answer within a minute - the broker or the network is silent", &tested);
+                return Err("no answer within a minute - the broker or the network is silent".into());
             }
         }
     }
-    let stdout = reader.join().unwrap_or_default();
-    parse_output(&stdout, tested)
+    Ok(reader.join().unwrap_or_default())
+}
+
+fn run(request: &Request, shared: &Shared, ctx: &egui::Context) -> State {
+    let tested = request.tested();
+    let exe = match build_checker() {
+        Ok(exe) => exe,
+        Err(why) => return failed(why, &tested),
+    };
+    if let Ok(mut s) = shared.lock() {
+        *s = State::Connecting;
+    }
+    ctx.request_repaint();
+    match run_checker(&exe, &[], &stdin_lines(request)) {
+        Ok(stdout) => parse_output(&stdout, tested),
+        Err(why) => failed(why, &tested),
+    }
+}
+
+// ── A key and its certificate request ────────────────────────────────────
+
+/// Who the certificate is for, and the key: `None` = make a new one.
+#[derive(Clone)]
+pub struct CsrRequest {
+    pub country: String,
+    pub organization: String,
+    pub common_name: String,
+    pub key: Option<String>,
+    /// The project it was asked for: an answer for another is dropped.
+    pub project: PathBuf,
+}
+
+/// What came back. No `Debug`: it carries the key.
+pub struct CsrDone {
+    /// The key the checker made, as PEM - `None` when it was given.
+    pub key: Option<String>,
+    /// The request, as PEM.
+    pub csr: String,
+    pub project: PathBuf,
+}
+
+/// Where a request stands.
+#[derive(Default)]
+pub enum CsrState {
+    #[default]
+    Idle,
+    Building,
+    Done(Result<CsrDone, String>),
+}
+
+pub type CsrShared = Arc<Mutex<CsrState>>;
+
+/// Makes a key (or takes `request.key`) and its certificate request, in the
+/// background.
+pub fn start_csr(request: CsrRequest, ctx: egui::Context) -> CsrShared {
+    let shared: CsrShared = Arc::new(Mutex::new(CsrState::Building));
+    let out = Arc::clone(&shared);
+    std::thread::spawn(move || {
+        let done = csr(&request);
+        if let Ok(mut s) = out.lock() {
+            *s = CsrState::Done(done);
+        }
+        ctx.request_repaint();
+    });
+    shared
+}
+
+/// The `csr` mode's stdin: one hex line per value.
+fn csr_lines(r: &CsrRequest) -> String {
+    let hex = |s: &str| s.bytes().map(|x| format!("{x:02x}")).collect::<String>();
+    [&r.country, &r.organization, &r.common_name, r.key.as_deref().unwrap_or("")]
+        .iter()
+        .map(|s| hex(s) + "\n")
+        .collect()
+}
+
+/// The `csr` mode's answer: a key it made (when it was asked to), the
+/// request - both or nothing.
+pub fn parse_csr(stdout: &str, want_key: bool, project: PathBuf) -> Result<CsrDone, String> {
+    let unhex = |h: &str| -> Option<String> {
+        let h = h.trim();
+        let bytes: Option<Vec<u8>> = (0..h.len() / 2).map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect();
+        String::from_utf8(bytes?).ok()
+    };
+    let (mut key, mut csr, mut result) = (None, None, None);
+    for line in stdout.lines() {
+        if let Some(h) = line.strip_prefix("KEY ") {
+            key = unhex(h);
+        } else if let Some(h) = line.strip_prefix("CSR ") {
+            csr = unhex(h);
+        } else if let Some(r) = line.strip_prefix("RESULT ok ") {
+            result = Some(Ok(r.to_owned()));
+        } else if let Some(r) = line.strip_prefix("RESULT fail ") {
+            result = Some(Err(r.to_owned()));
+        }
+    }
+    match result {
+        Some(Ok(_)) => {}
+        Some(Err(why)) => return Err(why),
+        None => return Err("the checker stopped without an answer".into()),
+    }
+    let csr = csr.filter(|c| c.contains("-----BEGIN CERTIFICATE REQUEST-----")).ok_or("no request came back")?;
+    if want_key && !key.as_deref().is_some_and(|k| k.contains("-----BEGIN EC PRIVATE KEY-----")) {
+        return Err("no key came back".into());
+    }
+    Ok(CsrDone { key: if want_key { key } else { None }, csr, project })
+}
+
+fn csr(request: &CsrRequest) -> Result<CsrDone, String> {
+    let exe = build_checker()?;
+    let stdout = run_checker(&exe, &["csr"], &csr_lines(request))?;
+    parse_csr(&stdout, request.key.is_none(), request.project.clone())
 }
 
 #[cfg(test)]
@@ -289,10 +402,13 @@ mod tests {
             client_id: "rustonchip".into(),
             user: "me".into(),
             password: "a\nb".into(),
+            alpn: false,
+            client_cert: String::new(),
+            client_key: String::new(),
         };
         let text = stdin_lines(&r);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 11);
         assert_eq!(lines[1], "38383833");
         assert_eq!(lines[3], "31");
         assert_eq!(lines[4], "3082");
@@ -355,6 +471,43 @@ mod tests {
         assert!(!name.starts_with(crate::names::LEGACY_SLOT_PREFIX), "the slot sweep would delete {name}");
     }
 
+    /// The helper's `csr` mode, for real: a new key and its request, then a
+    /// request for a given key - each checked with the board's own reader.
+    /// Writes both to %TEMP%/rustonchip_csr_check.* for `openssl req -verify`.
+    ///
+    /// ```text
+    /// cargo test --bin rust_on_chip csr_mode_makes_a_key_and_its_request -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "builds the checker"]
+    fn csr_mode_makes_a_key_and_its_request() {
+        use crate::panels::mcu_module::iot;
+        let request = |key: Option<String>| CsrRequest {
+            country: "RO".into(),
+            organization: "RustOnChip".into(),
+            common_name: "rustonchip-test-thing".into(),
+            key,
+            project: PathBuf::from("p"),
+        };
+        let made = csr(&request(None)).unwrap_or_else(|e| panic!("{e}"));
+        let key = made.key.expect("a new key");
+        let (_, point) = iot::client_key(&key).unwrap();
+        assert!(point.is_some(), "the key carries its public half");
+        assert!(made.csr.starts_with("-----BEGIN CERTIFICATE REQUEST-----"), "{}", made.csr);
+        let dir = std::env::temp_dir();
+        std::fs::write(dir.join("rustonchip_csr_check.csr"), &made.csr).unwrap();
+        std::fs::write(dir.join("rustonchip_csr_check.key"), &key).unwrap();
+        // Again for the same key: no new key back.
+        let again = csr(&request(Some(key))).unwrap_or_else(|e| panic!("{e}"));
+        assert!(again.key.is_none());
+        assert!(again.csr.starts_with("-----BEGIN CERTIFICATE REQUEST-----"));
+        // A bad subject is the helper's refusal, not a crash.
+        let mut bad = request(None);
+        bad.country = "ROU".into();
+        assert!(csr(&bad).is_err());
+        println!("{}", made.csr);
+    }
+
     /// Building and running the real checker against test.mosquitto.org:
     /// network and a minute of cargo, so by hand only.
     ///
@@ -375,6 +528,9 @@ mod tests {
             client_id: "rustonchip-ide-test".into(),
             user: String::new(),
             password: String::new(),
+            alpn: false,
+            client_cert: String::new(),
+            client_key: String::new(),
         };
         let ctx = egui::Context::default();
         for (port, name, want) in [

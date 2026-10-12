@@ -78,14 +78,20 @@ const PANIC_TAIL: &str = include_str!("iot_templates/panic.rs");
 /// a broker exactly as the board will.
 const LINK_TLS_ESP_TAIL: &str = concat!(
     include_str!("iot_templates/mqtt_link_tls_esp.rs"),
-    include_str!("iot_templates/tls_verify.rs")
+    include_str!("iot_templates/tls_verify.rs"),
+    include_str!("iot_templates/pem_der.rs")
 );
 const LINK_TLS_CYW43_TAIL: &str = concat!(
     include_str!("iot_templates/mqtt_link_tls_cyw43.rs"),
-    include_str!("iot_templates/tls_verify.rs")
+    include_str!("iot_templates/tls_verify.rs"),
+    include_str!("iot_templates/pem_der.rs")
 );
 /// The certificate checks alone, for the PC's check.
 pub const TLS_VERIFY: &str = include_str!("iot_templates/tls_verify.rs");
+/// The PEM and DER code, for the PC's check (the IDE reads it too: `iot::pem`).
+pub const PEM_DER: &str = include_str!("iot_templates/pem_der.rs");
+/// A key and its certificate request laid out as DER, for the PC's helper.
+pub const CSR_DER: &str = include_str!("iot_templates/csr_der.rs");
 
 /// The IoT tab's "Test from this PC": a small host program the IDE builds
 /// once and runs, with the same embedded-tls (`std` for the PC, `p384` so it
@@ -106,6 +112,9 @@ publish = false
 embedded-tls = { version = \"0.19\", default-features = false, features = [\"std\", \"rsa\", \"p384\"] }
 embedded-io-adapters = { version = \"0.7\", features = [\"std\"] }
 rand_core = { version = \"0.6\", features = [\"getrandom\"] }
+# The board's client certificate: its signature, and the key + CSR the tab makes.
+p256 = { version = \"0.13\", default-features = false, features = [\"ecdsa\", \"std\"] }
+ecdsa = { version = \"0.16\", default-features = false, features = [\"hazmat\", \"rfc6979\", \"std\"] }
 
 [profile.release]
 opt-level = 2
@@ -114,6 +123,8 @@ opt-level = 2
         ("Cargo.toml", CARGO_TOML.to_owned()),
         ("src/main.rs", lf(include_str!("iot_templates/tls_check_main.rs"))),
         ("src/tls_verify.rs", lf(TLS_VERIFY)),
+        ("src/pem_der.rs", lf(PEM_DER)),
+        ("src/csr_der.rs", lf(CSR_DER)),
     ]
 }
 /// The CA `mqtt_ca.rs` starts with: ISRG Root X1, Let's Encrypt's root (SHA-256
@@ -137,17 +148,21 @@ const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 ///   packets the broker may send at its buffer.
 /// - `mqtt_link_tls_*_v1`: the first TLS links, the same code with the
 ///   certificate checks inline - now a block shared with "Test from this PC".
-const LEGACY_TAILS: [(&str, &str); 6] = [
+/// - `mqtt_link_tls_*_v2`: the TLS links before the client certificate, one
+///   CA, the chain walked from its last certificate.
+const LEGACY_TAILS: [(&str, &str); 8] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
     (THREAD, include_str!("iot_templates/legacy/thread_nrf_v1.rs")),
     (MQTT, include_str!("iot_templates/legacy/mqtt_v1.rs")),
     (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_esp_v1.rs")),
     (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v1.rs")),
+    (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_esp_v2.rs")),
+    (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v2.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 20] = [
+const TAILS: [(&str, &str); 22] = [
     (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
@@ -168,6 +183,8 @@ const TAILS: [(&str, &str); 20] = [
     LEGACY_TAILS[3],
     LEGACY_TAILS[4],
     LEGACY_TAILS[5],
+    LEGACY_TAILS[6],
+    LEGACY_TAILS[7],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -200,13 +217,20 @@ pub const WIFI_SECRETS: [&str; 4] = ["WIFI_SSID", "WIFI_PASSWORD", "MQTT_USERNAM
 /// the network key and the PSKc.
 pub const THREAD_DATASET: &str = "THREAD_DATASET";
 
+/// The board's client certificate and its P-256 key, as PEM (MQTT over TLS
+/// with a client certificate). The key is the one secret whose loss cannot
+/// be undone: the broker knows the board by the certificate made for it.
+pub const CLIENT_SECRETS: [&str; 2] = ["MQTT_CLIENT_CERT", "MQTT_CLIENT_KEY"];
+
 /// Every secret the tab edits.
-pub const SECRET_NAMES: [&str; 5] = [
+pub const SECRET_NAMES: [&str; 7] = [
     WIFI_SECRETS[0],
     WIFI_SECRETS[1],
     WIFI_SECRETS[2],
     WIFI_SECRETS[3],
     THREAD_DATASET,
+    CLIENT_SECRETS[0],
+    CLIENT_SECRETS[1],
 ];
 
 /// What a fresh `secrets.rs` holds for the Wi-Fi station: every value empty.
@@ -217,13 +241,19 @@ pub fn secrets_body() -> String {
 /// What a fresh `secrets.rs` holds for the links on: the station's lines,
 /// Thread's, or both - every value empty.
 pub fn secrets_body_for(station: bool, thread: bool) -> String {
+    secrets_body_with(station, thread, false)
+}
+
+/// The same, with the client certificate's lines when `client`.
+pub fn secrets_body_with(station: bool, thread: bool, client: bool) -> String {
     let mut o = String::new();
     o.push_str("// Credentials for the IoT tab. This file is listed in .gitignore, so it stays\n");
     o.push_str("// on this machine: edit the values here or in the tab, never in a commit.\n");
     let names = WIFI_SECRETS
         .iter()
         .filter(|_| station)
-        .chain(std::iter::once(&THREAD_DATASET).filter(|_| thread));
+        .chain(std::iter::once(&THREAD_DATASET).filter(|_| thread))
+        .chain(CLIENT_SECRETS.iter().filter(|_| client));
     for name in names {
         o.push_str(&format!("pub const {name}: &str = \"\";\n"));
     }
@@ -254,7 +284,10 @@ pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
         out.push((WIFI.to_owned(), wifi_file(active.platform)));
     }
     if active.station || active.thread {
-        out.push((SECRETS.to_owned(), secrets_body_for(active.station, active.thread)));
+        out.push((
+            SECRETS.to_owned(),
+            secrets_body_with(active.station, active.thread, active.mqtt_client_cert),
+        ));
     }
     if let (true, Some(m)) = (active.mqtt, &cfg.mqtt) {
         out.push((MQTT.to_owned(), mqtt_file(m)));
@@ -401,6 +434,28 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
         o.push_str("fn wall_clock() -> Option<u64> {\n    None\n}\n");
         o.push_str("async fn clock_ready() {}\n");
     }
+    if active.mqtt_client_cert {
+        o.push_str("/// The board's certificate and P-256 key (secrets.rs), sent when the broker\n");
+        o.push_str("/// asks - none while either is empty there. A key that is not P-256, or a\n");
+        o.push_str("/// certificate that is not its own, fails the build.\n");
+        o.push_str("const CLIENT_CERT_DER: [u8; pem_len(super::secrets::MQTT_CLIENT_CERT.as_bytes(), b\"CERTIFICATE\", false)] = pem_der(\n");
+        o.push_str("    super::secrets::MQTT_CLIENT_CERT,\n    b\"CERTIFICATE\",\n    false,\n    true,\n");
+        o.push_str("    \"MQTT_CLIENT_CERT in secrets.rs holds no PEM certificate\",\n);\n");
+        o.push_str("const CLIENT_KEY_DER: [u8; pem_len(\n    super::secrets::MQTT_CLIENT_KEY.as_bytes(),\n");
+        o.push_str("    key_label(super::secrets::MQTT_CLIENT_KEY.as_bytes()),\n    false,\n)] = pem_der(\n");
+        o.push_str("    super::secrets::MQTT_CLIENT_KEY,\n    key_label(super::secrets::MQTT_CLIENT_KEY.as_bytes()),\n    false,\n    true,\n");
+        o.push_str("    \"MQTT_CLIENT_KEY in secrets.rs holds no P-256 key (EC PRIVATE KEY or PRIVATE KEY, not encrypted)\",\n);\n");
+        o.push_str("pub const CLIENT: Option<(&[u8], [u8; 32])> = client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER);\n");
+    } else {
+        o.push_str("/// No client certificate - switch it on in the tab when the broker wants one.\n");
+        o.push_str("pub const CLIENT: Option<(&[u8], [u8; 32])> = None;\n");
+    }
+    if iot::aws_alpn(m) {
+        o.push_str("/// AWS IoT on port 443 takes MQTT with a client certificate by this ALPN.\n");
+        o.push_str("pub const ALPN: &[&[u8]] = &[b\"x-amzn-mqtt-ca\"];\n");
+    } else {
+        o.push_str("pub const ALPN: &[&[u8]] = &[];\n");
+    }
     o.push_str(GEN_END_CFG);
     o.push('\n');
     o.push_str(&lf(match active.platform {
@@ -410,13 +465,68 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
     o
 }
 
+/// The CAs the tab offers to put in mqtt_ca.rs, by the brokers that need
+/// them. Public certificates; each SHA-256 checked when added.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaPreset {
+    /// ISRG Root X1: Let's Encrypt's (test.mosquitto.org on 8886).
+    LetsEncrypt,
+    /// Amazon Root CA 1 (RSA, 8E:CD:E6:88...19:6E) and 3 (P-256, 18:CE:6C:FE...B3:A4):
+    /// AWS IoT serves a chain ending in either, by the signature it picks.
+    Aws,
+    /// mosquitto.org's own CA (FC:9E:45:E2...65:39): test.mosquitto.org on 8883 and 8884.
+    Mosquitto,
+}
+
+impl CaPreset {
+    pub const ALL: [CaPreset; 3] = [Self::LetsEncrypt, Self::Aws, Self::Mosquitto];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LetsEncrypt => "ISRG Root X1 (Let's Encrypt; test.mosquitto.org 8886)",
+            Self::Aws => "Amazon Root CA 1 + 3 (AWS IoT)",
+            Self::Mosquitto => "mosquitto.org (test.mosquitto.org 8883, 8884)",
+        }
+    }
+}
+
+const CA_AMAZON_ROOT_1: &str = include_str!("iot_templates/ca/amazon_root_ca1.pem");
+const CA_AMAZON_ROOT_3: &str = include_str!("iot_templates/ca/amazon_root_ca3.pem");
+const CA_MOSQUITTO: &str = include_str!("iot_templates/ca/mosquitto_org.pem");
+
+/// mqtt_ca.rs holding `preset`'s CA(s).
+pub fn mqtt_ca_preset(preset: CaPreset) -> String {
+    if preset == CaPreset::LetsEncrypt {
+        return mqtt_ca_file();
+    }
+    let (about, pem) = match preset {
+        CaPreset::Aws => (
+            "//! AWS IoT Core: Amazon Root CA 1 (RSA) and Amazon Root CA 3 (P-256) - the\n\
+             //! broker's chain ends in one or the other, by the signature it picks.\n",
+            format!("{}\n{}", lf(CA_AMAZON_ROOT_1).trim_end(), lf(CA_AMAZON_ROOT_3).trim_end()),
+        ),
+        _ => (
+            "//! test.mosquitto.org on ports 8883 and 8884 (client certificate): the\n\
+             //! mosquitto.org CA (https://test.mosquitto.org/ssl/mosquitto.org.crt).\n",
+            lf(CA_MOSQUITTO).trim_end().to_owned(),
+        ),
+    };
+    let mut o = String::new();
+    o.push_str("//! The CAs the MQTT broker's certificate chain must end in (IoT tab: MQTT over\n");
+    o.push_str("//! TLS). A CA is public: this file is committed. Paste your broker's CA(s)\n");
+    o.push_str("//! here, as PEM - every certificate in it is trusted.\n//!\n");
+    o.push_str(about);
+    o.push_str(&format!("pub const CA_PEM: &str = \"{pem}\";\n"));
+    o
+}
+
 /// `mqtt_ca.rs` as first written: ISRG Root X1. No markers - the whole file
 /// is the user's once written (`write_once`).
 pub fn mqtt_ca_file() -> String {
     let mut o = String::new();
     o.push_str("//! The CA the MQTT broker's certificate chain must end in (IoT tab: MQTT over\n");
     o.push_str("//! TLS). A CA is public: this file is committed. Paste your broker's CA here,\n");
-    o.push_str("//! as PEM - only the first certificate is used.\n");
+    o.push_str("//! as PEM - every certificate in it is trusted.\n");
     o.push_str("//!\n");
     o.push_str("//! Written with ISRG Root X1, Let's Encrypt's root (valid to 2035-06-04): it\n");
     o.push_str("//! signs test.mosquitto.org on port 8886, and brokers with an RSA Let's\n");
@@ -551,17 +661,23 @@ pub fn write_secret(file: &str, name: &str, value: &str) -> String {
     let prefix = format!("pub const {name}: &str = ");
     let line = format!("{prefix}{};", lit(value));
     let mut found = false;
-    let mut out: Vec<String> = file
-        .lines()
-        .map(|l| {
-            if !found && l.trim_start().starts_with(&prefix) {
-                found = true;
-                line.clone()
-            } else {
-                l.to_owned()
-            }
-        })
-        .collect();
+    // The whole statement goes, however many lines it spans (a PEM written
+    // by hand as a multi-line literal), not just its first.
+    let mut inside = false;
+    let mut out: Vec<String> = Vec::new();
+    for l in file.lines() {
+        if inside {
+            inside = !l.trim_end().ends_with(';');
+            continue;
+        }
+        if !found && l.trim_start().starts_with(&prefix) {
+            found = true;
+            inside = !l.trim_end().ends_with(';');
+            out.push(line.clone());
+        } else {
+            out.push(l.to_owned());
+        }
+    }
     if !found {
         out.push(line);
     }
@@ -686,7 +802,14 @@ fn is_pristine(name: &str, content: &str) -> bool {
         return secrets_pristine(content);
     }
     if name == MQTT_CA {
-        return lf(content) == mqtt_ca_file();
+        // Also as the IDE wrote it before mqtt_ca.rs held several CAs.
+        let content = lf(content);
+        return content == mqtt_ca_file()
+            || content
+                == mqtt_ca_file().replace(
+                    "//! as PEM - every certificate in it is trusted.\n",
+                    "//! as PEM - only the first certificate is used.\n",
+                );
     }
     let Some(tail) = tail_of(content) else {
         return false;
@@ -802,6 +925,29 @@ pub fn mqtt_files_left(
         );
     }
     None
+}
+
+/// The harnesses' secrets.rs with the dummy client identity in it
+/// (`iot::test_pki`): an empty one would build no signing code at all.
+#[cfg(test)]
+pub(crate) fn seed_test_identity(files: &mut [(String, String)]) {
+    use crate::panels::mcu_module::iot::test_pki;
+    if let Some(secrets) = files.iter_mut().find(|(p, _)| p == SECRETS_PATH) {
+        secrets.1 = write_secret(&secrets.1, CLIENT_SECRETS[0], test_pki::CERT);
+        secrets.1 = write_secret(&secrets.1, CLIENT_SECRETS[1], test_pki::KEY_SEC1);
+    }
+}
+
+/// An edited mqtt_link.rs from before the client certificate, which the IDE
+/// left: with the certificate on, its generated block calls what that tail
+/// does not have.
+pub fn client_link_left(link: Option<&str>, client: bool) -> Option<&'static str> {
+    (client && link.is_some_and(|l| l.contains("embedded_tls::") && !l.contains("fn client_cert(")))
+        .then_some(
+            "src/pins/configs/mqtt_link.rs is from before the client certificate, and you edited it, \
+             so the IDE left it: it cannot send the certificate. Move your changes into the current \
+             template (delete the file to get it).",
+        )
 }
 
 /// Is `content` the file `name` written for another radio than `platform`'s,
@@ -1579,7 +1725,7 @@ mod tests {
                     "pub const VERIFY: bool = true;",
                     "pub const SERVER_NAME: &str = \"test.mosquitto.org\";",
                     "pub type Link<'s> = TlsConnection<'s, Gate<'s>, Aes128GcmSha256>;",
-                    "if !verifier.authenticated {",
+                    "if VERIFY && !verifier.authenticated {",
                     "CertificateEntryRef::X509(der) if is_ca(der) => {}",
                     "use super::mqtt_ca::CA_PEM;",
                     // The gaps embedded-tls 0.19 leaves, closed: an empty
@@ -1588,7 +1734,8 @@ mod tests {
                     "if self.head[0] == 0x17 && len < 17 {",
                     "if pss && !self.leaf_rsa {",
                     "State::Established | State::FinWait1 | State::FinWait2",
-                    "const BEGIN: &[u8] = b\"-----BEGIN CERTIFICATE-----\";",
+                    "pem_der(CA_PEM, b\"CERTIFICATE\", true, false,",
+                    "chain.entries.truncate(keep);",
                     chip,
                 ] {
                     assert!(link.contains(want), "{id} sntp={sntp}: {want}:\n{link}");
@@ -2557,6 +2704,86 @@ mod tests {
         let nrf = file(&nrf);
         assert!(nrf.contains("DWT::cycle_count()") && nrf.contains("WatchdogHandle::steal"), "{nrf}");
         assert!(nrf.contains("fn report_at_boot(_spawner: embassy_executor::Spawner, _report: Report)"), "{nrf}");
+    }
+
+    /// The client certificate's block, on and off; ALPN only for AWS IoT on 443.
+    #[test]
+    fn the_link_carries_the_client_certificate() {
+        let mut m = tls_mcu("esp32c3", false);
+        let link = |m: &Mcu| {
+            config_files_for(m)
+                .into_iter()
+                .find(|(n, _)| n == MQTT_LINK)
+                .map(|(_, b)| b)
+                .unwrap()
+        };
+        let off = link(&m);
+        assert!(off.contains("pub const CLIENT: Option<(&[u8], [u8; 32])> = None;"), "{off}");
+        assert!(off.contains("pub const ALPN: &[&[u8]] = &[];"));
+        assert!(off.contains("fn client_cert(&mut self)") && off.contains("struct ClientKey("));
+        assert!(off.contains("pub const fn client_identity("), "pem_der.rs rides along");
+        assert!(is_pristine(MQTT_LINK, &off));
+        if let Some(mq) = m.iot.mqtt.as_mut() {
+            mq.client_cert = true;
+            mq.host = "abc-ats.iot.eu-west-1.amazonaws.com".into();
+            mq.port = 443;
+        }
+        let on = link(&m);
+        assert!(on.contains("pub const CLIENT: Option<(&[u8], [u8; 32])> = client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER);"), "{on}");
+        assert!(on.contains("super::secrets::MQTT_CLIENT_KEY"));
+        assert!(on.contains("pub const ALPN: &[&[u8]] = &[b\"x-amzn-mqtt-ca\"];"));
+        let secrets = config_files_for(&m).into_iter().find(|(n, _)| n == SECRETS).map(|(_, b)| b).unwrap();
+        assert!(secrets.contains("pub const MQTT_CLIENT_CERT: &str = \"\";") && secrets.contains("pub const MQTT_CLIENT_KEY: &str = \"\";"));
+        // An edited link from before it cannot send it; the tab says so.
+        let legacy = format!("{GEN_END_CFG}\n{}", lf(LEGACY_TAILS[6].1));
+        assert!(client_link_left(Some(&legacy), true).is_some());
+        assert!(client_link_left(Some(&legacy), false).is_none());
+        assert!(client_link_left(Some(&on), true).is_none());
+    }
+
+    /// An untouched TLS link from before the client certificate moves to the
+    /// current one; one the user edited stays.
+    #[test]
+    fn a_pristine_v2_link_is_upgraded() {
+        let m = tls_mcu("esp32c3", false);
+        let body = config_files_for(&m).into_iter().find(|(n, _)| n == MQTT_LINK).map(|(_, b)| b).unwrap();
+        let (block, _) = body.split_once(GEN_END_CFG).unwrap();
+        for (legacy, current) in [(LEGACY_TAILS[6].1, LINK_TLS_ESP_TAIL), (LEGACY_TAILS[7].1, LINK_TLS_CYW43_TAIL)] {
+            let old = format!("{block}{GEN_END_CFG}\n{}", lf(legacy));
+            assert!(is_pristine(MQTT_LINK, &old));
+            let up = upgraded(MQTT_LINK, &old, &body).expect("upgraded");
+            assert!(up.ends_with(&lf(LINK_TLS_ESP_TAIL)) || up.ends_with(&lf(current)));
+            let edited = old.replace("RETRY", "RETRY_EDITED");
+            assert_eq!(upgraded(MQTT_LINK, &edited, &body), None);
+        }
+    }
+
+    /// The CA presets hold what they say.
+    #[test]
+    fn the_ca_presets_hold_their_cas() {
+        use crate::panels::mcu_module::iot;
+        let aws = mqtt_ca_preset(CaPreset::Aws);
+        let pem = ca_pem_of(&aws).unwrap();
+        assert_eq!(pem.matches("-----BEGIN CERTIFICATE-----").count(), 2);
+        assert!(iot::ca_summary(pem).unwrap().name.contains("Amazon Root CA 1"));
+        assert!(iot::cas_der(pem).is_some());
+        let mosq = mqtt_ca_preset(CaPreset::Mosquitto);
+        assert!(iot::ca_summary(ca_pem_of(&mosq).unwrap()).unwrap().name.contains("mosquitto.org"));
+        assert_eq!(mqtt_ca_preset(CaPreset::LetsEncrypt), mqtt_ca_file());
+    }
+
+    /// A secret written as several lines is replaced whole.
+    #[test]
+    fn a_multi_line_secret_is_replaced_whole() {
+        let file = "pub const MQTT_CLIENT_KEY: &str = \"-----BEGIN EC PRIVATE KEY-----\nabc\n-----END EC PRIVATE KEY-----\";\npub const MQTT_CLIENT_CERT: &str = \"\";\n";
+        let multi = "pub const MQTT_CLIENT_KEY: &str = r\"-----BEGIN EC PRIVATE KEY-----\nabc\n-----END EC PRIVATE KEY-----\n\";\npub const MQTT_CLIENT_CERT: &str = \"\";\n";
+        for f in [file, multi] {
+            let out = write_secret(f, CLIENT_SECRETS[1], "");
+            assert_eq!(out, "pub const MQTT_CLIENT_KEY: &str = \"\";\npub const MQTT_CLIENT_CERT: &str = \"\";\n", "{f}");
+        }
+        // The CA file an earlier IDE wrote still counts as untouched.
+        let old = mqtt_ca_file().replace("every certificate in it is trusted.", "only the first certificate is used.");
+        assert!(is_pristine(MQTT_CA, &old));
     }
 
     /// The signature the tab checks is the template's.

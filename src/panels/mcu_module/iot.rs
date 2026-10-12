@@ -420,6 +420,10 @@ pub struct MqttConfig {
     /// With TLS: accept chains signed with P-384 - an ECDSA Let's Encrypt
     /// certificate's issuers are (embedded-tls's `p384`, 114 KiB of flash).
     pub p384: bool,
+    /// The board presents a client certificate (secrets.rs: MQTT_CLIENT_CERT
+    /// and MQTT_CLIENT_KEY, P-256) when the broker asks - AWS IoT does.
+    #[serde(default)]
+    pub client_cert: bool,
 }
 
 impl Default for MqttConfig {
@@ -434,6 +438,7 @@ impl Default for MqttConfig {
             verify: true,
             server_name: String::new(),
             p384: false,
+            client_cert: false,
         }
     }
 }
@@ -496,6 +501,7 @@ pub struct CaSummary {
     pub is_ca: Option<bool>,
     pub key: CaKey,
     /// More than one certificate pasted: only the first is used.
+    /// More than one certificate: each is trusted.
     pub more: bool,
 }
 
@@ -513,6 +519,84 @@ fn der(d: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         d = &d[n..];
     }
     (d.len() >= len).then(|| (tag, &d[..len], &d[len..]))
+}
+
+/// The board's PEM and DER code (`iot_templates/pem_der.rs`), word for word:
+/// what the tab says of a key or a certificate is what the firmware builds.
+#[allow(dead_code)]
+pub mod pem {
+    include!("codegen/iot_templates/pem_der.rs");
+}
+
+/// The helper's key and certificate-request layout (`iot_templates/csr_der.rs`):
+/// the tab checks a subject with it, the tests the bytes.
+#[allow(dead_code)]
+pub mod csr {
+    include!("codegen/iot_templates/csr_der.rs");
+}
+
+/// Every certificate of `pem`, DER after DER - as the firmware's `CA_DER`
+/// holds mqtt_ca.rs's CAs. `None` when there is none.
+pub fn cas_der(pem_text: &str) -> Option<Vec<u8>> {
+    let p = pem_text.as_bytes();
+    let mut out = vec![0u8; pem::pem_len(p, b"CERTIFICATE", true)];
+    let n = pem::pem_decode(p, b"CERTIFICATE", true, &mut out);
+    (n == out.len() && out.first() == Some(&0x30)).then_some(out)
+}
+
+/// A P-256 key: its scalar, and its public point when the key carries one.
+pub type ClientKey = ([u8; 32], Option<[u8; 65]>);
+
+/// A client certificate: its DER, what it says, its P-256 point.
+pub type ClientCert = (Vec<u8>, CaSummary, Option<[u8; 65]>);
+
+/// A client key from secrets.rs (PEM): its scalar and, when it carries one,
+/// its public point - as the firmware reads it. `Err` says why not.
+pub fn client_key(pem_text: &str) -> Result<ClientKey, &'static str> {
+    let p = pem_text.as_bytes();
+    if pem::blank(p) {
+        return Err("no key yet");
+    }
+    if pem_text.contains("ENCRYPTED") || pem_text.contains("Proc-Type:") {
+        return Err("an encrypted key - the board needs it in the clear (openssl ec -in key.pem -out plain.pem)");
+    }
+    if pem_text.contains("BEGIN RSA PRIVATE KEY") {
+        return Err("an RSA key - the board signs with P-256 only: make a P-256 key and a CSR (Generate key + CSR)");
+    }
+    let label = pem::key_label(p);
+    let mut der = vec![0u8; pem::pem_len(p, label, false)];
+    if der.is_empty() {
+        return Err("not a PEM key - BEGIN EC PRIVATE KEY or BEGIN PRIVATE KEY, END line included");
+    }
+    pem::pem_decode(p, label, false, &mut der);
+    pem::ec_key(&der).ok_or("not a P-256 key - the board signs with P-256 only (an RSA or other curve key will not do)")
+}
+
+/// A client certificate from secrets.rs (PEM): its DER, what it says, and its
+/// public point when its key is P-256.
+pub fn client_cert(pem_text: &str) -> Result<ClientCert, &'static str> {
+    let p = pem_text.as_bytes();
+    if pem::blank(p) {
+        return Err("no certificate yet");
+    }
+    let mut der = vec![0u8; pem::pem_len(p, b"CERTIFICATE", false)];
+    if der.is_empty() {
+        return Err("not a PEM certificate - BEGIN CERTIFICATE and END lines included");
+    }
+    pem::pem_decode(p, b"CERTIFICATE", false, &mut der);
+    let summary = ca_summary(pem_text)?;
+    let point = pem::cert_ec_point(&der);
+    Ok((der, summary, point))
+}
+
+/// A certificate pasted from the AWS CLI's JSON carries `\n` escapes rather
+/// than line ends: `n` is base64, so it would decode into garbage. Undone
+/// when the text has no real line end at all.
+pub fn unescape_pem(text: &str) -> String {
+    if text.contains('\n') || !text.contains("\\n") {
+        return text.trim().to_owned();
+    }
+    text.replace("\\n", "\n").trim().trim_matches('"').to_owned()
 }
 
 /// The first PEM certificate's DER - as the firmware's `pem_to_der` reads it.
@@ -669,7 +753,27 @@ pub fn tls_problem(m: &MqttConfig) -> Option<&'static str> {
     if host.ends_with(".azure-devices.net") {
         return Some("Azure IoT Hub speaks MQTT 3.1.1, and rust-mqtt only MQTT 5");
     }
+    if aws_iot_host(host) && !m.client_cert {
+        return Some("AWS IoT takes a board only by its client certificate: switch \"Client certificate\" on");
+    }
     None
+}
+
+/// An AWS IoT Core data endpoint: `<prefix>-ats.iot.<region>.amazonaws.com`
+/// (`.amazonaws.com.cn` in China). Not Amazon MQ, which logs in by password.
+pub fn aws_iot_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let rest = host
+        .strip_suffix(".amazonaws.com")
+        .or_else(|| host.strip_suffix(".amazonaws.com.cn"));
+    rest.and_then(|r| r.rsplit_once(".iot."))
+        .is_some_and(|(prefix, region)| !prefix.is_empty() && !region.is_empty() && !region.contains('.'))
+}
+
+/// AWS IoT on port 443 takes MQTT with a client certificate only when the
+/// ClientHello asks for it by ALPN: `x-amzn-mqtt-ca`.
+pub fn aws_alpn(m: &MqttConfig) -> bool {
+    m.tls && m.client_cert && m.port == 443 && aws_iot_host(&m.host)
 }
 
 impl MqttConfig {
@@ -860,6 +964,8 @@ pub struct Active {
     pub mqtt_tls: bool,
     /// ... accepting P-384 chains.
     pub mqtt_p384: bool,
+    /// ... the board presenting a client certificate.
+    pub mqtt_client_cert: bool,
     /// SNTP over the stack - only with the station.
     pub sntp: bool,
     /// Bluetooth LE.
@@ -904,6 +1010,7 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
         mqtt: station && mcu.iot.mqtt.as_ref().is_some_and(|m| !m.tls || tls_ok),
         mqtt_tls: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls) && tls_ok,
         mqtt_p384: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls && m.p384) && tls_ok,
+        mqtt_client_cert: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls && m.client_cert) && tls_ok,
         sntp: station && mcu.iot.sntp.is_some(),
         ble,
         thread,
@@ -1138,9 +1245,122 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
     }
 }
 
+/// A P-256 key whose scalar is 1 and a self-signed certificate of its public
+/// key (the curve's G) - a dummy, nothing secret: for the tests and the
+/// matrix, which build the client certificate's code.
+#[cfg(test)]
+pub(crate) mod test_pki {
+    /// A P-256 key whose scalar is 1 - a dummy, for tests and the matrix only -
+    /// and a self-signed certificate of its public key (the curve's G).
+    pub const KEY_SEC1: &str = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABoAoGCCqGSM49\nAwEHoUQDQgAEaxfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpZP40Li/hp/\nm47n60p8D54WK84zV2sxXs7LtkBoN79R9Q==\n-----END EC PRIVATE KEY-----\n";
+    pub const KEY_PKCS8: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAGhRANCAARrF9Hy4SxCR/i85uVjpEDydwN9gS3r
+M6D0oTlF2JjClk/jQuL+Gn+bjufrSnwPnhYrzjNXazFezsu2QGg3v1H1
+-----END PRIVATE KEY-----
+    ";
+    pub const CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBsjCCAVegAwIBAgIUQJoiYkcDmdfZJFlbe8O5ahizAUowCgYIKoZIzj0EAwIw
+LTErMCkGA1UEAwwicnVzdG9uY2hpcCB0ZXN0IGtleSAxIChub3Qgc2VjcmV0KTAg
+Fw0yNjEwMTExNzE4MDdaGA8yMTI2MDkxNzE3MTgwN1owLTErMCkGA1UEAwwicnVz
+dG9uY2hpcCB0ZXN0IGtleSAxIChub3Qgc2VjcmV0KTBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4a
+f5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfWjUzBRMB0GA1UdDgQWBBS0Z6OZnrXv
+pnHeADLwipyeXv2g4TAfBgNVHSMEGDAWgBS0Z6OZnrXvpnHeADLwipyeXv2g4TAP
+BgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQCXyy/KJ1vriPOsnMl2
+gwSNA/Zp5yEe7ZGQh69qOfMwbQIhAPyHI8wv2E/0E2UrlNoMa+R8DCS2hEv0DeIF
+6E/EYPT7
+-----END CERTIFICATE-----
+    ";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The certificate request the helper sends out, laid out as PKCS#10 says:
+    /// read back with the board's own DER walker.
+    #[test]
+    fn the_certificate_request_is_pkcs10() {
+        let (_, point) = client_key(test_pki::KEY_SEC1).unwrap();
+        let point = point.unwrap();
+        let subject = csr::Subject {
+            country: "RO",
+            organization: "RustOnChip",
+            common_name: &"thing-".repeat(10),
+        };
+        assert_eq!(subject.problem(), None);
+        let info = csr::request_info(&subject, &point);
+        let request = csr::request(&info, &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]);
+        // CertificationRequest { info, algorithm, signature }
+        let (0x30, body, len) = pem::der_at(&request, 0).unwrap() else { panic!() };
+        assert_eq!(body + len, request.len());
+        let (0x30, info_at, info_len) = pem::der_at(&request, body).unwrap() else { panic!() };
+        assert_eq!(&request[body..info_at + info_len], &info[..]);
+        let (0x30, alg, alg_len) = pem::der_at(&request, info_at + info_len).unwrap() else { panic!() };
+        assert_eq!(&request[alg..alg + alg_len], &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02], "no parameters");
+        let (0x03, bits, _) = pem::der_at(&request, alg + alg_len).unwrap() else { panic!() };
+        assert_eq!(request[bits], 0);
+        // The info: version 0, the name (long form past 127 bytes), the key, [0] empty.
+        assert_eq!(&info[..2], &[0x30, 0x81]);
+        assert!(info.ends_with(&[0xA0, 0x00]));
+        assert!(info.windows(65).any(|w| w == point), "the key is in it");
+        // The key PEM the helper writes is the one the board reads.
+        let d = client_key(test_pki::KEY_SEC1).unwrap().0;
+        let pem_text = csr::to_pem("EC PRIVATE KEY", &csr::sec1_key(&d, &point));
+        assert_eq!(client_key(&pem_text).unwrap(), (d, Some(point)));
+        assert_eq!(pem_text, test_pki::KEY_SEC1, "openssl writes the same");
+        assert!(csr::Subject { country: "ROU", organization: "", common_name: "x" }.problem().is_some());
+        assert!(csr::Subject { country: "", organization: "", common_name: " " }.problem().is_some());
+    }
+
+    /// AWS IoT's data endpoints, not every amazonaws.com host.
+    #[test]
+    fn aws_iot_hosts_are_told_apart() {
+        assert!(aws_iot_host("a1b2c3d4e5f6g7-ats.iot.eu-central-1.amazonaws.com"));
+        assert!(aws_iot_host("A1B2-ats.iot.cn-north-1.amazonaws.com.cn"));
+        assert!(!aws_iot_host("b-1234.mq.eu-central-1.amazonaws.com"), "Amazon MQ");
+        assert!(!aws_iot_host("iot.eu-central-1.amazonaws.com"));
+        assert!(!aws_iot_host("test.mosquitto.org"));
+        let mut m = MqttConfig {
+            host: "x-ats.iot.us-east-1.amazonaws.com".into(),
+            port: TLS_PORT,
+            tls: true,
+            ..MqttConfig::default()
+        };
+        assert!(tls_problem(&m).is_some_and(|p| p.contains("client certificate")));
+        m.client_cert = true;
+        assert_eq!(tls_problem(&m), None);
+        assert!(!aws_alpn(&m), "8883 needs no ALPN");
+        m.port = 443;
+        assert!(aws_alpn(&m));
+    }
+
+    /// The tab reads a key and a certificate as the board does.
+    #[test]
+    fn client_keys_and_certificates_are_read_as_the_board_reads_them() {
+        let (sec1, pkcs8, cert) = (test_pki::KEY_SEC1, test_pki::KEY_PKCS8, test_pki::CERT);
+        let (d, point) = client_key(sec1).unwrap();
+        assert_eq!(d[31], 1, "the test key is 1");
+        let (d8, point8) = client_key(pkcs8).unwrap();
+        assert_eq!(d, d8);
+        let (der, summary, cert_point) = client_cert(cert).unwrap();
+        assert_eq!(der.first(), Some(&0x30));
+        assert_eq!(summary.key, CaKey::EcP256);
+        assert_eq!(point, cert_point, "the certificate is the key's");
+        assert_eq!(point8, cert_point);
+        assert!(client_key("").unwrap_err().contains("no key"));
+        assert!(client_key("-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----").unwrap_err().contains("RSA"));
+        assert!(client_key(&sec1.replace("-----BEGIN EC PRIVATE KEY-----\n", "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n")).unwrap_err().contains("encrypted"));
+        assert!(client_cert(" ").unwrap_err().contains("no certificate"));
+        // The AWS CLI's JSON form.
+        let json = cert.trim().replace('\n', "\\n");
+        assert_eq!(client_cert(&unescape_pem(&json)).unwrap().0, der);
+        // mqtt_ca.rs's CAs, all of them.
+        let two = format!("{cert}\n{cert}");
+        assert_eq!(cas_der(&two).unwrap().len(), 2 * der.len());
+    }
+
 
     /// The report's topic is always a topic name a `Message` can carry.
     #[test]

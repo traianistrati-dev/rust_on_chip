@@ -2090,6 +2090,9 @@ mod emit_for_manual_compile {
                     && crate::panels::mcu_module::iot::tls_available(&mcu.family, coex).is_ok();
                 // The C3's TLS row also builds embedded-tls's P-384 checks.
                 m.p384 = mode == "mqtts";
+                // `all` presents a client certificate wherever TLS runs: the
+                // signing code on every chip's TLS row (the S2 and C2 are tight).
+                m.client_cert = all && m.tls;
                 m.port = m.port_for_tls(m.tls);
                 mcu.iot.mqtt = Some(m);
             }
@@ -2288,6 +2291,18 @@ mod emit_for_manual_compile {
             }
         }
         let mut user: Vec<(String, String)> = mcu.pin_tree_files();
+        // The client certificate: the dummy identity, so the signing code is
+        // built and linked, not folded away as `CLIENT = None`.
+        if iot_active.is_some_and(|a| a.mqtt_client_cert) {
+            use crate::panels::mcu_module::codegen::iot_gen;
+            iot_gen::seed_test_identity(&mut user);
+            let link = user
+                .iter()
+                .find(|(p, _)| p == "src/pins/configs/mqtt_link.rs")
+                .map(|(_, c)| c.as_str())
+                .unwrap_or("");
+            assert!(link.contains("client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER)"), "{link}");
+        }
         // Thread with a real dataset: an empty one makes `commissioned()` a
         // constant false, and LTO would drop the whole attach / IPv6 / UDP
         // path - the code a user with a dataset builds - from the link.

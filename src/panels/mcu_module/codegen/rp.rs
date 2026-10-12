@@ -4977,16 +4977,18 @@ mod emit_async_for_manual_compile {
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_rp_iot_project() {
         use crate::panels::mcu_module::iot::{self, BleConfig, MqttConfig, SntpConfig};
-        // (board, folder, Wi-Fi + MQTT + SNTP, Bluetooth, MQTT over TLS): the
-        // Wi-Fi shape, Wi-Fi beside Bluetooth, Bluetooth alone with the LED in
-        // main, and MQTT over TLS - its heap, its whitened RNG, SNTP's clock.
-        for (id, dir_name, wifi, ble, tls) in [
-            ("rp2040_pico_w", "eide_rp2040w_iot_check", true, false, false),
-            ("rp2350_pico2_w", "eide_rp2350w_iot_check", true, false, false),
-            ("rp2040_pico_w", "eide_rp2040w_ble_check", true, true, false),
-            ("rp2350_pico2_w", "eide_rp2350w_ble_check", false, true, false),
-            ("rp2040_pico_w", "eide_rp2040w_tls_check", true, false, true),
-            ("rp2350_pico2_w", "eide_rp2350w_tls_check", true, false, true),
+        // (board, folder, Wi-Fi + MQTT + SNTP, Bluetooth, MQTT over TLS, a
+        // client certificate): the Wi-Fi shape, Wi-Fi beside Bluetooth,
+        // Bluetooth alone with the LED in main, and MQTT over TLS - its heap,
+        // its whitened RNG, SNTP's clock - the RP2040's with the board's own
+        // certificate, so P-256 signing links on the M0+.
+        for (id, dir_name, wifi, ble, tls, cert) in [
+            ("rp2040_pico_w", "eide_rp2040w_iot_check", true, false, false, false),
+            ("rp2350_pico2_w", "eide_rp2350w_iot_check", true, false, false, false),
+            ("rp2040_pico_w", "eide_rp2040w_ble_check", true, true, false, false),
+            ("rp2350_pico2_w", "eide_rp2350w_ble_check", false, true, false, false),
+            ("rp2040_pico_w", "eide_rp2040w_tls_check", true, false, true, true),
+            ("rp2350_pico2_w", "eide_rp2350w_tls_check", true, false, true, false),
         ] {
             let def = builtins::builtin_definitions()
                 .into_iter()
@@ -5008,6 +5010,7 @@ mod emit_async_for_manual_compile {
                 m.tls = tls;
                 // The Pico 2 W's TLS also builds embedded-tls's P-384 checks.
                 m.p384 = tls && id == "rp2350_pico2_w";
+                m.client_cert = cert;
                 m.port = m.port_for_tls(tls);
                 mcu.iot.mqtt = Some(m);
                 mcu.iot.sntp = Some(SntpConfig::default());
@@ -5047,7 +5050,11 @@ mod emit_async_for_manual_compile {
 
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
-            let user: Vec<(String, String)> = mcu.pin_tree_files();
+            let mut user: Vec<(String, String)> = mcu.pin_tree_files();
+            if cert {
+                crate::panels::mcu_module::codegen::iot_gen::seed_test_identity(&mut user);
+                assert!(active.is_some_and(|a| a.mqtt_client_cert), "{id}: the client certificate");
+            }
             // The credentials go with the station: Bluetooth alone has none.
             assert_eq!(
                 user.iter().any(|(p, _)| p == crate::panels::mcu_module::codegen::iot_gen::SECRETS_PATH),

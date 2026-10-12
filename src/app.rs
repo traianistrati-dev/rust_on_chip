@@ -5024,7 +5024,16 @@ impl eframe::App for AppIde {
             .wide_layout
             .unwrap_or((self.side_panels_collapsed, self.tree_collapsed));
         let mut state = PersistedState {
-            user_src_files: self.project_tree.user_src_files.clone(),
+            // Never secrets.rs: app.ron sits in the roaming profile, and the
+            // file holds the Wi-Fi and broker passwords and the client key.
+            // Nothing is lost: a project reopens from its folder.
+            user_src_files: self
+                .project_tree
+                .user_src_files
+                .iter()
+                .filter(|(p, _)| p != crate::panels::mcu_module::codegen::iot_gen::SECRETS_PATH)
+                .cloned()
+                .collect(),
             user_src_folders: self.project_tree.user_src_folders.clone(),
             paths_root_relative: true,
             project_name: self.project_name.clone(),

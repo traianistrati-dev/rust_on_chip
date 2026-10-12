@@ -12,6 +12,10 @@
 // authenticated: whoever controls the network can pose as the broker and read
 // the MQTT password.
 //
+// With a client certificate (CLIENT, from secrets.rs) the board proves who it
+// is when the broker asks - AWS IoT does: it sends the certificate and signs
+// the handshake with its P-256 key (one scalar multiplication, no heap).
+//
 // TLS 1.3 only, AES-128-GCM with P-256: a broker that speaks only TLS 1.2
 // (broker.hivemq.com) cannot be reached. Every certificate in the broker's
 // chain must be signed with RSA or ECDSA P-256 - or P-384 with the tab's
@@ -26,8 +30,8 @@ use embassy_net::tcp::{Error as TcpError, State, TcpSocket};
 use embassy_time::Timer;
 use embedded_io_async::{ErrorType, Read, Write};
 use embedded_tls::{
-    Aes128GcmSha256, CryptoProvider, CryptoRngCore, TlsConfig, TlsConnection, TlsContext, TlsError,
-    TlsVerifier, UnsecureProvider,
+    Aes128GcmSha256, Certificate, CryptoProvider, CryptoRngCore, SignatureScheme, TlsConfig,
+    TlsConnection, TlsContext, TlsError, TlsVerifier,
 };
 
 use super::mqtt_ca::CA_PEM;
@@ -85,8 +89,10 @@ impl embedded_tls::TlsClock for CertClock {
     }
 }
 
-/// The CA as DER, decoded by the compiler: a broken paste fails the build.
-static CA_DER: [u8; der_len(CA_PEM)] = pem_to_der(CA_PEM);
+/// The CAs as DER, one after the other, decoded by the compiler: a broken
+/// paste fails the build.
+static CA_DER: [u8; pem_len(CA_PEM.as_bytes(), b"CERTIFICATE", true)] =
+    pem_der(CA_PEM, b"CERTIFICATE", true, false, "CA_PEM in mqtt_ca.rs holds no PEM certificate");
 
 /// The connected socket, wrapped in TLS: the handshake, awaited whole.
 pub(super) async fn open<'s>(socket: TcpSocket<'s>, links: &'s mut LinkBuffers) -> Result<Link<'s>, ()> {
@@ -99,50 +105,61 @@ pub(super) async fn open<'s>(socket: TcpSocket<'s>, links: &'s mut LinkBuffers) 
     } else {
         TlsConfig::new().with_server_name(SERVER_NAME)
     };
-    if VERIFY {
-        if ip {
-            return Err(());
-        }
-        let mut verifier = Verifier::new(&CA_DER[..]);
-        let provider = Provider {
-            rng: tls_rng()?,
-            verifier: &mut verifier,
-        };
-        link.open(TlsContext::new(&config, provider))
-            .await
-            .map_err(drop)?;
-        // embedded-tls 0.19 also completes a handshake in which the server sent
-        // no certificate at all (its issue #215): then nobody was authenticated.
-        if !verifier.authenticated {
-            return Err(());
-        }
+    let config = if ALPN.is_empty() {
+        config
     } else {
-        let provider = UnsecureProvider::new::<Aes128GcmSha256>(tls_rng()?);
-        link.open(TlsContext::new(&config, provider))
-            .await
-            .map_err(drop)?;
+        config.with_alpn(ALPN)
+    };
+    if VERIFY && ip {
+        return Err(());
     }
+    let mut verifier = Verifier::new(&CA_DER[..]);
+    let provider = Provider {
+        rng: tls_rng()?,
+        verifier: if VERIFY { Some(&mut verifier) } else { None },
+    };
+    link.open(TlsContext::new(&config, provider))
+        .await
+        .map_err(drop)?;
+    // embedded-tls 0.19 also completes a handshake in which the server sent
+    // no certificate at all (its issue #215): then nobody was authenticated.
+    if VERIFY && !verifier.authenticated {
+        return Err(());
+    }
+    // A broker that refuses the board's certificate says so on the first
+    // read, not here: mqtt.rs then finds the connection closed and retries.
     Ok(link)
 }
 
-/// What embedded-tls asks for during the handshake: randomness, and the
-/// verifier that checks the broker's chain, its signature and its name.
+/// What embedded-tls asks for during the handshake: randomness, the verifier
+/// that checks the broker's chain, its signature and its name (none: encrypt
+/// only) - and, when the broker asks, the board's certificate and signature.
 struct Provider<'v, 'a> {
     rng: TlsRng,
-    verifier: &'v mut Verifier<'a>,
+    verifier: Option<&'v mut Verifier<'a>>,
 }
 
 impl CryptoProvider for Provider<'_, '_> {
     type CipherSuite = Aes128GcmSha256;
-    // No client certificate, so nothing is ever signed.
-    type Signature = [u8; 0];
+    type Signature = p256::ecdsa::DerSignature;
 
     fn rng(&mut self) -> impl CryptoRngCore {
         &mut self.rng
     }
 
     fn verifier(&mut self) -> Result<&mut impl TlsVerifier<Aes128GcmSha256>, TlsError> {
-        Ok(&mut *self.verifier)
+        // None: embedded-tls checks nothing at all - the chain, the signature
+        // and the name alike.
+        self.verifier.as_deref_mut().ok_or(TlsError::Unimplemented)
+    }
+
+    fn signer(&mut self) -> Result<(impl ecdsa::signature::SignerMut<Self::Signature>, SignatureScheme), TlsError> {
+        let (_, key) = CLIENT.ok_or(TlsError::Unimplemented)?;
+        Ok((ClientKey::new(key)?, SignatureScheme::EcdsaSecp256r1Sha256))
+    }
+
+    fn client_cert(&mut self) -> Option<Certificate<impl AsRef<[u8]>>> {
+        CLIENT.map(|(cert, _)| Certificate::X509(cert))
     }
 }
 

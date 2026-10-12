@@ -15,6 +15,7 @@
 //! PC-sampling (chip- + probe-specific). Not hardware-tested in this repo.
 
 use crate::build::no_window;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -102,6 +103,11 @@ pub struct Frame {
     /// probe-rs's marker where its Cortex-M unwinder crossed an exception
     /// entry: every frame outside it is the code the interrupt preempted.
     pub exception: bool,
+    /// An idle loop: everything inside it is the core idling, wherever the
+    /// halt caught it. esp-rtos's `idle_hook` - with a debugger attached it
+    /// SPINS instead of sleeping, because esp-hal's `wait_for_interrupt`
+    /// returns at once then, so most of its samples are not in a `wfi` at all.
+    pub idle_loop: bool,
 }
 
 /// What one source line cost over a sampling run.
@@ -195,6 +201,14 @@ fn executor_sleeps(name: &str, path: Option<&str>) -> bool {
         && (p.ends_with("/cortex_m.rs") || p.ends_with("/riscv32.rs"))
 }
 
+/// esp-rtos's idle loop: `idle_hook`, from the esp-rtos crate.
+fn runs_idle_loop(name: &str, path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    base_name(name) == "idle_hook" && path.replace('\\', "/").contains("/esp-rtos-")
+}
+
 /// probe-rs's name for the frame where its Cortex-M unwinder crossed an
 /// exception entry (`exception_handling::*::expanded_description`). That frame
 /// has no source and no PC suffix; the frames outside it belong to the
@@ -274,7 +288,14 @@ pub fn by_line(samples: &[Vec<Frame>]) -> ByLine {
         // Idle first: the sleep is reached from `main`'s loop, or from the
         // line of `#[embassy_executor::main]`, which would otherwise look like
         // the hottest code in the firmware.
-        if stack.last().is_some_and(|f| f.waits) {
+        // The idle loop only when it is the innermost PHYSICAL frame - all
+        // that is inside it inlined. An interrupt that preempts it is work.
+        let in_idle_loop = own
+            .iter()
+            .rev()
+            .find(|f| !f.name.ends_with(" #[inline]"))
+            .is_some_and(|f| f.idle_loop);
+        if stack.last().is_some_and(|f| f.waits) || in_idle_loop {
             out.idle += 1;
             continue;
         }
@@ -355,32 +376,343 @@ fn project_rel(path: &str, root: &Path) -> Option<String> {
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
+/// One halt as probe-rs reported it - kept raw, so a saved run is counted
+/// again by whatever this code has learned since.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RawSample {
+    /// The `stackFrames` of the `stackTrace` response, innermost first.
+    pub frames: Value,
+    /// The registers at the halt (RISC-V), read when this code unwinds the
+    /// stack itself - see [`ElfLines::unwind_halt`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regs: Option<RiscvRegs>,
+    /// The stack words that unwinding read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<StackCopy>,
+}
+
+/// The RISC-V registers unwinding starts from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiscvRegs {
+    pub ra: u64,
+    pub sp: u64,
+    /// `s0`, the frame pointer some CFI measures the CFA from.
+    pub s0: u64,
+}
+
+/// Target memory the unwinder read, in the 8-byte chunks it asked for: only
+/// the words it needed, wherever they were - a task's frame can be 3 KB.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackCopy {
+    pub chunks: Vec<(u64, Vec<u8>)>,
+}
+
+impl StackCopy {
+    /// The little-endian 32-bit word at `addr`, when a chunk holds it.
+    fn word(&self, addr: u64) -> Option<u64> {
+        self.chunks.iter().find_map(|(base, bytes)| {
+            let off = usize::try_from(addr.checked_sub(*base)?).ok()?;
+            let b = bytes.get(off..off.checked_add(4)?)?;
+            Some(u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+        })
+    }
+}
+
+/// The format tag of a saved run; a file with another one is refused.
+pub const RUN_FORMAT: &str = "rust_on_chip-profile-run-1";
+
+/// FNV-1a of the ELF: tells the build a run was sampled with from a later one
+/// at the same path - every Flash, Size and Sample rebuilds it there, and an
+/// esp-hal ELF carries no build-id. Written out rather than `DefaultHasher`,
+/// whose algorithm may change between Rust versions and orphan saved files.
+fn elf_fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Everything a sampling run produced - what "Save…" writes and "Load…" reads
+/// back. Counting happens in [`process`], for a live run and a loaded one
+/// alike.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SampleRun {
+    pub format: String,
+    pub chip: String,
+    pub target: String,
+    /// The project the ELF was built in: frames whose source lies under it
+    /// are the project's own.
+    pub project_dir: PathBuf,
+    /// The release ELF the run attached with, read again by every
+    /// [`process`] - and used only while it still matches `elf_hash`.
+    pub elf: PathBuf,
+    /// [`elf_fingerprint`] of `elf` at sampling time.
+    #[serde(default)]
+    pub elf_hash: Option<u64>,
+    /// [`reports_return_address`] as decided at sampling time.
+    pub fix_callers: bool,
+    /// Every project file's text as this run compiled it, keyed like the
+    /// sampled lines (`src/main.rs`). A file whose live text differs has been
+    /// edited since, and its line numbers may no longer point at the code
+    /// they were sampled on.
+    pub texts: HashMap<String, String>,
+    pub samples: Vec<RawSample>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FlameResult {
     pub root: FlameNode,
     pub by_line: ByLine,
-    /// Every `.rs` file's text as this run compiled it, keyed like the sampled
-    /// lines (`src/main.rs`). A file whose live text differs has been edited
-    /// since, and its line numbers may no longer point at the code they were
-    /// sampled on. Shared, because the UI clones the state every frame.
-    pub texts: Arc<HashMap<String, String>>,
+    /// The run itself: Save writes it, the editor reads its `texts`. Shared,
+    /// because the UI clones the state every frame.
+    pub run: Arc<SampleRun>,
+    /// Usable samples (a halt with no frames at all is dropped).
     pub samples: usize,
+    /// The file this result was loaded from, `None` for a live run.
+    pub loaded_from: Option<PathBuf>,
+    /// The run's ELF is gone or was rebuilt since: probe-rs's frames were
+    /// counted as they came, without anything read from the ELF.
+    pub elf_changed: bool,
 }
 
-/// Fold a run's samples into both views.
-fn result_of(samples: &[Vec<Frame>], texts: HashMap<String, String>) -> FlameResult {
+/// Fold counted stacks into both views.
+fn result_of(
+    samples: &[Vec<Frame>],
+    run: SampleRun,
+    loaded_from: Option<PathBuf>,
+    elf_changed: bool,
+) -> FlameResult {
     let names: Vec<Vec<String>> = samples
         .iter()
         .map(|s| s.iter().map(|f| f.name.clone()).collect())
         .collect();
     let mut by = by_line(samples);
-    fill_code(&mut by, &texts);
+    fill_code(&mut by, &run.texts);
     FlameResult {
         root: build_tree(&names),
         by_line: by,
-        texts: Arc::new(texts),
+        run: Arc::new(run),
         samples: samples.len(),
+        loaded_from,
+        elf_changed,
     }
+}
+
+/// The halt PC: the innermost frame's `instructionPointerReference`.
+fn halt_pc(frames: &Value) -> Option<u64> {
+    frames.as_array()?.first()?["instructionPointerReference"]
+        .as_str()
+        .and_then(parse_pc)
+}
+
+/// Count a run - live or loaded - into both views.
+pub fn process(run: SampleRun, loaded_from: Option<PathBuf>) -> FlameResult {
+    let elf_bytes = std::fs::read(&run.elf).ok();
+    // Only the ELF the run was sampled with: a rebuilt one would put the old
+    // addresses on other code.
+    let elf_changed = match &elf_bytes {
+        Some(b) => run.elf_hash != Some(elf_fingerprint(b)),
+        None => true,
+    };
+    let mut elf = elf_bytes
+        .as_deref()
+        .filter(|_| !elf_changed)
+        .and_then(ElfLines::new);
+    let root = run.project_dir.clone();
+    let mut stacks = Vec::with_capacity(run.samples.len());
+    for s in &run.samples {
+        let resp = json!({"body": {"stackFrames": s.frames}});
+        // RISC-V: the stack as the ELF's CFI unwinds it from the halt, out of
+        // the words the sampler read.
+        let unwound = match (s.regs, elf.as_ref(), halt_pc(&s.frames)) {
+            (Some(regs), Some(e), Some(pc)) => {
+                let mut word = |a: u64| s.stack.as_ref().and_then(|st| st.word(a));
+                e.unwind_halt(pc, regs, &mut word, 64).map(|u| (pc, u))
+            }
+            _ => None,
+        };
+        let mut lookup = |a: u64| elf.as_mut().map_or_else(Chain::new, |l| l.chain(a));
+        let frames = if run.fix_callers {
+            frames_of(&resp, &root, &mut lookup)
+        } else {
+            frames_of(&resp, &root, &mut |_| Chain::new())
+        };
+        let Some(mut frames) = frames.filter(|f| !f.is_empty()) else {
+            continue;
+        };
+        if let Some((pc, u)) = unwound {
+            frames = from_unwind(frames, pc, u, &root, &mut lookup);
+        }
+        stacks.push(frames);
+    }
+    result_of(&stacks, run, loaded_from, elf_changed)
+}
+
+/// What the ELF's call frame information makes of a RISC-V halt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Unwound {
+    /// The return addresses outward from the halt, innermost first.
+    returns: Vec<u64>,
+    /// `Some` when the halt is in ROM: the routine the call went to, named
+    /// when the call's target is a known symbol.
+    rom: Option<Option<String>>,
+}
+
+/// The stack rebuilt from an unwind: the halt's own frames - the ELF's inline
+/// chain at the PC, or probe-rs's ROM frame renamed - then one physical frame
+/// per return address, each looked up one byte back, inside its call.
+///
+/// probe-rs 0.29 reads only `.debug_frame`, and an esp-hal ELF has only an
+/// `.eh_frame`: every frame after the first comes from its no-CFI guess (`ra`,
+/// then two stale words below `sp`), so the stack rarely reached the user's
+/// own lines. ROM made it worse - no DWARF, no symbol, and a C3 without an FPU
+/// runs every `f32` operation there (`__mulsf3`, …), as it does `memcpy` and
+/// `__udivdi3`. probe-rs's frames past the first are dropped.
+fn from_unwind(
+    frames: Vec<Frame>,
+    pc: u64,
+    u: Unwound,
+    root: &Path,
+    lookup: &mut dyn FnMut(u64) -> Chain,
+) -> Vec<Frame> {
+    let inner = match u.rom {
+        Some(callee) => {
+            let Some(mut rom) = frames.last().cloned() else {
+                return frames;
+            };
+            // probe-rs names a ROM PC after the nearest symbol BELOW it - a
+            // `.bss` pool, say - which says nothing.
+            rom.name = callee.unwrap_or_else(|| "<unknown function>".to_owned());
+            vec![rom]
+        }
+        None => {
+            let mut inner = rebuilt(&lookup(pc), root);
+            if inner.is_empty() {
+                // No DWARF at the PC (hand-written trap code): nothing to
+                // build on.
+                return frames;
+            }
+            inner.reverse();
+            inner
+        }
+    };
+    let mut out = Vec::new();
+    for &ret in u.returns.iter().rev() {
+        let mut caller = rebuilt(&lookup(ret.wrapping_sub(1)), root);
+        caller.reverse();
+        out.extend(caller);
+    }
+    out.extend(inner);
+    out
+}
+
+/// Whether probe-rs lost this stack in ROM: the innermost frame has no source
+/// and its PC lies OUTSIDE the ELF's image - not hand-written code of the image
+/// (a trap entry). Whatever name probe-rs put on it, and whatever frames it
+/// guessed past it, mean nothing. Returns that frame's DAP id.
+fn lost_in_rom(frames: &Value, in_image: impl Fn(u64) -> bool) -> Option<i64> {
+    let first = frames.as_array()?.first()?;
+    if first["source"]["path"].is_string() || in_image(halt_pc(frames)?) {
+        return None;
+    }
+    first["id"].as_i64()
+}
+
+/// `ra`, `sp` and `s0` from the registers of a `variables` response. probe-rs
+/// names a RISC-V register "x1/…", its role after the slash.
+fn regs_of(vars: &Value) -> Option<RiscvRegs> {
+    let list = vars["body"]["variables"].as_array()?;
+    let reg = |names: &[&str]| {
+        list.iter().find(|v| {
+            v["name"].as_str().is_some_and(|n| {
+                n.split('/')
+                    .any(|p| names.contains(&p.trim().to_ascii_lowercase().as_str()))
+            })
+        })?["value"]
+            .as_str()
+            .and_then(parse_pc)
+    };
+    Some(RiscvRegs {
+        ra: reg(&["x1", "ra", "returnaddress"])?,
+        sp: reg(&["x2", "sp", "stackpointer"])?,
+        s0: reg(&["x8", "s0", "fp", "framepointer"]).unwrap_or(0),
+    })
+}
+
+/// Standard base64, what DAP's `readMemory` returns its bytes in.
+fn from_base64(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in text.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        acc = (acc << 6) | u32::from(value(c)?);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// What the Profile tab asks of a saved run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlameFileOp {
+    Save,
+    Load,
+}
+
+/// Write `run` to `path`, as JSON.
+pub fn save_run(run: &SampleRun, path: &Path) -> Result<(), String> {
+    let bytes = serde_json::to_vec(run).map_err(|e| e.to_string())?;
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+/// Read a saved run, refusing anything that is not one. Called BEFORE the run
+/// on screen is given up, so a wrong file leaves it there.
+pub fn read_run(path: &Path) -> Result<SampleRun, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let run: SampleRun =
+        serde_json::from_slice(&bytes).map_err(|e| format!("not a saved profile run: {e}"))?;
+    if run.format != RUN_FORMAT {
+        return Err(format!(
+            "not a saved profile run of this IDE (format {:?}, expected {RUN_FORMAT:?})",
+            run.format
+        ));
+    }
+    Ok(run)
+}
+
+/// Count a run read by [`read_run`] on a background thread, and show it.
+pub fn start_load(
+    run: SampleRun,
+    path: PathBuf,
+    state: Arc<Mutex<FlameState>>,
+    ctx: eframe::egui::Context,
+) {
+    if state.lock().unwrap().is_busy() {
+        return;
+    }
+    *state.lock().unwrap() = FlameState::Loading;
+    ctx.request_repaint();
+    thread::spawn(move || {
+        let next = FlameState::Done(process(run, Some(path)));
+        *state.lock().unwrap() = next;
+        ctx.request_repaint();
+    });
 }
 
 #[derive(Clone, Debug, Default)]
@@ -391,13 +723,18 @@ pub enum FlameState {
     Building,
     /// Sampling in progress: `(collected, target)`.
     Sampling(usize, usize),
+    /// A saved run being read and counted.
+    Loading,
     Done(FlameResult),
     Failed(String),
 }
 
 impl FlameState {
     pub fn is_busy(&self) -> bool {
-        matches!(self, FlameState::Building | FlameState::Sampling(..))
+        matches!(
+            self,
+            FlameState::Building | FlameState::Sampling(..) | FlameState::Loading
+        )
     }
 }
 
@@ -470,6 +807,10 @@ fn run(
     };
 
     let elf = build_elf(project_dir, target)?;
+    // The build this session attaches with, read and fingerprinted before
+    // anything else (Size, Analyze) can relink it at the same path.
+    let elf_bytes = std::fs::read(&elf).ok();
+    let elf_hash = elf_bytes.as_deref().map(elf_fingerprint);
 
     // Cortex-M caller frames need their lines looked up again only where this
     // probe-rs reports them at the return address - see `relocate_callers`.
@@ -540,8 +881,8 @@ fn run(
     let result = sample_over_dap(
         port,
         &elf,
-        project_dir,
-        fix_callers,
+        elf_bytes.as_deref(),
+        target,
         chip,
         &probe,
         &console,
@@ -598,7 +939,18 @@ fn run(
         }
         out
     })?;
-    Ok(result_of(&samples, texts))
+    let run = SampleRun {
+        format: RUN_FORMAT.to_owned(),
+        chip: chip.to_owned(),
+        target: target.to_owned(),
+        project_dir: project_dir.to_path_buf(),
+        elf,
+        elf_hash,
+        fix_callers,
+        texts,
+        samples,
+    };
+    Ok(process(run, None))
 }
 
 /// Wait up to `grace` for the dap-server to exit by itself, and only then kill
@@ -679,12 +1031,10 @@ fn build_elf(project_dir: &std::path::Path, target: &str) -> Result<PathBuf, Str
 fn sample_over_dap(
     port: u16,
     elf: &std::path::Path,
-    // The project the ELF was built from: frames whose source lies under it
-    // are the project's own lines.
-    project_dir: &Path,
-    // Whether Cortex-M caller frames are re-resolved one byte back - see
-    // `relocate_callers` and `reports_return_address`.
-    fix_callers: bool,
+    // That ELF's contents, as fingerprinted for the run.
+    elf_bytes: Option<&[u8]>,
+    // The Rust target: a RISC-V halt is unwound here - see `unwind_halt`.
+    target: &str,
     chip: &str,
     // Already resolved to ONE probe by `run` - never "let probe-rs choose".
     probe: &str,
@@ -692,17 +1042,12 @@ fn sample_over_dap(
     n_samples: usize,
     state: &Arc<Mutex<FlameState>>,
     ctx: &eframe::egui::Context,
-) -> Result<Vec<Vec<Frame>>, String> {
-    // Read before the session starts. Without it (not Cortex-M, a probe-rs
-    // that already steps back, no DWARF, unreadable ELF) the frames keep
-    // probe-rs's lines.
-    let elf_bytes = fix_callers.then(|| std::fs::read(elf).ok()).flatten();
-    let mut elf_lines = elf_bytes.as_deref().and_then(ElfLines::new);
-    let mut lookup = |addr: u64| {
-        elf_lines
-            .as_mut()
-            .map_or_else(Chain::new, |l| l.chain(addr))
-    };
+) -> Result<Vec<RawSample>, String> {
+    // RISC-V: the image, to tell a stack lost in ROM - see `through_rom`.
+    // Read before the session starts.
+    let image = elf_bytes
+        .filter(|_| target.starts_with("riscv"))
+        .and_then(ElfLines::new);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = None;
@@ -745,7 +1090,7 @@ fn sample_over_dap(
     *state.lock().unwrap() = FlameState::Sampling(0, n_samples);
     ctx.request_repaint();
 
-    let mut samples: Vec<Vec<Frame>> = Vec::with_capacity(n_samples);
+    let mut samples: Vec<RawSample> = Vec::with_capacity(n_samples);
     let mut thread_id = 0i64;
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -775,10 +1120,64 @@ fn sample_over_dap(
             json!({"threadId": thread_id.max(1), "startFrame": 0, "levels": 0}),
         )?;
         let st = wait_response(&mut stream, "stackTrace", console)?;
-        if let Some(stack) = frames_of(&st, project_dir, &mut lookup)
-            && !stack.is_empty()
-        {
-            samples.push(stack);
+        let frames = st["body"]["stackFrames"].clone();
+        // RISC-V: unwind here, with the ELF's CFI, when probe-rs cannot -
+        // every halt of an ELF without `.debug_frame` (esp-hal's), and a halt
+        // lost in ROM. The registers, then each stack word the walk asks for:
+        // 8-byte reads, ~1 per frame, recorded so a saved run replays the same
+        // walk. A refused request costs that sample its callers, not the run.
+        let (mut regs, mut stack) = (None, None);
+        let frame_id = image.as_ref().and_then(|img| {
+            if img.has_debug_frame() {
+                lost_in_rom(&frames, |pc| img.in_image(pc))
+            } else {
+                frames.as_array()?.first()?["id"].as_i64()
+            }
+        });
+        if let (Some(img), Some(frame_id)) = (image.as_ref(), frame_id) {
+            send(
+                &mut stream,
+                &mut seq,
+                "variables",
+                json!({"variablesReference": frame_id}),
+            )?;
+            regs = wait_response(&mut stream, "variables", console)
+                .ok()
+                .and_then(|v| regs_of(&v));
+            if let (Some(r), Some(pc)) = (regs, halt_pc(&frames)) {
+                let mut copy = StackCopy::default();
+                {
+                    let mut word = |addr: u64| -> Option<u64> {
+                        if let Some(w) = copy.word(addr) {
+                            return Some(w);
+                        }
+                        let base = addr & !7;
+                        send(
+                            &mut stream,
+                            &mut seq,
+                            "readMemory",
+                            json!({"memoryReference": format!("{base:#x}"), "count": 8}),
+                        )
+                        .ok()?;
+                        // probe-rs 0.29 puts the END address in `address`: the
+                        // chunk starts where it was asked to.
+                        let bytes = wait_response(&mut stream, "readMemory", console)
+                            .ok()
+                            .and_then(|m| from_base64(m["body"]["data"].as_str()?))?;
+                        copy.chunks.push((base, bytes));
+                        copy.word(addr)
+                    };
+                    let _ = img.unwind_halt(pc, r, &mut word, 64);
+                }
+                stack = Some(copy);
+            }
+        }
+        if frames.as_array().is_some_and(|a| !a.is_empty()) {
+            samples.push(RawSample {
+                frames,
+                regs,
+                stack,
+            });
         }
         send(
             &mut stream,
@@ -847,6 +1246,143 @@ fn reports_return_address(version: &str) -> bool {
         (parts.next().flatten(), parts.next().flatten()),
         (Some(0), Some(minor)) if minor <= 29
     )
+}
+
+/// One CFI row, reduced to what a RISC-V walk needs: the CFA is register
+/// `cfa_reg` (2 = `sp`, 8 = `s0`) plus `cfa_off`, and `ra` / `s0` were saved
+/// at CFA + `ra_at` / `s0_at`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CfiRow {
+    cfa_reg: u16,
+    cfa_off: i64,
+    ra_at: Option<i64>,
+    s0_at: Option<i64>,
+}
+
+/// The return addresses OUTSIDE a caller that runs at return address `pc`,
+/// innermost first, by call frame information: `row_at` gives the row in force
+/// at an address, `word` reads a saved register. Starts from `regs`' `sp` /
+/// `s0`. Every address must pass `is_return` (in the image, right after a
+/// call) or the walk stops there: a wrong step ends it rather than inventing
+/// frames.
+fn walk(
+    pc: u64,
+    regs: RiscvRegs,
+    max: usize,
+    row_at: impl Fn(u64) -> Option<CfiRow>,
+    is_return: impl Fn(u64) -> bool,
+    word: &mut dyn FnMut(u64) -> Option<u64>,
+) -> Vec<u64> {
+    let wrap = |base: u64, off: i64| base.wrapping_add_signed(off) & 0xffff_ffff;
+    let (mut pc, mut sp, mut s0) = (pc, regs.sp, regs.s0);
+    let mut out = Vec::new();
+    while out.len() < max {
+        // One byte back, inside the call: the row the caller was in.
+        let Some(row) = row_at(pc.wrapping_sub(1)) else {
+            break;
+        };
+        let cfa = match row.cfa_reg {
+            2 => wrap(sp, row.cfa_off),
+            8 => wrap(s0, row.cfa_off),
+            _ => break,
+        };
+        // The stack grows down: a caller that saved `ra` has a frame, and
+        // its CFA lies strictly above. A repeated return address is NOT a
+        // loop - direct recursion saves the same `ra` at every level.
+        if cfa <= sp {
+            break;
+        }
+        let Some(next) = row.ra_at.and_then(|o| word(wrap(cfa, o))) else {
+            break;
+        };
+        if let Some(v) = row.s0_at.and_then(|o| word(wrap(cfa, o))) {
+            s0 = v;
+        }
+        // RISC-V: the caller's `sp` is the CFA.
+        sp = cfa;
+        if next == 0 || !is_return(next) {
+            break;
+        }
+        out.push(next);
+        pc = next;
+    }
+    out
+}
+
+/// The RISC-V call whose return address is `ra`, from the instructions
+/// before it: `Some(Some(target))` for a direct call - `jal`, `auipc`/`lui` +
+/// `jalr` (how flash code reaches ROM, 32 MB away), `c.jal` -,
+/// `Some(None)` for a call through a register (`jalr`, `c.jalr`), `None` when
+/// the instruction before `ra` is no call at all, so `ra` is no caller's.
+fn call_into(
+    ra: u64,
+    word_at: impl Fn(u64) -> Option<u32>,
+    half_at: impl Fn(u64) -> Option<u16>,
+) -> Option<Option<u64>> {
+    // RV32: addresses wrap at 32 bits (`auipc` from 0x4201_xxxx to ROM does).
+    let add = |base: u64, off: i64| (base as i64).wrapping_add(off) as u64 & 0xffff_ffff;
+    if let Some(i) = ra.checked_sub(4).and_then(&word_at)
+        && i & 3 == 3
+        && (i >> 7) & 31 == 1
+    {
+        match i & 0x7f {
+            // jal ra, imm
+            0x6f => return Some(Some(add(ra - 4, jal_imm(i)))),
+            // jalr ra, lo(rs1) - with `auipc`/`lui rs1, hi` right before it
+            // the target is known, otherwise it came out of a register.
+            0x67 if (i >> 12) & 7 == 0 => {
+                let rs1 = (i >> 15) & 31;
+                let lo = i64::from((i as i32) >> 20);
+                let hi = ra
+                    .checked_sub(8)
+                    .and_then(&word_at)
+                    .filter(|p| p & 3 == 3 && (p >> 7) & 31 == rs1);
+                return Some(hi.and_then(|p| {
+                    let upper = i64::from((p & 0xffff_f000) as i32);
+                    match p & 0x7f {
+                        0x17 => Some(add(ra - 8, upper + lo)),
+                        0x37 => Some(add(0, upper + lo)),
+                        _ => None,
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+    let h = ra.checked_sub(2).and_then(half_at)?;
+    match (h >> 13, h & 3) {
+        // c.jal (RV32C only)
+        (0b001, 0b01) => Some(Some(add(ra - 2, cj_imm(h)))),
+        // c.jalr rs1: funct4 1001, rs1 != 0, rs2 == 0
+        (0b100, 0b10) if (h >> 12) & 1 == 1 && (h >> 7) & 31 != 0 && (h >> 2) & 31 == 0 => {
+            Some(None)
+        }
+        _ => None,
+    }
+}
+
+/// The J-type immediate of `jal`: imm[20|10:1|11|19:12], sign-extended.
+fn jal_imm(i: u32) -> i64 {
+    let imm = ((i >> 31) & 1) << 20
+        | ((i >> 21) & 0x3ff) << 1
+        | ((i >> 20) & 1) << 11
+        | ((i >> 12) & 0xff) << 12;
+    i64::from(((imm << 11) as i32) >> 11)
+}
+
+/// The CJ-type immediate of `c.jal`: imm[11|4|9:8|10|6|7|3:1|5],
+/// sign-extended.
+fn cj_imm(h: u16) -> i64 {
+    let h = u32::from(h);
+    let imm = ((h >> 12) & 1) << 11
+        | ((h >> 11) & 1) << 4
+        | ((h >> 9) & 3) << 8
+        | ((h >> 8) & 1) << 10
+        | ((h >> 7) & 1) << 6
+        | ((h >> 6) & 1) << 7
+        | ((h >> 3) & 7) << 1
+        | ((h >> 2) & 1) << 5;
+    i64::from(((imm << 20) as i32) >> 20)
 }
 
 /// `core::panicking::panic_fmt` -> `panic_fmt`,
@@ -951,6 +1487,7 @@ fn frames_of(
             Frame {
                 waits: !project && (waits_by_name(&name) || executor_sleeps(&name, r.path)),
                 exception: r.path.is_none() && !r.inline && is_exception_entry(r.name),
+                idle_loop: !project && runs_idle_loop(&name, r.path),
                 at: file.zip(r.line),
                 project,
                 name,
@@ -1081,16 +1618,21 @@ fn rebuilt(chain: &Chain, root: &Path) -> Vec<Frame> {
         .map(|(k, s)| {
             let file = s.path.as_deref().and_then(|p| project_rel(p, root));
             let func = s.func.clone().unwrap_or_default();
+            // Every function but the outermost was inlined into it.
+            let name = if k + 1 < chain.len() {
+                format!("{func} #[inline]")
+            } else {
+                func
+            };
+            let project = file.is_some();
+            let path = s.path.as_deref();
             Frame {
-                // Every function but the outermost was inlined into it.
-                name: if k + 1 < chain.len() {
-                    format!("{func} #[inline]")
-                } else {
-                    func
-                },
-                project: file.is_some(),
+                waits: !project && (waits_by_name(&name) || executor_sleeps(&name, path)),
+                idle_loop: !project && runs_idle_loop(&name, path),
+                project,
                 at: file.zip(s.line),
-                ..Frame::default()
+                name,
+                exception: false,
             }
         })
         .collect()
@@ -1102,13 +1644,79 @@ fn rebuilt(chain: &Chain, root: &Path) -> Vec<Frame> {
 struct ElfLines<'a> {
     ctx: addr2line::Context<gimli::EndianSlice<'a, gimli::RunTimeEndian>>,
     cache: HashMap<u64, Chain>,
+    /// Every allocated section: `(address, size, contents)`; the contents are
+    /// empty for one that occupies no file space.
+    sections: Vec<(u64, u64, &'a [u8])>,
+    /// Code symbols by address, ABSOLUTE ones included: the ROM routines a
+    /// linker script PROVIDEs (`memcpy = 0x40000358`), which no DWARF and no
+    /// sized symbol names.
+    symbols: HashMap<u64, &'a str>,
+    /// The call frame information, for [`ElfLines::unwind`].
+    cfi: Cfi<'a>,
+    bases: gimli::BaseAddresses,
+}
+
+type Slice<'a> = gimli::EndianSlice<'a, gimli::RunTimeEndian>;
+
+/// Where an ELF keeps its call frame information. An esp-hal release build
+/// has no `.debug_frame` at all, only an `.eh_frame` its linker script leaves
+/// unallocated (address 0) - whose pointers are relative to that address.
+enum Cfi<'a> {
+    Debug(gimli::DebugFrame<Slice<'a>>),
+    Eh(gimli::EhFrame<Slice<'a>>),
+    Missing,
+}
+
+/// The row of `section` in force at `addr`, reduced to a [`CfiRow`].
+fn cfi_row_in<'a, S: gimli::UnwindSection<Slice<'a>>>(
+    section: &S,
+    bases: &gimli::BaseAddresses,
+    addr: u64,
+) -> Option<CfiRow> {
+    let mut ctx = gimli::UnwindContext::new();
+    let row = section
+        .unwind_info_for_address(bases, &mut ctx, addr, |section, bases, offset| {
+            section.cie_from_offset(bases, offset)
+        })
+        .ok()?;
+    let gimli::CfaRule::RegisterAndOffset { register, offset } = row.cfa() else {
+        return None;
+    };
+    let at = |r: u16| match row.register(gimli::Register(r)) {
+        gimli::RegisterRule::Offset(o) => Some(o),
+        _ => None,
+    };
+    Some(CfiRow {
+        cfa_reg: register.0,
+        cfa_off: *offset,
+        ra_at: at(1),
+        s0_at: at(8),
+    })
 }
 
 impl<'a> ElfLines<'a> {
     /// `None` for anything that is not an ELF with DWARF in it.
     fn new(data: &'a [u8]) -> Option<Self> {
-        use object::{Object, ObjectSection};
+        use object::{Object, ObjectSection, ObjectSymbol};
         let obj = object::File::parse(data).ok()?;
+        let sections = obj
+            .sections()
+            .filter(|s| s.address() != 0 && s.size() != 0)
+            .map(|s| (s.address(), s.size(), s.data().unwrap_or(&[])))
+            .collect();
+        let mut symbols = HashMap::new();
+        for sym in obj.symbols() {
+            let Ok(name) = sym.name() else { continue };
+            if name.is_empty() || name.starts_with(['$', '.']) {
+                continue;
+            }
+            if matches!(
+                sym.kind(),
+                object::SymbolKind::Text | object::SymbolKind::Unknown | object::SymbolKind::Label
+            ) {
+                symbols.entry(sym.address()).or_insert(name);
+            }
+        }
         let endian = if obj.is_little_endian() {
             gimli::RunTimeEndian::Little
         } else {
@@ -1122,10 +1730,163 @@ impl<'a> ElfLines<'a> {
             Ok(gimli::EndianSlice::new(bytes, endian))
         })
         .ok()?;
+        let address_size = if obj.is_64() { 8 } else { 4 };
+        let found = |name: &str| {
+            let s = obj.section_by_name(name)?;
+            let data = s.data().ok().filter(|d| !d.is_empty())?;
+            Some((s.address(), data))
+        };
+        let mut bases = gimli::BaseAddresses::default();
+        let cfi = if let Some((_, data)) = found(".debug_frame") {
+            let mut f = gimli::DebugFrame::new(data, endian);
+            f.set_address_size(address_size);
+            Cfi::Debug(f)
+        } else if let Some((addr, data)) = found(".eh_frame") {
+            let mut f = gimli::EhFrame::new(data, endian);
+            f.set_address_size(address_size);
+            bases = bases.set_eh_frame(addr);
+            Cfi::Eh(f)
+        } else {
+            Cfi::Missing
+        };
         Some(Self {
             ctx: addr2line::Context::from_dwarf(dwarf).ok()?,
             cache: HashMap::new(),
+            sections,
+            symbols,
+            cfi,
+            bases,
         })
+    }
+
+    /// Whether the ELF has `.debug_frame` - the only CFI probe-rs 0.29 reads.
+    fn has_debug_frame(&self) -> bool {
+        matches!(self.cfi, Cfi::Debug(_))
+    }
+
+    /// A RISC-V halt at `pc`, unwound by this ELF's call frame information;
+    /// `None` where nothing can be said (a ROM PC whose `ra` follows no call,
+    /// code without CFI).
+    ///
+    /// In the image the row AT the PC holds (the halt is exact); `ra` comes
+    /// from the stack where the row saved it, else from the register (a leaf,
+    /// or a prologue). In ROM the routine is a leaf with no CFI: `ra` is its
+    /// caller's return address when the instruction before it is a call, and
+    /// the walk goes on from there with `sp` as the halt left it - or a few
+    /// 16-byte frames above it, for a ROM routine that keeps one: offset 0
+    /// first, the others only when that gets nowhere; each step is checked
+    /// against a call instruction, so a wrong size gets nowhere either.
+    fn unwind_halt(
+        &self,
+        pc: u64,
+        regs: RiscvRegs,
+        word: &mut dyn FnMut(u64) -> Option<u64>,
+        max: usize,
+    ) -> Option<Unwound> {
+        let is_return = |r: u64| self.in_image(r) && self.call_before(r).is_some();
+        let max = max.max(1);
+        if !self.in_image(pc) {
+            let target = self.call_before(regs.ra)?;
+            let mut outer = Vec::new();
+            for frame in (0..=96).step_by(16) {
+                let at = RiscvRegs {
+                    sp: regs.sp + frame,
+                    ..regs
+                };
+                let found = walk(
+                    regs.ra,
+                    at,
+                    max - 1,
+                    |a| self.cfi_row(a),
+                    is_return,
+                    &mut *word,
+                );
+                if found.len() > outer.len() {
+                    outer = found;
+                }
+                if !outer.is_empty() {
+                    break;
+                }
+            }
+            let mut returns = vec![regs.ra];
+            returns.extend(outer);
+            return Some(Unwound {
+                returns,
+                rom: Some(target.and_then(|t| self.symbol_name(t))),
+            });
+        }
+        let row = self.cfi_row(pc)?;
+        let wrap = |base: u64, off: i64| base.wrapping_add_signed(off) & 0xffff_ffff;
+        let cfa = match row.cfa_reg {
+            2 => wrap(regs.sp, row.cfa_off),
+            8 => wrap(regs.s0, row.cfa_off),
+            _ => return None,
+        };
+        let ra = match row.ra_at {
+            Some(o) => word(wrap(cfa, o)),
+            None => Some(regs.ra),
+        };
+        let s0 = row
+            .s0_at
+            .and_then(|o| word(wrap(cfa, o)))
+            .unwrap_or(regs.s0);
+        let mut returns = Vec::new();
+        if let Some(ra) = ra.filter(|&ra| is_return(ra)) {
+            returns.push(ra);
+            let next = RiscvRegs { ra, sp: cfa, s0 };
+            returns.extend(walk(
+                ra,
+                next,
+                max - 1,
+                |a| self.cfi_row(a),
+                is_return,
+                &mut *word,
+            ));
+        }
+        Some(Unwound { returns, rom: None })
+    }
+
+    /// The CFI row in force at `addr`, reduced to what [`walk`] reads.
+    fn cfi_row(&self, addr: u64) -> Option<CfiRow> {
+        match &self.cfi {
+            Cfi::Debug(f) => cfi_row_in(f, &self.bases, addr),
+            Cfi::Eh(f) => cfi_row_in(f, &self.bases, addr),
+            Cfi::Missing => None,
+        }
+    }
+
+    /// Whether `addr` lies in any section of the image (ROM does not).
+    fn in_image(&self, addr: u64) -> bool {
+        self.sections
+            .iter()
+            .any(|&(a, size, _)| addr >= a && addr - a < size)
+    }
+
+    /// `len` bytes of the image's contents at `addr`.
+    fn bytes(&self, addr: u64, len: usize) -> Option<&'a [u8]> {
+        self.sections.iter().find_map(|&(a, _, data)| {
+            let off = usize::try_from(addr.checked_sub(a)?).ok()?;
+            data.get(off..off.checked_add(len)?)
+        })
+    }
+
+    /// The call that returns to `ra` - see [`call_into`].
+    fn call_before(&self, ra: u64) -> Option<Option<u64>> {
+        call_into(
+            ra,
+            |at| {
+                self.bytes(at, 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            },
+            |at| self.bytes(at, 2).map(|b| u16::from_le_bytes([b[0], b[1]])),
+        )
+    }
+
+    /// The symbol exactly at `addr`, demangled to a bare name.
+    fn symbol_name(&self, addr: u64) -> Option<String> {
+        let raw = self.symbols.get(&addr)?;
+        let named = addr2line::demangle_auto(std::borrow::Cow::Borrowed(raw), None);
+        Some(bare_fn(&named))
     }
 
     /// The inline chain at `addr`, innermost first; empty where the DWARF
@@ -1979,6 +2740,553 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// Little-endian code at `base`, readable the way `call_into` reads it.
+    fn code_at(base: u64, words: &[u32]) -> impl Fn(u64, usize) -> Option<Vec<u8>> {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        move |at, len| {
+            let off = usize::try_from(at.checked_sub(base)?).ok()?;
+            bytes.get(off..off + len).map(<[u8]>::to_vec)
+        }
+    }
+
+    fn call(ra: u64, read: impl Fn(u64, usize) -> Option<Vec<u8>>) -> Option<Option<u64>> {
+        call_into(
+            ra,
+            |at| read(at, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            |at| read(at, 2).map(|b| u16::from_le_bytes([b[0], b[1]])),
+        )
+    }
+
+    #[test]
+    fn a_call_is_read_from_the_instructions_before_ra() {
+        // From the real ESP32-C3 build: flash code reaching ROM's `memcpy`.
+        //   420106fa: auipc ra, 0xfdff0
+        //   420106fe: jalr  -0x3a2(ra)  <memcpy>
+        let read = code_at(0x4201_06fa, &[0xfdff_0097, 0xc5e0_80e7]);
+        assert_eq!(call(0x4201_0702, &read), Some(Some(0x4000_0358)));
+        // jal ra, +0x100 and jal ra, -4.
+        assert_eq!(
+            call(0x1004, code_at(0x1000, &[0x1000_00ef])),
+            Some(Some(0x1100))
+        );
+        assert_eq!(
+            call(0x1004, code_at(0x1000, &[0xffdf_f0ef])),
+            Some(Some(0x0ffc))
+        );
+        // jalr ra, 0(a5) with nothing that set a5 up: a call, target unknown.
+        assert_eq!(
+            call(0x1008, code_at(0x1000, &[0x0000_0013, 0x0007_80e7])),
+            Some(None)
+        );
+        // c.jal +8 (RV32C) and c.jalr a5, as the low half of a word.
+        assert_eq!(
+            call(0x1002, code_at(0x1000, &[0x0000_2021])),
+            Some(Some(0x1008))
+        );
+        assert_eq!(call(0x1002, code_at(0x1000, &[0x0000_9782])), Some(None));
+        // addi a0, a0, 1: no call, so `ra` is nobody's return address.
+        assert_eq!(call(0x1004, code_at(0x1000, &[0x0015_0513])), None);
+        // Nothing to read at all.
+        assert_eq!(call(0x1004, code_at(0x2000, &[])), None);
+    }
+
+    #[test]
+    fn an_unwound_stack_reaches_the_users_line() {
+        // `__mulsf3` in ROM, called by libm's `log10f`, called from the
+        // user's `to_db` on line 262, called from `main`'s line 545.
+        let root = Path::new("/ws");
+        let mut lookup = |addr: u64| match addr {
+            0x4201_0701 => vec![site(&reg("libm/src/math/log10f.rs"), 76, "log10f")],
+            0x4200_2001 => vec![
+                site("/ws/src/parse_result.rs", 262, "to_db"),
+                site("/ws/src/main.rs", 545, "radar_task"),
+            ],
+            0x4200_3000 => vec![site("/ws/src/parse_result.rs", 270, "to_db")],
+            _ => Chain::new(),
+        };
+        // probe-rs's own frames: the ROM PC named after the nearest symbol
+        // below it, then two guesses.
+        let probe_rs = vec![
+            lib("garbage"),
+            lib("guess"),
+            lib("esp32c3_project::__main::POOL"),
+        ];
+        let rom = Unwound {
+            returns: vec![0x4201_0702, 0x4200_2002],
+            rom: Some(Some("__mulsf3".into())),
+        };
+        let out = from_unwind(probe_rs.clone(), 0x4000_0368, rom, root, &mut lookup);
+        assert_eq!(
+            names(&out),
+            ["radar_task", "to_db #[inline]", "log10f", "__mulsf3"]
+        );
+        let by = by_line(&[out]);
+        assert_eq!(stat(&by, "src/parse_result.rs", 262).self_n, 1);
+        assert_eq!(stat(&by, "src/main.rs", 545).total_n, 1);
+        assert_eq!(by.outside, 0);
+        // A ROM target with no name: not probe-rs's misleading neighbour.
+        let unnamed = Unwound {
+            returns: vec![0x4201_0702],
+            rom: Some(None),
+        };
+        let out = from_unwind(probe_rs.clone(), 0x4000_0368, unnamed, root, &mut lookup);
+        assert_eq!(names(&out), ["log10f", "<unknown function>"]);
+        // A halt in flash: the ELF's chain at the PC itself, then the callers.
+        let flash = Unwound {
+            returns: vec![0x4200_2002],
+            rom: None,
+        };
+        let out = from_unwind(probe_rs.clone(), 0x4200_3000, flash, root, &mut lookup);
+        assert_eq!(names(&out), ["radar_task", "to_db #[inline]", "to_db"]);
+        assert_eq!(charged(&out), Some(("src/parse_result.rs".to_owned(), 270)));
+        // No DWARF at the PC (trap code): probe-rs's frames stay.
+        let trap = Unwound {
+            returns: vec![],
+            rom: None,
+        };
+        assert_eq!(
+            from_unwind(probe_rs.clone(), 0x4038_0000, trap, root, &mut lookup),
+            probe_rs
+        );
+    }
+
+    #[test]
+    fn only_a_stack_that_ends_outside_the_image_is_lost_in_rom() {
+        let image = |pc: u64| (0x4200_0000..0x4240_0000).contains(&pc);
+        let rom = json!([{"id": 7, "name": "<unknown function @ 0x40000368>",
+                          "instructionPointerReference": "0x40000368", "line": 0}]);
+        assert_eq!(lost_in_rom(&rom, image), Some(7));
+        // Hand-written code of the image (a trap entry): `ra` is not a caller.
+        let trap = json!([{"id": 7, "name": "<unknown function @ 0x42000010>",
+                           "instructionPointerReference": "0x42000010", "line": 0}]);
+        assert_eq!(lost_in_rom(&trap, image), None);
+        // probe-rs's guesses past it, with sources, change nothing: they come
+        // from stale words below `sp`.
+        let guessed = json!([
+            {"id": 7, "name": "<unknown function @ 0x40000368>",
+             "instructionPointerReference": "0x40000368", "line": 0},
+            {"id": 8, "name": "main", "instructionPointerReference": "0x42001000",
+             "line": 12, "source": {"path": "/ws/src/main.rs"}}
+        ]);
+        assert_eq!(lost_in_rom(&guessed, image), Some(7));
+        // Nor does the name of the nearest symbol below the ROM PC.
+        let named = json!([{"id": 7, "name": "esp32c3_project::__main::POOL @ 0x40000368>",
+                            "instructionPointerReference": "0x40000368", "line": 0}]);
+        assert_eq!(lost_in_rom(&named, image), Some(7));
+        // A frame with a source is not lost.
+        let sourced = json!([{"id": 7, "name": "main", "line": 12,
+                              "instructionPointerReference": "0x40000368",
+                              "source": {"path": "/ws/src/main.rs"}}]);
+        assert_eq!(lost_in_rom(&sourced, image), None);
+        // The registers out of probe-rs's list.
+        let vars = json!({"body": {"variables": [
+            {"name": "x0/zero", "value": "0x00000000"},
+            {"name": "x1/RA", "value": "0x42010702"},
+            {"name": "x2/SP", "value": "0x3fc8f000"},
+            {"name": "x8/FP", "value": "0x3fc8f040"}
+        ]}});
+        assert_eq!(
+            regs_of(&vars),
+            Some(RiscvRegs {
+                ra: 0x4201_0702,
+                sp: 0x3fc8_f000,
+                s0: 0x3fc8_f040
+            })
+        );
+        assert_eq!(regs_of(&json!({"body": {"variables": []}})), None);
+    }
+
+    #[test]
+    fn esp_rtos_idle_hook_is_idle_wherever_the_halt_caught_it() {
+        // With a debugger attached `wait_for_interrupt` returns at once, so the
+        // halt lands anywhere in the loop - here inside `debugger_connected`.
+        let root = Path::new("/ws");
+        let rtos = reg("esp-rtos-0.3.0/src/task/mod.rs");
+        let hal = reg("esp-hal-1.1.1/src/debugger.rs");
+        let resp = stack(vec![
+            dap("debugger_connected #[inline]", Some(&hal), 9, 0x4202_6c80),
+            dap("wait_for_interrupt #[inline]", Some(&hal), 433, 0x4202_6c80),
+            dap("idle_hook", Some(&rtos), 38, 0x4202_6c80),
+        ]);
+        let frames = frames_of(&resp, root, &mut nothing).unwrap();
+        assert!(frames[0].idle_loop);
+        let by = by_line(&[frames]);
+        assert_eq!((by.idle, by.outside), (1, 0));
+    }
+
+    #[test]
+    fn a_saved_run_loads_back_and_counts_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.json");
+        let run = SampleRun {
+            format: RUN_FORMAT.to_owned(),
+            chip: "esp32c3".into(),
+            target: "riscv32imc-unknown-none-elf".into(),
+            project_dir: PathBuf::from("/ws"),
+            // Gone: the run still loads, without the ELF's help.
+            elf: dir.path().join("no-such-elf"),
+            elf_hash: Some(1),
+            fix_callers: false,
+            texts: HashMap::from([("src/main.rs".to_owned(), "a\nb\nlet x = 1;\n".to_owned())]),
+            samples: vec![
+                RawSample {
+                    frames: json!([{"id": 1, "name": "main", "line": 3,
+                                    "instructionPointerReference": "0x42000010",
+                                    "source": {"path": "/ws/src/main.rs"}}]),
+                    regs: Some(RiscvRegs {
+                        ra: 0x4201_0702,
+                        sp: 0x3fc8_f000,
+                        s0: 0,
+                    }),
+                    stack: Some(StackCopy {
+                        chunks: vec![(0x3fc8_f000, vec![1, 2, 3, 4, 5, 6, 7, 8])],
+                    }),
+                },
+                RawSample {
+                    frames: json!([]),
+                    regs: None,
+                    stack: None,
+                },
+            ],
+        };
+        save_run(&run, &path).unwrap();
+        let path_copy = dir.path().join("copy.json");
+        save_run(&run, &path_copy).unwrap();
+        let back = read_run(&path).unwrap();
+        assert_eq!(back.samples, run.samples);
+        assert_eq!(back.texts, run.texts);
+        let res = process(back, Some(path.clone()));
+        // The empty halt is dropped; the other is counted on its line.
+        assert_eq!(res.samples, 1);
+        assert_eq!(res.by_line.lines[0].code, "let x = 1;");
+        assert_eq!(res.loaded_from.as_deref(), Some(path.as_path()));
+        assert!(res.elf_changed);
+        // An ELF at the path that is not the one sampled is not used either.
+        let other = dir.path().join("other-elf");
+        std::fs::write(&other, b"\x7fELF not this build").unwrap();
+        let rebuilt_run = SampleRun {
+            elf: other.clone(),
+            elf_hash: Some(elf_fingerprint(b"\x7fELF the sampled build")),
+            ..read_run(&path_copy).unwrap()
+        };
+        assert!(process(rebuilt_run, None).elf_changed);
+        let same = SampleRun {
+            elf: other,
+            elf_hash: Some(elf_fingerprint(b"\x7fELF not this build")),
+            ..read_run(&path_copy).unwrap()
+        };
+        assert!(!process(same, None).elf_changed);
+        // Not a saved run.
+        std::fs::write(&path, br#"{"format": "something else"}"#).unwrap();
+        assert!(read_run(&path).is_err());
+    }
+
+    /// The way out of ROM against a real ESP32-C3 release ELF. Ignored and
+    /// path-driven - set `EIDE_RISCV_ELF` to a `riscv32*` release binary:
+    ///
+    /// `EIDE_RISCV_ELF=… cargo test -- --ignored a_real_riscv_elf`
+    ///
+    /// Every `auipc ra` + `jalr ra` in the image that lands OUTSIDE it (in ROM)
+    /// must decode to a call whose target is a named ROM routine.
+    #[test]
+    #[ignore]
+    fn a_real_riscv_elf_names_its_rom_calls() {
+        use object::{Object, ObjectSection};
+        let Some(elf) = std::env::var_os("EIDE_RISCV_ELF") else {
+            println!("EIDE_RISCV_ELF not set - nothing to check");
+            return;
+        };
+        let data = std::fs::read(&elf).unwrap();
+        let mut lines = ElfLines::new(&data).expect("an ELF with DWARF");
+        let obj = object::File::parse(&*data).unwrap();
+        let text = obj.section_by_name(".text").expect("a .text section");
+        let (base, code) = (text.address(), text.data().unwrap());
+        let mut found: HashMap<String, usize> = HashMap::new();
+        // Who calls what: the innermost line the ELF has for each call site.
+        let mut callers: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            Default::default();
+        let mut unnamed = Vec::new();
+        let (mut with_row, mut rows_checked) = (0, 0);
+        let mut no_row = Vec::new();
+        // Function starts, and one call site of each function called directly.
+        let mut starts: Vec<u64> = lines
+            .symbols
+            .keys()
+            .copied()
+            .filter(|&a| lines.in_image(a))
+            .collect();
+        starts.sort_unstable();
+        let mut called_from: HashMap<u64, u64> = HashMap::new();
+        for p in (0..code.len().saturating_sub(4)).step_by(2) {
+            let ret = base + p as u64 + 4;
+            if let Some(Some(t)) = lines.call_before(ret)
+                && lines.in_image(t)
+            {
+                called_from.entry(t).or_insert(ret);
+            }
+        }
+        let (mut walked, mut flash_walked, mut walk_wrong) = (0, 0, Vec::new());
+        let mut i = 0;
+        while i + 8 <= code.len() {
+            let w = |o: usize| u32::from_le_bytes([code[o], code[o + 1], code[o + 2], code[o + 3]]);
+            let (a, b) = (w(i), w(i + 4));
+            // auipc ra, hi ; jalr ra, lo(ra)
+            if a & 0xfff == 0x097 && b & 0x000f_ffff == 0x0000_80e7 {
+                let ret = base + i as u64 + 8;
+                if let Some(Some(target)) = lines.call_before(ret)
+                    && !lines.in_image(target)
+                {
+                    // The caller's CFI row, as `walk` will read it - for every
+                    // caller with lines; the boot code without DWARF has none.
+                    if !lines.chain(ret - 1).is_empty() {
+                        rows_checked += 1;
+                        match lines.cfi_row(ret - 1) {
+                            Some(row) if matches!(row.cfa_reg, 2 | 8) && row.ra_at.is_some() => {
+                                with_row += 1;
+                                // Halted in that ROM routine: a stack whose only
+                                // known word is the caller's saved ra, set to a
+                                // real call site of the caller. `unwind_halt`
+                                // must find both, through the real CFI row.
+                                let f = starts[starts.partition_point(|&a| a <= ret) - 1];
+                                if row.cfa_reg == 2
+                                    && let Some(&outer) = called_from.get(&f)
+                                {
+                                    let sp = 0x3fc8_0000u64;
+                                    let slot =
+                                        sp.wrapping_add_signed(row.cfa_off + row.ra_at.unwrap());
+                                    let regs = RiscvRegs { ra: ret, sp, s0: 0 };
+                                    let mut word = |a: u64| (a == slot).then_some(outer);
+                                    let got = lines.unwind_halt(target, regs, &mut word, 2);
+                                    walked += 1;
+                                    // Halted in the caller itself, right after
+                                    // that call: the row AT the PC, ra from
+                                    // the stack, the register ignored.
+                                    if let Some(at) = lines.cfi_row(ret)
+                                        && at.cfa_reg == 2
+                                        && let Some(ra_at) = at.ra_at
+                                    {
+                                        let slot = sp.wrapping_add_signed(at.cfa_off + ra_at);
+                                        let regs = RiscvRegs { ra: 0, sp, s0: 0 };
+                                        let mut word = |a: u64| (a == slot).then_some(outer);
+                                        let here = lines.unwind_halt(ret, regs, &mut word, 1);
+                                        flash_walked += 1;
+                                        if here.as_ref().map(|u| u.returns.as_slice())
+                                            != Some(&[outer])
+                                        {
+                                            walk_wrong.push(format!("flash {ret:#x}: {here:?}"));
+                                        }
+                                    }
+                                    if got.as_ref().map(|u| u.returns.as_slice())
+                                        != Some(&[ret, outer])
+                                    {
+                                        walk_wrong.push(format!("{:#x}: {got:?}", ret - 8));
+                                    }
+                                }
+                            }
+                            row => no_row.push(format!("{:#x} {row:?}", ret - 8)),
+                        }
+                    }
+                    match lines.symbol_name(target) {
+                        Some(name) => {
+                            *found.entry(name.clone()).or_default() += 1;
+                            let at = lines.chain(ret - 1).into_iter().find_map(|s| {
+                                let path = s.path?.replace('\\', "/");
+                                let tail: Vec<&str> = path.rsplit('/').take(2).collect();
+                                Some(format!("{}/{}:{}", tail[1..].join("/"), tail[0], s.line?))
+                            });
+                            if let Some(at) = at {
+                                callers.entry(name).or_default().insert(at);
+                            }
+                        }
+                        None => unnamed.push(format!("{:#x} -> {target:#x}", ret - 8)),
+                    }
+                }
+            }
+            i += 2;
+        }
+        println!("ROM calls by routine: {found:?}");
+        for (name, at) in &callers {
+            println!(
+                "  {name} <- {}",
+                at.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        println!("{with_row} of {rows_checked} ROM callers have a CFI row with a saved ra");
+        println!("{walked} ROM halts unwound through a real CFI row to the caller's caller");
+        println!("{flash_walked} flash halts unwound through the row at the PC to the caller");
+        assert!(flash_walked > 0, "no flash halt to walk from");
+        assert!(walked > 0, "no ROM call site to walk from");
+        assert!(walk_wrong.is_empty(), "wrong unwinds: {walk_wrong:?}");
+        assert!(!found.is_empty(), "no call into ROM found");
+        assert!(unnamed.is_empty(), "unnamed ROM targets: {unnamed:?}");
+        assert_eq!(
+            with_row, rows_checked,
+            "callers without a usable CFI row: {no_row:?}"
+        );
+    }
+
+    #[test]
+    fn the_walk_reads_return_addresses_out_of_the_stack_copy() {
+        // Two frames: `f` (CFA = sp + 16, ra at CFA - 4) returning into `g`
+        // (CFA = s0 + 0, ra at CFA - 4, s0 at CFA - 8), and `g`'s caller
+        // without a row - where the walk ends.
+        let row_at = |at: u64| match at {
+            0x4200_100f => Some(CfiRow {
+                cfa_reg: 2,
+                cfa_off: 16,
+                ra_at: Some(-4),
+                s0_at: Some(-8),
+            }),
+            0x4200_201f => Some(CfiRow {
+                cfa_reg: 8,
+                cfa_off: 0,
+                ra_at: Some(-4),
+                s0_at: None,
+            }),
+            _ => None,
+        };
+        let sp = 0x3fc8_0000u64;
+        let mut bytes = vec![0u8; 64];
+        let mut put = |at: u64, v: u32| {
+            let o = (at - sp) as usize;
+            bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        put(sp + 12, 0x4200_2020); // f's saved ra
+        put(sp + 8, 0x3fc8_0030); // f's saved s0 = g's frame pointer
+        put(0x3fc8_002c, 0x4200_3030); // g's saved ra
+        let stack = StackCopy {
+            chunks: vec![(sp, bytes)],
+        };
+        let mut word = |a: u64| stack.word(a);
+        let regs = RiscvRegs {
+            ra: 0x4200_1010,
+            sp,
+            s0: 0,
+        };
+        let out = walk(0x4200_1010, regs, 64, row_at, |_| true, &mut word);
+        assert_eq!(out, [0x4200_2020, 0x4200_3030]);
+        // A step that does not land right after a call stops the walk.
+        let out = walk(
+            0x4200_1010,
+            regs,
+            64,
+            row_at,
+            |r| r != 0x4200_3030,
+            &mut word,
+        );
+        assert_eq!(out, [0x4200_2020]);
+        // A saved register that cannot be read stops it too.
+        assert!(walk(0x4200_1010, regs, 64, row_at, |_| true, &mut |_| None).is_empty());
+        // The cap.
+        assert_eq!(
+            walk(0x4200_1010, regs, 1, row_at, |_| true, &mut word).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_walk_goes_through_direct_recursion() {
+        // F calls itself from one call site, so every level saves the same
+        // return address R; the outermost level returns into G at R2.
+        const R: u64 = 0x4200_1010;
+        const R2: u64 = 0x4200_2020;
+        let row_at = |at: u64| match at {
+            // F: CFA = sp + 16, ra at CFA - 4.
+            0x4200_100f => Some(CfiRow {
+                cfa_reg: 2,
+                cfa_off: 16,
+                ra_at: Some(-4),
+                s0_at: None,
+            }),
+            // G: CFA = sp + 16 as well.
+            0x4200_201f => Some(CfiRow {
+                cfa_reg: 2,
+                cfa_off: 16,
+                ra_at: Some(-4),
+                s0_at: None,
+            }),
+            _ => None,
+        };
+        let sp = 0x3fc8_0000u64;
+        let saved = HashMap::from([(sp + 12, R), (sp + 28, R2), (sp + 44, 0)]);
+        let mut word = |a: u64| saved.get(&a).copied();
+        let regs = RiscvRegs { ra: R, sp, s0: 0 };
+        assert_eq!(walk(R, regs, 64, row_at, |_| true, &mut word), [R, R2]);
+        // A row whose CFA does not rise above `sp` is no caller's frame.
+        let flat = |_: u64| {
+            Some(CfiRow {
+                cfa_reg: 2,
+                cfa_off: 0,
+                ra_at: Some(-4),
+                s0_at: None,
+            })
+        };
+        assert!(walk(R, regs, 64, flat, |_| true, &mut |_| Some(R)).is_empty());
+    }
+
+    /// A saved run, counted by this version and summed up. Ignored and
+    /// path-driven - set `EIDE_RUN_FILE` to a file the Profile tab saved:
+    ///
+    /// `EIDE_RUN_FILE=… cargo test -- --ignored a_saved_run_file --nocapture`
+    #[test]
+    #[ignore]
+    fn a_saved_run_file_is_counted() {
+        let Some(path) = std::env::var_os("EIDE_RUN_FILE") else {
+            println!("EIDE_RUN_FILE not set - nothing to count");
+            return;
+        };
+        let run = read_run(Path::new(&path)).unwrap();
+        let res = process(run, None);
+        let by = &res.by_line;
+        let pct = |k: usize| k as f32 * 100.0 / by.samples.max(1) as f32;
+        println!(
+            "{} samples · idle {:.1}% · outside {:.1}% · no line {:.1}% · ELF {}",
+            by.samples,
+            pct(by.idle),
+            pct(by.outside),
+            pct(by.no_line),
+            if res.elf_changed { "not used" } else { "used" }
+        );
+        for (f, k) in &by.outside_fns {
+            println!("  outside {k:>4}  {f}");
+        }
+        for l in by.lines.iter().take(15) {
+            println!(
+                "  {:>5.1}% self {:>5.1}% total  {}:{}  {}",
+                pct(l.self_n),
+                pct(l.total_n),
+                l.file,
+                l.line,
+                l.code
+            );
+        }
+        assert_eq!(
+            by.lines.iter().map(|l| l.self_n).sum::<usize>() + by.idle + by.outside + by.no_line,
+            by.samples
+        );
+    }
+
+    #[test]
+    fn read_memory_bytes_are_base64() {
+        assert_eq!(
+            from_base64("AQIDBA==").as_deref(),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+        assert_eq!(from_base64("TWFu").as_deref(), Some(&b"Man"[..]));
+        assert_eq!(from_base64("").as_deref(), Some(&[][..]));
+        assert_eq!(from_base64("not base64!"), None);
+        let copy = StackCopy {
+            chunks: vec![
+                (0x100, vec![0x78, 0x56, 0x34, 0x12, 0xff]),
+                (0x200, vec![1, 0, 0, 0]),
+            ],
+        };
+        assert_eq!(copy.word(0x100), Some(0x1234_5678));
+        assert_eq!(copy.word(0x200), Some(1));
+        assert_eq!(copy.word(0x102), None);
+        assert_eq!(copy.word(0xfc), None);
+    }
+
     #[test]
     fn the_standard_error_matches_the_plan_numbers() {
         // 10% of 120 samples: ±2.7 points; of 1000: ±0.95.
@@ -2031,7 +3339,11 @@ mod tests {
             "src/main.rs".to_owned(),
             "fn main() {\n    let x = read();\n}\n".to_owned(),
         )]);
-        let res = result_of(&[vec![at("main", "src/main.rs", 2)]], texts);
+        let run = SampleRun {
+            texts,
+            ..SampleRun::default()
+        };
+        let res = result_of(&[vec![at("main", "src/main.rs", 2)]], run, None, false);
         assert_eq!(res.by_line.lines[0].code, "let x = read();");
         assert_eq!(res.samples, 1);
         assert_eq!(res.root.children[0].name, "main");

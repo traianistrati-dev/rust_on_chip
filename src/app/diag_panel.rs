@@ -175,6 +175,8 @@ pub(super) fn show_diag_panel(
     flame_by_line: &mut bool,
     flame_heat: &mut bool,
     flame_stale: &[String],
+    // Its "Save…" / "Load…" (the caller opens the dialog).
+    flame_file: &mut Option<crate::flamegraph::FlameFileOp>,
     // Flash tab's probe-rs path (shared probe): status + "Flash (probe-rs)" signal.
     probe_flash_state: &Arc<Mutex<crate::probe_flash::ProbeFlashState>>,
     probe_flash_go: &mut bool,
@@ -854,6 +856,7 @@ pub(super) fn show_diag_panel(
                 flame_heat,
                 flame_stale,
                 nav,
+                flame_file,
                 rtt_chip,
                 can_flash,
                 probe_list,

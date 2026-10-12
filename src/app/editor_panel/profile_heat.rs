@@ -53,7 +53,7 @@ impl AppIde {
         };
         files
             .into_iter()
-            .filter(|f| res.texts.get(*f).map(String::as_str) != live(f))
+            .filter(|f| res.run.texts.get(*f).map(String::as_str) != live(f))
             .map(str::to_owned)
             .collect()
     }
@@ -84,7 +84,7 @@ impl AppIde {
         let FlameState::Done(res) = &*st else {
             return;
         };
-        if res.texts.get(&rel).map(String::as_str) != Some(display_code) {
+        if res.run.texts.get(&rel).map(String::as_str) != Some(display_code) {
             return;
         }
         let by = &res.by_line;

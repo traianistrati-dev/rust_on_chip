@@ -229,6 +229,7 @@ impl AppIde {
         let mut profile_run = false;
         let mut profile_sample = false;
         let flame_stale = self.flame_stale_files();
+        let mut flame_file: Option<crate::flamegraph::FlameFileOp> = None;
         let rtt_chip = self
             .selected_build_cfg()
             .map(|(p, _)| p.probe_chip)
@@ -413,6 +414,7 @@ impl AppIde {
                     &mut self.flame_by_line,
                     &mut self.flame_heat,
                     &flame_stale,
+                    &mut flame_file,
                     &self.probe_flash_state,
                     &mut probe_flash_go,
                     &mut probe_flash_stop,
@@ -606,6 +608,12 @@ impl AppIde {
         // Profile-tab "Sample" button → on-target flamegraph.
         if profile_sample {
             self.start_flame();
+        }
+        // Its "Save…" / "Load…" of a run's raw samples.
+        match flame_file {
+            Some(crate::flamegraph::FlameFileOp::Save) => self.save_flame_run(),
+            Some(crate::flamegraph::FlameFileOp::Load) => self.load_flame_run(),
+            None => {}
         }
         // "Debug-friendly build" flipped: the Mcu owns the preference, and the
         // codegen pass hashes it → `[profile.release]` is rewritten next frame,

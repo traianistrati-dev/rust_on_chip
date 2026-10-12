@@ -669,6 +669,63 @@ impl AppIde {
         }
     }
 
+    /// Profile tab "Save…": the run on screen, raw, to a file the user picks.
+    pub(crate) fn save_flame_run(&mut self) {
+        let run = match &*self.flame_state.lock().unwrap() {
+            crate::flamegraph::FlameState::Done(res) => Arc::clone(&res.run),
+            _ => return,
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save profile samples")
+            .add_filter("Profile samples", &["json"])
+            .set_file_name(format!("profile-{}.json", run.chip));
+        if let Some(dir) = &self.project_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        match crate::flamegraph::save_run(&run, &path) {
+            Ok(()) => self.set_status_msg(format!(
+                "Saved {} samples to {}",
+                run.samples.len(),
+                path.display()
+            )),
+            Err(e) => self.set_status_msg(format!("Could not save the samples: {e}")),
+        }
+    }
+
+    /// Profile tab "Load…": a saved run, counted again and shown in place of
+    /// the one on screen. Needs no chip, no probe and no board.
+    pub(crate) fn load_flame_run(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Load profile samples")
+            .add_filter("Profile samples", &["json"]);
+        if let Some(dir) = &self.project_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        // Read and checked BEFORE the run on screen is given up: a wrong file
+        // leaves it there, still savable.
+        let run = match crate::flamegraph::read_run(&path) {
+            Ok(run) => run,
+            Err(e) => {
+                self.set_status_msg(format!("Could not load {}: {e}", path.display()));
+                return;
+            }
+        };
+        self.build_tab = BuildPanelTab::Profile;
+        self.profile_mode = crate::profile::ProfileMode::Runtime;
+        crate::flamegraph::start_load(
+            run,
+            path,
+            Arc::clone(&self.flame_state),
+            self.egui_ctx.clone(),
+        );
+    }
+
     /// What stops RTT Run and Debug from flashing, as (console line, phase
     /// text): the FPGA bitstream, then the partition table probe-rs would be
     /// handed (`--idf-partition-table`) - the same check the espflash path

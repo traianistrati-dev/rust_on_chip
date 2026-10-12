@@ -4,7 +4,7 @@
 //!   firmware (see [`crate::flamegraph`]), shown as a flamegraph or counted per
 //!   source line ("By line").
 
-use crate::flamegraph::{FlameNode, FlameResult, FlameState, LineStat, std_err_pct};
+use crate::flamegraph::{FlameFileOp, FlameNode, FlameResult, FlameState, LineStat, std_err_pct};
 use crate::profile::{BloatRow, ProfileMode, ProfileState};
 use eframe::egui;
 use egui_phosphor::regular as ph;
@@ -29,6 +29,8 @@ pub fn show_profile_tab(
     flame_heat: &mut bool,
     flame_stale: &[String],
     nav: &mut Option<(String, usize, egui::Color32)>,
+    // "Save…" / "Load…" of a run's raw samples (the caller opens the dialog).
+    flame_file: &mut Option<FlameFileOp>,
     // The probe-rs chip name (for the runtime hover), and whether a chip config
     // exists (gates both modes).
     chip: &str,
@@ -79,6 +81,7 @@ pub fn show_profile_tab(
             flame_heat,
             flame_stale,
             nav,
+            flame_file,
             chip,
             can_run,
             probe_list,
@@ -294,6 +297,7 @@ fn runtime_view(
     flame_heat: &mut bool,
     flame_stale: &[String],
     nav: &mut Option<(String, usize, egui::Color32)>,
+    flame_file: &mut Option<FlameFileOp>,
     chip: &str,
     can_run: bool,
     probe_list: &[crate::probe::ProbeInfo],
@@ -357,6 +361,42 @@ fn runtime_view(
         {
             *sample_clicked = true;
         }
+        // A run's raw samples, to and from a file: to look again later, to
+        // compare with the next run, or to hand to someone. A loaded run is
+        // counted again by this version of the IDE.
+        let done = matches!(st, FlameState::Done(_));
+        if ui
+            .add_enabled(
+                done && !busy,
+                egui::Button::new(
+                    egui::RichText::new(format!("{} Save…", ph::FLOPPY_DISK)).size(10.5),
+                ),
+            )
+            .on_hover_text(
+                "Save this run's raw samples - the stacks probe-rs reported and the \
+                 source they point at - to a file.",
+            )
+            .on_disabled_hover_text("Sample, or load, a run first.")
+            .clicked()
+        {
+            *flame_file = Some(FlameFileOp::Save);
+        }
+        if ui
+            .add_enabled(
+                !busy,
+                egui::Button::new(
+                    egui::RichText::new(format!("{} Load…", ph::FOLDER_OPEN)).size(10.5),
+                ),
+            )
+            .on_hover_text(
+                "Load a saved run. Its samples are counted again by this version of the \
+                 IDE, with the release ELF it was sampled with while that is still the \
+                 same build. No board needed.",
+            )
+            .clicked()
+        {
+            *flame_file = Some(FlameFileOp::Load);
+        }
         ui.separator();
         ui.label(
             egui::RichText::new("Chip:")
@@ -392,12 +432,59 @@ fn runtime_view(
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(150));
                 }
-                FlameState::Done(r) => {
+                FlameState::Loading => {
                     ui.label(
+                        egui::RichText::new("loading…")
+                            .size(10.5)
+                            .color(egui::Color32::from_rgb(220, 180, 60)),
+                    );
+                    ui.spinner();
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(150));
+                }
+                FlameState::Done(r) => {
+                    // Right to left: the warning first, so it is never the one
+                    // squeezed; the file name last, cut to the room that is left
+                    // (its full path is in the hover).
+                    if r.elf_changed {
+                        ui.label(
+                            egui::RichText::new(format!("{} ELF rebuilt", ph::WARNING))
+                                .size(10.5)
+                                .color(egui::Color32::from_rgb(220, 170, 60)),
+                        )
+                        .on_hover_text(concat!(
+                            "The release ELF this run was sampled with is gone or was rebuilt ",
+                            "since (Flash, Size and Sample all rebuild it). Its frames are ",
+                            "counted as probe-rs reported them: no Cortex-M caller fix, no ",
+                            "unwinding of ESP stacks - Sample again for those.",
+                        ));
+                    }
+                    let green = egui::Color32::from_rgb(120, 190, 120);
+                    let count = ui.label(
                         egui::RichText::new(format!("{} samples", r.samples))
                             .size(10.5)
-                            .color(egui::Color32::from_rgb(120, 190, 120)),
+                            .color(green),
                     );
+                    match &r.loaded_from {
+                        Some(p) => {
+                            let name = p
+                                .file_name()
+                                .map(|f| f.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{name} ·"))
+                                        .size(10.5)
+                                        .color(green),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(format!("Loaded from {}", p.display()));
+                        }
+                        None => {
+                            count.on_hover_text("Sampled live.");
+                        }
+                    }
                 }
                 FlameState::Failed(_) => {
                     ui.label(
@@ -437,6 +524,14 @@ fn runtime_view(
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(format!("Sampling the call stack… {done}/{total}"))
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(200, 180, 120)),
+            );
+        }
+        FlameState::Loading => {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Reading the saved run and counting its samples…")
                     .size(11.0)
                     .color(egui::Color32::from_rgb(200, 180, 120)),
             );
@@ -1114,8 +1209,7 @@ fn draw_fitted_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flamegraph::ByLine;
-    use std::collections::HashMap;
+    use crate::flamegraph::{ByLine, SampleRun};
 
     fn line(file: &str, line: u32, self_n: usize, total_n: usize, code: &str) -> LineStat {
         LineStat {
@@ -1145,7 +1239,9 @@ mod tests {
                 no_line_fns: Vec::new(),
                 samples,
             },
-            texts: Arc::new(HashMap::new()),
+            run: Arc::new(SampleRun::default()),
+            loaded_from: None,
+            elf_changed: false,
             samples,
         }
     }

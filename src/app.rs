@@ -1700,6 +1700,11 @@ pub struct AppIde {
     profile_mode: crate::profile::ProfileMode,
     /// On-target flamegraph sampling state (Runtime mode; see `crate::flamegraph`).
     flame_state: Arc<Mutex<crate::flamegraph::FlameState>>,
+    /// Runtime mode shows the per-line table instead of the flamegraph, and
+    /// whether the editor tints the sampled lines. Session-only, both off at
+    /// start: the tint sits over the code.
+    flame_by_line: bool,
+    flame_heat: bool,
     /// Which flash pipelines (DFU, OpenOCD, espflash, probe-rs) have been busy
     /// since every one was last idle. Edge-detects "flash finished" to
     /// re-measure Flash/RAM automatically (see `poll_flash_finished_size`).
@@ -2478,6 +2483,8 @@ impl AppIde {
             profile_by_crate: false,
             profile_mode: crate::profile::ProfileMode::Static,
             flame_state: Arc::new(Mutex::new(crate::flamegraph::FlameState::Idle)),
+            flame_by_line: false,
+            flame_heat: false,
             flash_ran: [false; editor_panel::FLASH_PIPELINES],
             last_build_tab: BuildPanelTab::RustAnalyzer,
             clippy_sel: None,

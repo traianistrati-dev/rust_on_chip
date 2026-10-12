@@ -62,6 +62,7 @@ mod let_annotation;
 pub(super) mod macro_uses;
 mod move_lines;
 pub(crate) mod multi_cursor;
+mod profile_heat;
 mod rename;
 #[cfg(test)]
 mod replace_enter_tests;
@@ -1840,6 +1841,16 @@ impl AppIde {
             // click-to-revert. A revert mutates `display_code`; the write-back
             // below persists it (same as the context-menu Cut).
             self.tick_diff_gutter(&display_code, displayed_file);
+            // The Profile tab's sampled lines, under the diff marks.
+            self.paint_profile_heat(
+                ui,
+                &editor_resp,
+                &galley_rows,
+                editor_clip,
+                &display_code,
+                displayed_file,
+                &pill_edges,
+            );
             self.paint_diff_gutter(
                 ui,
                 &editor_resp,

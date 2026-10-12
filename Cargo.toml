@@ -58,6 +58,19 @@ url = "2"
 syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 
+# The release ELF's DWARF line table, for the Profile tab's per-line view.
+# probe-rs 0.29 places a Cortex-M caller frame at its RETURN address, so the
+# time spent inside a call landed on the line AFTER it; `flamegraph::ElfLines`
+# looks such frames up again one byte back, inside the call. Read-only and
+# minimal on purpose - no loader, no compression, no C++ - so these are the
+# only four crates it compiles (memchr was already there; gimli's weak
+# `fallible-iterator?/std` puts that crate in Cargo.lock, never in a build).
+# `rustc-demangle`: rustc 1.98 mangles v0 (`_RNv...`), and a frame rebuilt
+# from the ELF needs a name the way probe-rs shows one.
+addr2line = { version = "0.25", default-features = false, features = ["std", "rustc-demangle"] }
+gimli     = { version = "0.32", default-features = false, features = ["read", "std"] }
+object    = { version = "0.37", default-features = false, features = ["read_core", "elf", "std"] }
+
 # Killing a PROCESS GROUP (the rust-analyzer tree) has no std equivalent — the
 # Windows side shells out to `taskkill /T`, the unixes need `kill(-pgid)`.
 # Already in the tree transitively (rusb / serialport / eframe), so this costs

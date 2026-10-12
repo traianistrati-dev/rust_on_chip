@@ -259,6 +259,17 @@ pub(crate) struct EditorState {
     /// Whether the hint was DRAWN last frame. Tab accepts only a hint the user
     /// can see: the call-signature ghost can take its line and hide it.
     pub(crate) inlay_hint_drawn: bool,
+    /// (1-based line, right edge) of the type hint and of the call-signature
+    /// ghost as drawn last frame. The Profile heat band starts its hover
+    /// sensor past them: egui shows one tooltip per layer, and both carry
+    /// tooltips of their own.
+    pub(crate) inlay_hint_right: Option<(u32, f32)>,
+    pub(crate) sig_ghost_right: Option<(u32, f32)>,
+    /// The 1-based lines the Profile heat band put a hover sensor on THIS
+    /// frame, past their end. Taken by the diagnostics overlay, which stops a
+    /// multi-line span's hover at the end of such a line instead of running
+    /// over the sensor.
+    pub(crate) heat_sensor_lines: Vec<u32>,
 
     /// The last scan for the caret's untyped `let`, reused while the text and
     /// caret are unchanged: see `inlay_hint::InlayScan`.
@@ -364,6 +375,9 @@ impl EditorState {
             inlay_asked_at: (0, false),
             inlay_accept_pending: false,
             inlay_hint_drawn: false,
+            inlay_hint_right: None,
+            sig_ghost_right: None,
+            heat_sensor_lines: Vec::new(),
             inlay_scan: None,
             macro_facts: Default::default(),
             sig_scan: None,

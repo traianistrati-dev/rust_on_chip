@@ -968,8 +968,8 @@ work is dual licensed as above, with no additional terms.
 
 ### What the dependencies bring
 
-`Cargo.lock` pins 470 crates: the IDE plus 469 dependencies, every platform
-included. A build compiles fewer of them — 226 for Windows
+`Cargo.lock` pins 475 crates: the IDE plus 474 dependencies, every platform
+included. A build compiles fewer of them — 230 for Windows
 (`cargo tree -e normal,build --target x86_64-pc-windows-msvc --prefix none
 --no-dedupe | sort -u | wc -l`); Linux and macOS swap in their own windowing
 crates.

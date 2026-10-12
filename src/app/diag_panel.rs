@@ -170,6 +170,11 @@ pub(super) fn show_diag_panel(
     profile_run: &mut bool,
     flame_state: &Arc<Mutex<crate::flamegraph::FlameState>>,
     profile_sample: &mut bool,
+    // Runtime's "By line" view: the switch, the editor tint toggle, and the
+    // files edited since the sample (`AppIde::flame_stale_files`).
+    flame_by_line: &mut bool,
+    flame_heat: &mut bool,
+    flame_stale: &[String],
     // Flash tab's probe-rs path (shared probe): status + "Flash (probe-rs)" signal.
     probe_flash_state: &Arc<Mutex<crate::probe_flash::ProbeFlashState>>,
     probe_flash_go: &mut bool,
@@ -845,6 +850,10 @@ pub(super) fn show_diag_panel(
                 profile_run,
                 flame_state,
                 profile_sample,
+                flame_by_line,
+                flame_heat,
+                flame_stale,
+                nav,
                 rtt_chip,
                 can_flash,
                 probe_list,

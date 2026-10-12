@@ -521,13 +521,19 @@ impl AppIde {
     /// diagnostic's own position — e.g. adding a use of the variable elsewhere
     /// doesn't move the `let`, but must still invalidate the "unused" fade).
     pub(super) fn snapshot_build_text(&mut self) {
-        self.build_text_snapshot.clear();
-        self.build_text_snapshot
-            .insert("src/main.rs".to_owned(), self.generated_code.clone());
+        self.build_text_snapshot = self.source_texts();
+    }
+
+    /// Every project file's CURRENT content, keyed the way cargo and the DWARF
+    /// name them (`"src/main.rs"` / `"src/{rel}"`). What a build compiles, so
+    /// whatever a build reports can later be checked against the live text.
+    pub(super) fn source_texts(&self) -> std::collections::HashMap<String, String> {
+        let mut texts = std::collections::HashMap::new();
+        texts.insert("src/main.rs".to_owned(), self.generated_code.clone());
         for (rel, content) in &self.project_tree.user_src_files {
-            self.build_text_snapshot
-                .insert(rel.clone(), content.clone());
+            texts.insert(rel.clone(), content.clone());
         }
+        texts
     }
 
     /// Char-index spans of the unused IMPORTS in the displayed file — faded like

@@ -831,12 +831,12 @@ pub(crate) fn draw_signature_ghost(
     font_size: f32,
     ghost: &SigGhost,
     hover_id: egui::Id,
-) {
+) -> Option<egui::Rect> {
     let painter = ui.painter().with_clip_rect(clip);
     let loc = galley.pos_from_cursor(egui::text::CCursor::new(eol_disp));
     let (y_top, y_bot) = (galley_pos.y + loc.min.y, galley_pos.y + loc.max.y);
     if y_bot < clip.top() || y_top > clip.bottom() {
-        return;
+        return None;
     }
     let font = egui::FontId::monospace(font_size);
     let char_w = painter
@@ -873,6 +873,7 @@ pub(crate) fn draw_signature_ghost(
     }
     ui.interact(rect.intersect(clip), hover_id, egui::Sense::hover())
         .on_hover_text(full);
+    Some(rect)
 }
 
 #[cfg(test)]

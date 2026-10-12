@@ -1,9 +1,10 @@
 //! Profile tab — code efficiency. Two modes:
 //! - **Static** (`cargo bloat`): `.text`/Flash size per function or crate.
 //! - **Runtime** (on-target flamegraph): probe-rs stack-sampling of the running
-//!   firmware (see [`crate::flamegraph`]).
+//!   firmware (see [`crate::flamegraph`]), shown as a flamegraph or counted per
+//!   source line ("By line").
 
-use crate::flamegraph::{FlameNode, FlameState};
+use crate::flamegraph::{FlameNode, FlameResult, FlameState, LineStat, std_err_pct};
 use crate::profile::{BloatRow, ProfileMode, ProfileState};
 use eframe::egui;
 use egui_phosphor::regular as ph;
@@ -20,6 +21,14 @@ pub fn show_profile_tab(
     // ── Runtime (flamegraph) ──
     flame_state: &Arc<Mutex<FlameState>>,
     sample_clicked: &mut bool,
+    // Runtime's "Flame | By line" switch and the editor tint toggle
+    // (`AppIde::flame_by_line` / `flame_heat`), the files edited since the
+    // sample (their rows keep the old line numbers), and the jump a row click
+    // asks for - the same one the diagnostic tabs use.
+    flame_by_line: &mut bool,
+    flame_heat: &mut bool,
+    flame_stale: &[String],
+    nav: &mut Option<(String, usize, egui::Color32)>,
     // The probe-rs chip name (for the runtime hover), and whether a chip config
     // exists (gates both modes).
     chip: &str,
@@ -66,6 +75,10 @@ pub fn show_profile_tab(
             ui,
             flame_state,
             sample_clicked,
+            flame_by_line,
+            flame_heat,
+            flame_stale,
+            nav,
             chip,
             can_run,
             probe_list,
@@ -277,6 +290,10 @@ fn runtime_view(
     ui: &mut egui::Ui,
     flame_state: &Arc<Mutex<FlameState>>,
     sample_clicked: &mut bool,
+    flame_by_line: &mut bool,
+    flame_heat: &mut bool,
+    flame_stale: &[String],
+    nav: &mut Option<(String, usize, egui::Color32)>,
     chip: &str,
     can_run: bool,
     probe_list: &[crate::probe::ProbeInfo],
@@ -443,13 +460,373 @@ fn runtime_view(
                 });
         }
         FlameState::Done(res) => {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    flame_widget(ui, &res.root);
-                });
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    flame_by_line,
+                    false,
+                    egui::RichText::new("Flame").size(10.5),
+                )
+                .on_hover_text(
+                    "The samples' call stacks folded into a flamegraph: which FUNCTIONS the \
+                         time goes to.",
+                );
+                ui.selectable_value(
+                    flame_by_line,
+                    true,
+                    egui::RichText::new("By line").size(10.5),
+                )
+                .on_hover_text(
+                    "The same samples counted per SOURCE LINE of the project: which lines \
+                         the time goes to.",
+                );
+                // In both views: the tint belongs to the run, not to the
+                // table, and a band with no visible switch would be a mystery.
+                ui.separator();
+                ui.checkbox(flame_heat, egui::RichText::new("Heat in editor").size(10.5))
+                    .on_hover_text(
+                        "Tint every line the samples caught, in the editor - the strongest is \
+                         the run's hottest line - and hover a line for its numbers.\nHidden on \
+                         a file edited since the sample: its line numbers may point at other \
+                         code by now.",
+                    );
+            });
+            if *flame_by_line {
+                by_line_view(ui, res, flame_stale, nav);
+            } else {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        flame_widget(ui, &res.root);
+                    });
+            }
         }
     }
+}
+
+// ── Runtime: by line ──────────────────────────────────────────────────────────
+
+/// Column the by-line table is sorted on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineSort {
+    SelfTime,
+    Total,
+    Location,
+}
+
+const LINE_ROW_H: f32 = 18.0;
+/// Left edge of each column: self (with its bar), ±, total, samples, line.
+/// The code takes the rest.
+const COLS: [f32; 5] = [0.0, 62.0, 106.0, 162.0, 206.0];
+const LOC_W: f32 = 190.0;
+/// A clicked row's band in the editor: the location column's blue, off the
+/// heat scale - an orange band would stack on the line's heat and make a cold
+/// line read hot.
+const JUMP_BAND: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(120, 160, 200, 30);
+
+/// Where column `i` of a row starting at `left` begins and ends: the five
+/// cells at [`COLS`], then the code up to `right`.
+fn col_span(left: f32, right: f32, i: usize) -> (f32, f32) {
+    let start = |i: usize| COLS.get(i).copied().unwrap_or(COLS[4] + LOC_W);
+    let end = if i >= COLS.len() {
+        right
+    } else {
+        left + start(i + 1)
+    };
+    (left + start(i), end.min(right))
+}
+
+/// The per-line table: two fixed rows (idle, outside the project), then every
+/// sampled project line. A row click opens the line in the editor.
+fn by_line_view(
+    ui: &mut egui::Ui,
+    res: &FlameResult,
+    stale: &[String],
+    nav: &mut Option<(String, usize, egui::Color32)>,
+) {
+    let by = &res.by_line;
+    let n = by.samples.max(1);
+    let pct = |k: usize| k as f32 * 100.0 / n as f32;
+    let sort_id = ui.id().with("flame_line_sort");
+    let mut sort = ui
+        .data(|d| d.get_temp::<LineSort>(sort_id))
+        .unwrap_or(LineSort::SelfTime);
+
+    ui.label(
+        egui::RichText::new(
+            "Self = time on the line itself, the library calls it makes included. Total = \
+             time with the line anywhere on the stack. ± = one standard error: more samples, \
+             smaller ±.",
+        )
+        .size(10.5)
+        .color(egui::Color32::GRAY),
+    );
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    let (head, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), LINE_ROW_H),
+        egui::Sense::hover(),
+    );
+    let heads: [(&str, Option<LineSort>, &str); 6] = [
+        (
+            "Self",
+            Some(LineSort::SelfTime),
+            "Share of the samples spent on this line itself.",
+        ),
+        (
+            "±",
+            None,
+            "One standard error of the share, √(p(1−p)/n) in points. Twice it covers ~95% \
+             of runs.",
+        ),
+        (
+            "Total",
+            Some(LineSort::Total),
+            "Share of the samples with this line anywhere on the call stack.",
+        ),
+        ("n", None, "Samples on the line itself."),
+        (
+            "Line",
+            Some(LineSort::Location),
+            "File and line, as this run compiled them.",
+        ),
+        ("Code", None, "The line's text, as this run compiled it."),
+    ];
+    for (i, (label, key, hover)) in heads.iter().enumerate() {
+        let (x0, x1) = col_span(head.left(), head.right(), i);
+        if x1 <= x0 {
+            continue;
+        }
+        let cell =
+            egui::Rect::from_min_max(egui::pos2(x0, head.top()), egui::pos2(x1, head.bottom()));
+        let resp = ui.interact(
+            cell,
+            sort_id.with(i),
+            if key.is_some() {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
+        let active = *key == Some(sort);
+        let text = if active {
+            format!("{label} {}", ph::CARET_DOWN)
+        } else {
+            (*label).to_owned()
+        };
+        draw_fitted_text(
+            ui.painter(),
+            cell,
+            &text,
+            egui::FontId::proportional(10.5),
+            if active || resp.hovered() {
+                egui::Color32::from_gray(230)
+            } else {
+                egui::Color32::from_gray(160)
+            },
+        );
+        if let Some(k) = key
+            && resp.clicked()
+        {
+            sort = *k;
+        }
+        resp.on_hover_text(*hover);
+    }
+    ui.data_mut(|d| d.insert_temp(sort_id, sort));
+
+    let mut order: Vec<&LineStat> = by.lines.iter().collect();
+    match sort {
+        // `by_line` already sorts this way.
+        LineSort::SelfTime => {}
+        LineSort::Total => order.sort_by(|a, b| {
+            b.total_n
+                .cmp(&a.total_n)
+                .then(b.self_n.cmp(&a.self_n))
+                .then_with(|| a.file.cmp(&b.file))
+                .then(a.line.cmp(&b.line))
+        }),
+        LineSort::Location => order.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line))),
+    }
+
+    // ── Rows: idle, outside, no line (only when there is one), the lines ────
+    let dim = egui::Color32::from_gray(150);
+    let no_line_row = by.no_line > 0;
+    let fixed = if no_line_row { 3 } else { 2 };
+    egui::ScrollArea::vertical()
+        // Not the flamegraph's scroll state: switching views would open the
+        // table at the graph's offset, the fixed rows already scrolled away.
+        .id_salt("flame_by_line")
+        .auto_shrink([false, false])
+        .show_rows(ui, LINE_ROW_H, order.len() + fixed, |ui, range| {
+            for r in range {
+                if r == 0 {
+                    line_row(
+                        ui,
+                        [
+                            format!("{:>5.1}%", pct(by.idle)),
+                            format!("±{:.1}", std_err_pct(by.idle, n)),
+                            String::new(),
+                            by.idle.to_string(),
+                            "Idle".to_owned(),
+                        ],
+                        "waiting for an interrupt (wfi / wfe / waiti)",
+                        pct(by.idle) / 100.0,
+                        dim,
+                    )
+                    .on_hover_text(
+                        "Samples that caught the core asleep, waiting for an interrupt: time \
+                         the firmware had to spare.",
+                    );
+                    continue;
+                }
+                if r == 1 {
+                    let tip = fns_tip(
+                        "Samples with none of the project's code on the stack: interrupt \
+                         handlers in the HAL, the executor, the ROM, a radio blob.",
+                        &by.outside_fns,
+                    );
+                    line_row(
+                        ui,
+                        [
+                            format!("{:>5.1}%", pct(by.outside)),
+                            format!("±{:.1}", std_err_pct(by.outside, n)),
+                            String::new(),
+                            by.outside.to_string(),
+                            "Outside project".to_owned(),
+                        ],
+                        by.outside_fns.first().map_or("", |(f, _)| f.as_str()),
+                        pct(by.outside) / 100.0,
+                        dim,
+                    )
+                    .on_hover_text(tip);
+                    continue;
+                }
+                if r == 2 && no_line_row {
+                    let tip = fns_tip(
+                        "Samples in the project's own code that the DWARF gives no line: \
+                         optimised instructions on a \"line 0\" row. Not the caller's \
+                         time, so counted here instead of on the line that called it.",
+                        &by.no_line_fns,
+                    );
+                    line_row(
+                        ui,
+                        [
+                            format!("{:>5.1}%", pct(by.no_line)),
+                            format!("±{:.1}", std_err_pct(by.no_line, n)),
+                            String::new(),
+                            by.no_line.to_string(),
+                            "No line".to_owned(),
+                        ],
+                        by.no_line_fns.first().map_or("", |(f, _)| f.as_str()),
+                        pct(by.no_line) / 100.0,
+                        dim,
+                    )
+                    .on_hover_text(tip);
+                    continue;
+                }
+                let l = order[r - fixed];
+                let edited = stale.contains(&l.file);
+                let resp = line_row(
+                    ui,
+                    [
+                        format!("{:>5.1}%", pct(l.self_n)),
+                        format!("±{:.1}", std_err_pct(l.self_n, n)),
+                        format!("{:>5.1}%", pct(l.total_n)),
+                        l.self_n.to_string(),
+                        format!("{}:{}", file_name(&l.file), l.line),
+                    ],
+                    &l.code,
+                    pct(l.self_n) / 100.0,
+                    if edited {
+                        egui::Color32::from_rgb(220, 170, 60)
+                    } else {
+                        egui::Color32::from_rgb(120, 160, 200)
+                    },
+                );
+                let mut tip = format!(
+                    "{}:{}  in {}\nSelf: {} of {} samples · Total: {}",
+                    l.file, l.line, l.func, l.self_n, by.samples, l.total_n
+                );
+                if edited {
+                    tip.push_str(
+                        "\n\nThe file was edited after this sample, so the line may have \
+                         moved. Sample again for fresh numbers.",
+                    );
+                }
+                tip.push_str("\n\nClick to open the line.");
+                if resp.on_hover_text(tip).clicked() {
+                    *nav = Some((l.file.clone(), l.line as usize, JUMP_BAND));
+                }
+            }
+        });
+}
+
+/// A fixed row's hover: what it counts, then the functions it met most.
+fn fns_tip(intro: &str, fns: &[(String, usize)]) -> String {
+    if fns.is_empty() {
+        return intro.to_owned();
+    }
+    let list: Vec<String> = fns.iter().map(|(f, k)| format!("{k:>4}  {f}")).collect();
+    format!("{intro} Most often in:\n{}", list.join("\n"))
+}
+
+/// `src/app/pins.rs` -> `pins.rs`: the column is narrow, and the full path is
+/// in the hover.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// One table row: the five cells at [`COLS`], the code after them, and a bar
+/// under the self cell, `bar` (0..=1) of its width.
+fn line_row(
+    ui: &mut egui::Ui,
+    cells: [String; 5],
+    code: &str,
+    bar: f32,
+    loc_color: egui::Color32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), LINE_ROW_H),
+        egui::Sense::click(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let painter = ui.painter();
+    if resp.hovered() {
+        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(45));
+    }
+    let bar_w = (COLS[1] - 6.0) * bar.clamp(0.0, 1.0);
+    if bar_w > 0.0 {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(bar_w.max(1.0), rect.height())),
+            2.0,
+            egui::Color32::from_rgb(150, 70, 35),
+        );
+    }
+    let font = egui::FontId::monospace(10.5);
+    let texts = cells
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(code));
+    for (i, cell) in texts.enumerate() {
+        let (x0, x1) = col_span(rect.left(), rect.right(), i);
+        if x1 <= x0 {
+            continue;
+        }
+        let color = match i {
+            4 => loc_color,
+            5 => egui::Color32::from_gray(185),
+            _ => egui::Color32::from_gray(225),
+        };
+        draw_fitted_text(
+            painter,
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+            cell,
+            font.clone(),
+            color,
+        );
+    }
+    resp
 }
 
 /// Icicle flamegraph: root at the top (full width), callees stacked below, each
@@ -732,4 +1109,189 @@ fn draw_fitted_text(
             font,
             color,
         );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flamegraph::ByLine;
+    use std::collections::HashMap;
+
+    fn line(file: &str, line: u32, self_n: usize, total_n: usize, code: &str) -> LineStat {
+        LineStat {
+            file: file.into(),
+            line,
+            func: "app::work".into(),
+            code: code.into(),
+            self_n,
+            total_n,
+        }
+    }
+
+    fn result(lines: Vec<LineStat>, idle: usize, outside: usize) -> FlameResult {
+        let samples = lines.iter().map(|l| l.self_n).sum::<usize>() + idle + outside;
+        FlameResult {
+            root: FlameNode {
+                name: "all".into(),
+                count: samples,
+                children: Vec::new(),
+            },
+            by_line: ByLine {
+                lines,
+                idle,
+                outside,
+                outside_fns: vec![("esp_hal::timer::isr".into(), outside)],
+                no_line: 0,
+                no_line_fns: Vec::new(),
+                samples,
+            },
+            texts: Arc::new(HashMap::new()),
+            samples,
+        }
+    }
+
+    /// Every text the table painted, with the rect it was laid out in.
+    fn texts(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((
+                    t.galley.text().to_owned(),
+                    egui::Rect::from_min_size(t.pos, t.galley.size()),
+                )),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for s in &out.shapes {
+            walk(&s.shape, &mut found);
+        }
+        found
+    }
+
+    fn draw(res: &FlameResult, width: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let mut nav = None;
+        let mut last = None;
+        // A few frames: the scroll area settles its size after the first.
+        for pass in 0..3u32 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 500.0),
+                )),
+                time: Some(f64::from(pass) / 30.0),
+                ..Default::default()
+            };
+            last = Some(crate::headless::run_ui(&ctx, input, |ui| {
+                by_line_view(ui, res, &[], &mut nav)
+            }));
+        }
+        last.unwrap()
+    }
+
+    fn find<'a>(found: &'a [(String, egui::Rect)], text: &str) -> &'a egui::Rect {
+        &found
+            .iter()
+            .find(|(t, _)| t.trim() == text)
+            .unwrap_or_else(|| panic!("{text:?} not painted: {found:?}"))
+            .1
+    }
+
+    #[test]
+    fn the_header_and_the_cells_share_their_columns() {
+        let res = result(
+            vec![
+                line("src/main.rs", 42, 30, 45, "let v = adc.read(&mut pin);"),
+                line("src/app/pins.rs", 7, 10, 10, "led.toggle();"),
+            ],
+            50,
+            10,
+        );
+        let found = texts(&draw(&res, 1200.0));
+        let x = |t: &str| find(&found, t).left();
+        // The active sort column carries a caret after its name (and the note
+        // above the table starts with "Self =").
+        let self_head = found
+            .iter()
+            .find(|(t, _)| t.starts_with("Self ") && !t.contains('='))
+            .expect("Self header")
+            .1;
+        assert!((self_head.left() - x("30.0%")).abs() < 1.0);
+        assert!((x("Total") - x("45.0%")).abs() < 1.0);
+        assert!((x("Line") - x("main.rs:42")).abs() < 1.0);
+        assert!((x("Code") - x("let v = adc.read(&mut pin);")).abs() < 1.0);
+        // The fixed rows come first, hottest line next.
+        let y = |t: &str| find(&found, t).top();
+        assert!(y("Idle") < y("Outside project"));
+        assert!(y("Outside project") < y("main.rs:42"));
+        assert!(y("main.rs:42") < y("pins.rs:7"));
+    }
+
+    #[test]
+    fn the_no_line_row_shows_only_when_it_counts() {
+        let mut res = result(vec![line("src/main.rs", 42, 30, 45, "x();")], 50, 10);
+        let found = texts(&draw(&res, 1200.0));
+        assert!(!found.iter().any(|(t, _)| t == "No line"), "{found:?}");
+        res.by_line.no_line = 5;
+        res.by_line.no_line_fns = vec![("app::work".into(), 5)];
+        let found = texts(&draw(&res, 1200.0));
+        let y = |t: &str| find(&found, t).top();
+        assert!(y("Outside project") < y("No line"));
+        assert!(y("No line") < y("main.rs:42"));
+        assert!(find(&found, "app::work").left() > find(&found, "No line").left());
+    }
+
+    #[test]
+    fn no_two_cells_of_a_row_overlap() {
+        let long = "x".repeat(400);
+        let res = result(
+            vec![line(
+                "very_long_library_name/src/deeply/nested/module_file.rs",
+                12345,
+                99999,
+                99999,
+                &long,
+            )],
+            0,
+            0,
+        );
+        for width in [1200.0, 420.0] {
+            let found = texts(&draw(&res, width));
+            // The long row itself: the fixed rows above it share its "±0.0".
+            let row = find(&found, "module_file.rs:12345");
+            let mut cells: Vec<egui::Rect> = found
+                .iter()
+                .map(|(_, r)| *r)
+                .filter(|r| (r.center().y - row.center().y).abs() < 2.0)
+                .collect();
+            cells.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            assert!(cells.len() >= 4, "{width}: {found:?}");
+            for pair in cells.windows(2) {
+                assert!(
+                    pair[0].right() <= pair[1].left() + 0.5,
+                    "{width}: {:?} runs into {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            assert!(
+                cells.iter().all(|r| r.right() <= width),
+                "{width}: {cells:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_or_empty_table_still_draws() {
+        // No samples at all, and a panel narrower than the fixed columns.
+        let empty = result(Vec::new(), 0, 0);
+        for width in [1200.0, 150.0, 30.0] {
+            draw(&empty, width);
+            draw(
+                &result(vec![line("src/main.rs", 1, 1, 1, "loop {}")], 1, 0),
+                width,
+            );
+        }
+    }
 }

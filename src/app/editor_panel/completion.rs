@@ -968,6 +968,8 @@ impl AppIde {
             // bottom edge is the top of the diagnostics panel), so it bounds the
             // overlay to what's actually visible.
             let visible_clip = editor_clip;
+            // Taken, so a frame that drew no heat band clamps nothing.
+            let heat_lines = std::mem::take(&mut self.ed.heat_sensor_lines);
             let tooltip = show_diagnostics_overlay(
                 ui,
                 editor_resp.galley_pos,
@@ -980,6 +982,7 @@ impl AppIde {
                 def_line,
                 pill_edges,
                 quiet_line,
+                &heat_lines,
             );
             // Remembered for the focus hand-back in `show_code_view`, which
             // runs before this in BOTH views — see `click_in_tooltip`.
@@ -1085,13 +1088,14 @@ impl AppIde {
         // Whether the hint is on screen: Tab accepts only a hint the user can
         // see (`mod.rs`), and the signature ghost can take its line.
         self.ed.inlay_hint_drawn = false;
+        self.ed.inlay_hint_right = None;
         if let (Some(line), Some(hint)) = (inlay_line, self.ed.inlay_hint.as_ref()) {
             // Only draw a hint that still belongs to the caret's current line,
             // and not on the line the call-signature ghost has taken: both go
             // to the end of the line, and the signature is what is wrong there.
             if hint.line == line && quiet_line != Some(hint.line + 1) {
                 let eol_idx = line_index.line_end_char_idx(hint.line + 1);
-                show_inlay_hint(
+                let drawn = show_inlay_hint(
                     ui,
                     editor_resp.galley_pos,
                     editor_clip,
@@ -1100,6 +1104,7 @@ impl AppIde {
                     &hint.label,
                     self.editor_font_size,
                 );
+                self.ed.inlay_hint_right = drawn.map(|r| (hint.line + 1, r.right()));
                 self.ed.inlay_hint_drawn = true;
             }
         }
@@ -1108,12 +1113,13 @@ impl AppIde {
         // Gated, like the type hint, by the "Types" toolbar button — not by
         // the inline-errors one: it answers "what does this call want?",
         // which is worth seeing whether or not the squiggles are.
+        self.ed.sig_ghost_right = None;
         if let (Some(ghost), Some(eol)) = (&sig_ghost, sig_eol) {
             let pill_right = pill_edges
                 .iter()
                 .find(|(l, _)| *l == ghost.line)
                 .map(|(_, r)| *r);
-            super::signature_hint::draw_signature_ghost(
+            let drawn = super::signature_hint::draw_signature_ghost(
                 ui,
                 editor_resp.galley_pos,
                 editor_clip,
@@ -1124,6 +1130,7 @@ impl AppIde {
                 ghost,
                 egui::Id::new(("sig_hint", current_rel_path.as_deref(), slot)),
             );
+            self.ed.sig_ghost_right = drawn.map(|r| (ghost.line, r.right()));
         }
     }
 

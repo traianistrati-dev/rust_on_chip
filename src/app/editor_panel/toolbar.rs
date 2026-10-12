@@ -654,6 +654,10 @@ impl AppIde {
                     // the graph. Three hardware runs at this count landed
                     // within 8-11% of a 10% branch.
                     120,
+                    // What this build compiles: the by-line table's code
+                    // column, and what tells later whether a file has been
+                    // edited since its lines were sampled.
+                    self.source_texts(),
                     Arc::clone(&self.flame_state),
                     self.egui_ctx.clone(),
                 );

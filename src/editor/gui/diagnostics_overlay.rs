@@ -393,6 +393,9 @@ pub fn show_diagnostics_overlay(
     // A 1-based line whose inline message is left out: the call-signature
     // ghost is drawn there instead (see `editor_panel::signature_hint`).
     quiet_line: Option<u32>,
+    // 1-based lines whose space past the end is the Profile heat band's hover
+    // (`editor_panel::profile_heat`).
+    heat_lines: &[u32],
 ) -> Option<egui::Rect> {
     let total_chars = line_index.total_chars();
     // Every position below is `galley.pos_from_cursor`, looked up by binary
@@ -584,11 +587,13 @@ pub fn show_diagnostics_overlay(
             }
         }
 
-        // The call-signature ghost owns `quiet_line` past its end. A span that
-        // runs on to a later line reaches the galley's full width there, over
-        // the ghost, and the two tooltips would compete: stop it at the end
-        // of the line. Squiggle and tint are untouched.
-        let hover_ex = if !same_line && quiet_line == Some(diag.line) {
+        // The call-signature ghost owns `quiet_line` past its end, and the
+        // Profile heat band the end of its lines. A span that runs on to a
+        // later line reaches the galley's full width there, over them, and
+        // the two tooltips would compete: stop it at the end of the line.
+        // Squiggle and tint are untouched.
+        let owned = quiet_line == Some(diag.line) || heat_lines.contains(&diag.line);
+        let hover_ex = if !same_line && owned {
             ex.min(gp.x + loc_eol.min.x + 8.0).max(sx + 1.0)
         } else {
             ex
@@ -832,14 +837,14 @@ pub fn show_inlay_hint(
     eol_idx: usize,
     label: &str,
     font_size: f32,
-) {
+) -> Option<egui::Rect> {
     let painter = ui.painter().with_clip_rect(text_clip_rect);
     let loc = galley.pos_from_cursor(egui::text::CCursor::new(eol_idx));
     let y_top = galley_pos.y + loc.min.y;
     let y_bot = galley_pos.y + loc.max.y;
     // Skip when scrolled out of the visible editor.
     if y_bot < text_clip_rect.top() || y_top > text_clip_rect.bottom() {
-        return;
+        return None;
     }
     // A gap past the line's end, mirroring the inline-diagnostic messages.
     // rust-analyzer's type-hint label already includes the leading `: `
@@ -894,6 +899,7 @@ pub fn show_inlay_hint(
         )
         .on_hover_text(label);
     }
+    Some(drawn)
 }
 
 #[cfg(test)]

@@ -228,6 +228,7 @@ impl AppIde {
         // Profile-tab "Analyze" (cargo bloat) + "Sample" (flamegraph) buttons.
         let mut profile_run = false;
         let mut profile_sample = false;
+        let flame_stale = self.flame_stale_files();
         let rtt_chip = self
             .selected_build_cfg()
             .map(|(p, _)| p.probe_chip)
@@ -409,6 +410,9 @@ impl AppIde {
                     &mut profile_run,
                     &self.flame_state,
                     &mut profile_sample,
+                    &mut self.flame_by_line,
+                    &mut self.flame_heat,
+                    &flame_stale,
                     &self.probe_flash_state,
                     &mut probe_flash_go,
                     &mut probe_flash_stop,

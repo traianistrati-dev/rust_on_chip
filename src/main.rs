@@ -53,6 +53,7 @@ pub mod serial_matrix;
 pub mod serial_plot;
 pub mod size;
 pub mod startup;
+pub mod timing;
 pub mod terminal;
 pub mod udev;
 pub mod win_driver;

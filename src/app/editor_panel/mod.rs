@@ -68,6 +68,7 @@ mod rename;
 mod replace_enter_tests;
 pub(super) mod signature_hint;
 mod snippet;
+mod timing_mark;
 mod toggle_case;
 mod toolbar;
 pub(crate) mod usages;
@@ -2030,6 +2031,19 @@ impl AppIde {
                         self.debugger.add_watch(expr);
                         self.build_tab = crate::app::BuildPanelTab::Debug;
                     }
+                }
+                Some(a @ (A::TimeFunction | A::TimeLines)) => {
+                    let selection = editor_resp
+                        .state
+                        .cursor
+                        .char_range()
+                        .map(|r| (r.primary.index.0, r.secondary.index.0));
+                    self.mark_timing_region(
+                        &displayed_file,
+                        &display_code,
+                        selection,
+                        a == A::TimeFunction,
+                    );
                 }
                 Some(A::SelectBlock) => select_block_pressed = true,
                 Some(A::Completion) => ctrl_space_pressed = true,

@@ -1705,6 +1705,9 @@ pub struct AppIde {
     /// start: the tint sits over the code.
     flame_by_line: bool,
     flame_heat: bool,
+    /// Timing mode: the regions marked in the editor and the session that
+    /// measures them on the board (see `crate::timing`). Session-only.
+    timing: crate::timing::Timing,
     /// Which flash pipelines (DFU, OpenOCD, espflash, probe-rs) have been busy
     /// since every one was last idle. Edge-detects "flash finished" to
     /// re-measure Flash/RAM automatically (see `poll_flash_finished_size`).
@@ -2485,6 +2488,7 @@ impl AppIde {
             flame_state: Arc::new(Mutex::new(crate::flamegraph::FlameState::Idle)),
             flame_by_line: false,
             flame_heat: false,
+            timing: Default::default(),
             flash_ran: [false; editor_panel::FLASH_PIPELINES],
             last_build_tab: BuildPanelTab::RustAnalyzer,
             clippy_sel: None,
@@ -5098,6 +5102,7 @@ impl eframe::App for AppIde {
         // the next app start — kill them synchronously.
         self.rtt.stop();
         self.debugger.kill_now();
+        self.timing.kill_now();
         // Same for espflash: an orphan keeps the serial port open, and the next
         // flash then fails to claim it ("Access is denied").
         self.esp_monitor.stop();
@@ -5966,6 +5971,15 @@ impl eframe::App for AppIde {
         // This ensures Cargo.toml and all other required files are in sync.
         // The startup picker runs after this point in the frame, so its load
         // asks for the rewrite through a field instead of the local.
+        // A Measure build is over: the build copy gets the user's files back
+        // in place of the instrumented ones (`write_project` compares against
+        // the disk, so exactly those are rewritten). Asked here, after the
+        // panels: a Measure started this frame is Building already, and its
+        // copy must not be the one rewritten.
+        if self.timing.restore && self.timing.build_over() {
+            self.timing.restore = false;
+            self.workspace_write_requested = true;
+        }
         save_project_needed |= std::mem::take(&mut self.workspace_write_requested);
         if save_project_needed {
             if self.selected_build_cfg().is_some() {

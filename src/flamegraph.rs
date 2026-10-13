@@ -639,7 +639,7 @@ fn regs_of(vars: &Value) -> Option<RiscvRegs> {
 }
 
 /// Standard base64, what DAP's `readMemory` returns its bytes in.
-fn from_base64(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn from_base64(text: &str) -> Option<Vec<u8>> {
     let value = |c: u8| match c {
         b'A'..=b'Z' => Some(c - b'A'),
         b'a'..=b'z' => Some(c - b'a' + 26),
@@ -867,7 +867,12 @@ fn run(
                 let mut l = log.lock().unwrap();
                 l.push_str(&String::from_utf8_lossy(&buf[..n]));
                 if l.len() > 8192 {
-                    let cut = l.len() - 8192;
+                    // On a char boundary: a split one panics, with the lock
+                    // held.
+                    let mut cut = l.len() - 8192;
+                    while !l.is_char_boundary(cut) {
+                        cut += 1;
+                    }
                     *l = l.split_off(cut);
                 }
             }
@@ -901,43 +906,7 @@ fn run(
     // On failure, enrich the terse DAP error with the dap-server's own log tail
     // (probe-rs logs the real reason there).
     let samples = result.map_err(|e| {
-        let log = log.lock().unwrap();
-        let console = console.lock().unwrap();
-        // The console first: it carries the sentence, stderr only the banner.
-        let console_tail = tail_of(console.iter().map(String::as_str), 6);
-        let server_tail = tail_of(log.lines(), 4);
-        // A probe that enumerates but won't open, or a probe-rs crash, has an
-        // explanation card with the two or three things that actually fix it —
-        // worth far more than the raw chain. Everything probe-rs said is fed to
-        // the taggers, because the sentence arrives on the console, not in `e`.
-        let everything = format!(
-            "{e}\n{}\n{}",
-            console_tail.join("\n"),
-            server_tail.join("\n")
-        );
-        if let Some(tagged) = crate::failure_hint::probe_rs_panic(&everything)
-            .map(|d| crate::failure_hint::probe_rs_panic_message(&d))
-            .or_else(|| {
-                crate::failure_hint::probe_open_failure(&everything).map(|d| {
-                    crate::failure_hint::probe_open_message(
-                        &d,
-                        crate::probe::missing_device_interface_guid(Some(&probe)),
-                    )
-                })
-            })
-        {
-            return tagged;
-        }
-        let mut out = e;
-        for (title, lines) in [
-            ("probe-rs console:", console_tail),
-            ("probe-rs dap-server:", server_tail),
-        ] {
-            if !lines.is_empty() {
-                out = format!("{out}\n\n{title}\n{}", lines.join("\n"));
-            }
-        }
-        out
+        explain_dap_failure(e, &console.lock().unwrap(), &log.lock().unwrap(), &probe)
     })?;
     let run = SampleRun {
         format: RUN_FORMAT.to_owned(),
@@ -953,13 +922,53 @@ fn run(
     Ok(process(run, None))
 }
 
+/// A failed dap-server session's error, with what probe-rs said about it:
+/// its console (`output` events) and its stderr `log`.
+pub(crate) fn explain_dap_failure(e: String, console: &[String], log: &str, probe: &str) -> String {
+    // The console first: it carries the sentence, stderr only the banner.
+    let console_tail = tail_of(console.iter().map(String::as_str), 6);
+    let server_tail = tail_of(log.lines(), 4);
+    // A probe that enumerates but won't open, or a probe-rs crash, has an
+    // explanation card with the two or three things that actually fix it —
+    // worth far more than the raw chain. Everything probe-rs said is fed to
+    // the taggers, because the sentence arrives on the console, not in `e`.
+    let everything = format!(
+        "{e}\n{}\n{}",
+        console_tail.join("\n"),
+        server_tail.join("\n")
+    );
+    if let Some(tagged) = crate::failure_hint::probe_rs_panic(&everything)
+        .map(|d| crate::failure_hint::probe_rs_panic_message(&d))
+        .or_else(|| {
+            crate::failure_hint::probe_open_failure(&everything).map(|d| {
+                crate::failure_hint::probe_open_message(
+                    &d,
+                    crate::probe::missing_device_interface_guid(Some(probe)),
+                )
+            })
+        })
+    {
+        return tagged;
+    }
+    let mut out = e;
+    for (title, lines) in [
+        ("probe-rs console:", console_tail),
+        ("probe-rs dap-server:", server_tail),
+    ] {
+        if !lines.is_empty() {
+            out = format!("{out}\n\n{title}\n{}", lines.join("\n"));
+        }
+    }
+    out
+}
+
 /// Wait up to `grace` for the dap-server to exit by itself, and only then kill
 /// it. A debugger killed mid-teardown leaves the target's debug module still
 /// configured - on a RISC-V ESP32-C3 that shows up as probe-rs warning "Could
 /// not clear all hardware breakpoints", after which EVERY later attach dies
 /// with "Timeout during DMI access" until the board is power-cycled. The wait
 /// costs nothing in the normal case, where the server is already gone.
-fn wait_or_kill(server: &mut std::process::Child, grace: Duration) {
+pub(crate) fn wait_or_kill(server: &mut std::process::Child, grace: Duration) {
     // The server is started with `--single-session`, so a finished session is
     // what makes it leave; this only has to outlast probe-rs's own shutdown.
     let deadline = std::time::Instant::now() + grace;
@@ -976,7 +985,7 @@ fn wait_or_kill(server: &mut std::process::Child, grace: Duration) {
 
 /// The last `n` non-empty lines, trimmed and back in order — both failure
 /// tails want this and neither wants the blank lines probe-rs pads with.
-fn tail_of<'a>(lines: impl Iterator<Item = &'a str>, n: usize) -> Vec<&'a str> {
+pub(crate) fn tail_of<'a>(lines: impl Iterator<Item = &'a str>, n: usize) -> Vec<&'a str> {
     let mut kept: Vec<&str> = lines
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -990,22 +999,78 @@ fn tail_of<'a>(lines: impl Iterator<Item = &'a str>, n: usize) -> Vec<&'a str> {
 }
 
 /// `cargo build --release --message-format=json`, return the ELF path.
-fn build_elf(project_dir: &std::path::Path, target: &str) -> Result<PathBuf, String> {
-    let out = no_window(&mut Command::new("cargo"))
-        .current_dir(project_dir)
-        .args([
-            "build",
-            "--release",
-            "--target",
-            target,
-            "--message-format=json",
-            "--color=never",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("could not launch cargo: {e}"))?;
+pub(crate) fn build_elf(project_dir: &std::path::Path, target: &str) -> Result<PathBuf, String> {
+    build_elf_until(project_dir, target, None)
+        .map(|elf| elf.expect("a build with no stop flag is never stopped"))
+}
+
+/// [`build_elf`], ended - cargo and the rustc under it - as soon as `stop`
+/// is set: `Ok(None)` then.
+pub(crate) fn build_elf_until(
+    project_dir: &std::path::Path,
+    target: &str,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<PathBuf>, String> {
+    let mut child = crate::lsp::spawn_in_own_group(
+        no_window(&mut Command::new("cargo"))
+            .current_dir(project_dir)
+            .args([
+                "build",
+                "--release",
+                "--target",
+                target,
+                "--message-format=json",
+                "--color=never",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .spawn()
+    .map_err(|e| format!("could not launch cargo: {e}"))?;
+    // Both pipes drained as cargo writes, or a full one stops it.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::SeqCst)) {
+            crate::lsp::kill_process_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = (stdout.join(), stderr.join());
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let out = std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    };
     let mut elf: Option<PathBuf> = None;
+    // With `--message-format=json` rustc's errors are on stdout, as
+    // `compiler-message` records; stderr only says "could not compile".
+    let mut errors: Vec<String> = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -1015,14 +1080,26 @@ fn build_elf(project_dir: &std::path::Path, target: &str) -> Result<PathBuf, Str
                 elf = Some(PathBuf::from(exe));
             }
         }
+        if v["reason"] == "compiler-message"
+            && v["message"]["level"] == "error"
+            && let Some(text) = v["message"]["rendered"].as_str()
+            && errors.len() < 5
+        {
+            errors.push(text.trim_end().to_owned());
+        }
     }
     if !out.status.success() {
-        return Err(format!(
-            "release build failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        let mut msg = "release build failed:".to_owned();
+        for e in &errors {
+            msg.push('\n');
+            msg.push_str(e);
+        }
+        msg.push('\n');
+        msg.push_str(String::from_utf8_lossy(&out.stderr).trim_end());
+        return Err(msg);
     }
-    elf.ok_or_else(|| "build produced no executable (nothing to profile)".to_string())
+    elf.map(Some)
+        .ok_or_else(|| "build produced no executable (nothing to profile)".to_string())
 }
 
 /// Connect to the DAP server, attach, and run the pause/stackTrace/continue
@@ -1419,7 +1496,7 @@ struct RawFrame<'a> {
     pc: Option<u64>,
 }
 
-fn parse_pc(s: &str) -> Option<u64> {
+pub(crate) fn parse_pc(s: &str) -> Option<u64> {
     match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => s.parse().ok(),
@@ -1917,7 +1994,7 @@ impl<'a> ElfLines<'a> {
 
 // ── Minimal blocking DAP client ───────────────────────────────────────────────
 
-fn send(
+pub(crate) fn send(
     stream: &mut TcpStream,
     seq: &mut i64,
     command: &str,
@@ -1941,7 +2018,7 @@ fn send(
 }
 
 /// Read one `Content-Length`-framed DAP message (`None` on EOF / timeout).
-fn read_msg(stream: &mut TcpStream) -> Option<Value> {
+pub(crate) fn read_msg(stream: &mut TcpStream) -> Option<Value> {
     let mut header = Vec::new();
     let mut b = [0u8; 1];
     while !header.ends_with(b"\r\n\r\n") {
@@ -1964,7 +2041,7 @@ fn read_msg(stream: &mut TcpStream) -> Option<Value> {
 
 /// Read messages until a successful RESPONSE to `command` arrives, keeping any
 /// `output` event seen on the way (that is probe-rs's own log).
-fn wait_response(
+pub(crate) fn wait_response(
     stream: &mut TcpStream,
     command: &str,
     console: &Arc<Mutex<Vec<String>>>,
@@ -1987,7 +2064,7 @@ fn wait_response(
 }
 
 /// Park an `output` event's text in the session console.
-fn collect_output(msg: &Value, console: &Arc<Mutex<Vec<String>>>) {
+pub(crate) fn collect_output(msg: &Value, console: &Arc<Mutex<Vec<String>>>) {
     if msg["type"] != "event" || msg["event"] != "output" {
         return;
     }
@@ -2009,7 +2086,7 @@ fn collect_output(msg: &Value, console: &Arc<Mutex<Vec<String>>>) {
 /// request (e.g. `attach` when the probe/target isn't there) is surfaced with
 /// its message rather than skipped — otherwise the server just closes and the
 /// real reason is lost as a bare "closed waiting for 'initialized'".
-fn wait_event(
+pub(crate) fn wait_event(
     stream: &mut TcpStream,
     event: &str,
     console: &Arc<Mutex<Vec<String>>>,
@@ -2032,7 +2109,7 @@ fn wait_event(
     Err(format!("no '{event}' event"))
 }
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
         .and_then(|l| l.local_addr().ok())

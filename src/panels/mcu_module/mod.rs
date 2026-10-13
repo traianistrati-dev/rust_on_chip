@@ -9,6 +9,7 @@ pub mod codegen;
 pub mod codegen_esp;
 pub mod codegen_esp_configs;
 pub mod comparator;
+pub mod cpu_clock;
 pub mod datasheet_import;
 pub mod errata;
 pub mod esp_clocks;

@@ -30,6 +30,10 @@ pub(super) enum EditorAction {
     /// Add the selection (or the identifier at the caret) to the Debug tab's
     /// Watch pane.
     AddWatch,
+    /// Time the function around the caret on the board (Profile tab, Timing).
+    TimeFunction,
+    /// Time the statements the selection touches on the board.
+    TimeLines,
     Completion,
     Find,
     Replace,
@@ -217,6 +221,20 @@ pub(super) fn editor_menu(ui: &mut egui::Ui, is_rs: bool, is_cargo: bool) -> Opt
             "Add to Watch (Debug)",
             "",
             EditorAction::AddWatch,
+        );
+        item(
+            ui,
+            ph::TIMER,
+            "Time this function (Profile)",
+            "",
+            EditorAction::TimeFunction,
+        );
+        item(
+            ui,
+            ph::TIMER,
+            "Time selected lines (Profile)",
+            "",
+            EditorAction::TimeLines,
         );
     }
     if is_rs || is_cargo {

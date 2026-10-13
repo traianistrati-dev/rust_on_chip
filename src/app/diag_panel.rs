@@ -177,6 +177,8 @@ pub(super) fn show_diag_panel(
     flame_stale: &[String],
     // Its "Save…" / "Load…" (the caller opens the dialog).
     flame_file: &mut Option<crate::flamegraph::FlameFileOp>,
+    // Profile tab's Timing mode: regions, run, and its clicks.
+    timing: crate::app::tabs::TimingUi<'_>,
     // Flash tab's probe-rs path (shared probe): status + "Flash (probe-rs)" signal.
     probe_flash_state: &Arc<Mutex<crate::probe_flash::ProbeFlashState>>,
     probe_flash_go: &mut bool,
@@ -747,6 +749,8 @@ pub(super) fn show_diag_panel(
                     Some("RTT")
                 } else if flame_state.lock().unwrap().is_busy() {
                     Some("Profile sampling")
+                } else if timing.state.lock().unwrap().is_busy() {
+                    Some("Profile timing")
                 } else {
                     None
                 },
@@ -857,6 +861,7 @@ pub(super) fn show_diag_panel(
                 flame_stale,
                 nav,
                 flame_file,
+                timing,
                 rtt_chip,
                 can_flash,
                 probe_list,

@@ -836,6 +836,96 @@ impl AppIde {
         }
     }
 
+    /// Profile tab "Measure": the build copy gets a timer around every marked
+    /// region (`crate::timing`), then it is built, flashed and run, and its
+    /// table read until Stop. The user's files never see the timers: the
+    /// next workspace write, once the build is over, puts theirs back.
+    pub(crate) fn start_timing(&mut self) {
+        let Some((project, toolchain)) = self.selected_build_cfg() else {
+            return;
+        };
+        if self.timing.regions.is_empty() || self.timing.is_busy() {
+            return;
+        }
+        self.build_tab = BuildPanelTab::Profile;
+        let fail = |this: &mut Self, why: String| {
+            *this.timing.state.lock().unwrap() = crate::timing::TimingState::Failed(why);
+        };
+        let counter = match crate::timing::counter_for(&project.target, &project.probe_chip) {
+            Ok(c) => c,
+            Err(why) => return fail(self, why),
+        };
+        let mut files = self.current_project_files();
+        // It flashes: the bitstream and partition table checks, as Debug.
+        if let Some((why, _)) = self.flash_preflight(&files) {
+            return fail(self, why);
+        }
+        let (copies, regions) = match crate::timing::instrumented_copies(
+            &self.source_texts(),
+            &self.timing.regions,
+            counter,
+        ) {
+            Ok(c) => c,
+            Err(why) => return fail(self, why),
+        };
+        // Edits since the marking moved some: keep them where they are now.
+        for (stored, info) in self.timing.regions.iter_mut().zip(&regions) {
+            stored.clone_from(&info.region);
+        }
+        let mut guards: Vec<(String, Vec<usize>)> = Vec::new();
+        for (id, info) in regions.iter().enumerate() {
+            match guards.iter_mut().find(|(f, _)| *f == info.region.file) {
+                Some((_, ids)) => ids.push(id),
+                None => guards.push((info.region.file.clone(), vec![id])),
+            }
+        }
+        let mut user_files = self.project_tree.user_src_files.clone();
+        for (rel, text) in &mut user_files {
+            if let Some(copy) = copies.get(rel.as_str()) {
+                text.clone_from(copy);
+            }
+        }
+        if let Some(main) = copies.get("src/main.rs") {
+            files.main_rs.clone_from(main);
+        }
+        let hz = self
+            .mcu
+            .as_ref()
+            .and_then(|m| crate::panels::mcu_module::cpu_clock::cpu_hz(m, &self.generated_code));
+        let build_dir = crate::workspace::dir();
+        match project_gen::write_project(
+            &build_dir,
+            &files,
+            &user_files,
+            &self.mcu_config_text(),
+            &self.structure_config_text(),
+        ) {
+            Ok(()) => {
+                // Even if the write stopped halfway: what reached the disk
+                // goes back once the build is over.
+                self.timing.restore = true;
+                self.timing.start(
+                    crate::timing::TimingJob {
+                        project_dir: build_dir,
+                        target: project.target.clone(),
+                        chip: project.probe_chip.clone(),
+                        probe: self.selected_probe.clone(),
+                        toolchain,
+                        regions,
+                        hz,
+                        counter,
+                        guards,
+                    },
+                    self.egui_ctx.clone(),
+                );
+            }
+            Err(e) => {
+                self.timing.restore = true;
+                fail(self, format!("Could not write project: {e}"));
+            }
+        }
+    }
+
     /// Render the editor header toolbar.  `display_code` is the text shown in
     /// the editor (copied verbatim by the Copy button).
     pub(super) fn show_editor_toolbar(&mut self, ui: &mut egui::Ui, display_code: &str) {
@@ -1488,23 +1578,25 @@ mod tests {
     /// with one. A new flash path lands in neither, and fails this test.
     #[test]
     fn every_path_that_programs_the_board_checks_the_bitstream() {
-        const CHECKS: [&str; 5] = [
+        const CHECKS: [&str; 6] = [
             "flash_swd",
             "flash_probe_rs",
             "start_build",
             "start_rtt",
             "start_debug",
+            "start_timing",
         ];
         // The paths that hand an ESP's partitions.csv on (espflash
         // `--partition-table`, probe-rs `--idf-partition-table`, DAP), and
         // every path that writes an STM32 the memory.x of a flash store
         // (OpenOCD, cargo flash, RTT Run, Debug).
-        const TABLE_CHECKS: [&str; 5] = [
+        const TABLE_CHECKS: [&str; 6] = [
             "flash_esp",
             "flash_swd",
             "flash_probe_rs",
             "start_rtt",
             "start_debug",
+            "start_timing",
         ];
         // Measuring, profiling, sampling a running board, or an ESP (no FPGA).
         const EXEMPT: [&str; 4] = [

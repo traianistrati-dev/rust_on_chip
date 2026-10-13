@@ -15,6 +15,7 @@ pub mod rtt_tab;
 pub mod serial_info;
 pub mod serial_tab;
 pub mod terminal_tab;
+pub mod timing_view;
 pub mod tools_tab;
 
 // ── Feature gating on missing tools ──────────────────────────────────────────
@@ -42,6 +43,7 @@ pub use dfu_tab::show_dfu_tab;
 pub use git_tab::show_git_tab;
 pub use mcu_tab::show_peripherals_tab;
 pub use profile_tab::show_profile_tab;
+pub use timing_view::TimingUi;
 pub use ra_tab::show_ra_tab;
 pub use rtt_tab::show_rtt_tab;
 pub use serial_tab::show_serial_tab;

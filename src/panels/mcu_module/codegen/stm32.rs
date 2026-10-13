@@ -212,7 +212,18 @@ pub fn f1_hal_pclks(clock: &ClockConfig) -> Option<(u32, u32)> {
     hal_pclks(&cfgr_args(&typed_f1_clock(clock)))
 }
 
+/// The HCLK - the CPU clock - the same chain gives, by the same derivation.
+pub fn f1_hal_hclk(clock: &ClockConfig) -> Option<u32> {
+    hal_clocks(&cfgr_args(&typed_f1_clock(clock))).map(|(hclk, _, _)| hclk)
+}
+
 fn hal_pclks(a: &CfgrArgs) -> Option<(u32, u32)> {
+    hal_clocks(a).map(|(_, p1, p2)| (p1, p2))
+}
+
+/// `(HCLK, PCLK1, PCLK2)` as stm32f1xx-hal's `freeze` derives them, `None`
+/// where it would assert.
+fn hal_clocks(a: &CfgrArgs) -> Option<(u32, u32, u32)> {
     const HSI: u32 = 8_000_000;
     let pllsrc = a.hse.unwrap_or(HSI / 2);
     let sysclk = match a.sysclk / pllsrc {
@@ -270,7 +281,7 @@ fn hal_pclks(a: &CfgrArgs) -> Option<(u32, u32)> {
         && pclk1 <= 36_000_000
         && pclk2 <= 72_000_000
         && adcclk <= 14_000_000;
-    ok.then_some((pclk1, pclk2))
+    ok.then_some((hclk, pclk1, pclk2))
 }
 
 // ── Generated section builder ─────────────────────────────────────────────────

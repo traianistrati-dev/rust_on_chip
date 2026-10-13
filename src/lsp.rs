@@ -2284,7 +2284,7 @@ fn launch(
 /// we want — RA's lifetime is managed explicitly here — and the case it leaves
 /// open, the IDE dying without cleaning up, is exactly what `sweep_stale_ras`
 /// covers on the next launch.
-fn spawn_in_own_group(cmd: &mut Command) -> &mut Command {
+pub(crate) fn spawn_in_own_group(cmd: &mut Command) -> &mut Command {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

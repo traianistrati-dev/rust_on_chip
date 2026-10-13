@@ -324,7 +324,17 @@ pub fn graph_clock_block_for(
 /// `chip` matters for one fact: the connectivity line (F105/F107, metapac's
 /// `rcc_f1cl`) has a `PllMul` of only MUL4..MUL9, where the rest of the F1 goes
 /// to MUL16. A multiplier outside that window is flagged in the block.
-fn f1_embassy_block(chip: &str, c: &super::super::clock::model::Stm32f1Clock) -> String {
+/// The F1's SYSCLK as [`f1_embassy_block`] programs it: the crystal's
+/// frequency even where the tree leaves the HSE node off, because the block
+/// switches HSE on whenever SYSCLK or the PLL runs from it.
+pub fn f1_embassy_sysclk_hz(c: &super::super::clock::model::Stm32f1Clock) -> u32 {
+    f1_embassy_sys(c).4
+}
+
+/// `(source, PLL from HSE, pll_m, pll_n, SYSCLK Hz)` of the F1 on embassy.
+fn f1_embassy_sys(
+    c: &super::super::clock::model::Stm32f1Clock,
+) -> (SysSource, bool, u32, u32, u32) {
     use super::super::clock::model::{PllSrc, SysclkSrc};
     const HSI_HZ: u32 = 8_000_000;
     let sys = match c.sysclk_src {
@@ -340,6 +350,11 @@ fn f1_embassy_block(chip: &str, c: &super::super::clock::model::Stm32f1Clock) ->
         SysSource::Hse => c.hse_hz,
         SysSource::Pll => (if pll_src_hse { c.hse_hz } else { HSI_HZ }) / pll_m * pll_n,
     };
+    (sys, pll_src_hse, pll_m, pll_n, sysclk_hz)
+}
+
+fn f1_embassy_block(chip: &str, c: &super::super::clock::model::Stm32f1Clock) -> String {
+    let (sys, pll_src_hse, pll_m, pll_n, sysclk_hz) = f1_embassy_sys(c);
     let values = RccValues {
         sys,
         hse_on: c.hse_enabled || sys == SysSource::Hse || (sys == SysSource::Pll && pll_src_hse),

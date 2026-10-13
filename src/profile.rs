@@ -11,13 +11,16 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// Which Profile view is showing: static code-size (`cargo bloat`) or the
-/// runtime on-target flamegraph (probe-rs stack sampling, see [`crate::flamegraph`]).
+/// Which Profile view is showing: static code-size (`cargo bloat`), the
+/// runtime on-target flamegraph (probe-rs stack sampling, see
+/// [`crate::flamegraph`]), or the exact time of marked code (see
+/// [`crate::timing`]).
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum ProfileMode {
     #[default]
     Static,
     Runtime,
+    Timing,
 }
 
 /// One parsed `cargo bloat` row: a function (or crate) and its `.text` size.

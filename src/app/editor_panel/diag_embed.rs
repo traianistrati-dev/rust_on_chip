@@ -230,6 +230,12 @@ impl AppIde {
         let mut profile_sample = false;
         let flame_stale = self.flame_stale_files();
         let mut flame_file: Option<crate::flamegraph::FlameFileOp> = None;
+        // Profile-tab Timing mode: Measure / Stop / Clear, and a row's remove.
+        let (mut timing_go, mut timing_stop, mut timing_clear) = (false, false, false);
+        let mut timing_remove: Option<usize> = None;
+        let timing_unsupported = self
+            .selected_build_cfg()
+            .and_then(|(p, _)| crate::timing::counter_for(&p.target, &p.probe_chip).err());
         let rtt_chip = self
             .selected_build_cfg()
             .map(|(p, _)| p.probe_chip)
@@ -415,6 +421,15 @@ impl AppIde {
                     &mut self.flame_heat,
                     &flame_stale,
                     &mut flame_file,
+                    crate::app::tabs::TimingUi {
+                        state: &self.timing.state,
+                        regions: &self.timing.regions,
+                        unsupported: timing_unsupported.clone(),
+                        go: &mut timing_go,
+                        stop: &mut timing_stop,
+                        remove: &mut timing_remove,
+                        clear: &mut timing_clear,
+                    },
                     &self.probe_flash_state,
                     &mut probe_flash_go,
                     &mut probe_flash_stop,
@@ -614,6 +629,21 @@ impl AppIde {
             Some(crate::flamegraph::FlameFileOp::Save) => self.save_flame_run(),
             Some(crate::flamegraph::FlameFileOp::Load) => self.load_flame_run(),
             None => {}
+        }
+        // Timing mode: the list changes only while nothing measures it.
+        if timing_stop {
+            self.timing.stop();
+        }
+        if !self.timing.is_busy() {
+            if timing_clear {
+                self.timing.regions.clear();
+            }
+            if let Some(i) = timing_remove.filter(|i| *i < self.timing.regions.len()) {
+                self.timing.regions.remove(i);
+            }
+        }
+        if timing_go {
+            self.start_timing();
         }
         // "Debug-friendly build" flipped: the Mcu owns the preference, and the
         // codegen pass hashes it → `[profile.release]` is rewritten next frame,

@@ -1,8 +1,10 @@
-//! Profile tab — code efficiency. Two modes:
+//! Profile tab — code efficiency. Three modes:
 //! - **Static** (`cargo bloat`): `.text`/Flash size per function or crate.
 //! - **Runtime** (on-target flamegraph): probe-rs stack-sampling of the running
 //!   firmware (see [`crate::flamegraph`]), shown as a flamegraph or counted per
 //!   source line ("By line").
+//! - **Timing**: the exact time of code marked in the editor, measured by the
+//!   target's cycle counter (see [`crate::timing`] and [`super::timing_view`]).
 
 use crate::flamegraph::{FlameFileOp, FlameNode, FlameResult, FlameState, LineStat, std_err_pct};
 use crate::profile::{BloatRow, ProfileMode, ProfileState};
@@ -31,6 +33,8 @@ pub fn show_profile_tab(
     nav: &mut Option<(String, usize, egui::Color32)>,
     // "Save…" / "Load…" of a run's raw samples (the caller opens the dialog).
     flame_file: &mut Option<FlameFileOp>,
+    // Timing: the regions, the run, and the Measure / Stop / remove clicks.
+    timing: super::TimingUi<'_>,
     // The probe-rs chip name (for the runtime hover), and whether a chip config
     // exists (gates both modes).
     chip: &str,
@@ -61,6 +65,12 @@ pub fn show_profile_tab(
                 "On-target statistical profiler: halt-samples the running firmware's call \
                  stack via probe-rs. Needs the firmware flashed + running.",
             );
+        ui.selectable_value(mode, ProfileMode::Timing, "Timing (exact)")
+            .on_hover_text(concat!(
+                "How long marked code takes on the board, measured by the CPU's cycle ",
+                "counter: right-click in the editor to mark a function or statements, then ",
+                "Measure.",
+            ));
     });
     ui.separator();
 
@@ -82,6 +92,20 @@ pub fn show_profile_tab(
             flame_stale,
             nav,
             flame_file,
+            chip,
+            can_run,
+            probe_list,
+            selected_probe,
+            probe_scan,
+            probe_scan_err,
+            toolchain,
+            super::tool_missing(missing_tools, "probe-rs"),
+            holder,
+        ),
+        ProfileMode::Timing => super::timing_view::timing_view(
+            ui,
+            timing,
+            nav,
             chip,
             can_run,
             probe_list,

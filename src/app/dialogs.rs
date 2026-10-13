@@ -1385,6 +1385,8 @@ impl AppIde {
                         // old one. This path does not go through
                         // `load_project_from_dir`, so it says so itself.
                         self.drop_project_gotos();
+                        // And the Timing regions and run, as there.
+                        self.timing.forget();
                         // Same reason as in `load_project_from_dir`: the RA
                         // workspace content changes wholesale, so the flush must
                         // not trust what it wrote for the previous project.

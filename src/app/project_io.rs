@@ -36,6 +36,9 @@ impl AppIde {
         // that should be now - not in the middle of the user's first edit.
         self.mcu_state_hash = 0;
         self.config_moves = Default::default();
+        // Timing regions point into the files just replaced, and the last run
+        // measured them.
+        self.timing.forget();
         // Arm the one-shot post-load re-verify: RA's first analysis of this
         // project can be stale (a document opened before the workspace was
         // complete), so once it is loaded, errors get one forced re-check.

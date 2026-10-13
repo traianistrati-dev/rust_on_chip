@@ -1,5 +1,6 @@
 //! The IoT tab's "Test from this PC": does the broker pass the board's own
-//! certificate checks, and does it take the CONNECT?
+//! certificate checks, and does it take the CONNECT, the subscriptions and a
+//! test publication - what an AWS IoT policy allows or refuses?
 //!
 //! The checks are the firmware's - `iot_templates/tls_verify.rs`, the text
 //! every TLS `mqtt_link.rs` carries - compiled into a small host program
@@ -35,6 +36,12 @@ pub struct Request {
     /// reads them with the board's own code.
     pub client_cert: String,
     pub client_key: String,
+    /// The keep-alive the board asks for, and the filters it subscribes to.
+    pub keep_alive: u16,
+    pub subscribe: Vec<String>,
+    /// One QoS 1 message goes there - under the board's own name, where the
+    /// AWS IoT policy the tab writes allows it. Empty: none.
+    pub test_topic: String,
 }
 
 impl Request {
@@ -159,6 +166,10 @@ pub fn stdin_lines(r: &Request) -> String {
         },
         r.client_cert.as_bytes(),
         r.client_key.as_bytes(),
+        r.keep_alive.to_string().as_bytes(),
+        r.subscribe.join("
+").as_bytes(),
+        r.test_topic.as_bytes(),
     ] {
         o.push_str(&hex(field));
         o.push('\n');
@@ -446,10 +457,15 @@ mod tests {
             alpn: false,
             client_cert: String::new(),
             client_key: String::new(),
+            keep_alive: 60,
+            subscribe: vec!["a/b".into(), "c/#".into()],
+            test_topic: "rustonchip/test".into(),
         };
         let text = stdin_lines(&r);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 11);
+        assert_eq!(lines.len(), 14);
+        assert_eq!(lines[11], "3630");
+        assert_eq!(lines[12], "612f620a632f23", "the filters one per line inside their hex line");
         assert_eq!(lines[1], "38383833");
         assert_eq!(lines[3], "31");
         assert_eq!(lines[4], "3082");
@@ -469,6 +485,10 @@ mod tests {
             },
             Request {
                 password: "c".into(),
+                ..r.clone()
+            },
+            Request {
+                subscribe: vec!["a/b".into()],
                 ..r.clone()
             },
         ] {
@@ -615,6 +635,9 @@ mod tests {
             alpn: false,
             client_cert: String::new(),
             client_key: String::new(),
+            keep_alive: 60,
+            subscribe: vec!["rustonchip-ide-test/#".into()],
+            test_topic: "rustonchip-ide-test/test".into(),
         };
         let ctx = egui::Context::default();
         for (port, name, want) in [

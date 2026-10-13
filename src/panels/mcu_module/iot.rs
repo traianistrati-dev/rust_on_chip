@@ -782,9 +782,9 @@ pub fn tls_problem(m: &MqttConfig) -> Option<&'static str> {
     if host.ends_with(".azure-devices.net") {
         return Some("Azure IoT Hub speaks MQTT 3.1.1, and rust-mqtt only MQTT 5");
     }
-    if aws_iot_host(host) && !m.client_cert {
+    if aws_iot(m) && !m.client_cert {
         return Some(
-            "AWS IoT takes a board only by its client certificate: switch \"Client certificate\" on",
+            "AWS IoT takes a board by its client certificate (a password only through a custom authorizer, which the board cannot reach): switch \"Client certificate\" on",
         );
     }
     None
@@ -797,23 +797,17 @@ pub fn tls_trng(family: &str) -> bool {
     family == "rp235x"
 }
 
-/// An AWS IoT Core data endpoint: `<prefix>-ats.iot.<region>.amazonaws.com`
-/// (`.amazonaws.com.cn` in China). Not Amazon MQ, which logs in by password.
-pub fn aws_iot_host(host: &str) -> bool {
-    let host = host.trim().to_ascii_lowercase();
-    let rest = host
-        .strip_suffix(".amazonaws.com")
-        .or_else(|| host.strip_suffix(".amazonaws.com.cn"));
-    rest.and_then(|r| r.rsplit_once(".iot."))
-        .is_some_and(|(prefix, region)| {
-            !prefix.is_empty() && !region.is_empty() && !region.contains('.')
-        })
+/// Does this client talk to AWS IoT? Read off the name the TLS handshake
+/// sends (the SNI) - a host given as an address still reaches AWS by it - or
+/// the host: see `aws_iot::of`.
+pub fn aws_iot(m: &MqttConfig) -> bool {
+    super::aws_iot::of(m).is_some()
 }
 
 /// AWS IoT on port 443 takes MQTT with a client certificate only when the
 /// ClientHello asks for it by ALPN: `x-amzn-mqtt-ca`.
 pub fn aws_alpn(m: &MqttConfig) -> bool {
-    m.tls && m.client_cert && m.port == 443 && aws_iot_host(&m.host)
+    m.tls && m.client_cert && m.port == 443 && aws_iot(m)
 }
 
 impl MqttConfig {
@@ -831,12 +825,19 @@ impl MqttConfig {
 /// the template, so the tab can refuse a subscription the code would drop.
 pub const MAX_TOPIC: usize = 64;
 
-/// The topic "Restart on panic" reports on: `<client id>/panic`, made a valid
+/// The topic "Restart on panic" reports on: `<client id>/panic` - see
+/// [`client_topic`].
+pub fn panic_topic(m: &MqttConfig) -> String {
+    client_topic(m, "panic")
+}
+
+/// A topic under the board's own name, `<client id>/<leaf>`, made a valid
 /// MQTT topic NAME whatever the client id holds - `+` and `#` are wildcards
 /// there, a leading `$` is the broker's own namespace, and a `Message` holds
-/// 64 bytes. An empty client id (every board alike) gets `rustonchip/panic`.
-pub fn panic_topic(m: &MqttConfig) -> String {
-    const SUFFIX: &str = "/panic";
+/// 64 bytes. An empty client id (every board alike) gets `rustonchip/<leaf>`.
+/// On AWS IoT the policy the tab writes allows `<client id>/*`.
+pub fn client_topic(m: &MqttConfig, leaf: &str) -> String {
+    let suffix = format!("/{leaf}");
     let id: String = m
         .client_id
         .chars()
@@ -853,24 +854,35 @@ pub fn panic_topic(m: &MqttConfig) -> String {
         .trim_start_matches(['/', '$', ' '])
         .trim_end_matches('/')
         .to_owned();
-    while id.len() > MAX_TOPIC - SUFFIX.len() {
+    while id.len() > MAX_TOPIC - suffix.len() {
         id.pop();
     }
     if id.is_empty() {
         id = "rustonchip".to_owned();
     }
-    format!("{id}{SUFFIX}")
+    format!("{id}{suffix}")
 }
 
 /// What is wrong with an MQTT setting, for the line under the field. `None`
 /// = fine. These are the checks `rust-mqtt` would otherwise fail AT RUN TIME:
-/// an empty or wildcard topic name, a filter whose `#` is not last.
+/// an empty or wildcard topic name, a filter whose `#` is not last, a shared
+/// subscription that is not `$share/<name>/<filter>`.
 pub fn topic_filter_problem(filter: &str) -> Option<&'static str> {
     if filter.is_empty() {
         return Some("empty topic");
     }
     if filter.len() > MAX_TOPIC {
         return Some("longer than 64 bytes - a message on it would not fit `Message`");
+    }
+    // rust-mqtt takes anything starting `$share` for a shared subscription.
+    if let Some(rest) = filter.strip_prefix("$share") {
+        let shared = rest
+            .strip_prefix('/')
+            .and_then(|r| r.split_once('/'))
+            .is_some_and(|(name, f)| !name.is_empty() && !name.contains(['+', '#']) && !f.is_empty());
+        if !shared {
+            return Some("a shared subscription is `$share/<name>/<filter>`, the name without `+` or `#`");
+        }
     }
     let levels: Vec<&str> = filter.split('/').collect();
     for (i, level) in levels.iter().enumerate() {
@@ -882,6 +894,43 @@ pub fn topic_filter_problem(filter: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Why `filter` is left out of the board's SUBSCRIBE: what rust-mqtt would
+/// fail at run time, and on AWS IoT what the broker refuses or ends the
+/// connection over. `None` = subscribed.
+pub fn filter_left_out(m: &MqttConfig, filter: &str) -> Option<&'static str> {
+    topic_filter_problem(filter).or_else(|| {
+        if aws_iot(m) {
+            super::aws_iot::filter_problem(filter)
+        } else {
+            None
+        }
+    })
+}
+
+/// The filters the board subscribes to, in order.
+pub fn subscriptions(m: &MqttConfig) -> Vec<&str> {
+    m.subscribe
+        .iter()
+        .map(String::as_str)
+        .filter(|f| filter_left_out(m, f).is_none())
+        .collect()
+}
+
+/// A text file as a tool may have saved it: UTF-8 (a BOM dropped), or
+/// UTF-16 with its BOM - what PowerShell 5.1's `>` writes. `None`: neither.
+pub fn decode_text(bytes: &[u8]) -> Option<String> {
+    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = rest.as_chunks::<2>().0.iter().map(|c| unit(*c)).collect();
+        String::from_utf16(&units).ok()
+    };
+    match bytes {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8(rest.to_vec()).ok(),
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        _ => String::from_utf8(bytes.to_vec()).ok(),
+    }
 }
 
 /// The broker host as written: an IPv4 literal or a DNS name. `None` = fine.
@@ -1399,6 +1448,7 @@ mod tests {
     /// AWS IoT's data endpoints, not every amazonaws.com host.
     #[test]
     fn aws_iot_hosts_are_told_apart() {
+        let aws_iot_host = |h: &str| crate::panels::mcu_module::aws_iot::endpoint(h).is_some();
         assert!(aws_iot_host(
             "a1b2c3d4e5f6g7-ats.iot.eu-central-1.amazonaws.com"
         ));
@@ -1421,6 +1471,41 @@ mod tests {
         assert!(!aws_alpn(&m), "8883 needs no ALPN");
         m.port = 443;
         assert!(aws_alpn(&m));
+        // An address as the host, the endpoint as the name: still AWS - its
+        // SNI is what AWS reads.
+        m.host = "192.168.1.10".into();
+        assert!(!aws_alpn(&m));
+        m.server_name = "x-ats.iot.us-east-1.amazonaws.com".into();
+        assert!(aws_alpn(&m) && aws_iot(&m));
+    }
+
+    /// On AWS IoT a `$` filter other than `$aws/` ends the connection, so it
+    /// is left out of SUBSCRIBE there - and only there.
+    #[test]
+    fn subscriptions_leave_out_what_the_broker_ends_the_connection_over() {
+        let mut m = MqttConfig {
+            subscribe: vec!["a/b".into(), "$SYS/#".into(), "x/#/y".into(), "$aws/things/t/shadow/get/accepted".into()],
+            ..MqttConfig::default()
+        };
+        assert_eq!(subscriptions(&m), ["a/b", "$SYS/#", "$aws/things/t/shadow/get/accepted"]);
+        m.host = "x-ats.iot.us-east-1.amazonaws.com".into();
+        assert_eq!(subscriptions(&m), ["a/b", "$aws/things/t/shadow/get/accepted"]);
+        assert!(filter_left_out(&m, "$SYS/#").is_some());
+        assert_eq!(client_topic(&m, "test"), "rustonchip/test");
+    }
+
+    /// What PowerShell 5.1's `>` writes (UTF-16 with a BOM) reads as the
+    /// text it is.
+    #[test]
+    fn text_files_are_read_whatever_their_encoding() {
+        let pem = "-----BEGIN CERTIFICATE-----\nAB==\n";
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(pem.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain(pem.encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        let bom: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(pem.bytes()).collect();
+        for bytes in [le, be, bom, pem.as_bytes().to_vec()] {
+            assert_eq!(decode_text(&bytes).as_deref(), Some(pem));
+        }
+        assert_eq!(decode_text(&[0xC3]), None);
     }
 
     /// The tab reads a key and a certificate as the board does.
@@ -1978,6 +2063,11 @@ mod tests {
         assert!(topic_filter_problem("home/t+").is_some());
         assert!(topic_filter_problem("").is_some());
         assert!(topic_filter_problem(&"a".repeat(65)).is_some());
+        // rust-mqtt's shared subscriptions: `$share/<name>/<filter>`.
+        assert_eq!(topic_filter_problem("$share/g/a/#"), None);
+        for bad in ["$share/g/", "$share//a", "$share/a", "$shared/x/y", "$share/+/a"] {
+            assert!(topic_filter_problem(bad).is_some(), "{bad}");
+        }
     }
 
     #[test]

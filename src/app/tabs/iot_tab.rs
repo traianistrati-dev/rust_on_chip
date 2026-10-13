@@ -11,6 +11,7 @@
 //! read and rewritten in place on every edit.
 
 use crate::app::{AppIde, McuTab};
+use crate::panels::mcu_module::aws_iot;
 use crate::panels::mcu_module::codegen::iot_gen;
 use crate::panels::mcu_module::iot::{
     self, Availability, BleConfig, EspNowConfig, IotConfig, Link, MqttConfig, Platform, SntpConfig,
@@ -1283,6 +1284,9 @@ fn tls_section(
         if let Some(p) = iot::tls_problem(m) {
             ui.label(warn(p));
         }
+        if let Some(p) = aws_iot::server_name_problem(m) {
+            ui.label(warn(p));
+        }
         // The CA is compiled in either mode, so what is wrong with it is said
         // in both.
         match &tls.ca {
@@ -1388,9 +1392,6 @@ fn tls_section(
         test_from_pc(ui, m, tls);
     });
 }
-
-const AWS_TLS13: &str = "aws iot update-domain-configuration --domain-configuration-name \"iot:Data-ATS\" --tls-config securityPolicy=IoTSecurityPolicy_TLS13_1_2_2022_10";
-const AWS_SIGN: &str = "aws iot create-certificate-from-csr --certificate-signing-request file://device.csr --set-as-active --query certificatePem --output text > device.crt";
 
 /// One copyable command line.
 fn command_line(ui: &mut egui::Ui, text: &str) {
@@ -1524,9 +1525,8 @@ fn client_cert_section(
             if ui.button("Load key...").on_hover_text("A P-256 key from a .pem / .key file").clicked()
                 && let Some(path) = rfd::FileDialog::new().add_filter("PEM key", &["pem", "key"]).pick_file()
             {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                match iot::client_key(&text) {
-                    Ok(_) => {
+                match read_pem_file(&path).and_then(|text| iot::client_key(&text).map(|_| text)) {
+                    Ok(text) => {
                         actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[1], text.trim().to_owned() + "\n"));
                         ui.data_mut(|d| d.remove_temp::<String>(load_error_id));
                     }
@@ -1580,7 +1580,18 @@ fn client_cert_section(
                         if ui.small_button("Save as...").clicked()
                             && let Some(path) = rfd::FileDialog::new().set_file_name("device.csr").save_file()
                         {
-                            let _ = std::fs::write(path, &done.csr);
+                            match std::fs::write(&path, &done.csr) {
+                                Ok(()) => {
+                                    // The AWS lines run where device.csr is.
+                                    if let Some(dir) = path.parent() {
+                                        ui.data_mut(|d| d.insert_temp(aws_dir_id(tls), dir.to_path_buf()));
+                                    }
+                                }
+                                Err(e) => {
+                                    let error = format!("{}: {e}", path.display());
+                                    ui.data_mut(|d| d.insert_temp(load_error_id, error));
+                                }
+                            }
                         }
                     });
                 }
@@ -1633,9 +1644,11 @@ fn client_cert_section(
             if ui.button("Load certificate...").clicked()
                 && let Some(path) = rfd::FileDialog::new().add_filter("PEM certificate", &["pem", "crt", "cer"]).pick_file()
             {
-                let text = iot::unescape_pem(&std::fs::read_to_string(&path).unwrap_or_default());
-                match iot::client_cert(&text) {
-                    Ok(_) => {
+                match read_pem_file(&path)
+                    .map(|text| iot::unescape_pem(&text))
+                    .and_then(|text| iot::client_cert(&text).map(|_| text))
+                {
+                    Ok(text) => {
                         actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[0], text + "\n"));
                         ui.data_mut(|d| d.remove_temp::<String>(load_error_id));
                     }
@@ -1680,20 +1693,8 @@ fn client_cert_section(
             ui.label(warn(left));
         }
         // ── where to have it signed ──
-        if iot::aws_iot_host(&m.host) {
-            ui.label(dim("AWS IoT: the endpoint must speak TLS 1.3 (embedded-tls speaks nothing else) - once, for the account:"));
-            command_line(ui, AWS_TLS13);
-            ui.label(dim("The CSR signed and the certificate made active (save the request as device.csr first):"));
-            command_line(ui, AWS_SIGN);
-            ui.label(dim("Then attach a policy that allows iot:Connect for this client id (the thing's name), and attach the thing. Port 8883, or 443 (the ALPN goes with it)."));
-            if !matches!(&tls.ca, Some(Some(Ok(ca))) if ca.name.contains("Amazon")) {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(warn("mqtt_ca.rs does not hold Amazon's CAs"));
-                    if ui.small_button("Use Amazon Root CA 1 + 3").clicked() {
-                        actions.push(TlsAction::Ca(iot_gen::CaPreset::Aws));
-                    }
-                });
-            }
+        if let Some(e) = aws_iot::of(m) {
+            aws_section(ui, m, &e, tls, actions);
         } else if m.host.trim().eq_ignore_ascii_case("test.mosquitto.org") {
             ui.label(dim("test.mosquitto.org asks for a client certificate on port 8884: paste the CSR at https://test.mosquitto.org/ssl/ (it wants C, O and CN; its page shows an RSA key - whether it signs P-256 is untested). Its CA is mosquitto.org's."));
             if !matches!(&tls.ca, Some(Some(Ok(ca))) if ca.name.contains("mosquitto")) {
@@ -1713,8 +1714,148 @@ fn client_cert_section(
     });
 }
 
+/// A PEM file's text, whatever the tool that saved it wrote: PowerShell 5.1's
+/// `>` makes UTF-16.
+fn read_pem_file(path: &std::path::Path) -> Result<String, &'static str> {
+    let bytes = std::fs::read(path).map_err(|_| "the file could not be read")?;
+    iot::decode_text(&bytes).ok_or("neither UTF-8 nor UTF-16 text")
+}
+
+/// Where the user saved device.csr, per project: the AWS lines run there.
+fn aws_dir_id(tls: &TlsFacts) -> egui::Id {
+    egui::Id::new(("iot_aws_dir", tls.project.clone()))
+}
+
+/// One numbered AWS step: what it does, the line, and the line that checks it.
+fn aws_step(ui: &mut egui::Ui, n: &mut usize, step: &aws_iot::Step) {
+    *n += 1;
+    ui.label(dim(format!("{n}. {}", step.what)));
+    command_line(ui, &step.command);
+    if let Some((what, line)) = &step.also {
+        ui.label(dim(format!("    {what}")));
+        command_line(ui, line);
+    }
+}
+
+/// AWS IoT, step by step: the CLI lines with the region, the thing (the
+/// client id) and the certificate's ARN filled in, and the policy that fits
+/// this board - then how to see what AWS made of it.
+fn aws_section(
+    ui: &mut egui::Ui,
+    m: &MqttConfig,
+    e: &aws_iot::Endpoint,
+    tls: &TlsFacts,
+    actions: &mut Vec<TlsAction>,
+) {
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("AWS IoT").strong());
+    ui.label(dim(
+        "One board = one thing: the client id is its name, the certificate its own. AWS CLI 2.11.17 or newer, run where device.csr is (Save as... above):",
+    ));
+    let dir: Option<std::path::PathBuf> = ui.data_mut(|d| d.get_temp(aws_dir_id(tls)));
+    if let Some(dir) = &dir {
+        // `pushd` changes the drive in cmd too; PowerShell and bash have it.
+        command_line(ui, &format!("pushd \"{}\"", dir.display()));
+    }
+    let mut n = 0;
+    for step in aws_iot::steps(m, e) {
+        aws_step(ui, &mut n, &step);
+    }
+    // The certificate's ARN: the policy and the attach lines name it.
+    let arn_id = egui::Id::new(("iot_aws_arn", tls.project.clone()));
+    let mut arn_text: String = ui.data_mut(|d| d.get_temp(arn_id)).unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(dim(format!("{}. The ARN step {n} printed:", n + 1)));
+        ui.add(
+            egui::TextEdit::singleline(&mut arn_text)
+                .hint_text("arn:aws:iot:<region>:<account>:cert/<id>")
+                .desired_width(300.0),
+        );
+    });
+    n += 1;
+    ui.data_mut(|d| d.insert_temp(arn_id, arn_text.clone()));
+    let id = aws_iot::thing(m);
+    match aws_iot::cert_arn(&arn_text) {
+        Err(why) if !arn_text.trim().is_empty() => {
+            ui.label(warn(why));
+        }
+        Err(_) => {
+            ui.label(dim("Then policy.json and the lines that attach it follow, filled in."));
+        }
+        Ok(arn) => {
+            if arn.region != e.region {
+                ui.label(warn(format!(
+                    "this certificate is in {}, the endpoint in {} - a certificate works only in its own region",
+                    arn.region, e.region
+                )));
+            }
+            let policy = aws_iot::policy(m, &arn);
+            let error_id = egui::Id::new("iot_aws_policy_error");
+            ui.horizontal(|ui| {
+                let mut dialog = rfd::FileDialog::new().set_file_name("policy.json");
+                if let Some(dir) = &dir {
+                    dialog = dialog.set_directory(dir);
+                }
+                if ui
+                    .button("Save policy.json...")
+                    .on_hover_text("UTF-8, where the commands run - a shell's `>` could make it UTF-16")
+                    .clicked()
+                    && let Some(path) = dialog.save_file()
+                {
+                    match std::fs::write(&path, &policy) {
+                        Ok(()) => {
+                            ui.data_mut(|d| d.remove_temp::<String>(error_id));
+                        }
+                        Err(e) => {
+                            let error = format!("{}: {e}", path.display());
+                            ui.data_mut(|d| d.insert_temp(error_id, error));
+                        }
+                    }
+                }
+                if ui.small_button(format!("{} Copy", ph::COPY)).on_hover_text("Copy the policy").clicked() {
+                    ui.ctx().copy_text(policy.clone());
+                }
+            });
+            if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(error_id)) {
+                ui.label(warn(error));
+            }
+            let outside: Vec<String> = iot::subscriptions(m)
+                .into_iter()
+                .filter(|f| !f.starts_with(&format!("{id}/")))
+                .map(|f| format!("`{f}`"))
+                .collect();
+            ui.label(dim(format!(
+                "policy.json: connect as `{id}`; publish and receive under `{id}/` (the panic report and the test go there); subscribe there{}. Publish your own topics under `{id}/` - or add them to it.",
+                if outside.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and to {}", outside.join(", "))
+                }
+            )));
+            if aws_iot::policy_too_long(&policy) {
+                ui.label(warn("over AWS's 2048 characters for a policy: fewer subscriptions outside the client id's own topics"));
+            }
+            for step in aws_iot::attach_steps(m, &arn) {
+                aws_step(ui, &mut n, &step);
+            }
+        }
+    }
+    ui.label(dim(format!(
+        "Then wait up to 8 minutes - AWS caches policies - and Test from this PC: it connects, subscribes and publishes as the board would. Still silent on the board? In the AWS console's MQTT test client subscribe to `$aws/events/presence/+/{id}` (connects, disconnects, and why) and `{id}/#` (what it publishes); on the board, mqtt::last_refusal() says what AWS refused."
+    )));
+    if !matches!(&tls.ca, Some(Some(Ok(ca))) if ca.name.contains("Amazon")) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(warn("mqtt_ca.rs does not hold Amazon's CAs"));
+            if ui.small_button("Use Amazon Root CA 1 + 3").clicked() {
+                actions.push(TlsAction::Ca(iot_gen::CaPreset::Aws));
+            }
+        });
+    }
+}
+
 /// "Test from this PC": the board's own certificate checks, built into a small
-/// program and run here against the broker - then the CONNECT (`tls_check`).
+/// program and run here against the broker - then the CONNECT, the
+/// subscriptions and a test publication (`tls_check`).
 fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
     use crate::panels::mcu_module::tls_check::{self, Request, Shared, State};
     let id = egui::Id::new("iot_tls_check");
@@ -1731,8 +1872,10 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
         verify: m.verify,
         ca,
         client_id: m.client_id.clone(),
-        user: tls.user.clone().unwrap_or_default(),
-        password: tls.password.clone().unwrap_or_default(),
+        // Encrypt only sends no login from here: a login the tab cannot read
+        // still counts as one the board sends.
+        user: tls.user.clone().unwrap_or_else(|| if m.verify { String::new() } else { "?".to_owned() }),
+        password: tls.password.clone().unwrap_or_else(|| if m.verify { String::new() } else { "?".to_owned() }),
         alpn: iot::aws_alpn(m),
         client_cert: if m.client_cert {
             tls.client_cert_pem.clone()
@@ -1744,15 +1887,34 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
         } else {
             String::new()
         },
+        keep_alive: m.keep_alive_s,
+        subscribe: iot::subscriptions(m).into_iter().map(str::to_owned).collect(),
+        // On AWS IoT only, where the policy the tab writes allows it: another
+        // broker's ACL may refuse a topic the board never publishes on.
+        test_topic: if iot::aws_iot(m) {
+            iot::client_topic(m, "test")
+        } else {
+            String::new()
+        },
     });
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         let can = !busy && request.is_some() && iot::host_problem(&m.host).is_none();
         if ui
             .add_enabled(can, egui::Button::new(format!("{} Test from this PC", ph::PLUGS_CONNECTED)))
-            .on_hover_text(
-                "Connect to the broker from this PC with the board's own certificate checks, then send the MQTT CONNECT",
-            )
+            .on_hover_text(format!(
+                "Connect to the broker from this PC with the board's own certificate checks, then send the board's MQTT CONNECT and its subscriptions{}{}",
+                if iot::aws_iot(m) {
+                    format!(", and one test message on {}", iot::client_topic(m, "test"))
+                } else {
+                    String::new()
+                },
+                if m.client_id.is_empty() {
+                    ""
+                } else {
+                    " - as the board's client id, so a board online with it is dropped once"
+                }
+            ))
             .clicked()
             && let Some(request) = request.clone()
         {
@@ -1874,11 +2036,24 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
         if let Some(p) = iot::host_problem(&m.host) {
             ui.label(warn(p));
         }
+        let aws = aws_iot::of(m);
+        if let Some(e) = &aws {
+            if let Some(p) = aws_iot::endpoint_problem(e) {
+                ui.label(warn(p));
+            }
+            if let Some(p) = aws_iot::port_problem(m.port) {
+                ui.label(warn(p));
+            }
+        }
         ui.horizontal(|ui| {
             ui.add_sized([90.0, 18.0], egui::Label::new("Client id"));
             ui.add(egui::TextEdit::singleline(&mut m.client_id).desired_width(200.0));
         });
-        if m.client_id.is_empty() {
+        if aws.is_some() {
+            if let Some(p) = aws_iot::client_id_problem(&m.client_id) {
+                ui.label(warn(p));
+            }
+        } else if m.client_id.is_empty() {
             ui.label(dim("Empty: the broker assigns one."));
         }
         ui.horizontal(|ui| {
@@ -1890,11 +2065,16 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
                     .suffix(" s"),
             );
             ui.label(dim(if m.keep_alive_s == 0 {
-                "0 = none: a dead link is noticed only when a send fails"
+                "0 = none: TCP's own probes find a dead link within a few minutes"
             } else {
                 "a ping goes out at half of it when nothing else did"
             }));
         });
+        if aws.is_some()
+            && let Some(note) = aws_iot::keep_alive_note(m.keep_alive_s)
+        {
+            ui.label(dim(note));
+        }
 
         ui.add_space(4.0);
         ui.label("Subscribe to");
@@ -1905,7 +2085,10 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
                 if ui.small_button(ph::X).on_hover_text("Remove").clicked() {
                     remove = Some(i);
                 }
-                if let Some(p) = iot::topic_filter_problem(topic) {
+                // `iot::filter_left_out`, with the AWS half read off above.
+                let problem = iot::topic_filter_problem(topic)
+                    .or_else(|| aws.as_ref().and_then(|_| aws_iot::filter_problem(topic)));
+                if let Some(p) = problem {
                     ui.label(warn(format!("{p} - left out")));
                 }
             });
@@ -1916,9 +2099,11 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
         if ui.small_button(format!("{} Add topic", ph::PLUS)).clicked() {
             m.subscribe.push("rustonchip/cmd".to_owned());
         }
-        ui.label(dim(
-            "`+` matches one level, `#` the rest. What arrives comes out of incoming().",
-        ));
+        ui.label(dim(if aws.is_some() {
+            "`+` matches one level, `#` the rest - on AWS IoT `a/#` does not match `a`, and a wildcard filter gets no retained message. What arrives comes out of incoming()."
+        } else {
+            "`+` matches one level, `#` the rest. What arrives comes out of incoming()."
+        }));
 
         ui.add_space(4.0);
         tls_section(ui, m, tls, actions);

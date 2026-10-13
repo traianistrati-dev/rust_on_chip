@@ -2,12 +2,16 @@
 //!
 //! The board's own certificate checks - `tls_verify.rs`, the very text the
 //! firmware's `mqtt_link.rs` carries - run on this PC against the broker, then
-//! an MQTT 5 CONNECT as the firmware sends it. The IDE writes this program,
+//! the MQTT 5 CONNECT the firmware sends, each of its subscriptions, and one
+//! test publication: what a broker's policy (AWS IoT's) refuses shows here,
+//! not as a board that silently reconnects. The IDE writes this program,
 //! builds it once, and runs it with the request on stdin: one hex-encoded
 //! value per line - host, port, server name, verify ("1"/"0"), the CAs as DER,
 //! client id, user name, password, AWS IoT's ALPN ("1"/"0"), the client
-//! certificate and its key as PEM (empty: none). It prints `INFO ...` lines,
-//! then one `RESULT ok ...` or `RESULT fail ...`.
+//! certificate and its key as PEM (empty: none), the keep-alive, the filters
+//! subscribed to (one per line), and the topic of the test publication
+//! (empty: none). It prints `INFO ...` lines, then one `RESULT ok ...` or
+//! `RESULT fail ...`.
 //!
 //! `csr` as its argument: a P-256 key and a certificate request for it.
 //! stdin: country, organization, common name, and a key as PEM (empty: make
@@ -46,6 +50,9 @@ struct Request {
     alpn: bool,
     client_cert: String,
     client_key: String,
+    keep_alive: u16,
+    subscribe: Vec<String>,
+    test_topic: String,
 }
 
 fn unhex(line: &str) -> Vec<u8> {
@@ -75,6 +82,12 @@ fn read_request() -> Option<Request> {
         alpn: text(8)? == "1",
         client_cert: text(9)?,
         client_key: text(10)?,
+        // Absent from an older IDE's request: the CONNECT alone.
+        keep_alive: text(11).and_then(|k| k.parse().ok()).unwrap_or(60),
+        subscribe: text(12)
+            .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
+            .unwrap_or_default(),
+        test_topic: text(13).unwrap_or_default(),
     })
 }
 
@@ -227,7 +240,9 @@ fn explain(e: &embedded_tls::TlsError) -> &'static str {
         E::InvalidSignatureScheme | E::InvalidSignature => {
             "a signature the board cannot check: a key or curve embedded-tls does not take"
         }
-        E::HandshakeAborted(..) => "the broker refused the handshake: it may speak only TLS 1.2",
+        E::HandshakeAborted(..) => {
+            "the broker refused the handshake: it may speak only TLS 1.2 (an AWS IoT endpoint without a TLS 1.3 security policy answers like this)"
+        }
         E::Io(_) | E::IoError | E::ConnectionClosed => {
             "the connection broke during the handshake - a broker that speaks only TLS 1.2 (an AWS IoT endpoint without a TLS 1.3 security policy) hangs up like this"
         }
@@ -287,6 +302,13 @@ fn run(r: &Request) -> Result<String, String> {
         if r.verify && !verifier.chain_seen && matches!(e, embedded_tls::TlsError::DecodeError) {
             return Err(format!("embedded-tls could not read the broker's handshake - likely its request for a client certificate ({e:?})"));
         }
+        // A CA whose key is not the kind the chain is signed with (an EC CA
+        // for an RSA chain) fails to parse as that key, not as a bad chain.
+        if r.verify && verifier.chain_seen && !verifier.inner.chain_ok && matches!(e, embedded_tls::TlsError::DecodeError) {
+            return Err(format!(
+                "the broker's certificate did not check out: its chain is signed with another kind of key than mqtt_ca.rs's CA holds (an EC CA for an RSA chain - AWS IoT's ends in Amazon Root CA 1) ({e:?})"
+            ));
+        }
         return Err(format!("{} ({e:?})", explain(&e)));
     }
     if r.verify {
@@ -328,47 +350,277 @@ fn run(r: &Request) -> Result<String, String> {
     // MQTT 5 CONNECT, as the board sends it. The credentials only to a
     // broker whose certificate was checked.
     let credentials = r.verify;
-    let packet = connect_packet(&r.client_id, credentials.then_some((r.user.as_str(), r.password.as_str())));
-    // `write` takes what fits in one record (about 1.9 KB): a long token as
-    // the password needs more than one.
-    let mut rest = packet.as_slice();
-    while !rest.is_empty() {
-        match tls.write(rest) {
-            Ok(0) => return Err("the CONNECT could not be sent (no room)".into()),
-            Ok(n) => rest = &rest[n..],
-            Err(e) => return Err(refused(format!("the CONNECT could not be sent: {e:?}"))),
-        }
+    // Encrypt only sends no login from here, and the board sends
+    // secrets.rs's: what a broker refuses this PC then says nothing of it.
+    let login_untested = !credentials && !(r.user.is_empty() && r.password.is_empty());
+    if !r.client_id.is_empty() {
+        println!(
+            "INFO connecting as `{}`: a board online with this client id is dropped once, and reconnects",
+            r.client_id
+        );
     }
-    tls.flush().map_err(|e| refused(format!("the CONNECT could not be sent: {e:?}")))?;
-    let reason = read_connack(&mut tls).map_err(refused)?;
-    let _ = tls.write(&[0xE0, 0x00]);
-    let _ = tls.flush();
+    let packet = connect_packet(&r.client_id, r.keep_alive, credentials.then_some((r.user.as_str(), r.password.as_str())));
+    send(&mut tls, &packet).map_err(|e| refused(format!("the CONNECT could not be sent: {e}")))?;
+    let (kind, connack) = read_packet(&mut tls, "a CONNACK").map_err(|e| silent_443(r, refused(e)))?;
+    if kind != 0x20 {
+        return Err(format!("the broker answered something else than a CONNACK (0x{kind:02X})"));
+    }
+    let Some(&reason) = connack.get(1) else {
+        return Err("a CONNACK too short to read".into());
+    };
+    // The terms the broker set (a refusal may carry them too).
+    let terms = connack.get(2..).and_then(property_list).unwrap_or_default();
+    let assigned = terms
+        .iter()
+        .find(|(p, _)| *p == 0x12)
+        .map(|(_, v)| String::from_utf8_lossy(v).into_owned());
     let untested = if identity.is_some() && !asked.get() {
         " - the client certificate untested: this broker never asks for one (test.mosquitto.org asks on 8884 only)"
     } else {
         ""
     };
     match reason {
-        0x00 => Ok(if credentials {
-            format!("the broker accepted the connection (CONNACK: success){untested}")
-        } else {
-            format!("the broker accepted the connection without credentials (encrypt only sends none from here){untested}")
-        }),
+        0x00 => {}
+        // The broker asked for the certificate and still refuses, with the
+        // login (if any) sent: its policy - AWS IoT's.
+        code @ (0x87 | 0x05) if asked.get() && identity.is_some() && !login_untested => {
+            let id = if r.client_id.is_empty() || assigned.is_some() {
+                " The client id is empty, so the broker made one up - no AWS IoT policy allows it: set it to the thing's name."
+            } else {
+                ""
+            };
+            return Err(format!("the broker refused the CONNECT: not authorized (0x{code:02X}).{id} {AWS_CONNECT}"));
+        }
         // A login refused that was never sent: the board sends secrets.rs's
         // whatever the check, so TLS is all this could test.
-        code @ (0x04 | 0x05 | 0x86 | 0x87) if !credentials => Ok(format!(
-            "TLS works; the broker wants a login (0x{code:02X}), which encrypt only does not send from this PC - the board sends secrets.rs's, so turn the check on to test it"
-        )),
-        code => Err(format!("the broker refused the CONNECT: {} (0x{code:02X})", connack_reason(code))),
+        code @ (0x04 | 0x05 | 0x86 | 0x87) if login_untested => {
+            return Ok(format!(
+                "TLS works; the broker wants a login (0x{code:02X}), which encrypt only does not send from this PC - the board sends secrets.rs's, so turn the check on to test it"
+            ));
+        }
+        code => return Err(format!("the broker refused the CONNECT: {} (0x{code:02X})", connack_reason(code))),
+    }
+    // The board pings within both keep-alives, its own and the broker's.
+    if let Some(k) = u16_property(&terms, 0x13)
+        && k != r.keep_alive
+    {
+        println!("INFO the broker settled the keep-alive at {k} s (asked {} s): the board pings in time for both", r.keep_alive);
+    }
+    if let Some(id) = &assigned {
+        println!("INFO the broker assigned the client id `{id}` (the board sends none)");
+    }
+    let max_qos = terms.iter().find(|(p, _)| *p == 0x24).and_then(|(_, v)| v.first().copied());
+    let (subscribe, test_topic): (&[String], &str) = if login_untested && (!r.subscribe.is_empty() || !r.test_topic.is_empty()) {
+        println!("INFO the subscriptions and the test publication are left out: encrypt only sends no login from this PC, and the board logs in - turn the check on to test them");
+        (&[], "")
+    } else {
+        (r.subscribe.as_slice(), r.test_topic.as_str())
+    };
+
+    // Each subscription, one at a time as the board makes them: a policy that
+    // refuses one answers here, where the board says nothing.
+    let mut refusals = Vec::new();
+    let mut problem_info = false;
+    for (i, filter) in subscribe.iter().enumerate() {
+        let id = u16::try_from(i + 1).unwrap_or(u16::MAX);
+        let at = format!("the subscription to `{filter}`");
+        send(&mut tls, &subscribe_packet(id, filter)).map_err(|e| Wait::Ended(e).explain(&at, AWS_SUBSCRIBE_LOST))?;
+        let suback = read_until(&mut tls, 0x90, id, "a SUBACK").map_err(|w| w.explain(&at, AWS_SUBSCRIBE_LOST))?;
+        let (props, codes) = suback.get(2..).and_then(split_properties).ok_or("a SUBACK too short to read")?;
+        // The board asks for no "problem information"; rust-mqtt ends its
+        // connection on a reason string in a SUBACK all the same.
+        problem_info |= props.iter().any(|(p, _)| *p == 0x1F);
+        match codes.first() {
+            Some(&code) if code >= 0x80 => refusals.push(format!(
+                "{at}: {} (0x{code:02X}){}",
+                ack_reason(code),
+                if code == 0x87 { AWS_SUBSCRIBE } else { "" }
+            )),
+            Some(_) => println!("INFO subscribed to `{filter}`"),
+            None => return Err("a SUBACK without its reason code".into()),
+        }
+    }
+
+    // One test message under the board's own name (AWS IoT: where the tab's
+    // policy allows it), QoS 1 for the broker's answer.
+    let mut published = false;
+    if !test_topic.is_empty() {
+        if max_qos == Some(0) {
+            println!("INFO the broker takes QoS 0 only: the test publication is left out");
+        } else {
+            let at = format!("the publication on `{test_topic}`");
+            const PUBLISH_ID: u16 = 0x7E57;
+            send(&mut tls, &publish_packet(test_topic, PUBLISH_ID, b"RustOnChip: Test from this PC"))
+                .map_err(|e| Wait::Ended(e).explain(&at, AWS_PUBLISH_LOST))?;
+            let puback = read_until(&mut tls, 0x40, PUBLISH_ID, "a PUBACK").map_err(|w| w.explain(&at, AWS_PUBLISH_LOST))?;
+            match puback.get(2).copied().unwrap_or(0x00) {
+                code if code >= 0x80 => refusals.push(format!(
+                    "{at}: {} (0x{code:02X}){}",
+                    ack_reason(code),
+                    if code == 0x87 { AWS_PUBLISH } else { "" }
+                )),
+                _ => {
+                    println!("INFO published a test message on `{test_topic}` (QoS 1): the broker took it");
+                    published = true;
+                }
+            }
+        }
+    }
+    let _ = tls.write(&[0xE0, 0x00]);
+    let _ = tls.flush();
+
+    if let Some(first) = refusals.first() {
+        let more = if refusals.len() > 1 { format!(" (and {} more: {})", refusals.len() - 1, refusals[1..].join("; ")) } else { String::new() };
+        return Err(format!("the broker took the connection but refused {first}{more}"));
+    }
+    if problem_info {
+        return Err("the broker answers a subscription with a reason string the board did not ask for: rust-mqtt 0.6 ends the connection on it, so the board would reconnect for ever".into());
+    }
+    let mut did = Vec::new();
+    match subscribe.len() {
+        0 => {}
+        1 => did.push("the subscription".to_owned()),
+        n => did.push(format!("all {n} subscriptions")),
+    }
+    if published {
+        did.push("a publication".to_owned());
+    }
+    let did = if did.is_empty() { String::new() } else { format!(", then {}", did.join(" and ")) };
+    Ok(if credentials {
+        format!("the broker accepted the connection (CONNACK: success){did}{untested}")
+    } else {
+        format!("the broker accepted the connection without credentials (encrypt only sends none from here){did}{untested}")
+    })
+}
+
+/// What a CONNACK 0x87 means when the broker asked for the board's
+/// certificate - AWS IoT's policy check.
+const AWS_CONNECT: &str = "On AWS IoT: no policy attached to the certificate allows iot:Connect for this client id, the thing is not attached to it, or the client id is not the thing's name - a policy change takes up to 8 minutes";
+const AWS_SUBSCRIBE: &str = " - on AWS IoT the policy needs iot:Subscribe on topicfilter/<this filter>";
+const AWS_SUBSCRIBE_LOST: &str = "AWS IoT ends it over a reserved `$` topic or a filter it cannot take (a policy's refusal is a SUBACK 0x87 instead)";
+const AWS_PUBLISH: &str = " - on AWS IoT the policy needs iot:Publish on topic/<this topic>; the board publishes at QoS 0, where AWS ends the connection over the same refusal";
+const AWS_PUBLISH_LOST: &str = "AWS IoT ends it over a topic it cannot take (a policy's refusal at QoS 1 is a PUBACK 0x87 instead)";
+
+/// A broker on 443 that never answers: AWS IoT's HTTPS side, which a
+/// ClientHello without its ALPN reaches.
+fn silent_443(r: &Request, e: String) -> String {
+    if r.port == 443 && !r.alpn && (e.contains("TimedOut") || e.contains("Io(Other)")) {
+        format!("{e} - on 443 AWS IoT takes MQTT with a client certificate only by the ALPN x-amzn-mqtt-ca, which the IDE adds for an AWS endpoint name; elsewhere use 8883")
+    } else {
+        e
     }
 }
 
-/// An MQTT 5 CONNECT: clean start, keep-alive 60 s, no properties.
-fn connect_packet(client_id: &str, credentials: Option<(&str, &str)>) -> Vec<u8> {
-    let field = |out: &mut Vec<u8>, s: &[u8]| {
-        out.extend_from_slice(&(s.len() as u16).to_be_bytes());
-        out.extend_from_slice(s);
-    };
+/// Why an acknowledgement did not come: the connection ended, or it is
+/// still open and nothing came in time.
+enum Wait {
+    Ended(String),
+    Silent(String),
+}
+
+impl Wait {
+    /// A read that times out is `TimedOut` on Windows, `Other` (from
+    /// `WouldBlock`) on Linux and macOS: the connection is still there.
+    fn of(e: String) -> Self {
+        if e.contains("TimedOut") || e.contains("Io(Other)") {
+            Wait::Silent(e)
+        } else {
+            Wait::Ended(e)
+        }
+    }
+
+    fn explain(self, at: &str, aws: &str) -> String {
+        match self {
+            // A DISCONNECT says why itself.
+            Wait::Ended(e) if e.starts_with("DISCONNECT") => format!("the broker ended the connection at {at} ({e})"),
+            Wait::Ended(e) => format!("the broker ended the connection at {at} - {aws} ({e})"),
+            Wait::Silent(e) => format!("no answer came to {at}, the connection still open ({e})"),
+        }
+    }
+}
+
+type Tls<'a> = TlsConnection<'a, FromStd<TcpStream>, Aes128GcmSha256>;
+
+/// Writes all of `packet`: `write` takes what fits in one record (about
+/// 1.9 KB), and a long token as the password needs more than one.
+fn send(tls: &mut Tls<'_>, packet: &[u8]) -> Result<(), String> {
+    let mut rest = packet;
+    while !rest.is_empty() {
+        match tls.write(rest) {
+            Ok(0) => return Err("no room".into()),
+            Ok(n) => rest = &rest[n..],
+            Err(e) => return Err(format!("{e:?}")),
+        }
+    }
+    tls.flush().map_err(|e| format!("{e:?}"))
+}
+
+fn read_byte(tls: &mut Tls<'_>, what: &str) -> Result<u8, String> {
+    let mut b = [0u8; 1];
+    match tls.read(&mut b) {
+        Ok(1) => Ok(b[0]),
+        Ok(_) => Err(format!("the broker closed the connection before {what}")),
+        Err(e) => Err(format!("{what} did not come from the broker ({e:?})")),
+    }
+}
+
+/// One MQTT packet: its first byte and its body.
+fn read_packet(tls: &mut Tls<'_>, what: &str) -> Result<(u8, Vec<u8>), String> {
+    let kind = read_byte(tls, what)?;
+    let mut len = 0usize;
+    for shift in [0, 7, 14, 21] {
+        let b = read_byte(tls, what)?;
+        len |= usize::from(b & 0x7F) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    // The CONNECT capped what the broker may send at the board's buffer.
+    if len > 1 << 20 {
+        return Err(format!("{what} longer than any packet the board takes ({len} bytes)"));
+    }
+    let mut body = vec![0u8; len];
+    let mut got = 0;
+    while got < len {
+        match tls.read(&mut body[got..]) {
+            Ok(0) => return Err(format!("the broker closed the connection in the middle of {what}")),
+            Ok(n) => got += n,
+            Err(e) => return Err(format!("{what} did not come whole ({e:?})")),
+        }
+    }
+    Ok((kind, body))
+}
+
+/// Reads until the acknowledgement of type `ack` (its first byte) for packet
+/// `id`, passing over what else arrives - publications on a filter just
+/// subscribed, in any number for 15 s; a few of anything else. A DISCONNECT
+/// is the broker's answer instead.
+fn read_until(tls: &mut Tls<'_>, ack: u8, id: u16, what: &str) -> Result<Vec<u8>, Wait> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut others = 0;
+    while std::time::Instant::now() < deadline {
+        let (kind, body) = read_packet(tls, what).map_err(Wait::of)?;
+        if kind == ack && body.get(..2) == Some(&id.to_be_bytes()[..]) {
+            return Ok(body);
+        }
+        if kind == 0xE0 {
+            let code = body.first().copied().unwrap_or(0x00);
+            return Err(Wait::Ended(format!("DISCONNECT: {} (0x{code:02X})", ack_reason(code))));
+        }
+        if kind & 0xF0 != 0x30 {
+            others += 1;
+            if others > 64 {
+                return Err(Wait::Silent(format!("{what} did not come among 64 other packets")));
+            }
+        }
+    }
+    Err(Wait::Silent(format!("{what} did not come within 15 s - publications on the subscriptions kept coming")))
+}
+
+/// An MQTT 5 CONNECT as the board's rust-mqtt sends it: clean start, its
+/// keep-alive, and the properties Receive Maximum 1, Maximum Packet Size
+/// 1024 (the board's buffer) and Request Problem Information 0.
+fn connect_packet(client_id: &str, keep_alive: u16, credentials: Option<(&str, &str)>) -> Vec<u8> {
     let mut flags = 0x02u8;
     let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05];
     let mut payload = Vec::new();
@@ -384,10 +636,41 @@ fn connect_packet(client_id: &str, credentials: Option<(&str, &str)>) -> Vec<u8>
         }
     }
     body.push(flags);
-    body.extend_from_slice(&60u16.to_be_bytes());
-    body.push(0x00); // no properties
+    body.extend_from_slice(&keep_alive.to_be_bytes());
+    body.extend_from_slice(&[10, 0x21, 0x00, 0x01, 0x27, 0x00, 0x00, 0x04, 0x00, 0x17, 0x00]);
     body.extend_from_slice(&payload);
-    let mut packet = vec![0x10];
+    packet(0x10, &body)
+}
+
+/// A SUBSCRIBE of one filter at QoS 0, as the board makes it.
+fn subscribe_packet(id: u16, filter: &str) -> Vec<u8> {
+    let mut body = id.to_be_bytes().to_vec();
+    body.push(0x00);
+    field(&mut body, filter.as_bytes());
+    body.push(0x00);
+    packet(0x82, &body)
+}
+
+/// A PUBLISH at QoS 1, so the broker answers it.
+fn publish_packet(topic: &str, id: u16, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    field(&mut body, topic.as_bytes());
+    body.extend_from_slice(&id.to_be_bytes());
+    body.push(0x00);
+    body.extend_from_slice(payload);
+    packet(0x32, &body)
+}
+
+/// A string or binary field: its length, then it.
+fn field(out: &mut Vec<u8>, s: &[u8]) {
+    out.extend_from_slice(&u16::try_from(s.len()).unwrap_or(u16::MAX).to_be_bytes());
+    out.extend_from_slice(s);
+}
+
+/// The fixed header - the remaining length as a variable byte integer - then
+/// the body.
+fn packet(first: u8, body: &[u8]) -> Vec<u8> {
+    let mut packet = vec![first];
     let mut len = body.len();
     loop {
         let mut byte = (len % 128) as u8;
@@ -400,37 +683,89 @@ fn connect_packet(client_id: &str, credentials: Option<(&str, &str)>) -> Vec<u8>
             break;
         }
     }
-    packet.extend_from_slice(&body);
+    packet.extend_from_slice(body);
     packet
 }
 
-/// The CONNACK's reason code (its second byte).
-fn read_connack(tls: &mut TlsConnection<'_, FromStd<TcpStream>, Aes128GcmSha256>) -> Result<u8, String> {
-    let mut byte = |what: &str| -> Result<u8, String> {
-        let mut b = [0u8; 1];
-        match tls.read(&mut b) {
-            Ok(1) => Ok(b[0]),
-            Ok(_) => Err(format!("the broker closed the connection before {what}")),
-            Err(e) => Err(format!("{what} did not come from the broker ({e:?})")),
-        }
-    };
-    let kind = byte("a CONNACK")?;
-    if kind != 0x20 {
-        return Err(format!("the broker answered something else than a CONNACK (0x{kind:02X})"));
-    }
-    let mut len = 0usize;
-    for shift in [0, 7, 14, 21] {
-        let b = byte("the CONNACK")?;
-        len |= usize::from(b & 0x7F) << shift;
-        if b & 0x80 == 0 {
-            break;
+/// A variable byte integer, and what follows it.
+fn varint(b: &[u8]) -> Option<(usize, &[u8])> {
+    let mut n = 0usize;
+    for (i, &byte) in b.iter().enumerate().take(4) {
+        n |= usize::from(byte & 0x7F) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some((n, &b[i + 1..]));
         }
     }
-    if len < 2 {
-        return Err("a CONNACK too short to read".into());
+    None
+}
+
+/// A property list (its length first): what follows it too.
+fn split_properties(b: &[u8]) -> Option<(Vec<(u8, &[u8])>, &[u8])> {
+    let (n, rest) = varint(b)?;
+    Some((properties(rest.get(..n)?)?, rest.get(n..)?))
+}
+
+fn property_list(b: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    split_properties(b).map(|(p, _)| p)
+}
+
+/// MQTT 5 properties: (identifier, value) - numbers as their bytes, strings
+/// and binary data without their length. `None` = one this does not know.
+fn properties(mut p: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let len16 = |b: &[u8]| -> Option<usize> { Some(usize::from(u16::from_be_bytes([*b.first()?, *b.get(1)?]))) };
+    let mut out = Vec::new();
+    while let Some((&id, rest)) = p.split_first() {
+        let (skip, take) = match id {
+            0x01 | 0x17 | 0x19 | 0x24 | 0x25 | 0x28 | 0x29 | 0x2A => (0, 1),
+            0x13 | 0x21 | 0x22 | 0x23 => (0, 2),
+            0x02 | 0x11 | 0x18 | 0x27 => (0, 4),
+            0x0B => (0, rest.iter().position(|b| b & 0x80 == 0)? + 1),
+            0x03 | 0x08 | 0x09 | 0x12 | 0x15 | 0x16 | 0x1A | 0x1C | 0x1F => (2, len16(rest)?),
+            0x26 => {
+                let key = len16(rest)?;
+                (0, 2 + key + 2 + len16(rest.get(2 + key..)?)?)
+            }
+            _ => return None,
+        };
+        out.push((id, rest.get(skip..skip + take)?));
+        p = &rest[skip + take..];
     }
-    let _flags = byte("the CONNACK")?;
-    byte("the CONNACK")
+    Some(out)
+}
+
+fn u16_property(props: &[(u8, &[u8])], id: u8) -> Option<u16> {
+    let (_, v) = props.iter().find(|(p, _)| *p == id)?;
+    Some(u16::from_be_bytes([*v.first()?, *v.get(1)?]))
+}
+
+/// A SUBACK's, PUBACK's or DISCONNECT's reason code.
+fn ack_reason(code: u8) -> &'static str {
+    match code {
+        0x00 => "normal",
+        0x80 => "an unspecified error",
+        0x81 => "a malformed packet",
+        0x82 => "a protocol error",
+        0x83 => "refused by the broker's own rules",
+        0x87 => "not authorized",
+        0x89 => "the server is busy",
+        0x8B => "the server is shutting down",
+        0x8D => "the keep-alive ran out",
+        0x8E => "another connection took the client id over",
+        0x8F => "the topic filter is not valid",
+        0x90 => "the topic name is not valid",
+        0x91 => "the packet id is in use",
+        0x93 => "too many messages in flight",
+        0x94 => "a bad topic alias",
+        0x95 => "packet too large",
+        0x97 => "a quota is exceeded",
+        0x98 => "an administrative action",
+        0x9A => "retained messages are not taken",
+        0x9B => "the QoS is not taken",
+        0x9E => "shared subscriptions are not taken",
+        0xA1 => "subscription identifiers are not taken",
+        0xA2 => "wildcard subscriptions are not taken",
+        _ => "another reason",
+    }
 }
 
 fn connack_reason(code: u8) -> &'static str {

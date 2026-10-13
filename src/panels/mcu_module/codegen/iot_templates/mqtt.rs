@@ -10,7 +10,11 @@
 // queues the message for it. How it reaches the broker - plain TCP, or TLS
 // with the broker's certificate checked - is mqtt_link.rs, which the IoT
 // tab swaps; this file stays the same either way.
+//
+// What the broker refused last - a login, a policy (AWS IoT), a subscription -
+// is `last_refusal()`, for your own log.
 
+use core::cell::Cell;
 use core::num::NonZero;
 
 use embassy_executor::Spawner;
@@ -18,19 +22,20 @@ use embassy_futures::select::{Either3, select3};
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpAddress, Stack};
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use static_cell::ConstStaticCell;
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
-use rust_mqtt::client::Client;
 use rust_mqtt::client::event::Event;
 use rust_mqtt::client::options::{
     ConnectOptions, PublicationOptions, SubscriptionOptions, TopicReference,
 };
+use rust_mqtt::client::{Client, MqttError};
 use rust_mqtt::config::KeepAlive;
-use rust_mqtt::types::{MqttBinary, MqttString, TopicFilter, TopicName};
+use rust_mqtt::types::{MqttBinary, MqttString, ReasonCode, TopicFilter, TopicName};
 
 use super::mqtt_link::{self as link, Link, LinkBuffers};
 use super::secrets::{MQTT_PASSWORD, MQTT_USERNAME};
@@ -41,6 +46,11 @@ pub const MAX_TOPIC: usize = 64;
 pub const MAX_PAYLOAD: usize = 256;
 /// Seconds to wait before connecting again after the broker is lost.
 pub const RETRY_S: u64 = 5;
+/// Seconds the TLS handshake may take (an RP2040 checks RSA in software),
+/// and an answer to the CONNECT or a SUBSCRIBE: a broker that took the TCP
+/// connection and then says nothing must not hold the session for ever.
+const HANDSHAKE_S: u64 = 60;
+const ANSWER_S: u64 = 30;
 
 /// One publication, either way.
 pub struct Message {
@@ -53,13 +63,34 @@ pub struct Message {
 pub enum PublishError {
     TopicTooLong,
     PayloadTooLarge,
+    /// Empty, or with a `+` or `#` in it: a topic NAME holds no wildcard,
+    /// and the broker would end the connection over it.
+    InvalidTopic,
+}
+
+/// What the broker refused, with MQTT 5's reason code (0x87 = not
+/// authorized, 0x86 = bad user name or password).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The CONNECT: the login, the client id, or a policy that does not
+    /// allow it (AWS IoT: iot:Connect for this client id).
+    Connect(u8),
+    /// A subscription in SUBSCRIBE: nothing arrives on it.
+    Subscribe(&'static str, u8),
+    /// The broker ended the connection: 0x87 after a publication its policy
+    /// refuses, 0x8E when another client took over this client id.
+    Disconnect(u8),
 }
 
 static OUTGOING: Channel<CriticalSectionRawMutex, Message, 4> = Channel::new();
 static INCOMING: Channel<CriticalSectionRawMutex, Message, 4> = Channel::new();
+static REFUSAL: Mutex<CriticalSectionRawMutex, Cell<Option<Refusal>>> = Mutex::new(Cell::new(None));
 
 /// Queues `payload` for `topic` (QoS 0). Waits only while the queue is full.
 pub async fn publish(topic: &str, payload: &[u8]) -> Result<(), PublishError> {
+    if topic.is_empty() || topic.contains(['+', '#']) {
+        return Err(PublishError::InvalidTopic);
+    }
     let message = Message {
         topic: heapless::String::try_from(topic).map_err(|_| PublishError::TopicTooLong)?,
         payload: heapless::Vec::from_slice(payload).map_err(|_| PublishError::PayloadTooLarge)?,
@@ -71,6 +102,12 @@ pub async fn publish(topic: &str, payload: &[u8]) -> Result<(), PublishError> {
 /// The next publication on a subscribed topic.
 pub async fn incoming() -> Message {
     INCOMING.receive().await
+}
+
+/// What the broker refused last; `None` until it refuses something. The
+/// board only reconnects - this says why.
+pub fn last_refusal() -> Option<Refusal> {
+    REFUSAL.lock(Cell::get)
 }
 
 /// Starts the task that owns the connection.
@@ -111,6 +148,19 @@ async fn resolve(stack: Stack<'static>) -> Result<IpAddress, ()> {
 
 type MqttClient<'c> = Client<'c, 'c, Link<'c>, BumpBuffer<'c>, 1, 1, 1, 0, 0, 0, 0>;
 
+/// Keeps a refusal's reason code for `last_refusal()`; any other error is a
+/// lost connection.
+fn refused<const N: usize, A>(e: MqttError<'_, N, A>, what: fn(u8) -> Refusal) {
+    if let MqttError::Disconnect { reason, .. } = e {
+        REFUSAL.lock(|r| r.set(Some(what(reason.value()))));
+    }
+}
+
+/// An error once connected: a DISCONNECT from the broker, or a lost link.
+fn lost<const N: usize, A>(e: MqttError<'_, N, A>) {
+    refused(e, Refusal::Disconnect);
+}
+
 /// One connection, from TCP connect to the first error.
 async fn session(
     stack: Stack<'static>,
@@ -121,10 +171,20 @@ async fn session(
 ) -> Result<(), ()> {
     let address = resolve(stack).await?;
     let mut socket = TcpSocket::new(stack, rx, tx);
-    socket.set_timeout(Some(Duration::from_secs(u64::from(KEEP_ALIVE_S) * 2)));
+    // Closed after twice the keep-alive without a packet from the broker.
+    // Without one (0: a timeout of 0 s would close the socket before its SYN
+    // left), TCP's own probes find a dead link within a few minutes.
+    if KEEP_ALIVE_S > 0 {
+        socket.set_timeout(Some(Duration::from_secs(u64::from(KEEP_ALIVE_S) * 2)));
+    } else {
+        socket.set_keep_alive(Some(Duration::from_secs(60)));
+        socket.set_timeout(Some(Duration::from_secs(180)));
+    }
     socket.connect((address, BROKER_PORT)).await.map_err(drop)?;
     // Plain TCP as it is, or the TLS handshake - awaited whole.
-    let link = link::open(socket, links).await?;
+    let link = with_timeout(Duration::from_secs(HANDSHAKE_S), link::open(socket, links))
+        .await
+        .map_err(drop)??;
 
     // The broker must not send a packet the work buffer cannot hold: one
     // that does would end every connection it is sent on.
@@ -143,7 +203,10 @@ async fn session(
         options = options.maximum_packet_size(max);
     }
     let id = MqttString::try_from(CLIENT_ID).map_err(drop)?;
-    client.connect(link, &options, Some(id)).await.map_err(drop)?;
+    with_timeout(Duration::from_secs(ANSWER_S), client.connect(link, &options, Some(id)))
+        .await
+        .map_err(drop)?
+        .map_err(|e| refused(e, Refusal::Connect))?;
     reset(&mut client);
 
     for topic in SUBSCRIBE {
@@ -151,14 +214,38 @@ async fn session(
         client
             .subscribe(filter, &SubscriptionOptions::new())
             .await
-            .map_err(drop)?;
+            .map_err(lost)?;
         // One subscription in flight at a time: wait for its SUBACK.
-        while !poll(&mut client).await? {}
+        let code = with_timeout(Duration::from_secs(ANSWER_S), async {
+            loop {
+                if let Some(code) = poll(&mut client).await? {
+                    return Ok::<ReasonCode, ()>(code);
+                }
+            }
+        })
+        .await
+        .map_err(drop)??;
+        if code.is_erroneous() {
+            REFUSAL.lock(|r| r.set(Some(Refusal::Subscribe(topic, code.value()))));
+        }
     }
 
-    // Ping at half the keep-alive, unless something else went out since.
-    let interval = Duration::from_secs(u64::from(KEEP_ALIVE_S.max(2) / 2));
-    let mut next_ping = Instant::now() + interval;
+    // Ping at half the keep-alive - ours or the one the broker settled on
+    // (AWS IoT: 1200 s for none, 30 s for less), the shorter: the socket
+    // closes after twice ours without a packet - unless something else went
+    // out since. Never without either.
+    let settled = match client.shared_config().keep_alive {
+        KeepAlive::Seconds(s) => Some(s.get()),
+        KeepAlive::Infinite => None,
+    };
+    let interval = match (KEEP_ALIVE_S, settled) {
+        (0, settled) => settled,
+        (ours, Some(settled)) => Some(ours.min(settled)),
+        (ours, None) => Some(ours),
+    }
+    .map(|s| Duration::from_secs(u64::from(s.max(2) / 2)));
+    let after = |now: Instant| interval.map_or(Instant::MAX, |i| now + i);
+    let mut next_ping = after(Instant::now());
     loop {
         match select3(
             OUTGOING.receive(),
@@ -176,16 +263,16 @@ async fn session(
                         Bytes::from(&message.payload[..]),
                     )
                     .await
-                    .map_err(drop)?;
-                next_ping = Instant::now() + interval;
+                    .map_err(lost)?;
+                next_ping = after(Instant::now());
             }
             Either3::Second(()) => {
-                client.ping().await.map_err(drop)?;
-                next_ping = Instant::now() + interval;
+                client.ping().await.map_err(lost)?;
+                next_ping = after(Instant::now());
             }
             Either3::Third(header) => {
-                let header = header.map_err(drop)?;
-                let event = client.poll_body(header).await.map_err(drop)?;
+                let header = header.map_err(lost)?;
+                let event = client.poll_body(header).await.map_err(lost)?;
                 forward(event);
                 reset(&mut client);
             }
@@ -193,13 +280,16 @@ async fn session(
     }
 }
 
-/// Reads one packet; `true` when it was a SUBACK.
-async fn poll(client: &mut MqttClient<'_>) -> Result<bool, ()> {
-    let event = client.poll().await.map_err(drop)?;
-    let was_suback = matches!(event, Event::Suback(_));
+/// Reads one packet; a SUBACK's reason code when it was one.
+async fn poll(client: &mut MqttClient<'_>) -> Result<Option<ReasonCode>, ()> {
+    let event = client.poll().await.map_err(lost)?;
+    let suback = match &event {
+        Event::Suback(suback) => Some(suback.reason_code),
+        _ => None,
+    };
     forward(event);
     reset(client);
-    Ok(was_suback)
+    Ok(suback)
 }
 
 /// Hands a publication to `incoming()`; drops it if that queue is full.

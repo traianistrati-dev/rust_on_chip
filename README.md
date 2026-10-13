@@ -393,7 +393,9 @@ the generated block, the tasks below it, editable. Your code calls
 `pins::configs::mqtt::publish("topic", b"payload").await` /
 `incoming().await`, `pins::configs::sntp::now_unix()`, and
 `pins::configs::espnow::send(BROADCAST, b"..").await` / `receive().await`;
-each protocol has one task that owns it and reconnects or resyncs on its own.
+each protocol has one task that owns it and reconnects or resyncs on its own,
+and `pins::configs::mqtt::last_refusal()` says what the broker last refused —
+the login, a policy, a subscription — with its MQTT 5 reason code.
 
 **Restart on panic** (on for a new setup, on every IoT chip) makes a panic
 restart the chip instead of halting it: `src/pins/configs/panic.rs` writes
@@ -493,8 +495,10 @@ the warning it deserves; it is never the default. **Test from this PC** runs
 those same checks — the very text of the firmware's `mqtt_link.rs`, built into
 a small program with your own cargo (about a minute the first time, seconds
 after; nothing of it in the IDE's dependencies) — against the broker, then the
-MQTT 5 CONNECT with the login from `secrets.rs`, and says what failed: the
-CA, the name, the dates, P-384, TLS 1.2, the password. `mqtt_ca.rs` may hold
+board's own MQTT 5 CONNECT with the login from `secrets.rs`, each of its
+subscriptions and, on AWS IoT, one QoS 1 test message on `<client id>/test`,
+and says what failed: the CA, the name, the dates, P-384, TLS 1.2, the password, a
+subscription or a publication the broker's policy refuses. `mqtt_ca.rs` may hold
 several CAs, and the broker's chain may end in any of them, anywhere above its
 certificate — a cross-signed chain such as AWS IoT's, which runs past Amazon
 Root CA 1 to Starfield's roots, still ends in it; "Use a known CA" writes
@@ -512,10 +516,19 @@ that is not P-256, or a certificate that is not the key's own (checked when
 the key carries its public half, as every key the tab makes does; otherwise
 "Test from this PC" finds it), stops the build with a message saying so, and
 while either is empty the board connects without one. The key never reaches `mcu.config`, the IDE's saved window state, the
-tree's clipboard or a cloned project. AWS IoT needs TLS 1.3 switched on for the
-endpoint (the tab shows the one CLI line) and is reached on 8883, or on 443
-with the ALPN the board then sends. "Test from this PC" sends the same
-certificate and says whether the broker asked for it. Not reached: brokers
+tree's clipboard or a cloned project. For **AWS IoT** the tab lists the AWS
+CLI lines with the endpoint's region, the thing (the client id) and the
+certificate's ARN filled in — the account's endpoint, TLS 1.3 switched on for
+it, the thing, the certificate signed from the CSR, the policy, and the lines
+that attach it to the certificate and the certificate to the thing. The policy
+is a `policy.json` it writes for this board: connect as the thing; publish,
+receive and subscribe under `<client id>/`; subscribe to and receive each
+filter outside it. The tab says what AWS would refuse before the board meets
+it — an empty client id or one that is no thing's name, a `$` filter other
+than `$aws/` or `$share/`, more than 7 `/`, the shared or the legacy endpoint.
+AWS IoT is reached on 8883, or on 443 with the ALPN the board then sends. "Test from this PC" sends the same certificate and says whether the
+broker asked for it. `scripts/aws-iot-mock.py` is an AWS IoT look-alike on
+this PC, for testing all of this with no account. Not reached: brokers
 that speak only TLS 1.2 (broker.hivemq.com); revocation is not checked. The ESP heap grows by 32 KiB for the RSA checks
 (on the S2 all of it moves to the RAM the bootloader used); a Pico gets a
 32 KiB heap and keys whitened with SHA-256 from the RP2350's TRNG and ring

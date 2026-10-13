@@ -155,7 +155,10 @@ const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 ///   CA, the chain walked from its last certificate.
 /// - `mqtt_link_tls_cyw43_v3`: the Pico link before its entropy moved into
 ///   the generated block (the Pico 2 W's TRNG): the ring oscillator in it.
-const LEGACY_TAILS: [(&str, &str); 9] = [
+/// - `mqtt_v2`: `mqtt.rs` before `last_refusal()`: it set a socket timeout of
+///   0 s for a keep-alive of 0 - no SYN ever left - and pinged on its own
+///   keep-alive, not the one the broker settled on (AWS IoT: 1200 s for 0).
+const LEGACY_TAILS: [(&str, &str); 10] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
     (
@@ -183,10 +186,11 @@ const LEGACY_TAILS: [(&str, &str); 9] = [
         MQTT_LINK,
         include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v3.rs"),
     ),
+    (MQTT, include_str!("iot_templates/legacy/mqtt_v2.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 23] = [
+const TAILS: [(&str, &str); 24] = [
     (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
@@ -210,6 +214,7 @@ const TAILS: [(&str, &str); 23] = [
     LEGACY_TAILS[6],
     LEGACY_TAILS[7],
     LEGACY_TAILS[8],
+    LEGACY_TAILS[9],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -421,12 +426,7 @@ fn wifi_file(platform: Platform) -> String {
 }
 
 fn mqtt_file(m: &MqttConfig) -> String {
-    let topics: Vec<String> = m
-        .subscribe
-        .iter()
-        .filter(|t| iot::topic_filter_problem(t).is_none())
-        .map(|t| lit(t))
-        .collect();
+    let topics: Vec<String> = iot::subscriptions(m).into_iter().map(lit).collect();
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
@@ -2989,6 +2989,22 @@ mod tests {
             "pub const WIFI_SSID: &str = \"\";\npub const WIFI_PASSWORD: &str = \"\";\n"
         ));
     }
+    /// An untouched mqtt.rs from before `last_refusal()` moves to the current
+    /// one; panic.rs's `publish` is the same in both.
+    #[test]
+    fn an_untouched_mqtt_v2_moves_to_the_current_template() {
+        let m = MqttConfig::default();
+        let now = mqtt_file(&m);
+        let head = &now[..now.find(GEN_END_CFG).unwrap() + GEN_END_CFG.len() + 1];
+        let v2 = format!("{head}{}", lf(LEGACY_TAILS[9].1));
+        assert!(is_pristine(MQTT, &v2));
+        assert_eq!(upgraded(MQTT, &v2, &now).as_deref(), Some(now.as_str()));
+        assert!(!v2.contains("last_refusal") && now.contains("pub fn last_refusal() -> Option<Refusal>"));
+        assert!(lf(LEGACY_TAILS[9].1).contains(MQTT_PUBLISH_SIGNATURE));
+        assert!(now.contains("if KEEP_ALIVE_S > 0 {"), "no 0 s socket timeout");
+        assert!(now.contains("client.shared_config().keep_alive"), "the broker's keep-alive");
+    }
+
     #[test]
     fn the_template_carries_the_topic_length_the_tab_checks() {
         let line = format!("pub const MAX_TOPIC: usize = {};", iot::MAX_TOPIC);

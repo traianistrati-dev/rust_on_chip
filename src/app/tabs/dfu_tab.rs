@@ -181,7 +181,12 @@ pub fn show_dfu_tab(
         .then(|| super::needs_tool_hint("espflash"))
         .or_else(no_cfg)
         .or_else(blocked)
-        .or_else(busy_note);
+        .or_else(busy_note)
+        // Last in the chain, so it stays symmetric with `swd_reason`: a missing
+        // tool or a flash already running is the more urgent thing to say. The
+        // lookup is inline and short-lived on purpose — holding its borrow would
+        // collide with the `&mut String` the combo below needs.
+        .or_else(|| esp_port_reason(progs.get(dfu_sel_programmer)));
     let probe_reason: Option<String> = super::tool_missing(missing_tools, "probe-rs")
         .then(|| super::needs_tool_hint("probe-rs"))
         .or_else(|| held("cargo flash"))
@@ -441,6 +446,16 @@ pub fn show_dfu_tab(
             // log first (left), then the device console (right), with Size/Info
             // pushed to the far edge. `Tool: espflash` and the Build -> Flash
             // phases live on the probe row above.
+            // `board-info` WRITES nothing, so the Flash button's blocks do not
+            // apply to it: no buildable chip config yet, a partitions.csv
+            // espflash would panic on, an FPGA bitstream the board would reject
+            // — checking what is on the other end of the cable is exactly what
+            // you want to do while those are still unresolved. It needs only the
+            // tool and a port, which is why it gets its own short chain instead
+            // of `esp_reason`.
+            let info_reason: Option<String> = super::tool_missing(missing_tools, "espflash")
+                .then(|| super::needs_tool_hint("espflash"))
+                .or_else(|| esp_port_reason(progs.get(dfu_sel_programmer)));
             esp_board_info_button(
                 ui,
                 &esp_state,
@@ -449,6 +464,7 @@ pub fn show_dfu_tab(
                 esp_flash_child,
                 dfu_sel_programmer,
                 espflash_used_port,
+                info_reason.as_deref(),
             );
             // Disabled while a flash runs: it resets the very phase states the
             // Flash button reads to know it is showing "Stop Flash", so a Clear
@@ -1077,6 +1093,10 @@ fn stop_flash_button(ui: &mut egui::Ui, hover: &str) -> bool {
     .clicked()
 }
 
+/// `Read chip info` — `espflash board-info`, which writes nothing. Takes its own
+/// `reason` rather than the Flash button's, for the reason spelled out at the
+/// call site.
+#[allow(clippy::too_many_arguments)]
 fn esp_board_info_button(
     ui: &mut egui::Ui,
     esp_state: &EspFlashState,
@@ -1085,6 +1105,14 @@ fn esp_board_info_button(
     esp_flash_child: &crate::flash_stop::FlashHandle,
     dfu_sel_programmer: &str,
     espflash_used_port: &Arc<Mutex<String>>,
+    // Why it can't run, if it can't — same contract as [`flash_button`]: the
+    // text goes red, the button stays ENABLED, and a click opens the explanation
+    // instead of starting espflash.
+    //
+    // It needs one of its own rather than the Flash button's: `read_board_info`
+    // passes `--port` UNCONDITIONALLY, where the flash path omits it to mean
+    // auto-detect, so an unselected list used to run `board-info --port ""`.
+    reason: Option<&str>,
 ) {
     let busy = esp_state.is_busy();
     let reading = matches!(esp_state, EspFlashState::ReadingInfo);
@@ -1093,15 +1121,25 @@ fn esp_board_info_button(
     } else {
         format!("{} Read chip info", ph::INFO)
     };
-    if ui
-        .add_enabled(
-            !busy,
-            egui::Button::new(
-                egui::RichText::new(&label)
-                    .size(10.5)
-                    .color(egui::Color32::from_rgb(100, 180, 255)),
-            ),
-        )
+    let resp = ui.add_enabled(
+        !busy,
+        egui::Button::new(egui::RichText::new(&label).size(10.5).color(match reason {
+            Some(_) => egui::Color32::from_rgb(235, 85, 75),
+            None => egui::Color32::from_rgb(100, 180, 255),
+        })),
+    );
+    if let Some(r) = reason {
+        if resp
+            .on_hover_text(format!(
+                "Read chip info can't run right now — click for details.\n\n{r}"
+            ))
+            .clicked()
+        {
+            open_blocked_dialog(ui, "Read chip info", r);
+        }
+        return;
+    }
+    if resp
         .on_hover_text(
             "Run `espflash board-info` — connects to the chip and reads:\n\
              chip type, silicon revision, flash size, MAC address.\n\
@@ -1319,6 +1357,44 @@ fn combo_width(total: f32) -> f32 {
 
 /// The device lists never take more than this share of the panel width.
 const COMBO_MAX_FRACTION: f32 = 0.40;
+
+/// Why the ESP path must not start with the Programmer list as it stands, if it
+/// must not.
+///
+/// `selected` is `progs.get(dfu_sel_programmer)` — the LOOKUP, never the key.
+/// The automatic scan replaces the whole programmer map while deliberately
+/// keeping the pick (`scan_usb_keep_selection`), so after unplugging a board the
+/// key is still set and points at nothing; the combo already reads "— select —"
+/// in exactly that case. A gate written on `is_empty()` would leave the button
+/// orange while the list next to it says nothing is chosen.
+///
+/// Why it has to refuse at all: `flash_args` omits `--port` for an empty port,
+/// which is how espflash is told to auto-detect, and the flash path does NOT
+/// pass `--non-interactive` (the monitor does). With one recognised board that
+/// silently works — which is why this went unnoticed — but with two it either
+/// programs the wrong one or stops on a chooser prompt this window cannot show.
+/// The same trap the probe-rs row already refuses by passing `allow_auto: false`.
+fn esp_port_reason(selected: Option<&dfu::ProgrammerInfo>) -> Option<String> {
+    match selected {
+        None => Some(
+            "pick the board in the Programmer list (Scan USB finds it) — espflash is given \
+             no port otherwise and then chooses one itself, which means the wrong board \
+             when two are plugged in, or a prompt this window cannot show"
+                .to_owned(),
+        ),
+        // Not reachable by clicking: the dropdown only lets a COMPATIBLE row be
+        // picked. It is reached by switching an existing project's chip from an
+        // ARM part to an ESP one, which leaves the ST-Link selected and the list
+        // never had a say. Gating on the KIND behind the key rather than on its
+        // presence is the shape `swd_reason` already uses.
+        Some(p) if !dfu::is_espressif_target(&p.kind, &p.vid_pid) => Some(format!(
+            "the Programmer list has a {} selected, which espflash cannot drive — pick the \
+             ESP's own USB-serial port",
+            p.kind
+        )),
+        Some(_) => None,
+    }
+}
 
 /// A Flash button that says WHY it can't run. `reason` is `None` when it can;
 /// otherwise the text goes red and a click OPENS THE EXPLANATION instead of
@@ -1912,8 +1988,121 @@ const FLASH_NOTES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        COMBO_MAX_FRACTION, FLASH_W, RIGHT_W, SCAN_W, combo_width, ellipsize, right_block_w,
+        COMBO_MAX_FRACTION, FLASH_W, RIGHT_W, SCAN_W, combo_width, ellipsize, esp_port_reason,
+        right_block_w,
     };
+    use crate::dfu::ProgrammerInfo;
+    use std::collections::HashMap;
+
+    fn prog(kind: &str, vid_pid: &str) -> ProgrammerInfo {
+        ProgrammerInfo {
+            name: "a board".to_owned(),
+            vid_pid: vid_pid.to_owned(),
+            kind: kind.to_owned(),
+            port: "COM12".to_owned(),
+            extra_details: String::new(),
+        }
+    }
+
+    /// The ESP half of what `allow_auto: false` does for the probe-rs row: refuse
+    /// BEFORE espflash is handed the chance to pick a board nobody chose. The
+    /// sentence has to name the list, because it is the only thing to act on —
+    /// the tab's manual "Port:" field is commented out.
+    #[test]
+    fn nothing_selected_refuses_the_esp_flash_and_says_where_to_look() {
+        let why = esp_port_reason(None).expect("an unselected list must refuse");
+        assert!(
+            why.contains("Programmer list"),
+            "the dialog has to name the list to act on: {why}"
+        );
+    }
+
+    /// Not reachable by clicking — the dropdown only offers compatible rows — but
+    /// reached by switching an existing project's chip from an ARM part to an ESP
+    /// one, which leaves the ST-Link selected.
+    #[test]
+    fn a_programmer_espflash_cannot_drive_refuses_and_names_it() {
+        let why = esp_port_reason(Some(&prog("ST-Link", "0483:3748")))
+            .expect("espflash cannot drive an ST-Link");
+        assert!(why.contains("ST-Link"), "{why}");
+    }
+
+    /// Both ways `dfu::is_espressif_target` recognises an ESP target must pass,
+    /// or the gate would refuse a row the list let the user pick: the KIND for a
+    /// third-party UART bridge, and the Espressif VID for everything else
+    /// (uppercase included — the catalogue is not the only writer of that field).
+    #[test]
+    fn every_programmer_the_list_offers_an_esp_project_is_accepted() {
+        for p in [
+            prog("USB-Serial", "10c4:ea60"),
+            prog("ESP32", "303a:1001"),
+            prog("something the catalogue did not name", "303A:0002"),
+        ] {
+            assert!(
+                esp_port_reason(Some(&p)).is_none(),
+                "refused [{}] {}, which the list offers on an ESP project",
+                p.kind,
+                p.vid_pid
+            );
+        }
+    }
+
+    /// Every flash button's refusal chain must consult the device list it flashes
+    /// through. A chain is easy to write without that check — `esp_reason` was,
+    /// for as long as this tab has existed, so "Flash ESP32" stayed orange with
+    /// the Programmer list reading "— select —" and espflash picked a board
+    /// nobody had chosen.
+    ///
+    /// A source scan, because what regresses is a FOURTH chain, or one of these
+    /// rewritten without its arm — and the unit tests above cannot see either:
+    /// they exercise `esp_port_reason` in isolation, never whether anything calls
+    /// it. Same reasoning as `probe::no_caller_filters_a_probe_selector_by_hand`.
+    #[test]
+    fn every_flash_reason_chain_consults_its_device_list() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app/tabs/dfu_tab.rs"),
+        )
+        .expect("this very file");
+        // Flash SWD and Flash ESP32 go through the Programmer list, Flash
+        // (probe-rs) through the separate probe list; each pair is what proves
+        // the chain asked.
+        for (name, tokens) in [
+            ("swd_reason", ["is_swd", "sel_kind"]),
+            ("esp_reason", ["esp_port_reason", "dfu_sel_programmer"]),
+            ("probe_reason", ["selected_probe", "probe_list"]),
+        ] {
+            // Assembled from pieces so this table does not match ITSELF - the
+            // scan reads the file it lives in.
+            let binding = ["let ", name].concat();
+            let from = src
+                .find(&binding)
+                .unwrap_or_else(|| panic!("`{binding}` is gone - rename or removal?"));
+            // The chain runs until the next binding of the function body.
+            let rest = &src[from + binding.len()..];
+            let chain = &rest[..rest.find("\n    let ").unwrap_or(rest.len())];
+            assert!(
+                tokens.iter().any(|t| chain.contains(t)),
+                "`{binding}` mentions none of {tokens:?}, so its Flash button is not \
+                 refusing an unselected device list:\n{chain}"
+            );
+        }
+    }
+
+    /// Why the gate asks the MAP and not the key: the automatic scan replaces the
+    /// whole programmer map but keeps the pick, so once the board is unplugged
+    /// the key is still set and resolves to nothing. `is_empty()` would wave it
+    /// through and leave the button orange while the combo reads "— select —".
+    #[test]
+    fn a_stale_key_refuses_exactly_like_an_empty_one() {
+        let progs: HashMap<String, ProgrammerInfo> = HashMap::new();
+        let kept = "COM12".to_owned();
+        assert!(!kept.is_empty(), "the key survives the rescan");
+        assert_eq!(
+            esp_port_reason(progs.get(&kept)),
+            esp_port_reason(None),
+            "a key that resolves to nothing must read as nothing selected"
+        );
+    }
 
     /// A ComboBox does not truncate its own text, so a long programmer label
     /// would size the widget past its column and re-widen the editor side panel

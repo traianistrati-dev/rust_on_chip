@@ -1918,17 +1918,33 @@ mod tests {
     /// both the gate and the installed check must stop at a `-` / a line.
     #[test]
     fn the_soft_float_target_is_not_the_hard_float_one() {
-        assert!(target_gate_matches("thumbv7em-none-eabi", "thumbv7em-none-eabi"));
-        assert!(!target_gate_matches("thumbv7em-none-eabi", "thumbv7em-none-eabihf"));
-        assert!(target_gate_matches("riscv32imc", "riscv32imc-unknown-none-elf"));
-        assert!(!target_gate_matches("riscv32imc", "riscv32imac-unknown-none-elf"));
+        assert!(target_gate_matches(
+            "thumbv7em-none-eabi",
+            "thumbv7em-none-eabi"
+        ));
+        assert!(!target_gate_matches(
+            "thumbv7em-none-eabi",
+            "thumbv7em-none-eabihf"
+        ));
+        assert!(target_gate_matches(
+            "riscv32imc",
+            "riscv32imc-unknown-none-elf"
+        ));
+        assert!(!target_gate_matches(
+            "riscv32imc",
+            "riscv32imac-unknown-none-elf"
+        ));
         assert!(target_gate_matches("xtensa", "xtensa-esp32s3-none-elf"));
 
         let args = ["target", "list", "--installed"];
         let only_hf = "thumbv6m-none-eabi\nthumbv7em-none-eabihf\n";
         assert!(!output_has(&args, only_hf, "thumbv7em-none-eabi"));
         assert!(output_has(&args, only_hf, "thumbv7em-none-eabihf"));
-        assert!(output_has(&args, "thumbv7em-none-eabi\r\n", "thumbv7em-none-eabi"));
+        assert!(output_has(
+            &args,
+            "thumbv7em-none-eabi\r\n",
+            "thumbv7em-none-eabi"
+        ));
         // Other checks keep the substring rule: `esp (default)` is the esp toolchain.
         assert!(output_has(&["toolchain", "list"], "esp (default)\n", "esp"));
     }

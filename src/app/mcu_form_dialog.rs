@@ -692,7 +692,11 @@ fn pin_side_editor(
                          a resistor, a pin the debugger drives). Shown in the pin panel."
                             .to_owned()
                     };
-                    if ui.selectable_label(note_open, icon).on_hover_text(hover).clicked() {
+                    if ui
+                        .selectable_label(note_open, icon)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
                         note_open = !note_open;
                     }
                     if ui

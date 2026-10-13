@@ -486,7 +486,8 @@ $ALL_CASES = @(
     # The IoT tab on both W boards: the radio up once for the LED AND the
     # network, `control` handed to the Wi-Fi task, embassy-net + rust-mqtt
     # (bump buffer, no heap) + SNTP over it; then MQTT over TLS on both, with
-    # the heap TLS brings and the ring oscillator whitened by SHA-256. Linked,
+    # the heap TLS brings and keys whitened by SHA-256 - the ring oscillator's,
+    # and on the Pico 2 W its TRNG's, bound in main. Linked,
     # like the radio row; CMAKE naming nothing keeps them pure Rust.
     @{ n = "Raspberry Pi Pico W Wi-Fi/BLE/TLS x6"; t = "emit_rp_iot_project"; e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "rp"; lk = $true }
 

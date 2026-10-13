@@ -262,7 +262,11 @@ pub fn build_target(cargo_config: &str) -> Option<&str> {
 /// user's and is left alone by the splice. The `[build] target` and the
 /// `[target.<triple>]` table move together - one without the other loses
 /// `-Tlink.x` and the link fails.
-pub fn ensure_cargo_target(cargo_config: &str, c: &ProjectDef, toolchain: &ToolchainKind) -> String {
+pub fn ensure_cargo_target(
+    cargo_config: &str,
+    c: &ProjectDef,
+    toolchain: &ToolchainKind,
+) -> String {
     if *toolchain != ToolchainKind::RustEmbedded
         || build_target(cargo_config).is_none_or(|t| t == c.target)
     {
@@ -1166,7 +1170,13 @@ pub fn ensure_iot_deps(
     // mqtt_link.rs names embedded-io-async's traits. Added, never removed:
     // the async USART's config files use it too, and those are not `sources`.
     if tls {
-        s = ensure_dep(&s, "embedded-io-async", true, "embedded-io-async = \"0.7\"", sources);
+        s = ensure_dep(
+            &s,
+            "embedded-io-async",
+            true,
+            "embedded-io-async = \"0.7\"",
+            sources,
+        );
     }
     // The client certificate's signature: mqtt_link.rs names p256's types and
     // ecdsa's RFC 6979 signing. Both are embedded-tls's own versions, so no
@@ -1195,9 +1205,16 @@ pub fn ensure_iot_deps(
         "spin = { version = \"0.9\", default-features = false, features = [\"portable_atomic\"] }",
         sources,
     );
-    // A Pico has no heap: TLS brings one, and whitens the ring oscillator's
-    // bits with SHA-256 for its keys (rand_core 0.6 is embedded-tls's).
-    s = ensure_dep(&s, "embedded-alloc", tls_pico, "embedded-alloc = \"0.7\"", sources);
+    // A Pico has no heap: TLS brings one, and whitens the chip's entropy
+    // (the ring oscillator; the TRNG too on the RP2350) with SHA-256 for its
+    // keys (rand_core 0.6 is embedded-tls's).
+    s = ensure_dep(
+        &s,
+        "embedded-alloc",
+        tls_pico,
+        "embedded-alloc = \"0.7\"",
+        sources,
+    );
     s = ensure_dep(
         &s,
         "rand_core_06",
@@ -1256,8 +1273,20 @@ pub fn ensure_iot_deps(
         "nrf-mpsl = { version = \"0.4\", features = [\"critical-section-impl\"] }",
         sources,
     );
-    s = ensure_dep(&s, "bt-hci", nrf_feature.is_some(), "bt-hci = \"0.10\"", sources);
-    s = ensure_dep(&s, "rand_core", nrf_feature.is_some(), "rand_core = \"0.9\"", sources);
+    s = ensure_dep(
+        &s,
+        "bt-hci",
+        nrf_feature.is_some(),
+        "bt-hci = \"0.10\"",
+        sources,
+    );
+    s = ensure_dep(
+        &s,
+        "rand_core",
+        nrf_feature.is_some(),
+        "rand_core = \"0.9\"",
+        sources,
+    );
     // Thread: OpenThread with its default features - the set openthread-sys
     // ships compiled (`thumbv7em-none-eabi` for 0.4 on an nRF, riscv32imac
     // for 0.2 on an ESP); one more feature and it compiles OpenThread's C
@@ -1275,7 +1304,13 @@ pub fn ensure_iot_deps(
     // profile, and Mbed TLS is prebuilt only for `tls` exactly: naming it with
     // its defaults makes the union `tls`. Never on an nRF, whose openthread
     // 0.4 carries an Mbed TLS of its own - a second copy would clash.
-    s = ensure_dep(&s, "mbedtls-rs-sys", thread_esp, "mbedtls-rs-sys = \"0.1\"", sources);
+    s = ensure_dep(
+        &s,
+        "mbedtls-rs-sys",
+        thread_esp,
+        "mbedtls-rs-sys = \"0.1\"",
+        sources,
+    );
     // The libc functions OpenThread's C calls and neither target's ROM or
     // core has: `strcmp`, `strstr` (nRF), `utoa`, `strtoul` (ESP). One line
     // for both, so a project moved between them keeps linking.
@@ -1288,7 +1323,13 @@ pub fn ensure_iot_deps(
         s = ensure_dep(&s, "static_cell", true, "static_cell = \"2\"", sources);
     }
     if on {
-        s = ensure_dep(&s, "embassy-futures", true, "embassy-futures = \"0.1\"", sources);
+        s = ensure_dep(
+            &s,
+            "embassy-futures",
+            true,
+            "embassy-futures = \"0.1\"",
+            sources,
+        );
     }
     s
 }
@@ -1328,7 +1369,13 @@ pub fn ensure_build_std_alloc(cargo_config: &str, needs: bool) -> String {
     let ends_nl = cargo_config.ends_with('\n');
     let mut s = cargo_config
         .lines()
-        .map(|l| if l.trim() == from { l.replacen(from, to, 1) } else { l.to_owned() })
+        .map(|l| {
+            if l.trim() == from {
+                l.replacen(from, to, 1)
+            } else {
+                l.to_owned()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if ends_nl {
@@ -1372,15 +1419,27 @@ fn set_owned_dep_line(cargo_toml: &str, name: &str, line: &str) -> String {
 /// generated block, whose refresh puts the feature back - so this runs on
 /// every regeneration, after the block is refreshed.
 pub fn ensure_mpsl_critical_section(cargo_toml: &str, mpsl: bool) -> String {
-    const WITH: &str = "cortex-m    = { version = \"0.7\", features = [\"critical-section-single-core\"] }";
-    const WITHOUT: &str = "cortex-m    = \"0.7\"   # the critical section is nrf-mpsl's (IoT tab: Bluetooth)";
-    let (from, to) = if mpsl { (WITH, WITHOUT) } else { (WITHOUT, WITH) };
+    const WITH: &str =
+        "cortex-m    = { version = \"0.7\", features = [\"critical-section-single-core\"] }";
+    const WITHOUT: &str =
+        "cortex-m    = \"0.7\"   # the critical section is nrf-mpsl's (IoT tab: Bluetooth)";
+    let (from, to) = if mpsl {
+        (WITH, WITHOUT)
+    } else {
+        (WITHOUT, WITH)
+    };
     if !cargo_toml.lines().any(|l| l.trim() == from) {
         return cargo_toml.to_owned();
     }
     let mut s = cargo_toml
         .lines()
-        .map(|l| if l.trim() == from { l.replacen(from, to, 1) } else { l.to_owned() })
+        .map(|l| {
+            if l.trim() == from {
+                l.replacen(from, to, 1)
+            } else {
+                l.to_owned()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if cargo_toml.ends_with('\n') {
@@ -4105,8 +4164,14 @@ mod tests {
         fs::write(dir.join("src/pins/configs/stale.rs"), "old").unwrap();
         fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
         clear_project_dir_keep_target(&dir);
-        assert!(dir.join("target/debug/dep.rlib").exists(), "the cache stays");
-        assert!(!dir.join("src").exists(), "a stale config file must not survive");
+        assert!(
+            dir.join("target/debug/dep.rlib").exists(),
+            "the cache stays"
+        );
+        assert!(
+            !dir.join("src").exists(),
+            "a stale config file must not survive"
+        );
         assert!(!dir.join("Cargo.toml").exists());
         // A directory that does not exist yet is not an error.
         clear_project_dir_keep_target(&dir.join("nope"));
@@ -5570,15 +5635,32 @@ mod iot_deps_tests {
             assert!(on.contains(want), "{want} missing:\n{on}");
         }
         let rtos = on.lines().find(|l| l.starts_with("esp-rtos")).unwrap();
-        assert!(rtos.contains("\"esp-radio\"") && rtos.contains("\"esp-alloc\""), "{rtos}");
-        assert_eq!(ensure_iot_deps(&on, esp(true), "esp32c3", "esp32c3", &[]), on, "idempotent");
+        assert!(
+            rtos.contains("\"esp-radio\"") && rtos.contains("\"esp-alloc\""),
+            "{rtos}"
+        );
+        assert_eq!(
+            ensure_iot_deps(&on, esp(true), "esp32c3", "esp32c3", &[]),
+            on,
+            "idempotent"
+        );
 
         let off = ensure_iot_deps(&on, None, "esp32c3", "esp32c3", &[]);
-        for gone in ["esp-radio =", "esp-alloc", "embassy-net", "rust-mqtt", "heapless", "embassy-sync"] {
+        for gone in [
+            "esp-radio =",
+            "esp-alloc",
+            "embassy-net",
+            "rust-mqtt",
+            "heapless",
+            "embassy-sync",
+        ] {
             assert!(!off.contains(gone), "{gone} stayed:\n{off}");
         }
         let rtos = off.lines().find(|l| l.starts_with("esp-rtos")).unwrap();
-        assert!(!rtos.contains("esp-radio") && !rtos.contains("esp-alloc"), "{rtos}");
+        assert!(
+            !rtos.contains("esp-radio") && !rtos.contains("esp-alloc"),
+            "{rtos}"
+        );
     }
 
     /// MQTT off: the stack stays, the client goes.
@@ -5612,8 +5694,14 @@ mod iot_deps_tests {
             "rp2040",
             &[],
         );
-        assert!(pico.contains("embassy-net") && pico.contains("rust-mqtt"), "{pico}");
-        assert!(!pico.contains("esp-radio") && !pico.contains("esp-alloc"), "{pico}");
+        assert!(
+            pico.contains("embassy-net") && pico.contains("rust-mqtt"),
+            "{pico}"
+        );
+        assert!(
+            !pico.contains("esp-radio") && !pico.contains("esp-alloc"),
+            "{pico}"
+        );
     }
 
     /// A crate the user's own code names is never taken away.
@@ -5646,10 +5734,17 @@ mod iot_deps_tests {
             on.contains("esp-radio = { version = \"0.18\", features = [\"esp32c3\", \"wifi\", \"esp-now\", \"unstable\"] }"),
             "{on}"
         );
-        assert_eq!(ensure_iot_deps(&on, both, "esp32c3", "esp32c3", &[]), on, "idempotent");
+        assert_eq!(
+            ensure_iot_deps(&on, both, "esp32c3", "esp32c3", &[]),
+            on,
+            "idempotent"
+        );
         // The feature leaves with the switch, the line stays for the station.
         let station_only = ensure_iot_deps(&on, esp(false), "esp32c3", "esp32c3", &[]);
-        let radio = station_only.lines().find(|l| l.starts_with("esp-radio")).unwrap();
+        let radio = station_only
+            .lines()
+            .find(|l| l.starts_with("esp-radio"))
+            .unwrap();
         assert!(!radio.contains("esp-now"), "{radio}");
 
         let alone = Some(Active {
@@ -5667,8 +5762,14 @@ mod iot_deps_tests {
         });
         let a = ensure_iot_deps(ESP_ASYNC, alone, "esp32c3", "esp32c3", &[]);
         assert!(a.contains("\"esp-now\"") && a.contains("esp-alloc"), "{a}");
-        assert!(!a.contains("embassy-net") && !a.contains("rust-mqtt"), "{a}");
-        assert!(a.contains("embassy-sync") && a.contains("heapless"), "espnow.rs uses both:\n{a}");
+        assert!(
+            !a.contains("embassy-net") && !a.contains("rust-mqtt"),
+            "{a}"
+        );
+        assert!(
+            a.contains("embassy-sync") && a.contains("heapless"),
+            "espnow.rs uses both:\n{a}"
+        );
     }
 
     /// An esp-radio line the user wrote keeps its `esp-now`, whatever the tab
@@ -5714,7 +5815,10 @@ mod iot_deps_tests {
         );
         assert!(h2.contains("esp-radio = { version = \"0.18\", features = [\"esp32h2\", \"ble\", \"unstable\"] }"), "{h2}");
         assert!(h2.contains("trouble-host = { version = \"0.6\""), "{h2}");
-        assert!(h2.contains("embassy-sync-0-7 = { package = \"embassy-sync\", version = \"0.7\" }"), "{h2}");
+        assert!(
+            h2.contains("embassy-sync-0-7 = { package = \"embassy-sync\", version = \"0.7\" }"),
+            "{h2}"
+        );
         assert!(!h2.contains("embassy-net"), "{h2}");
 
         let both = active(Platform::Esp, true, false, true);
@@ -5723,16 +5827,29 @@ mod iot_deps_tests {
         for f in ["\"wifi\"", "\"ble\"", "\"coex\""] {
             assert!(radio.contains(f), "{f}: {radio}");
         }
-        assert_eq!(ensure_iot_deps(&coex, both, "esp32c3", "esp32c3", &[]), coex, "idempotent");
+        assert_eq!(
+            ensure_iot_deps(&coex, both, "esp32c3", "esp32c3", &[]),
+            coex,
+            "idempotent"
+        );
         // Bluetooth off: ble and coex go, wifi stays.
         let wifi = ensure_iot_deps(&coex, esp(false), "esp32c3", "esp32c3", &[]);
         let radio = wifi.lines().find(|l| l.starts_with("esp-radio")).unwrap();
-        assert!(!radio.contains("\"ble\"") && !radio.contains("\"coex\""), "{radio}");
+        assert!(
+            !radio.contains("\"ble\"") && !radio.contains("\"coex\""),
+            "{radio}"
+        );
         assert!(radio.contains("\"wifi\""), "{radio}");
         assert!(!wifi.contains("trouble-host"), "{wifi}");
 
         // Beside ESP-NOW with the station off: coex too, and no IP stack.
-        let now = ensure_iot_deps(ESP_ASYNC, active(Platform::Esp, false, true, true), "esp32c3", "esp32c3", &[]);
+        let now = ensure_iot_deps(
+            ESP_ASYNC,
+            active(Platform::Esp, false, true, true),
+            "esp32c3",
+            "esp32c3",
+            &[],
+        );
         let radio = now.lines().find(|l| l.starts_with("esp-radio")).unwrap();
         for f in ["\"wifi\"", "\"esp-now\"", "\"ble\"", "\"coex\""] {
             assert!(radio.contains(f), "{f}: {radio}");
@@ -5756,11 +5873,23 @@ mod iot_deps_tests {
         ] {
             assert!(on.contains(want), "{want}:\n{on}");
         }
-        assert!(!on.contains("esp-radio") && !on.contains("embassy-sync-0-7"), "{on}");
+        assert!(
+            !on.contains("esp-radio") && !on.contains("embassy-sync-0-7"),
+            "{on}"
+        );
 
-        let esp = ensure_iot_deps("[dependencies]\n", active(Platform::Esp, false, false, true), "esp32c3", "esp32c3", &[]);
+        let esp = ensure_iot_deps(
+            "[dependencies]\n",
+            active(Platform::Esp, false, false, true),
+            "esp32c3",
+            "esp32c3",
+            &[],
+        );
         let moved = ensure_iot_deps(&esp, nrf, "nRF52840_xxAA", "nrf52840", &[]);
-        let trouble = moved.lines().find(|l| l.starts_with("trouble-host")).unwrap();
+        let trouble = moved
+            .lines()
+            .find(|l| l.starts_with("trouble-host"))
+            .unwrap();
         assert!(trouble.contains("\"0.8\""), "{trouble}");
         assert_eq!(moved.matches("trouble-host").count(), 1, "{moved}");
     }
@@ -5787,10 +5916,20 @@ mod iot_deps_tests {
         ] {
             assert!(on.contains(want), "{want}:\n{on}");
         }
-        for absent in ["nrf-sdc", "nrf-mpsl", "trouble-host", "embassy-net", "rand_core"] {
+        for absent in [
+            "nrf-sdc",
+            "nrf-mpsl",
+            "trouble-host",
+            "embassy-net",
+            "rand_core",
+        ] {
             assert!(!on.contains(absent), "{absent}:\n{on}");
         }
-        assert_eq!(ensure_iot_deps(&on, thread, "nRF52840_xxAA", "nrf52840", &[]), on, "idempotent");
+        assert_eq!(
+            ensure_iot_deps(&on, thread, "nRF52840_xxAA", "nrf52840", &[]),
+            on,
+            "idempotent"
+        );
 
         let off = ensure_iot_deps(&on, None, "nRF52840_xxAA", "nrf52840", &[]);
         for absent in ["openthread", "tinyrlibc", "executor-interrupt"] {
@@ -5823,10 +5962,19 @@ mod iot_deps_tests {
         ] {
             assert!(on.contains(want), "{want}:\n{on}");
         }
-        for absent in ["\"wifi\"", "executor-interrupt", "embassy-net", "trouble-host"] {
+        for absent in [
+            "\"wifi\"",
+            "executor-interrupt",
+            "embassy-net",
+            "trouble-host",
+        ] {
             assert!(!on.contains(absent), "{absent}:\n{on}");
         }
-        assert_eq!(ensure_iot_deps(&on, thread, "esp32c6", "esp32c6", &[]), on, "idempotent");
+        assert_eq!(
+            ensure_iot_deps(&on, thread, "esp32c6", "esp32c6", &[]),
+            on,
+            "idempotent"
+        );
 
         // Off: the Thread lines and the radio feature go.
         let off = ensure_iot_deps(&on, None, "esp32c6", "esp32c6", &[]);
@@ -5858,24 +6006,52 @@ mod iot_deps_tests {
                 ..active(platform, true, false, false).unwrap()
             })
         };
-        let etls = "embedded-tls = { version = \"0.19\", default-features = false, features = [\"rsa\"] }";
+        let etls =
+            "embedded-tls = { version = \"0.19\", default-features = false, features = [\"rsa\"] }";
         let c3 = ensure_iot_deps(ESP_ASYNC, tls(Platform::Esp), "esp32c3", "esp32c3", &[]);
-        for want in [etls, "embedded-io-async = \"0.7\"", "spin = { version = \"0.9\", default-features = false, features = [\"portable_atomic\"] }", "rust-mqtt = "] {
+        for want in [
+            etls,
+            "embedded-io-async = \"0.7\"",
+            "spin = { version = \"0.9\", default-features = false, features = [\"portable_atomic\"] }",
+            "rust-mqtt = ",
+        ] {
             assert!(c3.contains(want), "{want}:\n{c3}");
         }
         for absent in ["embedded-alloc", "rand_core_06", "sha2"] {
             assert!(!c3.contains(absent), "{absent}:\n{c3}");
         }
-        assert_eq!(ensure_iot_deps(&c3, tls(Platform::Esp), "esp32c3", "esp32c3", &[]), c3, "idempotent");
-        let c6 = ensure_iot_deps(&ESP_ASYNC.replace("esp32c3", "esp32c6"), tls(Platform::Esp), "esp32c6", "esp32c6", &[]);
-        assert!(c6.contains(etls) && !c6.contains("spin = "), "the C6 has CAS:\n{c6}");
+        assert_eq!(
+            ensure_iot_deps(&c3, tls(Platform::Esp), "esp32c3", "esp32c3", &[]),
+            c3,
+            "idempotent"
+        );
+        let c6 = ensure_iot_deps(
+            &ESP_ASYNC.replace("esp32c3", "esp32c6"),
+            tls(Platform::Esp),
+            "esp32c6",
+            "esp32c6",
+            &[],
+        );
+        assert!(
+            c6.contains(etls) && !c6.contains("spin = "),
+            "the C6 has CAS:\n{c6}"
+        );
 
         let pico = ensure_iot_deps("[dependencies]\n", tls(Platform::Cyw43), "", "rp2040", &[]);
-        for want in [etls, "embedded-alloc = \"0.7\"", "rand_core_06 = { package = \"rand_core\", version = \"0.6\" }", "sha2 = ", "spin = "] {
+        for want in [
+            etls,
+            "embedded-alloc = \"0.7\"",
+            "rand_core_06 = { package = \"rand_core\", version = \"0.6\" }",
+            "sha2 = ",
+            "spin = ",
+        ] {
             assert!(pico.contains(want), "{want}:\n{pico}");
         }
         let pico2 = ensure_iot_deps("[dependencies]\n", tls(Platform::Cyw43), "", "rp235x", &[]);
-        assert!(pico2.contains("embedded-alloc") && !pico2.contains("spin = "), "{pico2}");
+        assert!(
+            pico2.contains("embedded-alloc") && !pico2.contains("spin = "),
+            "{pico2}"
+        );
 
         // P-384 chains: the feature on the same line, and off again.
         let p384 = Some(Active {
@@ -5887,7 +6063,10 @@ mod iot_deps_tests {
         let with = ensure_iot_deps(&c3, p384, "esp32c3", "esp32c3", &[]);
         assert!(with.contains("features = [\"rsa\", \"p384\"] }"), "{with}");
         assert_eq!(with.matches("embedded-tls = ").count(), 1, "{with}");
-        assert_eq!(ensure_iot_deps(&with, tls(Platform::Esp), "esp32c3", "esp32c3", &[]), c3);
+        assert_eq!(
+            ensure_iot_deps(&with, tls(Platform::Esp), "esp32c3", "esp32c3", &[]),
+            c3
+        );
 
         // Off: TLS's lines go, embedded-io-async stays.
         let plain = Some(Active {
@@ -5898,7 +6077,10 @@ mod iot_deps_tests {
         for absent in ["embedded-tls", "spin = "] {
             assert!(!off.contains(absent), "{absent}:\n{off}");
         }
-        assert!(off.contains("embedded-io-async"), "added, never removed:\n{off}");
+        assert!(
+            off.contains("embedded-io-async"),
+            "added, never removed:\n{off}"
+        );
         let pico_off = ensure_iot_deps(&pico, None, "", "rp2040", &[]);
         for absent in ["embedded-tls", "embedded-alloc", "rand_core_06", "sha2 = "] {
             assert!(!pico_off.contains(absent), "{absent}:\n{pico_off}");
@@ -5919,7 +6101,10 @@ mod iot_deps_tests {
     #[test]
     fn cyw43_bluetooth_follows_the_switch() {
         let on = ensure_cyw43_deps("[dependencies]\n", true, true, &[]);
-        assert!(on.contains("cyw43 = { version = \"0.7\", features = [\"bluetooth\"] }"), "{on}");
+        assert!(
+            on.contains("cyw43 = { version = \"0.7\", features = [\"bluetooth\"] }"),
+            "{on}"
+        );
         assert_eq!(ensure_cyw43_deps(&on, true, true, &[]), on);
         let off = ensure_cyw43_deps(&on, true, false, &[]);
         assert!(off.contains("cyw43 = \"0.7\""), "{off}");

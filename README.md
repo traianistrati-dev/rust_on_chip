@@ -518,7 +518,9 @@ with the ALPN the board then sends. "Test from this PC" sends the same
 certificate and says whether the broker asked for it. Not reached: brokers
 that speak only TLS 1.2 (broker.hivemq.com); revocation is not checked. The ESP heap grows by 32 KiB for the RSA checks
 (on the S2 all of it moves to the RAM the bootloader used); a Pico gets a
-32 KiB heap and keys from its ring oscillator whitened with SHA-256. Not on the
+32 KiB heap and keys whitened with SHA-256 from the RP2350's TRNG and ring
+oscillator on the Pico 2 W (sampled raw, as its bootrom does), from the ring
+oscillator alone on the Pico W. Not on the
 ESP32-C5 / C61 (no TRNG in esp-hal 1.1), nor on an ESP32 or ESP32-C2 with
 Bluetooth beside Wi-Fi (no RAM left) — and where TLS is switched on but cannot
 run, no MQTT is generated at all, never the password in clear.

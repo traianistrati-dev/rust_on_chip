@@ -2149,7 +2149,10 @@ mod tests {
         assert!(back.pins.top[1].note.is_empty());
         // And it reaches the runtime pin the panel reads.
         let mcu = back.build_mcu();
-        assert!(mcu.iter_all_pins().any(|p| p.note == "Cut SB1 to free the pad."));
+        assert!(
+            mcu.iter_all_pins()
+                .any(|p| p.note == "Cut SB1 to free the pad.")
+        );
     }
 
     /// The note is edited in a multi-line box: a blank one saves as no note
@@ -2158,7 +2161,10 @@ mod tests {
     fn an_edited_pad_note_saves_trimmed() {
         let def = crate::panels::mcu_module::builtins::builtin_for("nrf52840_dk").unwrap();
         let mut form = McuForm::from_definition(&def);
-        let at = form.pins[0].iter().position(|r| !r.note.is_empty()).unwrap();
+        let at = form.pins[0]
+            .iter()
+            .position(|r| !r.note.is_empty())
+            .unwrap();
         form.pins[0][at].note = " \n ".into();
         form.pins[0][at + 1].note = "  Cut SB9.\n".into();
         let back = form.to_definition();
@@ -2172,9 +2178,27 @@ mod tests {
     #[test]
     fn auto_fill_completes_an_nrf52_form() {
         for (name, family, target, hal, nfc) in [
-            ("nRF52810-QFAA", "nrf52810", "thumbv7em-none-eabi", "nrf52810-hal", false),
-            ("nRF52820", "nrf52820", "thumbv7em-none-eabi", "embassy-nrf", false),
-            ("my nrf52840 board", "nrf52840", "thumbv7em-none-eabihf", "nrf52840-hal", true),
+            (
+                "nRF52810-QFAA",
+                "nrf52810",
+                "thumbv7em-none-eabi",
+                "nrf52810-hal",
+                false,
+            ),
+            (
+                "nRF52820",
+                "nrf52820",
+                "thumbv7em-none-eabi",
+                "embassy-nrf",
+                false,
+            ),
+            (
+                "my nrf52840 board",
+                "nrf52840",
+                "thumbv7em-none-eabihf",
+                "nrf52840-hal",
+                true,
+            ),
         ] {
             let mut f = McuForm::empty();
             f.id = "x".into();
@@ -2190,7 +2214,8 @@ mod tests {
             assert!(matches!(f.effective_clock(), ClockDef::Graph(_)), "{name}");
             let w = f.warnings();
             assert!(
-                !w.iter().any(|w| w.contains("codegen backend") || w.contains("HAL")),
+                !w.iter()
+                    .any(|w| w.contains("codegen backend") || w.contains("HAL")),
                 "{name}: {w:?}"
             );
         }

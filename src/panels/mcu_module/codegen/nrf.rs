@@ -315,7 +315,11 @@ impl NrfChip {
     pub fn wdt(&self) -> &'static str {
         // The nRF54L names it WDT0 too on the SECURE core (WDT31 underneath);
         // its `WDT` alias exists on the non-secure one only.
-        if self.nrf53() || self.nrf54() { "WDT0" } else { "WDT" }
+        if self.nrf53() || self.nrf54() {
+            "WDT0"
+        } else {
+            "WDT"
+        }
     }
 
     /// The two NFC antenna pins.
@@ -365,7 +369,11 @@ impl NrfChip {
     /// The vector USB's VBUS detection binds: the power block on an nRF52,
     /// the USB regulator on the nRF5340.
     pub fn vbus_irq(&self) -> &'static str {
-        if self.nrf53() { "USBREGULATOR" } else { "CLOCK_POWER" }
+        if self.nrf53() {
+            "USBREGULATOR"
+        } else {
+            "CLOCK_POWER"
+        }
     }
 
     /// The Rust target: Cortex-M4F is hard-float, the M4 without an FPU is
@@ -704,7 +712,9 @@ fn block_of(f: &PinFunction) -> Option<(&'static str, Option<u8>, String)> {
         }
         PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => ("twim", Some(*i), format!("TWIM{i}")),
         PinFunction::TimerPwm { timer, .. } => ("pwm", Some(*timer), format!("PWM{timer}")),
-        PinFunction::AdcChannel { channel, .. } => ("saadc", Some(*channel), format!("AIN{channel}")),
+        PinFunction::AdcChannel { channel, .. } => {
+            ("saadc", Some(*channel), format!("AIN{channel}"))
+        }
         PinFunction::UsbDm | PinFunction::UsbDp => ("usbd", None, "USBD".to_owned()),
         PinFunction::QspiClk | PinFunction::QspiNcs { .. } | PinFunction::QspiIo { .. } => {
             ("qspi", None, "QSPI".to_owned())
@@ -831,8 +841,8 @@ fn usb_identity(mcu: &Mcu) -> String {
 /// as `(Hz, Frequency variant)`. The block's divider runs 1..=16.
 fn qspi_frequency(prescaler: u8) -> (u32, &'static str) {
     const F: [&str; 16] = [
-        "M32", "M16", "M10_7", "M8", "M6_4", "M5_3", "M4_6", "M4", "M3_6", "M3_2", "M2_9",
-        "M2_7", "M2_5", "M2_3", "M2_1", "M2",
+        "M32", "M16", "M10_7", "M8", "M6_4", "M5_3", "M4_6", "M4", "M3_6", "M3_2", "M2_9", "M2_7",
+        "M2_5", "M2_3", "M2_1", "M2",
     ];
     let i = usize::from(prescaler).min(F.len() - 1);
     (32_000_000 / (i as u32 + 1), F[i])
@@ -910,8 +920,16 @@ fn nrf54_pin_rule(f: &PinFunction, pp: (u8, u8)) -> Option<String> {
     let domain = match (inst, port) {
         (30, 0) | (20..=22, 1) => None,
         (0, 2) => {
-            let ok: Vec<u8> = [20, 21].iter().filter_map(|g| nrf54_p2_pin(role, *g)).collect();
-            (!ok.contains(&pin)).then(|| format!("SERIAL00 reaches only its dedicated P2 pins - {} for this signal", list(&ok)))
+            let ok: Vec<u8> = [20, 21]
+                .iter()
+                .filter_map(|g| nrf54_p2_pin(role, *g))
+                .collect();
+            (!ok.contains(&pin)).then(|| {
+                format!(
+                    "SERIAL00 reaches only its dedicated P2 pins - {} for this signal",
+                    list(&ok)
+                )
+            })
         }
         (20 | 21, 2) if !twi && nrf54_p2_pin(role, inst) == Some(pin) => {
             return Some(format!(
@@ -1301,7 +1319,11 @@ fn section(mcu: &Mcu) -> String {
     o.push_str(&clock_lines(mcu, &hal));
     // After the clocks, so the LFCLK source the Clock tab picked is the one the
     // WDT will count. Configured only - nothing bites until `activate`.
-    o.push_str(&super::watchdog_gen::nrf_init_lines(&mcu.watchdog, false, "WDT"));
+    o.push_str(&super::watchdog_gen::nrf_init_lines(
+        &mcu.watchdog,
+        false,
+        "WDT",
+    ));
     // Port 1 only where the definition names a P1 pin: the nRF52832, 52810 and
     // 52811 have P0 alone, and their HALs have no `p1` module to take.
     let has_p1 = mcu
@@ -1346,7 +1368,9 @@ fn hal_line(mcu: &Mcu, is_async: bool) -> String {
     if is_async {
         format!("// MCU: {} | HAL: embassy-nrf (async)\n", mcu.name)
     } else {
-        let krate = chip(&mcu.family).and_then(|c| c.nrf_hal).unwrap_or("embassy-nrf");
+        let krate = chip(&mcu.family)
+            .and_then(|c| c.nrf_hal)
+            .unwrap_or("embassy-nrf");
         format!("// MCU: {} | HAL: {krate} (blocking)\n", mcu.name)
     }
 }
@@ -2506,7 +2530,8 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         ));
         o.push_str("    spawner.spawn(usb_task(usb_builder.build()).unwrap());\n");
         irqs.push(
-            "    USBD => embassy_nrf::usb::InterruptHandler<embassy_nrf::peripherals::USBD>;".to_owned(),
+            "    USBD => embassy_nrf::usb::InterruptHandler<embassy_nrf::peripherals::USBD>;"
+                .to_owned(),
         );
         // VBUS detection sits on the power block's vector on an nRF52 and on
         // the USB regulator's on the nRF5340.
@@ -2556,7 +2581,9 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         o.push_str(&format!(
             "    qspi_cfg.address_mode = embassy_nrf::qspi::AddressMode::{addr};\n"
         ));
-        o.push_str("    // Quad I/O read and page program by default - Config::default()'s opcodes.\n");
+        o.push_str(
+            "    // Quad I/O read and page program by default - Config::default()'s opcodes.\n",
+        );
         o.push_str(&format!(
             "{ALLOW}    let mut qspi = embassy_nrf::qspi::Qspi::new(\n        p.QSPI,\n        Irqs,\n        p.{}, // SCK\n        p.{}, // CSN\n        p.{}, // IO0\n        p.{}, // IO1\n        p.{}, // IO2\n        p.{}, // IO3\n        qspi_cfg,\n    );\n",
             periph(sck),
@@ -2602,8 +2629,7 @@ pub fn needs_static_cell(mcu: &Mcu) -> bool {
 /// answer.
 pub fn thread_on(mcu: &Mcu) -> bool {
     use crate::panels::mcu_module::iot::{self, Platform};
-    mcu.is_async()
-        && iot::active(mcu).is_some_and(|a| a.platform == Platform::Nrf && a.thread)
+    mcu.is_async() && iot::active(mcu).is_some_and(|a| a.platform == Platform::Nrf && a.thread)
 }
 
 /// The target a Thread project builds for. openthread-sys 0.4 ships OpenThread
@@ -2646,8 +2672,7 @@ fn thread_lines(irqs: &mut Vec<String>) -> String {
 /// section), which must follow the same answer.
 pub fn ble_on(mcu: &Mcu) -> bool {
     use crate::panels::mcu_module::iot::{self, Platform};
-    mcu.is_async()
-        && iot::active(mcu).is_some_and(|a| a.platform == Platform::Nrf && a.ble)
+    mcu.is_async() && iot::active(mcu).is_some_and(|a| a.platform == Platform::Nrf && a.ble)
 }
 
 /// The MPSL's vectors on the nRF52, each with its handler: the low-priority
@@ -2691,10 +2716,13 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     }
 
     let mut before = String::new();
-    before.push_str("    // Bluetooth (IoT tab): interrupt priority 0 belongs to the radio's MPSL,\n");
+    before.push_str(
+        "    // Bluetooth (IoT tab): interrupt priority 0 belongs to the radio's MPSL,\n",
+    );
     before.push_str("    // so embassy-time and GPIOTE run at 2.\n");
     before.push_str("    config.time_interrupt_priority = embassy_nrf::interrupt::Priority::P2;\n");
-    before.push_str("    config.gpiote_interrupt_priority = embassy_nrf::interrupt::Priority::P2;\n");
+    before
+        .push_str("    config.gpiote_interrupt_priority = embassy_nrf::interrupt::Priority::P2;\n");
 
     let mut after = String::new();
     if !ours.is_empty() {
@@ -2712,7 +2740,13 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
 
     let clock = clock_choice(mcu);
     let (source, ctiv, temp_ctiv, ppm, what) = match clock.lf {
-        LfSource::Xtal => ("MPSL_CLOCK_LF_SRC_XTAL", "0", "0", "50", "the 32.768 kHz crystal, 50 ppm"),
+        LfSource::Xtal => (
+            "MPSL_CLOCK_LF_SRC_XTAL",
+            "0",
+            "0",
+            "50",
+            "the 32.768 kHz crystal, 50 ppm",
+        ),
         LfSource::Synth => (
             "MPSL_CLOCK_LF_SRC_SYNTH",
             "0",
@@ -2730,10 +2764,16 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     };
     let mut body = String::new();
     body.push_str("\n    // ── IoT (IoT tab) ──\n");
-    body.push_str("    // Bluetooth LE on Nordic's SoftDevice Controller, under the MPSL. Its LF\n");
-    body.push_str(&format!("    // clock is the one `init` started: {what}.\n"));
+    body.push_str(
+        "    // Bluetooth LE on Nordic's SoftDevice Controller, under the MPSL. Its LF\n",
+    );
+    body.push_str(&format!(
+        "    // clock is the one `init` started: {what}.\n"
+    ));
     body.push_str("    let lfclk = nrf_sdc::mpsl::raw::mpsl_clock_lfclk_cfg_t {\n");
-    body.push_str(&format!("        source: nrf_sdc::mpsl::raw::{source} as u8,\n"));
+    body.push_str(&format!(
+        "        source: nrf_sdc::mpsl::raw::{source} as u8,\n"
+    ));
     body.push_str(&format!("        rc_ctiv: {ctiv},\n"));
     body.push_str(&format!("        rc_temp_ctiv: {temp_ctiv},\n"));
     body.push_str(&format!("        accuracy_ppm: {ppm},\n"));
@@ -2753,7 +2793,9 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     // events only; the Clock tab's crystal is held by a request never
     // released. LFSYNTH keeps it running already.
     if clock.hfxo && clock.lf != LfSource::Synth {
-        body.push_str("    // The Clock tab's 32 MHz crystal: the MPSL owns CLOCK now and may stop it\n");
+        body.push_str(
+            "    // The Clock tab's 32 MHz crystal: the MPSL owns CLOCK now and may stop it\n",
+        );
         body.push_str("    // between radio events, so it is requested once and never released.\n");
         body.push_str("    core::mem::forget(mpsl.request_hfclk().await.unwrap());\n");
     }
@@ -2763,8 +2805,12 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     body.push_str("        spawner,\n");
     body.push_str("        mpsl,\n");
     body.push_str("        nrf_sdc::Peripherals::new(\n");
-    body.push_str("            p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23,\n");
-    body.push_str("            p.PPI_CH24, p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,\n");
+    body.push_str(
+        "            p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23,\n",
+    );
+    body.push_str(
+        "            p.PPI_CH24, p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,\n",
+    );
     body.push_str("        ),\n");
     body.push_str("        RNG.init(embassy_nrf::rng::Rng::new_blocking(p.RNG)),\n");
     body.push_str("    );\n");
@@ -2804,11 +2850,17 @@ pub fn shared_block_partner(
     let (sn, tn) = match me.kind {
         ModuleKind::GenericInterfaceSpi => {
             let block = serial_block(family, "spim", n).0;
-            (n, (0..4).find(|&m| serial_block(family, "twim", m).0 == block)?)
+            (
+                n,
+                (0..4).find(|&m| serial_block(family, "twim", m).0 == block)?,
+            )
         }
         ModuleKind::GenericInterfaceI2c => {
             let block = serial_block(family, "twim", n).0;
-            ((0..4).find(|&m| serial_block(family, "spim", m).0 == block)?, n)
+            (
+                (0..4).find(|&m| serial_block(family, "spim", m).0 == block)?,
+                n,
+            )
         }
         _ => return None,
     };
@@ -2875,7 +2927,8 @@ fn async_section(mcu: &Mcu) -> String {
     let clock = async_clock_lines(mcu);
     match &ble {
         Some((before, after, _)) => {
-            const INIT: &str = "    #[allow(unused_variables)]\n    let p = embassy_nrf::init(config);\n\n";
+            const INIT: &str =
+                "    #[allow(unused_variables)]\n    let p = embassy_nrf::init(config);\n\n";
             o.push_str(&clock.replacen(INIT, &format!("{before}{INIT}{after}"), 1));
         }
         None => o.push_str(&clock),
@@ -2967,7 +3020,15 @@ mod tests {
         assert!(is_nrf("nrf52840"));
         assert!(is_nrf("nrf5340"));
         assert!(is_nrf("nrf54l15"));
-        for other in ["nrf51", "nrf5340-net", "nrf54h20", "rp2040", "stm32f4", "esp32c3", ""] {
+        for other in [
+            "nrf51",
+            "nrf5340-net",
+            "nrf54h20",
+            "rp2040",
+            "stm32f4",
+            "esp32c3",
+            "",
+        ] {
             assert!(!is_nrf(other), "{other:?} matched");
         }
     }
@@ -4243,7 +4304,10 @@ mod async_codegen {
         mcu.iot.ble = Some(BleConfig::default());
         let main = mcu.fresh_main_rs();
         assert!(!main.contains(hold), "{main}");
-        assert!(main.contains("recalibrated by the MPSL at least every 8 s"), "{main}");
+        assert!(
+            main.contains("recalibrated by the MPSL at least every 8 s"),
+            "{main}"
+        );
 
         select(&mut mcu, "hfclk_src", 1);
         let main = mcu.fresh_main_rs();
@@ -4280,14 +4344,28 @@ mod async_codegen {
         let tc = ToolchainKind::RustEmbedded;
         let before = project_gen::gen_config(ConfigFile::CargoConfig, &hard, &tc);
         let after = project_gen::ensure_cargo_target(&before, &soft, &tc);
-        assert!(after.contains("target = \"thumbv7em-none-eabi\"\n"), "{after}");
+        assert!(
+            after.contains("target = \"thumbv7em-none-eabi\"\n"),
+            "{after}"
+        );
         assert!(after.contains("[target.thumbv7em-none-eabi]\n"), "{after}");
         assert!(!after.contains("eabihf"), "{after}");
-        assert_eq!(project_gen::ensure_cargo_target(&after, &soft, &tc), after, "idempotent");
-        assert_eq!(project_gen::ensure_cargo_target(&after, &hard, &tc), before, "and back");
+        assert_eq!(
+            project_gen::ensure_cargo_target(&after, &soft, &tc),
+            after,
+            "idempotent"
+        );
+        assert_eq!(
+            project_gen::ensure_cargo_target(&after, &hard, &tc),
+            before,
+            "and back"
+        );
         // What the user wrote outside the block stays.
         let tailed = format!("{after}\n[env]\nMY_VAR = \"1\"\n");
-        assert!(project_gen::ensure_cargo_target(&tailed, &hard, &tc).ends_with("[env]\nMY_VAR = \"1\"\n"));
+        assert!(
+            project_gen::ensure_cargo_target(&tailed, &hard, &tc)
+                .ends_with("[env]\nMY_VAR = \"1\"\n")
+        );
         // A hand-written config (no markers) is the user's.
         let mine = "[build]\ntarget = \"thumbv7em-none-eabihf\"\n";
         assert_eq!(project_gen::ensure_cargo_target(mine, &soft, &tc), mine);
@@ -4345,15 +4423,22 @@ mod async_codegen {
                 "        // Your main loop code here.\n",
                 concat!(
                     "        // Your main loop code here.\n",
-                "        let packet = pins::configs::ble::receive().await;\n",
-                "        if pins::configs::ble::connected() {\n",
-                "            pins::configs::ble::send(&packet.data).await.ok();\n",
-                "        }\n",
+                    "        let packet = pins::configs::ble::receive().await;\n",
+                    "        if pins::configs::ble::connected() {\n",
+                    "            pins::configs::ble::send(&packet.data).await.ok();\n",
+                    "        }\n",
                 ),
                 1,
             );
-            assert!(main_rs.contains("ble::receive().await"), "the loop was seeded:\n{main_rs}");
-            assert_eq!(main_rs.contains("request_hfclk"), id == "nrf52840_dk", "{main_rs}");
+            assert!(
+                main_rs.contains("ble::receive().await"),
+                "the loop was seeded:\n{main_rs}"
+            );
+            assert_eq!(
+                main_rs.contains("request_hfclk"),
+                id == "nrf52840_dk",
+                "{main_rs}"
+            );
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
@@ -4430,9 +4515,15 @@ mod async_codegen {
                 m
             };
             let before = build_cfg(&def, Some(&mcu));
-            assert_eq!(before.target, "thumbv7em-none-eabihf", "{id}: hard-float before");
+            assert_eq!(
+                before.target, "thumbv7em-none-eabihf",
+                "{id}: hard-float before"
+            );
             mcu.iot.thread = Some(ThreadConfig::default());
-            assert!(super::thread_on(&mcu) && !super::ble_on(&mcu), "{id}: Thread alone");
+            assert!(
+                super::thread_on(&mcu) && !super::ble_on(&mcu),
+                "{id}: Thread alone"
+            );
             let project = build_cfg(&def, Some(&mcu));
             assert_eq!(project.target, super::THREAD_TARGET, "{id}");
 
@@ -4447,21 +4538,36 @@ mod async_codegen {
                 ),
                 1,
             );
-            assert!(main_rs.contains("thread::receive().await"), "the loop was seeded:\n{main_rs}");
+            assert!(
+                main_rs.contains("thread::receive().await"),
+                "the loop was seeded:\n{main_rs}"
+            );
             assert!(main_rs.contains("HfclkSource::ExternalXtal;"), "{main_rs}");
             // The project as the app had it before the switch, then the app's
             // refresh of `.cargo/config.toml`.
             let mut files = project_gen::build_project_files(&before, &def.toolchain, &main_rs);
             files.cargo_config =
                 project_gen::ensure_cargo_target(&files.cargo_config, &project, &def.toolchain);
-            assert!(files.cargo_config.contains("[target.thumbv7em-none-eabi]"), "{}", files.cargo_config);
-            assert!(!files.cargo_config.contains("eabihf"), "{}", files.cargo_config);
+            assert!(
+                files.cargo_config.contains("[target.thumbv7em-none-eabi]"),
+                "{}",
+                files.cargo_config
+            );
+            assert!(
+                !files.cargo_config.contains("eabihf"),
+                "{}",
+                files.cargo_config
+            );
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             assert!(
-                user.iter().any(|(p, c)| p == iot_gen::SECRETS_PATH && c.contains("THREAD_DATASET")),
+                user.iter()
+                    .any(|(p, c)| p == iot_gen::SECRETS_PATH && c.contains("THREAD_DATASET")),
                 "{id}: secrets.rs with the dataset line"
             );
-            assert!(user.iter().any(|(p, _)| p == "src/pins/configs/thread.rs"), "{id}");
+            assert!(
+                user.iter().any(|(p, _)| p == "src/pins/configs/thread.rs"),
+                "{id}"
+            );
             let dir = std::env::temp_dir().join(dir_name);
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
@@ -4493,7 +4599,12 @@ mod async_codegen {
                 &sources,
             );
             let toml = project_gen::ensure_mpsl_critical_section(&toml, super::ble_on(&mcu));
-            for want in ["openthread = ", "tinyrlibc = ", "\"executor-interrupt\"", "critical-section-single-core"] {
+            for want in [
+                "openthread = ",
+                "tinyrlibc = ",
+                "\"executor-interrupt\"",
+                "critical-section-single-core",
+            ] {
                 assert!(toml.contains(want), "{want}:\n{toml}");
             }
             assert!(!toml.contains("nrf-sdc"), "{toml}");

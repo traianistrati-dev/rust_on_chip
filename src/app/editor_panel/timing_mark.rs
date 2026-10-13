@@ -339,6 +339,21 @@ impl AppIde {
                 placed.lines.0, placed.lines.1, placed.func
             )
         };
+        // A task that never returns was turned into one pass of its loop.
+        if whole_fn && !region.whole_fn {
+            let lines = if placed.lines.0 == placed.lines.1 {
+                format!("line {}", placed.lines.0)
+            } else {
+                format!("lines {}-{}", placed.lines.0, placed.lines.1)
+            };
+            what = format!(
+                concat!(
+                    "one pass of the loop of {} ({}) - it never returns, so its own time ",
+                    "would never end",
+                ),
+                placed.func, lines
+            );
+        }
         if shown.as_deref() != Some(region.file.as_str()) {
             what.push_str(&format!(" ({})", region.file));
         }

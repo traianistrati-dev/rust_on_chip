@@ -529,7 +529,10 @@ mod tests {
         use crate::panels::mcu_module::pins::PinFunction;
         let defs = [
             stm_def(),
-            ron::from_str(include_str!("../../../assets/mcus/examples/stm32f103rb.ron")).unwrap(),
+            ron::from_str(include_str!(
+                "../../../assets/mcus/examples/stm32f103rb.ron"
+            ))
+            .unwrap(),
             ron::from_str(include_str!(
                 "../../../assets/mcus/examples/stm32f103_graphclock.ron"
             ))
@@ -1063,7 +1066,11 @@ mod the_manifest_follows_the_runtime {
                 .expect("a dependency line names a crate");
             // The LINES differ, not always the crate: the nRF5340 is on
             // embassy-nrf both ways, with the time driver only on Async.
-            assert_ne!(async_line, d.project.hal_dep, "{}: the two lines differ", d.id);
+            assert_ne!(
+                async_line, d.project.hal_dep,
+                "{}: the two lines differ",
+                d.id
+            );
 
             let mut mcu = d.build_mcu();
             mcu.runtime = Runtime::Async;
@@ -1086,8 +1093,7 @@ mod the_manifest_follows_the_runtime {
             let btoml =
                 project_gen::gen_config(project_gen::ConfigFile::CargoToml, &bcfg, &d.toolchain);
             assert!(
-                btoml.contains(d.project.hal_dep.as_str())
-                    && !btoml.contains(async_line.as_str()),
+                btoml.contains(d.project.hal_dep.as_str()) && !btoml.contains(async_line.as_str()),
                 "{}: Blocking must carry its own line, got:\n{btoml}",
                 d.id
             );

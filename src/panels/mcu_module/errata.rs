@@ -445,7 +445,10 @@ mod adc2_wifi_tests {
     #[test]
     fn adc2_clashes_with_wifi_only() {
         let mut m = esp32_with_adc(2);
-        assert!(clashes(&m).iter().all(|c| !c.text.contains("ADC2")), "no Wi-Fi yet");
+        assert!(
+            clashes(&m).iter().all(|c| !c.text.contains("ADC2")),
+            "no Wi-Fi yet"
+        );
         m.iot.wifi = true;
         let c = clashes(&m);
         assert!(c.iter().any(|c| c.text.contains("ADC2")), "{c:?}");

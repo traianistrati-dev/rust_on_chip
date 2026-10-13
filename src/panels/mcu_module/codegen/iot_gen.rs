@@ -121,7 +121,10 @@ opt-level = 2
 ";
     vec![
         ("Cargo.toml", CARGO_TOML.to_owned()),
-        ("src/main.rs", lf(include_str!("iot_templates/tls_check_main.rs"))),
+        (
+            "src/main.rs",
+            lf(include_str!("iot_templates/tls_check_main.rs")),
+        ),
         ("src/tls_verify.rs", lf(TLS_VERIFY)),
         ("src/pem_der.rs", lf(PEM_DER)),
         ("src/csr_der.rs", lf(CSR_DER)),
@@ -150,19 +153,40 @@ const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 ///   certificate checks inline - now a block shared with "Test from this PC".
 /// - `mqtt_link_tls_*_v2`: the TLS links before the client certificate, one
 ///   CA, the chain walked from its last certificate.
-const LEGACY_TAILS: [(&str, &str); 8] = [
+/// - `mqtt_link_tls_cyw43_v3`: the Pico link before its entropy moved into
+///   the generated block (the Pico 2 W's TRNG): the ring oscillator in it.
+const LEGACY_TAILS: [(&str, &str); 9] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
-    (THREAD, include_str!("iot_templates/legacy/thread_nrf_v1.rs")),
+    (
+        THREAD,
+        include_str!("iot_templates/legacy/thread_nrf_v1.rs"),
+    ),
     (MQTT, include_str!("iot_templates/legacy/mqtt_v1.rs")),
-    (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_esp_v1.rs")),
-    (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v1.rs")),
-    (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_esp_v2.rs")),
-    (MQTT_LINK, include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v2.rs")),
+    (
+        MQTT_LINK,
+        include_str!("iot_templates/legacy/mqtt_link_tls_esp_v1.rs"),
+    ),
+    (
+        MQTT_LINK,
+        include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v1.rs"),
+    ),
+    (
+        MQTT_LINK,
+        include_str!("iot_templates/legacy/mqtt_link_tls_esp_v2.rs"),
+    ),
+    (
+        MQTT_LINK,
+        include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v2.rs"),
+    ),
+    (
+        MQTT_LINK,
+        include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v3.rs"),
+    ),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 22] = [
+const TAILS: [(&str, &str); 23] = [
     (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
@@ -185,6 +209,7 @@ const TAILS: [(&str, &str); 22] = [
     LEGACY_TAILS[5],
     LEGACY_TAILS[6],
     LEGACY_TAILS[7],
+    LEGACY_TAILS[8],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -211,7 +236,12 @@ pub fn runtime_free(name: &str) -> bool {
 
 /// The Wi-Fi station's secrets, in the order they are written: the network,
 /// and the broker's login (written with the station, MQTT or not).
-pub const WIFI_SECRETS: [&str; 4] = ["WIFI_SSID", "WIFI_PASSWORD", "MQTT_USERNAME", "MQTT_PASSWORD"];
+pub const WIFI_SECRETS: [&str; 4] = [
+    "WIFI_SSID",
+    "WIFI_PASSWORD",
+    "MQTT_USERNAME",
+    "MQTT_PASSWORD",
+];
 
 /// Thread's one secret: the Active Operational Dataset, as hex TLVs. It holds
 /// the network key and the PSKc.
@@ -266,7 +296,7 @@ pub fn config_files_for(mcu: &Mcu) -> Vec<(String, String)> {
     let Some(active) = iot::active(mcu) else {
         return Vec::new();
     };
-    let mut files = config_files(&mcu.iot, active);
+    let mut files = config_files(&mcu.iot, active, &mcu.family);
     // Last, so the other files keep their places in the list.
     if active.panic {
         files.push((PANIC.to_owned(), panic_file(mcu, active)));
@@ -277,7 +307,7 @@ pub fn config_files_for(mcu: &Mcu) -> Vec<(String, String)> {
 /// The files for `cfg` on `active` - see [`config_files_for`]. The station
 /// brings the stack and the credentials; MQTT and SNTP ride on it; ESP-NOW
 /// stands on its own.
-pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
+pub fn config_files(cfg: &IotConfig, active: Active, family: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if active.station {
         out.push((NET.to_owned(), net_file(&cfg.ip, active)));
@@ -291,7 +321,7 @@ pub fn config_files(cfg: &IotConfig, active: Active) -> Vec<(String, String)> {
     }
     if let (true, Some(m)) = (active.mqtt, &cfg.mqtt) {
         out.push((MQTT.to_owned(), mqtt_file(m)));
-        out.push((MQTT_LINK.to_owned(), mqtt_link_file(m, active)));
+        out.push((MQTT_LINK.to_owned(), mqtt_link_file(m, active, family)));
         if active.mqtt_tls {
             out.push((MQTT_CA.to_owned(), mqtt_ca_file()));
         }
@@ -336,9 +366,18 @@ fn net_file(ip: &IpConfig, active: Active) -> String {
     o.push('\n');
     o.push_str("// IP settings (from the IoT tab) — auto-updated; edit them in the tab.\n");
     o.push_str(&format!("pub const DHCP: bool = {};\n", ip.dhcp));
-    o.push_str(&format!("pub const STATIC_IP: [u8; 4] = {};\n", bytes4(ip.address)));
-    o.push_str(&format!("pub const PREFIX_LEN: u8 = {};\n", ip.prefix.min(32)));
-    o.push_str(&format!("pub const GATEWAY: [u8; 4] = {};\n", bytes4(ip.gateway)));
+    o.push_str(&format!(
+        "pub const STATIC_IP: [u8; 4] = {};\n",
+        bytes4(ip.address)
+    ));
+    o.push_str(&format!(
+        "pub const PREFIX_LEN: u8 = {};\n",
+        ip.prefix.min(32)
+    ));
+    o.push_str(&format!(
+        "pub const GATEWAY: [u8; 4] = {};\n",
+        bytes4(ip.gateway)
+    ));
     o.push_str(&format!("pub const DNS: [u8; 4] = {};\n", bytes4(ip.dns)));
     let mut users = vec!["DHCP and DNS take one each"];
     if active.mqtt {
@@ -351,7 +390,10 @@ fn net_file(ip: &IpConfig, active: Active) -> String {
         "/// Sockets embassy-net can hold at once: {}, and two are left for yours.\n",
         users.join(", ")
     ));
-    o.push_str(&format!("pub const SOCKETS: usize = {};\n", sockets(active)));
+    o.push_str(&format!(
+        "pub const SOCKETS: usize = {};\n",
+        sockets(active)
+    ));
     o.push_str(GEN_END_CFG);
     o.push('\n');
     o.push_str(&lf(NET_TAIL));
@@ -368,7 +410,9 @@ fn wifi_file(platform: Platform) -> String {
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
-    o.push_str(&format!("// Wi-Fi station (from the IoT tab) on {radio}.\n"));
+    o.push_str(&format!(
+        "// Wi-Fi station (from the IoT tab) on {radio}.\n"
+    ));
     o.push_str("// The network name and password are in `secrets.rs`, which git ignores.\n");
     o.push_str(GEN_END_CFG);
     o.push('\n');
@@ -387,12 +431,24 @@ fn mqtt_file(m: &MqttConfig) -> String {
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
     o.push_str("// MQTT client (from the IoT tab) — auto-updated; edit it in the tab.\n");
-    o.push_str(&format!("pub const BROKER_HOST: &str = {};\n", lit(m.host.trim())));
+    o.push_str(&format!(
+        "pub const BROKER_HOST: &str = {};\n",
+        lit(m.host.trim())
+    ));
     o.push_str(&format!("pub const BROKER_PORT: u16 = {};\n", m.port));
-    o.push_str(&format!("pub const CLIENT_ID: &str = {};\n", lit(&m.client_id)));
-    o.push_str(&format!("pub const KEEP_ALIVE_S: u16 = {};\n", m.keep_alive_s));
+    o.push_str(&format!(
+        "pub const CLIENT_ID: &str = {};\n",
+        lit(&m.client_id)
+    ));
+    o.push_str(&format!(
+        "pub const KEEP_ALIVE_S: u16 = {};\n",
+        m.keep_alive_s
+    ));
     o.push_str("/// Subscribed after every connect; what arrives comes out of `incoming()`.\n");
-    o.push_str(&format!("pub const SUBSCRIBE: &[&str] = &[{}];\n", topics.join(", ")));
+    o.push_str(&format!(
+        "pub const SUBSCRIBE: &[&str] = &[{}];\n",
+        topics.join(", ")
+    ));
     o.push_str(GEN_END_CFG);
     o.push('\n');
     o.push_str(&lf(MQTT_TAIL));
@@ -402,7 +458,7 @@ fn mqtt_file(m: &MqttConfig) -> String {
 /// `mqtt_link.rs`: plain TCP, or TLS with the tab's verification, name and -
 /// with SNTP on - its clock for the certificates' dates. The editable half
 /// per radio: the RNG (and on a Pico the heap) is the chip's.
-fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
+fn mqtt_link_file(m: &MqttConfig, active: Active, family: &str) -> String {
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
@@ -419,15 +475,22 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
     o.push_str("/// the broker and read the MQTT password.\n");
     o.push_str(&format!("pub const VERIFY: bool = {};\n", m.verify));
     o.push_str("/// The name the broker's certificate must carry, sent as SNI.\n");
-    o.push_str(&format!("pub const SERVER_NAME: &str = {};\n", lit(m.tls_name())));
+    o.push_str(&format!(
+        "pub const SERVER_NAME: &str = {};\n",
+        lit(m.tls_name())
+    ));
     if active.sntp {
         o.push_str("/// The time the certificates' dates are checked against: SNTP's.\n");
         o.push_str("fn wall_clock() -> Option<u64> {\n    super::sntp::now_unix()\n}\n");
-        o.push_str("/// Before a handshake: up to 10 s for SNTP's first answer, so the dates are\n");
+        o.push_str(
+            "/// Before a handshake: up to 10 s for SNTP's first answer, so the dates are\n",
+        );
         o.push_str("/// checked from the first connection on.\n");
         o.push_str("async fn clock_ready() {\n");
         o.push_str("    let wait = embassy_time::Duration::from_secs(10);\n");
-        o.push_str("    let _ = embassy_time::with_timeout(wait, super::sntp::wait_synced()).await;\n");
+        o.push_str(
+            "    let _ = embassy_time::with_timeout(wait, super::sntp::wait_synced()).await;\n",
+        );
         o.push_str("}\n");
     } else {
         o.push_str("/// No wall clock - SNTP is off: the certificates' dates are NOT checked.\n");
@@ -435,11 +498,15 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
         o.push_str("async fn clock_ready() {}\n");
     }
     if active.mqtt_client_cert {
-        o.push_str("/// The board's certificate and P-256 key (secrets.rs), sent when the broker\n");
+        o.push_str(
+            "/// The board's certificate and P-256 key (secrets.rs), sent when the broker\n",
+        );
         o.push_str("/// asks - none while either is empty there. A key that is not P-256, or a\n");
         o.push_str("/// certificate that is not its own, fails the build.\n");
         o.push_str("const CLIENT_CERT_DER: [u8; pem_len(super::secrets::MQTT_CLIENT_CERT.as_bytes(), b\"CERTIFICATE\", false)] = pem_der(\n");
-        o.push_str("    super::secrets::MQTT_CLIENT_CERT,\n    b\"CERTIFICATE\",\n    false,\n    true,\n");
+        o.push_str(
+            "    super::secrets::MQTT_CLIENT_CERT,\n    b\"CERTIFICATE\",\n    false,\n    true,\n",
+        );
         o.push_str("    \"MQTT_CLIENT_CERT in secrets.rs holds no PEM certificate\",\n);\n");
         o.push_str("const CLIENT_KEY_DER: [u8; pem_len(\n    super::secrets::MQTT_CLIENT_KEY.as_bytes(),\n");
         o.push_str("    key_label(super::secrets::MQTT_CLIENT_KEY.as_bytes()),\n    false,\n)] = pem_der(\n");
@@ -447,7 +514,9 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
         o.push_str("    \"MQTT_CLIENT_KEY in secrets.rs holds no P-256 key (EC PRIVATE KEY or PRIVATE KEY, not encrypted)\",\n);\n");
         o.push_str("pub const CLIENT: Option<(&[u8], [u8; 32])> = client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER);\n");
     } else {
-        o.push_str("/// No client certificate - switch it on in the tab when the broker wants one.\n");
+        o.push_str(
+            "/// No client certificate - switch it on in the tab when the broker wants one.\n",
+        );
         o.push_str("pub const CLIENT: Option<(&[u8], [u8; 32])> = None;\n");
     }
     if iot::aws_alpn(m) {
@@ -455,6 +524,9 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
         o.push_str("pub const ALPN: &[&[u8]] = &[b\"x-amzn-mqtt-ca\"];\n");
     } else {
         o.push_str("pub const ALPN: &[&[u8]] = &[];\n");
+    }
+    if active.platform == Platform::Cyw43 {
+        o.push_str(if iot::tls_trng(family) { RP2350_ENTROPY } else { RP2040_ENTROPY });
     }
     o.push_str(GEN_END_CFG);
     o.push('\n');
@@ -503,7 +575,11 @@ pub fn mqtt_ca_preset(preset: CaPreset) -> String {
         CaPreset::Aws => (
             "//! AWS IoT Core: Amazon Root CA 1 (RSA) and Amazon Root CA 3 (P-256) - the\n\
              //! broker's chain ends in one or the other, by the signature it picks.\n",
-            format!("{}\n{}", lf(CA_AMAZON_ROOT_1).trim_end(), lf(CA_AMAZON_ROOT_3).trim_end()),
+            format!(
+                "{}\n{}",
+                lf(CA_AMAZON_ROOT_1).trim_end(),
+                lf(CA_AMAZON_ROOT_3).trim_end()
+            ),
         ),
         _ => (
             "//! test.mosquitto.org on ports 8883 and 8884 (client certificate): the\n\
@@ -520,6 +596,52 @@ pub fn mqtt_ca_preset(preset: CaPreset) -> String {
     o
 }
 
+/// The Pico W's entropy for TLS's keys: the ring oscillator's random bit.
+const RP2040_ENTROPY: &str = "\
+/// Raw entropy TLS's keys are whitened from (SHA-256, below): the ring
+/// oscillator's random bit - the RP2040 has no TRNG.
+pub const ENTROPY_BYTES: usize = 64;
+#[allow(dead_code)]
+fn entropy(raw: &mut [u8]) {
+    embassy_rp::clocks::RoscRng.fill_bytes(raw);
+}
+";
+
+/// The Pico 2 W's: its TRNG, sampled raw the way its bootrom samples it, with
+/// the ring oscillator beside it.
+const RP2350_ENTROPY: &str = "\
+/// Raw entropy TLS's keys are whitened from (SHA-256, below): the RP2350's
+/// TRNG, 512 bytes a key's worth, and the ring oscillator's bit beside it.
+pub const ENTROPY_BYTES: usize = 512 + 64;
+#[allow(dead_code)]
+fn entropy(raw: &mut [u8]) {
+    // Out of reset - embassy-rp leaves the TRNG as the bootrom did: RESETS'
+    // atomic clear alias, then RESET_DONE.
+    const RESETS: usize = 0x4002_0000;
+    const TRNG: u32 = 1 << 25;
+    // SAFETY: the TRNG's own reset bit, through the clear alias; nothing
+    // else is touched.
+    unsafe {
+        core::ptr::write_volatile((RESETS + 0x3000) as *mut u32, TRNG);
+        while core::ptr::read_volatile((RESETS + 0x8) as *const u32) & TRNG == 0 {}
+    }
+    // Sampled raw, as the bootrom does it, and conditioned by the SHA-256
+    // below: embassy-rp 0.10's health tests panic when one fails. At least
+    // 17 cycles between samples with the decorrelator off; 200 spreads them.
+    let mut config = embassy_rp::trng::Config::default();
+    config.disable_autocorrelation_test = true;
+    config.disable_crngt_test = true;
+    config.disable_von_neumann_balancer = true;
+    config.sample_count = 200;
+    let (from_trng, from_rosc) = raw.split_at_mut(raw.len().saturating_sub(64));
+    // SAFETY: main moved `p.TRNG` out of everyone's reach; TLS's handshakes
+    // take it one at a time.
+    let trng = unsafe { embassy_rp::peripherals::TRNG::steal() };
+    embassy_rp::trng::Trng::new(trng, crate::Irqs, config).blocking_fill_bytes(from_trng);
+    embassy_rp::clocks::RoscRng.fill_bytes(from_rosc);
+}
+";
+
 /// `mqtt_ca.rs` as first written: ISRG Root X1. No markers - the whole file
 /// is the user's once written (`write_once`).
 pub fn mqtt_ca_file() -> String {
@@ -534,7 +656,10 @@ pub fn mqtt_ca_file() -> String {
     o.push_str("//! through P-384 issuers: switch \"P-384 chains\" on in the IoT tab for it.\n");
     o.push_str("//! test.mosquitto.org's 8883 needs mosquitto.org's own CA\n");
     o.push_str("//! (https://test.mosquitto.org/ssl/mosquitto.org.crt).\n");
-    o.push_str(&format!("pub const CA_PEM: &str = \"{}\";\n", lf(CA_ISRG_ROOT_X1).trim_end()));
+    o.push_str(&format!(
+        "pub const CA_PEM: &str = \"{}\";\n",
+        lf(CA_ISRG_ROOT_X1).trim_end()
+    ));
     o
 }
 
@@ -543,7 +668,10 @@ fn sntp_file(s: &SntpConfig) -> String {
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
     o.push_str("// Network time (from the IoT tab) — auto-updated; edit it in the tab.\n");
-    o.push_str(&format!("pub const SERVER: &str = {};\n", lit(s.server.trim())));
+    o.push_str(&format!(
+        "pub const SERVER: &str = {};\n",
+        lit(s.server.trim())
+    ));
     o.push_str("pub const PORT: u16 = 123;\n");
     o.push_str("/// Seconds between two synchronisations once the clock is set.\n");
     o.push_str(&format!(
@@ -573,10 +701,16 @@ fn espnow_file(n: &EspNowConfig) -> String {
     o.push_str("// ESP-NOW (from the IoT tab) — auto-updated; edit it in the tab.\n");
     o.push_str("/// The channel ESP-NOW talks on while the Wi-Fi station is off (1..=13).\n");
     o.push_str("/// With the station on, the radio is on the access point's channel instead.\n");
-    o.push_str(&format!("pub const CHANNEL: u8 = {};\n", n.channel.clamp(1, 13)));
+    o.push_str(&format!(
+        "pub const CHANNEL: u8 = {};\n",
+        n.channel.clamp(1, 13)
+    ));
     o.push_str("/// Boards put on the peer list at start. `send` adds any other address the\n");
     o.push_str("/// first time it is used; the list holds 20, the broadcast address among them.\n");
-    o.push_str(&format!("pub const PEERS: &[[u8; 6]] = &[{}];\n", peers.join(", ")));
+    o.push_str(&format!(
+        "pub const PEERS: &[[u8; 6]] = &[{}];\n",
+        peers.join(", ")
+    ));
     o.push_str(GEN_END_CFG);
     o.push('\n');
     o.push_str(&lf(ESPNOW_TAIL));
@@ -741,12 +875,16 @@ fn declares(line: &str, name: &str) -> bool {
             l = l[close + 1..].trim_start();
         }
     }
-    let Some(rest) = l.strip_prefix("const ").or_else(|| l.strip_prefix("static ")) else {
+    let Some(rest) = l
+        .strip_prefix("const ")
+        .or_else(|| l.strip_prefix("static "))
+    else {
         return false;
     };
     let rest = rest.trim_start();
     let rest = rest.strip_prefix("mut ").map_or(rest, str::trim_start);
-    rest.strip_prefix(name).is_some_and(|r| r.trim_start().starts_with(':'))
+    rest.strip_prefix(name)
+        .is_some_and(|r| r.trim_start().starts_with(':'))
 }
 
 /// Exactly what `secrets_body_for` wrote, for whichever links: comments, and
@@ -758,7 +896,11 @@ fn secrets_pristine(content: &str) -> bool {
         .map(|n| format!("pub const {n}: &str = \"\";"))
         .collect();
     let mut any = false;
-    for line in content.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")) {
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+    {
         if !empty.iter().any(|e| e == line) {
             return false;
         }
@@ -852,8 +994,7 @@ pub fn upgraded(name: &str, existing: &str, body: &str) -> Option<String> {
 }
 
 /// Phase 1's ESP `init`, which created the radio itself.
-const V1_INIT: &str =
-    "pub fn init(spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -> Stack<'static> {\n";
+const V1_INIT: &str = "pub fn init(spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -> Stack<'static> {\n";
 const V1_NEW: &str =
     "    let (controller, interfaces) = esp_radio::wifi::new(wifi, Default::default()).unwrap();\n";
 const V2_INIT: &str = "pub fn init(\n    spawner: Spawner,\n    controller: WifiController<'static>,\n    station: Interface<'static>,\n) -> Stack<'static> {\n";
@@ -913,7 +1054,9 @@ pub fn mqtt_files_left(
     let link = link?;
     let has_tls = link.contains("embedded_tls::");
     let other_radio = match platform {
-        Platform::Esp => link.contains("embassy_rp::"),
+        // The Pico's tail names embassy-rp only in its generated block now;
+        // its own heap is the mark it carries.
+        Platform::Esp => link.contains("embassy_rp::") || link.contains("embedded_alloc::"),
         Platform::Cyw43 => link.contains("esp_hal::"),
         Platform::Nrf => false,
     };
@@ -950,6 +1093,22 @@ pub fn client_link_left(link: Option<&str>, client: bool) -> Option<&'static str
         )
 }
 
+/// An edited mqtt_link.rs from before the Pico 2 W's TRNG, which the IDE left:
+/// its tail still draws TLS's keys from the ring oscillator alone, and never
+/// calls the block's `entropy()`. Read off the tail - the block always has it.
+pub fn entropy_link_left(link: Option<&str>, trng: bool) -> Option<&'static str> {
+    (trng
+        && link.is_some_and(|l| {
+            l.contains("embedded_tls::")
+                && !tail_of(l).unwrap_or_else(|| l.to_owned()).contains("entropy(&mut")
+        }))
+    .then_some(
+        "src/pins/configs/mqtt_link.rs is from before the Pico 2 W's TRNG, and you edited it, \
+         so the IDE left it: its keys still come from the ring oscillator alone. Move your \
+         changes into the current template (delete the file to get it).",
+    )
+}
+
 /// Is `content` the file `name` written for another radio than `platform`'s,
 /// and edited since, so [`upgraded`] left it? Then it no longer compiles
 /// against the `main.rs` this chip gets. Read off the crates each template
@@ -981,7 +1140,9 @@ fn tail_of(content: &str) -> Option<String> {
 /// with a password in it. A pristine one goes like any pruned config file.
 pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
-    for name in [NET, WIFI, MQTT, MQTT_LINK, MQTT_CA, SNTP, ESPNOW, BLE, THREAD, SECRETS, PANIC] {
+    for name in [
+        NET, WIFI, MQTT, MQTT_LINK, MQTT_CA, SNTP, ESPNOW, BLE, THREAD, SECRETS, PANIC,
+    ] {
         if files.iter().any(|(n, _)| n == name) {
             continue;
         }
@@ -1002,9 +1163,12 @@ pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<
 /// "Restart on panic" prints nothing on it (esp-println's fallback port).
 fn esp_uart0_taken(mcu: &Mcu) -> bool {
     use crate::panels::mcu_module::PinFunction;
-    mcu.iter_all_pins()
-        .filter(|p| !p.reserved)
-        .any(|p| matches!(p.selected_function, PinFunction::UsartRx(0) | PinFunction::UsartTx(0)))
+    mcu.iter_all_pins().filter(|p| !p.reserved).any(|p| {
+        matches!(
+            p.selected_function,
+            PinFunction::UsartRx(0) | PinFunction::UsartTx(0)
+        )
+    })
 }
 
 /// The `publish` panic.rs's MQTT report calls, as mqtt.rs's template has it:
@@ -1048,7 +1212,9 @@ fn panic_file(mcu: &Mcu, active: Active) -> String {
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
-    o.push_str("// Restart on panic (from the IoT tab) — auto-updated; switch it off in the tab.\n");
+    o.push_str(
+        "// Restart on panic (from the IoT tab) — auto-updated; switch it off in the tab.\n",
+    );
     match active.platform {
         Platform::Esp => o.push_str(&esp_panic_pieces(&mcu.family)),
         Platform::Cyw43 => o.push_str(RP_PANIC_PIECES),
@@ -1063,13 +1229,23 @@ fn panic_file(mcu: &Mcu, active: Active) -> String {
         o.push_str("/// At the panic: nothing to print on.\n");
         o.push_str("fn announce(_text: &str, _wait_ms: u32) {}\n");
     }
-    let spawner = if topic.is_some() { "spawner" } else { "_spawner" };
-    let report = if serial || topic.is_some() { "report" } else { "_report" };
+    let spawner = if topic.is_some() {
+        "spawner"
+    } else {
+        "_spawner"
+    };
+    let report = if serial || topic.is_some() {
+        "report"
+    } else {
+        "_report"
+    };
     o.push_str(match (serial, topic.is_some()) {
         (true, true) => "/// At the next boot: the serial port, and MQTT once it connects.\n",
         (true, false) => "/// At the next boot: the serial port.\n",
         (false, true) => "/// At the next boot: MQTT, once it connects.\n",
-        (false, false) => "/// At the next boot: nowhere by itself - `last()` has it for your code.\n",
+        (false, false) => {
+            "/// At the next boot: nowhere by itself - `last()` has it for your code.\n"
+        }
     });
     o.push_str(&format!(
         "fn report_at_boot({spawner}: embassy_executor::Spawner, {report}: Report) {{\n"
@@ -1117,7 +1293,9 @@ fn esp_panic_pieces(family: &str) -> String {
             "/// The record: RTC {} memory, which a software reset keeps and a\n/// power-on clears.\n",
             if region == "rtc_slow" { "SLOW" } else { "FAST" }
         ));
-        o.push_str(&format!("#[esp_hal::ram(unstable({region}, persistent))]\n"));
+        o.push_str(&format!(
+            "#[esp_hal::ram(unstable({region}, persistent))]\n"
+        ));
         o.push_str("static mut RECORD: [u32; RECORD_WORDS] = [0; RECORD_WORDS];\n");
         o.push_str("fn record() -> *mut [u32; RECORD_WORDS] {\n");
         o.push_str("    &raw mut RECORD\n");
@@ -1311,7 +1489,11 @@ fn handler_item(head: &str) -> Option<(usize, usize)> {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     let end = open + i + 1;
-                    let end = if head.get(end..)?.starts_with('\n') { end + 1 } else { end };
+                    let end = if head.get(end..)?.starts_with('\n') {
+                        end + 1
+                    } else {
+                        end
+                    };
                     return Some((start, end));
                 }
             }
@@ -1359,7 +1541,10 @@ fn block_comment_depth(depth: usize, line: &str) -> usize {
 /// The start of the handler's note when the line above `start` is it.
 fn with_note(head: &str, start: usize) -> usize {
     let above = head.get(..start).unwrap_or("");
-    let line_start = above.trim_end_matches('\n').rfind('\n').map_or(0, |i| i + 1);
+    let line_start = above
+        .trim_end_matches('\n')
+        .rfind('\n')
+        .map_or(0, |i| i + 1);
     match above.get(line_start..) {
         Some(line) if line.trim() == PANIC_HANDLER_NOTE.trim() => line_start,
         _ => start,
@@ -1368,7 +1553,9 @@ fn with_note(head: &str, start: usize) -> usize {
 
 /// The part of `main_rs` above the generated block - its header.
 fn header_of(main_rs: &str) -> &str {
-    main_rs.find(super::GEN_BEGIN).map_or(main_rs, |i| &main_rs[..i])
+    main_rs
+        .find(super::GEN_BEGIN)
+        .map_or(main_rs, |i| &main_rs[..i])
 }
 
 /// Does `main_rs`'s header still call into panic.rs (the tab's warning once
@@ -1418,7 +1605,11 @@ pub fn panic_main(code: String, mcu: &Mcu) -> String {
         handler_item(head)
             .filter(|&(s, e)| squash(&head[s..e]) == squash(PANIC_HANDLER_ITEM))
             .map(|(s, e)| {
-                let back = if mcu.family.starts_with("esp32") { halt } else { PANIC_HALT_LINE };
+                let back = if mcu.family.starts_with("esp32") {
+                    halt
+                } else {
+                    PANIC_HALT_LINE
+                };
                 ((with_note(head, s), e), back.to_owned())
             })
     };
@@ -1447,7 +1638,8 @@ pub fn panic_start_lines(mcu: &Mcu) -> String {
 /// What the ESP generator's block looks like where the heap must go in: the
 /// scheduler start. esp-rtos and esp-radio allocate from the heap, so it has
 /// to exist before `esp_rtos::start`, as the esp-radio docs order it.
-const ESP_START_MARK: &str = "\n    // ── Async runtime (esp-rtos drives the embassy executor) ──\n";
+const ESP_START_MARK: &str =
+    "\n    // ── Async runtime (esp-rtos drives the embassy executor) ──\n";
 
 /// The ESP lines, spliced into the GENERATED block of an already generated
 /// `main.rs` - a no-op unless the IoT code is active. Done here rather than
@@ -1523,17 +1715,27 @@ pub fn esp_heap_lines(heap_kib: u32, active: Active, family: &str) -> String {
         } else {
             (64, 64, "half")
         };
-        o.push_str("    // Wi-Fi beside Bluetooth (coex) needs more: the RAM the bootloader used\n");
-        o.push_str(&format!("    // is free once the app runs, and carries {share} of it.\n"));
+        o.push_str(
+            "    // Wi-Fi beside Bluetooth (coex) needs more: the RAM the bootloader used\n",
+        );
+        o.push_str(&format!(
+            "    // is free once the app runs, and carries {share} of it.\n"
+        ));
         o.push_str(&format!(
             "    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: {reclaimed} * 1024);\n"
         ));
-        o.push_str(&format!("    esp_alloc::heap_allocator!(size: {more} * 1024);\n"));
+        o.push_str(&format!(
+            "    esp_alloc::heap_allocator!(size: {more} * 1024);\n"
+        ));
     } else {
         if active.mqtt_tls {
-            o.push_str("    // MQTT over TLS checks the broker's RSA chain on the heap (about 22 KB at\n");
+            o.push_str(
+                "    // MQTT over TLS checks the broker's RSA chain on the heap (about 22 KB at\n",
+            );
             o.push_str("    // its peak): 32 KiB more, in the RAM the bootloader used.\n");
-            o.push_str("    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 32 * 1024);\n");
+            o.push_str(
+                "    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 32 * 1024);\n",
+            );
         }
         o.push_str(&format!(
             "    esp_alloc::heap_allocator!(size: {} * 1024);\n",
@@ -1626,17 +1828,25 @@ pub fn cyw43_main_lines(active: Active) -> String {
     let mut o = String::new();
     o.push_str("    // ── IoT (IoT tab) ──\n");
     if active.ble {
-        o.push_str("    // Bluetooth LE: the radio's Bluetooth half goes to the BLE task. Its address\n");
-        o.push_str("    // is made of the radio's Wi-Fi MAC, so that is read before `control` moves on.\n");
+        o.push_str(
+            "    // Bluetooth LE: the radio's Bluetooth half goes to the BLE task. Its address\n",
+        );
+        o.push_str(
+            "    // is made of the radio's Wi-Fi MAC, so that is read before `control` moves on.\n",
+        );
         o.push_str("    let mac = control.address().await;\n");
         o.push_str("    pins::configs::ble::start(spawner, bt_device, Some(mac));\n");
     }
     if active.station {
-        o.push_str("    // The radio's `control` belongs to the Wi-Fi task from here on, so the LED\n");
+        o.push_str(
+            "    // The radio's `control` belongs to the Wi-Fi task from here on, so the LED\n",
+        );
         o.push_str("    // (GPIO0 on the radio) is switched through it: `pins::configs::wifi::set_led(true)`.\n");
         o.push_str(&stack_lines(active, "net_device, control"));
     } else {
-        o.push_str("    // The LED is GPIO0 ON THE RADIO, so it is driven through `control` rather\n");
+        o.push_str(
+            "    // The LED is GPIO0 ON THE RADIO, so it is driven through `control` rather\n",
+        );
         o.push_str("    // than through a pin: `wl_led.gpio_set(0, true).await` turns it on.\n");
         o.push_str("    #[allow(unused_mut, unused_variables)]\n");
         o.push_str("    let mut wl_led = control;\n");
@@ -1664,12 +1874,18 @@ mod tests {
     /// The files, each only while its switch is on.
     #[test]
     fn the_files_follow_the_tab() {
-        let names = |m: &Mcu| -> Vec<String> {
-            config_files_for(m).into_iter().map(|(n, _)| n).collect()
-        };
+        let names =
+            |m: &Mcu| -> Vec<String> { config_files_for(m).into_iter().map(|(n, _)| n).collect() };
         assert_eq!(
             names(&mcu("esp32c3", Runtime::Async, true)),
-            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "mqtt_link.rs", "panic.rs"]
+            [
+                "net.rs",
+                "wifi.rs",
+                "secrets.rs",
+                "mqtt.rs",
+                "mqtt_link.rs",
+                "panic.rs"
+            ]
         );
         assert_eq!(
             names(&mcu("esp32c3", Runtime::Async, false)),
@@ -1680,7 +1896,16 @@ mod tests {
         all.iot.esp_now = Some(EspNowConfig::default());
         assert_eq!(
             names(&all),
-            ["net.rs", "wifi.rs", "secrets.rs", "mqtt.rs", "mqtt_link.rs", "sntp.rs", "espnow.rs", "panic.rs"]
+            [
+                "net.rs",
+                "wifi.rs",
+                "secrets.rs",
+                "mqtt.rs",
+                "mqtt_link.rs",
+                "sntp.rs",
+                "espnow.rs",
+                "panic.rs"
+            ]
         );
         // ESP-NOW alone: no stack, no credentials - and MQTT/SNTP, still ticked,
         // have nothing to run on.
@@ -1709,11 +1934,17 @@ mod tests {
         let plain = mcu("esp32c3", Runtime::Async, true);
         let files = config_files_for(&plain);
         let link = &files.iter().find(|(n, _)| n == MQTT_LINK).unwrap().1;
-        assert!(link.contains("pub type Link<'s> = TcpSocket<'s>;"), "{link}");
+        assert!(
+            link.contains("pub type Link<'s> = TcpSocket<'s>;"),
+            "{link}"
+        );
         assert!(!files.iter().any(|(n, _)| n == MQTT_CA));
         let plain_mqtt = files.iter().find(|(n, _)| n == MQTT).unwrap().1.clone();
 
-        for (id, chip) in [("esp32c3", "esp_hal::rng::Trng"), ("rp2040_pico_w", "embassy_rp::clocks::RoscRng")] {
+        for (id, chip) in [
+            ("esp32c3", "esp_hal::rng::Trng"),
+            ("rp2040_pico_w", "embassy_rp::clocks::RoscRng"),
+        ] {
             for sntp in [false, true] {
                 let m = tls_mcu(id, sntp);
                 let a = iot::active(&m).unwrap();
@@ -1744,17 +1975,27 @@ mod tests {
                 assert!(is_pristine(MQTT_LINK, &link));
                 let mq = get(MQTT).unwrap();
                 assert!(mq.contains("pub const BROKER_PORT: u16 = 8886;"), "{mq}");
-                assert_eq!(tail_of(&mq), tail_of(&plain_mqtt), "mqtt.rs's own half never changes");
+                assert_eq!(
+                    tail_of(&mq),
+                    tail_of(&plain_mqtt),
+                    "mqtt.rs's own half never changes"
+                );
                 let ca = get(MQTT_CA).unwrap();
                 assert!(ca.starts_with("//! The CA the MQTT broker's"), "{ca}");
-                assert!(ca.contains("pub const CA_PEM: &str = \"-----BEGIN CERTIFICATE-----\nMIIFazCC"), "{ca}");
+                assert!(
+                    ca.contains("pub const CA_PEM: &str = \"-----BEGIN CERTIFICATE-----\nMIIFazCC"),
+                    "{ca}"
+                );
                 assert!(ca.contains("-----END CERTIFICATE-----\";"), "{ca}");
                 assert!(write_once(MQTT_CA) && is_pristine(MQTT_CA, &ca) && runtime_free(MQTT_CA));
                 assert!(!is_pristine(MQTT_CA, &ca.replace("MIIFazCC", "MIIFazCD")));
                 // The SOCKETS count is the plain one: TLS runs on MQTT's socket.
                 let mut same = mcu(id, Runtime::Async, true);
                 same.iot.sntp = sntp.then(SntpConfig::default);
-                let net = config_files_for(&same).into_iter().find(|(n, _)| n == NET).map(|(_, b)| b);
+                let net = config_files_for(&same)
+                    .into_iter()
+                    .find(|(n, _)| n == NET)
+                    .map(|(_, b)| b);
                 assert_eq!(get(NET), net, "{id} sntp={sntp}");
             }
         }
@@ -1764,9 +2005,16 @@ mod tests {
             mq.verify = false;
             mq.server_name = "broker.example.org".into();
         }
-        let link = config_files_for(&m).into_iter().find(|(n, _)| n == MQTT_LINK).unwrap().1;
+        let link = config_files_for(&m)
+            .into_iter()
+            .find(|(n, _)| n == MQTT_LINK)
+            .unwrap()
+            .1;
         assert!(link.contains("pub const VERIFY: bool = false;"), "{link}");
-        assert!(link.contains("pub const SERVER_NAME: &str = \"broker.example.org\";"), "{link}");
+        assert!(
+            link.contains("pub const SERVER_NAME: &str = \"broker.example.org\";"),
+            "{link}"
+        );
     }
 
     /// Where TLS cannot run (no TRNG on the C5 / C61) and it is asked for, no
@@ -1777,15 +2025,26 @@ mod tests {
         for id in ["esp32c5", "esp32c61"] {
             let m = tls_mcu(id, false);
             let a = iot::active(&m).unwrap();
-            assert!(!a.mqtt && !a.mqtt_tls, "{id}: never the password in clear to a TLS port");
+            assert!(
+                !a.mqtt && !a.mqtt_tls,
+                "{id}: never the password in clear to a TLS port"
+            );
             let files = config_files_for(&m);
-            assert!(!files.iter().any(|(n, _)| n == MQTT || n == MQTT_LINK || n == MQTT_CA), "{id}");
+            assert!(
+                !files
+                    .iter()
+                    .any(|(n, _)| n == MQTT || n == MQTT_LINK || n == MQTT_CA),
+                "{id}"
+            );
             // Switched off, MQTT comes back plain.
             let mut plain = m.clone();
             if let Some(mq) = plain.iot.mqtt.as_mut() {
                 mq.tls = false;
             }
-            assert!(iot::active(&plain).is_some_and(|a| a.mqtt && !a.mqtt_tls), "{id}");
+            assert!(
+                iot::active(&plain).is_some_and(|a| a.mqtt && !a.mqtt_tls),
+                "{id}"
+            );
         }
     }
 
@@ -1794,23 +2053,46 @@ mod tests {
     #[test]
     fn tls_brings_heap_on_an_esp() {
         let code = tls_mcu("esp32c3", false).fresh_main_rs();
-        assert!(code.contains("esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 32 * 1024);"), "{code}");
-        assert!(code.contains("esp_alloc::heap_allocator!(size: 72 * 1024);"), "{code}");
+        assert!(
+            code.contains(
+                "esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 32 * 1024);"
+            ),
+            "{code}"
+        );
+        assert!(
+            code.contains("esp_alloc::heap_allocator!(size: 72 * 1024);"),
+            "{code}"
+        );
         let mut coex = tls_mcu("esp32c3", false);
         coex.iot.ble = Some(BleConfig::default());
         let code = coex.fresh_main_rs();
-        assert!(code.contains("#[esp_hal::ram(reclaimed)] size: 64 * 1024"), "{code}");
-        assert!(code.contains("esp_alloc::heap_allocator!(size: 96 * 1024);"), "{code}");
+        assert!(
+            code.contains("#[esp_hal::ram(reclaimed)] size: 64 * 1024"),
+            "{code}"
+        );
+        assert!(
+            code.contains("esp_alloc::heap_allocator!(size: 96 * 1024);"),
+            "{code}"
+        );
         // The S2: all of it in the reclaimed RAM.
         let s2 = tls_mcu("esp32s2", false).fresh_main_rs();
-        assert!(s2.contains("esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 104 * 1024);"), "{s2}");
+        assert!(
+            s2.contains("esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 104 * 1024);"),
+            "{s2}"
+        );
         assert!(!s2.contains("esp_alloc::heap_allocator!(size:"), "{s2}");
         // The ESP32 with coex: no TLS, and its heap as before.
         let mut e32 = tls_mcu("esp32", false);
         e32.iot.ble = Some(BleConfig::default());
         let a = iot::active(&e32).unwrap();
-        assert!(!a.mqtt_tls && !a.mqtt, "TLS asked for and impossible: no MQTT at all");
-        assert!(e32.fresh_main_rs().contains("esp_alloc::heap_allocator!(size: 24 * 1024);"));
+        assert!(
+            !a.mqtt_tls && !a.mqtt,
+            "TLS asked for and impossible: no MQTT at all"
+        );
+        assert!(
+            e32.fresh_main_rs()
+                .contains("esp_alloc::heap_allocator!(size: 24 * 1024);")
+        );
         // Plain MQTT: nothing more.
         let plain = mcu("esp32c3", Runtime::Async, true).fresh_main_rs();
         assert!(!plain.contains("size: 32 * 1024"), "{plain}");
@@ -1830,10 +2112,23 @@ mod tests {
         let plain = lf(LINK_PLAIN_TAIL);
         let esp = lf(LINK_TLS_ESP_TAIL);
         let pico = lf(LINK_TLS_CYW43_TAIL);
-        assert_eq!(mqtt_files_left(Some(&v2), Some(&plain), false, Platform::Esp), None);
-        assert_eq!(mqtt_files_left(Some(&v2), Some(&esp), true, Platform::Esp), None);
-        assert_eq!(mqtt_files_left(Some(&v2), Some(&pico), true, Platform::Cyw43), None);
-        assert_eq!(mqtt_files_left(Some(v1), None, false, Platform::Esp), None, "v1 still works plain");
+        assert_eq!(
+            mqtt_files_left(Some(&v2), Some(&plain), false, Platform::Esp),
+            None
+        );
+        assert_eq!(
+            mqtt_files_left(Some(&v2), Some(&esp), true, Platform::Esp),
+            None
+        );
+        assert_eq!(
+            mqtt_files_left(Some(&v2), Some(&pico), true, Platform::Cyw43),
+            None
+        );
+        assert_eq!(
+            mqtt_files_left(Some(v1), None, false, Platform::Esp),
+            None,
+            "v1 still works plain"
+        );
         assert!(mqtt_files_left(Some(v1), Some(&esp), true, Platform::Esp).is_some());
         assert!(mqtt_files_left(Some(&v2), Some(&plain), true, Platform::Esp).is_some());
         assert!(mqtt_files_left(Some(&v2), Some(&esp), false, Platform::Esp).is_some());
@@ -1858,14 +2153,28 @@ mod tests {
         assert!(is_pristine(MQTT, &v1));
 
         let plain = config_files_for(&mcu("esp32c3", Runtime::Async, true));
-        let plain = plain.iter().find(|(n, _)| n == MQTT_LINK).unwrap().1.clone();
+        let plain = plain
+            .iter()
+            .find(|(n, _)| n == MQTT_LINK)
+            .unwrap()
+            .1
+            .clone();
         let esp = config_files_for(&tls_mcu("esp32c3", false));
         let esp = esp.iter().find(|(n, _)| n == MQTT_LINK).unwrap().1.clone();
         let pico = config_files_for(&tls_mcu("rp2040_pico_w", false));
         let pico = pico.iter().find(|(n, _)| n == MQTT_LINK).unwrap().1.clone();
-        assert_eq!(upgraded(MQTT_LINK, &plain, &esp).as_deref(), Some(esp.as_str()));
-        assert_eq!(upgraded(MQTT_LINK, &esp, &plain).as_deref(), Some(plain.as_str()));
-        assert_eq!(upgraded(MQTT_LINK, &esp, &pico).as_deref(), Some(pico.as_str()));
+        assert_eq!(
+            upgraded(MQTT_LINK, &plain, &esp).as_deref(),
+            Some(esp.as_str())
+        );
+        assert_eq!(
+            upgraded(MQTT_LINK, &esp, &plain).as_deref(),
+            Some(plain.as_str())
+        );
+        assert_eq!(
+            upgraded(MQTT_LINK, &esp, &pico).as_deref(),
+            Some(pico.as_str())
+        );
         let edited = format!("{plain}\n// mine\n");
         assert_eq!(upgraded(MQTT_LINK, &edited, &esp), None);
     }
@@ -1891,7 +2200,11 @@ mod tests {
                 .find(|(n, _)| n == NET)
                 .map(|(_, b)| b)
                 .unwrap();
-            let line = net.lines().find(|l| l.starts_with("pub const SOCKETS")).unwrap().to_owned();
+            let line = net
+                .lines()
+                .find(|l| l.starts_with("pub const SOCKETS"))
+                .unwrap()
+                .to_owned();
             line
         };
         // Never fewer than phase 1's 4: code opening two sockets keeps working.
@@ -1916,7 +2229,10 @@ mod tests {
             "{f}"
         );
         let empty = espnow_file(&EspNowConfig::default());
-        assert!(empty.contains("pub const PEERS: &[[u8; 6]] = &[];"), "{empty}");
+        assert!(
+            empty.contains("pub const PEERS: &[[u8; 6]] = &[];"),
+            "{empty}"
+        );
     }
 
     #[test]
@@ -1925,10 +2241,16 @@ mod tests {
             server: " time.example \"x\" ".into(),
             interval_s: 5,
         });
-        assert!(f.contains(r#"pub const SERVER: &str = "time.example \"x\"";"#), "{f}");
+        assert!(
+            f.contains(r#"pub const SERVER: &str = "time.example \"x\"";"#),
+            "{f}"
+        );
         // Public pools refuse faster polling: clamped to their minimum.
         assert!(
-            f.contains(&format!("pub const INTERVAL_S: u64 = {};", iot::MIN_SNTP_INTERVAL_S)),
+            f.contains(&format!(
+                "pub const INTERVAL_S: u64 = {};",
+                iot::MIN_SNTP_INTERVAL_S
+            )),
             "{f}"
         );
     }
@@ -1941,18 +2263,35 @@ mod tests {
         m.iot.sntp = Some(SntpConfig::default());
         m.iot.esp_now = Some(EspNowConfig::default());
         let code = m.fresh_main_rs();
-        let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s} missing:\n{code}"));
+        let at = |s: &str| {
+            code.find(s)
+                .unwrap_or_else(|| panic!("{s} missing:\n{code}"))
+        };
         assert_eq!(code.matches("esp_radio::wifi::new(").count(), 1, "{code}");
-        assert!(at("esp_radio::wifi::new(") < at("wifi::init(spawner, wifi_controller, radio.station)"));
+        assert!(
+            at("esp_radio::wifi::new(") < at("wifi::init(spawner, wifi_controller, radio.station)")
+        );
         assert!(at("mqtt::start(spawner, net_stack)") < at("sntp::start(spawner, net_stack)"));
         assert!(at("sntp::start(") < at("espnow::start(spawner, radio.esp_now)"));
-        assert!(!code.contains("hold_radio"), "the station keeps the controller:\n{code}");
-        assert!(!code.contains("#[allow(unused_variables)]\n    let net_stack"), "{code}");
+        assert!(
+            !code.contains("hold_radio"),
+            "the station keeps the controller:\n{code}"
+        );
+        assert!(
+            !code.contains("#[allow(unused_variables)]\n    let net_stack"),
+            "{code}"
+        );
 
         m.iot.wifi = false;
         let alone = m.fresh_main_rs();
-        assert!(alone.contains("pins::configs::espnow::hold_radio(spawner, wifi_controller);"), "{alone}");
-        assert!(alone.contains("pins::configs::espnow::start(spawner, radio.esp_now);"), "{alone}");
+        assert!(
+            alone.contains("pins::configs::espnow::hold_radio(spawner, wifi_controller);"),
+            "{alone}"
+        );
+        assert!(
+            alone.contains("pins::configs::espnow::start(spawner, radio.esp_now);"),
+            "{alone}"
+        );
         assert!(!alone.contains("net_stack"), "{alone}");
     }
 
@@ -1993,7 +2332,10 @@ mod tests {
         assert_eq!(upgraded(BLE, &esp, &ble_file(&b, Platform::Cyw43)), None);
         let headed = format!("// mine\n{esp}");
         let up = upgraded(BLE, &headed, &nrf).expect("swapped");
-        assert!(up.starts_with("// mine\n") && up.ends_with(&lf(BLE_NRF_TAIL)), "{up}");
+        assert!(
+            up.starts_with("// mine\n") && up.ends_with(&lf(BLE_NRF_TAIL)),
+            "{up}"
+        );
         assert!(!foreign_radio_file(BLE, &up, Platform::Nrf));
 
         let (we, wc) = (wifi_file(Platform::Esp), wifi_file(Platform::Cyw43));
@@ -2018,11 +2360,22 @@ mod tests {
             "{GEN_BEGIN_CFG}\n// x\n{GEN_END_CFG}\n{}",
             include_str!("iot_templates/legacy/wifi_esp_v1.rs")
         )
-        .replace("pub const RETRY_S: u64 = 5;", "pub const RETRY_S: u64 = 10;");
+        .replace(
+            "pub const RETRY_S: u64 = 5;",
+            "pub const RETRY_S: u64 = 10;",
+        );
         let body = wifi_file(Platform::Esp);
         let up = upgraded(WIFI, &old, &body).expect("migrated");
-        assert!(up.contains("pub const RETRY_S: u64 = 10;"), "the user's edit stays:\n{up}");
-        assert!(up.contains("    controller: WifiController<'static>,\n    station: Interface<'static>,"), "{up}");
+        assert!(
+            up.contains("pub const RETRY_S: u64 = 10;"),
+            "the user's edit stays:\n{up}"
+        );
+        assert!(
+            up.contains(
+                "    controller: WifiController<'static>,\n    station: Interface<'static>,"
+            ),
+            "{up}"
+        );
         assert!(!up.contains("esp_radio::wifi::new("), "{up}");
         assert!(!up.contains("interfaces.station"), "{up}");
         assert!(!phase_one_wifi_left(&up));
@@ -2057,8 +2410,15 @@ mod tests {
     fn at_most_nineteen_peers_are_written() {
         let peers: Vec<[u8; 6]> = (0..25u8).map(|i| [0x24, 0, 0, 0, 0, i]).collect();
         let f = espnow_file(&EspNowConfig { channel: 1, peers });
-        let line = f.lines().find(|l| l.starts_with("pub const PEERS")).unwrap();
-        assert_eq!(line.matches("[0x24").count(), iot::MAX_ESPNOW_PEERS, "{line}");
+        let line = f
+            .lines()
+            .find(|l| l.starts_with("pub const PEERS"))
+            .unwrap();
+        assert_eq!(
+            line.matches("[0x24").count(),
+            iot::MAX_ESPNOW_PEERS,
+            "{line}"
+        );
     }
 
     /// Blocking has no driver to generate for: nothing, rather than files
@@ -2093,7 +2453,9 @@ mod tests {
         let esp = wifi(&mcu("esp32c3", Runtime::Async, false));
         assert!(esp.contains("station: Interface<'static>,"), "{esp}");
         assert!(!esp.contains("esp_radio::wifi::new("), "{esp}");
-        assert!(wifi(&mcu("rp2350_pico2_w", Runtime::Async, false)).contains("cyw43::Control<'static>"));
+        assert!(
+            wifi(&mcu("rp2350_pico2_w", Runtime::Async, false)).contains("cyw43::Control<'static>")
+        );
     }
 
     /// Strings typed in the tab reach the file as Rust literals, quotes and
@@ -2107,8 +2469,14 @@ mod tests {
             ..MqttConfig::default()
         };
         let f = mqtt_file(&m);
-        assert!(f.contains(r#"pub const BROKER_HOST: &str = "broker\"x";"#), "{f}");
-        assert!(f.contains(r#"pub const SUBSCRIBE: &[&str] = &["a/#", "b/+"];"#), "{f}");
+        assert!(
+            f.contains(r#"pub const BROKER_HOST: &str = "broker\"x";"#),
+            "{f}"
+        );
+        assert!(
+            f.contains(r#"pub const SUBSCRIBE: &[&str] = &["a/#", "b/+"];"#),
+            "{f}"
+        );
     }
 
     /// The ESP block: heap before the scheduler, spawner named, bring-up
@@ -2118,7 +2486,10 @@ mod tests {
         let m = mcu("esp32c3", Runtime::Async, true);
         // Through the backend, as the app generates it - not `esp_main` by hand.
         let code = m.fresh_main_rs();
-        let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s} missing:\n{code}"));
+        let at = |s: &str| {
+            code.find(s)
+                .unwrap_or_else(|| panic!("{s} missing:\n{code}"))
+        };
         assert!(at("esp_alloc::heap_allocator!(size: 72 * 1024);") < at("esp_rtos::start("));
         assert!(at("esp_rtos::start(") < at("esp_radio::wifi::new(peripherals.WIFI"));
         assert!(at("pins::configs::mqtt::start(spawner, net_stack);") < at(super::super::GEN_END));
@@ -2145,9 +2516,18 @@ mod tests {
         assert!(rp::needs_radio(&m));
         let code = m.fresh_main_rs();
         assert_eq!(code.matches("cyw43::new(").count(), 1, "{code}");
-        assert!(code.contains("let (net_device, mut control, runner) = cyw43::new("), "{code}");
-        assert!(code.contains("pins::configs::wifi::init(spawner, net_device, control);"), "{code}");
-        assert!(code.contains("pins::configs::mqtt::start(spawner, net_stack);"), "{code}");
+        assert!(
+            code.contains("let (net_device, mut control, runner) = cyw43::new("),
+            "{code}"
+        );
+        assert!(
+            code.contains("pins::configs::wifi::init(spawner, net_device, control);"),
+            "{code}"
+        );
+        assert!(
+            code.contains("pins::configs::mqtt::start(spawner, net_stack);"),
+            "{code}"
+        );
         assert!(!code.contains("wl_led"), "{code}");
         // The Configuration tab lists the PIO the radio takes.
         assert_eq!(rp::pio_uses(&m).len(), 1);
@@ -2172,9 +2552,15 @@ mod tests {
         let m = ble_mcu("esp32c3", false);
         let code = m.fresh_main_rs();
         assert!(code.contains("esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default()).unwrap();"), "{code}");
-        assert!(code.contains("pins::configs::ble::start(spawner, ble, None);"), "{code}");
+        assert!(
+            code.contains("pins::configs::ble::start(spawner, ble, None);"),
+            "{code}"
+        );
         assert!(!code.contains("esp_radio::wifi::new("), "{code}");
-        assert!(code.contains("esp_alloc::heap_allocator!(size: 72 * 1024);"), "{code}");
+        assert!(
+            code.contains("esp_alloc::heap_allocator!(size: 72 * 1024);"),
+            "{code}"
+        );
         let names: Vec<String> = config_files_for(&m).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["ble.rs", "panic.rs"]);
     }
@@ -2184,13 +2570,25 @@ mod tests {
     #[test]
     fn esp_ble_beside_wifi_takes_the_coex_heap() {
         let c3 = ble_mcu("esp32c3", true).fresh_main_rs();
-        assert!(c3.contains("esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);"), "{c3}");
-        assert!(c3.contains("esp_alloc::heap_allocator!(size: 64 * 1024);"), "{c3}");
+        assert!(
+            c3.contains("esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);"),
+            "{c3}"
+        );
+        assert!(
+            c3.contains("esp_alloc::heap_allocator!(size: 64 * 1024);"),
+            "{c3}"
+        );
         let at = |s: &str| c3.find(s).unwrap_or_else(|| panic!("{s}:\n{c3}"));
         assert!(at("pins::configs::ble::start(") < at("esp_radio::wifi::new("));
         let e32 = ble_mcu("esp32", true).fresh_main_rs();
-        assert!(e32.contains("#[esp_hal::ram(reclaimed)] size: 96 * 1024"), "{e32}");
-        assert!(e32.contains("esp_alloc::heap_allocator!(size: 24 * 1024);"), "{e32}");
+        assert!(
+            e32.contains("#[esp_hal::ram(reclaimed)] size: 96 * 1024"),
+            "{e32}"
+        );
+        assert!(
+            e32.contains("esp_alloc::heap_allocator!(size: 24 * 1024);"),
+            "{e32}"
+        );
     }
 
     /// Beside ESP-NOW with the station off: the coex heap, Bluetooth first,
@@ -2200,13 +2598,22 @@ mod tests {
         let mut m = ble_mcu("esp32c3", false);
         m.iot.esp_now = Some(EspNowConfig::default());
         let code = m.fresh_main_rs();
-        assert!(code.contains("#[esp_hal::ram(reclaimed)] size: 64 * 1024"), "{code}");
+        assert!(
+            code.contains("#[esp_hal::ram(reclaimed)] size: 64 * 1024"),
+            "{code}"
+        );
         let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
         assert!(at("pins::configs::ble::start(spawner, ble, None);") < at("esp_radio::wifi::new("));
-        assert!(code.contains("pins::configs::espnow::hold_radio(spawner, wifi_controller);"), "{code}");
+        assert!(
+            code.contains("pins::configs::espnow::hold_radio(spawner, wifi_controller);"),
+            "{code}"
+        );
         assert!(!code.contains("net_stack"), "{code}");
         let names: Vec<String> = config_files_for(&m).into_iter().map(|(n, _)| n).collect();
-        assert!(names.contains(&BLE.to_owned()) && names.contains(&ESPNOW.to_owned()), "{names:?}");
+        assert!(
+            names.contains(&BLE.to_owned()) && names.contains(&ESPNOW.to_owned()),
+            "{names:?}"
+        );
         assert!(!names.contains(&NET.to_owned()), "{names:?}");
     }
 
@@ -2232,10 +2639,22 @@ mod tests {
             device_name: "x".repeat(iot::MAX_BLE_NAME + 1),
         };
         let esp = ble_file(&long, Platform::Esp);
-        assert!(esp.contains("pub type Radio = esp_radio::ble::controller::BleConnector<'static>;"), "{esp}");
-        assert!(esp.contains(&format!("pub const DEVICE_NAME: &str = \"{}\";", iot::DEFAULT_BLE_NAME)), "{esp}");
+        assert!(
+            esp.contains("pub type Radio = esp_radio::ble::controller::BleConnector<'static>;"),
+            "{esp}"
+        );
+        assert!(
+            esp.contains(&format!(
+                "pub const DEVICE_NAME: &str = \"{}\";",
+                iot::DEFAULT_BLE_NAME
+            )),
+            "{esp}"
+        );
         let pico = ble_file(&BleConfig::default(), Platform::Cyw43);
-        assert!(pico.contains("pub type Radio = cyw43::bluetooth::BtDriver<'static>;"), "{pico}");
+        assert!(
+            pico.contains("pub type Radio = cyw43::bluetooth::BtDriver<'static>;"),
+            "{pico}"
+        );
         assert_eq!(tail_of(&esp), tail_of(&pico), "one editable half");
         let nrf = ble_file(&BleConfig::default(), Platform::Nrf);
         assert!(!nrf.contains("pub type Radio"), "{nrf}");
@@ -2249,11 +2668,24 @@ mod tests {
     fn the_pico_w_brings_up_bluetooth_alone() {
         let m = ble_mcu("rp2040_pico_w", false);
         let code = m.fresh_main_rs();
-        assert_eq!(code.matches("cyw43::new_with_bluetooth(").count(), 1, "{code}");
+        assert_eq!(
+            code.matches("cyw43::new_with_bluetooth(").count(),
+            1,
+            "{code}"
+        );
         assert!(!code.contains("cyw43::new(state"), "{code}");
-        assert!(code.contains("cyw43::aligned_bytes!(\"../firmware/43439A0_btfw.bin\")"), "{code}");
-        assert!(code.contains("let (_net_device, bt_device, mut control, runner) ="), "{code}");
-        assert!(code.contains("pins::configs::ble::start(spawner, bt_device, Some(mac));"), "{code}");
+        assert!(
+            code.contains("cyw43::aligned_bytes!(\"../firmware/43439A0_btfw.bin\")"),
+            "{code}"
+        );
+        assert!(
+            code.contains("let (_net_device, bt_device, mut control, runner) ="),
+            "{code}"
+        );
+        assert!(
+            code.contains("pins::configs::ble::start(spawner, bt_device, Some(mac));"),
+            "{code}"
+        );
         assert!(code.contains("let mut wl_led = control;"), "{code}");
         assert!(crate::panels::mcu_module::codegen::rp::needs_bluetooth(&m));
         assert!(crate::panels::mcu_module::codegen::rp::needs_radio(&m));
@@ -2265,7 +2697,10 @@ mod tests {
         let code = ble_mcu("rp2350_pico2_w", true).fresh_main_rs();
         let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
         assert!(at("control.address().await") < at("wifi::init(spawner, net_device, control)"));
-        assert!(code.contains("let (net_device, bt_device, mut control, runner) ="), "{code}");
+        assert!(
+            code.contains("let (net_device, bt_device, mut control, runner) ="),
+            "{code}"
+        );
         assert!(!code.contains("wl_led"), "{code}");
     }
 
@@ -2292,7 +2727,9 @@ mod tests {
         }
         let at = |s: &str| code.find(s).unwrap();
         assert!(at("config.time_interrupt_priority") < at("embassy_nrf::init(config)"));
-        assert!(crate::panels::mcu_module::codegen::nrf::needs_static_cell(&m));
+        assert!(crate::panels::mcu_module::codegen::nrf::needs_static_cell(
+            &m
+        ));
     }
 
     /// The nRF5340 and the 54L15 do not get Bluetooth generated (their reasons
@@ -2340,11 +2777,23 @@ mod tests {
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, [SECRETS, THREAD, PANIC]);
         let secrets = &files[0].1;
-        assert!(secrets.contains("pub const THREAD_DATASET: &str = \"\";"), "{secrets}");
-        assert!(!secrets.contains("WIFI_SSID"), "no Wi-Fi on an nRF:\n{secrets}");
+        assert!(
+            secrets.contains("pub const THREAD_DATASET: &str = \"\";"),
+            "{secrets}"
+        );
+        assert!(
+            !secrets.contains("WIFI_SSID"),
+            "no Wi-Fi on an nRF:\n{secrets}"
+        );
         let thread = &files[1].1;
-        assert!(thread.contains("pub const UDP_PORT: u16 = 1212;"), "{thread}");
-        assert!(thread.contains("use super::secrets::THREAD_DATASET;"), "{thread}");
+        assert!(
+            thread.contains("pub const UDP_PORT: u16 = 1212;"),
+            "{thread}"
+        );
+        assert!(
+            thread.contains("use super::secrets::THREAD_DATASET;"),
+            "{thread}"
+        );
         // An empty dataset is "set" without error: only a complete one starts
         // Thread, or the device would look for any parent on defaults.
         assert!(thread.contains("&& ot.is_commissioned()"), "{thread}");
@@ -2365,7 +2814,10 @@ mod tests {
         for id in ["esp32c6", "esp32h2", "esp32c5"] {
             let m = thread_mcu(id);
             // The nRF's soft-float switch is the nRF's: an ESP keeps riscv32imac.
-            assert!(!crate::panels::mcu_module::codegen::nrf::thread_on(&m), "{id}");
+            assert!(
+                !crate::panels::mcu_module::codegen::nrf::thread_on(&m),
+                "{id}"
+            );
             let code = m.fresh_main_rs();
             for want in [
                 "pins::configs::thread::start(spawner, peripherals.IEEE802154);",
@@ -2374,7 +2826,12 @@ mod tests {
             ] {
                 assert!(code.contains(want), "{id}: {want}:\n{code}");
             }
-            for absent in ["esp_radio::wifi::new(", "BleConnector", "EGU0_SWI0", "InterruptExecutor"] {
+            for absent in [
+                "esp_radio::wifi::new(",
+                "BleConnector",
+                "EGU0_SWI0",
+                "InterruptExecutor",
+            ] {
                 assert!(!code.contains(absent), "{id}: {absent}:\n{code}");
             }
             let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
@@ -2419,10 +2876,16 @@ mod tests {
             "{GEN_BEGIN_CFG}\npub const UDP_PORT: u16 = 1212;\n{GEN_END_CFG}\n{}",
             include_str!("iot_templates/legacy/thread_nrf_v1.rs")
         );
-        assert!(!v1.contains("core::mem::forget(ot)"), "v1 is the one without the fix");
+        assert!(
+            !v1.contains("core::mem::forget(ot)"),
+            "v1 is the one without the fix"
+        );
         let up = upgraded(THREAD, &v1, &nrf).expect("phase 4's template is moved");
         assert!(up.contains("core::mem::forget(ot);"), "{up}");
-        assert!(is_pristine(THREAD, &v1), "an untouched v1 may go with the switch");
+        assert!(
+            is_pristine(THREAD, &v1),
+            "an untouched v1 may go with the switch"
+        );
         let edited = format!("{esp}\n// mine\n");
         assert_eq!(upgraded(THREAD, &edited, &nrf), None);
         assert!(foreign_radio_file(THREAD, &edited, Platform::Nrf));
@@ -2444,7 +2907,10 @@ mod tests {
         }
         let code = m.fresh_main_rs();
         assert!(code.contains("HfclkSource::ExternalXtal;"), "{code}");
-        assert!(!code.contains("Thread (IoT tab) needs the crystal"), "{code}");
+        assert!(
+            !code.contains("Thread (IoT tab) needs the crystal"),
+            "{code}"
+        );
 
         m.iot.ble = Some(BleConfig::default());
         let code = m.fresh_main_rs();
@@ -2461,8 +2927,14 @@ mod tests {
         let wifi = write_secret(&secrets_body(), "WIFI_SSID", "home");
         let thread_body = secrets_body_for(false, true);
         let up = topped_up(&wifi, &thread_body).expect("THREAD_DATASET is missing");
-        assert!(up.starts_with(&wifi), "the old lines stay as they were:\n{up}");
-        assert!(up.ends_with("pub const THREAD_DATASET: &str = \"\";\n"), "{up}");
+        assert!(
+            up.starts_with(&wifi),
+            "the old lines stay as they were:\n{up}"
+        );
+        assert!(
+            up.ends_with("pub const THREAD_DATASET: &str = \"\";\n"),
+            "{up}"
+        );
         assert_eq!(read_secret(&up, "WIFI_SSID").as_deref(), Some("home"));
         assert_eq!(topped_up(&up, &thread_body), None, "once");
         assert_eq!(topped_up(&up, &secrets_body_for(true, true)), None);
@@ -2478,10 +2950,20 @@ mod tests {
             assert!(has_secret_line(custom, THREAD_DATASET), "{custom}");
         }
         // A longer name, or one only mentioned, is not the declaration.
-        assert!(!has_secret_line("pub const THREAD_DATASET_V2: &str = \"\";", THREAD_DATASET));
-        assert!(!has_secret_line("// THREAD_DATASET: paste it here", THREAD_DATASET));
+        assert!(!has_secret_line(
+            "pub const THREAD_DATASET_V2: &str = \"\";",
+            THREAD_DATASET
+        ));
+        assert!(!has_secret_line(
+            "// THREAD_DATASET: paste it here",
+            THREAD_DATASET
+        ));
         // No trailing newline: the line still starts on a line of its own.
-        assert!(topped_up("// mine", &thread_body).unwrap().starts_with("// mine\npub const"));
+        assert!(
+            topped_up("// mine", &thread_body)
+                .unwrap()
+                .starts_with("// mine\npub const")
+        );
     }
 
     /// Pristine is "every secret line there is empty", whichever links wrote
@@ -2497,10 +2979,15 @@ mod tests {
         assert!(!secrets_pristine("// nothing of ours\n"));
         // A line of the user's own keeps the file, even beside empty ones -
         // pruning it would lose that line with the next Save.
-        let mine = format!("{}pub const OTA_KEY: &str = \"s3cret\";\n", secrets_body_for(false, true));
+        let mine = format!(
+            "{}pub const OTA_KEY: &str = \"s3cret\";\n",
+            secrets_body_for(false, true)
+        );
         assert!(!secrets_pristine(&mine));
         // Lines deleted, nothing added: nothing of the user's is in it.
-        assert!(secrets_pristine("pub const WIFI_SSID: &str = \"\";\npub const WIFI_PASSWORD: &str = \"\";\n"));
+        assert!(secrets_pristine(
+            "pub const WIFI_SSID: &str = \"\";\npub const WIFI_PASSWORD: &str = \"\";\n"
+        ));
     }
     #[test]
     fn the_template_carries_the_topic_length_the_tab_checks() {
@@ -2526,7 +3013,10 @@ mod tests {
     /// A value the tab cannot show is left alone, not misread.
     #[test]
     fn a_hand_written_expression_is_not_a_secret() {
-        assert_eq!(read_secret("pub const WIFI_SSID: &str = env!(\"X\");\n", "WIFI_SSID"), None);
+        assert_eq!(
+            read_secret("pub const WIFI_SSID: &str = env!(\"X\");\n", "WIFI_SSID"),
+            None
+        );
     }
 
     /// Switched off, a file the user wrote in stays; a template goes.
@@ -2550,8 +3040,14 @@ mod tests {
         }
         let kept = kept_paths(&[], &tree);
         assert!(kept.contains(&SECRETS_PATH.to_owned()), "{kept:?}");
-        assert!(kept.contains(&"src/pins/configs/mqtt.rs".to_owned()), "{kept:?}");
-        assert!(kept_paths(&files, &tree).is_empty(), "nothing to keep while generated");
+        assert!(
+            kept.contains(&"src/pins/configs/mqtt.rs".to_owned()),
+            "{kept:?}"
+        );
+        assert!(
+            kept_paths(&files, &tree).is_empty(),
+            "nothing to keep while generated"
+        );
     }
 
     // ── Restart on panic ──────────────────────────────────────────────────
@@ -2571,7 +3067,14 @@ mod tests {
     #[test]
     fn the_header_handler_follows_the_switch() {
         let halt = crate::panels::mcu_module::codegen_esp::PANIC_HALT;
-        for id in ["esp32c3", "esp32", "esp32s3", "esp32c2", "rp2040_pico_w", "nrf52840_dk"] {
+        for id in [
+            "esp32c3",
+            "esp32",
+            "esp32s3",
+            "esp32c2",
+            "rp2040_pico_w",
+            "nrf52840_dk",
+        ] {
             let mut m = if id.starts_with("nrf") {
                 let mut m = mcu(id, Runtime::Async, false);
                 m.iot.wifi = false;
@@ -2583,8 +3086,14 @@ mod tests {
             assert!(m.iot.restart_on_panic, "a new setup restarts");
             let fresh = m.fresh_main_rs();
             assert_eq!(panic_header(&fresh), PanicHeader::Restart, "{id}:\n{fresh}");
-            assert!(fresh.contains("pins::configs::panic::restart(info)"), "{id}");
-            assert!(fresh.contains("pins::configs::panic::start(spawner);"), "{id}:\n{fresh}");
+            assert!(
+                fresh.contains("pins::configs::panic::restart(info)"),
+                "{id}"
+            );
+            assert!(
+                fresh.contains("pins::configs::panic::start(spawner);"),
+                "{id}:\n{fresh}"
+            );
             assert!(!fresh.contains("use panic_halt as _;"), "{id}:\n{fresh}");
             // Idempotent.
             assert_eq!(m.update_main_rs(&fresh), fresh, "{id}");
@@ -2594,7 +3103,11 @@ mod tests {
             assert_eq!(panic_header(&off), PanicHeader::Halt, "{id}:\n{off}");
             assert!(!off.contains("pins::configs::panic"), "{id}:\n{off}");
             assert!(!off.contains("Restart on panic (IoT tab)"), "{id}:\n{off}");
-            assert_eq!(off, m.fresh_main_rs(), "{id}: off is what a fresh file holds");
+            assert_eq!(
+                off,
+                m.fresh_main_rs(),
+                "{id}: off is what a fresh file holds"
+            );
             if id.starts_with("esp") {
                 assert!(off.contains(halt), "{id}");
             } else {
@@ -2606,7 +3119,11 @@ mod tests {
             // Blocking: no IoT, the halt comes back.
             m.runtime = Runtime::Blocking;
             let blocking = m.update_main_rs(&fresh);
-            assert_eq!(panic_header(&blocking), PanicHeader::Halt, "{id}:\n{blocking}");
+            assert_eq!(
+                panic_header(&blocking),
+                PanicHeader::Halt,
+                "{id}:\n{blocking}"
+            );
         }
     }
 
@@ -2615,7 +3132,9 @@ mod tests {
     fn a_handler_the_user_wrote_is_left_alone() {
         let m = mcu("esp32c3", Runtime::Async, true);
         // rustfmt's copy of the IDE's halt: swapped like the original.
-        let fmt = esp_header("#[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! {\n    loop {}\n}\n");
+        let fmt = esp_header(
+            "#[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! {\n    loop {}\n}\n",
+        );
         assert_eq!(panic_header(&panic_main(fmt, &m)), PanicHeader::Restart);
         // One that prints first: left.
         let own = esp_header(
@@ -2647,7 +3166,10 @@ mod tests {
         assert_eq!(panic_main(gated.clone(), &pico), gated);
         // ... and an inline one is swapped.
         let plain = gated.replace("#[cfg(not(test))]\n", "");
-        assert_eq!(panic_header(&panic_main(plain.clone(), &pico)), PanicHeader::Restart);
+        assert_eq!(
+            panic_header(&panic_main(plain.clone(), &pico)),
+            PanicHeader::Restart
+        );
         pico.iot.restart_on_panic = false;
         assert_eq!(panic_main(plain.clone(), &pico), plain);
     }
@@ -2668,21 +3190,42 @@ mod tests {
             ("esp32c6", "#[esp_hal::ram(unstable(rtc_fast, persistent))]"),
             ("esp32", "#[esp_hal::ram(unstable(rtc_slow, persistent))]"),
             ("esp32s3", "#[esp_hal::ram(unstable(rtc_slow, persistent))]"),
-            ("esp32c2", "#[unsafe(link_section = \".noinit.rustonchip_panic\")]"),
-            ("esp32c61", "#[unsafe(link_section = \".noinit.rustonchip_panic\")]"),
+            (
+                "esp32c2",
+                "#[unsafe(link_section = \".noinit.rustonchip_panic\")]",
+            ),
+            (
+                "esp32c61",
+                "#[unsafe(link_section = \".noinit.rustonchip_panic\")]",
+            ),
         ] {
             let body = file(&mcu(id, Runtime::Async, true));
             assert!(body.contains(want), "{id}:\n{body}");
             assert!(body.contains("esp_hal::system::software_reset()"), "{id}");
-            assert!(body.contains("esp_println::println!(\"{report}\");"), "{id}: the serial port");
-            assert!(body.contains("pub const REPORT_TOPIC: &str = \"rustonchip-"), "{id}: MQTT");
-            assert!(body.contains("super::mqtt::publish(REPORT_TOPIC, text.as_bytes())"), "{id}");
+            assert!(
+                body.contains("esp_println::println!(\"{report}\");"),
+                "{id}: the serial port"
+            );
+            assert!(
+                body.contains("pub const REPORT_TOPIC: &str = \"rustonchip-"),
+                "{id}: MQTT"
+            );
+            assert!(
+                body.contains("super::mqtt::publish(REPORT_TOPIC, text.as_bytes())"),
+                "{id}"
+            );
             assert!(is_pristine(PANIC, &body), "{id}");
         }
         // No MQTT: no topic, no task.
         let plain = file(&mcu("esp32c3", Runtime::Async, false));
-        assert!(!plain.contains("REPORT_TOPIC") && !plain.contains("report_task"), "{plain}");
-        assert!(plain.contains("fn report_at_boot(_spawner: embassy_executor::Spawner, report: Report)"));
+        assert!(
+            !plain.contains("REPORT_TOPIC") && !plain.contains("report_task"),
+            "{plain}"
+        );
+        assert!(
+            plain
+                .contains("fn report_at_boot(_spawner: embassy_executor::Spawner, report: Report)")
+        );
         // UART0 is the user's: nothing printed on it.
         let mut uart = mcu("esp32c3", Runtime::Async, false);
         let pad = uart
@@ -2690,20 +3233,39 @@ mod tests {
             .find(|p| !p.reserved)
             .map(|p| p.number)
             .unwrap();
-        uart.apply_saved_pins_by_number(&[(pad, crate::panels::mcu_module::PinFunction::UsartTx(0))]);
+        uart.apply_saved_pins_by_number(&[(
+            pad,
+            crate::panels::mcu_module::PinFunction::UsartTx(0),
+        )]);
         let quiet = file(&uart);
         assert!(!quiet.contains("esp_println"), "{quiet}");
-        assert!(quiet.contains("fn report_at_boot(_spawner: embassy_executor::Spawner, _report: Report)"), "{quiet}");
+        assert!(
+            quiet.contains(
+                "fn report_at_boot(_spawner: embassy_executor::Spawner, _report: Report)"
+            ),
+            "{quiet}"
+        );
         // The Pico W and the nRF: `.uninit`, a core reset.
         let pico = file(&mcu("rp2040_pico_w", Runtime::Async, true));
-        assert!(pico.contains(".uninit.rustonchip_panic") && pico.contains("SCB::sys_reset()"), "{pico}");
-        assert!(pico.contains("Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() }).stop();"));
+        assert!(
+            pico.contains(".uninit.rustonchip_panic") && pico.contains("SCB::sys_reset()"),
+            "{pico}"
+        );
+        assert!(pico.contains(
+            "Watchdog::new(unsafe { embassy_rp::peripherals::WATCHDOG::steal() }).stop();"
+        ));
         let mut nrf = mcu("nrf52840_dk", Runtime::Async, false);
         nrf.iot.wifi = false;
         nrf.iot.ble = Some(BleConfig::default());
         let nrf = file(&nrf);
-        assert!(nrf.contains("DWT::cycle_count()") && nrf.contains("WatchdogHandle::steal"), "{nrf}");
-        assert!(nrf.contains("fn report_at_boot(_spawner: embassy_executor::Spawner, _report: Report)"), "{nrf}");
+        assert!(
+            nrf.contains("DWT::cycle_count()") && nrf.contains("WatchdogHandle::steal"),
+            "{nrf}"
+        );
+        assert!(
+            nrf.contains("fn report_at_boot(_spawner: embassy_executor::Spawner, _report: Report)"),
+            "{nrf}"
+        );
     }
 
     /// The client certificate's block, on and off; ALPN only for AWS IoT on 443.
@@ -2718,10 +3280,16 @@ mod tests {
                 .unwrap()
         };
         let off = link(&m);
-        assert!(off.contains("pub const CLIENT: Option<(&[u8], [u8; 32])> = None;"), "{off}");
+        assert!(
+            off.contains("pub const CLIENT: Option<(&[u8], [u8; 32])> = None;"),
+            "{off}"
+        );
         assert!(off.contains("pub const ALPN: &[&[u8]] = &[];"));
         assert!(off.contains("fn client_cert(&mut self)") && off.contains("struct ClientKey("));
-        assert!(off.contains("pub const fn client_identity("), "pem_der.rs rides along");
+        assert!(
+            off.contains("pub const fn client_identity("),
+            "pem_der.rs rides along"
+        );
         assert!(is_pristine(MQTT_LINK, &off));
         if let Some(mq) = m.iot.mqtt.as_mut() {
             mq.client_cert = true;
@@ -2732,8 +3300,15 @@ mod tests {
         assert!(on.contains("pub const CLIENT: Option<(&[u8], [u8; 32])> = client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER);"), "{on}");
         assert!(on.contains("super::secrets::MQTT_CLIENT_KEY"));
         assert!(on.contains("pub const ALPN: &[&[u8]] = &[b\"x-amzn-mqtt-ca\"];"));
-        let secrets = config_files_for(&m).into_iter().find(|(n, _)| n == SECRETS).map(|(_, b)| b).unwrap();
-        assert!(secrets.contains("pub const MQTT_CLIENT_CERT: &str = \"\";") && secrets.contains("pub const MQTT_CLIENT_KEY: &str = \"\";"));
+        let secrets = config_files_for(&m)
+            .into_iter()
+            .find(|(n, _)| n == SECRETS)
+            .map(|(_, b)| b)
+            .unwrap();
+        assert!(
+            secrets.contains("pub const MQTT_CLIENT_CERT: &str = \"\";")
+                && secrets.contains("pub const MQTT_CLIENT_KEY: &str = \"\";")
+        );
         // An edited link from before it cannot send it; the tab says so.
         let legacy = format!("{GEN_END_CFG}\n{}", lf(LEGACY_TAILS[6].1));
         assert!(client_link_left(Some(&legacy), true).is_some());
@@ -2746,9 +3321,16 @@ mod tests {
     #[test]
     fn a_pristine_v2_link_is_upgraded() {
         let m = tls_mcu("esp32c3", false);
-        let body = config_files_for(&m).into_iter().find(|(n, _)| n == MQTT_LINK).map(|(_, b)| b).unwrap();
+        let body = config_files_for(&m)
+            .into_iter()
+            .find(|(n, _)| n == MQTT_LINK)
+            .map(|(_, b)| b)
+            .unwrap();
         let (block, _) = body.split_once(GEN_END_CFG).unwrap();
-        for (legacy, current) in [(LEGACY_TAILS[6].1, LINK_TLS_ESP_TAIL), (LEGACY_TAILS[7].1, LINK_TLS_CYW43_TAIL)] {
+        for (legacy, current) in [
+            (LEGACY_TAILS[6].1, LINK_TLS_ESP_TAIL),
+            (LEGACY_TAILS[7].1, LINK_TLS_CYW43_TAIL),
+        ] {
             let old = format!("{block}{GEN_END_CFG}\n{}", lf(legacy));
             assert!(is_pristine(MQTT_LINK, &old));
             let up = upgraded(MQTT_LINK, &old, &body).expect("upgraded");
@@ -2765,10 +3347,20 @@ mod tests {
         let aws = mqtt_ca_preset(CaPreset::Aws);
         let pem = ca_pem_of(&aws).unwrap();
         assert_eq!(pem.matches("-----BEGIN CERTIFICATE-----").count(), 2);
-        assert!(iot::ca_summary(pem).unwrap().name.contains("Amazon Root CA 1"));
+        assert!(
+            iot::ca_summary(pem)
+                .unwrap()
+                .name
+                .contains("Amazon Root CA 1")
+        );
         assert!(iot::cas_der(pem).is_some());
         let mosq = mqtt_ca_preset(CaPreset::Mosquitto);
-        assert!(iot::ca_summary(ca_pem_of(&mosq).unwrap()).unwrap().name.contains("mosquitto.org"));
+        assert!(
+            iot::ca_summary(ca_pem_of(&mosq).unwrap())
+                .unwrap()
+                .name
+                .contains("mosquitto.org")
+        );
         assert_eq!(mqtt_ca_preset(CaPreset::LetsEncrypt), mqtt_ca_file());
     }
 
@@ -2779,11 +3371,51 @@ mod tests {
         let multi = "pub const MQTT_CLIENT_KEY: &str = r\"-----BEGIN EC PRIVATE KEY-----\nabc\n-----END EC PRIVATE KEY-----\n\";\npub const MQTT_CLIENT_CERT: &str = \"\";\n";
         for f in [file, multi] {
             let out = write_secret(f, CLIENT_SECRETS[1], "");
-            assert_eq!(out, "pub const MQTT_CLIENT_KEY: &str = \"\";\npub const MQTT_CLIENT_CERT: &str = \"\";\n", "{f}");
+            assert_eq!(
+                out,
+                "pub const MQTT_CLIENT_KEY: &str = \"\";\npub const MQTT_CLIENT_CERT: &str = \"\";\n",
+                "{f}"
+            );
         }
         // The CA file an earlier IDE wrote still counts as untouched.
-        let old = mqtt_ca_file().replace("every certificate in it is trusted.", "only the first certificate is used.");
+        let old = mqtt_ca_file().replace(
+            "every certificate in it is trusted.",
+            "only the first certificate is used.",
+        );
         assert!(is_pristine(MQTT_CA, &old));
+    }
+
+    /// The Pico W's TLS keys come from its ring oscillator, the Pico 2 W's from
+    /// its TRNG and the oscillator; an untouched v3 link moves to the new tail.
+    #[test]
+    fn the_pico_links_draw_their_entropy_from_the_chip() {
+        let link = |id: &str| {
+            let m = tls_mcu(id, false);
+            config_files_for(&m).into_iter().find(|(n, _)| n == MQTT_LINK).map(|(_, b)| b).unwrap()
+        };
+        let pico = link("rp2040_pico_w");
+        assert!(pico.contains("pub const ENTROPY_BYTES: usize = 64;"), "{pico}");
+        assert!(!pico.contains("trng"), "no TRNG on an RP2040:\n{pico}");
+        let pico2 = link("rp2350_pico2_w");
+        assert!(pico2.contains("embassy_rp::trng::Trng::new(trng, crate::Irqs, config).blocking_fill_bytes(from_trng);"), "{pico2}");
+        assert!(pico2.contains("config.disable_crngt_test = true;") && pico2.contains("config.sample_count = 200;"));
+        for body in [&pico, &pico2] {
+            assert!(body.contains("let mut raw = [0u8; ENTROPY_BYTES];") && body.contains("entropy(&mut raw);"));
+            assert!(is_pristine(MQTT_LINK, body));
+        }
+        assert!(!link("esp32c3").contains("ENTROPY_BYTES"), "the ESP's TRNG is esp-hal's");
+        let (block, _) = pico2.split_once(GEN_END_CFG).unwrap();
+        let old = format!("{block}{GEN_END_CFG}\n{}", lf(LEGACY_TAILS[8].1));
+        assert!(is_pristine(MQTT_LINK, &old));
+        assert!(upgraded(MQTT_LINK, &old, &pico2).is_some_and(|up| up.contains("entropy(&mut raw);")));
+        // Edited, it stays - on the oscillator alone, and the tab says so; the
+        // block's own `fn entropy(` does not count as a call.
+        let edited = old.replace("const TCP_RX", "// mine\nconst TCP_RX");
+        assert_ne!(edited, old);
+        assert!(upgraded(MQTT_LINK, &edited, &pico2).is_none());
+        assert!(entropy_link_left(Some(&edited), true).is_some());
+        assert!(entropy_link_left(Some(&edited), false).is_none());
+        assert!(entropy_link_left(Some(&pico2), true).is_none());
     }
 
     /// The signature the tab checks is the template's.
@@ -2807,7 +3439,10 @@ mod tests {
         assert!(is_pristine(PANIC, &spliced));
         let tree = vec![("src/pins/configs/panic.rs".to_owned(), spliced.clone())];
         assert!(kept_paths(&[], &tree).is_empty());
-        let edited = vec![("src/pins/configs/panic.rs".to_owned(), spliced.replace("1_000;", "500;"))];
+        let edited = vec![(
+            "src/pins/configs/panic.rs".to_owned(),
+            spliced.replace("1_000;", "500;"),
+        )];
         assert_eq!(kept_paths(&[], &edited), ["src/pins/configs/panic.rs"]);
         assert!(runtime_free(PANIC));
     }

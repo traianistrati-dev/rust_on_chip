@@ -3861,6 +3861,11 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
     } else {
         String::new()
     };
+    // The RP2350's TRNG: MQTT over TLS's keys (mqtt_link.rs drives it, and
+    // embassy-rp's driver wants its interrupt bound even when it only polls).
+    if tls_trng(mcu) {
+        irqs.push("    TRNG_IRQ => embassy_rp::trng::InterruptHandler<embassy_rp::peripherals::TRNG>;".to_owned());
+    }
 
     if dma > 0 {
         // Every channel drains through the one DMA interrupt, so the
@@ -4031,6 +4036,12 @@ pub fn needs_bluetooth(mcu: &Mcu) -> bool {
 fn iot_radio(mcu: &Mcu) -> Option<crate::panels::mcu_module::iot::Active> {
     use crate::panels::mcu_module::iot::{self, Platform};
     iot::active(mcu).filter(|a| a.platform == Platform::Cyw43 && (a.station || a.ble))
+}
+
+/// MQTT over TLS on an RP2350: mqtt_link.rs draws its keys from the TRNG,
+/// so main binds the TRNG's interrupt and keeps `p.TRNG` from everyone else.
+fn tls_trng(mcu: &Mcu) -> bool {
+    crate::panels::mcu_module::iot::tls_trng(&mcu.family) && iot_radio(mcu).is_some_and(|a| a.mqtt_tls)
 }
 
 /// The bring-up for the CYW43 radio, for its GPIO0 (the LED) and, with the
@@ -4358,6 +4369,13 @@ fn async_section(mcu: &Mcu) -> String {
     o.push_str("    // embassy-rp brings up the clocks itself. On RP2040 it also supplies the\n");
     o.push_str("    // second-stage bootloader, which the blocking HAL makes you declare.\n");
     o.push_str("    let p = embassy_rp::init(Default::default());\n\n");
+    // mqtt_link.rs steals the TRNG for TLS's keys: moved out of `p` here, a
+    // second driver on it no longer compiles.
+    if tls_trng(mcu) {
+        o.push_str("    // The TRNG is MQTT over TLS's (mqtt_link.rs draws its keys from it):\n");
+        o.push_str("    // moved out of `p`, so no second driver can share it.\n");
+        o.push_str("    let _tls_trng = p.TRNG;\n\n");
+    }
     // A panic that restarted the chip (IoT tab), reported before anything
     // else could panic again.
     o.push_str(&super::iot_gen::panic_start_lines(mcu));
@@ -4983,12 +5001,54 @@ mod emit_async_for_manual_compile {
         // its whitened RNG, SNTP's clock - the RP2040's with the board's own
         // certificate, so P-256 signing links on the M0+.
         for (id, dir_name, wifi, ble, tls, cert) in [
-            ("rp2040_pico_w", "eide_rp2040w_iot_check", true, false, false, false),
-            ("rp2350_pico2_w", "eide_rp2350w_iot_check", true, false, false, false),
-            ("rp2040_pico_w", "eide_rp2040w_ble_check", true, true, false, false),
-            ("rp2350_pico2_w", "eide_rp2350w_ble_check", false, true, false, false),
-            ("rp2040_pico_w", "eide_rp2040w_tls_check", true, false, true, true),
-            ("rp2350_pico2_w", "eide_rp2350w_tls_check", true, false, true, false),
+            (
+                "rp2040_pico_w",
+                "eide_rp2040w_iot_check",
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                "rp2350_pico2_w",
+                "eide_rp2350w_iot_check",
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                "rp2040_pico_w",
+                "eide_rp2040w_ble_check",
+                true,
+                true,
+                false,
+                false,
+            ),
+            (
+                "rp2350_pico2_w",
+                "eide_rp2350w_ble_check",
+                false,
+                true,
+                false,
+                false,
+            ),
+            (
+                "rp2040_pico_w",
+                "eide_rp2040w_tls_check",
+                true,
+                false,
+                true,
+                true,
+            ),
+            (
+                "rp2350_pico2_w",
+                "eide_rp2350w_tls_check",
+                true,
+                false,
+                true,
+                false,
+            ),
         ] {
             let def = builtins::builtin_definitions()
                 .into_iter()
@@ -5020,7 +5080,11 @@ mod emit_async_for_manual_compile {
             }
             let active = iot::active(&mcu);
             assert!(active.is_some(), "a link on a W board on Async");
-            assert_eq!(active.is_some_and(|a| a.mqtt_tls), tls, "{id}: TLS exactly when asked");
+            assert_eq!(
+                active.is_some_and(|a| a.mqtt_tls),
+                tls,
+                "{id}: TLS exactly when asked"
+            );
 
             let mut used = String::from("        // Your main loop code here.\n");
             if wifi {
@@ -5032,20 +5096,35 @@ mod emit_async_for_manual_compile {
                 used.push_str("        let _ = (pins::configs::sntp::now_unix(), pins::configs::sntp::now_unix_ms());\n");
             } else {
                 // Bluetooth alone: the LED stays `main`'s.
-                used.push_str("        wl_led.gpio_set(0, pins::configs::ble::connected()).await;\n");
+                used.push_str(
+                    "        wl_led.gpio_set(0, pins::configs::ble::connected()).await;\n",
+                );
             }
             if ble {
                 used.push_str("        let packet = pins::configs::ble::receive().await;\n");
                 used.push_str("        pins::configs::ble::send(&packet.data).await.ok();\n");
             }
-            let main_rs = mcu
-                .fresh_main_rs()
-                .replacen("        // Your main loop code here.\n", &used, 1);
-            assert!(main_rs.contains(&used), "the user loop was seeded:\n{main_rs}");
+            let main_rs =
+                mcu.fresh_main_rs()
+                    .replacen("        // Your main loop code here.\n", &used, 1);
+            assert!(
+                main_rs.contains(&used),
+                "the user loop was seeded:\n{main_rs}"
+            );
             if wifi {
-                assert!(main_rs.contains("pins::configs::sntp::start(spawner, net_stack);"), "{main_rs}");
+                assert!(
+                    main_rs.contains("pins::configs::sntp::start(spawner, net_stack);"),
+                    "{main_rs}"
+                );
             }
-            let bring_up = if ble { "cyw43::new_with_bluetooth(" } else { "cyw43::new(" };
+            if !tls {
+                assert!(!main_rs.contains("TRNG_IRQ"), "{id}: no TLS, no TRNG:\n{main_rs}");
+            }
+            let bring_up = if ble {
+                "cyw43::new_with_bluetooth("
+            } else {
+                "cyw43::new("
+            };
             assert_eq!(main_rs.matches(bring_up).count(), 1, "{main_rs}");
 
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
@@ -5053,11 +5132,15 @@ mod emit_async_for_manual_compile {
             let mut user: Vec<(String, String)> = mcu.pin_tree_files();
             if cert {
                 crate::panels::mcu_module::codegen::iot_gen::seed_test_identity(&mut user);
-                assert!(active.is_some_and(|a| a.mqtt_client_cert), "{id}: the client certificate");
+                assert!(
+                    active.is_some_and(|a| a.mqtt_client_cert),
+                    "{id}: the client certificate"
+                );
             }
             // The credentials go with the station: Bluetooth alone has none.
             assert_eq!(
-                user.iter().any(|(p, _)| p == crate::panels::mcu_module::codegen::iot_gen::SECRETS_PATH),
+                user.iter()
+                    .any(|(p, _)| p == crate::panels::mcu_module::codegen::iot_gen::SECRETS_PATH),
                 wifi,
                 "secrets.rs is written exactly with Wi-Fi"
             );
@@ -5092,9 +5175,27 @@ mod emit_async_for_manual_compile {
                     .map(|(_, c)| c.as_str())
                     .unwrap_or("");
                 assert!(link.contains("embassy_rp::clocks::RoscRng"), "{link}");
+                // The Pico 2 W's keys come from its TRNG too, bound in main.
+                let trng = mcu.family == "rp235x";
+                assert_eq!(link.contains("embassy_rp::trng::Trng::new("), trng, "{id}:\n{link}");
+                assert_eq!(
+                    main_rs.contains("TRNG_IRQ => embassy_rp::trng::InterruptHandler<embassy_rp::peripherals::TRNG>;"),
+                    trng,
+                    "{id}:\n{main_rs}"
+                );
+                assert_eq!(main_rs.contains("let _tls_trng = p.TRNG;"), trng, "{id}:\n{main_rs}");
                 assert!(link.contains("super::sntp::now_unix()"), "{link}");
-                assert!(user.iter().any(|(p, _)| p == "src/pins/configs/mqtt_ca.rs"), "the CA");
-                for want in ["embedded-tls = ", "embedded-alloc = ", "rand_core_06 = ", "sha2 = ", "embedded-io-async = "] {
+                assert!(
+                    user.iter().any(|(p, _)| p == "src/pins/configs/mqtt_ca.rs"),
+                    "the CA"
+                );
+                for want in [
+                    "embedded-tls = ",
+                    "embedded-alloc = ",
+                    "rand_core_06 = ",
+                    "sha2 = ",
+                    "embedded-io-async = ",
+                ] {
                     assert!(toml.contains(want), "{want}:\n{toml}");
                 }
                 assert_eq!(toml.contains("spin = "), mcu.family == "rp2040", "{toml}");

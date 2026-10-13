@@ -113,7 +113,11 @@ fn reaches(c: &NrfChip, inst: u8, port: u8) -> bool {
 #[cfg(test)]
 /// The UARTEs a pin on `port` can carry.
 fn uartes(c: &NrfChip, port: u8) -> Vec<u8> {
-    c.uarte.iter().copied().filter(|&u| reaches(c, u, port)).collect()
+    c.uarte
+        .iter()
+        .copied()
+        .filter(|&u| reaches(c, u, port))
+        .collect()
 }
 
 #[cfg(test)]
@@ -291,29 +295,101 @@ const NRF52840_DK: Board = Board {
         Fixed("P0.18 (RESET)"),
     ],
     notes: &[
-        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB2 and short SB4."),
-        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and short SB3."),
-        ((0, 5), "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR; free for other use when flow control is not detected. Cut SB51 to disconnect it."),
-        ((0, 6), "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR. Cut SB53 to disconnect it."),
-        ((0, 7), "VCOM CTS: once flow control is detected, the interface MCU drives it until it power-cycles or sees a new DTR; free otherwise. Cut SB50 to disconnect it."),
-        ((0, 8), "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR. Cut SB52 to disconnect it."),
-        ((0, 9), "Wired to the NFC antenna by default. For GPIO: remove R44 and R46, fit 0R at R43 and R45, and set UICR.NFCPINS to GPIO."),
-        ((0, 10), "Wired to the NFC antenna by default. For GPIO: remove R44 and R46, fit 0R at R43 and R45, and set UICR.NFCPINS to GPIO."),
-        ((0, 17), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23."),
-        ((0, 18), "Goes to the interface MCU through SB56, closed by default - cut it to disconnect."),
-        ((0, 19), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21."),
-        ((0, 20), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22."),
-        ((0, 21), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24."),
-        ((0, 22), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25."),
-        ((0, 23), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20."),
-        ((0, 26), "The on-board I2C pull-ups are switched in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
-        ((0, 27), "The on-board I2C pull-ups are switched in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
-        ((1, 0), "SWO / TRACEDATA[0], connected to the interface MCU through a signal switch. Cut SB57 to disconnect it."),
+        (
+            (0, 0),
+            "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB2 and short SB4.",
+        ),
+        (
+            (0, 1),
+            "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and short SB3.",
+        ),
+        (
+            (0, 5),
+            "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR; free for other use when flow control is not detected. Cut SB51 to disconnect it.",
+        ),
+        (
+            (0, 6),
+            "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR. Cut SB53 to disconnect it.",
+        ),
+        (
+            (0, 7),
+            "VCOM CTS: once flow control is detected, the interface MCU drives it until it power-cycles or sees a new DTR; free otherwise. Cut SB50 to disconnect it.",
+        ),
+        (
+            (0, 8),
+            "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR. Cut SB52 to disconnect it.",
+        ),
+        (
+            (0, 9),
+            "Wired to the NFC antenna by default. For GPIO: remove R44 and R46, fit 0R at R43 and R45, and set UICR.NFCPINS to GPIO.",
+        ),
+        (
+            (0, 10),
+            "Wired to the NFC antenna by default. For GPIO: remove R44 and R46, fit 0R at R43 and R45, and set UICR.NFCPINS to GPIO.",
+        ),
+        (
+            (0, 17),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23.",
+        ),
+        (
+            (0, 18),
+            "Goes to the interface MCU through SB56, closed by default - cut it to disconnect.",
+        ),
+        (
+            (0, 19),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21.",
+        ),
+        (
+            (0, 20),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22.",
+        ),
+        (
+            (0, 21),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24.",
+        ),
+        (
+            (0, 22),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25.",
+        ),
+        (
+            (0, 23),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20.",
+        ),
+        (
+            (0, 26),
+            "The on-board I2C pull-ups are switched in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off.",
+        ),
+        (
+            (0, 27),
+            "The on-board I2C pull-ups are switched in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off.",
+        ),
+        (
+            (1, 0),
+            "SWO / TRACEDATA[0], connected to the interface MCU through a signal switch. Cut SB57 to disconnect it.",
+        ),
     ],
     low_freq: &[
-        (0, 2), (0, 3), (0, 9), (0, 10), (0, 28), (0, 29), (0, 30), (0, 31),
-        (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7),
-        (1, 10), (1, 11), (1, 12), (1, 13), (1, 14), (1, 15),
+        (0, 2),
+        (0, 3),
+        (0, 9),
+        (0, 10),
+        (0, 28),
+        (0, 29),
+        (0, 30),
+        (0, 31),
+        (1, 1),
+        (1, 2),
+        (1, 3),
+        (1, 4),
+        (1, 5),
+        (1, 6),
+        (1, 7),
+        (1, 10),
+        (1, 11),
+        (1, 12),
+        (1, 13),
+        (1, 14),
+        (1, 15),
     ],
     every_pad: "",
 };
@@ -371,19 +447,58 @@ const NRF52_DK: Board = Board {
         Fixed("P0.21 (RESET)"),
     ],
     notes: &[
-        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4."),
-        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4."),
-        ((0, 5), "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR."),
-        ((0, 6), "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR."),
-        ((0, 7), "VCOM CTS: tri-stated until a terminal sends DTR; once flow control is detected the interface MCU drives it until a power-on reset or a new DTR."),
-        ((0, 8), "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR."),
-        ((0, 9), "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO."),
-        ((0, 10), "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO."),
-        ((0, 18), "Also SWO / TRACEDATA[0], wired to the interface MCU through SB27 (closed by default; SB26 on v1.x boards) - cut it to isolate the pin."),
-        ((0, 21), "Goes to the interface MCU through SB26 (closed by default; SB27 on v1.x boards). The Arduino RESET pin is NOT this pin by default: SB17 and SB43 are open."),
+        (
+            (0, 0),
+            "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4.",
+        ),
+        (
+            (0, 1),
+            "Wired to the 32.768 kHz crystal by default and not on the connectors. For GPIO: cut SB1 and SB2, solder SB3 and SB4.",
+        ),
+        (
+            (0, 5),
+            "VCOM RTS to the interface MCU, tri-stated until a terminal sends DTR.",
+        ),
+        (
+            (0, 6),
+            "VCOM TXD to the interface MCU, tri-stated until a terminal sends DTR.",
+        ),
+        (
+            (0, 7),
+            "VCOM CTS: tri-stated until a terminal sends DTR; once flow control is detected the interface MCU drives it until a power-on reset or a new DTR.",
+        ),
+        (
+            (0, 8),
+            "VCOM RXD from the interface MCU, tri-stated until a terminal sends DTR.",
+        ),
+        (
+            (0, 9),
+            "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO.",
+        ),
+        (
+            (0, 10),
+            "Wired to the NFC antenna by default. For GPIO: remove R25 and R26, fit 0R on R27 and R28, and set UICR.NFCPINS to GPIO.",
+        ),
+        (
+            (0, 18),
+            "Also SWO / TRACEDATA[0], wired to the interface MCU through SB27 (closed by default; SB26 on v1.x boards) - cut it to isolate the pin.",
+        ),
+        (
+            (0, 21),
+            "Goes to the interface MCU through SB26 (closed by default; SB27 on v1.x boards). The Arduino RESET pin is NOT this pin by default: SB17 and SB43 are open.",
+        ),
     ],
     low_freq: &[
-        (0, 22), (0, 23), (0, 24), (0, 25), (0, 26), (0, 27), (0, 28), (0, 29), (0, 30), (0, 31),
+        (0, 22),
+        (0, 23),
+        (0, 24),
+        (0, 25),
+        (0, 26),
+        (0, 27),
+        (0, 28),
+        (0, 29),
+        (0, 30),
+        (0, 31),
     ],
     every_pad: "",
 };
@@ -462,25 +577,82 @@ const NRF5340_DK: Board = Board {
         Fixed("P0.01 (XL2, 32.768 kHz)"),
     ],
     notes: &[
-        ((0, 0), "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4."),
-        ((0, 1), "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4."),
-        ((0, 2), "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO."),
-        ((0, 3), "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO."),
-        ((0, 8), "Also TRACEDATA[3] and SPIM4's dedicated SCK: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
-        ((0, 9), "Also TRACEDATA[2] and SPIM4's dedicated MOSI: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
-        ((0, 10), "Serial port 0 (VCOM0) CTS, also TRACEDATA[1] and SPIM4's dedicated 32 Mbps MISO. Set SW7 (serial port 0 flow control) OFF to use it for trace."),
-        ((0, 11), "Serial port 0 (VCOM0) RTS, also TRACEDATA[0] / SWO and SPIM4's dedicated 32 Mbps CSN. Set SW7 (serial port 0 flow control) OFF to use it for trace."),
-        ((0, 12), "TRACECLK, and SPIM4's dedicated DCX: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX)."),
-        ((0, 13), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22."),
-        ((0, 14), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24."),
-        ((0, 15), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25."),
-        ((0, 16), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20."),
-        ((0, 17), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21."),
-        ((0, 18), "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23."),
-        ((1, 0), "Serial port 0 (VCOM0) RXD. Zephyr's stock app-core board hands it to the network core, which uses it as its console."),
-        ((1, 1), "Serial port 0 (VCOM0) TXD. Zephyr's stock app-core board hands it to the network core, which uses it as its console."),
-        ((1, 2), "With P1.03, the nRF5340's only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
-        ((1, 3), "With P1.02, the nRF5340's only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off."),
+        (
+            (0, 0),
+            "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4.",
+        ),
+        (
+            (0, 1),
+            "Wired to the 32.768 kHz crystal by default and not on the headers. For GPIO: cut SB1 and SB2, short SB3 and SB4.",
+        ),
+        (
+            (0, 2),
+            "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO.",
+        ),
+        (
+            (0, 3),
+            "Wired to the NFC antenna by default. For GPIO: remove R43 and R46, fit 0R at R42 and R45, and set UICR.NFCPINS to GPIO.",
+        ),
+        (
+            (0, 8),
+            "Also TRACEDATA[3] and SPIM4's dedicated SCK: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX).",
+        ),
+        (
+            (0, 9),
+            "Also TRACEDATA[2] and SPIM4's dedicated MOSI: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX).",
+        ),
+        (
+            (0, 10),
+            "Serial port 0 (VCOM0) CTS, also TRACEDATA[1] and SPIM4's dedicated 32 Mbps MISO. Set SW7 (serial port 0 flow control) OFF to use it for trace.",
+        ),
+        (
+            (0, 11),
+            "Serial port 0 (VCOM0) RTS, also TRACEDATA[0] / SWO and SPIM4's dedicated 32 Mbps CSN. Set SW7 (serial port 0 flow control) OFF to use it for trace.",
+        ),
+        (
+            (0, 12),
+            "TRACECLK, and SPIM4's dedicated DCX: SPIM4 runs at 32 Mbps only on P0.08-P0.12 (SCK, MOSI, MISO, CSN, DCX).",
+        ),
+        (
+            (0, 13),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB12 and short SB22.",
+        ),
+        (
+            (0, 14),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB14 and short SB24.",
+        ),
+        (
+            (0, 15),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB15 and short SB25.",
+        ),
+        (
+            (0, 16),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB10 and short SB20.",
+        ),
+        (
+            (0, 17),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB11 and short SB21.",
+        ),
+        (
+            (0, 18),
+            "Wired to the QSPI flash by default and not on header P24. For GPIO: cut SB13 and short SB23.",
+        ),
+        (
+            (1, 0),
+            "Serial port 0 (VCOM0) RXD. Zephyr's stock app-core board hands it to the network core, which uses it as its console.",
+        ),
+        (
+            (1, 1),
+            "Serial port 0 (VCOM0) TXD. Zephyr's stock app-core board hands it to the network core, which uses it as its console.",
+        ),
+        (
+            (1, 2),
+            "With P1.03, the nRF5340's only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off.",
+        ),
+        (
+            (1, 3),
+            "With P1.02, the nRF5340's only pin pair for 1 Mbps TWI (E0E1 drive). The on-board pull-ups switch in only while a shield is plugged in: short SB32 to keep them on, cut SB33 to keep them off.",
+        ),
     ],
     low_freq: &[],
     every_pad: "",
@@ -547,30 +719,96 @@ const NRF54L15_DK: Board = Board {
         Fixed("P1.01 (XL2, 32.768 kHz)"),
     ],
     notes: &[
-        ((0, 0), "VCOM0 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
-        ((0, 1), "VCOM0 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
-        ((0, 2), "VCOM0 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected."),
-        ((0, 3), "VCOM0 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR."),
-        ((1, 0), "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6."),
-        ((1, 1), "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6."),
-        ((1, 2), "Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf's `nfc-pins-as-gpio` does at every boot."),
-        ((1, 3), "Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf's `nfc-pins-as-gpio` does at every boot."),
-        ((1, 4), "VCOM1 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
-        ((1, 5), "VCOM1 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR."),
-        ((1, 6), "VCOM1 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected."),
-        ((1, 7), "VCOM1 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR."),
-        ((1, 10), "Switches LED1 through a transistor; the LEDs are powered by the PMIC and stay dark if 'Power to LEDs' is off in Board Configurator."),
-        ((1, 14), "Switches LED3 through a transistor; the LEDs are powered by the PMIC and stay dark if 'Power to LEDs' is off in Board Configurator."),
-        ((2, 0), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
-        ((2, 1), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
-        ((2, 2), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
-        ((2, 3), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
-        ((2, 4), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
-        ((2, 5), "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22)."),
+        (
+            (0, 0),
+            "VCOM0 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR.",
+        ),
+        (
+            (0, 1),
+            "VCOM0 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR.",
+        ),
+        (
+            (0, 2),
+            "VCOM0 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected.",
+        ),
+        (
+            (0, 3),
+            "VCOM0 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR.",
+        ),
+        (
+            (1, 0),
+            "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6.",
+        ),
+        (
+            (1, 1),
+            "Wired to the 32.768 kHz crystal by default and not on the header. For GPIO: cut SB3 and SB4, short SB5 and SB6.",
+        ),
+        (
+            (1, 2),
+            "Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf's `nfc-pins-as-gpio` does at every boot.",
+        ),
+        (
+            (1, 3),
+            "Wired to the NFC antenna by default and not on the header. For GPIO: move the 0R resistors from R21/R22 to R33/R34; the firmware must also turn the NFCT pads off (NFCT.PADCONFIG - this part has no UICR.NFCPINS), which embassy-nrf's `nfc-pins-as-gpio` does at every boot.",
+        ),
+        (
+            (1, 4),
+            "VCOM1 TXD to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR.",
+        ),
+        (
+            (1, 5),
+            "VCOM1 RXD from the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR.",
+        ),
+        (
+            (1, 6),
+            "VCOM1 RTS to the debugger through analog switch U4/U5, tri-stated until a terminal sends DTR; free when flow control is not detected.",
+        ),
+        (
+            (1, 7),
+            "VCOM1 CTS: tri-stated until a terminal sends DTR; once flow control is detected the debugger drives it until a power-on reset or a new DTR.",
+        ),
+        (
+            (1, 10),
+            "Switches LED1 through a transistor; the LEDs are powered by the PMIC and stay dark if 'Power to LEDs' is off in Board Configurator.",
+        ),
+        (
+            (1, 14),
+            "Switches LED3 through a transistor; the LEDs are powered by the PMIC and stay dark if 'Power to LEDs' is off in Board Configurator.",
+        ),
+        (
+            (2, 0),
+            "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
+        ),
+        (
+            (2, 1),
+            "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
+        ),
+        (
+            (2, 2),
+            "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
+        ),
+        (
+            (2, 3),
+            "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
+        ),
+        (
+            (2, 4),
+            "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
+        ),
+        (
+            (2, 5),
+            "Wired to the on-board flash by default, not to header P2: turn off 'External memory' in Board Configurator (v0.9.x boards: cut SB11-SB16, short SB17-SB22).",
+        ),
         ((2, 6), "Trace port TRACECLK."),
-        ((2, 7), "Switches LED2 through a transistor (LEDs powered by the PMIC, dark if 'Power to LEDs' is off). Also TRACEDATA[0] / SWO: on v1.0.0 boards the debugger's SWO reaches it only with 'SWO Control' on in Board Configurator; on v0.9.x boards it does through SB24, closed by default (cut it to disconnect)."),
+        (
+            (2, 7),
+            "Switches LED2 through a transistor (LEDs powered by the PMIC, dark if 'Power to LEDs' is off). Also TRACEDATA[0] / SWO: on v1.0.0 boards the debugger's SWO reaches it only with 'SWO Control' on in Board Configurator; on v0.9.x boards it does through SB24, closed by default (cut it to disconnect).",
+        ),
         ((2, 8), "Trace port TRACEDATA[1]."),
-        ((2, 9), "Switches LED0 through a transistor (LEDs powered by the PMIC, dark if 'Power to LEDs' is off). Also trace port TRACEDATA[2]."),
+        (
+            (2, 9),
+            "Switches LED0 through a transistor (LEDs powered by the PMIC, dark if 'Power to LEDs' is off). Also trace port TRACEDATA[2].",
+        ),
         ((2, 10), "Trace port TRACEDATA[3]."),
     ],
     low_freq: &[],
@@ -693,10 +931,20 @@ fn definition_of(b: &Board) -> McuDefinition {
     for side in [&mut d.pins.left, &mut d.pins.right, &mut d.pins.top] {
         for p in side.iter_mut() {
             let pp = super::nrf::nrf_pin(&p.name);
-            let own = b.notes.iter().find(|(at, _)| Some(*at) == pp).map(|(_, t)| *t);
-            let low = pp.filter(|pp| b.low_freq.contains(pp)).map(|_| LOW_FREQ_NOTE);
+            let own = b
+                .notes
+                .iter()
+                .find(|(at, _)| Some(*at) == pp)
+                .map(|(_, t)| *t);
+            let low = pp
+                .filter(|pp| b.low_freq.contains(pp))
+                .map(|_| LOW_FREQ_NOTE);
             let every = Some(b.every_pad).filter(|t| !t.is_empty() && !p.reserved);
-            p.note = [every, own, low].into_iter().flatten().collect::<Vec<_>>().join(" ");
+            p.note = [every, own, low]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
         }
     }
     d.clock = ClockDef::Graph(clock_graph(true));
@@ -771,27 +1019,125 @@ mod tests {
     }
 
     const CASES: [Case; 14] = [
-        Case { dir: "eide_nrf52840_dk_check", board: "nrf52840_dk", part: None, runtime: Runtime::Blocking, spim: 2, twim: 0 },
-        Case { dir: "eide_nrf52840_dk_async_check", board: "nrf52840_dk", part: None, runtime: Runtime::Async, spim: 2, twim: 0 },
-        Case { dir: "eide_nrf52832_dk_check", board: "nrf52832_dk", part: None, runtime: Runtime::Blocking, spim: 2, twim: 1 },
-        Case { dir: "eide_nrf52832_dk_async_check", board: "nrf52832_dk", part: None, runtime: Runtime::Async, spim: 2, twim: 1 },
+        Case {
+            dir: "eide_nrf52840_dk_check",
+            board: "nrf52840_dk",
+            part: None,
+            runtime: Runtime::Blocking,
+            spim: 2,
+            twim: 0,
+        },
+        Case {
+            dir: "eide_nrf52840_dk_async_check",
+            board: "nrf52840_dk",
+            part: None,
+            runtime: Runtime::Async,
+            spim: 2,
+            twim: 0,
+        },
+        Case {
+            dir: "eide_nrf52832_dk_check",
+            board: "nrf52832_dk",
+            part: None,
+            runtime: Runtime::Blocking,
+            spim: 2,
+            twim: 1,
+        },
+        Case {
+            dir: "eide_nrf52832_dk_async_check",
+            board: "nrf52832_dk",
+            part: None,
+            runtime: Runtime::Async,
+            spim: 2,
+            twim: 1,
+        },
         // SPIM0 and TWIM0 are SEPARATE blocks here (`SPI0`, `TWI0`).
-        Case { dir: "eide_nrf52810_check", board: "nrf52832_dk", part: Some("nrf52810"), runtime: Runtime::Blocking, spim: 0, twim: 0 },
-        Case { dir: "eide_nrf52810_async_check", board: "nrf52832_dk", part: Some("nrf52810"), runtime: Runtime::Async, spim: 0, twim: 0 },
+        Case {
+            dir: "eide_nrf52810_check",
+            board: "nrf52832_dk",
+            part: Some("nrf52810"),
+            runtime: Runtime::Blocking,
+            spim: 0,
+            twim: 0,
+        },
+        Case {
+            dir: "eide_nrf52810_async_check",
+            board: "nrf52832_dk",
+            part: Some("nrf52810"),
+            runtime: Runtime::Async,
+            spim: 0,
+            twim: 0,
+        },
         // No PWM at all, and the SAADC on AIN2/AIN3 only.
-        Case { dir: "eide_nrf52805_async_check", board: "nrf52832_dk", part: Some("nrf52805"), runtime: Runtime::Async, spim: 0, twim: 0 },
+        Case {
+            dir: "eide_nrf52805_async_check",
+            board: "nrf52832_dk",
+            part: Some("nrf52805"),
+            runtime: Runtime::Async,
+            spim: 0,
+            twim: 0,
+        },
         // TWIM0 shares `TWI0_SPI1` with SPIM1, not with SPIM0.
-        Case { dir: "eide_nrf52811_check", board: "nrf52832_dk", part: Some("nrf52811"), runtime: Runtime::Blocking, spim: 0, twim: 0 },
+        Case {
+            dir: "eide_nrf52811_check",
+            board: "nrf52832_dk",
+            part: Some("nrf52811"),
+            runtime: Runtime::Blocking,
+            spim: 0,
+            twim: 0,
+        },
         // No nrf-hal crate: Blocking is embassy-nrf without an executor.
-        Case { dir: "eide_nrf52820_check", board: "nrf52832_dk", part: Some("nrf52820"), runtime: Runtime::Blocking, spim: 0, twim: 1 },
-        Case { dir: "eide_nrf52820_async_check", board: "nrf52832_dk", part: Some("nrf52820"), runtime: Runtime::Async, spim: 0, twim: 1 },
+        Case {
+            dir: "eide_nrf52820_check",
+            board: "nrf52832_dk",
+            part: Some("nrf52820"),
+            runtime: Runtime::Blocking,
+            spim: 0,
+            twim: 1,
+        },
+        Case {
+            dir: "eide_nrf52820_async_check",
+            board: "nrf52832_dk",
+            part: Some("nrf52820"),
+            runtime: Runtime::Async,
+            spim: 0,
+            twim: 1,
+        },
         // The nRF5340's application core: SERIALn blocks, SPIM4, WDT0, Cortex-M33,
         // and Blocking on embassy-nrf.
-        Case { dir: "eide_nrf5340_dk_check", board: "nrf5340_dk", part: None, runtime: Runtime::Blocking, spim: 4, twim: 1 },
-        Case { dir: "eide_nrf5340_dk_async_check", board: "nrf5340_dk", part: None, runtime: Runtime::Async, spim: 4, twim: 1 },
+        Case {
+            dir: "eide_nrf5340_dk_check",
+            board: "nrf5340_dk",
+            part: None,
+            runtime: Runtime::Blocking,
+            spim: 4,
+            twim: 1,
+        },
+        Case {
+            dir: "eide_nrf5340_dk_async_check",
+            board: "nrf5340_dk",
+            part: None,
+            runtime: Runtime::Async,
+            spim: 4,
+            twim: 1,
+        },
         // The nRF54L15: SERIAL00/2x/30, PWM20, the GRTC time driver, P2.
-        Case { dir: "eide_nrf54l15_dk_check", board: "nrf54l15_dk", part: None, runtime: Runtime::Blocking, spim: 0, twim: 21 },
-        Case { dir: "eide_nrf54l15_dk_async_check", board: "nrf54l15_dk", part: None, runtime: Runtime::Async, spim: 0, twim: 21 },
+        Case {
+            dir: "eide_nrf54l15_dk_check",
+            board: "nrf54l15_dk",
+            part: None,
+            runtime: Runtime::Blocking,
+            spim: 0,
+            twim: 21,
+        },
+        Case {
+            dir: "eide_nrf54l15_dk_async_check",
+            board: "nrf54l15_dk",
+            part: None,
+            runtime: Runtime::Async,
+            spim: 0,
+            twim: 21,
+        },
     ];
 
     /// The case's definition and its wired `Mcu`: an LED, a PWM on two more
@@ -904,7 +1250,12 @@ mod tests {
             let (_, mcu) = wired(case);
             let main = mcu.fresh_main_rs();
             let c = chip(&mcu.family).unwrap();
-            assert!(main.contains("LfclkSource::ExternalXtal") || main.contains("set_lfclk_src_external"), "{}", case.dir);
+            assert!(
+                main.contains("LfclkSource::ExternalXtal")
+                    || main.contains("set_lfclk_src_external"),
+                "{}",
+                case.dir
+            );
             if c.pwm.is_empty() {
                 assert!(main.contains("PWM0 is wired on"), "{}:\n{main}", case.dir);
                 assert!(!main.contains("p.PWM0"), "{}", case.dir);
@@ -924,7 +1275,10 @@ mod tests {
                 assert!(!main.contains("embassy_executor"), "{}", case.dir);
             }
             if super::super::nrf::blocking_on_embassy(&mcu.family) && !mcu.is_async() {
-                assert!(main.contains("let p = embassy_nrf::init(config);"), "{main}");
+                assert!(
+                    main.contains("let p = embassy_nrf::init(config);"),
+                    "{main}"
+                );
                 let ram = format!("let mut twim{}_ram = [0u8; 32];", case.twim);
                 assert!(main.contains(&ram), "{main}");
                 assert!(!main.contains("static_cell"), "{main}");
@@ -994,7 +1348,12 @@ mod tests {
         };
         for dir in ["eide_nrf5340_dk_check", "eide_nrf5340_dk_async_check"] {
             let m = main(dir);
-            for want in ["p.SERIAL0,", "p.SPIM4,", "p.SERIAL1,", "let watchdog = p.WDT0;"] {
+            for want in [
+                "p.SERIAL0,",
+                "p.SPIM4,",
+                "p.SERIAL1,",
+                "let watchdog = p.WDT0;",
+            ] {
                 assert!(m.contains(want), "{dir}: missing {want:?}:\n{m}");
             }
         }
@@ -1019,7 +1378,10 @@ mod tests {
                 }
             }
             let main = mcu.fresh_main_rs();
-            assert!(main.contains("// P1.02 is one of the NFC antenna pins."), "{main}");
+            assert!(
+                main.contains("// P1.02 is one of the NFC antenna pins."),
+                "{main}"
+            );
             assert!(main.contains("(NFCT.PADCONFIG) on every boot"), "{main}");
             assert!(!main.contains("UICR"), "{main}");
         }
@@ -1046,7 +1408,11 @@ mod tests {
                 continue;
             };
             // QFN48 ports: P0.00..06, P1.00..14, P2.00..10.
-            assert!(pp.1 <= [6, 14, 10][pp.0 as usize], "{}: not a QFN48 pin", p.name);
+            assert!(
+                pp.1 <= [6, 14, 10][pp.0 as usize],
+                "{}: not a QFN48 pin",
+                p.name
+            );
             for f in &p.available_functions {
                 assert!(
                     super::super::nrf::pin_fits(c, f, pp),
@@ -1088,28 +1454,56 @@ mod tests {
             mcu.fresh_main_rs()
         };
         // The wrong power domain.
-        let m = notes(&[("P0.00", PinFunction::UsartTx(20)), ("P1.05", PinFunction::UsartRx(20))]);
+        let m = notes(&[
+            ("P0.00", PinFunction::UsartTx(20)),
+            ("P1.05", PinFunction::UsartRx(20)),
+        ]);
         assert!(
             m.contains("UARTE20 TXD is on P0.00, which the nRF54L15 cannot use for it: SERIAL20 reaches P1 only."),
             "{m}"
         );
         assert!(!m.contains("UARTE20 RXD is on"), "P1.05 is P1's own:\n{m}");
         // SERIAL00 on a P2 pin that is not one of its dedicated ones.
-        let m = notes(&[("P2.03", PinFunction::UsartTx(0)), ("P2.07", PinFunction::UsartRx(0))]);
+        let m = notes(&[
+            ("P2.03", PinFunction::UsartTx(0)),
+            ("P2.07", PinFunction::UsartRx(0)),
+        ]);
         assert!(m.contains("UARTE0 TXD is on P2.03, which the nRF54L15 cannot use for it: SERIAL00 reaches only its dedicated P2 pins - P2.02 or P2.08"), "{m}");
-        assert!(!m.contains("UARTE0 RXD is on"), "P2.07 is a dedicated RXD pin:\n{m}");
+        assert!(
+            !m.contains("UARTE0 RXD is on"),
+            "P2.07 is a dedicated RXD pin:\n{m}"
+        );
         // SERIAL20 on its own cross-domain P2 pin: Constant Latency only.
-        let m = notes(&[("P2.02", PinFunction::UsartTx(20)), ("P2.07", PinFunction::UsartRx(20))]);
+        let m = notes(&[
+            ("P2.02", PinFunction::UsartTx(20)),
+            ("P2.07", PinFunction::UsartRx(20)),
+        ]);
         assert!(m.contains("UARTE20 TXD is on P2.02, which the nRF54L15 cannot use for it: a cross-domain pin SERIAL20 reaches only in Constant Latency mode"), "{m}");
         assert!(m.contains("UARTE20 RXD is on P2.07, which the nRF54L15 cannot use for it: SERIAL20 reaches P1, and on P2 only P2.00"), "{m}");
         // TWIM on P2 has no pin at all, and SCL off a clock pin.
-        let m = notes(&[("P2.06", PinFunction::I2cScl(21)), ("P1.10", PinFunction::I2cScl(22)), ("P1.12", PinFunction::I2cSda(22))]);
+        let m = notes(&[
+            ("P2.06", PinFunction::I2cScl(21)),
+            ("P1.10", PinFunction::I2cScl(22)),
+            ("P1.12", PinFunction::I2cSda(22)),
+        ]);
         assert!(m.contains("TWIM21 SCL is on P2.06, which the nRF54L15 cannot use for it: SERIAL21 reaches P1 only."), "{m}");
-        assert!(m.contains("TWIM22 SCL is on P1.10, which the nRF54L15 cannot use for it: not a clock pin"), "{m}");
-        assert!(!m.contains("TWIM22 SDA is on"), "SDA needs no clock pin:\n{m}");
+        assert!(
+            m.contains(
+                "TWIM22 SCL is on P1.10, which the nRF54L15 cannot use for it: not a clock pin"
+            ),
+            "{m}"
+        );
+        assert!(
+            !m.contains("TWIM22 SDA is on"),
+            "SDA needs no clock pin:\n{m}"
+        );
         // The kit's own wiring has nothing to say.
         for dir in ["eide_nrf54l15_dk_check", "eide_nrf54l15_dk_async_check"] {
-            assert!(!main(dir).contains("cannot use for it"), "{dir}:\n{}", main(dir));
+            assert!(
+                !main(dir).contains("cannot use for it"),
+                "{dir}:\n{}",
+                main(dir)
+            );
         }
     }
 
@@ -1205,7 +1599,12 @@ mod tests {
             }
             if !b.every_pad.is_empty() {
                 for p in pads.iter().filter(|p| !p.reserved) {
-                    assert!(p.note.starts_with(b.every_pad), "{}: {} misses it", b.id, p.name);
+                    assert!(
+                        p.note.starts_with(b.every_pad),
+                        "{}: {} misses it",
+                        b.id,
+                        p.name
+                    );
                 }
             }
         }
@@ -1236,7 +1635,12 @@ mod tests {
             let mut seen = std::collections::BTreeSet::new();
             let mut numbers = std::collections::BTreeSet::new();
             for p in mcu.iter_all_pins() {
-                assert!(numbers.insert(p.number), "{}: pad {} twice", def.id, p.number);
+                assert!(
+                    numbers.insert(p.number),
+                    "{}: pad {} twice",
+                    def.id,
+                    p.number
+                );
                 // The USB balls are no GPIO: they offer their USB role only.
                 if p.name.starts_with("USB ") {
                     assert!(c.usbd, "{}: USB pads on a part without USBD", def.id);
@@ -1253,7 +1657,12 @@ mod tests {
                 let pp = super::super::nrf::nrf_pin(&p.name)
                     .unwrap_or_else(|| panic!("{}: {} names no pin", def.id, p.name));
                 assert!(seen.insert(pp), "{}: {:?} twice", def.id, pp);
-                assert!(pp.0 == 0 || c.p1, "{}: {} on a part without P1", def.id, p.name);
+                assert!(
+                    pp.0 == 0 || c.p1,
+                    "{}: {} on a part without P1",
+                    def.id,
+                    p.name
+                );
                 for f in &p.available_functions {
                     let ok = match f {
                         PinFunction::UsartTx(i)

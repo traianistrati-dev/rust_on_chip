@@ -471,7 +471,11 @@ impl MqttConfig {
     /// The name the certificate is checked against and sent as SNI.
     pub fn tls_name(&self) -> &str {
         let name = self.server_name.trim();
-        if name.is_empty() { self.host.trim() } else { name }
+        if name.is_empty() {
+            self.host.trim()
+        } else {
+            name
+        }
     }
 }
 
@@ -558,10 +562,14 @@ pub fn client_key(pem_text: &str) -> Result<ClientKey, &'static str> {
         return Err("no key yet");
     }
     if pem_text.contains("ENCRYPTED") || pem_text.contains("Proc-Type:") {
-        return Err("an encrypted key - the board needs it in the clear (openssl ec -in key.pem -out plain.pem)");
+        return Err(
+            "an encrypted key - the board needs it in the clear (openssl ec -in key.pem -out plain.pem)",
+        );
     }
     if pem_text.contains("BEGIN RSA PRIVATE KEY") {
-        return Err("an RSA key - the board signs with P-256 only: make a P-256 key and a CSR (Generate key + CSR)");
+        return Err(
+            "an RSA key - the board signs with P-256 only: make a P-256 key and a CSR (Generate key + CSR)",
+        );
     }
     let label = pem::key_label(p);
     let mut der = vec![0u8; pem::pem_len(p, label, false)];
@@ -569,7 +577,9 @@ pub fn client_key(pem_text: &str) -> Result<ClientKey, &'static str> {
         return Err("not a PEM key - BEGIN EC PRIVATE KEY or BEGIN PRIVATE KEY, END line included");
     }
     pem::pem_decode(p, label, false, &mut der);
-    pem::ec_key(&der).ok_or("not a P-256 key - the board signs with P-256 only (an RSA or other curve key will not do)")
+    pem::ec_key(&der).ok_or(
+        "not a P-256 key - the board signs with P-256 only (an RSA or other curve key will not do)",
+    )
 }
 
 /// A client certificate from secrets.rs (PEM): its DER, what it says, and its
@@ -596,7 +606,10 @@ pub fn unescape_pem(text: &str) -> String {
     if text.contains('\n') || !text.contains("\\n") {
         return text.trim().to_owned();
     }
-    text.replace("\\n", "\n").trim().trim_matches('"').to_owned()
+    text.replace("\\n", "\n")
+        .trim()
+        .trim_matches('"')
+        .to_owned()
 }
 
 /// The first PEM certificate's DER - as the firmware's `pem_to_der` reads it.
@@ -675,9 +688,15 @@ pub fn ca_summary(pem: &str) -> Result<CaSummary, &'static str> {
     let mut rdns = subject;
     while let Some((_, set, next)) = der(rdns) {
         rdns = next;
-        let Some((_, atv, _)) = der(set) else { continue };
-        let Some((0x06, oid, value)) = der(atv) else { continue };
-        let Some((_, text, _)) = der(value) else { continue };
+        let Some((_, atv, _)) = der(set) else {
+            continue;
+        };
+        let Some((0x06, oid, value)) = der(atv) else {
+            continue;
+        };
+        let Some((_, text, _)) = der(value) else {
+            continue;
+        };
         let text = String::from_utf8_lossy(text).into_owned();
         if oid == OID_CN {
             cn = Some(text);
@@ -710,7 +729,9 @@ pub fn ca_summary(pem: &str) -> Result<CaSummary, &'static str> {
     {
         while let Some((_, extension, next)) = der(list) {
             list = next;
-            let Some((0x06, oid, mut value)) = der(extension) else { continue };
+            let Some((0x06, oid, mut value)) = der(extension) else {
+                continue;
+            };
             if oid != [0x55, 0x1D, 0x13] {
                 continue;
             }
@@ -726,7 +747,13 @@ pub fn ca_summary(pem: &str) -> Result<CaSummary, &'static str> {
         }
     }
     let more = pem.matches("-----BEGIN CERTIFICATE-----").count() > 1;
-    Ok(CaSummary { name, not_after, is_ca, key, more })
+    Ok(CaSummary {
+        name,
+        not_after,
+        is_ca,
+        key,
+        more,
+    })
 }
 
 /// What is wrong with the TLS settings. `None` = fine.
@@ -744,7 +771,9 @@ pub fn tls_problem(m: &MqttConfig) -> Option<&'static str> {
         return Some("longer than 64 bytes - embedded-tls cannot check a name that long");
     }
     if m.port == PLAIN_PORT {
-        return Some("1883 is MQTT without TLS - TLS brokers listen on 8883 (test.mosquitto.org: 8886)");
+        return Some(
+            "1883 is MQTT without TLS - TLS brokers listen on 8883 (test.mosquitto.org: 8886)",
+        );
     }
     let host = m.host.trim();
     if host == "broker.hivemq.com" {
@@ -754,9 +783,18 @@ pub fn tls_problem(m: &MqttConfig) -> Option<&'static str> {
         return Some("Azure IoT Hub speaks MQTT 3.1.1, and rust-mqtt only MQTT 5");
     }
     if aws_iot_host(host) && !m.client_cert {
-        return Some("AWS IoT takes a board only by its client certificate: switch \"Client certificate\" on");
+        return Some(
+            "AWS IoT takes a board only by its client certificate: switch \"Client certificate\" on",
+        );
     }
     None
+}
+
+/// Does MQTT over TLS on `family` draw its keys from a hardware TRNG the
+/// Pico's link drives itself? The RP2350's (the Pico 2 W); the RP2040 has
+/// only its ring oscillator. The ESPs' TRNG goes through esp-hal instead.
+pub fn tls_trng(family: &str) -> bool {
+    family == "rp235x"
 }
 
 /// An AWS IoT Core data endpoint: `<prefix>-ats.iot.<region>.amazonaws.com`
@@ -767,7 +805,9 @@ pub fn aws_iot_host(host: &str) -> bool {
         .strip_suffix(".amazonaws.com")
         .or_else(|| host.strip_suffix(".amazonaws.com.cn"));
     rest.and_then(|r| r.rsplit_once(".iot."))
-        .is_some_and(|(prefix, region)| !prefix.is_empty() && !region.is_empty() && !region.contains('.'))
+        .is_some_and(|(prefix, region)| {
+            !prefix.is_empty() && !region.is_empty() && !region.contains('.')
+        })
 }
 
 /// AWS IoT on port 443 takes MQTT with a client certificate only when the
@@ -800,7 +840,13 @@ pub fn panic_topic(m: &MqttConfig) -> String {
     let id: String = m
         .client_id
         .chars()
-        .map(|c| if matches!(c, '+' | '#') || c.is_control() { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '+' | '#') || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let mut id = id
         .trim()
@@ -994,9 +1040,7 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     let station = mcu.iot.wifi && wifi.is_some();
     let esp_now = mcu.iot.esp_now.is_some() && ESP_WIFI.contains(&mcu.family.as_str());
     let ble = mcu.iot.ble.is_some() && bt.is_some() && !nrf_ble_blocked_by_usb(mcu);
-    let thread = mcu.iot.thread.is_some()
-        && thread_platform(&mcu.family)
-        && !thread_blocked(mcu);
+    let thread = mcu.iot.thread.is_some() && thread_platform(&mcu.family) && !thread_blocked(mcu);
     if !station && !esp_now && !ble && !thread {
         return None;
     }
@@ -1010,7 +1054,13 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
         mqtt: station && mcu.iot.mqtt.as_ref().is_some_and(|m| !m.tls || tls_ok),
         mqtt_tls: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls) && tls_ok,
         mqtt_p384: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls && m.p384) && tls_ok,
-        mqtt_client_cert: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls && m.client_cert) && tls_ok,
+        mqtt_client_cert: station
+            && mcu
+                .iot
+                .mqtt
+                .as_ref()
+                .is_some_and(|m| m.tls && m.client_cert)
+            && tls_ok,
         sntp: station && mcu.iot.sntp.is_some(),
         ble,
         thread,
@@ -1027,8 +1077,12 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
 ///   TLS's 30 KB; the C2 overflows its DRAM by 41 KB).
 pub fn tls_available(family: &str, coex: bool) -> Result<(), &'static str> {
     match family {
-        "esp32c5" | "esp32c61" => Err("no TRNG in esp-hal 1.1 on this chip, and TLS's keys need one"),
-        "esp32" | "esp32c2" if coex => Err("Bluetooth beside Wi-Fi leaves this chip no RAM for TLS"),
+        "esp32c5" | "esp32c61" => {
+            Err("no TRNG in esp-hal 1.1 on this chip, and TLS's keys need one")
+        }
+        "esp32" | "esp32c2" if coex => {
+            Err("Bluetooth beside Wi-Fi leaves this chip no RAM for TLS")
+        }
         _ => Ok(()),
     }
 }
@@ -1226,9 +1280,9 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         Link::Thread if family == "nrf54l15" => NotHere(
             "embassy-nrf 0.11 has no 802.15.4 driver for the nRF54L, and OpenThread ships no prebuilt for its target",
         ),
-        Link::Thread if family == "nrf5340" => NotHere(
-            "the 802.15.4 radio is on the network core, which this IDE does not generate",
-        ),
+        Link::Thread if family == "nrf5340" => {
+            NotHere("the 802.15.4 radio is on the network core, which this IDE does not generate")
+        }
         Link::Thread if family.starts_with("stm32wb") => NotHere(
             "the WB55 / WB35 radio runs Thread inside ST's co-processor firmware, reached through embassy-stm32-wpan - not published on crates.io (the WB15 / WB10 have no 802.15.4)",
         ),
@@ -1293,13 +1347,25 @@ mod tests {
         let info = csr::request_info(&subject, &point);
         let request = csr::request(&info, &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]);
         // CertificationRequest { info, algorithm, signature }
-        let (0x30, body, len) = pem::der_at(&request, 0).unwrap() else { panic!() };
+        let (0x30, body, len) = pem::der_at(&request, 0).unwrap() else {
+            panic!()
+        };
         assert_eq!(body + len, request.len());
-        let (0x30, info_at, info_len) = pem::der_at(&request, body).unwrap() else { panic!() };
+        let (0x30, info_at, info_len) = pem::der_at(&request, body).unwrap() else {
+            panic!()
+        };
         assert_eq!(&request[body..info_at + info_len], &info[..]);
-        let (0x30, alg, alg_len) = pem::der_at(&request, info_at + info_len).unwrap() else { panic!() };
-        assert_eq!(&request[alg..alg + alg_len], &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02], "no parameters");
-        let (0x03, bits, _) = pem::der_at(&request, alg + alg_len).unwrap() else { panic!() };
+        let (0x30, alg, alg_len) = pem::der_at(&request, info_at + info_len).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            &request[alg..alg + alg_len],
+            &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02],
+            "no parameters"
+        );
+        let (0x03, bits, _) = pem::der_at(&request, alg + alg_len).unwrap() else {
+            panic!()
+        };
         assert_eq!(request[bits], 0);
         // The info: version 0, the name (long form past 127 bytes), the key, [0] empty.
         assert_eq!(&info[..2], &[0x30, 0x81]);
@@ -1310,16 +1376,37 @@ mod tests {
         let pem_text = csr::to_pem("EC PRIVATE KEY", &csr::sec1_key(&d, &point));
         assert_eq!(client_key(&pem_text).unwrap(), (d, Some(point)));
         assert_eq!(pem_text, test_pki::KEY_SEC1, "openssl writes the same");
-        assert!(csr::Subject { country: "ROU", organization: "", common_name: "x" }.problem().is_some());
-        assert!(csr::Subject { country: "", organization: "", common_name: " " }.problem().is_some());
+        assert!(
+            csr::Subject {
+                country: "ROU",
+                organization: "",
+                common_name: "x"
+            }
+            .problem()
+            .is_some()
+        );
+        assert!(
+            csr::Subject {
+                country: "",
+                organization: "",
+                common_name: " "
+            }
+            .problem()
+            .is_some()
+        );
     }
 
     /// AWS IoT's data endpoints, not every amazonaws.com host.
     #[test]
     fn aws_iot_hosts_are_told_apart() {
-        assert!(aws_iot_host("a1b2c3d4e5f6g7-ats.iot.eu-central-1.amazonaws.com"));
+        assert!(aws_iot_host(
+            "a1b2c3d4e5f6g7-ats.iot.eu-central-1.amazonaws.com"
+        ));
         assert!(aws_iot_host("A1B2-ats.iot.cn-north-1.amazonaws.com.cn"));
-        assert!(!aws_iot_host("b-1234.mq.eu-central-1.amazonaws.com"), "Amazon MQ");
+        assert!(
+            !aws_iot_host("b-1234.mq.eu-central-1.amazonaws.com"),
+            "Amazon MQ"
+        );
         assert!(!aws_iot_host("iot.eu-central-1.amazonaws.com"));
         assert!(!aws_iot_host("test.mosquitto.org"));
         let mut m = MqttConfig {
@@ -1350,8 +1437,19 @@ mod tests {
         assert_eq!(point, cert_point, "the certificate is the key's");
         assert_eq!(point8, cert_point);
         assert!(client_key("").unwrap_err().contains("no key"));
-        assert!(client_key("-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----").unwrap_err().contains("RSA"));
-        assert!(client_key(&sec1.replace("-----BEGIN EC PRIVATE KEY-----\n", "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n")).unwrap_err().contains("encrypted"));
+        assert!(
+            client_key("-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----")
+                .unwrap_err()
+                .contains("RSA")
+        );
+        assert!(
+            client_key(&sec1.replace(
+                "-----BEGIN EC PRIVATE KEY-----\n",
+                "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n"
+            ))
+            .unwrap_err()
+            .contains("encrypted")
+        );
         assert!(client_cert(" ").unwrap_err().contains("no certificate"));
         // The AWS CLI's JSON form.
         let json = cert.trim().replace('\n', "\\n");
@@ -1360,7 +1458,6 @@ mod tests {
         let two = format!("{cert}\n{cert}");
         assert_eq!(cas_der(&two).unwrap().len(), 2 * der.len());
     }
-
 
     /// The report's topic is always a topic name a `Message` can carry.
     #[test]
@@ -1380,7 +1477,10 @@ mod tests {
         assert_eq!(topic("/$SYS/x"), "SYS/x/panic");
         assert_eq!(topic(" /$share/g/t"), "share/g/t/panic");
         let long = topic(&"é".repeat(60));
-        assert!(long.len() <= MAX_TOPIC && long.ends_with("/panic"), "{long}");
+        assert!(
+            long.len() <= MAX_TOPIC && long.ends_with("/panic"),
+            "{long}"
+        );
         for id in ["", "a+b#c", "$SYS", "/x/", &"z".repeat(90)] {
             let t = topic(id);
             assert!(t.len() <= MAX_TOPIC, "{t}");
@@ -1403,11 +1503,24 @@ mod tests {
     #[test]
     fn wifi_follows_the_radio() {
         for chip in ESP_WIFI {
-            assert_eq!(availability(Link::Wifi, chip, false), Availability::Ready, "{chip}");
+            assert_eq!(
+                availability(Link::Wifi, chip, false),
+                Availability::Ready,
+                "{chip}"
+            );
         }
-        assert!(matches!(availability(Link::Wifi, "esp32h2", false), Availability::NotHere(_)));
-        assert!(matches!(availability(Link::Wifi, "nrf52840", false), Availability::NotHere(_)));
-        assert!(matches!(availability(Link::Wifi, "stm32f1", false), Availability::NotHere(_)));
+        assert!(matches!(
+            availability(Link::Wifi, "esp32h2", false),
+            Availability::NotHere(_)
+        ));
+        assert!(matches!(
+            availability(Link::Wifi, "nrf52840", false),
+            Availability::NotHere(_)
+        ));
+        assert!(matches!(
+            availability(Link::Wifi, "stm32f1", false),
+            Availability::NotHere(_)
+        ));
     }
 
     /// The RP family carries Wi-Fi only on a W board: the radio is beside the
@@ -1417,7 +1530,10 @@ mod tests {
         assert_eq!(platform("rp2040", true), Some(Platform::Cyw43));
         assert_eq!(platform("rp235x", true), Some(Platform::Cyw43));
         assert_eq!(platform("rp2040", false), None);
-        assert!(matches!(availability(Link::Wifi, "rp235x", false), Availability::NotHere(_)));
+        assert!(matches!(
+            availability(Link::Wifi, "rp235x", false),
+            Availability::NotHere(_)
+        ));
     }
 
     /// A WL_LED pad on something that is not an RP is not a CYW43.
@@ -1431,7 +1547,9 @@ mod tests {
     /// `ble_platform` has a radio for it, nothing else.
     #[test]
     fn only_generated_links_are_ready() {
-        for family in ["esp32", "esp32s2", "esp32c6", "esp32h2", "rp2040", "nrf52840", "nrf5340", "stm32f1"] {
+        for family in [
+            "esp32", "esp32s2", "esp32c6", "esp32h2", "rp2040", "nrf52840", "nrf5340", "stm32f1",
+        ] {
             for link in Link::ALL {
                 let a = availability(link, family, family == "rp2040");
                 let cyw43 = family == "rp2040";
@@ -1462,12 +1580,18 @@ mod tests {
     fn the_tab_lists_only_what_the_chip_can_carry() {
         use Link::*;
         assert!(links_for("stm32f1", false).is_empty());
-        assert!(links_for("rp2040", false).is_empty(), "a Pico without the W");
+        assert!(
+            links_for("rp2040", false).is_empty(),
+            "a Pico without the W"
+        );
         assert_eq!(links_for("rp2040", true), [Wifi, Ble, BleMesh]);
         assert_eq!(links_for("rp235x", true), [Wifi, Ble, BleMesh]);
         assert_eq!(links_for("nrf52832", false), [Ble, BleMesh]);
         assert_eq!(links_for("nrf52840", false), [Ble, Thread, BleMesh, Zigbee]);
-        assert_eq!(links_for("esp32c3", false), [Wifi, EspNow, Ble, BleMesh, EspWifiMesh]);
+        assert_eq!(
+            links_for("esp32c3", false),
+            [Wifi, EspNow, Ble, BleMesh, EspWifiMesh]
+        );
         assert_eq!(links_for("esp32s2", false), [Wifi, EspNow, EspWifiMesh]);
         assert_eq!(links_for("esp32h2", false), [Ble, Thread, BleMesh, Zigbee]);
         assert_eq!(
@@ -1485,10 +1609,10 @@ mod tests {
     #[test]
     fn a_listed_link_never_says_the_chip_lacks_its_radio() {
         for family in [
-            "esp32", "esp32s2", "esp32s3", "esp32c2", "esp32c3", "esp32c5", "esp32c6",
-            "esp32c61", "esp32h2", "rp2040", "rp235x", "nrf52805", "nrf52810", "nrf52811",
-            "nrf52820", "nrf52832", "nrf52833", "nrf52840", "nrf5340", "nrf54l15", "stm32wb",
-            "stm32wba", "stm32wl", "stm32wl3", "stm32f1",
+            "esp32", "esp32s2", "esp32s3", "esp32c2", "esp32c3", "esp32c5", "esp32c6", "esp32c61",
+            "esp32h2", "rp2040", "rp235x", "nrf52805", "nrf52810", "nrf52811", "nrf52820",
+            "nrf52832", "nrf52833", "nrf52840", "nrf5340", "nrf54l15", "stm32wb", "stm32wba",
+            "stm32wl", "stm32wl3", "stm32f1",
         ] {
             for cyw43 in [false, true] {
                 for link in links_for(family, cyw43) {
@@ -1510,9 +1634,9 @@ mod tests {
     #[test]
     fn everything_generated_is_listed() {
         for family in [
-            "esp32", "esp32s2", "esp32s3", "esp32c2", "esp32c3", "esp32c5", "esp32c6",
-            "esp32c61", "esp32h2", "rp2040", "rp235x", "nrf52832", "nrf52833", "nrf52840",
-            "nrf5340", "nrf54l15", "stm32f1",
+            "esp32", "esp32s2", "esp32s3", "esp32c2", "esp32c3", "esp32c5", "esp32c6", "esp32c61",
+            "esp32h2", "rp2040", "rp235x", "nrf52832", "nrf52833", "nrf52840", "nrf5340",
+            "nrf54l15", "stm32f1",
         ] {
             for cyw43 in [false, true] {
                 for link in Link::ALL {
@@ -1530,7 +1654,12 @@ mod tests {
         assert_eq!(mac, [0x24, 0x6F, 0x28, 0xAA, 0xBB, 0x01]);
         assert_eq!(fmt_mac(&mac), "24:6F:28:AA:BB:01");
         assert_eq!(parse_mac("24-6F-28-AA-BB-01"), Some(mac));
-        for bad in ["24:6F:28:AA:BB", "24:6F:28:AA:BB:0G", "246F28AABB01", "24:6F:28:AA:BB:001"] {
+        for bad in [
+            "24:6F:28:AA:BB",
+            "24:6F:28:AA:BB:0G",
+            "246F28AABB01",
+            "24:6F:28:AA:BB:001",
+        ] {
             assert_eq!(parse_mac(bad), None, "{bad}");
         }
         assert!(peer_problem(&[0xFF; 6]).is_some());
@@ -1579,7 +1708,10 @@ mod tests {
         assert_eq!(s.channel, Some(25));
         assert_eq!(s.pan_id, Some(0x0fd8));
         assert_eq!(s.network_name.as_deref(), Some("NEST-PAN-0FD8"));
-        assert_eq!(s.ext_pan_id, Some([0xb5, 0x66, 0x14, 0x7d, 0x38, 0xe3, 0x84, 0x20]));
+        assert_eq!(
+            s.ext_pan_id,
+            Some([0xb5, 0x66, 0x14, 0x7d, 0x38, 0xe3, 0x84, 0x20])
+        );
         assert!(s.has_network_key);
         assert!(s.mesh_local_prefix.is_some());
         // Upper case and surrounding blanks are what a terminal copy gives.
@@ -1587,9 +1719,18 @@ mod tests {
 
         assert_eq!(decode_dataset(""), Err("empty"));
         assert!(decode_dataset("0e08zz").is_err(), "not hex");
-        assert!(decode_dataset(&EXAMPLE[..EXAMPLE.len() - 1]).is_err(), "odd");
-        assert!(decode_dataset(&EXAMPLE[..EXAMPLE.len() - 2]).is_err(), "cut short");
-        assert!(decode_dataset(&"00".repeat(MAX_DATASET_BYTES + 1)).is_err(), "too long");
+        assert!(
+            decode_dataset(&EXAMPLE[..EXAMPLE.len() - 1]).is_err(),
+            "odd"
+        );
+        assert!(
+            decode_dataset(&EXAMPLE[..EXAMPLE.len() - 2]).is_err(),
+            "cut short"
+        );
+        assert!(
+            decode_dataset(&"00".repeat(MAX_DATASET_BYTES + 1)).is_err(),
+            "too long"
+        );
         // A channel alone has no key to attach with.
         assert_eq!(decode_dataset("000300000f"), Err("no network key in it"));
         // What OpenThread refuses, or cannot attach with, is refused here too.
@@ -1632,7 +1773,10 @@ mod tests {
     fn thread_takes_the_radio_only_without_bluetooth() {
         use crate::panels::mcu_module::builtins::builtin_definitions;
         let build = |id: &str| {
-            let def = builtin_definitions().into_iter().find(|d| d.id == id).unwrap();
+            let def = builtin_definitions()
+                .into_iter()
+                .find(|d| d.id == id)
+                .unwrap();
             let mut m = def.build_mcu();
             m.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
             m.iot.thread = Some(ThreadConfig::default());
@@ -1665,7 +1809,10 @@ mod tests {
     fn thread_on_an_esp_takes_the_radio_alone() {
         use crate::panels::mcu_module::builtins::builtin_definitions;
         let build = |id: &str| {
-            let def = builtin_definitions().into_iter().find(|d| d.id == id).unwrap();
+            let def = builtin_definitions()
+                .into_iter()
+                .find(|d| d.id == id)
+                .unwrap();
             let mut m = def.build_mcu();
             m.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
             m.iot.thread = Some(ThreadConfig::default());
@@ -1674,9 +1821,15 @@ mod tests {
         for id in ["esp32c6", "esp32h2", "esp32c5"] {
             let m = build(id);
             let a = active(&m).unwrap_or_else(|| panic!("{id}: Thread alone"));
-            assert!(a.thread && !a.station && !a.ble && !a.esp_now, "{id}: {a:?}");
+            assert!(
+                a.thread && !a.station && !a.ble && !a.esp_now,
+                "{id}: {a:?}"
+            );
             assert_eq!(a.platform, Platform::Esp, "{id}");
-            assert_eq!(availability(Link::Thread, &m.family, false), Availability::Ready);
+            assert_eq!(
+                availability(Link::Thread, &m.family, false),
+                Availability::Ready
+            );
         }
         let mut c6 = build("esp32c6");
         c6.iot.wifi = true;
@@ -1717,14 +1870,20 @@ mod tests {
         assert!(ca_summary("hello").is_err());
         // A non-ASCII time is refused, never sliced through a character.
         let der = pem_der(pem).unwrap();
-        let at = der.windows(13).position(|w| w == b"350604110438Z").expect("notAfter");
+        let at = der
+            .windows(13)
+            .position(|w| w == b"350604110438Z")
+            .expect("notAfter");
         let mut bent = der.clone();
         bent[at..at + 2].copy_from_slice("é".as_bytes());
         let b64 = {
             const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             let mut s = String::new();
             for c in bent.chunks(3) {
-                let n = c.iter().enumerate().fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+                let n = c
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
                 for i in 0..=c.len() {
                     s.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
                 }
@@ -1733,7 +1892,9 @@ mod tests {
         };
         let pem_bent = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
         assert!(ca_summary(&pem_bent).is_err());
-        assert!(ca_summary("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----").is_err());
+        assert!(
+            ca_summary("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----").is_err()
+        );
     }
 
     /// TLS's settings: the port follows the switch only from its default,
@@ -1741,7 +1902,11 @@ mod tests {
     #[test]
     fn tls_settings_follow_the_switch() {
         let mut m = MqttConfig::default();
-        assert_eq!(m.port_for_tls(true), 8886, "test.mosquitto.org's Let's Encrypt port");
+        assert_eq!(
+            m.port_for_tls(true),
+            8886,
+            "test.mosquitto.org's Let's Encrypt port"
+        );
         m.host = "broker.example.org".into();
         assert_eq!(m.port_for_tls(true), TLS_PORT);
         m.port = 8883;
@@ -1790,11 +1955,17 @@ mod tests {
     /// A project saved before Thread existed reads with Thread off.
     #[test]
     fn a_config_without_thread_still_reads() {
-        let old: IotConfig = ron::from_str("(wifi: true, ble: Some((device_name: \"x\")))").unwrap();
+        let old: IotConfig =
+            ron::from_str("(wifi: true, ble: Some((device_name: \"x\")))").unwrap();
         assert_eq!(old.thread, None);
-        let back: IotConfig =
-            ron::from_str(&ron::to_string(&IotConfig { thread: Some(ThreadConfig { udp_port: 5683 }), ..old.clone() }).unwrap())
-                .unwrap();
+        let back: IotConfig = ron::from_str(
+            &ron::to_string(&IotConfig {
+                thread: Some(ThreadConfig { udp_port: 5683 }),
+                ..old.clone()
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(back.thread, Some(ThreadConfig { udp_port: 5683 }));
     }
 

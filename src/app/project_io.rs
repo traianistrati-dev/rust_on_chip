@@ -153,7 +153,10 @@ impl AppIde {
             mcu.flash_store = cfg.as_deref().and_then(mcu_config::parse_flashstore);
             // The IoT tab too: Wi-Fi switched on in the last project must not
             // generate network code in this one.
-            mcu.iot = cfg.as_deref().map(mcu_config::parse_iot).unwrap_or_default();
+            mcu.iot = cfg
+                .as_deref()
+                .map(mcu_config::parse_iot)
+                .unwrap_or_default();
         }
 
         // ── Restore pin state from mcu.config and src/main.rs ────────────────

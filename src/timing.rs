@@ -188,6 +188,12 @@ pub fn resolve(text: &str, r: &TimingRegion) -> Result<(TimingRegion, Placement)
         ..r.clone()
     };
     let p = place(text, &moved)?;
+    if r.whole_fn && p.loop_body.is_some() {
+        return Err(format!(
+            "{}: `{}` now never returns (it ends in an endless loop) - mark it again",
+            r.file, r.func
+        ));
+    }
     if !r.func.is_empty() && (p.func != r.func || p.lines != (first, last)) {
         return Err(format!(
             "{}: the code timed in `{}` (lines {}-{}) has changed - mark it again",
@@ -201,8 +207,27 @@ pub fn resolve(text: &str, r: &TimingRegion) -> Result<(TimingRegion, Placement)
 /// exactly the same way when Measure looks for it again. A statement that
 /// shares a line with a block's brace or with another statement cannot be:
 /// the lines stored for it place differently a second time.
+///
+/// A whole function or closure that ends in an endless `loop` - an embassy
+/// task, `fn main() -> !` - never returns, so its own time never ends and its
+/// row would stay empty: one pass of that loop is marked instead, as
+/// statements (the caller sees `whole_fn` turned off).
 pub fn mark(text: &str, asked: TimingRegion) -> Result<(TimingRegion, Placement), String> {
     let placed = place(text, &asked)?;
+    if asked.whole_fn
+        && let Some((first, last)) = placed.loop_body
+    {
+        return mark(
+            text,
+            TimingRegion {
+                whole_fn: false,
+                first,
+                last,
+                col: 0,
+                ..asked
+            },
+        );
+    }
     let region = anchored(text, asked, &placed);
     match resolve(text, &region) {
         Ok((_, again)) if again == placed => Ok((region, placed)),
@@ -536,6 +561,127 @@ pub struct Placement {
     /// The region awaits: what it measures is wall time, other tasks
     /// included.
     pub awaits: bool,
+    /// A whole function or closure that ends in an endless `loop` (an
+    /// embassy task, `fn main() -> !`): the lines of that loop's statements.
+    /// Its time never ends, so [`mark`] times one pass of the loop instead.
+    pub loop_body: Option<(u32, u32)>,
+}
+
+/// The endless `loop` that `stmts` end in - one with no `break` out of it, no
+/// `return` and no `?`, also inside a macro's arguments -: `Some(Ok(lines))`
+/// of its statements, `Some(Err(why))` when one pass of it cannot be timed
+/// (empty, or statements on a line of its braces: they would place as the
+/// whole loop), `None` when they end otherwise.
+fn endless_loop_body(stmts: &[syn::Stmt]) -> Option<Result<(u32, u32), &'static str>> {
+    use syn::spanned::Spanned;
+    use syn::visit::Visit;
+    struct Exits {
+        label: Option<String>,
+        /// Loops entered inside it: an unlabeled `break` there leaves them.
+        depth: usize,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Exits {
+        fn visit_expr_break(&mut self, b: &'ast syn::ExprBreak) {
+            match &b.label {
+                Some(l) => {
+                    self.found |= self.label.as_deref() == Some(l.ident.to_string().as_str())
+                }
+                None => self.found |= self.depth == 0,
+            }
+            syn::visit::visit_expr_break(self, b);
+        }
+        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+            self.found = true;
+        }
+        fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
+            self.found = true;
+        }
+        fn visit_expr_loop(&mut self, l: &'ast syn::ExprLoop) {
+            self.depth += 1;
+            syn::visit::visit_expr_loop(self, l);
+            self.depth -= 1;
+        }
+        fn visit_expr_while(&mut self, w: &'ast syn::ExprWhile) {
+            self.depth += 1;
+            syn::visit::visit_expr_while(self, w);
+            self.depth -= 1;
+        }
+        fn visit_expr_for_loop(&mut self, f: &'ast syn::ExprForLoop) {
+            self.depth += 1;
+            syn::visit::visit_expr_for_loop(self, f);
+            self.depth -= 1;
+        }
+        // Their own `return` / `?` / `break` leave them, not the loop.
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
+        // `info!("{}", read()?)`: what a macro's arguments do is in its
+        // tokens. A `?`, `return` or `break` there may leave the loop - and
+        // a format string is one literal, so `{:?}` is not one.
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            fn exits(tokens: proc_macro2::TokenStream) -> bool {
+                tokens.into_iter().any(|t| match t {
+                    proc_macro2::TokenTree::Ident(i) => i == "return" || i == "break",
+                    proc_macro2::TokenTree::Punct(p) => p.as_char() == '?',
+                    proc_macro2::TokenTree::Group(g) => exits(g.stream()),
+                    proc_macro2::TokenTree::Literal(_) => false,
+                })
+            }
+            self.found |= exits(m.tokens.clone());
+        }
+    }
+    let last = stmts
+        .iter()
+        .rev()
+        .find(|s| !matches!(s, syn::Stmt::Item(_)))?;
+    let syn::Stmt::Expr(syn::Expr::Loop(l), _) = last else {
+        return None;
+    };
+    let mut exits = Exits {
+        label: l.label.as_ref().map(|l| l.name.ident.to_string()),
+        depth: 0,
+        found: false,
+    };
+    exits.visit_block(&l.body);
+    if exits.found {
+        return None;
+    }
+    let body: Vec<&syn::Stmt> = l
+        .body
+        .stmts
+        .iter()
+        .filter(|s| !matches!(s, syn::Stmt::Item(_)))
+        .collect();
+    let (Some(first), Some(last)) = (body.first(), body.last()) else {
+        return Some(Err("its loop is empty"));
+    };
+    let (first, last) = (
+        first.span().start().line as u32,
+        last.span().end().line as u32,
+    );
+    let (open, close) = (
+        l.body.brace_token.span.open().start().line as u32,
+        l.body.brace_token.span.close().start().line as u32,
+    );
+    if first <= open || last >= close {
+        return Some(Err(
+            "its loop's statements share a line with the loop's braces: put them on lines of their own to time one pass",
+        ));
+    }
+    Some(Ok((first, last)))
+}
+
+/// A whole body's placement: one pass of the endless loop it ends in, or why
+/// that loop makes it untimeable.
+fn whole_body(stmts: &[syn::Stmt], name: &str) -> Result<Option<(u32, u32)>, String> {
+    match endless_loop_body(stmts) {
+        None => Ok(None),
+        Some(Ok(lines)) => Ok(Some(lines)),
+        Some(Err(why)) => Err(format!(
+            "`{name}` never returns (it ends in an endless loop), and {why}"
+        )),
+    }
 }
 
 /// Where `r` goes in `text`: whole statements of the innermost block holding
@@ -740,7 +886,7 @@ impl Finder {
             Err(format!(
                 "`{name}` is a naked function: nothing can be timed in it"
             ))
-        } else if never {
+        } else if never && endless_loop_body(&body.stmts).is_none() {
             Err(format!(
                 concat!(
                     "`{}` never returns (`-> !`), so its time never ends - select the ",
@@ -748,6 +894,8 @@ impl Finder {
                 ),
                 name
             ))
+        } else if let Err(why) = whole_body(&body.stmts, &name) {
+            Err(why)
         } else {
             // Before the first statement that RUNS, not right after `{`:
             // past the body's inner attributes (`#![allow(..)]`, a guard in
@@ -767,6 +915,7 @@ impl Finder {
                 fn_col: sig.fn_token.span.start().column as u32,
                 lines: (sig_line as u32, close as u32),
                 awaits: sig.asyncness.is_some() || awaits(&body.stmts),
+                loop_body: whole_body(&body.stmts, &name).ok().flatten(),
             })
         });
     }
@@ -801,6 +950,7 @@ impl Finder {
                 ));
             }
         };
+        let loop_body = whole_body(&block.stmts, name)?;
         let at = match block
             .stmts
             .iter()
@@ -817,6 +967,7 @@ impl Finder {
             fn_col: start_col as u32,
             lines: (start as u32, close as u32),
             awaits: c.asyncness.is_some() || async_block || awaits(&block.stmts),
+            loop_body,
         })
     }
 
@@ -1052,6 +1203,7 @@ impl<'ast> syn::visit::Visit<'ast> for Finder {
                     fn_col,
                     lines: (s0.line as u32, s1.line as u32),
                     awaits: awaits(&b.stmts[first..=last]),
+                    loop_body: None,
                 }));
             }
         }
@@ -2283,8 +2435,19 @@ const K: u32 = { 1 + 2 };
         assert!(place(SRC, &r).unwrap().awaits);
         assert!(place(SRC, &region(11, 11)).unwrap().awaits);
         assert!(!place(SRC, &region(12, 12)).unwrap().awaits);
+        // `-> !` ending in a loop: one pass of the loop.
         r.first = 16;
-        assert!(place(SRC, &r).unwrap_err().contains("never returns"));
+        let (pass, p) = mark(SRC, r.clone()).unwrap();
+        assert!(!pass.whole_fn);
+        assert_eq!((p.func.as_str(), p.lines), ("main", (17, 17)));
+        // Without a loop to time it by, refused.
+        let mut never = region(1, 1);
+        never.whole_fn = true;
+        assert!(
+            place("fn halt() -> ! {\n    panic!()\n}\n", &never)
+                .unwrap_err()
+                .contains("never returns")
+        );
         // The loop body is fine.
         assert_eq!(place(SRC, &region(17, 17)).unwrap().func, "main");
         // Nothing in a const.
@@ -2768,6 +2931,69 @@ const K: u32 = { 1 + 2 };
     }
 
     #[test]
+    fn a_task_that_never_returns_is_timed_by_one_pass_of_its_loop() {
+        // The user's embassy tasks: set up, then loop for ever.
+        let src = "async fn tick() {\n    loop {\n        inc();\n        delay(999_990).await;\n    }\n}\nasync fn listen() {\n    let mut nav = Nav::new();\n    loop {\n        let e = next().await;\n        nav.feed(e);\n    }\n}\n";
+        for (line, lines, awaits) in [(1, (3, 4), true), (7, (10, 11), true)] {
+            let mut r = region(line, line);
+            r.whole_fn = true;
+            let (region, p) = mark(src, r).unwrap();
+            assert!(!region.whole_fn, "line {line}");
+            assert_eq!((p.lines, p.awaits), (lines, awaits));
+        }
+        // A loop that can end is no endless one: the function as a whole.
+        for body in [
+            "loop {\n        if done() {\n            break;\n        }\n    }",
+            "loop {\n        if done() {\n            return;\n        }\n    }",
+            "loop {\n        step()?;\n    }",
+            "'outer: loop {\n        loop {\n            break 'outer;\n        }\n    }",
+        ] {
+            let src = format!("fn f() -> Result<(), E> {{\n    {body}\n}}\n");
+            let mut r = region(1, 1);
+            r.whole_fn = true;
+            let (region, p) = mark(&src, r).unwrap();
+            assert!(region.whole_fn && p.loop_body.is_none(), "{body}");
+        }
+        // One pass that would place as the whole loop: refused, not marked.
+        for src in [
+            "fn main() -> ! {\n    init();\n    loop { step(); }\n}\n",
+            "fn main() -> ! {\n    loop {\n        a();\n        b(); }\n}\n",
+            "async fn t() {\n    loop {}\n}\n",
+        ] {
+            let mut r = region(1, 1);
+            r.whole_fn = true;
+            let e = mark(src, r).unwrap_err();
+            assert!(e.contains("never returns"), "{src}: {e}");
+        }
+        // A `?` inside a macro's arguments can leave the loop.
+        let src = "async fn poll() -> Result<(), E> {\n    loop {\n        info!(\"t = {:?}\", read().await?);\n        wait().await;\n    }\n}\n";
+        let mut r = region(1, 1);
+        r.whole_fn = true;
+        assert!(mark(src, r).unwrap().0.whole_fn);
+        let src = "async fn poll() {\n    loop {\n        info!(\"t = {:?}\", read().await);\n        wait().await;\n    }\n}\n";
+        let mut r = region(1, 1);
+        r.whole_fn = true;
+        assert!(!mark(src, r).unwrap().0.whole_fn, "`{{:?}}` is no `?`");
+        // A whole row whose function became endless: refused at Measure.
+        let finite = "fn f() {\n    loop {\n        g();\n        if done() {\n            break;\n        }\n    }\n}\n";
+        let mut r = region(1, 1);
+        r.whole_fn = true;
+        let row = mark(finite, r).unwrap().0;
+        assert!(row.whole_fn);
+        let endless = finite.replace("            break;\n", "            h();\n");
+        assert!(
+            resolve(&endless, &row)
+                .unwrap_err()
+                .contains("now never returns")
+        );
+        // An inner loop's own `break` does not leave the outer one.
+        let src = "fn f() {\n    loop {\n        loop {\n            break;\n        }\n        tick();\n    }\n}\n";
+        let mut r = region(1, 1);
+        r.whole_fn = true;
+        assert!(!mark(src, r).unwrap().0.whole_fn);
+    }
+
+    #[test]
     fn a_naked_function_is_refused() {
         for attr in ["#[naked]", "#[unsafe(naked)]"] {
             let src = format!(
@@ -2959,6 +3185,30 @@ const K: u32 = { 1 + 2 };
             }
         }
         assert!(closures > 0, "no closure with braces in {path}");
+    }
+
+    /// A REAL file's functions as "Time this function" marks them: a task that
+    /// never returns as one pass of its loop, every other one as itself.
+    /// `EIDE_TIMING_FILE`: a `.rs` file.
+    #[test]
+    #[ignore = "reads a project file: set EIDE_TIMING_FILE"]
+    fn a_real_files_functions_are_marked_as_they_can_be_timed() {
+        let Ok(path) = std::env::var("EIDE_TIMING_FILE") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        for f in functions(&text, "src/main.rs").unwrap() {
+            let mut r = region(f.sig, f.sig);
+            r.whole_fn = true;
+            r.col = f.col;
+            match mark(&text, r) {
+                Ok((region, p)) if region.whole_fn => {
+                    eprintln!("{}: whole, lines {:?}", f.path, p.lines)
+                }
+                Ok((_, p)) => eprintln!("{}: one pass of its loop, lines {:?}", f.path, p.lines),
+                Err(e) => eprintln!("{}: refused - {e}", f.path),
+            }
+        }
     }
 
     /// Stop ends a release build at once - cargo and the rustc under it -

@@ -624,7 +624,10 @@ pub fn nrf_config_files(
     // The application core of an nRF5340 has two watchdogs; its own is WDT0.
     let wdt = super::nrf::chip(family).map_or("WDT", |c| c.wdt());
     let embassy_tmpl = NRF_ASYNC_TMPL
-        .replace("use embassy_nrf::peripherals::WDT;", &format!("use embassy_nrf::peripherals::{wdt};"))
+        .replace(
+            "use embassy_nrf::peripherals::WDT;",
+            &format!("use embassy_nrf::peripherals::{wdt};"),
+        )
         .replace("Peri<'static, WDT>", &format!("Peri<'static, {wdt}>"));
     let body = if is_async {
         embassy_tmpl

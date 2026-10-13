@@ -143,12 +143,20 @@ pub fn stdin_lines(r: &Request) -> String {
         r.host.as_bytes(),
         r.port.to_string().as_bytes(),
         r.server_name.as_bytes(),
-        if r.verify { b"1".as_slice() } else { b"0".as_slice() },
+        if r.verify {
+            b"1".as_slice()
+        } else {
+            b"0".as_slice()
+        },
         &r.ca,
         r.client_id.as_bytes(),
         r.user.as_bytes(),
         r.password.as_bytes(),
-        if r.alpn { b"1".as_slice() } else { b"0".as_slice() },
+        if r.alpn {
+            b"1".as_slice()
+        } else {
+            b"0".as_slice()
+        },
         r.client_cert.as_bytes(),
         r.client_key.as_bytes(),
     ] {
@@ -176,8 +184,15 @@ pub fn parse_output(stdout: &str, tested: Tested) -> State {
             result = Some((false, r.to_owned()));
         }
     }
-    let (ok, summary) = result.unwrap_or((false, "the checker stopped without an answer".to_owned()));
-    State::Done { ok, summary, steps, p384, tested }
+    let (ok, summary) =
+        result.unwrap_or((false, "the checker stopped without an answer".to_owned()));
+    State::Done {
+        ok,
+        summary,
+        steps,
+        p384,
+        tested,
+    }
 }
 
 fn failed(summary: impl Into<String>, tested: &Tested) -> State {
@@ -223,7 +238,12 @@ fn build_checker() -> Result<PathBuf, String> {
         Err(e) => return Err(format!("cargo could not be started: {e}")),
         Ok(out) if !out.status.success() => {
             let err = String::from_utf8_lossy(&out.stderr);
-            let tail: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).rev().take(3).collect();
+            let tail: Vec<&str> = err
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .rev()
+                .take(3)
+                .collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();
             return Err(format!("the checker did not build: {}", tail.join(" / ")));
         }
@@ -247,7 +267,9 @@ fn run_checker(exe: &Path, args: &[&str], input: &str) -> Result<String, String>
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = check.spawn().map_err(|e| format!("the checker could not be started: {e}"))?;
+    let mut child = check
+        .spawn()
+        .map_err(|e| format!("the checker could not be started: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input.as_bytes());
     }
@@ -267,7 +289,9 @@ fn run_checker(exe: &Path, args: &[&str], input: &str) -> Result<String, String>
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("no answer within a minute - the broker or the network is silent".into());
+                return Err(
+                    "no answer within a minute - the broker or the network is silent".into(),
+                );
             }
         }
     }
@@ -341,10 +365,15 @@ pub fn start_csr(request: CsrRequest, ctx: egui::Context) -> CsrShared {
 /// The `csr` mode's stdin: one hex line per value.
 fn csr_lines(r: &CsrRequest) -> String {
     let hex = |s: &str| s.bytes().map(|x| format!("{x:02x}")).collect::<String>();
-    [&r.country, &r.organization, &r.common_name, r.key.as_deref().unwrap_or("")]
-        .iter()
-        .map(|s| hex(s) + "\n")
-        .collect()
+    [
+        &r.country,
+        &r.organization,
+        &r.common_name,
+        r.key.as_deref().unwrap_or(""),
+    ]
+    .iter()
+    .map(|s| hex(s) + "\n")
+    .collect()
 }
 
 /// The `csr` mode's answer: a key it made (when it was asked to), the
@@ -352,7 +381,9 @@ fn csr_lines(r: &CsrRequest) -> String {
 pub fn parse_csr(stdout: &str, want_key: bool, project: PathBuf) -> Result<CsrDone, String> {
     let unhex = |h: &str| -> Option<String> {
         let h = h.trim();
-        let bytes: Option<Vec<u8>> = (0..h.len() / 2).map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect();
+        let bytes: Option<Vec<u8>> = (0..h.len() / 2)
+            .map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok())
+            .collect();
         String::from_utf8(bytes?).ok()
     };
     let (mut key, mut csr, mut result) = (None, None, None);
@@ -372,11 +403,21 @@ pub fn parse_csr(stdout: &str, want_key: bool, project: PathBuf) -> Result<CsrDo
         Some(Err(why)) => return Err(why),
         None => return Err("the checker stopped without an answer".into()),
     }
-    let csr = csr.filter(|c| c.contains("-----BEGIN CERTIFICATE REQUEST-----")).ok_or("no request came back")?;
-    if want_key && !key.as_deref().is_some_and(|k| k.contains("-----BEGIN EC PRIVATE KEY-----")) {
+    let csr = csr
+        .filter(|c| c.contains("-----BEGIN CERTIFICATE REQUEST-----"))
+        .ok_or("no request came back")?;
+    if want_key
+        && !key
+            .as_deref()
+            .is_some_and(|k| k.contains("-----BEGIN EC PRIVATE KEY-----"))
+    {
         return Err("no key came back".into());
     }
-    Ok(CsrDone { key: if want_key { key } else { None }, csr, project })
+    Ok(CsrDone {
+        key: if want_key { key } else { None },
+        csr,
+        project,
+    })
 }
 
 fn csr(request: &CsrRequest) -> Result<CsrDone, String> {
@@ -418,9 +459,18 @@ mod tests {
         // though the broker is the same.
         let before = r.tested();
         for changed in [
-            Request { verify: false, ..r.clone() },
-            Request { ca: vec![0x30, 0x83], ..r.clone() },
-            Request { password: "c".into(), ..r.clone() },
+            Request {
+                verify: false,
+                ..r.clone()
+            },
+            Request {
+                ca: vec![0x30, 0x83],
+                ..r.clone()
+            },
+            Request {
+                password: "c".into(),
+                ..r.clone()
+            },
         ] {
             assert_eq!(changed.key(), before.key);
             assert_ne!(changed.tested().fingerprint, before.fingerprint);
@@ -432,26 +482,47 @@ mod tests {
     #[test]
     fn the_answer_is_read_back() {
         let out = "INFO resolved 1.2.3.4:8886\nINFO TCP connected\nINFO p384\nRESULT ok the broker accepted\n";
-        let k = Tested { key: "k".into(), ..Tested::default() };
-        let State::Done { ok, summary, steps, p384, tested } = parse_output(out, k.clone()) else {
+        let k = Tested {
+            key: "k".into(),
+            ..Tested::default()
+        };
+        let State::Done {
+            ok,
+            summary,
+            steps,
+            p384,
+            tested,
+        } = parse_output(out, k.clone())
+        else {
             panic!("done");
         };
         assert!(ok && p384);
         assert_eq!(summary, "the broker accepted");
         assert_eq!(steps, ["resolved 1.2.3.4:8886", "TCP connected"]);
         assert_eq!(tested, k);
-        let State::Done { ok, summary, .. } = parse_output("RESULT fail bad CA\n", Tested::default()) else {
+        let State::Done { ok, summary, .. } =
+            parse_output("RESULT fail bad CA\n", Tested::default())
+        else {
             panic!("done");
         };
         assert!(!ok && summary == "bad CA");
-        assert!(matches!(parse_output("", Tested::default()), State::Done { ok: false, .. }));
+        assert!(matches!(
+            parse_output("", Tested::default()),
+            State::Done { ok: false, .. }
+        ));
     }
 
     /// The checker compiles the firmware's own certificate checks.
     #[test]
     fn the_checker_carries_the_firmwares_checks() {
         let files = iot_gen::tls_check_files();
-        let get = |n: &str| files.iter().find(|(f, _)| *f == n).map(|(_, b)| b.as_str()).unwrap();
+        let get = |n: &str| {
+            files
+                .iter()
+                .find(|(f, _)| *f == n)
+                .map(|(_, b)| b.as_str())
+                .unwrap()
+        };
         assert!(get("src/main.rs").contains("include!(\"tls_verify.rs\");"));
         assert!(get("Cargo.toml").contains("features = [\"std\", \"rsa\", \"p384\"]"));
         assert!(get("Cargo.toml").contains("[workspace]"));
@@ -465,10 +536,18 @@ mod tests {
     fn the_checker_is_not_in_the_firmware_workspace() {
         let ws = crate::workspace::dir();
         let d = dir();
-        assert!(!d.starts_with(&ws), "{} is inside {}", d.display(), ws.display());
+        assert!(
+            !d.starts_with(&ws),
+            "{} is inside {}",
+            d.display(),
+            ws.display()
+        );
         assert_eq!(d.parent(), ws.parent());
         let name = d.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(!name.starts_with(crate::names::LEGACY_SLOT_PREFIX), "the slot sweep would delete {name}");
+        assert!(
+            !name.starts_with(crate::names::LEGACY_SLOT_PREFIX),
+            "the slot sweep would delete {name}"
+        );
     }
 
     /// The helper's `csr` mode, for real: a new key and its request, then a
@@ -493,7 +572,11 @@ mod tests {
         let key = made.key.expect("a new key");
         let (_, point) = iot::client_key(&key).unwrap();
         assert!(point.is_some(), "the key carries its public half");
-        assert!(made.csr.starts_with("-----BEGIN CERTIFICATE REQUEST-----"), "{}", made.csr);
+        assert!(
+            made.csr.starts_with("-----BEGIN CERTIFICATE REQUEST-----"),
+            "{}",
+            made.csr
+        );
         let dir = std::env::temp_dir();
         std::fs::write(dir.join("rustonchip_csr_check.csr"), &made.csr).unwrap();
         std::fs::write(dir.join("rustonchip_csr_check.key"), &key).unwrap();
@@ -518,7 +601,8 @@ mod tests {
     #[ignore = "builds the checker and connects to test.mosquitto.org"]
     fn tls_check_against_mosquitto() {
         let pem = iot_gen::mqtt_ca_file();
-        let ca = crate::panels::mcu_module::iot::pem_der(iot_gen::ca_pem_of(&pem).unwrap()).unwrap();
+        let ca =
+            crate::panels::mcu_module::iot::pem_der(iot_gen::ca_pem_of(&pem).unwrap()).unwrap();
         let request = |port: u16, name: &str| Request {
             host: "test.mosquitto.org".into(),
             port,
@@ -541,7 +625,10 @@ mod tests {
             let shared = Shared::default();
             let done = run(&request(port, name), &shared, &ctx);
             println!("{port} {name}: {done:?}");
-            assert!(matches!(done, State::Done { ok, .. } if ok == want), "{port} {name}: {done:?}");
+            assert!(
+                matches!(done, State::Done { ok, .. } if ok == want),
+                "{port} {name}: {done:?}"
+            );
         }
     }
 }

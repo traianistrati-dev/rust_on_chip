@@ -719,7 +719,9 @@ impl ProjectTreeState {
                     .iter_mut()
                     .find(|(p, _)| p == &file_path)
             {
-                if let Some(up) = crate::panels::mcu_module::codegen::iot_gen::topped_up(content, body) {
+                if let Some(up) =
+                    crate::panels::mcu_module::codegen::iot_gen::topped_up(content, body)
+                {
                     *content = up;
                 }
                 continue;
@@ -2866,13 +2868,24 @@ mod iot_secrets_sync_tests {
                 *c = mine.clone();
             }
         }
-        let both = vec![(iot_gen::SECRETS.to_owned(), iot_gen::secrets_body_for(true, true))];
+        let both = vec![(
+            iot_gen::SECRETS.to_owned(),
+            iot_gen::secrets_body_for(true, true),
+        )];
         for force in [false, true] {
             tree.sync_config_files(&both, force, &[], &mut None);
             let now = secrets(&tree).unwrap();
             assert!(now.starts_with(&mine), "{now}");
-            assert_eq!(now.matches("pub const THREAD_DATASET: &str = \"\";").count(), 1, "{now}");
-            assert_eq!(iot_gen::read_secret(&now, "WIFI_PASSWORD").as_deref(), Some("hunter2"));
+            assert_eq!(
+                now.matches("pub const THREAD_DATASET: &str = \"\";")
+                    .count(),
+                1,
+                "{now}"
+            );
+            assert_eq!(
+                iot_gen::read_secret(&now, "WIFI_PASSWORD").as_deref(),
+                Some("hunter2")
+            );
         }
     }
 

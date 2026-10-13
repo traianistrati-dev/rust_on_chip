@@ -72,9 +72,10 @@ impl Default for LinkBuffers {
 }
 
 // ── This chip's pieces ──
-/// The ring oscillator's random bit - every RP has it; the RP2350's own TRNG
-/// is not used yet - whitened: each 32 bytes out are the SHA-256 of 64 raw
-/// bytes and a counter.
+/// The chip's raw entropy - `entropy()` in the block above: the ring
+/// oscillator on the Pico W, the TRNG and the oscillator on the Pico 2 W -
+/// whitened: each 32 bytes out are the SHA-256 of ENTROPY_BYTES raw bytes
+/// and a counter.
 struct TlsRng {
     counter: u64,
 }
@@ -95,8 +96,8 @@ impl rand_core_06::RngCore for TlsRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         use sha2::Digest as _;
         for chunk in dest.chunks_mut(32) {
-            let mut raw = [0u8; 64];
-            embassy_rp::clocks::RoscRng.fill_bytes(&mut raw);
+            let mut raw = [0u8; ENTROPY_BYTES];
+            entropy(&mut raw);
             let mut hash = sha2::Sha256::new();
             hash.update(raw);
             hash.update(self.counter.to_le_bytes());

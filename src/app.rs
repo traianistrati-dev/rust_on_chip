@@ -3790,10 +3790,10 @@ impl AppIde {
             // The nRF's: nrf-hal's `Usbd` is a usb-device 0.3 bus (the ESP OTG
             // versions), embassy-nrf's driver runs under embassy-usb. One
             // decision, shared with the harness - see `nrf::usb_stack`.
-            let (nrf_usb_device, nrf_embassy_usb) = self
-                .mcu
-                .as_ref()
-                .map_or((false, false), crate::panels::mcu_module::codegen::nrf::usb_stack);
+            let (nrf_usb_device, nrf_embassy_usb) = self.mcu.as_ref().map_or(
+                (false, false),
+                crate::panels::mcu_module::codegen::nrf::usb_stack,
+            );
             // …and the ESP's own stack, which only the OTG role wants.
             let needs_esp_otg = is_esp_family
                 && both_usb_pads
@@ -4016,7 +4016,8 @@ impl AppIde {
             // has when `build-std` lists it.
             let runner = project_gen::ensure_build_std_alloc(
                 &runner,
-                iot_active.is_some_and(|a| a.platform == crate::panels::mcu_module::iot::Platform::Esp),
+                iot_active
+                    .is_some_and(|a| a.platform == crate::panels::mcu_module::iot::Platform::Esp),
             );
             if csv != self.partitions_csv || runner != self.cargo_config {
                 self.partitions_csv = csv;
@@ -4354,81 +4355,81 @@ impl AppIde {
                 if asker.definition == GotoOrigin::Timing {
                     self.timing_definition_answer(locs, error);
                 } else {
-                let noun = if is_impl {
-                    "implementation"
-                } else {
-                    "definition"
-                };
-                // Read each target's own line and the `impl` header above it, so
-                // two rows of `fn parse(&mut self)` can be told apart, then float
-                // the one the caret's line actually names to the top. Ranking is
-                // a permutation: nothing is hidden, only ordered.
-                let mut targets = editor_panel::impl_picker::build_targets(locs);
-                editor_panel::impl_picker::dedupe(&mut targets);
-                editor_panel::impl_picker::rank(&mut targets, &self.definition_caret_line);
-                match targets.len() {
-                    // Answered, but with nothing. Silence here read as "the key
-                    // did nothing", and a just-started analyzer answers this way
-                    // more often than a warm one — an empty result and a
-                    // JSON-RPC error arrive in the same shape.
-                    0 if asker.definition == GotoOrigin::DefinitionTab => {
-                        let (ready, indexed) = {
-                            let lsp = self.lsp_state.lock().unwrap();
-                            (matches!(lsp.status, lsp::LspStatus::Ready), lsp.indexed)
-                        };
-                        let reason = definition_nav::external_silence_reason(
-                            error.as_deref(),
-                            ready,
-                            indexed,
-                        )
-                        .map(|r| format!(" ({r})"))
-                        .unwrap_or_default();
-                        self.set_status_msg(format!(
-                            "{} No {noun} found at the Definition tab's caret{reason}",
-                            egui_phosphor::regular::X_CIRCLE
-                        ));
-                    }
-                    0 => {
-                        let asked = self.lsp_state.lock().unwrap().definition_for.clone();
-                        let reason = asked
-                            .and_then(|(rel, line)| self.caret_silence_reason(&rel, line))
+                    let noun = if is_impl {
+                        "implementation"
+                    } else {
+                        "definition"
+                    };
+                    // Read each target's own line and the `impl` header above it, so
+                    // two rows of `fn parse(&mut self)` can be told apart, then float
+                    // the one the caret's line actually names to the top. Ranking is
+                    // a permutation: nothing is hidden, only ordered.
+                    let mut targets = editor_panel::impl_picker::build_targets(locs);
+                    editor_panel::impl_picker::dedupe(&mut targets);
+                    editor_panel::impl_picker::rank(&mut targets, &self.definition_caret_line);
+                    match targets.len() {
+                        // Answered, but with nothing. Silence here read as "the key
+                        // did nothing", and a just-started analyzer answers this way
+                        // more often than a warm one — an empty result and a
+                        // JSON-RPC error arrive in the same shape.
+                        0 if asker.definition == GotoOrigin::DefinitionTab => {
+                            let (ready, indexed) = {
+                                let lsp = self.lsp_state.lock().unwrap();
+                                (matches!(lsp.status, lsp::LspStatus::Ready), lsp.indexed)
+                            };
+                            let reason = definition_nav::external_silence_reason(
+                                error.as_deref(),
+                                ready,
+                                indexed,
+                            )
                             .map(|r| format!(" ({r})"))
                             .unwrap_or_default();
-                        self.set_status_msg(format!(
-                            "{} No {noun} found for the symbol at the caret{reason}",
-                            egui_phosphor::regular::X_CIRCLE
-                        ));
+                            self.set_status_msg(format!(
+                                "{} No {noun} found at the Definition tab's caret{reason}",
+                                egui_phosphor::regular::X_CIRCLE
+                            ));
+                        }
+                        0 => {
+                            let asked = self.lsp_state.lock().unwrap().definition_for.clone();
+                            let reason = asked
+                                .and_then(|(rel, line)| self.caret_silence_reason(&rel, line))
+                                .map(|r| format!(" ({r})"))
+                                .unwrap_or_default();
+                            self.set_status_msg(format!(
+                                "{} No {noun} found for the symbol at the caret{reason}",
+                                egui_phosphor::regular::X_CIRCLE
+                            ));
+                        }
+                        // The overwhelmingly common case, and it must stay a single
+                        // keypress: offering a one-row chooser would tax every F12 to
+                        // pay for the rare Ctrl+F12.
+                        1 => {
+                            let t = targets.remove(0);
+                            self.goto_definition_target(&t, asker.definition);
+                        }
+                        // More than one REAL answer. Jumping to a guess would trade
+                        // "always the wrong file" for "usually the right one, and no
+                        // way to tell when it is not" — worse, because it is not
+                        // visibly wrong. The list says what rust-analyzer said.
+                        n => {
+                            self.set_status_msg(format!(
+                                "{} {n} {noun}s - Up/Down, Enter to open, Esc to dismiss",
+                                egui_phosphor::regular::ARROW_ELBOW_DOWN_RIGHT
+                            ));
+                            self.impl_picker = Some(editor_panel::impl_picker::ImplPicker {
+                                targets,
+                                sel: 0,
+                                pos: self.definition_anchor,
+                                // Drawn, and its keys taken, by the MAIN editor's
+                                // pass for a request from the tab: the tab has no
+                                // editor pass of its own, and the list is a free
+                                // `Area` anchored under the tab's caret anyway.
+                                slot: asker.definition.editor(),
+                                origin: asker.definition,
+                                title: format!("{n} {noun}s"),
+                            });
+                        }
                     }
-                    // The overwhelmingly common case, and it must stay a single
-                    // keypress: offering a one-row chooser would tax every F12 to
-                    // pay for the rare Ctrl+F12.
-                    1 => {
-                        let t = targets.remove(0);
-                        self.goto_definition_target(&t, asker.definition);
-                    }
-                    // More than one REAL answer. Jumping to a guess would trade
-                    // "always the wrong file" for "usually the right one, and no
-                    // way to tell when it is not" — worse, because it is not
-                    // visibly wrong. The list says what rust-analyzer said.
-                    n => {
-                        self.set_status_msg(format!(
-                            "{} {n} {noun}s - Up/Down, Enter to open, Esc to dismiss",
-                            egui_phosphor::regular::ARROW_ELBOW_DOWN_RIGHT
-                        ));
-                        self.impl_picker = Some(editor_panel::impl_picker::ImplPicker {
-                            targets,
-                            sel: 0,
-                            pos: self.definition_anchor,
-                            // Drawn, and its keys taken, by the MAIN editor's
-                            // pass for a request from the tab: the tab has no
-                            // editor pass of its own, and the list is a free
-                            // `Area` anchored under the tab's caret anyway.
-                            slot: asker.definition.editor(),
-                            origin: asker.definition,
-                            title: format!("{n} {noun}s"),
-                        });
-                    }
-                }
                 }
                 self.egui_ctx.request_repaint();
             }

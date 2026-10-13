@@ -2255,18 +2255,27 @@ mod emit_for_manual_compile {
             &mcu.family,
             &[],
         );
-        files.cargo_config = project_gen::ensure_build_std_alloc(
-            &files.cargo_config,
-            iot_active.is_some(),
-        );
+        files.cargo_config =
+            project_gen::ensure_build_std_alloc(&files.cargo_config, iot_active.is_some());
         let tls = iot_active.is_some_and(|a| a.mqtt_tls);
         if matches!(iot_mode.as_deref(), Some("mqtts")) {
             assert!(tls, "{chip}: mqtts is MQTT over TLS");
         }
         if tls {
-            assert!(files.cargo_toml.contains("embedded-tls = "), "{}", files.cargo_toml);
-            assert!(files.cargo_toml.contains("embedded-io-async = "), "{}", files.cargo_toml);
-            assert!(!files.cargo_toml.contains("embedded-alloc"), "the ESP heap is esp-alloc's");
+            assert!(
+                files.cargo_toml.contains("embedded-tls = "),
+                "{}",
+                files.cargo_toml
+            );
+            assert!(
+                files.cargo_toml.contains("embedded-io-async = "),
+                "{}",
+                files.cargo_toml
+            );
+            assert!(
+                !files.cargo_toml.contains("embedded-alloc"),
+                "the ESP heap is esp-alloc's"
+            );
         }
         if iot_mode.as_deref() == Some("thread") {
             for want in [
@@ -2275,10 +2284,18 @@ mod emit_for_manual_compile {
                 "\"ieee802154\"",
                 "tinyrlibc = ",
             ] {
-                assert!(files.cargo_toml.contains(want), "{want}:\n{}", files.cargo_toml);
+                assert!(
+                    files.cargo_toml.contains(want),
+                    "{want}:\n{}",
+                    files.cargo_toml
+                );
             }
             for absent in ["executor-interrupt", "\"wifi\"", "\"ble\""] {
-                assert!(!files.cargo_toml.contains(absent), "{absent}:\n{}", files.cargo_toml);
+                assert!(
+                    !files.cargo_toml.contains(absent),
+                    "{absent}:\n{}",
+                    files.cargo_toml
+                );
             }
         }
         // The legacy single address, never edited into a list - what every
@@ -2301,7 +2318,10 @@ mod emit_for_manual_compile {
                 .find(|(p, _)| p == "src/pins/configs/mqtt_link.rs")
                 .map(|(_, c)| c.as_str())
                 .unwrap_or("");
-            assert!(link.contains("client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER)"), "{link}");
+            assert!(
+                link.contains("client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER)"),
+                "{link}"
+            );
         }
         // Thread with a real dataset: an empty one makes `commissioned()` a
         // constant false, and LTO would drop the whole attach / IPv6 / UDP

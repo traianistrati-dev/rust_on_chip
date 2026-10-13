@@ -103,37 +103,36 @@ impl AppIde {
                 .map(str::to_owned);
             // Restart on panic: what this build reports to, and what main.rs's
             // header holds for a panic handler.
-            let panic = {
-                let src = |path: &str| {
-                    self.project_tree
-                        .user_src_files
-                        .iter()
-                        .find(|(p, _)| p == path)
-                        .map(|(_, c)| c.as_str())
+            let panic =
+                {
+                    let src = |path: &str| {
+                        self.project_tree
+                            .user_src_files
+                            .iter()
+                            .find(|(p, _)| p == path)
+                            .map(|(_, c)| c.as_str())
+                    };
+                    let active = iot::active(mcu);
+                    // main.rs is the editor's buffer, not a file of the tree.
+                    let main_rs = self.generated_code.as_str();
+                    PanicFacts {
+                        is_async,
+                        links: mcu.iot.wifi
+                            || mcu.iot.esp_now.is_some()
+                            || mcu.iot.ble.is_some()
+                            || mcu.iot.thread.is_some(),
+                        active: active.is_some(),
+                        sinks: active.map(|a| iot_gen::panic_sinks(mcu, a)),
+                        header: (!main_rs.is_empty()).then(|| iot_gen::panic_header(main_rs)),
+                        calls_restart: iot_gen::header_calls_panic(main_rs),
+                        publish_moved: active.is_some_and(|a| a.mqtt)
+                            && src("src/pins/configs/mqtt.rs")
+                                .is_some_and(|c| !c.contains(iot_gen::MQTT_PUBLISH_SIGNATURE)),
+                        public_broker: mcu.iot.mqtt.as_ref().is_some_and(|m| {
+                            m.host.trim().eq_ignore_ascii_case("test.mosquitto.org")
+                        }),
+                    }
                 };
-                let active = iot::active(mcu);
-                // main.rs is the editor's buffer, not a file of the tree.
-                let main_rs = self.generated_code.as_str();
-                PanicFacts {
-                    is_async,
-                    links: mcu.iot.wifi
-                        || mcu.iot.esp_now.is_some()
-                        || mcu.iot.ble.is_some()
-                        || mcu.iot.thread.is_some(),
-                    active: active.is_some(),
-                    sinks: active.map(|a| iot_gen::panic_sinks(mcu, a)),
-                    header: (!main_rs.is_empty()).then(|| iot_gen::panic_header(main_rs)),
-                    calls_restart: iot_gen::header_calls_panic(main_rs),
-                    publish_moved: active.is_some_and(|a| a.mqtt)
-                        && src("src/pins/configs/mqtt.rs")
-                            .is_some_and(|c| !c.contains(iot_gen::MQTT_PUBLISH_SIGNATURE)),
-                    public_broker: mcu
-                        .iot
-                        .mqtt
-                        .as_ref()
-                        .is_some_and(|m| m.host.trim().eq_ignore_ascii_case("test.mosquitto.org")),
-                }
-            };
             // MQTT over TLS: whether this chip can, what mqtt_ca.rs holds, and an
             // edited mqtt.rs / mqtt_link.rs that no longer fits the switch.
             let tls = {
@@ -150,6 +149,11 @@ impl AppIde {
                 TlsFacts {
                     available: iot::tls_available(&family, coex),
                     pico: platform == Some(Platform::Cyw43),
+                    rp2350: platform == Some(Platform::Cyw43) && iot::tls_trng(&family),
+                    entropy_left: iot_gen::entropy_link_left(
+                        file(iot_gen::MQTT_LINK),
+                        want && platform == Some(Platform::Cyw43) && iot::tls_trng(&family),
+                    ),
                     sntp: mcu.iot.sntp.is_some(),
                     coex,
                     s2: family == "esp32s2",
@@ -157,7 +161,9 @@ impl AppIde {
                     // What "Test from this PC" sends: mqtt_ca.rs's CA (the one
                     // it will be written with, until it is), and the login.
                     ca_der: iot_gen::ca_pem_of(
-                        file(iot_gen::MQTT_CA).map_or(iot_gen::mqtt_ca_file(), str::to_owned).as_str(),
+                        file(iot_gen::MQTT_CA)
+                            .map_or(iot_gen::mqtt_ca_file(), str::to_owned)
+                            .as_str(),
                     )
                     .and_then(iot::cas_der),
                     // The client certificate and its key, as secrets.rs holds them.
@@ -168,23 +174,35 @@ impl AppIde {
                         .and_then(|s| iot_gen::read_secret(s, iot_gen::CLIENT_SECRETS[0]))
                         .unwrap_or_default(),
                     client_key: file(iot_gen::SECRETS).map(|s| {
-                        iot_gen::read_secret(s, iot_gen::CLIENT_SECRETS[1]).map(|k| iot::client_key(&k))
+                        iot_gen::read_secret(s, iot_gen::CLIENT_SECRETS[1])
+                            .map(|k| iot::client_key(&k))
                     }),
                     client_cert: file(iot_gen::SECRETS).map(|s| {
-                        iot_gen::read_secret(s, iot_gen::CLIENT_SECRETS[0]).map(|c| iot::client_cert(&c))
+                        iot_gen::read_secret(s, iot_gen::CLIENT_SECRETS[0])
+                            .map(|c| iot::client_cert(&c))
                     }),
                     client_left: iot_gen::client_link_left(
                         file(iot_gen::MQTT_LINK),
-                        mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls && m.client_cert),
+                        mcu.iot
+                            .mqtt
+                            .as_ref()
+                            .is_some_and(|m| m.tls && m.client_cert),
                     ),
                     project: project_dir.clone(),
                     // No secrets.rs yet = it will be written with an empty login.
-                    user: file(iot_gen::SECRETS)
-                        .map_or(Some(String::new()), |s| iot_gen::read_secret(s, "MQTT_USERNAME")),
-                    password: file(iot_gen::SECRETS)
-                        .map_or(Some(String::new()), |s| iot_gen::read_secret(s, "MQTT_PASSWORD")),
+                    user: file(iot_gen::SECRETS).map_or(Some(String::new()), |s| {
+                        iot_gen::read_secret(s, "MQTT_USERNAME")
+                    }),
+                    password: file(iot_gen::SECRETS).map_or(Some(String::new()), |s| {
+                        iot_gen::read_secret(s, "MQTT_PASSWORD")
+                    }),
                     left: platform.and_then(|p| {
-                        iot_gen::mqtt_files_left(file(iot_gen::MQTT), file(iot_gen::MQTT_LINK), want, p)
+                        iot_gen::mqtt_files_left(
+                            file(iot_gen::MQTT),
+                            file(iot_gen::MQTT_LINK),
+                            want,
+                            p,
+                        )
                     }),
                 }
             };
@@ -923,7 +941,9 @@ fn secrets_card(
         };
         // A link switched on after the file was written, or a line the user
         // deleted: its empty line goes back now, as the next sync would.
-        if let Some(up) = iot_gen::topped_up(body, &iot_gen::secrets_body_for(wanted.wifi, wanted.thread)) {
+        if let Some(up) =
+            iot_gen::topped_up(body, &iot_gen::secrets_body_for(wanted.wifi, wanted.thread))
+        {
             *body = up;
             changed = true;
         }
@@ -947,7 +967,11 @@ fn secrets_card(
                     Some(mut value) => {
                         let edit = egui::TextEdit::singleline(&mut value)
                             .password(*secret)
-                            .desired_width(if *name == iot_gen::THREAD_DATASET { 320.0 } else { 220.0 });
+                            .desired_width(if *name == iot_gen::THREAD_DATASET {
+                                320.0
+                            } else {
+                                220.0
+                            });
                         if ui.add(edit).changed() {
                             *body = iot_gen::write_secret(body, name, &value);
                             changed = true;
@@ -964,7 +988,9 @@ fn secrets_card(
         if wanted.wifi {
             let ssid = iot_gen::read_secret(body, "WIFI_SSID").unwrap_or_default();
             if ssid.is_empty() {
-                ui.label(warn("no network name yet - the station has nothing to join"));
+                ui.label(warn(
+                    "no network name yet - the station has nothing to join",
+                ));
             } else if ssid.len() > 32 {
                 ui.label(warn("an SSID is at most 32 bytes"));
             }
@@ -1025,7 +1051,9 @@ fn dataset_summary(ui: &mut egui::Ui, hex: &str) {
 fn network_card(ui: &mut egui::Ui, cfg: &mut IotConfig) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(egui::RichText::new(format!("{}  NETWORK", ph::GLOBE)).strong());
-        ui.label(dim("embassy-net 0.9: IPv4, TCP, UDP, DNS - src/pins/configs/net.rs."));
+        ui.label(dim(
+            "embassy-net 0.9: IPv4, TCP, UDP, DNS - src/pins/configs/net.rs.",
+        ));
         ui.add_space(4.0);
         let ip = &mut cfg.ip;
         ui.horizontal(|ui| {
@@ -1073,6 +1101,10 @@ struct TlsFacts {
     available: Result<(), &'static str>,
     /// A Pico W / Pico 2 W: TLS brings a heap.
     pico: bool,
+    /// ... the Pico 2 W, whose keys come from the RP2350's TRNG.
+    rp2350: bool,
+    /// An edited mqtt_link.rs on a Pico 2 W that never asks the TRNG.
+    entropy_left: Option<&'static str>,
     /// SNTP is on: the certificates' dates are checked.
     sntp: bool,
     /// Bluetooth beside Wi-Fi: the ESP heap is the fixed coex one.
@@ -1160,7 +1192,11 @@ fn application_card(
         ui.horizontal(|ui| {
             ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
             ui.label(egui::RichText::new("HTTP client").strong());
-            ui.label(egui::RichText::new("planned").size(10.0).color(egui::Color32::from_rgb(120, 170, 230)));
+            ui.label(
+                egui::RichText::new("planned")
+                    .size(10.0)
+                    .color(egui::Color32::from_rgb(120, 170, 230)),
+            );
             ui.label(dim("on request: reqwless runs on the same TcpSocket"));
         });
     });
@@ -1168,20 +1204,29 @@ fn application_card(
 
 /// MQTT over TLS: the switch, the check, the name, the CA - and what each
 /// leaves unchecked.
-fn tls_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mut Vec<TlsAction>) {
+fn tls_section(
+    ui: &mut egui::Ui,
+    m: &mut MqttConfig,
+    tls: &TlsFacts,
+    actions: &mut Vec<TlsAction>,
+) {
     ui.horizontal(|ui| {
         let mut on = m.tls;
         let can = tls.available.is_ok();
         if ui
             .add_enabled(can || on, egui::Checkbox::new(&mut on, ""))
-            .on_hover_text("Encrypt the connection: TLS 1.3 (embedded-tls) in src/pins/configs/mqtt_link.rs")
+            .on_hover_text(
+                "Encrypt the connection: TLS 1.3 (embedded-tls) in src/pins/configs/mqtt_link.rs",
+            )
             .changed()
         {
             m.port = m.port_for_tls(on);
             m.tls = on;
         }
         ui.label(egui::RichText::new("TLS").strong());
-        ui.label(dim("MQTT over TLS 1.3 - src/pins/configs/mqtt_link.rs, the CA in mqtt_ca.rs"));
+        ui.label(dim(
+            "MQTT over TLS 1.3 - src/pins/configs/mqtt_link.rs, the CA in mqtt_ca.rs",
+        ));
     });
     if let Err(why) = tls.available {
         if m.tls {
@@ -1191,7 +1236,9 @@ fn tls_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &
         } else {
             ui.label(dim(format!("TLS is not on this chip: {why}.")));
             if m.port == iot::PLAIN_PORT {
-                ui.label(warn("1883 is plain TCP: anyone on the network can read it, the password included."));
+                ui.label(warn(
+                    "1883 is plain TCP: anyone on the network can read it, the password included.",
+                ));
             }
         }
         return;
@@ -1320,7 +1367,11 @@ fn tls_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &
             "reach; test.mosquitto.org works on 8886. Revocation is not checked."
         )));
         ui.label(dim(if tls.pico {
-            "On a Pico TLS brings a 32 KiB heap (the RSA checks), and keys from the ring oscillator, whitened."
+            if tls.rp2350 {
+                "On a Pico 2 W TLS brings a 32 KiB heap (the RSA checks), and keys from the RP2350's TRNG and ring oscillator, whitened by SHA-256."
+            } else {
+                "On a Pico W TLS brings a 32 KiB heap (the RSA checks), and keys from the ring oscillator, whitened by SHA-256 - the RP2040 has no TRNG."
+            }
         } else if tls.coex {
             "Beside Bluetooth the heap is fixed: 64 KiB of the bootloader's RAM + 96 KiB (32 more for the RSA checks)."
         } else if tls.s2 {
@@ -1328,6 +1379,9 @@ fn tls_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &
         } else {
             "The heap grows by 32 KiB for the RSA checks, in the RAM the bootloader used."
         }));
+        if let Some(left) = tls.entropy_left {
+            ui.label(warn(left));
+        }
         if let Some(left) = tls.left {
             ui.label(warn(left));
         }
@@ -1342,7 +1396,11 @@ const AWS_SIGN: &str = "aws iot create-certificate-from-csr --certificate-signin
 fn command_line(ui: &mut egui::Ui, text: &str) {
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(text).monospace().size(10.5));
-        if ui.small_button(ph::COPY).on_hover_text("Copy the command").clicked() {
+        if ui
+            .small_button(ph::COPY)
+            .on_hover_text("Copy the command")
+            .clicked()
+        {
             ui.ctx().copy_text(text.to_owned());
         }
     });
@@ -1351,7 +1409,12 @@ fn command_line(ui: &mut egui::Ui, text: &str) {
 /// The board's own certificate: the switch, its key (made here with a CSR,
 /// or loaded), the certificate the broker's CA signed - and whether the two
 /// belong together.
-fn client_cert_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mut Vec<TlsAction>) {
+fn client_cert_section(
+    ui: &mut egui::Ui,
+    m: &mut MqttConfig,
+    tls: &TlsFacts,
+    actions: &mut Vec<TlsAction>,
+) {
     use crate::panels::mcu_module::tls_check::{self, CsrRequest, CsrShared, CsrState};
     ui.horizontal(|ui| {
         ui.checkbox(&mut m.client_cert, "Client certificate (P-256)")
@@ -1671,8 +1734,16 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
         user: tls.user.clone().unwrap_or_default(),
         password: tls.password.clone().unwrap_or_default(),
         alpn: iot::aws_alpn(m),
-        client_cert: if m.client_cert { tls.client_cert_pem.clone() } else { String::new() },
-        client_key: if m.client_cert { tls.client_key_pem.clone() } else { String::new() },
+        client_cert: if m.client_cert {
+            tls.client_cert_pem.clone()
+        } else {
+            String::new()
+        },
+        client_key: if m.client_cert {
+            tls.client_key_pem.clone()
+        } else {
+            String::new()
+        },
     });
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -1703,7 +1774,14 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
     if request.is_none() {
         ui.label(dim("mqtt_ca.rs holds no certificate the checker can use."));
     }
-    let State::Done { ok, summary, steps, p384, tested } = &state else {
+    let State::Done {
+        ok,
+        summary,
+        steps,
+        p384,
+        tested,
+    } = &state
+    else {
         return;
     };
     if m.verify && (tls.user.is_none() || tls.password.is_none()) {
@@ -1713,7 +1791,10 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
     }
     let now = request.as_ref().map(|r| r.tested().fingerprint);
     if now != Some(tested.fingerprint) {
-        ui.label(dim(format!("For {} - the settings have changed since.", tested.key)));
+        ui.label(dim(format!(
+            "For {} - the settings have changed since.",
+            tested.key
+        )));
     }
     for step in steps {
         ui.label(dim(format!("{}  {step}", ph::CHECK)));
@@ -1739,7 +1820,8 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
     }
 }
 
-const SNTP_USAGE: &str = "let unix_s = pins::configs::sntp::now_unix(); // None until the first answer";
+const SNTP_USAGE: &str =
+    "let unix_s = pins::configs::sntp::now_unix(); // None until the first answer";
 
 fn sntp_body(ui: &mut egui::Ui, s: &mut SntpConfig) {
     ui.indent("sntp", |ui| {
@@ -1758,7 +1840,9 @@ fn sntp_body(ui: &mut egui::Ui, s: &mut SntpConfig) {
                     .clamp_existing_to_range(false)
                     .suffix(" s"),
             );
-            ui.label(dim("the clock is set again this often; between, it runs on embassy-time"));
+            ui.label(dim(
+                "the clock is set again this often; between, it runs on embassy-time",
+            ));
         });
         if !(iot::MIN_SNTP_INTERVAL_S..=86_400).contains(&s.interval_s) {
             ui.label(warn(format!(
@@ -1832,7 +1916,9 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
         if ui.small_button(format!("{} Add topic", ph::PLUS)).clicked() {
             m.subscribe.push("rustonchip/cmd".to_owned());
         }
-        ui.label(dim("`+` matches one level, `#` the rest. What arrives comes out of incoming()."));
+        ui.label(dim(
+            "`+` matches one level, `#` the rest. What arrives comes out of incoming().",
+        ));
 
         ui.add_space(4.0);
         tls_section(ui, m, tls, actions);

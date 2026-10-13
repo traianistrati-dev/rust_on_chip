@@ -395,7 +395,10 @@ the generated block, the tasks below it, editable. Your code calls
 `pins::configs::espnow::send(BROADCAST, b"..").await` / `receive().await`;
 each protocol has one task that owns it and reconnects or resyncs on its own,
 and `pins::configs::mqtt::last_refusal()` says what the broker last refused —
-the login, a policy, a subscription — with its MQTT 5 reason code.
+the login, a policy, a subscription — with its MQTT 5 reason code. `publish`
+waits while its queue is full, as long as the broker is away; a loop that must
+not stop for that calls `try_publish`, which never waits, or asks
+`connected()`.
 
 **Restart on panic** (on for a new setup, on every IoT chip) makes a panic
 restart the chip instead of halting it: `src/pins/configs/panic.rs` writes

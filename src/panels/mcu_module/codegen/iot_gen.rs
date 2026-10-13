@@ -3002,6 +3002,9 @@ mod tests {
         assert!(!v2.contains("last_refusal") && now.contains("pub fn last_refusal() -> Option<Refusal>"));
         assert!(lf(LEGACY_TAILS[9].1).contains(MQTT_PUBLISH_SIGNATURE));
         assert!(now.contains("if KEEP_ALIVE_S > 0 {"), "no 0 s socket timeout");
+        // A loop that publishes must not freeze while the broker is away.
+        assert!(now.contains("pub fn try_publish(topic: &str, payload: &[u8]) -> Result<(), PublishError>"));
+        assert!(now.contains("pub fn connected() -> bool"));
         assert!(now.contains("client.shared_config().keep_alive"), "the broker's keep-alive");
     }
 

@@ -2115,5 +2115,8 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
                 ui.ctx().copy_text(MQTT_USAGE.to_owned());
             }
         });
+        ui.label(dim(
+            "publish waits while its queue is full - as long as the broker is away; try_publish never waits, and connected() says whether the broker is there.",
+        ));
     });
 }

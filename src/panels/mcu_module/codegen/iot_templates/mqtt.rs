@@ -7,7 +7,9 @@
 //     let msg = pins::configs::mqtt::incoming().await;   // msg.topic, msg.payload
 //
 // One task owns the connection: it reconnects on its own, and `publish` only
-// queues the message for it. How it reaches the broker - plain TCP, or TLS
+// queues the message for it - and waits while the queue is full, which it
+// stays while the broker is away. A loop that must not stop for that calls
+// `try_publish`, which never waits; `connected()` says whether it is up. How it reaches the broker - plain TCP, or TLS
 // with the broker's certificate checked - is mqtt_link.rs, which the IoT
 // tab swaps; this file stays the same either way.
 //
@@ -16,6 +18,7 @@
 
 use core::cell::Cell;
 use core::num::NonZero;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either3, select3};
@@ -66,6 +69,9 @@ pub enum PublishError {
     /// Empty, or with a `+` or `#` in it: a topic NAME holds no wildcard,
     /// and the broker would end the connection over it.
     InvalidTopic,
+    /// `try_publish` only: the queue is full - the broker away, or messages
+    /// coming faster than it takes them.
+    QueueFull,
 }
 
 /// What the broker refused, with MQTT 5's reason code (0x87 = not
@@ -85,18 +91,36 @@ pub enum Refusal {
 static OUTGOING: Channel<CriticalSectionRawMutex, Message, 4> = Channel::new();
 static INCOMING: Channel<CriticalSectionRawMutex, Message, 4> = Channel::new();
 static REFUSAL: Mutex<CriticalSectionRawMutex, Cell<Option<Refusal>>> = Mutex::new(Cell::new(None));
+static CONNECTED: AtomicBool = AtomicBool::new(false);
 
-/// Queues `payload` for `topic` (QoS 0). Waits only while the queue is full.
+/// Queues `payload` for `topic` (QoS 0). Waits while the queue is full - for
+/// as long as the broker is away: `try_publish` does not.
 pub async fn publish(topic: &str, payload: &[u8]) -> Result<(), PublishError> {
+    OUTGOING.send(message(topic, payload)?).await;
+    Ok(())
+}
+
+/// Queues `payload` for `topic` (QoS 0) without waiting: `QueueFull` while
+/// the queue is - the message is dropped, as QoS 0 allows.
+pub fn try_publish(topic: &str, payload: &[u8]) -> Result<(), PublishError> {
+    OUTGOING
+        .try_send(message(topic, payload)?)
+        .map_err(|_| PublishError::QueueFull)
+}
+
+/// The broker took the CONNECT, and the connection still stands.
+pub fn connected() -> bool {
+    CONNECTED.load(Ordering::Relaxed)
+}
+
+fn message(topic: &str, payload: &[u8]) -> Result<Message, PublishError> {
     if topic.is_empty() || topic.contains(['+', '#']) {
         return Err(PublishError::InvalidTopic);
     }
-    let message = Message {
+    Ok(Message {
         topic: heapless::String::try_from(topic).map_err(|_| PublishError::TopicTooLong)?,
         payload: heapless::Vec::from_slice(payload).map_err(|_| PublishError::PayloadTooLarge)?,
-    };
-    OUTGOING.send(message).await;
-    Ok(())
+    })
 }
 
 /// The next publication on a subscribed topic.
@@ -130,6 +154,7 @@ async fn mqtt_task(stack: Stack<'static>) -> ! {
         stack.wait_config_up().await;
         // `Err` is a lost or refused connection; either way, start over.
         let _ = session(stack, &mut rx, &mut tx, &mut work, links).await;
+        CONNECTED.store(false, Ordering::Relaxed);
         Timer::after(Duration::from_secs(RETRY_S)).await;
     }
 }
@@ -207,6 +232,7 @@ async fn session(
         .await
         .map_err(drop)?
         .map_err(|e| refused(e, Refusal::Connect))?;
+    CONNECTED.store(true, Ordering::Relaxed);
     reset(&mut client);
 
     for topic in SUBSCRIBE {

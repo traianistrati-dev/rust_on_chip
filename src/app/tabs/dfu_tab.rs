@@ -136,12 +136,38 @@ pub fn show_dfu_tab(
     //         .then_with(|| a.name.cmp(&b.name))
     // });
 
+    // ── Adopt the only board there is ───────────────────────────────────────
+    // With one compatible board attached, refusing the Flash button would only
+    // be telling the user to click the single row in the list. So pick it - and
+    // note this is STRICTLY better than the auto-detect it replaces: espflash
+    // now gets an explicit `--port` instead of choosing for itself.
+    //
+    // Runs every frame and is idempotent: it fires only while nothing USABLE is
+    // selected, which is also what an explicit Scan leaves behind (`scan_usb`
+    // drops the pick on purpose) and what a rescan leaves when a board is
+    // unplugged - so a board that comes back is adopted again. Two boards is a
+    // real choice and nothing is written; that is still `esp_port_reason`'s job.
+    //
+    // Before `sel_kind` below, so the refusal chains see the adoption in the
+    // SAME frame and the button never flashes red for one frame.
+    let selection_is_usable = progs
+        .get(dfu_sel_programmer)
+        .is_some_and(|p| flashable_by(toolchain, p));
+    let adopt = if selection_is_usable {
+        None
+    } else {
+        lone_flashable(&progs, toolchain).cloned()
+    };
+    if let Some(key) = adopt {
+        *dfu_sel_programmer = key;
+    }
+
     // Determine selected programmer kind for adaptive config UI
     let sel_kind = progs
         .get(dfu_sel_programmer)
         .map(|p| p.kind.clone())
         .unwrap_or("".to_string());
-    let is_swd = matches!(sel_kind.as_str(), "ST-Link" | "J-Link" | "CMSIS-DAP");
+    let is_swd = is_swd_kind(&sel_kind);
     let interface_cfg = openocd::interface_cfg_for_kind(&sel_kind);
 
     let dfu_busy = state.is_busy();
@@ -1358,6 +1384,69 @@ fn combo_width(total: f32) -> f32 {
 /// The device lists never take more than this share of the panel width.
 const COMBO_MAX_FRACTION: f32 = 0.40;
 
+/// The programmer kinds OpenOCD can drive over SWD.
+///
+/// One definition, because `is_swd` — which also decides whether the SWD config
+/// row is the one shown — and [`flashable_by`] must not drift apart.
+fn is_swd_kind(kind: &str) -> bool {
+    matches!(kind, "ST-Link" | "J-Link" | "CMSIS-DAP")
+}
+
+/// Which rows the Programmer dropdown lets you pick, for a given toolchain.
+///
+/// WIDER than [`flashable_by`] on purpose: a DFU bootloader is a legitimate
+/// thing to select on an ARM project, and the list says so, even though Flash
+/// SWD cannot drive one. `everything_auto_selection_can_pick_is_also_pickable_by_hand`
+/// pins the one direction that must hold between the two.
+fn selectable_for(toolchain: &ToolchainKind, p: &dfu::ProgrammerInfo) -> bool {
+    match toolchain {
+        ToolchainKind::RustEmbedded => {
+            matches!(p.kind.as_str(), "DFU Bootloader" | "STLink" | "STM") || is_swd_kind(&p.kind)
+        }
+        ToolchainKind::EspRust => dfu::is_espressif_target(&p.kind, &p.vid_pid),
+        ToolchainKind::SdccC => false,
+    }
+}
+
+/// Can the toolchain's own flash path actually drive this programmer?
+///
+/// Narrower than [`selectable_for`], and that is the point: it is the set each
+/// refusal chain already demands — `is_swd` for OpenOCD, `is_espressif_target`
+/// for espflash (see [`esp_port_reason`]) — so adopting one of these ALWAYS
+/// turns the Flash button green. Auto-selecting a lone DFU bootloader instead
+/// would leave the list looking chosen and Flash SWD still red, which is worse
+/// than leaving it empty.
+fn flashable_by(toolchain: &ToolchainKind, p: &dfu::ProgrammerInfo) -> bool {
+    match toolchain {
+        ToolchainKind::RustEmbedded => is_swd_kind(&p.kind),
+        ToolchainKind::EspRust => dfu::is_espressif_target(&p.kind, &p.vid_pid),
+        ToolchainKind::SdccC => false,
+    }
+}
+
+/// The one board worth adopting without asking, if there is exactly one.
+///
+/// `None` the moment there are two: a real choice belongs to the user, and
+/// guessing between two attached boards is how the wrong one gets programmed —
+/// the very thing [`esp_port_reason`] exists to prevent. Map order is irrelevant
+/// because anything but a single hit is refused.
+fn lone_flashable<'a>(
+    progs: &'a HashMap<String, dfu::ProgrammerInfo>,
+    toolchain: &ToolchainKind,
+) -> Option<&'a String> {
+    let mut only = None;
+    for (key, p) in progs {
+        if !flashable_by(toolchain, p) {
+            continue;
+        }
+        if only.is_some() {
+            return None;
+        }
+        only = Some(key);
+    }
+    only
+}
+
 /// Why the ESP path must not start with the Programmer list as it stands, if it
 /// must not.
 ///
@@ -1676,18 +1765,10 @@ fn programmer_combo(
                     );
                 }
                 for (key, p) in progs.iter() {
-                    // Determine if this programmer is compatible with the selected toolchain
-                    let is_stm_programmer = matches!(
-                        p.kind.as_str(),
-                        "DFU Bootloader" | "ST-Link" | "STLink" | "STM" | "J-Link" | "CMSIS-DAP"
-                    );
-                    let is_esp_programmer = crate::dfu::is_espressif_target(&p.kind, &p.vid_pid);
-
-                    let is_compatible = match toolchain {
-                        ToolchainKind::RustEmbedded => is_stm_programmer,
-                        ToolchainKind::EspRust => is_esp_programmer,
-                        ToolchainKind::SdccC => false,
-                    };
+                    // Shared with the auto-selection above, so the list and the
+                    // pick it makes for you can never disagree about what counts
+                    // as compatible - see `selectable_for`.
+                    let is_compatible = selectable_for(toolchain, p);
 
                     let kind_color = match p.kind.as_str() {
                         "DFU Bootloader" => egui::Color32::from_rgb(100, 200, 255),
@@ -1989,9 +2070,10 @@ const FLASH_NOTES: &[&str] = &[
 mod tests {
     use super::{
         COMBO_MAX_FRACTION, FLASH_W, RIGHT_W, SCAN_W, combo_width, ellipsize, esp_port_reason,
-        right_block_w,
+        flashable_by, is_swd_kind, lone_flashable, right_block_w, selectable_for,
     };
     use crate::dfu::ProgrammerInfo;
+    use crate::panels::mcu_module::ToolchainKind;
     use std::collections::HashMap;
 
     fn prog(kind: &str, vid_pid: &str) -> ProgrammerInfo {
@@ -2002,6 +2084,220 @@ mod tests {
             port: "COM12".to_owned(),
             extra_details: String::new(),
         }
+    }
+
+    /// Keyed by port, the way the real scan keys it (`dfu.rs`), so the fixtures
+    /// behave like the map the tab is handed.
+    fn listed(items: &[(&str, &str, &str)]) -> HashMap<String, ProgrammerInfo> {
+        items
+            .iter()
+            .map(|(port, kind, vid_pid)| {
+                let mut p = prog(kind, vid_pid);
+                p.port = (*port).to_owned();
+                ((*port).to_owned(), p)
+            })
+            .collect()
+    }
+
+    /// This very file, for the source scans below.
+    fn read_self() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app/tabs/dfu_tab.rs"),
+        )
+        .expect("this very file")
+    }
+
+    const EVERY_KIND: &[(&str, &str)] = &[
+        ("ST-Link", "0483:3748"),
+        ("J-Link", "1366:0101"),
+        ("CMSIS-DAP", "0d28:0204"),
+        ("DFU Bootloader", "0483:df11"),
+        ("STLink", "0483:3752"),
+        ("STM", "0483:0000"),
+        ("USB-Serial", "10c4:ea60"),
+        ("ESP32", "303a:1001"),
+        ("unknown gadget", "1234:5678"),
+    ];
+
+    const EVERY_TOOLCHAIN: &[ToolchainKind] = &[
+        ToolchainKind::RustEmbedded,
+        ToolchainKind::EspRust,
+        ToolchainKind::SdccC,
+    ];
+
+    /// Auto-selection must never adopt a row the dropdown would refuse to let the
+    /// user pick by hand — the list would then show a selection that cannot be
+    /// reproduced, or changed back to, by clicking. One direction only:
+    /// `flashable_by` ⊆ `selectable_for`, never the reverse.
+    #[test]
+    fn everything_auto_selection_can_pick_is_also_pickable_by_hand() {
+        for tc in EVERY_TOOLCHAIN {
+            for (kind, vid_pid) in EVERY_KIND {
+                let p = prog(kind, vid_pid);
+                if flashable_by(tc, &p) {
+                    assert!(
+                        selectable_for(tc, &p),
+                        "{tc:?} would adopt [{kind}] {vid_pid}, which its list will not offer"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The exact set the dropdown offers, pinned because `selectable_for` was
+    /// EXTRACTED from `programmer_combo` rather than written fresh: the refactor
+    /// is only correct if the offered set did not move. The ARM list is wider
+    /// than SWD on purpose — it carries the DFU bootloader and the two legacy
+    /// ST-Link spellings the scan can still produce.
+    #[test]
+    fn the_dropdown_offers_exactly_what_it_offered_before() {
+        let offered = |tc: &ToolchainKind| -> Vec<&str> {
+            EVERY_KIND
+                .iter()
+                .filter(|(kind, vid_pid)| selectable_for(tc, &prog(kind, vid_pid)))
+                .map(|(kind, _)| *kind)
+                .collect()
+        };
+        let mut arm = offered(&ToolchainKind::RustEmbedded);
+        arm.sort_unstable();
+        assert_eq!(
+            arm,
+            [
+                "CMSIS-DAP",
+                "DFU Bootloader",
+                "J-Link",
+                "ST-Link",
+                "STLink",
+                "STM"
+            ],
+            "the ARM list changed shape"
+        );
+        let mut esp = offered(&ToolchainKind::EspRust);
+        esp.sort_unstable();
+        assert_eq!(esp, ["ESP32", "USB-Serial"], "the ESP list changed shape");
+        assert!(
+            offered(&ToolchainKind::SdccC).is_empty(),
+            "SdccC has no flashing path on this tab"
+        );
+    }
+
+    /// The narrowing is deliberate and is the whole reason the two rules differ:
+    /// a DFU bootloader is offered on an ARM project, but Flash SWD cannot drive
+    /// one, so adopting it would leave the list looking chosen and the button red.
+    #[test]
+    fn a_lone_dfu_bootloader_is_offered_but_never_adopted() {
+        let dfu_boot = prog("DFU Bootloader", "0483:df11");
+        let arm = ToolchainKind::RustEmbedded;
+        assert!(selectable_for(&arm, &dfu_boot), "the list offers it");
+        assert!(!flashable_by(&arm, &dfu_boot), "OpenOCD cannot drive it");
+        assert_eq!(
+            lone_flashable(&listed(&[("1", "DFU Bootloader", "0483:df11")]), &arm),
+            None,
+            "a lone DFU bootloader must be left for the user to pick"
+        );
+    }
+
+    /// One compatible board is not a choice, so it is made for the user — this is
+    /// what spares a click after every Scan, which drops the pick on purpose.
+    #[test]
+    fn the_only_compatible_board_is_adopted_on_each_toolchain() {
+        let esp = listed(&[("COM12", "USB-Serial", "303a:1001")]);
+        assert_eq!(
+            lone_flashable(&esp, &ToolchainKind::EspRust).map(String::as_str),
+            Some("COM12")
+        );
+        let arm = listed(&[("3", "ST-Link", "0483:3748")]);
+        assert_eq!(
+            lone_flashable(&arm, &ToolchainKind::RustEmbedded).map(String::as_str),
+            Some("3")
+        );
+        // Incompatible company does not make it ambiguous: an ST-Link attached
+        // next to the ESP is not a candidate for espflash.
+        let mixed = listed(&[
+            ("COM12", "USB-Serial", "303a:1001"),
+            ("3", "ST-Link", "0483:3748"),
+        ]);
+        assert_eq!(
+            lone_flashable(&mixed, &ToolchainKind::EspRust).map(String::as_str),
+            Some("COM12")
+        );
+        assert_eq!(
+            lone_flashable(&mixed, &ToolchainKind::RustEmbedded).map(String::as_str),
+            Some("3")
+        );
+    }
+
+    /// Two candidates is a REAL choice, and guessing between two attached boards
+    /// is how the wrong one gets programmed — exactly what the refusal exists to
+    /// prevent. Nothing is adopted, and the refusal stands.
+    #[test]
+    fn two_compatible_boards_are_never_guessed_between() {
+        let two = listed(&[
+            ("COM12", "USB-Serial", "303a:1001"),
+            ("COM7", "ESP32", "303a:1001"),
+        ]);
+        assert_eq!(lone_flashable(&two, &ToolchainKind::EspRust), None);
+        // …and the gate still refuses, so the user is told to choose.
+        assert!(esp_port_reason(two.get("nothing selected yet")).is_some());
+    }
+
+    /// An empty list, and a list with nothing the toolchain can use, both adopt
+    /// nothing rather than reaching for the first row.
+    #[test]
+    fn nothing_usable_adopts_nothing() {
+        let empty: HashMap<String, ProgrammerInfo> = HashMap::new();
+        for tc in EVERY_TOOLCHAIN {
+            assert_eq!(lone_flashable(&empty, tc), None, "{tc:?}");
+        }
+        let only_arm = listed(&[("3", "ST-Link", "0483:3748")]);
+        assert_eq!(lone_flashable(&only_arm, &ToolchainKind::EspRust), None);
+        let only_esp = listed(&[("COM12", "USB-Serial", "303a:1001")]);
+        assert_eq!(
+            lone_flashable(&only_esp, &ToolchainKind::RustEmbedded),
+            None
+        );
+        // SdccC has no flash path on this tab at all, so nothing is ever adopted.
+        for (kind, vid_pid) in EVERY_KIND {
+            assert!(!flashable_by(&ToolchainKind::SdccC, &prog(kind, vid_pid)));
+        }
+    }
+
+    /// `is_swd` decides both the SWD refusal and which config row is shown, so it
+    /// and `flashable_by` read one definition. Pinned as a set, because a kind
+    /// added to one and not the other is a silent divergence.
+    #[test]
+    fn the_swd_kinds_are_one_definition() {
+        for (kind, vid_pid) in EVERY_KIND {
+            assert_eq!(
+                is_swd_kind(kind),
+                flashable_by(&ToolchainKind::RustEmbedded, &prog(kind, vid_pid)),
+                "[{kind}] disagrees between `is_swd_kind` and the ARM flash path"
+            );
+        }
+        assert!(is_swd_kind("ST-Link") && is_swd_kind("J-Link") && is_swd_kind("CMSIS-DAP"));
+        assert!(!is_swd_kind("DFU Bootloader") && !is_swd_kind("USB-Serial"));
+    }
+
+    /// The adoption has to be WIRED, and wired BEFORE the refusal chains, or the
+    /// Flash button goes red for one frame before turning orange. Same blind spot
+    /// as `every_flash_reason_chain_consults_its_device_list`: a unit test of
+    /// `lone_flashable` cannot see whether anything calls it.
+    #[test]
+    fn the_lone_board_is_adopted_before_the_refusals_are_computed() {
+        let src = read_self();
+        // Assembled so this test does not match itself.
+        let call = ["lone_flashable(", "&progs, toolchain)"].concat();
+        let adopt = src
+            .find(&call)
+            .unwrap_or_else(|| panic!("`{call}` is gone - the tab adopts nothing any more"));
+        let refusals = src
+            .find(&["let ", "swd_reason"].concat())
+            .expect("the refusal chains");
+        assert!(
+            adopt < refusals,
+            "the adoption must run BEFORE the refusal chains, or the button flashes \
+             red for a frame on the single-board case"
+        );
     }
 
     /// The ESP half of what `allow_auto: false` does for the probe-rs row: refuse
@@ -2059,10 +2355,7 @@ mod tests {
     /// it. Same reasoning as `probe::no_caller_filters_a_probe_selector_by_hand`.
     #[test]
     fn every_flash_reason_chain_consults_its_device_list() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app/tabs/dfu_tab.rs"),
-        )
-        .expect("this very file");
+        let src = read_self();
         // Flash SWD and Flash ESP32 go through the Programmer list, Flash
         // (probe-rs) through the separate probe list; each pair is what proves
         // the chain asked.

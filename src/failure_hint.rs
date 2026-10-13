@@ -72,6 +72,11 @@ pub const HINTS: &[Hint] = &[
         tool: None, // nothing to install — it is a build/probe situation
     },
     Hint {
+        tag: "[RISCV_DMI_TIMEOUT]",
+        title: "The chip's debug unit is not answering",
+        tool: None, // a state of the chip: a power cycle, not an install
+    },
+    Hint {
         tag: "[STALE_OUT_DIR]",
         title: "A dependency's generated file is missing",
         tool: None, // nothing to install — one package's fingerprint has to go
@@ -205,6 +210,78 @@ pub fn probe_rs_panic(text: &str) -> Option<String> {
     } else {
         format!("{where_}\n  {what}")
     })
+}
+
+/// The tagged message for a RISC-V chip whose debug module does not answer
+/// (`Timeout during DMI access`), `None` when `text` does not say so.
+///
+/// On an ESP32-C3 over its built-in USB-JTAG this is the chip's state, not
+/// the code's or the probe's: a debug session cut off without its
+/// disconnect leaves the debug module like this until the board loses
+/// power, and a sleeping chip does not answer either. The raw error names
+/// none of that.
+///
+/// `chip` names the pins its debug link uses; `flashes` says whether the
+/// failed session would have flashed the firmware (Debug, RTT Run, Measure)
+/// or only attaches (Sample, RTT Attach) - the way out of a chip that hangs
+/// every time differs.
+pub fn riscv_dmi_timeout(text: &str, chip: &str, flashes: bool) -> Option<String> {
+    if !text.contains("Timeout during DMI access") {
+        return None;
+    }
+    let chip = chip.to_ascii_lowercase();
+    // The USB-Serial-JTAG's D-/D+ pads; the C2 has none, only real JTAG.
+    let c2 = chip.starts_with("esp32c2");
+    let pins = if chip.starts_with("esp32c3") {
+        "GPIO18/GPIO19, its USB-JTAG pins"
+    } else if chip.starts_with("esp32c6") || chip.starts_with("esp32c61") {
+        "GPIO12/GPIO13, its USB-JTAG pins"
+    } else if chip.starts_with("esp32c5") {
+        "GPIO13/GPIO14, its USB-JTAG pins"
+    } else if chip.starts_with("esp32h2") {
+        "GPIO26/GPIO27, its USB-JTAG pins"
+    } else if c2 {
+        "GPIO4-GPIO7, its JTAG pins"
+    } else {
+        "the pins its debug link uses"
+    };
+    let power = if c2 {
+        concat!(
+            "-> Power-cycle the BOARD: an ESP32-C2 is debugged through a separate JTAG ",
+            "probe, and unplugging the probe leaves the chip powered and stuck. Remove ",
+            "every cable that powers the board, then plug it back in.",
+        )
+    } else {
+        concat!(
+            "-> Remove every cable that powers the board - both USB ports of a two-port ",
+            "devkit - and plug it back in. A power cycle: the reset button is not enough. ",
+            "A debug session cut off earlier (a closed IDE, a killed probe-rs) leaves the ",
+            "debug unit like this.",
+        )
+    };
+    let boot = if flashes {
+        concat!(
+            "Hold BOOT while plugging in, so the chip waits in its ROM, and try again: ",
+            "this session flashes the firmware and starts it from there.",
+        )
+    } else {
+        concat!(
+            "Hold BOOT while plugging in, flash the firmware (the Flash tab, or RTT Run), ",
+            "then try again: this session only attaches, and a chip held in its ROM runs ",
+            "nothing to attach to. Firmware that sleeps or takes those pins cannot be ",
+            "attached to while it runs.",
+        )
+    };
+    Some(format!(
+        concat!(
+            "[RISCV_DMI_TIMEOUT] probe-rs reached the probe, but the chip's RISC-V debug ",
+            "unit did not answer (\"Timeout during DMI access\").\n\n",
+            "This is a state of the chip, not of your code or the probe:\n{}\n",
+            "-> If it comes back every time, the firmware may put the chip to sleep (light ",
+            "or deep sleep stops the debug unit) or take over {}. {}",
+        ),
+        power, pins, boot
+    ))
 }
 
 /// The tagged message for a probe-rs crash. The point is to say plainly that
@@ -505,12 +582,48 @@ mod tests {
             "[PROBE_RS_PANIC]",
             "[PROBE_OPEN_FAILED]",
             "[LAUNCH_STALLED]",
+            "[RISCV_DMI_TIMEOUT]",
         ] {
             assert!(
                 HINTS.iter().any(|h| h.tag == tag),
                 "{tag} has no hint entry"
             );
         }
+    }
+
+    /// The ESP32-C3's stuck debug unit, as the Timing tab met it: the console
+    /// lines probe-rs wrote become the card, from every probe-rs session.
+    #[test]
+    fn a_debug_unit_that_does_not_answer_gets_its_card() {
+        let console = [
+            "probe-rs-debug: Starting debug session from: 127.0.0.1:59524".to_owned(),
+            "A RISC-V specific error occurred.".to_owned(),
+            "\"Timeout during DMI access.\"".to_owned(),
+        ];
+        let e =
+            "launch failed: A RISC-V specific error occurred.\n    \"Timeout during DMI access.\"";
+        let card = crate::flamegraph::explain_dap_failure(
+            e.to_owned(),
+            &console,
+            "",
+            "303a:1001",
+            "esp32c3",
+            true,
+        );
+        let (hint, body) = parse(&card).expect("tagged");
+        assert_eq!(hint.tag, "[RISCV_DMI_TIMEOUT]");
+        assert!(body.contains("plug it back in") && body.contains("GPIO18/GPIO19"));
+        assert!(body.contains("this session flashes"));
+        assert!(crate::rtt::probe_rs_failure(e, None, "esp32c3", true).is_some_and(|m| m == card));
+        // Per chip, per kind of session.
+        let c6 = riscv_dmi_timeout(e, "esp32c6", false).unwrap();
+        assert!(c6.contains("GPIO12/GPIO13") && c6.contains("only attaches"));
+        let c2 = riscv_dmi_timeout(e, "esp32c2", true).unwrap();
+        assert!(c2.contains("GPIO4-GPIO7") && c2.contains("Power-cycle the BOARD"));
+        assert_eq!(
+            riscv_dmi_timeout("launch failed: no probe", "esp32c3", true),
+            None
+        );
     }
 
     /// The linker dump repeats the same shortfall once per section — the card

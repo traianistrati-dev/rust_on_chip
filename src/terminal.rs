@@ -59,6 +59,9 @@ pub struct TerminalState {
     /// be worse than no stamp. Time SINCE THE BOARD STARTED TALKING is also the
     /// number you actually want when watching a loop.
     pub stamp_from: Option<Instant>,
+    /// Every line ever pushed, scrollback cap and Clear notwithstanding: what
+    /// [`TerminalState::tail_since`] counts a session's own lines by.
+    pub pushed: u64,
     /// egui pass number of the last frame that DREW these lines — set by the
     /// renderer. Readers repaint only while it is recent, see
     /// [`drawn_recently`].
@@ -127,6 +130,7 @@ impl TerminalState {
             );
         }
         self.lines.push(TermLine { kind, spans });
+        self.pushed += 1;
         if self.lines.len() > MAX_LINES {
             let excess = self.lines.len() - MAX_LINES;
             self.lines.drain(..excess);
@@ -140,8 +144,16 @@ impl TerminalState {
     /// The last `n` lines as plain text (colour spans flattened), oldest first.
     /// For post-mortems on a console a subprocess wrote into — a crash is always
     /// at the END, and a long session's scrollback isn't worth walking.
-    pub(crate) fn tail_text(&self, n: usize) -> String {
-        let start = self.lines.len().saturating_sub(n);
+    /// Where the lines a session is about to print will start.
+    pub(crate) fn mark(&self) -> u64 {
+        self.pushed
+    }
+
+    /// The last `n` lines pushed after `mark`: what ONE session printed, not
+    /// an earlier session's failure still in the scrollback.
+    pub(crate) fn tail_since(&self, mark: u64, n: usize) -> String {
+        let new = self.pushed.saturating_sub(mark).min(n as u64) as usize;
+        let start = self.lines.len().saturating_sub(new);
         self.lines[start..]
             .iter()
             .map(|l| l.spans.iter().map(|(t, _)| t.as_str()).collect::<String>())
@@ -633,6 +645,22 @@ fn sgr_color(params: &str, prev: Option<egui::Color32>) -> Option<egui::Color32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's failure is read from its own lines: an earlier session's
+    /// error still in the scrollback is not one of them.
+    #[test]
+    fn a_session_reads_only_the_lines_it_printed() {
+        let mut t = TerminalState::default();
+        t.push_plain(LineKind::Stderr, "Timeout during DMI access");
+        let mark = t.mark();
+        assert_eq!(t.tail_since(mark, 60), "");
+        t.push_plain(LineKind::Stderr, "No connected probes were found");
+        assert_eq!(t.tail_since(mark, 60), "No connected probes were found");
+        // Cleared in between: what is left of it.
+        t.lines.clear();
+        t.push_plain(LineKind::Stderr, "again");
+        assert_eq!(t.tail_since(mark, 60), "again");
+    }
 
     #[test]
     fn a_stream_repaints_only_a_view_drawn_lately() {

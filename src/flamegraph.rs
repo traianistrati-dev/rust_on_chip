@@ -906,7 +906,15 @@ fn run(
     // On failure, enrich the terse DAP error with the dap-server's own log tail
     // (probe-rs logs the real reason there).
     let samples = result.map_err(|e| {
-        explain_dap_failure(e, &console.lock().unwrap(), &log.lock().unwrap(), &probe)
+        // Sample attaches: it never flashes.
+        explain_dap_failure(
+            e,
+            &console.lock().unwrap(),
+            &log.lock().unwrap(),
+            &probe,
+            chip,
+            false,
+        )
     })?;
     let run = SampleRun {
         format: RUN_FORMAT.to_owned(),
@@ -924,7 +932,16 @@ fn run(
 
 /// A failed dap-server session's error, with what probe-rs said about it:
 /// its console (`output` events) and its stderr `log`.
-pub(crate) fn explain_dap_failure(e: String, console: &[String], log: &str, probe: &str) -> String {
+pub(crate) fn explain_dap_failure(
+    e: String,
+    console: &[String],
+    log: &str,
+    probe: &str,
+    // For the stuck-debug-unit card: which pins, and whether this session
+    // would have flashed (see `failure_hint::riscv_dmi_timeout`).
+    chip: &str,
+    flashes: bool,
+) -> String {
     // The console first: it carries the sentence, stderr only the banner.
     let console_tail = tail_of(console.iter().map(String::as_str), 6);
     let server_tail = tail_of(log.lines(), 4);
@@ -939,6 +956,7 @@ pub(crate) fn explain_dap_failure(e: String, console: &[String], log: &str, prob
     );
     if let Some(tagged) = crate::failure_hint::probe_rs_panic(&everything)
         .map(|d| crate::failure_hint::probe_rs_panic_message(&d))
+        .or_else(|| crate::failure_hint::riscv_dmi_timeout(&everything, chip, flashes))
         .or_else(|| {
             crate::failure_hint::probe_open_failure(&everything).map(|d| {
                 crate::failure_hint::probe_open_message(

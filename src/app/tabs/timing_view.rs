@@ -495,6 +495,7 @@ mod tests {
             first,
             last: first + 1,
             whole_fn,
+            col: 0,
             func: func.into(),
             fn_copy: (0, 1),
             anchor: Vec::new(),

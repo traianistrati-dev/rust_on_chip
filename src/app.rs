@@ -694,6 +694,9 @@ pub(crate) enum GotoOrigin {
     Editor(EditorSlot),
     /// The read-only Definition tab (a chained F12, Ctrl+F12 or Ctrl+Click).
     DefinitionTab,
+    /// The editor's "Time this function": the answer names what to time, it
+    /// opens nothing (see `editor_panel::timing_mark`).
+    Timing,
 }
 
 impl Default for GotoOrigin {
@@ -1937,6 +1940,8 @@ pub struct AppIde {
     // ── Go to definition (F12 → textDocument/definition) ─────────────────────
     /// `true` after an F12 request, until the definition arrives.
     definition_in_flight: bool,
+    /// A "Time this function" waiting on that same answer.
+    timing_ask: Option<editor_panel::timing_mark::TimingAsk>,
     /// Where to anchor the go-to chooser: the caret, captured when the request
     /// went out. The answer lands frames later, by which time the galley that
     /// could locate the caret no longer exists — the same reason
@@ -2558,6 +2563,7 @@ impl AppIde {
             file_cycle: editor_panel::file_cycle::FileCycle::default(),
             last_selected_file: ProjectFileId::MainRs,
             definition_in_flight: false,
+            timing_ask: None,
             definition_anchor: egui::Pos2::ZERO,
             definition_caret_line: String::new(),
             impl_picker: None,
@@ -4345,6 +4351,9 @@ impl AppIde {
             };
             if let Some(locs) = taken {
                 self.definition_in_flight = false;
+                if asker.definition == GotoOrigin::Timing {
+                    self.timing_definition_answer(locs, error);
+                } else {
                 let noun = if is_impl {
                     "implementation"
                 } else {
@@ -4419,6 +4428,7 @@ impl AppIde {
                             title: format!("{n} {noun}s"),
                         });
                     }
+                }
                 }
                 self.egui_ctx.request_repaint();
             }

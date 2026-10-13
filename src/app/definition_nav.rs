@@ -492,7 +492,7 @@ impl GotoOrigin {
     pub(crate) fn editor(self) -> EditorSlot {
         match self {
             GotoOrigin::Editor(slot) => slot,
-            GotoOrigin::DefinitionTab => EditorSlot::Main,
+            GotoOrigin::DefinitionTab | GotoOrigin::Timing => EditorSlot::Main,
         }
     }
 }

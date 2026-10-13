@@ -39,6 +39,11 @@ pub struct TimingRegion {
     pub first: u32,
     pub last: u32,
     pub whole_fn: bool,
+    /// A whole function: the 0-based char column of the caret it was marked
+    /// at, then (once anchored) of the function's or closure's start - with
+    /// `first`, WHICH of the callables of that line it is: `.filter(|x| ..)
+    /// .for_each(|x| { .. })` puts two on one.
+    pub col: u32,
     /// The path of the function it is in (`fade`, `Led::set`,
     /// `<Level as From<u8>>::from`), as [`place`] found it when it was
     /// marked. Empty: not anchored, the line numbers are taken as they are.
@@ -70,7 +75,10 @@ pub fn anchored(text: &str, r: TimingRegion, p: &Placement) -> TimingRegion {
     // `place` parsed this text already: `functions` cannot fail on it.
     let fns = functions(text, &r.file).unwrap_or_default();
     let same: Vec<&FnSeen> = fns.iter().filter(|f| f.path == p.func).collect();
-    let index = same.iter().position(|f| f.sig == p.fn_line).unwrap_or(0);
+    let index = same
+        .iter()
+        .position(|f| f.sig == p.fn_line && f.col == p.fn_col)
+        .unwrap_or(0);
     let copy = match same.get(index) {
         Some(f) if !anchor.is_empty() => {
             let runs = runs_in(text, f, &anchor);
@@ -86,6 +94,7 @@ pub fn anchored(text: &str, r: TimingRegion, p: &Placement) -> TimingRegion {
         first: p.lines.0,
         last: p.lines.1,
         func: p.func.clone(),
+        col: p.fn_col,
         fn_copy: (index as u32, same.len().max(1) as u32),
         anchor,
         copy,
@@ -111,8 +120,13 @@ fn runs_in(text: &str, f: &FnSeen, anchor: &[String]) -> Vec<usize> {
 /// refused, as it is when its lines changed: nothing is ever timed under a
 /// label that names other code.
 pub fn locate(text: &str, r: &TimingRegion) -> Result<(u32, u32), String> {
+    find(text, r).map(|(first, last, _)| (first, last))
+}
+
+/// [`locate`], with the column of a whole function's start.
+fn find(text: &str, r: &TimingRegion) -> Result<(u32, u32, u32), String> {
     if r.func.is_empty() {
-        return Ok((r.first, r.last));
+        return Ok((r.first, r.last, r.col));
     }
     let fns = functions(text, &r.file)?;
     let same: Vec<&FnSeen> = fns.iter().filter(|f| f.path == r.func).collect();
@@ -136,12 +150,14 @@ pub fn locate(text: &str, r: &TimingRegion) -> Result<(u32, u32), String> {
         }
     };
     if r.whole_fn || r.anchor.is_empty() {
-        return Ok((f.sig, f.close));
+        return Ok((f.sig, f.close, f.col));
     }
     let runs = runs_in(text, f, &r.anchor);
     let (index, count) = r.copy;
     match runs.get(index as usize) {
-        Some(&i) if runs.len() as u32 == count => Ok((i as u32 + 1, (i + r.anchor.len()) as u32)),
+        Some(&i) if runs.len() as u32 == count => {
+            Ok((i as u32 + 1, (i + r.anchor.len()) as u32, r.col))
+        }
         _ if runs.is_empty() => Err(format!(
             "{}: the code timed in `{}` (lines {}-{}) has changed - mark it again",
             r.file, r.func, r.first, r.last
@@ -164,10 +180,11 @@ pub fn locate(text: &str, r: &TimingRegion) -> Result<(u32, u32), String> {
 /// macro or a string would otherwise place the code AROUND them under the
 /// row's label.
 pub fn resolve(text: &str, r: &TimingRegion) -> Result<(TimingRegion, Placement), String> {
-    let (first, last) = locate(text, r)?;
+    let (first, last, col) = find(text, r)?;
     let moved = TimingRegion {
         first,
         last,
+        col,
         ..r.clone()
     };
     let p = place(text, &moved)?;
@@ -201,7 +218,38 @@ pub fn mark(text: &str, asked: TimingRegion) -> Result<(TimingRegion, Placement)
 struct FnSeen {
     path: String,
     sig: u32,
+    /// The 0-based char column it starts at: the `fn` keyword, the closure.
+    col: u32,
     close: u32,
+    /// What it is: what the tests tell a closure from a function by.
+    #[cfg_attr(not(test), allow(dead_code))]
+    kind: Callable,
+}
+
+/// What a body that can be timed as a whole is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Callable {
+    /// A free function (of a module).
+    Fn,
+    /// A function of an `impl` or a trait.
+    Method,
+    /// A closure, `async` or not, named by the `let` it is bound to.
+    Closure,
+}
+
+/// What the path so far has entered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    Mod,
+    Impl,
+    Trait,
+    Fn,
+    Closure,
+}
+
+/// Why `text` does not parse, `None` when it does.
+pub fn parse_error(text: &str, file: &str) -> Option<String> {
+    functions(text, file).err()
 }
 
 /// Every function body of `text`.
@@ -217,6 +265,232 @@ fn functions(text: &str, file: &str) -> Result<Vec<FnSeen>, String> {
     let mut f = Finder::new(0, 0, false);
     f.visit_file(&parsed);
     Ok(f.seen)
+}
+
+/// The name of the call whose name the caret is on, at `(1-based line,
+/// 0-based char column)`: a function, a method, a closure - also inside a
+/// macro's arguments (`println!("{}", f(x))`) and as `<T as Tr>::f(..)`.
+/// `None` when the caret is on no call's name. Used only to tell, when
+/// rust-analyzer cannot be asked, that the caret meant a call.
+pub fn call_name_at(text: &str, line: usize, col: usize) -> Option<String> {
+    use syn::visit::Visit;
+    struct Calls {
+        line: usize,
+        col: usize,
+        found: Option<String>,
+    }
+    impl Calls {
+        fn on(&mut self, ident: &proc_macro2::Ident) {
+            let (a, b) = (ident.span().start(), ident.span().end());
+            if a.line == self.line && a.column <= self.col && self.col <= b.column {
+                self.found = Some(ident.to_string());
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Calls {
+        fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*c.func
+                && let Some(last) = p.path.segments.last()
+            {
+                self.on(&last.ident);
+            }
+            syn::visit::visit_expr_call(self, c);
+        }
+        fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {
+            self.on(&m.method);
+            syn::visit::visit_expr_method_call(self, m);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            // The arguments of `println!`, `info!`, `join!`, `assert!`: one
+            // comma-separated list of expressions, spans and all.
+            use syn::parse::Parser;
+            let args = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+            if let Ok(exprs) = args.parse2(m.tokens.clone()) {
+                for e in &exprs {
+                    self.visit_expr(e);
+                }
+            }
+        }
+    }
+    proc_macro2::extra::invalidate_current_thread_spans();
+    let file = syn::parse_file(text).ok()?;
+    let mut calls = Calls {
+        line,
+        col,
+        found: None,
+    };
+    calls.visit_file(&file);
+    calls.found
+}
+
+/// The function or closure a definition names, from the position of its
+/// name (what rust-analyzer's "go to definition" answers): the name of a
+/// `fn`, or of a `let` that binds a closure. `(1-based line, 0-based char
+/// column)` of the callable's start, `None` for anything else - a struct, a
+/// variable, a field.
+pub fn callable_at_definition(text: &str, line: usize, col: usize) -> Option<(u32, u32)> {
+    use syn::spanned::Spanned;
+    use syn::visit::Visit;
+    struct Names {
+        line: usize,
+        col: usize,
+        found: Option<(u32, u32)>,
+    }
+    impl Names {
+        fn at(&self, ident: &proc_macro2::Ident) -> bool {
+            let (a, b) = (ident.span().start(), ident.span().end());
+            a.line == self.line && a.column <= self.col && self.col <= b.column
+        }
+        fn sig(&mut self, sig: &syn::Signature) {
+            if self.at(&sig.ident) {
+                let f = sig.fn_token.span.start();
+                self.found = Some((f.line as u32, f.column as u32));
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Names {
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            self.sig(&f.sig);
+            syn::visit::visit_item_fn(self, f);
+        }
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            self.sig(&f.sig);
+            syn::visit::visit_impl_item_fn(self, f);
+        }
+        fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
+            if f.default.is_some() {
+                self.sig(&f.sig);
+            }
+            syn::visit::visit_trait_item_fn(self, f);
+        }
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            if let Some(init) = &l.init
+                && let syn::Expr::Closure(c) = &*init.expr
+                && let Some(ident) = pat_ident(&l.pat)
+                && self.at(ident)
+            {
+                let at = c.span().start();
+                self.found = Some((at.line as u32, at.column as u32));
+            }
+            syn::visit::visit_local(self, l);
+        }
+    }
+    proc_macro2::extra::invalidate_current_thread_spans();
+    let file = syn::parse_file(text).ok()?;
+    let mut names = Names {
+        line,
+        col,
+        found: None,
+    };
+    names.visit_file(&file);
+    names.found
+}
+
+/// Why the name at a definition's position is nothing
+/// [`callable_at_definition`] can time - for the refusal to say the truth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotCallable {
+    /// A trait's method with no default body: the type decides the impl.
+    TraitFnWithoutBody,
+    /// A function of an `extern` block: not Rust code of the project.
+    ExternFn,
+    /// The file does not parse - why.
+    Unparsed(String),
+    /// A struct, an enum variant, a variable, a parameter, a field.
+    Other,
+}
+
+/// What the name at `(1-based line, 0-based char column)` is, when
+/// [`callable_at_definition`] finds no callable there.
+pub fn not_callable(text: &str, file: &str, line: usize, col: usize) -> NotCallable {
+    use syn::visit::Visit;
+    struct Kinds {
+        line: usize,
+        col: usize,
+        found: NotCallable,
+    }
+    impl Kinds {
+        fn at(&self, ident: &proc_macro2::Ident) -> bool {
+            let (a, b) = (ident.span().start(), ident.span().end());
+            a.line == self.line && a.column <= self.col && self.col <= b.column
+        }
+    }
+    impl<'ast> Visit<'ast> for Kinds {
+        fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
+            if f.default.is_none() && self.at(&f.sig.ident) {
+                self.found = NotCallable::TraitFnWithoutBody;
+            }
+            syn::visit::visit_trait_item_fn(self, f);
+        }
+        fn visit_foreign_item_fn(&mut self, f: &'ast syn::ForeignItemFn) {
+            if self.at(&f.sig.ident) {
+                self.found = NotCallable::ExternFn;
+            }
+            syn::visit::visit_foreign_item_fn(self, f);
+        }
+    }
+    if let Some(why) = parse_error(text, file) {
+        return NotCallable::Unparsed(why);
+    }
+    proc_macro2::extra::invalidate_current_thread_spans();
+    let Ok(parsed) = syn::parse_file(text) else {
+        return NotCallable::Other;
+    };
+    let mut kinds = Kinds {
+        line,
+        col,
+        found: NotCallable::Other,
+    };
+    kinds.visit_file(&parsed);
+    kinds.found
+}
+
+/// The name of the path the caret is on - a call's callee, a function
+/// passed by name (`for_each(toggle)`), a variable - also inside a macro's
+/// arguments. `None` on anything else.
+pub fn path_name_at(text: &str, line: usize, col: usize) -> Option<String> {
+    use syn::visit::Visit;
+    struct Paths {
+        line: usize,
+        col: usize,
+        found: Option<String>,
+    }
+    impl<'ast> Visit<'ast> for Paths {
+        fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+            if let Some(last) = p.path.segments.last() {
+                let (a, b) = (last.ident.span().start(), last.ident.span().end());
+                if a.line == self.line && a.column <= self.col && self.col <= b.column {
+                    self.found = Some(last.ident.to_string());
+                }
+            }
+            syn::visit::visit_expr_path(self, p);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            use syn::parse::Parser;
+            let args = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+            if let Ok(exprs) = args.parse2(m.tokens.clone()) {
+                for e in &exprs {
+                    self.visit_expr(e);
+                }
+            }
+        }
+    }
+    proc_macro2::extra::invalidate_current_thread_spans();
+    let file = syn::parse_file(text).ok()?;
+    let mut paths = Paths {
+        line,
+        col,
+        found: None,
+    };
+    paths.visit_file(&file);
+    paths.found
+}
+
+/// Whether `text` defines a function or a let-bound closure named `name`.
+pub fn defines_callable(text: &str, name: &str) -> bool {
+    functions(text, "")
+        .map(|fns| fns.iter().any(|f| f.path.rsplit("::").next() == Some(name)))
+        .unwrap_or(false)
 }
 
 /// At most this many regions at once.
@@ -252,9 +526,11 @@ pub struct Placement {
     /// of its block, where the guard's own `Drop` records it - also on
     /// `return`, `?`, `break`.
     pub end: Option<(usize, usize)>,
-    /// The path of the function the region is in, and its signature line.
+    /// The path of the function the region is in, and the line and char
+    /// column it starts at.
     pub func: String,
     pub fn_line: u32,
+    pub fn_col: u32,
     /// The lines actually covered: whole statements.
     pub lines: (u32, u32),
     /// The region awaits: what it measures is wall time, other tasks
@@ -283,6 +559,7 @@ pub fn place(text: &str, r: &TimingRegion) -> Result<Placement, String> {
         (r.first.min(r.last), r.first.max(r.last))
     };
     let mut f = Finder::new(lo as usize, hi as usize, r.whole_fn);
+    f.col = r.col as usize;
     f.visit_file(&file);
     match f.hit {
         Some(Ok(p)) => Ok(p),
@@ -305,16 +582,36 @@ struct Finder {
     /// Inside a `const` / `static` initializer or a `const fn`: no guard can
     /// run there.
     const_depth: usize,
-    /// The path so far: modules, impls, traits, functions.
+    /// The path so far: modules, impls, traits, functions, closures - and
+    /// what each one is.
     scope: Vec<String>,
+    kinds: Vec<Scope>,
+    /// Closures about to be visited that a `let` names: `(address, name)`.
+    closure_names: Vec<(usize, String)>,
     /// The functions around the visit: path and signature line.
-    fns: Vec<(String, u32)>,
+    fns: Vec<(String, u32, u32)>,
+    /// A whole function: the caret's column on line `lo`, which decides
+    /// whether a closure of that line holds it.
+    col: usize,
     /// Every function body met.
     seen: Vec<FnSeen>,
     /// `const_depth` outside each function entered.
     depths: Vec<usize>,
     /// The innermost match so far (visits are pre-order: deeper wins).
     hit: Option<Result<Placement, String>>,
+}
+
+/// The name a `let` pattern binds: `f`, `mut f`, `f: T`.
+fn pat_name(p: &syn::Pat) -> Option<String> {
+    pat_ident(p).map(ToString::to_string)
+}
+
+fn pat_ident(p: &syn::Pat) -> Option<&proc_macro2::Ident> {
+    match p {
+        syn::Pat::Ident(i) => Some(&i.ident),
+        syn::Pat::Type(t) => pat_ident(&t.pat),
+        _ => None,
+    }
 }
 
 /// `#[naked]`, or the 2024 edition's `#[unsafe(naked)]`.
@@ -407,18 +704,21 @@ impl Finder {
             whole_fn,
             const_depth: 0,
             scope: Vec::new(),
+            kinds: Vec::new(),
+            closure_names: Vec::new(),
             fns: Vec::new(),
+            col: 0,
             seen: Vec::new(),
             depths: Vec::new(),
             hit: None,
         }
     }
 
-    fn func(&self) -> (String, u32) {
+    fn func(&self) -> (String, u32, u32) {
         self.fns
             .last()
             .cloned()
-            .unwrap_or_else(|| ("?".to_owned(), 0))
+            .unwrap_or_else(|| ("?".to_owned(), 0, 0))
     }
 
     /// A function's body, for "time this function".
@@ -464,20 +764,78 @@ impl Finder {
                 end: None,
                 func: path.to_owned(),
                 fn_line: sig_line as u32,
+                fn_col: sig.fn_token.span.start().column as u32,
                 lines: (sig_line as u32, close as u32),
                 awaits: sig.asyncness.is_some() || awaits(&body.stmts),
             })
         });
     }
 
+    /// A closure's body, for "time this function": like a fn's, when it has
+    /// braces - `async |..| { .. }`, `|..| async move { .. }` too.
+    fn closure(
+        &self,
+        c: &syn::ExprClosure,
+        path: &str,
+        name: &str,
+        start: usize,
+        start_col: usize,
+        close: usize,
+    ) -> Result<Placement, String> {
+        use syn::spanned::Spanned;
+        if self.const_depth > 0 {
+            return Err(format!(
+                "`{name}` is in a const context: nothing can be timed in it"
+            ));
+        }
+        let (block, async_block) = match &*c.body {
+            syn::Expr::Block(b) => (&b.block, false),
+            syn::Expr::Async(a) => (&a.block, true),
+            _ => {
+                return Err(format!(
+                    concat!(
+                        "the closure `{}` has no braces around its body: write it as ",
+                        "`|..| {{ .. }}` to time it",
+                    ),
+                    name
+                ));
+            }
+        };
+        let at = match block
+            .stmts
+            .iter()
+            .find(|s| !matches!(s, syn::Stmt::Item(_)))
+        {
+            Some(s) => s.span().start(),
+            None => block.brace_token.span.close().start(),
+        };
+        Ok(Placement {
+            start: pos(at),
+            end: None,
+            func: path.to_owned(),
+            fn_line: start as u32,
+            fn_col: start_col as u32,
+            lines: (start as u32, close as u32),
+            awaits: c.asyncness.is_some() || async_block || awaits(&block.stmts),
+        })
+    }
+
     fn enter(&mut self, sig: &syn::Signature, body: &syn::Block, attrs: &[syn::Attribute]) {
+        let method = matches!(self.kinds.last(), Some(Scope::Impl | Scope::Trait));
         self.scope.push(sig.ident.to_string());
+        self.kinds.push(Scope::Fn);
         let path = self.scope.join("::");
         let sig_line = sig.fn_token.span.start().line as u32;
         self.seen.push(FnSeen {
             path: path.clone(),
             sig: sig_line,
+            col: sig.fn_token.span.start().column as u32,
             close: body.brace_token.span.close().end().line as u32,
+            kind: if method {
+                Callable::Method
+            } else {
+                Callable::Fn
+            },
         });
         // A fn item is runtime code even inside a `const` block (an impl in
         // `const _: () = { .. }`); only a `const fn` body is const.
@@ -490,12 +848,14 @@ impl Finder {
             0
         };
         self.function(sig, body, &path, naked);
-        self.fns.push((path, sig_line));
+        self.fns
+            .push((path, sig_line, sig.fn_token.span.start().column as u32));
     }
 
     fn leave(&mut self, _sig: &syn::Signature) {
         self.fns.pop();
         self.scope.pop();
+        self.kinds.pop();
         self.const_depth = self.depths.pop().unwrap_or(0);
     }
 }
@@ -503,8 +863,10 @@ impl Finder {
 impl<'ast> syn::visit::Visit<'ast> for Finder {
     fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
         self.scope.push(m.ident.to_string());
+        self.kinds.push(Scope::Mod);
         syn::visit::visit_item_mod(self, m);
         self.scope.pop();
+        self.kinds.pop();
     }
 
     fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
@@ -516,14 +878,62 @@ impl<'ast> syn::visit::Visit<'ast> for Finder {
             ),
             None => ty,
         });
+        self.kinds.push(Scope::Impl);
         syn::visit::visit_item_impl(self, i);
         self.scope.pop();
+        self.kinds.pop();
     }
 
     fn visit_item_trait(&mut self, t: &'ast syn::ItemTrait) {
         self.scope.push(t.ident.to_string());
+        self.kinds.push(Scope::Trait);
         syn::visit::visit_item_trait(self, t);
         self.scope.pop();
+        self.kinds.pop();
+    }
+
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        if let Some(init) = &l.init
+            && let syn::Expr::Closure(c) = &*init.expr
+            && let Some(name) = pat_name(&l.pat)
+        {
+            self.closure_names
+                .push((c as *const syn::ExprClosure as usize, name));
+        }
+        syn::visit::visit_local(self, l);
+    }
+
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        use syn::spanned::Spanned;
+        let key = c as *const syn::ExprClosure as usize;
+        let name = match self.closure_names.iter().rposition(|(k, _)| *k == key) {
+            Some(i) => self.closure_names.remove(i).1,
+            None => "{closure}".to_owned(),
+        };
+        let (from, to) = (c.span().start(), c.body.span().end());
+        let (start, close) = (from.line, to.line);
+        self.scope.push(name.clone());
+        self.kinds.push(Scope::Closure);
+        let path = self.scope.join("::");
+        self.seen.push(FnSeen {
+            path: path.clone(),
+            sig: start as u32,
+            col: from.column as u32,
+            close: close as u32,
+            kind: Callable::Closure,
+        });
+        // The caret INSIDE the closure, not just on one of its lines: a
+        // `.filter(|b| ..)` on the caret's line must not take a "time this
+        // function" meant for the function around it.
+        let at = (self.lo, self.col);
+        if self.whole_fn && (from.line, from.column) <= at && at <= (to.line, to.column) {
+            self.hit = Some(self.closure(c, &path, &name, start, from.column, close));
+        }
+        self.fns.push((path, start as u32, from.column as u32));
+        syn::visit::visit_expr_closure(self, c);
+        self.fns.pop();
+        self.scope.pop();
+        self.kinds.pop();
     }
 
     fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
@@ -630,7 +1040,7 @@ impl<'ast> syn::visit::Visit<'ast> for Finder {
             {
                 let s0 = b.stmts[first].span().start();
                 let s1 = b.stmts[last].span().end();
-                let (func, fn_line) = self.func();
+                let (func, fn_line, fn_col) = self.func();
                 self.hit = Some(Ok(Placement {
                     start: pos(s0),
                     // The block's last statement - a tail expression or not -
@@ -639,6 +1049,7 @@ impl<'ast> syn::visit::Visit<'ast> for Finder {
                     end: (last + 1 < b.stmts.len()).then(|| pos(s1)),
                     func,
                     fn_line,
+                    fn_col,
                     lines: (s0.line as u32, s1.line as u32),
                     awaits: awaits(&b.stmts[first..=last]),
                 }));
@@ -1283,6 +1694,9 @@ pub fn instrumented_copies(
             b.region.file == a.region.file
                 && b.region.whole_fn == a.region.whole_fn
                 && b.lines == a.lines
+                && b.region.func == a.region.func
+                && b.region.fn_copy == a.region.fn_copy
+                && b.region.col == a.region.col
         }) {
             return Err(format!(
                 "Rows {} and {} time the same code - remove one of them",
@@ -1465,6 +1879,8 @@ fn run(
             &console.lock().unwrap(),
             &log.lock().unwrap(),
             &probe,
+            &job.chip,
+            true,
         )
     })
 }
@@ -1777,6 +2193,7 @@ mod tests {
             first,
             last,
             whole_fn: false,
+            col: 0,
             func: String::new(),
             fn_copy: (0, 1),
             anchor: Vec::new(),
@@ -2220,6 +2637,137 @@ const K: u32 = { 1 + 2 };
     }
 
     #[test]
+    fn a_closure_is_a_function_of_its_own() {
+        let src = "fn outer() {\n    let work = async |a: u32| {\n        step(a).await;\n        other();\n    };\n    let v: Vec<u32> = xs.iter().map(|x| {\n        x + 1\n    }).collect();\n    let short = |x: u32| x * 2;\n    work(1).await;\n}\n";
+        let mut r = region(3, 3);
+        r.whole_fn = true;
+        let p = place(src, &r).unwrap();
+        assert_eq!(
+            (p.func.as_str(), p.lines, p.awaits),
+            ("outer::work", (2, 5), true)
+        );
+        let out = instrument(src, &[(0, p)]).unwrap();
+        assert!(
+            out.contains("        let __roc_g0 = crate::__roc::Span::start(0); step(a).await;"),
+            "{out}"
+        );
+        // Unnamed: named by where it is, told apart by its copy.
+        r.first = 7;
+        assert_eq!(place(src, &r).unwrap().func, "outer::{closure}");
+        // No braces: nothing to put a guard in.
+        // The caret inside it (column 16); at column 0 it is `outer`'s line.
+        r.first = 9;
+        r.col = 16;
+        assert!(place(src, &r).unwrap_err().contains("no braces"));
+        r.col = 0;
+        assert_eq!(place(src, &r).unwrap().func, "outer");
+        // Statements inside a closure belong to it.
+        assert_eq!(place(src, &region(4, 4)).unwrap().func, "outer::work");
+        // Found again after lines added above.
+        let work = marked(src, 3, 3, true);
+        assert_eq!(locate(&format!("use a;\nuse b;\n{src}"), &work), Ok((4, 7)));
+    }
+
+    #[test]
+    fn two_closures_on_one_line_are_told_apart_by_their_column() {
+        let src = "fn show(items: &[u8]) {\n    items.iter().filter(|i| **i != 0).for_each(|i| {\n        draw(i);\n        flush();\n    });\n    let n = items.iter().filter(|b| **b != 0).count();\n}\n";
+        // Statements of the `for_each` closure: marked and found again.
+        assert_eq!(mark(src, region(3, 3)).unwrap().1.lines, (3, 3));
+        // The caret inside the `for_each` closure, past the `filter` one.
+        let mut r = region(2, 2);
+        r.whole_fn = true;
+        r.col = 50;
+        let (whole, p) = mark(src, r.clone()).unwrap();
+        assert_eq!((p.func.as_str(), p.lines), ("show::{closure}", (2, 5)));
+        assert_eq!(locate(&format!("use a;\n{src}"), &whole), Ok((3, 6)));
+        // At column 0 of a line with a brace-less closure: the function.
+        r.first = 6;
+        r.col = 0;
+        assert_eq!(place(src, &r).unwrap().func, "show");
+        // Inside the brace-less one: refused, it is what the caret is on.
+        r.col = 32;
+        assert!(place(src, &r).unwrap_err().contains("no braces"));
+    }
+
+    #[test]
+    fn two_closures_on_one_line_are_two_rows_at_measure_too() {
+        let src = "fn main() {\n    btn.on_press(|| { n += 1; }).on_release(|| { n -= 1; });\n}\n";
+        let whole = |col: u32| {
+            let mut r = region(2, 2);
+            r.whole_fn = true;
+            r.col = col;
+            mark(src, r).unwrap().0
+        };
+        // Inside the first closure, inside the second.
+        let (press, release) = (whole(22), whole(48));
+        assert_ne!(press.col, release.col);
+        let texts: HashMap<String, String> = [("src/main.rs".to_owned(), src.to_owned())].into();
+        let (out, infos) =
+            instrumented_copies(&texts, &[press.clone(), release], Counter::EspPccr).unwrap();
+        assert_eq!(infos.len(), 2);
+        assert!(
+            out["src/main.rs"]
+                .contains("|| { let __roc_g1 = crate::__roc::Span::start(1); n -= 1; }")
+        );
+        // The same row twice is still refused.
+        assert!(
+            instrumented_copies(&texts, &[press.clone(), press], Counter::EspPccr)
+                .unwrap_err()
+                .contains("time the same code")
+        );
+    }
+
+    #[test]
+    fn the_caret_on_a_call_is_seen_as_one_even_inside_a_macro() {
+        let src = "fn main() {\n    show(1);\n    radar.begin_config();\n    println!(\"{}\", calc(x));\n    <Led as Drop>::drop(&mut led);\n    let v = x;\n}\n";
+        assert_eq!(call_name_at(src, 2, 6).as_deref(), Some("show"));
+        assert_eq!(call_name_at(src, 3, 14).as_deref(), Some("begin_config"));
+        assert_eq!(call_name_at(src, 4, 21).as_deref(), Some("calc"));
+        assert_eq!(call_name_at(src, 5, 21).as_deref(), Some("drop"));
+        // An argument, a receiver, a variable: no call.
+        assert_eq!(call_name_at(src, 2, 9), None);
+        assert_eq!(call_name_at(src, 3, 6), None);
+        assert_eq!(call_name_at(src, 6, 9), None);
+    }
+
+    #[test]
+    fn a_definitions_position_names_its_callable() {
+        let src = "fn main() {\n    let show = async |n: u32| {\n        draw(n);\n    };\n    let v = 1;\n}\nimpl Led {\n    pub fn set(&mut self) {\n        on();\n    }\n}\nstruct P(u8);\n";
+        // rust-analyzer points at the NAME: of a let-bound closure, of a fn.
+        assert_eq!(callable_at_definition(src, 2, 8), Some((2, 15)));
+        assert_eq!(callable_at_definition(src, 1, 3), Some((1, 0)));
+        assert_eq!(callable_at_definition(src, 8, 11), Some((8, 8)));
+        // A variable, a struct: no callable.
+        assert_eq!(callable_at_definition(src, 5, 8), None);
+        assert_eq!(callable_at_definition(src, 12, 7), None);
+        // Why not, said from the syntax, not from how a line looks.
+        let decl = "trait S {\n    fn read<T>(&mut self) -> T\n    where\n        T: From<u16>;\n}\nunsafe extern \"C\" {\n    fn crc(p: *const u8) -> u32;\n}\nfn f() {\n    let g = if fast { fast_fn } else { slow_fn };\n}\n";
+        assert_eq!(
+            not_callable(decl, "src/s.rs", 2, 8),
+            NotCallable::TraitFnWithoutBody
+        );
+        assert_eq!(not_callable(decl, "src/s.rs", 7, 8), NotCallable::ExternFn);
+        assert_eq!(not_callable(decl, "src/s.rs", 10, 8), NotCallable::Other);
+        assert!(matches!(
+            not_callable("fn broken( {", "src/b.rs", 1, 3),
+            NotCallable::Unparsed(_)
+        ));
+        // A function passed by name is a path the caret can be on.
+        let pass =
+            "fn main() {\n    leds.for_each(toggle);\n}\nfn toggle(l: &mut L) {\n    l.t();\n}\n";
+        assert_eq!(path_name_at(pass, 2, 20).as_deref(), Some("toggle"));
+        assert!(defines_callable(pass, "toggle") && !defines_callable(pass, "leds"));
+        // And the callable it names is what gets marked, as a whole.
+        let mut r = region(2, 2);
+        r.whole_fn = true;
+        r.col = 15;
+        assert_eq!(place(src, &r).unwrap().func, "main::show");
+        r.first = 8;
+        r.col = 8;
+        assert_eq!(place(src, &r).unwrap().func, "Led::set");
+    }
+
+    #[test]
     fn a_naked_function_is_refused() {
         for attr in ["#[naked]", "#[unsafe(naked)]"] {
             let src = format!(
@@ -2362,6 +2910,57 @@ const K: u32 = { 1 + 2 };
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 
+    /// A REAL file's closures and the calls to them: every closure with braces
+    /// is marked as itself - from inside it, and from the caret on a call to
+    /// it - never as the function around it. `EIDE_TIMING_FILE`: a `.rs` file.
+    #[test]
+    #[ignore = "reads a project file: set EIDE_TIMING_FILE"]
+    fn a_real_files_closures_are_marked_as_themselves() {
+        let Ok(path) = std::env::var("EIDE_TIMING_FILE") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        let fns = functions(&text, "src/main.rs").unwrap();
+        let mut closures = 0;
+        for f in fns.iter().filter(|f| f.kind == Callable::Closure) {
+            let mut r = region(f.sig + 1, f.sig + 1);
+            r.whole_fn = true;
+            match mark(&text, r) {
+                Ok((region, p)) => {
+                    eprintln!("{} lines {:?} awaits {}", p.func, p.lines, p.awaits);
+                    assert_eq!(region.func, f.path);
+                    assert_eq!(p.lines, (f.sig, f.close));
+                    closures += 1;
+                }
+                Err(e) => eprintln!("{} (line {}): {e}", f.path, f.sig),
+            }
+        }
+        // Every call by name of a bound closure is seen as a call, and the
+        // binding rust-analyzer answers with names the closure.
+        for f in fns.iter().filter(|f| f.kind == Callable::Closure) {
+            let name = f.path.rsplit("::").next().unwrap();
+            if name == "{closure}" {
+                continue;
+            }
+            let bind = text.lines().nth(f.sig as usize - 1).unwrap();
+            let at = bind.find(&format!("let {name}")).unwrap() + 4;
+            let col = bind[..at].chars().count();
+            assert_eq!(
+                callable_at_definition(&text, f.sig as usize, col),
+                Some((f.sig, f.col)),
+                "{name}"
+            );
+            for (i, line) in text.lines().enumerate().skip(f.close as usize) {
+                if let Some(at) = line.find(&format!("{name}(")) {
+                    let col = line[..at].chars().count() + 1;
+                    eprintln!("line {}: {name}(", i + 1);
+                    assert_eq!(call_name_at(&text, i + 1, col).as_deref(), Some(name));
+                }
+            }
+        }
+        assert!(closures > 0, "no closure with braces in {path}");
+    }
+
     /// Stop ends a release build at once - cargo and the rustc under it -
     /// rather than after it. `EIDE_TIMING_PROJECT` / `EIDE_TIMING_TARGET`:
     /// a project whose build takes longer than three seconds (a cold one).
@@ -2411,6 +3010,7 @@ const K: u32 = { 1 + 2 };
                     first: l,
                     last: l,
                     whole_fn,
+                    col: 0,
                     func: String::new(),
                     fn_copy: (0, 1),
                     anchor: Vec::new(),
@@ -2427,6 +3027,18 @@ const K: u32 = { 1 + 2 };
         let mut regions = vec![stmts];
         regions.extend(at(true, &|_| true));
         regions.extend(at(false, &|p| p.func == "main" && p.end.is_none()));
+        // A closure as a whole (an `async` one holds its guard across awaits).
+        regions.extend(
+            functions(&text, "src/main.rs")
+                .unwrap()
+                .iter()
+                .filter(|f| f.kind == Callable::Closure)
+                .find_map(|f| {
+                    let mut r = region(f.sig + 1, f.sig + 1);
+                    r.whole_fn = true;
+                    place(&text, &r).ok()
+                }),
+        );
         let regions: Vec<(usize, Placement)> = regions.into_iter().enumerate().collect();
         for (id, p) in &regions {
             eprintln!(

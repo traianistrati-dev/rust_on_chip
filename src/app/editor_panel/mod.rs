@@ -68,7 +68,7 @@ mod rename;
 mod replace_enter_tests;
 pub(super) mod signature_hint;
 mod snippet;
-mod timing_mark;
+pub(crate) mod timing_mark;
 mod toggle_case;
 mod toolbar;
 pub(crate) mod usages;

@@ -267,6 +267,9 @@ struct SessionCfg {
     /// Breakpoints at session start (rel path → 1-based lines). Later edits
     /// go over the wire directly (`Debugger::sync_breakpoints`).
     breakpoints: BTreeMap<String, Vec<u32>>,
+    /// Where this session's console lines start: its failures are classified
+    /// on them alone, not on an earlier session's still in the scrollback.
+    console_mark: u64,
 }
 
 // ── The debugger ──────────────────────────────────────────────────────────────
@@ -932,6 +935,7 @@ fn run_session(
         probe: crate::probe::selector(probe.as_deref()),
         elf,
         breakpoints,
+        console_mark: console.lock().unwrap().mark(),
     });
     *cfg_slot.lock().unwrap() = Some(Arc::clone(&cfg));
 
@@ -1087,8 +1091,8 @@ fn spawn_dap_reader(
             // after a wall of `<unknown>` frames or a WinUSB complaint.
             // Copy the tail, THEN classify: the classifier may query the registry,
             // and the Debug tab locks this console every frame to draw it.
-            let tail = console.lock().unwrap().tail_text(60);
-            let crash = crate::rtt::probe_rs_failure(&tail, cfg.probe.as_deref());
+            let tail = console.lock().unwrap().tail_since(cfg.console_mark, 60);
+            let crash = crate::rtt::probe_rs_failure(&tail, cfg.probe.as_deref(), &cfg.chip, true);
             let mut st = state.lock().unwrap();
             // `Stopping` is excluded: the socket closing is EXPECTED there (the
             // single-session server exits after our disconnect), and `stop`'s
@@ -1211,8 +1215,8 @@ fn handle_response(
             // won't open, a probe-rs crash) is in the server's own output that
             // came before it.
             // The lock is released before classifying, as above.
-            let tail = console.lock().unwrap().tail_text(60);
-            let real = crate::rtt::probe_rs_failure(&tail, cfg.probe.as_deref());
+            let tail = console.lock().unwrap().tail_since(cfg.console_mark, 60);
+            let real = crate::rtt::probe_rs_failure(&tail, cfg.probe.as_deref(), &cfg.chip, true);
             state.lock().unwrap().phase = DebugPhase::Error(real.unwrap_or(err));
         }
         return;

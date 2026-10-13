@@ -265,9 +265,10 @@ pub(crate) fn cargo_build_streamed(
 }
 
 /// The tagged explanation for whatever probe-rs failure is visible in `tail` —
-/// the console's last lines (`TerminalState::tail_text(60)`) — a crash, or a
-/// probe that enumerates but won't open. `None` when the output shows neither,
-/// so the caller keeps its own error text.
+/// the last lines THIS session printed (`TerminalState::tail_since`) — a
+/// crash, a chip whose debug unit does not answer, or a probe that enumerates
+/// but won't open. `None` when the output shows none of them, so the caller
+/// keeps its own error text.
 ///
 /// Shared with the Debug tab: probe-rs dying of its own bug looks exactly like
 /// an ordinary exit / socket close, so both orchestrators have to go looking for
@@ -276,9 +277,19 @@ pub(crate) fn cargo_build_streamed(
 /// Takes the TEXT, not the console: the open-failure branch runs registry
 /// queries, and the UI thread locks that console every frame to draw it. Called
 /// with the guard held, it froze the Debug and RTT tabs for the whole query.
-pub(crate) fn probe_rs_failure(tail: &str, probe: Option<&str>) -> Option<String> {
+pub(crate) fn probe_rs_failure(
+    tail: &str,
+    probe: Option<&str>,
+    // Which pins, and whether this session flashes (see
+    // `failure_hint::riscv_dmi_timeout`).
+    chip: &str,
+    flashes: bool,
+) -> Option<String> {
     if let Some(detail) = crate::failure_hint::probe_rs_panic(tail) {
         return Some(crate::failure_hint::probe_rs_panic_message(&detail));
+    }
+    if let Some(msg) = crate::failure_hint::riscv_dmi_timeout(tail, chip, flashes) {
+        return Some(msg);
     }
     crate::failure_hint::probe_open_failure(tail).map(|d| {
         crate::failure_hint::probe_open_message(
@@ -345,6 +356,9 @@ fn run_session(
     stop: &Arc<AtomicBool>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
+    // Where this session's lines start: its failure is classified on them
+    // alone, not on an earlier session's still in the scrollback.
+    let mark = state.lock().unwrap().mark();
     // ── Phase 1: cargo build --release ────────────────────────────────────────
     let Some(elf) = cargo_build_streamed(project_dir, target, state, child_slot, stop, ctx)? else {
         return Ok(()); // stopped by the user mid-build
@@ -441,8 +455,8 @@ fn run_session(
             // just listed — neither is "check your wiring", so say what it was.
             // The tail is copied out first: the classifier may query the
             // registry, and the RTT tab locks this state every frame.
-            let tail = state.lock().unwrap().tail_text(60);
-            if let Some(msg) = probe_rs_failure(&tail, probe) {
+            let tail = state.lock().unwrap().tail_since(mark, 60);
+            if let Some(msg) = probe_rs_failure(&tail, probe, chip, mode == RttMode::Run) {
                 return Err(msg);
             }
             Err(format!(

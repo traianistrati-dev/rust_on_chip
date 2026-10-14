@@ -253,8 +253,9 @@ pub fn thing_problem(name: &str) -> Option<&'static str> {
 /// <topic>?qos=<qos>` - the topic percent-encoded byte by byte but for RFC
 /// 3986's unreserved characters and `/`. The firmware's `aws_url`, rule for
 /// rule (`http_core_tests` holds them to the same bytes): what AWS refuses,
-/// refused here with why.
-pub fn publish_url(host: &str, port: u16, topic: &str, qos: u8) -> Result<String, &'static str> {
+/// refused here with why. `retain` adds `&retain=true`, as `AwsMessage`'s
+/// does.
+pub fn publish_url(host: &str, port: u16, topic: &str, qos: u8, retain: bool) -> Result<String, &'static str> {
     let counted = topic
         .strip_prefix("$aws/rules/")
         .and_then(|rest| rest.split_once('/'))
@@ -285,6 +286,9 @@ pub fn publish_url(host: &str, port: u16, topic: &str, qos: u8) -> Result<String
     if qos > 1 {
         return Err("QoS 0 or 1 - HTTP has no QoS 2");
     }
+    if retain && topic.starts_with('$') {
+        return Err("AWS IoT keeps no retained message on a `$` topic");
+    }
     let mut url = format!("https://{host}");
     if port != 443 {
         url.push_str(&format!(":{port}"));
@@ -298,6 +302,9 @@ pub fn publish_url(host: &str, port: u16, topic: &str, qos: u8) -> Result<String
         }
     }
     url.push_str(&format!("?qos={qos}"));
+    if retain {
+        url.push_str("&retain=true");
+    }
     Ok(url)
 }
 
@@ -315,13 +322,14 @@ fn outside_filters(m: &MqttConfig) -> Vec<&str> {
 /// under `<thing>/` (the panic report's topic and the test's are there),
 /// subscribe there and to each filter the board subscribes to.
 pub fn policy(m: &MqttConfig, arn: &CertArn) -> String {
-    policy_for(thing(m), &outside_filters(m), arn)
+    policy_for(thing(m), &outside_filters(m), arn, false)
 }
 
 /// ... for the thing `id`, subscribed to `outside` beyond `<id>/`: HTTPS
 /// publish alone subscribes to nothing - and whether AWS checks iot:Connect
-/// for it is undocumented, so the line stays.
-pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn) -> String {
+/// for it is undocumented, so the line stays. `retain`: iot:RetainPublish
+/// under `<id>/` too, which a retained message needs beside iot:Publish.
+pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn, retain: bool) -> String {
     let base = format!("arn:{}:iot:{}:{}:", arn.partition, arn.region, arn.account);
     let mut subscribe = vec![format!("{base}topicfilter/{id}/*")];
     let mut receive = vec![format!("{base}topic/{id}/*")];
@@ -342,8 +350,16 @@ pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn) -> String {
             .collect::<Vec<_>>()
             .join(",\n")
     };
+    let retained = if retain {
+        format!(
+            "\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:RetainPublish\",\n      \"Resource\": {}\n    }},",
+            json_string(&format!("{base}topic/{id}/*"))
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "{{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Connect\",\n      \"Resource\": {}\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Publish\",\n      \"Resource\": {}\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Subscribe\",\n      \"Resource\": [\n{}\n      ]\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Receive\",\n      \"Resource\": [\n{}\n      ]\n    }}\n  ]\n}}\n",
+        "{{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Connect\",\n      \"Resource\": {}\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Publish\",\n      \"Resource\": {}\n    }},{retained}\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Subscribe\",\n      \"Resource\": [\n{}\n      ]\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Receive\",\n      \"Resource\": [\n{}\n      ]\n    }}\n  ]\n}}\n",
         json_string(&format!("{base}client/{id}")),
         json_string(&format!("{base}topic/{id}/*")),
         list(&subscribe),
@@ -643,7 +659,7 @@ mod tests {
         assert!(all[2].command.contains("create-thing --thing-name sensor-7 --region eu-south-1"));
         assert!(all[4].command.contains("--policy-name sensor-7-policy"));
         assert!(all[6].command.contains("--thing-name sensor-7 --principal"));
-        let text = policy_for("sensor-7", &[], &arn);
+        let text = policy_for("sensor-7", &[], &arn, false);
         assert!(text.contains("\"arn:aws:iot:eu-central-1:123456789012:topic/sensor-7/*\""), "{text}");
         assert!(text.contains("client/sensor-7"));
         assert!(!policy_too_long(&text));
@@ -651,7 +667,14 @@ mod tests {
         // filters added.
         let m = aws("a1-ats.iot.eu-central-1.amazonaws.com");
         let outside = outside_filters(&m);
-        assert_eq!(policy(&m, &arn), policy_for("rustonchip-esp32c3", &outside, &arn));
+        assert_eq!(policy(&m, &arn), policy_for("rustonchip-esp32c3", &outside, &arn, false));
+        // Retained messages: iot:RetainPublish under the thing, beside Publish.
+        let kept = policy_for("sensor-7", &[], &arn, true);
+        assert!(kept.contains("\"Action\": \"iot:RetainPublish\",\n      \"Resource\": \"arn:aws:iot:eu-central-1:123456789012:topic/sensor-7/*\""), "{kept}");
+        let parsed: serde_json::Value = serde_json::from_str(&kept).expect("valid JSON");
+        assert_eq!(parsed["Statement"].as_array().map(Vec::len), Some(5));
+        let plain: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(plain["Statement"].as_array().map(Vec::len), Some(4));
 
         assert!(thing_problem("sensor-7").is_none() && thing_problem("a:b_c-1").is_none());
         for bad in ["", "a b", "a/b", "caf\u{e9}"] {
@@ -665,16 +688,21 @@ mod tests {
     fn publish_url_writes_what_aws_publish_sends() {
         let host = "a1-ats.iot.eu-south-1.amazonaws.com";
         assert_eq!(
-            publish_url(host, 8443, "sensor-7/t", 1).unwrap(),
+            publish_url(host, 8443, "sensor-7/t", 1, false).unwrap(),
             "https://a1-ats.iot.eu-south-1.amazonaws.com:8443/topics/sensor-7/t?qos=1"
         );
         assert_eq!(
-            publish_url(host, 443, "a b/\u{e9}", 0).unwrap(),
+            publish_url(host, 443, "a b/\u{e9}", 0, false).unwrap(),
             "https://a1-ats.iot.eu-south-1.amazonaws.com/topics/a%20b/%C3%A9?qos=0"
         );
         for (topic, qos) in [("", 1), ("a/#", 1), ("a/+/b", 1), ("$SYS/x", 1), ("a", 2)] {
-            assert!(publish_url(host, 8443, topic, qos).is_err(), "{topic:?}");
+            assert!(publish_url(host, 8443, topic, qos, false).is_err(), "{topic:?}");
         }
-        assert!(publish_url("", 8443, "a", 1).is_err());
+        assert!(publish_url("", 8443, "a", 1, false).is_err());
+        assert_eq!(
+            publish_url(host, 8443, "sensor-7/state", 1, true).unwrap(),
+            "https://a1-ats.iot.eu-south-1.amazonaws.com:8443/topics/sensor-7/state?qos=1&retain=true"
+        );
+        assert!(publish_url(host, 8443, "$aws/things/t/shadow/update", 1, true).is_err());
     }
 }

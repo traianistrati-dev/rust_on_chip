@@ -29,7 +29,8 @@
 //! REQUEST_HEAD_MAX (0: unchecked); then, each absent from an older IDE's
 //! request: the method ("POST", else a GET), the Content-Type, the payload,
 //! the client certificate and its key as PEM, the ALPN, a host:port to dial
-//! instead of the URL's (a look-alike on this PC), and AWS IoT ("1"/"0").
+//! instead of the URL's (a look-alike on this PC), AWS IoT ("1"/"0"), and
+//! more headers (`Name: value` one a line).
 //! It prints `INFO ...` lines, then the `RESULT` line.
 #![allow(dead_code)]
 
@@ -137,6 +138,9 @@ struct HttpRequest {
     connect_to: String,
     /// The URL is AWS IoT's HTTPS publish: refusals said in its terms.
     aws: bool,
+    /// More headers, `Name: value` one a line - after Content-Length, as the
+    /// board's `build()` writes a request's own (AWS's x-amz-mqtt5-*).
+    headers: Vec<(String, String)>,
 }
 
 fn read_http_request() -> Option<HttpRequest> {
@@ -161,6 +165,11 @@ fn read_http_request() -> Option<HttpRequest> {
         alpn: text(13).unwrap_or_default(),
         connect_to: text(14).unwrap_or_default(),
         aws: text(15).is_some_and(|a| a == "1"),
+        headers: text(16)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_once(':').map(|(n, v)| (n.trim().to_owned(), v.trim().to_owned())))
+            .collect(),
     })
 }
 
@@ -1040,10 +1049,20 @@ fn http(r: &HttpRequest) -> Result<String, String> {
     if r.content_type.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         return Err("the Content-Type holds a line break: the request would come apart".into());
     }
+    let mut extra = String::new();
+    for (name, value) in &r.headers {
+        if name.is_empty() || name.bytes().any(|b| !(b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))) {
+            return Err(format!("`{name}` is no header name"));
+        }
+        if value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+            return Err(format!("the {name} header holds a line break: the request would come apart"));
+        }
+        extra.push_str(&format!("{name}: {value}\r\n"));
+    }
     let mut request = if r.post {
-        url.post(&r.user_agent, &r.content_type, r.payload.len())
+        url.post(&r.user_agent, &r.content_type, r.payload.len(), &extra)
     } else {
-        url.get(&r.user_agent)
+        url.get(&r.user_agent, &extra)
     }
     .into_bytes();
     if r.request_head_max > 0 && request.len() > r.request_head_max {
@@ -1175,8 +1194,10 @@ fn http(r: &HttpRequest) -> Result<String, String> {
         let said = text_of(&src.kept);
         let said = if said.is_empty() { String::new() } else { format!(": {said}") };
         return Err(if r.aws && head.status == 403 {
+            let retained = url.path().contains("retain=true");
             format!(
-                "AWS IoT answered {what}{said} - the policy on the board's certificate allows no iot:Publish on topic/{}",
+                "AWS IoT answered {what}{said} - the policy on the board's certificate allows no iot:Publish{} on topic/{}",
+                if retained { " - or, for a retained message, no iot:RetainPublish -" } else { "" },
                 topic_in(&url.path())
             )
         } else {
@@ -1294,20 +1315,20 @@ impl<'a> Url<'a> {
 
     /// The request the board sends for a GET: the port in Host only when it
     /// is not the scheme's, one connection per request.
-    fn get(&self, user_agent: &str) -> String {
-        format!("GET {} HTTP/1.1\r\n{}\r\n", self.path(), self.headers(user_agent))
+    fn get(&self, user_agent: &str, extra: &str) -> String {
+        format!("GET {} HTTP/1.1\r\n{}{extra}\r\n", self.path(), self.headers(user_agent))
     }
 
     /// The head the board sends for a POST of `len` bytes, in its `build()`'s
     /// order: Content-Type when given, Content-Length always.
-    fn post(&self, user_agent: &str, content_type: &str, len: usize) -> String {
+    fn post(&self, user_agent: &str, content_type: &str, len: usize, extra: &str) -> String {
         let kind = if content_type.is_empty() {
             String::new()
         } else {
             format!("Content-Type: {content_type}\r\n")
         };
         format!(
-            "POST {} HTTP/1.1\r\n{}{kind}Content-Length: {len}\r\n\r\n",
+            "POST {} HTTP/1.1\r\n{}{kind}Content-Length: {len}\r\n{extra}\r\n",
             self.path(),
             self.headers(user_agent)
         )

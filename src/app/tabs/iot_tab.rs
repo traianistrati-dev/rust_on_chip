@@ -248,6 +248,12 @@ impl AppIde {
                         .iter()
                         .find(|(p, _)| *p == format!("src/pins/configs/{}", iot_gen::HTTP))
                         .is_some_and(|(_, c)| !c.contains("pub async fn aws_publish(")),
+                    no_aws_message: self
+                        .project_tree
+                        .user_src_files
+                        .iter()
+                        .find(|(p, _)| *p == format!("src/pins/configs/{}", iot_gen::HTTP))
+                        .is_some_and(|(_, c)| !c.contains("pub async fn aws_publish_with(")),
                     project: project_dir.clone(),
                 }
             };
@@ -1278,6 +1284,9 @@ struct HttpFacts {
     /// An http.rs the user edited from before aws_publish(): the IDE left its
     /// tail, so the line the tab offers would not build.
     no_aws_publish: bool,
+    /// ... from before AwsMessage and aws_publish_with(): aws_publish() is
+    /// there, the retained line is not.
+    no_aws_message: bool,
     project: Option<std::path::PathBuf>,
 }
 
@@ -2232,6 +2241,7 @@ fn http_body(
 }
 
 const AWS_PUBLISH_USAGE: &str = "pins::configs::http::aws_publish(\"<thing>/data\", b\"{\\\"t\\\":21.5}\", &mut body).await";
+const AWS_RETAIN_USAGE: &str = "let m = pins::configs::http::AwsMessage { retain: true, ..pins::configs::http::AwsMessage::new(\"<thing>/state\", b\"{\\\"on\\\":true}\") }; pins::configs::http::aws_publish_with(&m, &mut body).await";
 
 /// The board's certificate for one host - AWS IoT's HTTPS publish above all:
 /// the host, the identity, and for AWS the steps and a publish from this PC.
@@ -2339,14 +2349,37 @@ fn aws_https_section(
             "src/pins/configs/http.rs is from before aws_publish(), and you edited it, so the IDE left it: the line below would not build. Move your changes into the current template (delete the file to get it).",
         ));
     }
-    let usage = AWS_PUBLISH_USAGE.replace("<thing>", if thing.is_empty() { "my-thing" } else { &thing });
+    let named = if thing.is_empty() { "my-thing" } else { thing.as_str() };
     ui.label(dim("From anywhere in the firmware - the topic percent-encoded for you, each call a connection of its own (about a second on an ESP32-C3):"));
+    let mut lines = vec![AWS_PUBLISH_USAGE.replace("<thing>", named)];
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(&usage).monospace().size(11.0));
-        if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
-            ui.ctx().copy_text(usage.clone());
-        }
+        ui.add_sized([90.0, 18.0], egui::Label::new("Retained"));
+        ui.checkbox(&mut h.aws_retain, "the firmware publishes retained messages")
+            .on_hover_text(if mqtt_aws.is_some() {
+                "AwsMessage { retain: true, .. }: the MQTT card's policy.json needs iot:RetainPublish - see below"
+            } else {
+                "AwsMessage { retain: true, .. }: the policy.json below gets iot:RetainPublish"
+            });
     });
+    if h.aws_retain && f.no_aws_message && !f.no_aws_publish {
+        ui.label(warn(
+            "src/pins/configs/http.rs is from before AwsMessage and aws_publish_with(), and you edited it, so the IDE left it: aws_publish() works, the retained line below would not build. Move your changes into the current template (delete the file to get it).",
+        ));
+    }
+    if h.aws_retain {
+        lines.push(AWS_RETAIN_USAGE.replace("<thing>", named));
+        ui.label(dim(
+            "A retained message stays for whoever subscribes later - an empty one deletes the topic's; at most one a second per topic, none on a `$` topic. AwsMessage also carries MQTT 5's content type, expiry, response topic, correlation data and user properties.",
+        ));
+    }
+    for usage in lines {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&usage).monospace().size(11.0));
+            if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                ui.ctx().copy_text(usage.clone());
+            }
+        });
+    }
     if !f.amazon_ca {
         ui.horizontal_wrapped(|ui| {
             ui.label(warn("http_ca.rs does not hold Amazon's CAs: AWS IoT's chain ends in Amazon Root CA 1"));
@@ -2359,6 +2392,12 @@ fn aws_https_section(
         ui.label(dim(format!(
             "The thing, the certificate and the policy: the MQTT card's AWS steps - its policy allows iot:Publish under `{id}/`, HTTPS included."
         )));
+        if h.aws_retain {
+            ui.label(warn(format!(
+                "Retained messages need iot:RetainPublish, which the MQTT card's policy.json does not grant: add {{\"Effect\": \"Allow\", \"Action\": \"iot:RetainPublish\", \"Resource\": \"arn:{}:iot:{}:<account>:topic/{id}/*\"}} to its Statement, then create-policy-version.",
+                e.partition, e.region
+            )));
+        }
     } else if aws_iot::thing_problem(&thing).is_none() {
         ui.label(dim("AWS CLI 2.11.17 or newer, run where device.csr is:"));
         let dir: Option<std::path::PathBuf> = ui.data_mut(|d| d.get_temp(aws_dir_id(tls)));
@@ -2395,10 +2434,11 @@ fn aws_https_section(
                         arn.region, e.region
                     )));
                 }
-                let policy = aws_iot::policy_for(&thing, &[], &arn);
+                let policy = aws_iot::policy_for(&thing, &[], &arn, h.aws_retain);
                 policy_buttons(ui, &policy, dir.as_deref());
                 ui.label(dim(format!(
-                    "policy.json: publish under `{thing}/` (its iot:Connect line is harmless: whether AWS checks it for HTTPS is undocumented). Publish elsewhere, and add that topic to it."
+                    "policy.json: publish{} under `{thing}/` (its iot:Connect line is harmless: whether AWS checks it for HTTPS is undocumented). Publish elsewhere, and add that topic to it.",
+                    if h.aws_retain { " and keep retained messages" } else { "" }
                 )));
                 for step in aws_iot::attach_steps_for(&thing, &arn) {
                     aws_step(ui, &mut n, &step);
@@ -2437,7 +2477,15 @@ fn aws_publish_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &T
     });
     let port = if h.aws_port == 443 { 443 } else { 8443 };
     let payload_max = h.payload_max.clamp(*iot::HTTP_BODY_RANGE.start(), *iot::HTTP_BODY_RANGE.end()) as usize;
-    let url = aws_iot::publish_url(&iot::http_cert_host(h), port, &topic, u8::from(h.aws_qos >= 1));
+    let retain_id = egui::Id::new(("iot_aws_publish_retain", f.project.clone()));
+    let mut retain: bool = ui.data_mut(|d| d.get_temp(retain_id)).unwrap_or(false);
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, 18.0], egui::Label::new(""));
+        ui.checkbox(&mut retain, "retained")
+            .on_hover_text("&retain=true - AWS refuses it without iot:RetainPublish (Retained, above)");
+    });
+    ui.data_mut(|d| d.insert_temp(retain_id, retain));
+    let url = aws_iot::publish_url(&iot::http_cert_host(h), port, &topic, u8::from(h.aws_qos >= 1), retain);
     let refused = match &url {
         Err(why) => Some((*why).to_owned()),
         Ok(_) if f.ca_der.is_none() => Some("http_ca.rs holds no certificate the checker can read".to_owned()),
@@ -2468,6 +2516,7 @@ fn aws_publish_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &T
         alpn: (port == 443).then(|| "x-amzn-http-ca".to_owned()),
         connect_to: None,
         aws: true,
+        headers: Vec::new(),
     };
     let shared: Option<Shared> = ui.data_mut(|d| d.get_temp::<Shared>(id));
     let state = shared

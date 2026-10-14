@@ -308,28 +308,36 @@ pub const AWS_TOPIC_MAX: usize = 256;
 /// 1. `TooLarge` when `out` cannot hold it all.
 #[allow(dead_code)]
 pub fn aws_url(out: &mut [u8], host: &str, port: u16, topic: &str, qos: u8) -> Result<usize, HttpError> {
+    let mut o = Out { buf: out, n: 0 };
+    aws_target(&mut o, host, port, topic, qos)?;
+    Ok(o.n)
+}
+
+/// A topic AWS IoT takes to publish on: see `aws_url`.
+#[allow(dead_code)]
+fn aws_topic_ok(topic: &str) -> bool {
     let t = topic.as_bytes();
     let counted = match topic.strip_prefix("$aws/rules/").and_then(|r| r.split_once('/')) {
         Some((_, rest)) => rest,
         None => topic,
     };
+    !t.is_empty()
+        && t.len() <= AWS_TOPIC_MAX
+        && counted.bytes().filter(|&b| b == b'/').count() <= 7
+        && !t.iter().any(|&b| matches!(b, b'+' | b'#' | 0))
+        && (t[0] != b'$' || topic.starts_with("$aws/"))
+}
+
+/// `aws_url`'s text, into `o`.
+#[allow(dead_code)]
+fn aws_target(o: &mut Out<'_>, host: &str, port: u16, topic: &str, qos: u8) -> Result<(), HttpError> {
     let host_ok = !host.is_empty()
         && host
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'));
-    if !host_ok
-        || port == 0
-        || t.is_empty()
-        || t.len() > AWS_TOPIC_MAX
-        || counted.bytes().filter(|&b| b == b'/').count() > 7
-        || t.iter().any(|&b| matches!(b, b'+' | b'#' | 0))
-        || (t[0] == b'$' && !topic.starts_with("$aws/"))
-        || qos > 1
-    {
+    if !host_ok || port == 0 || !aws_topic_ok(topic) || qos > 1 {
         return Err(HttpError::Url);
     }
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut o = Out { buf: out, n: 0 };
     o.put(b"https://")?;
     o.put(host.as_bytes())?;
     if port != 443 {
@@ -337,16 +345,233 @@ pub fn aws_url(out: &mut [u8], host: &str, port: u16, topic: &str, qos: u8) -> R
         o.number(usize::from(port))?;
     }
     o.put(b"/topics/")?;
-    for &b in t {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
-            o.put(&[b])?;
-        } else {
-            o.put(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]])?;
+    o.percent(topic.as_bytes(), true)?;
+    o.put(b"?qos=")?;
+    o.put(&[b'0' + qos])
+}
+
+/// One message for AWS IoT's HTTPS publish, with what MQTT 5 adds to it -
+/// AWS takes it as the URL's query and three headers. `new` gives the topic
+/// and the payload; the rest is optional:
+///
+///     let m = AwsMessage { retain: true, ..AwsMessage::new("my-thing/state", b"{\"on\":true}") };
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct AwsMessage<'a> {
+    pub topic: &'a str,
+    pub payload: &'a [u8],
+    /// 0 or 1; `None` = the tab's (AWS_QOS).
+    pub qos: Option<u8>,
+    /// Kept by the broker for whoever subscribes later - an empty payload
+    /// deletes the topic's. Needs iot:RetainPublish; never on a `$` topic.
+    pub retain: bool,
+    /// MQTT 5's Content Type ("application/json"): at most 256 bytes.
+    pub content_type: Option<&'a str>,
+    /// Seconds until the broker drops it undelivered: AWS raises 0 to 1 and
+    /// lowers anything over 604800 (7 days) to that.
+    pub message_expiry_s: Option<u32>,
+    /// Where an answer should go: a topic name, no wildcard (`+`, `#`).
+    pub response_topic: Option<&'a str>,
+    /// What an answer carries back to be matched to this message.
+    pub correlation_data: Option<&'a [u8]>,
+    /// Name-value pairs, in order; a name may repeat.
+    pub user_properties: &'a [(&'a str, &'a str)],
+    /// The payload is UTF-8 text (MQTT 5's Payload Format Indicator).
+    pub utf8: bool,
+}
+
+#[allow(dead_code)]
+impl<'a> AwsMessage<'a> {
+    pub const fn new(topic: &'a str, payload: &'a [u8]) -> Self {
+        Self {
+            topic,
+            payload,
+            qos: None,
+            retain: false,
+            content_type: None,
+            message_expiry_s: None,
+            response_topic: None,
+            correlation_data: None,
+            user_properties: &[],
+            utf8: false,
         }
     }
-    o.put(b"?qos=")?;
-    o.put(&[b'0' + qos])?;
+}
+
+/// AWS's limits on MQTT 5's Content Type, and on Correlation Data and the
+/// user properties (as JSON).
+#[allow(dead_code)]
+const AWS_CONTENT_TYPE_MAX: usize = 256;
+#[allow(dead_code)]
+const AWS_PROPERTIES_MAX: usize = 8192;
+
+/// `m`'s URL - `aws_url`'s, then `&retain=true`, `&contentType=`,
+/// `&messageExpiry=`, `&responseTopic=` as `m` has them, each value
+/// percent-encoded (a `/` too, as AWS's SDKs send a query) - into `out`; its
+/// length back. `Url` for what AWS refuses (see `aws_url`, and a retained
+/// `$` topic, a Content Type over 256 bytes, a response topic with a
+/// wildcard or none at all, a payload marked UTF-8 that is not).
+#[allow(dead_code)]
+pub fn aws_message_url(out: &mut [u8], host: &str, port: u16, m: &AwsMessage<'_>, qos: u8) -> Result<usize, HttpError> {
+    let bad_type = m.content_type.is_some_and(|t| t.len() > AWS_CONTENT_TYPE_MAX);
+    // AWS's rule for a response topic: no wildcard. An empty one, or a NUL,
+    // is no topic name at all.
+    let bad_response = m
+        .response_topic
+        .is_some_and(|t| t.is_empty() || t.bytes().any(|b| matches!(b, b'+' | b'#' | 0)));
+    let bad_text = m.utf8 && core::str::from_utf8(m.payload).is_err();
+    if (m.retain && m.topic.starts_with('$')) || bad_type || bad_response || bad_text {
+        return Err(HttpError::Url);
+    }
+    let mut o = Out { buf: out, n: 0 };
+    aws_target(&mut o, host, port, m.topic, m.qos.unwrap_or(qos))?;
+    if m.retain {
+        o.put(b"&retain=true")?;
+    }
+    if let Some(kind) = m.content_type {
+        o.put(b"&contentType=")?;
+        o.percent(kind.as_bytes(), false)?;
+    }
+    if let Some(s) = m.message_expiry_s {
+        o.put(b"&messageExpiry=")?;
+        o.number(s as usize)?;
+    }
+    if let Some(topic) = m.response_topic {
+        o.put(b"&responseTopic=")?;
+        o.percent(topic.as_bytes(), false)?;
+    }
     Ok(o.n)
+}
+
+/// The MQTT 5 headers of AWS's HTTPS publish, their values in `values`.
+#[allow(dead_code)]
+pub struct AwsHeaders<'v> {
+    list: [(&'static str, &'v str); 3],
+    n: usize,
+}
+
+#[allow(dead_code)]
+impl<'v> AwsHeaders<'v> {
+    pub fn as_slice(&self) -> &[(&'static str, &'v str)] {
+        &self.list[..self.n]
+    }
+}
+
+/// `m`'s headers: x-amz-mqtt5-user-properties (its pairs as a JSON array of
+/// one-pair objects, base64), x-amz-mqtt5-correlation-data (base64),
+/// x-amz-mqtt5-payload-format-indicator (UTF8_DATA) - each only when `m`
+/// has it, the values written into `values`. `TooLarge` past `values` or
+/// AWS's 8 KB.
+#[allow(dead_code)]
+pub fn aws_message_headers<'v>(values: &'v mut [u8], m: &AwsMessage<'_>) -> Result<AwsHeaders<'v>, HttpError> {
+    let mut o = Out { buf: values, n: 0 };
+    let mut ends = [0usize; 2];
+    if !m.user_properties.is_empty() {
+        let mut b = Base64 { out: &mut o, group: [0; 3], k: 0, fed: 0 };
+        b.feed(b"[")?;
+        for (i, (name, value)) in m.user_properties.iter().enumerate() {
+            b.feed(if i == 0 { b"{" } else { b",{" })?;
+            b.json_string(name)?;
+            b.feed(b":")?;
+            b.json_string(value)?;
+            b.feed(b"}")?;
+        }
+        b.feed(b"]")?;
+        if b.fed > AWS_PROPERTIES_MAX {
+            return Err(HttpError::TooLarge);
+        }
+        b.finish()?;
+    }
+    ends[0] = o.n;
+    if let Some(data) = m.correlation_data {
+        if data.len() > AWS_PROPERTIES_MAX {
+            return Err(HttpError::TooLarge);
+        }
+        let mut b = Base64 { out: &mut o, group: [0; 3], k: 0, fed: 0 };
+        b.feed(data)?;
+        b.finish()?;
+    }
+    ends[1] = o.n;
+    let values: &'v [u8] = o.buf;
+    let text = |at: core::ops::Range<usize>| core::str::from_utf8(&values[at]).map_err(|_| HttpError::Header);
+    let mut list = [("", ""); 3];
+    let mut n = 0;
+    if !m.user_properties.is_empty() {
+        list[n] = ("x-amz-mqtt5-user-properties", text(0..ends[0])?);
+        n += 1;
+    }
+    if m.correlation_data.is_some() {
+        list[n] = ("x-amz-mqtt5-correlation-data", text(ends[0]..ends[1])?);
+        n += 1;
+    }
+    if m.utf8 {
+        list[n] = ("x-amz-mqtt5-payload-format-indicator", "UTF8_DATA");
+        n += 1;
+    }
+    Ok(AwsHeaders { list, n })
+}
+
+/// Bytes fed in, base64 (RFC 4648, padded) out, three at a time - so what is
+/// encoded is never held whole anywhere.
+#[allow(dead_code)]
+struct Base64<'o, 'b> {
+    out: &'o mut Out<'b>,
+    group: [u8; 3],
+    k: usize,
+    /// Bytes fed so far.
+    fed: usize,
+}
+
+#[allow(dead_code)]
+impl Base64<'_, '_> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<(), HttpError> {
+        for &b in bytes {
+            self.group[self.k] = b;
+            self.k += 1;
+            self.fed += 1;
+            if self.k == 3 {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), HttpError> {
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        if self.k == 0 {
+            return Ok(());
+        }
+        for b in self.group.iter_mut().skip(self.k) {
+            *b = 0;
+        }
+        let v = (u32::from(self.group[0]) << 16) | (u32::from(self.group[1]) << 8) | u32::from(self.group[2]);
+        let mut quad = [b'='; 4];
+        for (i, q) in quad.iter_mut().enumerate().take(self.k + 1) {
+            *q = ALPHABET[((v >> (18 - 6 * i)) & 63) as usize];
+        }
+        self.k = 0;
+        self.out.put(&quad)
+    }
+
+    fn finish(mut self) -> Result<(), HttpError> {
+        self.flush()
+    }
+
+    /// `s` as a JSON string: quoted, `"` and `\` escaped, control
+    /// characters as \u00XX.
+    fn json_string(&mut self, s: &str) -> Result<(), HttpError> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        self.feed(b"\"")?;
+        for &b in s.as_bytes() {
+            match b {
+                b'"' => self.feed(b"\\\"")?,
+                b'\\' => self.feed(b"\\\\")?,
+                0..=0x1f => self.feed(&[b'\\', b'u', b'0', b'0', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]])?,
+                _ => self.feed(&[b])?,
+            }
+        }
+        self.feed(b"\"")
+    }
 }
 
 /// The request head as it is built: `buf[..n]` so far.
@@ -419,6 +644,20 @@ impl Out<'_> {
         self.put(b": ")?;
         self.put(value)?;
         self.put(b"\r\n")
+    }
+
+    /// `bytes` percent-encoded but for RFC 3986's unreserved characters - and
+    /// `/` when `slash` (a path; a query value encodes it).
+    fn percent(&mut self, bytes: &[u8], slash: bool) -> Result<(), HttpError> {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for &b in bytes {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') || (slash && b == b'/') {
+                self.put(&[b])?;
+            } else {
+                self.put(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]])?;
+            }
+        }
+        Ok(())
     }
 }
 

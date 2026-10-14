@@ -193,7 +193,9 @@ const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 /// - `http_v1`: the first `http.rs`, before `aws_publish()` and `aws_url`.
 /// - `tls_esp_v1` / `tls_cyw43_v1`: the first `tls.rs`, whose Provider sent the
 ///   board's certificate to a server that had not proven who it is.
-const LEGACY_TAILS: [(&str, &str); 15] = [
+/// - `http_v2`: `http.rs` with aws_publish() alone, before `AwsMessage` and
+///   aws_publish_with() (retained, MQTT 5's properties).
+const LEGACY_TAILS: [(&str, &str); 16] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
     (
@@ -233,10 +235,11 @@ const LEGACY_TAILS: [(&str, &str); 15] = [
     (HTTP, include_str!("iot_templates/legacy/http_v1.rs")),
     (TLS, include_str!("iot_templates/legacy/tls_esp_v1.rs")),
     (TLS, include_str!("iot_templates/legacy/tls_cyw43_v1.rs")),
+    (HTTP, include_str!("iot_templates/legacy/http_v2.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 31] = [
+const TAILS: [(&str, &str); 32] = [
     (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
@@ -268,6 +271,7 @@ const TAILS: [(&str, &str); 31] = [
     LEGACY_TAILS[12],
     LEGACY_TAILS[13],
     LEGACY_TAILS[14],
+    LEGACY_TAILS[15],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -4172,6 +4176,13 @@ mod tests {
         let edited = format!("{old}// mine\n");
         assert_eq!(upgraded(HTTP, &edited, &body), None);
         assert!(lf(HTTP_TAIL).contains("pub async fn aws_publish(topic: &str, payload: &[u8], body: &mut [u8])"));
+        // The second: aws_publish() alone, before AwsMessage.
+        let second = format!("{block}{GEN_END_CFG}\n{}", lf(LEGACY_TAILS[15].1));
+        assert!(is_pristine(HTTP, &second));
+        assert_eq!(upgraded(HTTP, &second, &body).as_deref(), Some(body.as_str()));
+        let v2 = lf(LEGACY_TAILS[15].1);
+        assert!(v2.contains("pub async fn aws_publish(") && !v2.contains("AwsMessage"));
+        assert!(lf(HTTP_TAIL).contains("pub async fn aws_publish_with(m: &AwsMessage<'_>, body: &mut [u8])"));
     }
 
     /// An untouched tls.rs from before the Provider waited for the server's

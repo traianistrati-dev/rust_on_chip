@@ -896,12 +896,200 @@ fn the_ide_and_the_board_build_the_same_aws_url() {
         }
         let port = [443, 8443, 0][(rnd() % 3) as usize];
         let qos = (rnd() % 3) as u8;
-        let board = aws(ENDPOINT, port, &topic, qos);
-        let ide = publish_url(ENDPOINT, port, &topic, qos);
+        let retain = rnd() % 2 == 0;
+        // The board's retained URL is AwsMessage's.
+        let board = {
+            let mut buf = [0u8; 2048];
+            let m = AwsMessage { retain, ..AwsMessage::new(&topic, b"") };
+            aws_message_url(&mut buf, ENDPOINT, port, &m, qos).map(|n| String::from_utf8(buf[..n].to_vec()).unwrap())
+        };
+        let ide = publish_url(ENDPOINT, port, &topic, qos, retain);
         match (&board, &ide) {
             (Ok(b), Ok(p)) => assert_eq!(b, p, "run {i}: {topic:?}"),
             (Err(HttpError::Url), Err(_)) => {}
-            _ => panic!("run {i}: {topic:?} port {port} qos {qos}: board {board:?}, IDE {ide:?}"),
+            _ => panic!("run {i}: {topic:?} port {port} qos {qos} retain {retain}: board {board:?}, IDE {ide:?}"),
+        }
+    }
+}
+
+/// Standard base64 back to bytes - `None` for anything a strict decoder
+/// would refuse (bad length, padding, alphabet).
+fn unbase64(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let b = text.as_bytes();
+    if b.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (q, quad) in b.chunks(4).enumerate() {
+        let last = q == b.len() / 4 - 1;
+        let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut v = 0u32;
+        for &c in &quad[..4 - pad] {
+            v = (v << 6) | ALPHABET.iter().position(|&a| a == c)? as u32;
+        }
+        v <<= 6 * pad as u32;
+        let bytes = [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+        out.extend_from_slice(&bytes[..3 - pad]);
+    }
+    Some(out)
+}
+
+fn message_url(m: &AwsMessage<'_>) -> Result<String, HttpError> {
+    let mut buf = [0u8; 2048];
+    let n = aws_message_url(&mut buf, ENDPOINT, 8443, m, 1)?;
+    Ok(String::from_utf8(buf[..n].to_vec()).unwrap())
+}
+
+fn message_headers(m: &AwsMessage<'_>) -> Result<Vec<(String, String)>, HttpError> {
+    let mut values = [0u8; 4096];
+    let headers = aws_message_headers(&mut values, m)?;
+    Ok(headers.as_slice().iter().map(|(n, v)| (n.to_string(), v.to_string())).collect())
+}
+
+/// AWS's query parameters, in the URL the board sends - and `aws_publish`'s
+/// own URL unchanged by them.
+#[test]
+fn an_aws_message_carries_retain_and_mqtt5_in_the_query() {
+    let plain = message_url(&AwsMessage::new("t/a", b"x")).unwrap();
+    assert_eq!(plain, aws(ENDPOINT, 8443, "t/a", 1).unwrap());
+    let m = AwsMessage {
+        retain: true,
+        qos: Some(0),
+        content_type: Some("application/json; charset=utf-8"),
+        message_expiry_s: Some(3600),
+        response_topic: Some("t/reply"),
+        ..AwsMessage::new("t/a", b"{}")
+    };
+    assert_eq!(
+        message_url(&m).unwrap(),
+        format!(
+            "https://{ENDPOINT}:8443/topics/t/a?qos=0&retain=true&contentType=application%2Fjson%3B%20charset%3Dutf-8&messageExpiry=3600&responseTopic=t%2Freply"
+        )
+    );
+    // What AWS refuses never leaves the board.
+    let refused = [
+        AwsMessage { retain: true, ..AwsMessage::new("$aws/things/t/shadow/update", b"{}") },
+        AwsMessage { content_type: Some(&"c".repeat(257)), ..AwsMessage::new("t", b"") },
+        AwsMessage { response_topic: Some("t/+/r"), ..AwsMessage::new("t", b"") },
+        AwsMessage { response_topic: Some(""), ..AwsMessage::new("t", b"") },
+        AwsMessage { utf8: true, ..AwsMessage::new("t", &[0xff, 0xfe]) },
+        AwsMessage { qos: Some(2), ..AwsMessage::new("t", b"") },
+    ];
+    for (i, m) in refused.iter().enumerate() {
+        assert_eq!(message_url(m), Err(HttpError::Url), "case {i}");
+    }
+    // A response topic: AWS asks only for no wildcard.
+    for reply in ["$app/reply", "a/b/c/d/e/f/g/h/i", "\u{e9}"] {
+        assert!(message_url(&AwsMessage { response_topic: Some(reply), ..AwsMessage::new("t", b"") }).is_ok(), "{reply}");
+    }
+    // 256 bytes of content type are AWS's limit, not over it.
+    assert!(message_url(&AwsMessage { content_type: Some(&"c".repeat(256)), ..AwsMessage::new("t", b"") }).is_ok());
+    // An empty retained payload: AWS deletes the topic's - allowed.
+    assert!(message_url(&AwsMessage { retain: true, ..AwsMessage::new("t", b"") }).is_ok());
+}
+
+/// The three headers: user properties as base64 of a JSON array of one-pair
+/// objects (escaped), correlation data as base64, the format indicator - only
+/// those the message has, and none for a plain one.
+#[test]
+fn an_aws_message_carries_its_properties_in_three_headers() {
+    assert!(message_headers(&AwsMessage::new("t", b"x")).unwrap().is_empty());
+    let props = [("name", "alpha"), ("a\"b", "c\\d\n\u{7}"), ("name", "\u{e9}")];
+    let m = AwsMessage {
+        user_properties: &props,
+        correlation_data: Some(&[0, 1, 2, 0xfe, 0xff]),
+        utf8: true,
+        ..AwsMessage::new("t", "\u{e9}t\u{e9}".as_bytes())
+    };
+    let h = message_headers(&m).unwrap();
+    assert_eq!(h.len(), 3);
+    assert_eq!(h[0].0, "x-amz-mqtt5-user-properties");
+    let json = String::from_utf8(unbase64(&h[0].1).unwrap()).unwrap();
+    assert_eq!(json, r#"[{"name":"alpha"},{"a\"b":"c\\d\u000a\u0007"},{"name":"é"}]"#);
+    let parsed: Vec<std::collections::BTreeMap<String, String>> = serde_json::from_str(&json).unwrap();
+    let pairs: Vec<(String, String)> = parsed.into_iter().flat_map(|o| o.into_iter()).collect();
+    assert_eq!(pairs, props.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>());
+    assert_eq!(h[1], ("x-amz-mqtt5-correlation-data".to_owned(), "AAEC/v8=".to_owned()));
+    assert_eq!(h[2], ("x-amz-mqtt5-payload-format-indicator".to_owned(), "UTF8_DATA".to_owned()));
+    // The request carries them as any other headers.
+    let mut values = [0u8; 4096];
+    let headers = aws_message_headers(&mut values, &m).unwrap();
+    let url = Url::parse("https://h/topics/t?qos=1").unwrap();
+    let mut head = [0u8; REQUEST_HEAD_MAX];
+    let n = build(&mut head, Method::Post, &url, Auth::None, None, headers.as_slice(), 5).unwrap();
+    let text = std::str::from_utf8(&head[..n]).unwrap();
+    assert!(text.contains("\r\nx-amz-mqtt5-payload-format-indicator: UTF8_DATA\r\n"), "{text}");
+    // Over AWS's 8 KB, or past the buffer: TooLarge.
+    let long = "v".repeat(9000);
+    let big = [("k", long.as_str())];
+    assert_eq!(
+        message_headers(&AwsMessage { user_properties: &big, ..AwsMessage::new("t", b"") }),
+        Err(HttpError::TooLarge)
+    );
+    let mut small = [0u8; 8];
+    assert!(matches!(aws_message_headers(&mut small, &m), Err(HttpError::TooLarge)));
+    // AWS's 8 KB themselves, with room in the buffer: the JSON's bytes (not
+    // its base64) count, and the correlation data's.
+    let mut room = vec![0u8; 16 * 1024];
+    let at_limit = "v".repeat(8192 - r#"[{"k":""}]"#.len());
+    let fits = [("k", at_limit.as_str())];
+    assert!(aws_message_headers(&mut room, &AwsMessage { user_properties: &fits, ..AwsMessage::new("t", b"") }).is_ok());
+    let over = "v".repeat(at_limit.len() + 1);
+    let past = [("k", over.as_str())];
+    assert!(matches!(
+        aws_message_headers(&mut room, &AwsMessage { user_properties: &past, ..AwsMessage::new("t", b"") }),
+        Err(HttpError::TooLarge)
+    ));
+    let data = vec![7u8; 8192];
+    assert!(aws_message_headers(&mut room, &AwsMessage { correlation_data: Some(&data), ..AwsMessage::new("t", b"") }).is_ok());
+    let data = vec![7u8; 8193];
+    assert!(matches!(
+        aws_message_headers(&mut room, &AwsMessage { correlation_data: Some(&data), ..AwsMessage::new("t", b"") }),
+        Err(HttpError::TooLarge)
+    ));
+}
+
+/// Whatever the pairs and bytes, the headers decode back to them: JSON
+/// that parses to the same pairs, in order, and the same correlation data.
+#[test]
+fn aws_message_headers_always_decode_back() {
+    let mut rnd = xorshift(0xBADC_0FFE_E0DD_F00D);
+    let pieces = ["a", "Z", "0", " ", "\"", "\\", "/", "\n", "\t", "\u{1}", "\u{1f}", "\u{7f}", "\u{e9}", "\u{1f600}", "{", "}", "[", ":", ","];
+    for i in 0..FUZZ_RUNS / 4 {
+        let mut strings: Vec<String> = Vec::new();
+        for _ in 0..(rnd() % 6) * 2 {
+            let mut s = String::new();
+            for _ in 0..rnd() % 8 {
+                s.push_str(pieces[(rnd() as usize) % pieces.len()]);
+            }
+            strings.push(s);
+        }
+        let props: Vec<(&str, &str)> = strings.chunks(2).map(|p| (p[0].as_str(), p[1].as_str())).collect();
+        let data: Vec<u8> = (0..rnd() % 40).map(|_| rnd() as u8).collect();
+        let m = AwsMessage {
+            user_properties: &props,
+            correlation_data: (rnd() % 2 == 0).then_some(data.as_slice()),
+            ..AwsMessage::new("t", b"")
+        };
+        let h = message_headers(&m).unwrap_or_else(|e| panic!("run {i}: {e:?}"));
+        let mut at = 0;
+        if !props.is_empty() {
+            let json = String::from_utf8(unbase64(&h[at].1).unwrap()).unwrap();
+            let parsed: Vec<serde_json::Map<String, serde_json::Value>> =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("run {i}: {json:?}: {e}"));
+            assert_eq!(parsed.len(), props.len(), "run {i}");
+            for (o, (k, v)) in parsed.iter().zip(&props) {
+                assert_eq!(o.len(), 1);
+                assert_eq!(o.get(*k).and_then(|x| x.as_str()), Some(*v), "run {i}: {json:?}");
+            }
+            at += 1;
+        }
+        if let Some(d) = m.correlation_data {
+            assert_eq!(unbase64(&h[at].1).unwrap(), d, "run {i}");
         }
     }
 }

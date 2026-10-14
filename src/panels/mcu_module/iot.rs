@@ -176,6 +176,9 @@ pub struct HttpConfig {
     /// the steps name it (MQTT's client id when MQTT talks to AWS too). Not
     /// in the firmware: HTTPS publish carries no client id.
     pub aws_thing: String,
+    /// The firmware publishes retained messages (`AwsMessage::retain`):
+    /// policy.json gets iot:RetainPublish. Tab-only, as `aws_thing`.
+    pub aws_retain: bool,
 }
 
 impl Default for HttpConfig {
@@ -193,6 +196,7 @@ impl Default for HttpConfig {
             aws_port: 8443,
             aws_qos: 1,
             aws_thing: String::new(),
+            aws_retain: false,
         }
     }
 }

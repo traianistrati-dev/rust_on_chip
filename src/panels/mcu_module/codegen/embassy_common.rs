@@ -2184,6 +2184,14 @@ mod emit_for_manual_compile {
                 used.push_str("        if let Ok(r) = pins::configs::http::aws_publish(\"rustonchip-test/data\", b\"{}\", &mut reply).await {\n");
                 used.push_str("            let _ = (r.status, r.len);\n");
                 used.push_str("        }\n");
+                // Every field of a message, so all of the encoding is linked.
+                used.push_str("        let props = [(\"board\", \"esp32c3\")];\n");
+                used.push_str("        let m = pins::configs::http::AwsMessage {\n");
+                used.push_str("            qos: Some(0),\n            retain: true,\n            content_type: Some(\"application/json\"),\n");
+                used.push_str("            message_expiry_s: Some(60),\n            response_topic: Some(\"rustonchip-test/reply\"),\n");
+                used.push_str("            correlation_data: Some(b\"7\"),\n            user_properties: &props,\n            utf8: true,\n");
+                used.push_str("            ..pins::configs::http::AwsMessage::new(\"rustonchip-test/state\", b\"{}\")\n        };\n");
+                used.push_str("        pins::configs::http::aws_publish_with(&m, &mut reply).await.ok();\n");
             }
             if matches!(mode, "http" | "https" | "awshttps") || all {
                 used.push_str("        let mut body = [0u8; 256];\n");

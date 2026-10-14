@@ -17,6 +17,13 @@
 //     let r = pins::configs::http::aws_publish("my-thing/temperature", b"{\"t\":21.5}", &mut body).await;
 //     // Ok(r) with r.status == 200: the broker took it
 //
+// Retained, or with MQTT 5's properties - a content type, an expiry, a
+// response topic, user properties:
+//
+//     use pins::configs::http::AwsMessage;
+//     let m = AwsMessage { retain: true, ..AwsMessage::new("my-thing/state", b"{\"on\":true}") };
+//     pins::configs::http::aws_publish_with(&m, &mut body).await.ok();
+//
 // One task makes the requests, one at a time: it holds the socket, the TLS
 // buffers and the handshake, so a caller's own task stays small. Each request
 // opens its own connection (`Connection: close`) and takes TIMEOUT_S at most.
@@ -134,10 +141,6 @@ pub async fn request(req: Request<'_>, body: &mut [u8]) -> Result<Response, Http
     Ok(response)
 }
 
-/// The longest URL `aws_publish()` builds: the endpoint, its port, and a
-/// 256-byte topic percent-encoded throughout.
-const AWS_URL_MAX: usize = "https://".len() + HOST_MAX + ":65535/topics/?qos=1".len() + 3 * AWS_TOPIC_MAX;
-
 /// Publishes `payload` on `topic` in AWS IoT over HTTPS, with the board's
 /// certificate: the endpoint, port and QoS the tab gave (CERT_HOST,
 /// AWS_PORT, AWS_QOS). The answer lands in `body`, as `request()`'s does:
@@ -155,16 +158,38 @@ const AWS_URL_MAX: usize = "https://".len() + HOST_MAX + ":65535/topics/?qos=1".
 /// Each call is a connection and a handshake of its own: about a second on
 /// an ESP32-C3. A lost answer and a retry can publish the message twice.
 pub async fn aws_publish(topic: &str, payload: &[u8], body: &mut [u8]) -> Result<Response, HttpError> {
+    aws_publish_with(&AwsMessage::new(topic, payload), body).await
+}
+
+/// `aws_publish()` with the rest of an MQTT 5 message: retained, a content
+/// type, an expiry, a response topic and correlation data, user properties,
+/// the payload marked UTF-8 (see `AwsMessage`):
+///
+///     let m = AwsMessage { retain: true, ..AwsMessage::new("my-thing/state", b"{\"on\":true}") };
+///     pins::configs::http::aws_publish_with(&m, &mut body).await
+///
+/// A retained message needs iot:RetainPublish (the tab's "Retained
+/// messages"), at most one a second per topic; an empty retained payload
+/// deletes the topic's. `Err(Url)` also for a retained `$` topic, a content
+/// type over 256 bytes, a response topic with a wildcard, a payload marked
+/// UTF-8 that is not. The URL and the headers are built here, on the
+/// caller's task - one kilobyte of it while the request runs.
+pub async fn aws_publish_with(m: &AwsMessage<'_>, body: &mut [u8]) -> Result<Response, HttpError> {
     if AWS_PORT == 0 {
         return Err(HttpError::Url);
     }
-    let mut url = [0u8; AWS_URL_MAX];
-    let n = aws_url(&mut url, CERT_HOST, AWS_PORT, topic, AWS_QOS)?;
-    // Every byte aws_url wrote is ASCII.
-    let url = core::str::from_utf8(&url[..n]).map_err(|_| HttpError::Url)?;
+    // Both go into the request head, so one head's worth holds both: the
+    // URL, then the headers' values after it.
+    let mut buf = [0u8; REQUEST_HEAD_MAX];
+    let n = aws_message_url(&mut buf, CERT_HOST, AWS_PORT, m, AWS_QOS)?;
+    let (url, values) = buf.split_at_mut(n);
+    // Every byte aws_message_url wrote is ASCII.
+    let url = core::str::from_utf8(url).map_err(|_| HttpError::Url)?;
+    let headers = aws_message_headers(values, m)?;
     let req = Request {
         method: Method::Post,
-        payload,
+        headers: headers.as_slice(),
+        payload: m.payload,
         ..Request::get(url)
     };
     request(req, body).await

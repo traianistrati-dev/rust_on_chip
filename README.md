@@ -578,8 +578,14 @@ For an AWS IoT endpoint `aws_publish("topic", payload, &mut body)` POSTs to
 `/topics/<topic>?qos=N` on 8443, or on 443 with the ALPN `x-amzn-http-ca`, the
 topic percent-encoded and checked as AWS checks it before anything is sent; a
 200 is the broker's yes, a 403 its policy's no, and a refused certificate a
-reset. The tab writes the CLI steps and the policy for the thing it names, and
-**Publish from this PC** sends the very request the board sends. The local AWS
+reset. `aws_publish_with(&AwsMessage { .. }, ..)` adds what MQTT 5 carries:
+a **retained** message (an empty one deletes the topic's; the tab's
+"Retained" switch puts iot:RetainPublish in the policy), a content type, an
+expiry, a response topic, correlation data and user properties - the query and
+three `x-amz-mqtt5-*` headers AWS takes, encoded on the board without a heap
+and checked against what AWS refuses. The tab writes the CLI steps and the
+policy for the thing it names, and **Publish from this PC** sends the very
+request the board sends, retained or not. The local AWS
 IoT look-alike (`scripts/aws-iot-mock.py`) takes it on 8443 and 443 and hands
 it to its MQTT subscribers - its HTTP answers follow AWS's documentation, not
 captured traffic.

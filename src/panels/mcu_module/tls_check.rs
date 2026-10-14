@@ -101,6 +101,9 @@ pub struct HttpRequest {
     pub connect_to: Option<String>,
     /// The URL is AWS IoT's HTTPS publish: refusals said in its terms.
     pub aws: bool,
+    /// More headers, after Content-Length as the board writes them: AWS's
+    /// x-amz-mqtt5-* for an `AwsMessage`'s properties.
+    pub headers: Vec<(String, String)>,
 }
 
 /// What a POST carries.
@@ -268,8 +271,9 @@ pub fn stdin_lines(r: &Request) -> String {
 /// value - the URL, verify, the CAs as DER, "P-384 chains", HEAD_MAX,
 /// BODY_MAX, the User-Agent, REQUEST_HEAD_MAX, then the method (POST or a
 /// GET), the Content-Type, the payload, the client certificate and key, the
-/// ALPN, a host:port to dial instead, and AWS IoT ("1"/"0") - sixteen lines,
-/// an empty value still taking its own.
+/// ALPN, a host:port to dial instead, AWS IoT ("1"/"0"), and more headers
+/// (`Name: value` one a line) - seventeen lines, an empty value still taking
+/// its own.
 pub fn http_stdin_lines(r: &HttpRequest) -> String {
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let flag = |on: bool| if on { "1" } else { "0" };
@@ -290,6 +294,11 @@ pub fn http_stdin_lines(r: &HttpRequest) -> String {
         r.alpn.as_deref().unwrap_or_default().as_bytes(),
         r.connect_to.as_deref().unwrap_or_default().as_bytes(),
         flag(r.aws).as_bytes(),
+        r.headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\n"))
+            .collect::<String>()
+            .as_bytes(),
     ]
     .iter()
     .map(|field| hex(field) + "\n")
@@ -635,10 +644,10 @@ mod tests {
         assert_eq!(r.clone().tested(), before);
     }
 
-    /// The HTTP probe's request goes over as hex lines too, sixteen of them
+    /// The HTTP probe's request goes over as hex lines too, seventeen of them
     /// in the order the checker's `http` mode reads them - an empty CA (plain
     /// http://) still takes its line, and a GET without a certificate leaves
-    /// the last eight empty but there.
+    /// the last nine empty but there.
     #[test]
     fn the_http_request_is_one_hex_line_per_value() {
         let r = HttpRequest {
@@ -659,9 +668,9 @@ mod tests {
         };
         let text = http_stdin_lines(&r);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 16);
+        assert_eq!(lines.len(), 17);
         assert_eq!(unhex(lines[8]), b"GET");
-        assert_eq!(&lines[9..], ["", "", "", "", "", "", "30"], "a GET, nothing more");
+        assert_eq!(&lines[9..], ["", "", "", "", "", "", "30", ""], "a GET, nothing more");
         assert_eq!(unhex(lines[0]), r.url.as_bytes());
         assert_eq!(lines[1], "31", "verify");
         assert_eq!(lines[2], "3082", "the CAs");
@@ -677,7 +686,7 @@ mod tests {
         };
         let text = http_stdin_lines(&plain);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 16);
+        assert_eq!(lines.len(), 17);
         assert_eq!(lines[2], "");
         assert_eq!(lines[4], "32303438", "the lines after the CA stay in place");
         // AWS IoT's publish: a POST, the board's identity, the ALPN, the
@@ -693,11 +702,15 @@ mod tests {
             alpn: Some("x-amzn-http-ca".into()),
             connect_to: Some("127.0.0.1:18443".into()),
             aws: true,
+            headers: vec![
+                ("x-amz-mqtt5-user-properties".into(), "W3siYSI6IjEifV0=".into()),
+                ("x-amz-mqtt5-payload-format-indicator".into(), "UTF8_DATA".into()),
+            ],
             ..r.clone()
         };
         let text = http_stdin_lines(&publish);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 16);
+        assert_eq!(lines.len(), 17);
         assert_eq!(unhex(lines[8]), b"POST");
         assert_eq!(lines[9], "", "no Content-Type");
         assert_eq!(unhex(lines[10]), b"{}");
@@ -706,11 +719,15 @@ mod tests {
         assert_eq!(unhex(lines[13]), b"x-amzn-http-ca");
         assert_eq!(unhex(lines[14]), b"127.0.0.1:18443");
         assert_eq!(lines[15], "31");
+        assert_eq!(
+            unhex(lines[16]),
+            b"x-amz-mqtt5-user-properties: W3siYSI6IjEifV0=\nx-amz-mqtt5-payload-format-indicator: UTF8_DATA\n"
+        );
         let empty = HttpRequest {
             post: Some(HttpPost::default()),
             ..publish
         };
-        assert_eq!(http_stdin_lines(&empty).lines().count(), 16);
+        assert_eq!(http_stdin_lines(&empty).lines().count(), 17);
     }
 
     /// A probe's result is for its URL, and goes stale when anything it was

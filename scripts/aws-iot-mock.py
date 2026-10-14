@@ -59,12 +59,14 @@ the script warns and goes on with OpenSSL's own list.
 """
 
 import argparse
+import base64
 import binascii
 import collections
 import concurrent.futures
 import ctypes
 import datetime
 import hashlib
+import json
 import os
 import pathlib
 import platform
@@ -690,6 +692,7 @@ class Options:
         self.chain = "chain3.pem"          # what AWS sends over TLS 1.3 (chain4.pem: over TLS 1.2)
         self.tickets = 0                   # AWS sends no NewSessionTicket
         self.nocert = "rst"                # no client certificate: a reset (AWS), or "alert"
+        self.allow_retain = False          # iot:RetainPublish on topic/<thing>/* (--allow-retain)
         for key, value in changes.items():
             if not hasattr(self, key):
                 raise TypeError("no option " + key)
@@ -875,7 +878,7 @@ class Broker:
             "receive": ["topic/%s/*" % thing]
                        + ["topic/" + strip_share(f).replace("+", "*").replace("#", "*") for f in allow],
             "subscribe": ["topicfilter/%s/*" % thing] + ["topicfilter/" + f for f in allow],
-            "retainpublish": [],
+            "retainpublish": ["topic/%s/*" % thing] if self.o.allow_retain else [],
         }
 
     def may(self, thing, action, value):
@@ -1168,6 +1171,14 @@ class Session:
             return self.refuse_publish(qos, pid, 0x87, what + ": iot:Publish on topic/%s denied" % topic)
         if retain and not self.broker.may(self.thing, "retainpublish", topic):
             return self.refuse_publish(qos, pid, 0x87, what + ": iot:RetainPublish on topic/%s denied" % topic)
+        if retain:
+            # Kept for later subscribers, as AWS does - an empty payload deletes.
+            with self.broker.lock:
+                if payload:
+                    self.broker.retained[topic] = payload
+                else:
+                    self.broker.retained.pop(topic, None)
+            self.log("retained `%s` %s" % (topic, "stored (%d bytes)" % len(payload) if payload else "deleted"))
         receivers = self.broker.deliver(topic, payload, self)
         code = 0x00 if receivers else 0x10  # 0x10: no matching subscribers
         if qos == 1:
@@ -1274,7 +1285,7 @@ class HttpsPublish:
             topic = urllib.parse.unquote_to_bytes(path[len("/topics/"):]).decode("utf-8")
         except UnicodeDecodeError:
             return self.answer(400, "Bad Request", "Bad Request")
-        params = urllib.parse.parse_qs(query)
+        params = urllib.parse.parse_qs(query, keep_blank_values=True)
         qos = params.get("qos", ["0"])[0]
         what = "HTTPS POST `%s` qos %s %r" % (topic, qos, body[:48])
         if qos not in ("0", "1"):
@@ -1288,13 +1299,88 @@ class HttpsPublish:
         if not self.broker.may(self.thing, "publish", topic):
             self.log(what + ": iot:Publish on topic/%s denied -> 403" % topic)
             return self.answer(403, "Forbidden", "Forbidden")
-        if params.get("retain", ["false"])[0] == "true" and not self.broker.may(self.thing, "retainpublish", topic):
+        retain = params.get("retain", ["false"])[0] == "true"
+        if retain and topic.startswith("$"):
+            self.log(what + ": retained, on a reserved topic -> 400")
+            return self.answer(400, "Bad Request", "Bad Request")
+        if retain and not self.broker.may(self.thing, "retainpublish", topic):
             self.log(what + ": iot:RetainPublish on topic/%s denied -> 403" % topic)
             return self.answer(403, "Forbidden", "Forbidden")
+        props = self.properties(params, headers, body)
+        if props is None:
+            self.log(what + ": MQTT 5 properties AWS would refuse -> 400")
+            return self.answer(400, "Bad Request", "Bad Request")
+        if props:
+            self.log("MQTT 5 properties: " + ", ".join("%s=%r" % kv for kv in props))
+        if retain:
+            with self.broker.lock:
+                if body:
+                    self.broker.retained[topic] = body
+                else:
+                    self.broker.retained.pop(topic, None)
+            self.log("retained `%s` %s" % (topic, "stored (%d bytes)" % len(body) if body else "deleted"))
         receivers = self.broker.deliver(topic, body, None)
         # HTTP has no "no matching subscribers": a 200 either way.
         self.log("%s: allowed, %d receiver(s) -> 200" % (what, receivers))
         return self.answer(200, "OK", "OK")
+
+    def properties(self, params, headers, body):
+        """MQTT 5's properties as AWS's HTTP publish takes them - the query's
+        contentType, messageExpiry, responseTopic and three x-amz-mqtt5-*
+        headers - checked by AWS's documented limits (contentType 256 bytes,
+        user properties and correlation data 8 KB each, no wildcard in the
+        response topic, the indicator's two names). None for what it would
+        refuse - its status for that is not documented: 400 here, an
+        assumption, as is reading an empty responseTopic as no topic."""
+        import base64
+        import json
+        out = []
+        kind = params.get("contentType", [None])[0]
+        if kind is not None:
+            if len(kind.encode()) > 256:
+                return None
+            out.append(("contentType", kind))
+        expiry = params.get("messageExpiry", [None])[0]
+        if expiry is not None:
+            if not expiry.isdigit():
+                return None
+            out.append(("messageExpiry", int(expiry)))
+        reply = params.get("responseTopic", [None])[0]
+        if reply is not None:
+            if not reply or "+" in reply or "#" in reply:
+                return None
+            out.append(("responseTopic", reply))
+        users = headers.get("x-amz-mqtt5-user-properties")
+        if users is not None:
+            try:
+                raw = base64.b64decode(users, validate=True)
+                pairs = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return None
+            # An array of objects: AWS's example gives one pair each.
+            if len(raw) > 8192 or not isinstance(pairs, list) or not all(isinstance(p, dict) for p in pairs):
+                return None
+            out.append(("userProperties", [kv for p in pairs for kv in p.items()]))
+        correlation = headers.get("x-amz-mqtt5-correlation-data")
+        if correlation is not None:
+            try:
+                data = base64.b64decode(correlation, validate=True)
+            except ValueError:
+                return None
+            if len(data) > 8192:
+                return None
+            out.append(("correlationData", data.hex()))
+        indicator = headers.get("x-amz-mqtt5-payload-format-indicator")
+        if indicator is not None:
+            if indicator not in ("UTF8_DATA", "UNSPECIFIED_BYTES"):
+                return None
+            if indicator == "UTF8_DATA":
+                try:
+                    body.decode("utf-8")
+                except UnicodeDecodeError:
+                    return None
+            out.append(("payloadFormat", indicator))
+        return out
 
 
 class Listener:
@@ -1328,7 +1414,8 @@ class Case:
     def __init__(self, cid, title, port="443", alpn=True, cert="device", client_id=THING, ca=("root1", "root3"),
                  filters=GOOD_FILTERS, topic=GOOD_TOPIC, keep_alive=60, broker=None, real_443=False, wire=False,
                  result="ok", result_has=GOOD_RESULT, info_has=GOOD_INFO, info_lacks=(), log_has=(),
-                 https=False, qos=1, payload=b'{"t":21.5}', listener=GOOD_TOPIC):
+                 https=False, qos=1, payload=b'{"t":21.5}', listener=GOOD_TOPIC, retain=False, query="",
+                 headers=()):
         self.cid, self.title, self.port, self.alpn, self.cert = cid, title, port, alpn, cert
         self.client_id, self.ca, self.filters, self.topic, self.keep_alive = client_id, ca, filters, topic, keep_alive
         self.broker, self.real_443, self.wire = broker or {}, real_443, wire
@@ -1337,6 +1424,8 @@ class Case:
         # HTTPS publish: the helper's `http` mode, a POST of `payload` on `topic`,
         # an MQTT subscriber to `listener` (None: nobody subscribed).
         self.https, self.qos, self.payload, self.listener = https, qos, payload, listener
+        # ... retained, more of the query (MQTT 5's), and headers as `Name: value`.
+        self.retain, self.query, self.headers = retain, query, headers
 
     def picked_by(self, arg):
         return self.cid == arg or (self.cid.startswith(arg) and self.cid[len(arg):].isalpha())
@@ -1347,6 +1436,8 @@ def fails(cid, title, has, info=(), **kw):
 
 
 SENT_CERT = ("asked for the client certificate: sent",)
+# A user property the board's JSON escapes: a quote in the name, a backslash in the value.
+UP_KEY, UP_VALUE = 'a"b', "c\\d"
 
 
 def publish(cid, title, has=("AWS IoT took the message on `rustonchip-test/test`",), info=SENT_CERT, **kw):
@@ -1424,6 +1515,22 @@ CASES = [
             log_has=("allowed, 0 receiver(s) -> 200",)),
     publish_fails("16i", "an endpoint on a TLS 1.2 security policy", ("TLS 1.3 security policy",),
                   broker={"tls12": True, "chain": "chain4.pem"}),
+    publish_fails("16j", "a retained message without iot:RetainPublish: 403", ("403", "iot:RetainPublish"),
+                  SENT_CERT, retain=True, log_has=("iot:RetainPublish on topic/rustonchip-test/test denied",)),
+    publish("16k", "a retained message with iot:RetainPublish: kept", retain=True, broker={"allow_retain": True},
+            log_has=("retained `rustonchip-test/test` stored", "allowed, 1 receiver(s) -> 200")),
+    publish("16l", "an empty retained message deletes the topic's", retain=True, payload=b"",
+            broker={"allow_retain": True, "retained": {"rustonchip-test/test": b"old"}},
+            log_has=("retained `rustonchip-test/test` deleted",)),
+    publish("16m", "MQTT 5's properties, in the query and three headers",
+            query="&contentType=application%2Fjson&messageExpiry=60&responseTopic=rustonchip-test%2Freply",
+            headers=("x-amz-mqtt5-user-properties: " + base64.b64encode(json.dumps(
+                         [{"name": "alpha"}, {UP_KEY: UP_VALUE}], separators=(",", ":")).encode()).decode(),
+                     "x-amz-mqtt5-correlation-data: AAEC/v8=",
+                     "x-amz-mqtt5-payload-format-indicator: UTF8_DATA"),
+            log_has=("contentType='application/json'", "messageExpiry=60", "responseTopic='rustonchip-test/reply'",
+                     "userProperties=%r" % [("name", "alpha"), (UP_KEY, UP_VALUE)], "correlationData='000102feff'",
+                     "payloadFormat='UTF8_DATA'")),
 ]
 
 
@@ -1439,7 +1546,7 @@ def helper_request(case, pki, port):
 
 
 def helper_http_request(case, pki, port):
-    """The 16 lines of the helper's `http` mode: a POST as aws_publish() sends it,
+    """The 17 lines of the helper's `http` mode: a POST as aws_publish() sends it,
     dialled at the mock while named and checked as the endpoint."""
     import urllib.parse
     cert = key = ""
@@ -1448,10 +1555,11 @@ def helper_http_request(case, pki, port):
         key = pki.path(("device" if case.cert == "device" else "other") + ".key").read_text()
     ca = b"".join(pki.der(name) for name in case.ca)
     on_443 = case.port == "443"
-    url = "https://%s%s/topics/%s?qos=%d" % (ENDPOINT, "" if on_443 else ":8443",
-                                             urllib.parse.quote(case.topic, safe="/"), case.qos)
+    url = "https://%s%s/topics/%s?qos=%d%s%s" % (ENDPOINT, "" if on_443 else ":8443",
+                                                 urllib.parse.quote(case.topic, safe="/"), case.qos,
+                                                 "&retain=true" if case.retain else "", case.query)
     values = [url, "1", ca, "0", "2048", "2048", "RustOnChip", "1024", "POST", "", case.payload, cert, key,
-              ALPN_HTTP if on_443 else "", "127.0.0.1:%d" % port, "1"]
+              ALPN_HTTP if on_443 else "", "127.0.0.1:%d" % port, "1", "\n".join(case.headers)]
     return "".join(hexl(v) + "\n" for v in values).encode("ascii")
 
 
@@ -1501,7 +1609,8 @@ def wire_check(broker):
 
 
 def run_case(case, pki, helper, aws_sigalgs):
-    options = Options(aws_sigalgs=aws_sigalgs, retained=dict(SEED_RETAINED), **case.broker)
+    # A case's own retained messages win over the seeded ones.
+    options = Options(aws_sigalgs=aws_sigalgs, **{"retained": dict(SEED_RETAINED), **case.broker})
     broker = Broker(pki, options)
     t0 = time.monotonic()
     out = {"status": "PASS", "why": [], "output": [], "log": broker.lines, "seconds": 0.0}
@@ -1630,6 +1739,7 @@ def serve(argv):
     ap.add_argument("--csr", action="append", default=[], metavar="FILE",
                     help="sign this CSR (the IDE's) and register it to the thing, as create-certificate-from-csr")
     ap.add_argument("--tls12", action="store_true", help="act as an endpoint with no TLS 1.3 security policy")
+    ap.add_argument("--allow-retain", action="store_true", help="also allow iot:RetainPublish on topic/<thing>/*")
     args = ap.parse_args(argv)
     helper = find_helper(args.helper)
     pki = Pki(args.work, find_openssl(), helper if os.path.isfile(helper) else None).ensure()
@@ -1639,7 +1749,8 @@ def serve(argv):
         retained[topic] = text.encode("utf-8")
     options = Options(allow=args.allow, deny=args.deny, reason_strings=args.reason_strings,
                       retained_before_suback=args.retained_before_suback, retained=retained,
-                      aws_sigalgs=args.aws_sigalgs, tls12=args.tls12, chain="chain4.pem" if args.tls12 else "chain3.pem")
+                      aws_sigalgs=args.aws_sigalgs, tls12=args.tls12, chain="chain4.pem" if args.tls12 else "chain3.pem",
+                      allow_retain=args.allow_retain)
     broker = Broker(pki, options, echo=True)
     certs = [(pki.path("device.pem"), pki.path("device.key"))]
     for csr in args.csr:

@@ -89,20 +89,15 @@ pub enum EspRuntime {
 
 impl EspRuntime {
     /// The attribute + `fn` signature line(s) that open `main`, ending in `{\n`.
-    fn entry(self) -> &'static str {
-        self.entry_with(false)
-    }
-
-    /// The entry point, with the `Spawner` NAMED when the body spawns a task.
     ///
-    /// Two spellings rather than always `spawner`: an async project with nothing
-    /// to spawn would carry an unused-variable warning on a line inside the
-    /// generated block, which the reader cannot edit away.
-    fn entry_with(self, spawns: bool) -> &'static str {
-        match (self, spawns) {
-            (Self::Blocking, _) => "#[esp_hal::main]\nfn main() -> ! {\n",
-            (Self::Async, false) => "#[esp_rtos::main]\nasync fn main(_spawner: Spawner) {\n",
-            (Self::Async, true) => "#[esp_rtos::main]\nasync fn main(spawner: Spawner) {\n",
+    /// ONE spelling, `_spawner`, whatever the block spawns: the line sits in
+    /// the generated block and the user's code below it names it too
+    /// (`_spawner.spawn(..)`), so a rename there breaks their code. Used or
+    /// not, an underscored name never warns.
+    fn entry(self) -> &'static str {
+        match self {
+            Self::Blocking => "#[esp_hal::main]\nfn main() -> ! {\n",
+            Self::Async => "#[esp_rtos::main]\nasync fn main(_spawner: Spawner) {\n",
         }
     }
 
@@ -139,11 +134,11 @@ impl EspRuntime {
 
 /// Which spawner a task of `prio` is launched on.
 ///
-/// `spawner` is the thread-mode executor `#[esp_rtos::main]` hands in - the one
-/// every task used to share. The raised tiers each have their own.
+/// `_spawner` is the thread-mode executor `#[esp_rtos::main]` hands in - the
+/// one every task used to share. The raised tiers each have their own.
 fn spawner_for(prio: TaskPriority) -> &'static str {
     match prio {
-        TaskPriority::Normal => "spawner",
+        TaskPriority::Normal => "_spawner",
         TaskPriority::High => "spawner_high",
         TaskPriority::Critical => "spawner_critical",
     }
@@ -805,7 +800,7 @@ fn make_gen_section(
                 // returns `()`. It was the other way round one version earlier,
                 // so a version bump is worth re-checking here. The `unwrap`
                 // cannot fire: one task function, one spawn, a pool of one.
-                // WHICH spawner is the whole feature: `spawner` is the shared
+                // WHICH spawner is the whole feature: `_spawner` is the shared
                 // thread-mode executor every task used to land on, while a
                 // raised task goes to an interrupt executor that preempts it.
                 body.push_str(&format!(
@@ -1126,17 +1121,6 @@ fn make_gen_section(
     } else {
         irq_handler_items(&armed)
     };
-    // The SHARED spawner is named only when a task actually lands on it.
-    //
-    // Not `!tasks.is_empty()`: a task at a raised priority is spawned on its own
-    // interrupt executor, so a project where EVERY armed pin is raised has tasks
-    // and still never touches `spawner` — which put an unused-variable warning
-    // on a line inside the generated block, exactly the case `entry_with` was
-    // written to avoid.
-    let spawns_on_shared = runtime == EspRuntime::Async
-        && armed
-            .iter()
-            .any(|(_, _, prio)| *prio == TaskPriority::Normal);
     format!(
         "{GEN_BEGIN}\n\
          {use_block}\
@@ -1144,7 +1128,7 @@ fn make_gen_section(
          {entry}\
          {body}\
          {GEN_END}\n",
-        entry = runtime.entry_with(spawns_on_shared),
+        entry = runtime.entry(),
     )
 }
 
@@ -2529,12 +2513,11 @@ mod tests {
         );
         // …and main hands it the pin.
         assert!(
-            code.contains("spawner.spawn(gpio0_in_mw_ot2_irq(gpio0_in_mw_ot2).unwrap());"),
+            code.contains("_spawner.spawn(gpio0_in_mw_ot2_irq(gpio0_in_mw_ot2).unwrap());"),
             "{code}"
         );
-        // The Spawner is NAMED now — an unused `_spawner` would warn on a line
-        // inside the generated block.
-        assert!(code.contains("async fn main(spawner: Spawner)"), "{code}");
+        // On `main`'s `_spawner`, never renamed: the user's code names it too.
+        assert!(code.contains("async fn main(_spawner: Spawner)"), "{code}");
         // The pin's own `let` is untouched: it is the only record
         // `parse_main_rs` rebuilds the diagram from.
         assert!(
@@ -3673,7 +3656,7 @@ mod tests {
     #[test]
     fn an_unraised_project_is_unchanged() {
         let code = prio_code(&[prio_pin("GPIO0", TaskPriority::Normal)]);
-        assert!(code.contains("spawner.spawn("), "{code}");
+        assert!(code.contains("_spawner.spawn("), "{code}");
         for absent in ["InterruptExecutor", "StaticCell", "spawner_high"] {
             assert!(!code.contains(absent), "{absent} leaked in: {code}");
         }
@@ -3719,14 +3702,10 @@ mod tests {
         assert!(start < spawn, "spawning onto an unstarted executor: {code}");
     }
 
-    /// A project whose every task is raised must not name the shared spawner.
-    ///
-    /// It has tasks, so the old `!tasks.is_empty()` said "name it" — but they
-    /// all went to interrupt executors, leaving an unused-variable warning on a
-    /// line inside the generated block that the reader cannot edit away. The
-    /// real compile caught this; the text assertions did not.
+    /// A project whose every task is raised still opens `main` with
+    /// `_spawner`: unused there, and an underscored name never warns.
     #[test]
-    fn an_all_raised_project_does_not_name_the_shared_spawner() {
+    fn an_all_raised_project_keeps_mains_spawner_underscored() {
         let code = prio_code(&[prio_pin("GPIO0", TaskPriority::High)]);
         assert!(
             code.contains("async fn main(_spawner: Spawner)"),
@@ -3734,18 +3713,18 @@ mod tests {
         );
     }
 
-    /// One Normal task among raised ones DOES use the shared spawner.
+    /// One Normal task among raised ones lands on `main`'s own `_spawner`.
     #[test]
-    fn a_mixed_project_still_names_the_shared_spawner() {
+    fn a_mixed_project_spawns_its_normal_task_on_mains_spawner() {
         let code = prio_code(&[
             prio_pin("GPIO0", TaskPriority::High),
             prio_pin("GPIO1", TaskPriority::Normal),
         ]);
         assert!(
-            code.contains("async fn main(spawner: Spawner)"),
-            "the Normal task lands on it: {code}"
+            code.contains("async fn main(_spawner: Spawner)"),
+            "the name never changes: {code}"
         );
-        assert!(code.contains("spawner.spawn("), "{code}");
+        assert!(code.contains("_spawner.spawn("), "{code}");
         assert!(code.contains("spawner_high.spawn("), "{code}");
     }
 

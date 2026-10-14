@@ -2069,6 +2069,9 @@ mod emit_for_manual_compile {
         // alone (tls.rs for HTTP only). `all` and `ble+all` are over TLS
         // wherever the chip can carry it, HTTPS beside MQTT's included - two
         // TLS sessions, where `iot::https_available` allows the second.
+        // `EIDE_ESP_SNTP=1` adds SNTP to any mode and `EIDE_ESP_P384=1` builds
+        // HTTPS's P-384 checks: a board test reaching real servers, whose
+        // dates are checked and whose ECDSA Let's Encrypt chains need P-384.
         let iot_mode = std::env::var("EIDE_ESP_IOT").ok();
         if let Some(mode) = iot_mode.as_deref() {
             use crate::panels::mcu_module::iot::{
@@ -2079,6 +2082,7 @@ mod emit_for_manual_compile {
             if matches!(mode, "http" | "https") || all {
                 mcu.iot.http = Some(HttpConfig {
                     tls: mode != "http",
+                    p384: std::env::var_os("EIDE_ESP_P384").is_some(),
                     ..HttpConfig::default()
                 });
             }
@@ -2105,7 +2109,7 @@ mod emit_for_manual_compile {
                 m.port = m.port_for_tls(m.tls);
                 mcu.iot.mqtt = Some(m);
             }
-            if all {
+            if all || std::env::var_os("EIDE_ESP_SNTP").is_some() {
                 mcu.iot.sntp = Some(SntpConfig::default());
             }
             if matches!(mode, "espnow" | "ble+espnow") || all {
@@ -2127,12 +2131,12 @@ mod emit_for_manual_compile {
                 "the Wi-Fi radio exactly when a Wi-Fi link is on:\n{main_rs}"
             );
             assert_eq!(
-                main_rs.contains("pins::configs::http::start(spawner, net_stack);"),
+                main_rs.contains("pins::configs::http::start(_spawner, net_stack);"),
                 matches!(mode, "http" | "https") || all,
                 "the HTTP task exactly with HTTP:\n{main_rs}"
             );
             assert_eq!(
-                main_rs.contains("pins::configs::thread::start(spawner, peripherals.IEEE802154);"),
+                main_rs.contains("pins::configs::thread::start(_spawner, peripherals.IEEE802154);"),
                 mode == "thread",
                 "Thread exactly when it is on:\n{main_rs}"
             );
@@ -2144,6 +2148,9 @@ mod emit_for_manual_compile {
             // The user's loop calls everything the files offer, as a user
             // would, so the API is compiled and not just declared.
             let mut used = String::from("        // Your main loop code here.\n");
+            // The user's code names `main`'s spawner as `_spawner`, whatever
+            // the IoT tab turns on: it must still be there by that name.
+            used.push_str("        let _ = _spawner;\n");
             if matches!(mode, "mqtt" | "mqtts") || all {
                 used.push_str("        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n");
                 used.push_str("        let msg = pins::configs::mqtt::incoming().await;\n");

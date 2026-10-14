@@ -1926,7 +1926,7 @@ pub fn panic_start_lines(mcu: &Mcu) -> String {
     }
     concat!(
         "    // Restart on panic (IoT tab): a panic that restarted the chip is reported now.\n",
-        "    pins::configs::panic::start(spawner);\n",
+        "    pins::configs::panic::start(_spawner);\n",
     )
     .to_owned()
 }
@@ -1942,12 +1942,13 @@ const ESP_START_MARK: &str =
 /// The ESP lines, spliced into the GENERATED block of an already generated
 /// `main.rs` - a no-op unless the IoT code is active. Done here rather than
 /// by threading two more arguments through twenty call sites of the ESP
-/// generator: the three places it touches are each fixed text of that
-/// generator, and the tests below pin all three.
+/// generator: the places it touches are each fixed text of that generator,
+/// and the tests below pin them. `main`'s `_spawner` is never renamed: the
+/// user's code below the block names it too (`_spawner.spawn(..)`).
 pub fn esp_main(code: String, mcu: &Mcu) -> String {
     match iot::active(mcu) {
         Some(active) if active.platform == Platform::Esp => {
-            let code = esp_main_with(code, mcu.iot.heap_kib, active, &mcu.family);
+            let code = esp_main_with(code, &mcu.iot, active, &mcu.family);
             esp_panic_start(code, &panic_start_lines(mcu))
         }
         _ => code,
@@ -2043,24 +2044,19 @@ pub fn esp_heap_lines(heap_kib: u32, active: Active, family: &str) -> String {
     o
 }
 
-fn esp_main_with(code: String, heap_kib: u32, active: Active, family: &str) -> String {
+fn esp_main_with(code: String, cfg: &IotConfig, active: Active, family: &str) -> String {
     use super::{GEN_BEGIN, GEN_END};
     let (Some(begin), Some(end)) = (code.find(GEN_BEGIN), code.find(GEN_END)) else {
         return code;
     };
     let mut block = code[begin..end].to_owned();
     // 1. The heap, before the scheduler starts.
-    let heap = esp_heap_lines(heap_kib, active, family);
+    let heap = esp_heap_lines(cfg.heap_kib, active, family);
     if let Some(at) = block.find(ESP_START_MARK) {
         block.insert_str(at, &heap);
     }
-    // 2. The spawner is named: the IoT tasks are spawned on it.
-    block = block.replacen(
-        "async fn main(_spawner: Spawner)",
-        "async fn main(spawner: Spawner)",
-        1,
-    );
-    // 3. The bring-up, last in the block: it only needs `peripherals.BT`,
+    // 2. The bring-up, last in the block, on `main`'s `_spawner` - the name
+    //    stays what the user's code below the block calls it: it only needs `peripherals.BT`,
     //    `peripherals.WIFI` and `peripherals.IEEE802154`. One
     //    `esp_radio::wifi::new`: it hands out the station AND ESP-NOW, and a
     //    second call would fail. Thread is never beside them (`iot::active`).
@@ -2068,36 +2064,50 @@ fn esp_main_with(code: String, heap_kib: u32, active: Active, family: &str) -> S
     if active.thread {
         block.push_str("    // Thread: OpenThread on the 802.15.4 radio, joining the network in\n");
         block.push_str("    // secrets.rs (THREAD_DATASET).\n");
-        block.push_str("    pins::configs::thread::start(spawner, peripherals.IEEE802154);\n");
+        block.push_str("    pins::configs::thread::start(_spawner, peripherals.IEEE802154);\n");
     }
     if active.ble {
         block.push_str("    // Bluetooth LE: the chip's own controller, on its public address.\n");
         block.push_str(
             "    let ble = esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default()).unwrap();\n",
         );
-        block.push_str("    pins::configs::ble::start(spawner, ble, None);\n");
+        block.push_str("    pins::configs::ble::start(_spawner, ble, None);\n");
     }
     if active.station || active.esp_now {
         block.push_str(
-            "    let (wifi_controller, radio) = esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();\n",
+            "    let (mut wifi_controller, radio) = esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();\n",
         );
+        block.push_str(&wifi_tx_power_lines(cfg.wifi_tx_power));
         if active.station {
             block.push_str(&stack_lines(active, "wifi_controller, radio.station"));
         } else {
             // ESP-NOW alone: someone has to keep the controller - dropping it
             // stops the radio, and ESP-NOW with it.
-            block.push_str("    pins::configs::espnow::hold_radio(spawner, wifi_controller);\n");
+            block.push_str("    pins::configs::espnow::hold_radio(_spawner, wifi_controller);\n");
         }
         if active.esp_now {
-            block.push_str("    pins::configs::espnow::start(spawner, radio.esp_now);\n");
+            block.push_str("    pins::configs::espnow::start(_spawner, radio.esp_now);\n");
         }
     }
     block.push('\n');
     format!("{}{block}{}", &code[..begin], &code[end..])
 }
 
+/// The transmit power cap, right after `esp_radio::wifi::new` - which starts
+/// the radio, as `set_max_tx_power` needs; `wifi.rs`'s own `set_config` later
+/// keeps the cap (same mode, no restart). It covers the station and ESP-NOW
+/// alike. `q` is in quarter dBm and lands on the driver's step for it.
+fn wifi_tx_power_lines(q: u8) -> String {
+    let (q, label) = iot::wifi_tx_power_step(q.clamp(8, 84));
+    format!(
+        "    // Transmit power at most {label} (IoT tab). esp-radio would send at 20 dBm,\n    \
+         // where many ESP32-C3 boards never join (AuthenticationExpired).\n    \
+         wifi_controller.set_max_tx_power({q}).unwrap();\n"
+    )
+}
+
 /// `wifi::init` and what runs on the stack it returns. `args` are the radio
-/// halves after `spawner`, which differ per radio.
+/// halves after `_spawner`, which differ per radio.
 fn stack_lines(active: Active, args: &str) -> String {
     let mut o = String::new();
     if !active.mqtt && !active.sntp && !active.http {
@@ -2105,16 +2115,16 @@ fn stack_lines(active: Active, args: &str) -> String {
         o.push_str("    #[allow(unused_variables)]\n");
     }
     o.push_str(&format!(
-        "    let net_stack = pins::configs::wifi::init(spawner, {args});\n"
+        "    let net_stack = pins::configs::wifi::init(_spawner, {args});\n"
     ));
     if active.mqtt {
-        o.push_str("    pins::configs::mqtt::start(spawner, net_stack);\n");
+        o.push_str("    pins::configs::mqtt::start(_spawner, net_stack);\n");
     }
     if active.sntp {
-        o.push_str("    pins::configs::sntp::start(spawner, net_stack);\n");
+        o.push_str("    pins::configs::sntp::start(_spawner, net_stack);\n");
     }
     if active.http {
-        o.push_str("    pins::configs::http::start(spawner, net_stack);\n");
+        o.push_str("    pins::configs::http::start(_spawner, net_stack);\n");
     }
     o
 }
@@ -2136,7 +2146,7 @@ pub fn cyw43_main_lines(active: Active) -> String {
             "    // is made of the radio's Wi-Fi MAC, so that is read before `control` moves on.\n",
         );
         o.push_str("    let mac = control.address().await;\n");
-        o.push_str("    pins::configs::ble::start(spawner, bt_device, Some(mac));\n");
+        o.push_str("    pins::configs::ble::start(_spawner, bt_device, Some(mac));\n");
     }
     if active.station {
         o.push_str(
@@ -2592,10 +2602,11 @@ mod tests {
         };
         assert_eq!(code.matches("esp_radio::wifi::new(").count(), 1, "{code}");
         assert!(
-            at("esp_radio::wifi::new(") < at("wifi::init(spawner, wifi_controller, radio.station)")
+            at("esp_radio::wifi::new(")
+                < at("wifi::init(_spawner, wifi_controller, radio.station)")
         );
-        assert!(at("mqtt::start(spawner, net_stack)") < at("sntp::start(spawner, net_stack)"));
-        assert!(at("sntp::start(") < at("espnow::start(spawner, radio.esp_now)"));
+        assert!(at("mqtt::start(_spawner, net_stack)") < at("sntp::start(_spawner, net_stack)"));
+        assert!(at("sntp::start(") < at("espnow::start(_spawner, radio.esp_now)"));
         assert!(
             !code.contains("hold_radio"),
             "the station keeps the controller:\n{code}"
@@ -2608,14 +2619,54 @@ mod tests {
         m.iot.wifi = false;
         let alone = m.fresh_main_rs();
         assert!(
-            alone.contains("pins::configs::espnow::hold_radio(spawner, wifi_controller);"),
+            alone.contains("pins::configs::espnow::hold_radio(_spawner, wifi_controller);"),
             "{alone}"
         );
         assert!(
-            alone.contains("pins::configs::espnow::start(spawner, radio.esp_now);"),
+            alone.contains("pins::configs::espnow::start(_spawner, radio.esp_now);"),
             "{alone}"
         );
         assert!(!alone.contains("net_stack"), "{alone}");
+    }
+
+    /// The transmit power cap: right after the radio comes up and before
+    /// anything takes the controller - the station, or ESP-NOW alone - on
+    /// the driver's step for the tab's value, within 2..20 dBm.
+    #[test]
+    fn the_esp_radio_comes_up_with_its_power_cap() {
+        let mut m = mcu("esp32c3", Runtime::Async, true);
+        let cap = |q: u8| format!("    wifi_controller.set_max_tx_power({q}).unwrap();\n");
+        let at = |c: &str, s: &str| c.find(s).unwrap_or_else(|| panic!("{s} missing:\n{c}"));
+        let code = m.fresh_main_rs();
+        let default = cap(iot::DEFAULT_WIFI_TX_POWER);
+        assert!(
+            code.contains("    let (mut wifi_controller, radio) = esp_radio::wifi::new("),
+            "{code}"
+        );
+        assert_eq!(code.matches("set_max_tx_power(").count(), 1, "{code}");
+        assert!(at(&code, "esp_radio::wifi::new(") < at(&code, &default));
+        assert!(at(&code, &default) < at(&code, "wifi::init(_spawner, wifi_controller"));
+        assert!(code.contains("// Transmit power at most 13 dBm (IoT tab)."), "{code}");
+
+        m.iot.wifi = false;
+        m.iot.esp_now = Some(EspNowConfig::default());
+        let alone = m.fresh_main_rs();
+        assert!(at(&alone, &default) < at(&alone, "hold_radio(_spawner, wifi_controller)"));
+
+        m.iot.wifi = true;
+        for (q, want) in [(50, 44), (0, 8), (200, 80), (84, 80), (72, 72)] {
+            m.iot.wifi_tx_power = q;
+            let c = m.fresh_main_rs();
+            assert!(c.contains(&cap(want)), "{q}:\n{c}");
+        }
+        // At full power the comment still tells the truth.
+        m.iot.wifi_tx_power = 80;
+        let full = m.fresh_main_rs();
+        assert!(full.contains("// Transmit power at most 20 dBm (IoT tab). esp-radio would send at 20 dBm,"), "{full}");
+
+        // Bluetooth alone has no Wi-Fi radio to cap.
+        let h2 = ble_mcu("esp32h2", true).fresh_main_rs();
+        assert!(!h2.contains("set_max_tx_power"), "{h2}");
     }
 
     /// A phase-1 ESP `wifi.rs` nobody touched moves to the current template;
@@ -2802,7 +2853,7 @@ mod tests {
         );
     }
 
-    /// The ESP block: heap before the scheduler, spawner named, bring-up
+    /// The ESP block: heap before the scheduler, `_spawner` kept, bring-up
     /// last - in that order.
     #[test]
     fn esp_main_orders_heap_start_and_bring_up() {
@@ -2815,9 +2866,9 @@ mod tests {
         };
         assert!(at("esp_alloc::heap_allocator!(size: 72 * 1024);") < at("esp_rtos::start("));
         assert!(at("esp_rtos::start(") < at("esp_radio::wifi::new(peripherals.WIFI"));
-        assert!(at("pins::configs::mqtt::start(spawner, net_stack);") < at(super::super::GEN_END));
-        assert!(code.contains("async fn main(spawner: Spawner)"), "{code}");
-        assert!(!code.contains("_spawner"), "{code}");
+        assert!(at("pins::configs::mqtt::start(_spawner, net_stack);") < at(super::super::GEN_END));
+        assert!(code.contains("async fn main(_spawner: Spawner)"), "{code}");
+        assert!(!code.contains("async fn main(spawner"), "{code}");
     }
 
     /// Splicing twice changes nothing: `update_main_rs` runs every regeneration.
@@ -2844,11 +2895,11 @@ mod tests {
             "{code}"
         );
         assert!(
-            code.contains("pins::configs::wifi::init(spawner, net_device, control);"),
+            code.contains("pins::configs::wifi::init(_spawner, net_device, control);"),
             "{code}"
         );
         assert!(
-            code.contains("pins::configs::mqtt::start(spawner, net_stack);"),
+            code.contains("pins::configs::mqtt::start(_spawner, net_stack);"),
             "{code}"
         );
         assert!(!code.contains("wl_led"), "{code}");
@@ -2876,7 +2927,7 @@ mod tests {
         let code = m.fresh_main_rs();
         assert!(code.contains("esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default()).unwrap();"), "{code}");
         assert!(
-            code.contains("pins::configs::ble::start(spawner, ble, None);"),
+            code.contains("pins::configs::ble::start(_spawner, ble, None);"),
             "{code}"
         );
         assert!(!code.contains("esp_radio::wifi::new("), "{code}");
@@ -2926,9 +2977,11 @@ mod tests {
             "{code}"
         );
         let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
-        assert!(at("pins::configs::ble::start(spawner, ble, None);") < at("esp_radio::wifi::new("));
         assert!(
-            code.contains("pins::configs::espnow::hold_radio(spawner, wifi_controller);"),
+            at("pins::configs::ble::start(_spawner, ble, None);") < at("esp_radio::wifi::new(")
+        );
+        assert!(
+            code.contains("pins::configs::espnow::hold_radio(_spawner, wifi_controller);"),
             "{code}"
         );
         assert!(!code.contains("net_stack"), "{code}");
@@ -3006,7 +3059,7 @@ mod tests {
             "{code}"
         );
         assert!(
-            code.contains("pins::configs::ble::start(spawner, bt_device, Some(mac));"),
+            code.contains("pins::configs::ble::start(_spawner, bt_device, Some(mac));"),
             "{code}"
         );
         assert!(code.contains("let mut wl_led = control;"), "{code}");
@@ -3019,7 +3072,7 @@ mod tests {
     fn the_pico_w_reads_its_mac_before_wifi_takes_control() {
         let code = ble_mcu("rp2350_pico2_w", true).fresh_main_rs();
         let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("{s}:\n{code}"));
-        assert!(at("control.address().await") < at("wifi::init(spawner, net_device, control)"));
+        assert!(at("control.address().await") < at("wifi::init(_spawner, net_device, control)"));
         assert!(
             code.contains("let (net_device, bt_device, mut control, runner) ="),
             "{code}"
@@ -3028,7 +3081,7 @@ mod tests {
     }
 
     /// nRF Bluetooth: the MPSL's vectors bound, priority 0 left to the radio,
-    /// the bring-up last, the spawner named.
+    /// the bring-up last, the `_spawner` kept.
     #[test]
     fn the_nrf_brings_up_the_softdevice_controller() {
         let m = ble_mcu("nrf52840_dk", false);
@@ -3044,7 +3097,7 @@ mod tests {
             "config.gpiote_interrupt_priority = embassy_nrf::interrupt::Priority::P2;",
             "nrf_sdc::mpsl::MultiprotocolServiceLayer::new(",
             "pins::configs::ble::start(",
-            "async fn main(spawner: embassy_executor::Spawner)",
+            "async fn main(_spawner: embassy_executor::Spawner)",
         ] {
             assert!(code.contains(want), "{want}:\n{code}");
         }
@@ -3073,7 +3126,7 @@ mod tests {
 
     /// Thread on an nRF52840: RADIO bound to embassy-nrf's handler, the
     /// crystal started, the radio and an RNG handed to `thread::start` last,
-    /// the spawner named - and none of Bluetooth's MPSL.
+    /// the `_spawner` kept - and none of Bluetooth's MPSL.
     #[test]
     fn the_nrf_brings_up_thread() {
         let m = thread_mcu("nrf52840_dk");
@@ -3086,7 +3139,7 @@ mod tests {
             "embassy_nrf::radio::ieee802154::Radio::new(p.RADIO, Irqs),",
             "RNG.init(embassy_nrf::rng::Rng::new_blocking(p.RNG)),",
             "pins::configs::thread::start(",
-            "async fn main(spawner: embassy_executor::Spawner)",
+            "async fn main(_spawner: embassy_executor::Spawner)",
         ] {
             assert!(code.contains(want), "{want}:\n{code}");
         }
@@ -3143,9 +3196,9 @@ mod tests {
             );
             let code = m.fresh_main_rs();
             for want in [
-                "pins::configs::thread::start(spawner, peripherals.IEEE802154);",
+                "pins::configs::thread::start(_spawner, peripherals.IEEE802154);",
                 "esp_alloc::heap_allocator!(size: 72 * 1024);",
-                "async fn main(spawner: Spawner)",
+                "async fn main(_spawner: Spawner)",
             ] {
                 assert!(code.contains(want), "{id}: {want}:\n{code}");
             }
@@ -3433,7 +3486,7 @@ mod tests {
                 "{id}"
             );
             assert!(
-                fresh.contains("pins::configs::panic::start(spawner);"),
+                fresh.contains("pins::configs::panic::start(_spawner);"),
                 "{id}:\n{fresh}"
             );
             assert!(!fresh.contains("use panic_halt as _;"), "{id}:\n{fresh}");
@@ -3801,7 +3854,7 @@ mod tests {
         assert!(file_of(&plain, TLS).is_none() && file_of(&plain, HTTP_CA).is_none());
         let net = file_of(&plain, NET).unwrap();
         assert!(net.contains("HTTP one") && net.contains("pub const SOCKETS: usize = 5;"), "{net}");
-        assert!(stack_lines(a, "x").contains("pins::configs::http::start(spawner, net_stack);"));
+        assert!(stack_lines(a, "x").contains("pins::configs::http::start(_spawner, net_stack);"));
 
         let alone = http_mcu("esp32c3", false, true);
         let a = iot::active(&alone).unwrap();

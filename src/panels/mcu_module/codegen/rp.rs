@@ -2067,7 +2067,7 @@ mod pin_interrupts {
                 "{edge:?} waits with {wait}:\n{code}"
             );
             assert!(
-                code.contains("spawner.spawn(gp15in_irq(gp15in).unwrap());"),
+                code.contains("_spawner.spawn(gp15in_irq(gp15in).unwrap());"),
                 "main hands the pin over:\n{code}"
             );
             // The task is a TOP-LEVEL item; nested in `main` it does not compile.
@@ -2825,7 +2825,7 @@ mod fpga_loader_codegen {
         };
         let load = at("p.PIN_31");
         assert!(at("embassy_rp::init(") < load);
-        assert!(load < at("spawner.spawn"), "{code}");
+        assert!(load < at("_spawner.spawn"), "{code}");
         assert!(load < at("p.UART1"), "{code}");
         assert!(load < at("p.PIN_41"), "{code}");
     }
@@ -3348,11 +3348,11 @@ mod radio_led {
     fn an_untouched_pad_emits_nothing() {
         let code = pico_w(Runtime::Async, false).fresh_main_rs();
         assert!(!code.contains("cyw43"), "no radio until asked:\n{code}");
-        // And the spawner stays underscored, or the project warns.
+        // And `main` hands in `_spawner`, as always.
         assert!(code.contains("async fn main(_spawner: Spawner)"), "{code}");
     }
 
-    /// Taking it brings up the radio AND wakes the spawner.
+    /// Taking it brings up the radio, spawned on `main`'s `_spawner`.
     #[test]
     fn taking_the_pad_brings_up_the_radio() {
         let code = pico_w(Runtime::Async, true).fresh_main_rs();
@@ -3368,8 +3368,8 @@ mod radio_led {
             assert!(code.contains(want), "missing {want}:\n{code}");
         }
         assert!(
-            code.contains("async fn main(spawner: Spawner)"),
-            "spawning needs a live spawner:\n{code}"
+            code.contains("async fn main(_spawner: Spawner)"),
+            "the name never changes:\n{code}"
         );
     }
 
@@ -3582,7 +3582,7 @@ fn wait_fn(edge: Edge) -> &'static str {
 fn async_gpio_lines(mcu: &Mcu) -> (String, String) {
     let mut tasks = String::new();
     // One entry per pin, blank-line separated (see `common::blank_separated`).
-    // An armed input's `let` and its `spawner.spawn` belong together, so they
+    // An armed input's `let` and its `_spawner.spawn` belong together, so they
     // are ONE entry — a blank line between them would split a pair that reads
     // as a unit.
     let mut pins_out: Vec<String> = Vec::new();
@@ -3617,7 +3617,7 @@ fn async_gpio_lines(mcu: &Mcu) -> (String, String) {
                 tasks.push_str(&format!("    loop {{\n        pin.{wait}().await;\n"));
                 tasks.push_str("        // The edge arrived. Your code here.\n    }\n}\n\n");
                 pins_out.push(format!(
-                    "    let {name} = Input::new(p.PIN_{n}, Pull::Up);\n    spawner.spawn({name}_irq({name}).unwrap());\n"
+                    "    let {name} = Input::new(p.PIN_{n}, Pull::Up);\n    _spawner.spawn({name}_irq({name}).unwrap());\n"
                 ));
             }
             _ => {}
@@ -4155,7 +4155,7 @@ async fn cyw43_task(
     let state = RADIO_STATE.init(cyw43::State::new());
 {bring_up}    // embassy-executor 0.10: the task FUNCTION returns the Result (the pool can
     // be exhausted), so the `unwrap` goes inside `spawn`, not after it.
-    spawner.spawn(cyw43_task(runner).unwrap());
+    _spawner.spawn(cyw43_task(runner).unwrap());
     control.init(clm).await;
     control
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
@@ -4343,12 +4343,6 @@ fn blocking_fpga_body(hal: &str, usb_mhz: u32) -> String {
 fn async_section(mcu: &Mcu) -> String {
     let (irq_binding, buses, radio_task, _) = async_bus_lines(mcu);
     let (gpio_tasks, gpio_body) = async_gpio_lines(mcu);
-    // An armed input needs a live spawner just as much as the radio does.
-    let spawner = if radio_task.is_empty() && gpio_tasks.is_empty() {
-        "_spawner"
-    } else {
-        "spawner"
-    };
     let mut o = String::new();
     o.push_str(GEN_BEGIN);
     o.push('\n');
@@ -4365,7 +4359,9 @@ fn async_section(mcu: &Mcu) -> String {
         o.push_str(&fpga_items());
     }
     o.push_str("#[embassy_executor::main]\n");
-    o.push_str(&format!("async fn main({spawner}: Spawner) {{\n"));
+    // `_spawner` whatever the block spawns (the radio, armed inputs): the
+    // user's code below the block names it too, and a rename breaks it.
+    o.push_str("async fn main(_spawner: Spawner) {\n");
     o.push_str("    // embassy-rp brings up the clocks itself. On RP2040 it also supplies the\n");
     o.push_str("    // second-stage bootloader, which the blocking HAL makes you declare.\n");
     o.push_str("    let p = embassy_rp::init(Default::default());\n\n");
@@ -5144,7 +5140,7 @@ mod emit_async_for_manual_compile {
             );
             if wifi {
                 assert!(
-                    main_rs.contains("pins::configs::sntp::start(spawner, net_stack);"),
+                    main_rs.contains("pins::configs::sntp::start(_spawner, net_stack);"),
                     "{main_rs}"
                 );
             }
@@ -5152,7 +5148,7 @@ mod emit_async_for_manual_compile {
                 assert!(!main_rs.contains("TRNG_IRQ"), "{id}: no TLS, no TRNG:\n{main_rs}");
             }
             assert_eq!(
-                main_rs.contains("pins::configs::http::start(spawner, net_stack);"),
+                main_rs.contains("pins::configs::http::start(_spawner, net_stack);"),
                 http.is_some(),
                 "{main_rs}"
             );

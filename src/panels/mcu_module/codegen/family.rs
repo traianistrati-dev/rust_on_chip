@@ -1163,7 +1163,7 @@ const RP_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "Entry:",
-            "#[embassy_executor::main] async fn main(spawner: Spawner) on embassy-rp's Peripherals (p.PIN_0, p.UART0, p.DMA_CH0).",
+            "#[embassy_executor::main] async fn main(_spawner: Spawner) on embassy-rp's Peripherals (p.PIN_0, p.UART0, p.DMA_CH0).",
         ),
         (
             "USART:",
@@ -1204,7 +1204,7 @@ const NRF_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "Entry:",
-            "#[embassy_executor::main] async fn main(spawner: Spawner); embassy_nrf::init(config) starts both clocks itself, so the Clock tab is two fields of Config. A wired USB module sets the HFCLK source to ExternalXtal whatever the tab says.",
+            "#[embassy_executor::main] async fn main(_spawner: Spawner); embassy_nrf::init(config) starts both clocks itself, so the Clock tab is two fields of Config. A wired USB module sets the HFCLK source to ExternalXtal whatever the tab says.",
         ),
         (
             "USART:",

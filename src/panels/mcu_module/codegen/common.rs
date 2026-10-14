@@ -1330,6 +1330,52 @@ fn has_ident(text: &str, ident: &str) -> bool {
     })
 }
 
+// ── `main`'s spawner ──────────────────────────────────────────────────────────
+
+/// The lines that also name `main`'s spawner `spawner`, for a user's code
+/// written while the IDE named it so.
+const SPAWNER_ALIAS: &str = concat!(
+    "    // Your code below names `spawner`: the same Spawner as `_spawner`.\n",
+    "    #[allow(unused_variables)]\n",
+    "    let spawner = _spawner;\n",
+);
+
+/// `main`'s spawner is `_spawner` on every runtime, whatever the generated
+/// block spawns - the user's code below the block names it so. Before that,
+/// the IoT tab, an armed input, a Pico W radio or an nRF USB device renamed
+/// it `spawner`, and a user's code may have followed: for that code the
+/// block also names it `spawner` (`Spawner` is `Copy`), right after the
+/// signature. Never a rewrite of the user's code; gone again once that code
+/// no longer says `spawner`.
+pub fn spawner_alias(mut code: String) -> String {
+    // Only ever inside the block: the header above it is the user's, and a
+    // signature quoted in a comment there is no place for a `let`.
+    let (Some(begin), Some(end)) = (code.find(GEN_BEGIN), code.find(GEN_END)) else {
+        return code;
+    };
+    if begin >= end {
+        return code;
+    }
+    // Off first: an older pass may have left it where the block is not
+    // regenerated.
+    let mut end = end;
+    if let Some(at) = code[begin..end].find(SPAWNER_ALIAS) {
+        code.replace_range(begin + at..begin + at + SPAWNER_ALIAS.len(), "");
+        end -= SPAWNER_ALIAS.len();
+    }
+    if !has_ident(&code[end + GEN_END.len()..], "spawner") {
+        return code;
+    }
+    let Some(sig) = code[begin..end].find("async fn main(_spawner:") else {
+        return code;
+    };
+    let Some(open) = code[begin + sig..end].find("{\n") else {
+        return code;
+    };
+    code.insert_str(begin + sig + open + 2, SPAWNER_ALIAS);
+    code
+}
+
 // ── Variable name suffix ──────────────────────────────────────────────────────
 
 use super::super::pins::logic::pin_function::PinFunction;
@@ -1964,6 +2010,47 @@ mod tests {
             "#[esp_rtos::main]\nasync fn main(_spawner: Spawner) {\n}\n",
             "and still a no-op when strict is off"
         );
+    }
+
+    #[test]
+    fn a_users_spawner_gets_an_alias_and_only_while_it_needs_one() {
+        let block = format!(
+            "{GEN_BEGIN}\n#[esp_rtos::main]\nasync fn main(_spawner: Spawner) {{\n    let p = init();\n{GEN_END}\n"
+        );
+        // Code from when the IDE named it `spawner`: aliased, once.
+        let old = format!("{block}    spawner.spawn(blink()).ok();\n    loop {{}}\n}}\n");
+        let once = spawner_alias(old.clone());
+        assert!(once.contains(
+            "async fn main(_spawner: Spawner) {\n    // Your code below names `spawner`"
+        ));
+        assert_eq!(spawner_alias(once.clone()), once, "idempotent");
+        // `_spawner`, `spawner_high` and the generated block's own text are not it.
+        for tail in [
+            "    _spawner.spawn(blink()).ok();\n",
+            "    spawner_high.spawn(blink()).ok();\n",
+            "    loop {}\n",
+        ] {
+            let code = format!("{block}{tail}}}\n");
+            assert_eq!(spawner_alias(code.clone()), code, "{tail}");
+        }
+        // The user moved on to `_spawner`: the alias goes.
+        let moved = once.replace("    spawner.spawn(", "    _spawner.spawn(");
+        assert!(!spawner_alias(moved).contains("let spawner = _spawner;"));
+        // On embassy-nrf's spelling too.
+        let nrf = format!(
+            "{GEN_BEGIN}\nasync fn main(_spawner: embassy_executor::Spawner) {{\n{GEN_END}\n    spawner.spawn(x()).ok();\n}}\n"
+        );
+        assert!(spawner_alias(nrf).contains("let spawner = _spawner;"));
+        // The signature quoted in the user's header: the block's is the one.
+        let quoted = format!("// async fn main(_spawner: Spawner) {{\n{old}");
+        let aliased = spawner_alias(quoted);
+        // Nothing went in after the comment's `{`.
+        assert!(aliased.starts_with(&format!(
+            "// async fn main(_spawner: Spawner) {{\n{GEN_BEGIN}"
+        )));
+        assert_eq!(aliased.matches("let spawner = _spawner;").count(), 1);
+        let block_sig = aliased.find("#[esp_rtos::main]").unwrap();
+        assert!(aliased.find("let spawner = _spawner;").unwrap() > block_sig);
     }
 
     #[test]

@@ -39,6 +39,42 @@ use serde::{Deserialize, Serialize};
 /// esp-radio's own examples use 72 KiB; less starves its RX buffers.
 pub const DEFAULT_HEAP_KIB: u32 = 72;
 
+/// The ESP radio's transmit power cap when nobody chose, in quarter dBm as
+/// esp-radio takes it (`set_max_tx_power`): 13 dBm. esp-radio 0.18 leaves the
+/// PHY at 20 dBm, and at that cheap ESP32-C3 boards (a badly matched chip
+/// antenna) never join: the access point cannot decode their Authentication,
+/// the driver reports `AuthenticationExpired`, then `ConnectionFailed` (it
+/// blacklisted the AP for one try), and so on. Measured 2026-10-14 on a C3
+/// board 1 m from a TP-Link: 0 joins at 20 dBm, every one from 18 dBm down;
+/// esp-hal #5631's C3 failed from 16.5 dBm up. Two steps below that.
+pub const DEFAULT_WIFI_TX_POWER: u8 = 52;
+
+/// The caps the driver keeps, each from its value up to the next one's
+/// (ESP-IDF's `esp_wifi_set_max_tx_power`), in quarter dBm.
+pub const WIFI_TX_POWER_STEPS: [(u8, &str); 11] = [
+    (8, "2 dBm"),
+    (20, "5 dBm"),
+    (28, "7 dBm"),
+    (34, "8.5 dBm"),
+    (44, "11 dBm"),
+    (52, "13 dBm"),
+    (56, "14 dBm"),
+    (60, "15 dBm"),
+    (66, "16.5 dBm"),
+    (72, "18 dBm"),
+    (80, "20 dBm"),
+];
+
+/// `q` (quarter dBm) as the step the driver keeps, and its label.
+pub fn wifi_tx_power_step(q: u8) -> (u8, &'static str) {
+    WIFI_TX_POWER_STEPS
+        .iter()
+        .rev()
+        .find(|(at, _)| q >= *at)
+        .copied()
+        .unwrap_or(WIFI_TX_POWER_STEPS[0])
+}
+
 /// The tab's settings. The SSID and the passwords are NOT here: they live in
 /// `src/pins/configs/secrets.rs`, which the project's `.gitignore` lists, so
 /// `mcu.config` - a committed file - never carries them.
@@ -52,6 +88,11 @@ pub struct IotConfig {
     pub mqtt: Option<MqttConfig>,
     /// ESP only: the heap `esp_alloc::heap_allocator!` reserves.
     pub heap_kib: u32,
+    /// ESP only: the Wi-Fi radio's transmit power cap, in quarter dBm
+    /// ([`WIFI_TX_POWER_STEPS`]). An `@iot` line from before the setting
+    /// reads the default too: the radio's own 20 dBm is what kept cheap C3
+    /// boards off the network.
+    pub wifi_tx_power: u8,
     /// ESP-NOW, `Some` while it is switched on. A link of its own: it runs
     /// beside the station or without it.
     pub esp_now: Option<EspNowConfig>,
@@ -85,6 +126,7 @@ impl Default for IotConfig {
             ip: IpConfig::default(),
             mqtt: None,
             heap_kib: DEFAULT_HEAP_KIB,
+            wifi_tx_power: DEFAULT_WIFI_TX_POWER,
             esp_now: None,
             sntp: None,
             ble: None,
@@ -1703,6 +1745,38 @@ mod tests {
         let old: IotConfig = ron::from_str("(wifi: true, heap_kib: 72)").unwrap();
         assert!(!old.restart_on_panic);
         assert!(!old.is_default(), "persisted, so it stays off");
+    }
+
+    /// The power cap: an `@iot` line from before it reads the default (the
+    /// radio's own 20 dBm kept C3 boards off the network), and any value
+    /// lands on the step the driver keeps for it.
+    #[test]
+    fn the_wifi_power_cap_reads_and_rounds_like_the_driver() {
+        let old: IotConfig = ron::from_str("(wifi: true, heap_kib: 72)").unwrap();
+        assert_eq!(old.wifi_tx_power, DEFAULT_WIFI_TX_POWER);
+        assert_eq!(wifi_tx_power_step(DEFAULT_WIFI_TX_POWER), (52, "13 dBm"));
+        let cases = [
+            (0, 8),
+            (8, 8),
+            (19, 8),
+            (20, 20),
+            (43, 34),
+            (44, 44),
+            (79, 72),
+            (80, 80),
+            (84, 80),
+            (255, 80),
+        ];
+        for (q, want) in cases {
+            assert_eq!(wifi_tx_power_step(q).0, want, "{q}");
+        }
+        // Ascending, so the search from the top finds the step.
+        assert!(WIFI_TX_POWER_STEPS.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(
+            WIFI_TX_POWER_STEPS
+                .iter()
+                .any(|(q, _)| *q == DEFAULT_WIFI_TX_POWER)
+        );
     }
 
     /// Every ESP with a Wi-Fi radio is Ready; the H2 says why it is not.

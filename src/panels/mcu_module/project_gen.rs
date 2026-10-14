@@ -1124,6 +1124,12 @@ pub fn ensure_iot_deps(
             if esp_now || ours {
                 l = toggle_esp_now(&l, esp_now);
             }
+            // main.rs caps the Wi-Fi radio's transmit power, and
+            // `set_max_tx_power` is esp-radio's unstable API. Never taken off:
+            // Bluetooth and Thread need it too.
+            if wifi {
+                l = toggle_hal_feature(&l, "unstable", true);
+            }
             out.push(l);
         } else if is_dep_line(line, "embassy-executor")
             && line.contains("features = [")
@@ -5799,6 +5805,23 @@ mod iot_deps_tests {
         assert!(radio.contains("\"esp-now\""), "{radio}");
         let off = ensure_iot_deps(&mine, None, "esp32c3", "esp32c3", &[]);
         assert!(off.contains("\"esp-now\""), "never removed:\n{off}");
+    }
+
+    /// main.rs caps the radio's transmit power through esp-radio's unstable
+    /// `set_max_tx_power`: a hand-written station line without `unstable`
+    /// gains it - it compiled before the cap, and would not after.
+    #[test]
+    fn a_hand_written_radio_line_gets_what_the_power_cap_needs() {
+        let mine = format!(
+            "{ESP_ASYNC}esp-radio = {{ version = \"0.18\", features = [\"esp32c3\", \"wifi\"] }}\n"
+        );
+        let after = ensure_iot_deps(&mine, esp(false), "esp32c3", "esp32c3", &[]);
+        let radio = after.lines().find(|l| l.starts_with("esp-radio")).unwrap();
+        assert!(radio.contains("\"unstable\""), "{radio}");
+        assert!(!radio.contains("# <rust_on_chip>"), "still the user's line: {radio}");
+        // Off, nothing is taken from it.
+        let off = ensure_iot_deps(&after, None, "esp32c3", "esp32c3", &[]);
+        assert!(off.contains("\"unstable\""), "never removed:\n{off}");
     }
 
     fn active(platform: Platform, station: bool, esp_now: bool, ble: bool) -> Option<Active> {

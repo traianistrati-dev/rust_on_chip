@@ -712,6 +712,9 @@ fn link_card(
                     ui.label(warn("between 32 and 256 KiB"));
                 }
             }
+            if wifi_here && platform == Some(Platform::Esp) {
+                wifi_tx_power_row(ui, &mut cfg.wifi_tx_power);
+            }
             if cfg.wifi && platform == Some(Platform::Cyw43) {
                 ui.label(dim(concat!(
                     "The radio's `control` belongs to the Wi-Fi task, so the on-board LED is ",
@@ -724,6 +727,41 @@ fn link_card(
             }
         }
     });
+}
+
+/// The ESP radio's transmit power cap: the driver's steps, the default
+/// marked.
+fn wifi_tx_power_row(ui: &mut egui::Ui, q: &mut u8) {
+    let (step, label) = iot::wifi_tx_power_step(*q);
+    ui.horizontal(|ui| {
+        ui.label("Transmit power");
+        egui::ComboBox::from_id_salt("iot_wifi_tx_power")
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                for (at, name) in iot::WIFI_TX_POWER_STEPS {
+                    let text = if at == iot::DEFAULT_WIFI_TX_POWER {
+                        format!("{name} (default)")
+                    } else {
+                        name.to_owned()
+                    };
+                    ui.selectable_value(q, at, text);
+                }
+            });
+        ui.label(dim("at most - Wi-Fi and ESP-NOW"));
+    });
+    if step >= 66 {
+        ui.label(warn(
+            "cheap ESP32-C3 boards fail from 16.5 dBm up (one measured from 20, another from 16.5): Wi-Fi then never joins - AuthenticationExpired, then ConnectionFailed",
+        ));
+    } else if step > iot::DEFAULT_WIFI_TX_POWER {
+        ui.label(dim(
+            "More reach for a far access point or ESP-NOW peer; cheap ESP32-C3 boards fail from 16.5 dBm up.",
+        ));
+    } else {
+        ui.label(dim(
+            "esp-radio would transmit at 20 dBm, where cheap ESP32-C3 boards never join. Raise it for a far access point or ESP-NOW peer.",
+        ));
+    }
 }
 
 const BLE_USAGE: &str = "pins::configs::ble::send(b\"21.5\\n\").await.ok();";
@@ -1441,7 +1479,7 @@ fn tls_section(
         ui.horizontal(|ui| {
             ui.checkbox(&mut m.p384, "P-384 chains")
                 .on_hover_text("embedded-tls's `p384` feature: about 114 KiB of flash more");
-            ui.label(dim("an ECDSA Let's Encrypt certificate (certbot's default) needs it: its issuers are P-384"));
+            ui.label(dim("an ECDSA Let's Encrypt certificate (certbot's default) needs it: its issuers are P-384. About 12 s per connection on an ESP32-C3"));
         });
         client_cert_section(ui, m, tls, actions);
         ui.label(dim(concat!(
@@ -2181,7 +2219,7 @@ fn https_settings(ui: &mut egui::Ui, h: &mut HttpConfig, f: &HttpFacts, actions:
             ui.checkbox(&mut h.p384, "P-384 chains")
                 .on_hover_text("embedded-tls's `p384` feature: about 114 KiB of flash more");
         });
-        ui.label(dim("P-384 chains: Discord and Google (GTS Root R4), ECDSA Let's Encrypt certificates. TLS 1.2-only servers (httpbin.org) cannot be reached."));
+        ui.label(dim("P-384 chains: Discord and Google (GTS Root R4), ECDSA Let's Encrypt certificates - most Let's Encrypt sites now. Checking one takes about 12 s on an ESP32-C3 (an RSA chain: about a second), and every request opens its own connection. TLS 1.2-only servers (httpbin.org) cannot be reached."));
         ui.label(dim(if f.sntp {
             "The certificates' dates are checked once SNTP has the time."
         } else {

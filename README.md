@@ -565,6 +565,16 @@ chains"), each fingerprint checked against two published lists. **Test from
 this PC** takes a URL: the board's own handshake, its CAs and its buffers -
 it says, before anything is flashed, when a server speaks only TLS 1.2, wants
 a CA or P-384, sends a head over the board's 2 KB, redirects or answers 404.
+On a real ESP32-C3 against public servers - 19 cases in three rounds, every
+one passing but for Open-Meteo's own occasional 503: an RSA chain answers in
+about a second, a P-384 chain (most Let's Encrypt sites now) in about 12 s, a
+plain request in 40 ms; ten callers at once get nine answers and one `Busy`;
+the heap peaks at 79 of 104 KiB and comes back to where it started.
+
+The ESP radio's **transmit power** is capped in the tab, 13 dBm unless chosen:
+esp-radio 0.18 leaves it at 20 dBm, and at that cheap ESP32-C3 boards never
+join - `AuthenticationExpired`, then `ConnectionFailed`, forever (measured: 0
+joins at 20 dBm, every one from 18 dBm down).
 
 ### Virtual device modules
 Instead of wiring a peripheral pin by pin, you can drop a **device** onto the

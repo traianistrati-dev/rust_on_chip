@@ -180,6 +180,9 @@ impl Mcu {
         // Rebuilt with the block, so renaming a device in the panel renames it
         // here on the next save.
         let code = common::with_device_comment(code, self);
+        // A user's code still naming `main`'s spawner `spawner`, from when
+        // the IDE renamed it: the block names it so too.
+        let code = common::spawner_alias(code);
         // Strict-lints exemption on the (freshly re-spliced) entry fn.
         common::strict_main_exemption(code, self.strict_lints)
     }

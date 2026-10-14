@@ -1314,8 +1314,8 @@ mod tests {
         for want in [
             "config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;",
             "async fn usb_task(",
-            "spawner.spawn(usb_task(usb_builder.build()).unwrap());",
-            "async fn main(spawner: embassy_executor::Spawner)",
+            "_spawner.spawn(usb_task(usb_builder.build()).unwrap());",
+            "async fn main(_spawner: embassy_executor::Spawner)",
             "USBD => embassy_nrf::usb::InterruptHandler<embassy_nrf::peripherals::USBD>;",
             "CLOCK_POWER => embassy_nrf::usb::vbus_detect::InterruptHandler;",
             "QSPI => embassy_nrf::qspi::InterruptHandler<embassy_nrf::peripherals::QSPI>;",

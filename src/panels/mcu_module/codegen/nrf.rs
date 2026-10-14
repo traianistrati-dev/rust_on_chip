@@ -2016,7 +2016,7 @@ fn async_gpio_lines(mcu: &Mcu) -> (String, String) {
                 // (its pool can be exhausted), so the `unwrap` sits inside
                 // `spawn`, the same as on the RP.
                 pins_out.push(format!(
-                    "    // {what}\n    let {var} = {ctor};\n    spawner.spawn({var}_irq({var}).unwrap());\n"
+                    "    // {what}\n    let {var} = {ctor};\n    _spawner.spawn({var}_irq({var}).unwrap());\n"
                 ));
             }
             _ => {}
@@ -2144,9 +2144,6 @@ struct AsyncBuses {
     /// Whether `body` names `static_cell` (a TWIM's RAM buffer, the USB
     /// stack's buffers).
     static_cell: bool,
-    /// Whether `body` spawns a task (the USB device's), so `main` needs its
-    /// spawner by name.
-    spawns: bool,
 }
 
 /// UARTE, SPIM, TWIM, PWM and SAADC on embassy-nrf, in that order.
@@ -2508,7 +2505,6 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         irqs.push("    SAADC => embassy_nrf::saadc::InterruptHandler;".to_owned());
     }
 
-    let mut spawns = false;
     if usb_wired(mcu) && !mcu.is_async() {
         // The part nrf-hal has no crate for, on Blocking: embassy-nrf's USB
         // driver only runs under embassy-usb, which needs the executor.
@@ -2528,7 +2524,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         o.push_str(&format!(
             "{ALLOW}    let mut usb_serial = embassy_usb::class::cdc_acm::CdcAcmClass::new(\n        &mut usb_builder,\n        USB_CDC_STATE.init(embassy_usb::class::cdc_acm::State::new()),\n        64,\n    );\n"
         ));
-        o.push_str("    spawner.spawn(usb_task(usb_builder.build()).unwrap());\n");
+        o.push_str("    _spawner.spawn(usb_task(usb_builder.build()).unwrap());\n");
         irqs.push(
             "    USBD => embassy_nrf::usb::InterruptHandler<embassy_nrf::peripherals::USBD>;"
                 .to_owned(),
@@ -2540,7 +2536,6 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             "    {vbus} => embassy_nrf::usb::vbus_detect::InterruptHandler;"
         ));
         static_cell = true;
-        spawns = true;
     }
 
     if let Some((sck, csn, io)) = qspi_wired(mcu).filter(|_| mcu.is_async()) {
@@ -2606,7 +2601,6 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         body: o,
         items,
         static_cell,
-        spawns,
     }
 }
 
@@ -2659,7 +2653,7 @@ fn thread_lines(irqs: &mut Vec<String>) -> String {
     body.push_str("    static RNG: static_cell::StaticCell<embassy_nrf::rng::Rng<'static, embassy_nrf::mode::Blocking>> =\n");
     body.push_str("        static_cell::StaticCell::new();\n");
     body.push_str("    pins::configs::thread::start(\n");
-    body.push_str("        spawner,\n");
+    body.push_str("        _spawner,\n");
     body.push_str("        embassy_nrf::radio::ieee802154::Radio::new(p.RADIO, Irqs),\n");
     body.push_str("        RNG.init(embassy_nrf::rng::Rng::new_blocking(p.RNG)),\n");
     body.push_str("    );\n");
@@ -2802,7 +2796,7 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     body.push_str("    static RNG:static_cell::StaticCell<embassy_nrf::rng::Rng<'static, embassy_nrf::mode::Blocking>> =\n");
     body.push_str("        static_cell::StaticCell::new();\n");
     body.push_str("    pins::configs::ble::start(\n");
-    body.push_str("        spawner,\n");
+    body.push_str("        _spawner,\n");
     body.push_str("        mpsl,\n");
     body.push_str("        nrf_sdc::Peripherals::new(\n");
     body.push_str(
@@ -2893,12 +2887,6 @@ fn async_section(mcu: &Mcu) -> String {
     let ble = ble_on(mcu).then(|| ble_lines(mcu, &mut buses.irqs));
     // Thread binds RADIO and starts last; never with Bluetooth (`iot::active`).
     let thread = thread_on(mcu).then(|| thread_lines(&mut buses.irqs));
-    // An armed input is the only thing here that needs the spawner.
-    let spawner = if tasks.is_empty() && !buses.spawns && ble.is_none() && thread.is_none() {
-        "_spawner"
-    } else {
-        "spawner"
-    };
     let mut o = String::new();
     o.push_str(GEN_BEGIN);
     o.push('\n');
@@ -2912,9 +2900,9 @@ fn async_section(mcu: &Mcu) -> String {
     o.push_str(&tasks);
     if mcu.is_async() {
         o.push_str("#[embassy_executor::main]\n");
-        o.push_str(&format!(
-            "async fn main({spawner}: embassy_executor::Spawner) {{\n"
-        ));
+        // `_spawner` whatever the block spawns (USB, armed inputs, BLE,
+        // Thread): the user's code below the block names it too.
+        o.push_str("async fn main(_spawner: embassy_executor::Spawner) {\n");
         o.push_str("    // Imported here, not in the header: a runtime switch keeps the header, and\n    // on Blocking embassy-nrf is not a dependency.\n");
     } else {
         // The part nrf-hal has no crate for: embassy-nrf with no executor,
@@ -3847,7 +3835,7 @@ mod async_codegen {
     }
 
     /// An armed input is a task that owns the pin; a plain one is a binding.
-    /// The spawner is named only when something is spawned.
+    /// It is spawned on `main`'s `_spawner`, whose name never changes.
     #[test]
     fn an_armed_input_becomes_a_task_that_owns_it() {
         let mut mcu = on_async(microbit(&[
@@ -3865,8 +3853,8 @@ mod async_codegen {
             "#[embassy_executor::task]\nasync fn p0_14_in_irq(mut pin: embassy_nrf::gpio::Input<'static>) {",
             // The body is a call to the user's hook, not a comment to fill in.
             "pin.wait_for_falling_edge().await;\n        on_p0_14_in_edge(pin.is_high()).await;",
-            "let p0_14_in = Input::new(p.P0_14, Pull::Up);\n    spawner.spawn(p0_14_in_irq(p0_14_in).unwrap());",
-            "async fn main(spawner: embassy_executor::Spawner) {",
+            "let p0_14_in = Input::new(p.P0_14, Pull::Up);\n    _spawner.spawn(p0_14_in_irq(p0_14_in).unwrap());",
+            "async fn main(_spawner: embassy_executor::Spawner) {",
             "let p0_23_in = Input::new(p.P0_23, Pull::None);",
         ] {
             assert!(main.contains(want), "missing {want:?} in:\n{main}");

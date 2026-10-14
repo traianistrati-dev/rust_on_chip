@@ -14,8 +14,8 @@ use crate::app::{AppIde, McuTab};
 use crate::panels::mcu_module::aws_iot;
 use crate::panels::mcu_module::codegen::iot_gen;
 use crate::panels::mcu_module::iot::{
-    self, Availability, BleConfig, EspNowConfig, IotConfig, Link, MqttConfig, Platform, SntpConfig,
-    ThreadConfig,
+    self, Availability, BleConfig, EspNowConfig, HttpConfig, IotConfig, Link, MqttConfig, Platform,
+    SntpConfig, ThreadConfig,
 };
 use crate::panels::mcu_module::mcu::model::Runtime;
 use eframe::egui;
@@ -82,6 +82,8 @@ impl AppIde {
                 (iot_gen::BLE, ble.platform),
                 // Thread's radio is the Bluetooth one on every Thread chip.
                 (iot_gen::THREAD, ble.platform.filter(|_| ble.thread)),
+                // tls.rs carries the radio's randomness and (Pico) heap.
+                (iot_gen::TLS, platform),
             ]
             .into_iter()
             .filter_map(|(name, p)| {
@@ -207,6 +209,35 @@ impl AppIde {
                     }),
                 }
             };
+            // The HTTP client: whether HTTPS fits beside what else runs, and
+            // what http_ca.rs holds.
+            let http = {
+                let ca_file = self
+                    .project_tree
+                    .user_src_files
+                    .iter()
+                    .find(|(p, _)| *p == format!("src/pins/configs/{}", iot_gen::HTTP_CA))
+                    .map(|(_, c)| c.clone());
+                let coex = mcu.iot.ble.is_some() && (mcu.iot.wifi || mcu.iot.esp_now.is_some());
+                let mqtt_tls = iot::active(mcu).is_some_and(|a| a.mqtt_tls);
+                HttpFacts {
+                    https: iot::https_available(&family, coex, mqtt_tls),
+                    tight: iot::https_tight(&family, mqtt_tls),
+                    beside_mqtt: mqtt_tls,
+                    s2: family == "esp32s2",
+                    coex,
+                    p384_built: iot::active(mcu).is_some_and(|a| a.p384()),
+                    sntp: mcu.iot.sntp.is_some(),
+                    ca: ca_file
+                        .as_deref()
+                        .map(|c| iot_gen::ca_pem_of(c).map(iot::ca_summary)),
+                    ca_der: iot_gen::ca_pem_of(
+                        ca_file.unwrap_or_else(iot_gen::http_ca_file).as_str(),
+                    )
+                    .and_then(iot::cas_der),
+                    project: project_dir.clone(),
+                }
+            };
             let files = &mut self.project_tree.user_src_files;
             let mut changed = false;
             let mut tls_actions: Vec<TlsAction> = Vec::new();
@@ -313,7 +344,7 @@ impl AppIde {
                     ui.add_space(12.0);
 
                     ui.add_enabled_ui(link_up, |ui| {
-                        application_card(ui, &mut mcu.iot, &chip_id, &tls, &mut tls_actions);
+                        application_card(ui, &mut mcu.iot, &chip_id, &tls, &http, &mut tls_actions);
                     });
                 }
             });
@@ -361,6 +392,20 @@ impl AppIde {
                             None => files.push((path, body)),
                         }
                         changed = true;
+                    }
+                    TlsAction::HttpCa(ca) => {
+                        // Added to what http_ca.rs holds - written first, when
+                        // it is not there yet.
+                        let path = format!("src/pins/configs/{}", iot_gen::HTTP_CA);
+                        let at = files.iter().position(|(p, _)| *p == path);
+                        let existing = at.map_or_else(iot_gen::http_ca_file, |i| files[i].1.clone());
+                        if let Some(body) = iot_gen::http_ca_with(&existing, ca) {
+                            match at {
+                                Some(i) => files[i].1 = body,
+                                None => files.push((path, body)),
+                            }
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -645,12 +690,14 @@ fn link_card(
                             .suffix(" KiB"),
                     );
                     if coex {
-                        let tls = cfg.mqtt.as_ref().is_some_and(|m| m.tls)
+                        // Any TLS client checks RSA on the heap: MQTT's or HTTPS.
+                        let tls = (cfg.mqtt.as_ref().is_some_and(|m| m.tls)
+                            || cfg.http.as_ref().is_some_and(|h| h.tls))
                             && iot::tls_available(&ble.family, true).is_ok();
                         ui.label(dim(if ble.family == "esp32" {
                             "Wi-Fi beside Bluetooth takes a fixed heap: 96 KiB of the bootloader's RAM + 24 KiB."
                         } else if tls {
-                            "Wi-Fi beside Bluetooth, with MQTT over TLS, takes a fixed heap: 64 KiB of the bootloader's RAM + 96 KiB."
+                            "Wi-Fi beside Bluetooth, with TLS, takes a fixed heap: 64 KiB of the bootloader's RAM + 96 KiB."
                         } else {
                             "Wi-Fi beside Bluetooth takes a fixed heap: 64 KiB of the bootloader's RAM + 64 KiB."
                         }));
@@ -1145,7 +1192,37 @@ enum TlsAction {
     Secret(&'static str, String),
     /// mqtt_ca.rs replaced with a known CA.
     Ca(iot_gen::CaPreset),
+    /// A known CA added to http_ca.rs.
+    HttpCa(iot_gen::HttpCa),
 }
+
+/// What the HTTP card shows besides the settings.
+struct HttpFacts {
+    /// HTTPS fits on this chip, beside what else runs (`iot::https_available`).
+    https: Result<(), &'static str>,
+    /// ... with about 15 KB of stack left (`iot::https_tight`).
+    tight: bool,
+    /// MQTT runs over TLS too: HTTPS is a second session (about 40 KB).
+    beside_mqtt: bool,
+    /// The ESP32-S2, whose whole heap moves to the reclaimed RAM with TLS.
+    s2: bool,
+    /// Bluetooth beside Wi-Fi: the ESP heap is the fixed coex one.
+    coex: bool,
+    /// embedded-tls is built with `p384` - one switch, MQTT's or HTTP's, turns
+    /// it on for both.
+    p384_built: bool,
+    /// SNTP is on: the certificates' dates are checked.
+    sntp: bool,
+    /// What http_ca.rs holds, once it exists.
+    ca: Option<Option<Result<iot::CaSummary, &'static str>>>,
+    /// Its CAs as DER, for "Test from this PC" (the one it will be written
+    /// with, until it is).
+    ca_der: Option<Vec<u8>>,
+    project: Option<std::path::PathBuf>,
+}
+
+const HTTP_USAGE: &str =
+    "let r = pins::configs::http::get(\"https://api.open-meteo.com/v1/forecast?latitude=44.43&longitude=26.1&current=temperature_2m\", &mut body).await;";
 
 /// What runs over the stack: MQTT today, the rest listed.
 fn application_card(
@@ -1153,6 +1230,7 @@ fn application_card(
     cfg: &mut IotConfig,
     chip_id: &str,
     tls: &TlsFacts,
+    http: &HttpFacts,
     actions: &mut Vec<TlsAction>,
 ) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1190,16 +1268,17 @@ fn application_card(
             sntp_body(ui, s);
         }
         ui.add_space(6.0);
+        let mut http_on = cfg.http.is_some();
         ui.horizontal(|ui| {
-            ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
+            if ui.checkbox(&mut http_on, "").changed() {
+                toggle_kept(ui, &mut cfg.http, http_on, "iot_stash_http");
+            }
             ui.label(egui::RichText::new("HTTP client").strong());
-            ui.label(
-                egui::RichText::new("planned")
-                    .size(10.0)
-                    .color(egui::Color32::from_rgb(120, 170, 230)),
-            );
-            ui.label(dim("on request: reqwless runs on the same TcpSocket"));
+            ui.label(dim("HTTP/1.1, HTTPS through tls.rs - src/pins/configs/http.rs"));
         });
+        if let Some(h) = cfg.http.as_mut() {
+            http_body(ui, h, http, actions);
+        }
     });
 }
 
@@ -1979,6 +2058,250 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
         ui.label(dim(
             "The dates were checked by this PC's clock; the board checks them only with SNTP on.",
         ));
+    }
+}
+
+/// The HTTP client's settings: HTTPS and its checks, the limits, the
+/// User-Agent - and a URL tested from this PC.
+fn http_body(ui: &mut egui::Ui, h: &mut HttpConfig, f: &HttpFacts, actions: &mut Vec<TlsAction>) {
+    ui.indent("http", |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut h.tls, "HTTPS")
+                .on_hover_text("https:// URLs: TLS 1.3 through tls.rs. Off, they are refused - never sent in clear");
+            ui.label(dim("TLS 1.3, the CAs in http_ca.rs"));
+        });
+        if h.tls {
+            if let Err(why) = f.https {
+                ui.label(warn(format!(
+                    "Not here: {why}. https:// URLs are refused (HttpError::NoTls); http:// ones still go."
+                )));
+            } else {
+                https_settings(ui, h, f, actions);
+            }
+        } else {
+            ui.label(dim("https:// URLs are refused (HttpError::NoTls); http:// ones go in clear."));
+        }
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Answer up to"));
+            ui.add(
+                crate::panels::drag_value(ui, &mut h.body_max)
+                    .range(iot::HTTP_BODY_RANGE)
+                    .clamp_existing_to_range(false)
+                    .suffix(" B"),
+            );
+            ui.label(dim("more is dropped, and `truncated` set"));
+        });
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Send up to"));
+            ui.add(
+                crate::panels::drag_value(ui, &mut h.payload_max)
+                    .range(iot::HTTP_BODY_RANGE)
+                    .clamp_existing_to_range(false)
+                    .suffix(" B"),
+            );
+            ui.label(dim("a request's body"));
+        });
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Timeout"));
+            ui.add(
+                crate::panels::drag_value(ui, &mut h.timeout_s)
+                    .range(1..=300)
+                    .clamp_existing_to_range(false)
+                    .suffix(" s"),
+            );
+            ui.label(dim("a whole request: the lookup, the handshake, the answer"));
+        });
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("User-Agent"));
+            ui.add(egui::TextEdit::singleline(&mut h.user_agent).desired_width(200.0));
+        });
+        let sent = iot::http_user_agent(&h.user_agent);
+        if sent != h.user_agent {
+            ui.label(dim(format!("sent as \"{sent}\"")));
+        }
+        ui.label(dim(
+            "One request at a time, from one task; each its own connection. A redirect is reported (location()), never followed. A .local name does not resolve: give the address.",
+        ));
+        ui.label(dim("From anywhere in the firmware (body: a [u8] buffer):"));
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(HTTP_USAGE).monospace().size(11.0));
+            if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                ui.ctx().copy_text(HTTP_USAGE.to_owned());
+            }
+        });
+        http_test_from_pc(ui, h, f);
+    });
+}
+
+/// HTTPS's checks and CAs, where the chip carries it.
+fn https_settings(ui: &mut egui::Ui, h: &mut HttpConfig, f: &HttpFacts, actions: &mut Vec<TlsAction>) {
+    ui.indent("https", |ui| {
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut h.verify, true, "Check the server's certificate");
+            ui.radio_value(&mut h.verify, false, "Encrypt only - NO check");
+        });
+        if !h.verify {
+            ui.label(warn(
+                "Encrypted but NOT authenticated: whoever controls the network can pose as the server, and read any token the board sends.",
+            ));
+        }
+        match &f.ca {
+            Some(Some(Ok(ca))) => {
+                ui.label(dim(format!(
+                    "CA: {}{} - src/pins/configs/http_ca.rs; every certificate in it is trusted.",
+                    ca.name,
+                    if ca.more { " and more" } else { "" }
+                )));
+            }
+            Some(Some(Err(why))) => {
+                ui.label(warn(format!("http_ca.rs: {why} - the build fails on it")));
+            }
+            Some(None) => {
+                ui.label(dim("http_ca.rs's CA_PEM is not a plain string literal: the tab cannot read it, the build checks it."));
+            }
+            None => {
+                ui.label(dim("http_ca.rs is written with the next regeneration: ISRG Root X1 (Let's Encrypt)."));
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.menu_button(format!("{} Add a known CA", ph::CERTIFICATE), |ui| {
+                for ca in iot_gen::HttpCa::ALL {
+                    if ui.button(ca.label()).clicked() {
+                        actions.push(TlsAction::HttpCa(ca));
+                        // What a P-384 root signs checks only with P-384 on.
+                        if ca.p384() {
+                            h.p384 = true;
+                        }
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Add to http_ca.rs a CA these services' chains end in");
+            ui.checkbox(&mut h.p384, "P-384 chains")
+                .on_hover_text("embedded-tls's `p384` feature: about 114 KiB of flash more");
+        });
+        ui.label(dim("P-384 chains: Discord and Google (GTS Root R4), ECDSA Let's Encrypt certificates. TLS 1.2-only servers (httpbin.org) cannot be reached."));
+        ui.label(dim(if f.sntp {
+            "The certificates' dates are checked once SNTP has the time."
+        } else {
+            "The certificates' dates are NOT checked: there is no clock - switch SNTP on."
+        }));
+        if f.beside_mqtt {
+            ui.label(dim("Beside MQTT over TLS: a second TLS session, about 40 KB of RAM; one handshake at a time."));
+        } else if f.s2 {
+            ui.label(dim("On the S2 all of the heap moves to the RAM the bootloader used (TLS's buffers fill its DRAM), 32 KiB more for the RSA checks: keep it at 104 KiB or less."));
+        } else if f.coex {
+            ui.label(dim("Beside Bluetooth the heap is fixed: 64 KiB of the bootloader's RAM + 96 KiB (32 more for the RSA checks)."));
+        } else {
+            ui.label(dim("The ESP heap grows by 32 KiB for the RSA checks (a Pico gets a 32 KiB heap)."));
+        }
+        if f.tight {
+            ui.label(warn(
+                "Beside MQTT over TLS this chip keeps about 15 KB of stack: it links, but was never run on a board.",
+            ));
+        }
+    });
+}
+
+/// "Test from this PC" for a URL: the board's checks and buffers, here.
+fn http_test_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts) {
+    use crate::panels::mcu_module::tls_check::{self, HttpRequest, Shared, State};
+    let url_id = egui::Id::new(("iot_http_test_url", f.project.clone()));
+    let id = egui::Id::new(("iot_http_check", f.project.clone()));
+    let mut url: String = ui.data_mut(|d| d.get_temp(url_id)).unwrap_or_else(|| {
+        "https://api.open-meteo.com/v1/forecast?latitude=44.43&longitude=26.10&current=temperature_2m".to_owned()
+    });
+    let shared: Option<Shared> = ui.data_mut(|d| d.get_temp::<Shared>(id));
+    let state = shared
+        .as_ref()
+        .and_then(|s| s.lock().ok().map(|s| s.clone()))
+        .unwrap_or_default();
+    let busy = matches!(state, State::Building | State::Connecting);
+    ui.add_space(4.0);
+    ui.add(egui::TextEdit::singleline(&mut url).hint_text("https://...").desired_width(320.0));
+    let https_url = url
+        .trim()
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+    // What the board would do with this URL before any network: no HTTPS,
+    // or no CA it could check against.
+    let refused = if https_url && !(h.tls && f.https.is_ok()) {
+        Some("HTTPS is off for this board: get() of an https:// URL returns HttpError::NoTls, and nothing is sent")
+    } else if https_url && h.verify && f.ca_der.is_none() {
+        Some("http_ca.rs holds no certificate the checker can read")
+    } else {
+        None
+    };
+    // The board's own limits, as http.rs gets them.
+    let request = HttpRequest {
+        url: url.trim().to_owned(),
+        verify: h.verify,
+        ca: f.ca_der.clone().unwrap_or_default(),
+        // One switch builds P-384 in for both clients.
+        p384: h.p384 || f.p384_built,
+        head_max: iot::HTTP_HEAD_MAX,
+        body_max: h.body_max.clamp(*iot::HTTP_BODY_RANGE.start(), *iot::HTTP_BODY_RANGE.end()) as usize,
+        user_agent: iot::http_user_agent(&h.user_agent),
+        request_head_max: iot::HTTP_REQUEST_HEAD_MAX,
+    };
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                !busy && !url.trim().is_empty() && refused.is_none(),
+                egui::Button::new(format!("{} Test from this PC", ph::PLUGS_CONNECTED)),
+            )
+            .on_hover_text("GET this URL from this PC with the board's own certificate checks and buffers")
+            .clicked()
+        {
+            let started = tls_check::start_http(request.clone(), ui.ctx().clone());
+            ui.data_mut(|d| d.insert_temp(id, started));
+        }
+        match &state {
+            State::Building => {
+                ui.spinner();
+                ui.label(dim("Building the checker - about a minute the first time."));
+            }
+            State::Connecting => {
+                ui.spinner();
+            }
+            _ => {}
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(url_id, url.clone()));
+    if let Some(why) = refused {
+        ui.label(warn(why));
+    }
+    let State::Done {
+        ok,
+        summary,
+        steps,
+        p384,
+        tested,
+    } = &state
+    else {
+        return;
+    };
+    if request.tested().fingerprint != tested.fingerprint {
+        ui.label(dim(format!("For {} - the settings have changed since.", tested.key)));
+    }
+    for step in steps {
+        ui.label(dim(format!("{}  {step}", ph::CHECK)));
+    }
+    if *ok {
+        ui.label(
+            egui::RichText::new(format!("{}  {summary}", ph::CHECK_CIRCLE))
+                .size(11.0)
+                .color(egui::Color32::from_rgb(120, 200, 140)),
+        );
+    } else {
+        ui.label(warn(summary.as_str()));
+    }
+    if *p384 && !h.p384 && !f.p384_built {
+        ui.label(warn("the server's chain is signed with P-384: this PC checks it, the board only with \"P-384 chains\" on"));
+    }
+    if *ok && tested.verify && !f.sntp {
+        ui.label(dim("The dates were checked by this PC's clock; the board checks them only with SNTP on."));
     }
 }
 

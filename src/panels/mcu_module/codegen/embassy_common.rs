@@ -2064,15 +2064,24 @@ mod emit_for_manual_compile {
         // off (`coex` with no IP stack), `ble+all` = everything at once,
         // `thread` = Thread alone on the 802.15.4 radio (C6, H2, C5:
         // openthread 0.2, prebuilt OpenThread and Mbed TLS), `mqtts` = the
-        // station + MQTT over TLS with no SNTP (dates unchecked). `all` and
-        // `ble+all` are over TLS wherever the chip can carry it.
+        // station + MQTT over TLS with no SNTP (dates unchecked), `http` = the
+        // station + the HTTP client, plain only, `https` = the station + HTTPS
+        // alone (tls.rs for HTTP only). `all` and `ble+all` are over TLS
+        // wherever the chip can carry it, HTTPS beside MQTT's included - two
+        // TLS sessions, where `iot::https_available` allows the second.
         let iot_mode = std::env::var("EIDE_ESP_IOT").ok();
         if let Some(mode) = iot_mode.as_deref() {
             use crate::panels::mcu_module::iot::{
-                BleConfig, EspNowConfig, MqttConfig, SntpConfig, ThreadConfig,
+                BleConfig, EspNowConfig, HttpConfig, MqttConfig, SntpConfig, ThreadConfig,
             };
             let all = matches!(mode, "all" | "ble+all");
-            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt" | "mqtts") || all;
+            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt" | "mqtts" | "http" | "https") || all;
+            if matches!(mode, "http" | "https") || all {
+                mcu.iot.http = Some(HttpConfig {
+                    tls: mode != "http",
+                    ..HttpConfig::default()
+                });
+            }
             if matches!(mode, "ble" | "ble+espnow" | "ble+all") {
                 mcu.iot.ble = Some(BleConfig::default());
             }
@@ -2118,6 +2127,11 @@ mod emit_for_manual_compile {
                 "the Wi-Fi radio exactly when a Wi-Fi link is on:\n{main_rs}"
             );
             assert_eq!(
+                main_rs.contains("pins::configs::http::start(spawner, net_stack);"),
+                matches!(mode, "http" | "https") || all,
+                "the HTTP task exactly with HTTP:\n{main_rs}"
+            );
+            assert_eq!(
                 main_rs.contains("pins::configs::thread::start(spawner, peripherals.IEEE802154);"),
                 mode == "thread",
                 "Thread exactly when it is on:\n{main_rs}"
@@ -2150,6 +2164,19 @@ mod emit_for_manual_compile {
                 used.push_str("        let _ = (pins::configs::thread::role(), pins::configs::thread::addresses());\n");
                 used.push_str("        let d = pins::configs::thread::receive().await;\n");
                 used.push_str("        pins::configs::thread::send_to(*d.from.ip(), d.from.port(), &d.data).await.ok();\n");
+            }
+            if matches!(mode, "http" | "https") || all {
+                used.push_str("        let mut body = [0u8; 256];\n");
+                used.push_str("        if let Ok(r) = pins::configs::http::get(\"http://example.com/\", &mut body).await {\n");
+                used.push_str("            let _ = (r.status, r.len, r.truncated, r.location());\n");
+                used.push_str("        }\n");
+                used.push_str("        pins::configs::http::post(\"https://example.com/in\", \"application/json\", b\"{}\", &mut body).await.ok();\n");
+                used.push_str("        let req = pins::configs::http::Request {\n");
+                used.push_str("            auth: pins::configs::http::Auth::Bearer(\"token\"),\n");
+                used.push_str("            headers: &[(\"X-Board\", \"esp\")],\n");
+                used.push_str("            ..pins::configs::http::Request::get(\"http://192.168.1.10:8123/api/\")\n");
+                used.push_str("        };\n");
+                used.push_str("        pins::configs::http::request(req, &mut body).await.ok();\n");
             }
             if matches!(mode, "espnow" | "ble+espnow") || all {
                 used.push_str("        let me = pins::configs::espnow::own_mac();\n");
@@ -2257,9 +2284,15 @@ mod emit_for_manual_compile {
         );
         files.cargo_config =
             project_gen::ensure_build_std_alloc(&files.cargo_config, iot_active.is_some());
-        let tls = iot_active.is_some_and(|a| a.mqtt_tls);
+        let tls = iot_active.is_some_and(|a| a.tls());
         if matches!(iot_mode.as_deref(), Some("mqtts")) {
-            assert!(tls, "{chip}: mqtts is MQTT over TLS");
+            assert!(iot_active.is_some_and(|a| a.mqtt_tls), "{chip}: mqtts is MQTT over TLS");
+        }
+        if matches!(iot_mode.as_deref(), Some("https")) {
+            assert!(
+                iot_active.is_some_and(|a| a.http_tls && !a.mqtt),
+                "{chip}: https is HTTPS alone"
+            );
         }
         if tls {
             assert!(

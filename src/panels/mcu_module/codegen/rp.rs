@@ -4038,10 +4038,10 @@ fn iot_radio(mcu: &Mcu) -> Option<crate::panels::mcu_module::iot::Active> {
     iot::active(mcu).filter(|a| a.platform == Platform::Cyw43 && (a.station || a.ble))
 }
 
-/// MQTT over TLS on an RP2350: mqtt_link.rs draws its keys from the TRNG,
+/// TLS (MQTT's or HTTP's) on an RP2350: tls.rs draws its keys from the TRNG,
 /// so main binds the TRNG's interrupt and keeps `p.TRNG` from everyone else.
 fn tls_trng(mcu: &Mcu) -> bool {
-    crate::panels::mcu_module::iot::tls_trng(&mcu.family) && iot_radio(mcu).is_some_and(|a| a.mqtt_tls)
+    crate::panels::mcu_module::iot::tls_trng(&mcu.family) && iot_radio(mcu).is_some_and(|a| a.tls())
 }
 
 /// The bring-up for the CYW43 radio, for its GPIO0 (the LED) and, with the
@@ -4369,10 +4369,10 @@ fn async_section(mcu: &Mcu) -> String {
     o.push_str("    // embassy-rp brings up the clocks itself. On RP2040 it also supplies the\n");
     o.push_str("    // second-stage bootloader, which the blocking HAL makes you declare.\n");
     o.push_str("    let p = embassy_rp::init(Default::default());\n\n");
-    // mqtt_link.rs steals the TRNG for TLS's keys: moved out of `p` here, a
+    // tls.rs steals the TRNG for TLS's keys: moved out of `p` here, a
     // second driver on it no longer compiles.
     if tls_trng(mcu) {
-        o.push_str("    // The TRNG is MQTT over TLS's (mqtt_link.rs draws its keys from it):\n");
+        o.push_str("    // The TRNG is TLS's (tls.rs draws its keys from it, for MQTT and HTTP):\n");
         o.push_str("    // moved out of `p`, so no second driver can share it.\n");
         o.push_str("    let _tls_trng = p.TRNG;\n\n");
     }
@@ -4994,13 +4994,15 @@ mod emit_async_for_manual_compile {
     #[test]
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_rp_iot_project() {
-        use crate::panels::mcu_module::iot::{self, BleConfig, MqttConfig, SntpConfig};
+        use crate::panels::mcu_module::iot::{self, BleConfig, HttpConfig, MqttConfig, SntpConfig};
         // (board, folder, Wi-Fi + MQTT + SNTP, Bluetooth, MQTT over TLS, a
-        // client certificate): the Wi-Fi shape, Wi-Fi beside Bluetooth,
+        // client certificate, HTTP - Some(HTTPS)): the Wi-Fi shape with plain
+        // HTTP, HTTPS alone (tls.rs for HTTP only), Wi-Fi beside Bluetooth,
         // Bluetooth alone with the LED in main, and MQTT over TLS - its heap,
         // its whitened RNG, SNTP's clock - the RP2040's with the board's own
-        // certificate, so P-256 signing links on the M0+.
-        for (id, dir_name, wifi, ble, tls, cert) in [
+        // certificate, so P-256 signing links on the M0+, and HTTPS beside it:
+        // two TLS sessions on the smallest chip.
+        for (id, dir_name, wifi, ble, tls, cert, http) in [
             (
                 "rp2040_pico_w",
                 "eide_rp2040w_iot_check",
@@ -5008,6 +5010,7 @@ mod emit_async_for_manual_compile {
                 false,
                 false,
                 false,
+                Some(false),
             ),
             (
                 "rp2350_pico2_w",
@@ -5016,6 +5019,7 @@ mod emit_async_for_manual_compile {
                 false,
                 false,
                 false,
+                Some(true),
             ),
             (
                 "rp2040_pico_w",
@@ -5024,6 +5028,7 @@ mod emit_async_for_manual_compile {
                 true,
                 false,
                 false,
+                None,
             ),
             (
                 "rp2350_pico2_w",
@@ -5032,6 +5037,7 @@ mod emit_async_for_manual_compile {
                 true,
                 false,
                 false,
+                None,
             ),
             (
                 "rp2040_pico_w",
@@ -5040,6 +5046,7 @@ mod emit_async_for_manual_compile {
                 false,
                 true,
                 true,
+                Some(true),
             ),
             (
                 "rp2350_pico2_w",
@@ -5048,6 +5055,7 @@ mod emit_async_for_manual_compile {
                 false,
                 true,
                 false,
+                None,
             ),
         ] {
             let def = builtins::builtin_definitions()
@@ -5075,6 +5083,12 @@ mod emit_async_for_manual_compile {
                 mcu.iot.mqtt = Some(m);
                 mcu.iot.sntp = Some(SntpConfig::default());
             }
+            if let Some(https) = http {
+                mcu.iot.http = Some(HttpConfig {
+                    tls: https,
+                    ..HttpConfig::default()
+                });
+            }
             if ble {
                 mcu.iot.ble = Some(BleConfig::default());
             }
@@ -5085,6 +5099,10 @@ mod emit_async_for_manual_compile {
                 tls,
                 "{id}: TLS exactly when asked"
             );
+            let https = http == Some(true);
+            assert_eq!(active.is_some_and(|a| a.http_tls), https, "{id}: HTTPS");
+            // tls.rs whenever either client speaks TLS.
+            let any_tls = tls || https;
 
             let mut used = String::from("        // Your main loop code here.\n");
             if wifi {
@@ -5099,6 +5117,19 @@ mod emit_async_for_manual_compile {
                 used.push_str(
                     "        wl_led.gpio_set(0, pins::configs::ble::connected()).await;\n",
                 );
+            }
+            if http.is_some() {
+                used.push_str("        let mut body = [0u8; 256];\n");
+                used.push_str("        if let Ok(r) = pins::configs::http::get(\"http://example.com/\", &mut body).await {\n");
+                used.push_str("            let _ = (r.status, r.len, r.truncated, r.location());\n");
+                used.push_str("        }\n");
+                used.push_str("        pins::configs::http::post(\"https://example.com/in\", \"application/json\", b\"{}\", &mut body).await.ok();\n");
+                used.push_str("        let req = pins::configs::http::Request {\n");
+                used.push_str("            auth: pins::configs::http::Auth::Bearer(\"token\"),\n");
+                used.push_str("            headers: &[(\"X-Board\", \"pico\")],\n");
+                used.push_str("            ..pins::configs::http::Request::get(\"http://192.168.1.10:8123/api/\")\n");
+                used.push_str("        };\n");
+                used.push_str("        pins::configs::http::request(req, &mut body).await.ok();\n");
             }
             if ble {
                 used.push_str("        let packet = pins::configs::ble::receive().await;\n");
@@ -5117,9 +5148,14 @@ mod emit_async_for_manual_compile {
                     "{main_rs}"
                 );
             }
-            if !tls {
+            if !any_tls {
                 assert!(!main_rs.contains("TRNG_IRQ"), "{id}: no TLS, no TRNG:\n{main_rs}");
             }
+            assert_eq!(
+                main_rs.contains("pins::configs::http::start(spawner, net_stack);"),
+                http.is_some(),
+                "{main_rs}"
+            );
             let bring_up = if ble {
                 "cyw43::new_with_bluetooth("
             } else {
@@ -5168,26 +5204,32 @@ mod emit_async_for_manual_compile {
             );
             let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
             let toml = project_gen::ensure_iot_deps(&toml, active, "", &mcu.family, &[]);
-            if tls {
-                let link = user
+            if any_tls {
+                let tls_rs = user
                     .iter()
-                    .find(|(p, _)| p == "src/pins/configs/mqtt_link.rs")
+                    .find(|(p, _)| p == "src/pins/configs/tls.rs")
                     .map(|(_, c)| c.as_str())
                     .unwrap_or("");
-                assert!(link.contains("embassy_rp::clocks::RoscRng"), "{link}");
+                assert!(tls_rs.contains("embassy_rp::clocks::RoscRng"), "{tls_rs}");
                 // The Pico 2 W's keys come from its TRNG too, bound in main.
                 let trng = mcu.family == "rp235x";
-                assert_eq!(link.contains("embassy_rp::trng::Trng::new("), trng, "{id}:\n{link}");
+                assert_eq!(tls_rs.contains("embassy_rp::trng::Trng::new("), trng, "{id}:\n{tls_rs}");
                 assert_eq!(
                     main_rs.contains("TRNG_IRQ => embassy_rp::trng::InterruptHandler<embassy_rp::peripherals::TRNG>;"),
                     trng,
                     "{id}:\n{main_rs}"
                 );
                 assert_eq!(main_rs.contains("let _tls_trng = p.TRNG;"), trng, "{id}:\n{main_rs}");
-                assert!(link.contains("super::sntp::now_unix()"), "{link}");
-                assert!(
+                assert!(tls_rs.contains("super::sntp::now_unix()"), "{tls_rs}");
+                assert_eq!(
                     user.iter().any(|(p, _)| p == "src/pins/configs/mqtt_ca.rs"),
-                    "the CA"
+                    tls,
+                    "the broker's CA"
+                );
+                assert_eq!(
+                    user.iter().any(|(p, _)| p == "src/pins/configs/http_ca.rs"),
+                    https,
+                    "the HTTPS servers' CAs"
                 );
                 for want in [
                     "embedded-tls = ",

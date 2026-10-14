@@ -17,6 +17,15 @@
 //! stdin: country, organization, common name, and a key as PEM (empty: make
 //! one). It prints `KEY <hex PEM>` (a key it made), `CSR <hex PEM>`, then the
 //! `RESULT` line.
+//!
+//! `http` as its argument: one GET of a URL as the firmware's `http.rs` makes
+//! it - for https:// the same handshake and checks as above, nothing for
+//! http:// - and the answer measured against the board's buffers: a head the
+//! board would refuse, a redirect it would not follow, a body it would cut,
+//! show here before flashing. stdin: the URL, verify ("1"/"0"), the CAs as
+//! DER (http_ca.rs's), "P-384 chains" ("1"/"0"), the board's HEAD_MAX and
+//! BODY_MAX (decimal), and its User-Agent. It prints `INFO ...` lines, then
+//! the `RESULT` line.
 #![allow(dead_code)]
 
 use std::cell::Cell;
@@ -33,6 +42,9 @@ use embedded_tls::{Aes128GcmSha256, Certificate, SignatureScheme, TlsConfig, Tls
 type CertClock = std::time::SystemTime;
 /// The longest certificate chain the broker may send - as on the board.
 const MAX_CHAIN: usize = 8192;
+/// The TLS record buffers, as on the board: a whole 16 KiB record in.
+const RECORD_RX: usize = 16_640;
+const RECORD_TX: usize = 2048;
 
 include!("tls_verify.rs");
 include!("pem_der.rs");
@@ -91,9 +103,51 @@ fn read_request() -> Option<Request> {
     })
 }
 
+/// The `http` mode's request: a URL and what the board's `http.rs` holds.
+struct HttpRequest {
+    url: String,
+    verify: bool,
+    ca: Vec<u8>,
+    /// "P-384 chains" is on: the board checks a chain signed with P-384.
+    p384: bool,
+    /// The board's buffer for the response head, and for the body.
+    head_max: usize,
+    body_max: usize,
+    user_agent: String,
+    /// The board's buffer for the request head; 0: not checked.
+    request_head_max: usize,
+}
+
+fn read_http_request() -> Option<HttpRequest> {
+    let lines = stdin_values();
+    let text = |i: usize| lines.get(i).map(|b| String::from_utf8_lossy(b).into_owned());
+    Some(HttpRequest {
+        url: text(0)?,
+        verify: text(1)? == "1",
+        ca: lines.get(2)?.clone(),
+        p384: text(3)? == "1",
+        head_max: text(4)?.parse().ok()?,
+        body_max: text(5)?.parse().ok()?,
+        user_agent: text(6)?,
+        // Absent from an older IDE's request: not checked.
+        request_head_max: text(7).and_then(|v| v.parse().ok()).unwrap_or(0),
+    })
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("csr") {
         match csr() {
+            Ok(what) => println!("RESULT ok {what}"),
+            Err(why) => println!("RESULT fail {why}"),
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("http") {
+        let done = match read_http_request() {
+            Some(request) => http(&request),
+            None => Err("the IDE sent no readable request".into()),
+        };
+        match done {
             Ok(what) => println!("RESULT ok {what}"),
             Err(why) => println!("RESULT fail {why}"),
         }
@@ -230,23 +284,56 @@ fn client_identity_of(cert_pem: &str, key_pem: &str) -> Result<Option<(Vec<u8>, 
     Ok(Some((cert, d)))
 }
 
+/// Who answers at the other end, in the messages: MQTT's broker, its CAs in
+/// mqtt_ca.rs, or an HTTP server, its CAs in http_ca.rs.
+#[derive(Clone, Copy)]
+struct Peer {
+    /// "the broker".
+    the: &'static str,
+    /// "a broker".
+    a: &'static str,
+    /// The file the board's CAs are in.
+    ca_file: &'static str,
+    /// One that speaks TLS 1.2 only - the board speaks TLS 1.3.
+    tls12: &'static str,
+    /// Where an EC CA for an RSA chain is the usual slip.
+    ec_ca: &'static str,
+}
+
+const BROKER: Peer = Peer {
+    the: "the broker",
+    a: "a broker",
+    ca_file: "mqtt_ca.rs",
+    tls12: "an AWS IoT endpoint without a TLS 1.3 security policy",
+    ec_ca: " - AWS IoT's ends in Amazon Root CA 1",
+};
+
+const SERVER: Peer = Peer {
+    the: "the server",
+    a: "a server",
+    ca_file: "http_ca.rs",
+    tls12: "httpbin.org",
+    ec_ca: "",
+};
+
 /// What a refused handshake means, in the user's terms.
-fn explain(e: &embedded_tls::TlsError) -> &'static str {
+fn explain(e: &embedded_tls::TlsError, peer: Peer) -> String {
     use embedded_tls::TlsError as E;
+    let Peer { the, a, ca_file, tls12, .. } = peer;
     match e {
-        E::InvalidCertificate => {
-            "the broker's certificate did not check out: its chain does not end in mqtt_ca.rs's CA, it does not name the server name, or it is out of date"
-        }
+        E::InvalidCertificate => format!(
+            "{the}'s certificate did not check out: its chain does not end in {ca_file}'s CA, it does not name the server name, or it is out of date"
+        ),
         E::InvalidSignatureScheme | E::InvalidSignature => {
-            "a signature the board cannot check: a key or curve embedded-tls does not take"
+            "a signature the board cannot check: a key or curve embedded-tls does not take".into()
         }
         E::HandshakeAborted(..) => {
-            "the broker refused the handshake: it may speak only TLS 1.2 (an AWS IoT endpoint without a TLS 1.3 security policy answers like this)"
+            format!("{the} refused the handshake: it may speak only TLS 1.2 ({tls12} answers like this)")
         }
-        E::Io(_) | E::IoError | E::ConnectionClosed => {
-            "the connection broke during the handshake - a broker that speaks only TLS 1.2 (an AWS IoT endpoint without a TLS 1.3 security policy) hangs up like this"
-        }
-        _ => "the handshake failed",
+        E::Io(_) | E::IoError | E::ConnectionClosed => format!(
+            "the connection broke during the handshake - {a} that speaks only TLS 1.2 ({tls12}) hangs up like this"
+        ),
+        _ => "the handshake failed".into(),
     }
 }
 
@@ -254,43 +341,75 @@ fn explain(e: &embedded_tls::TlsError) -> &'static str {
 /// board's certificate.
 const REFUSED_CERT: &str = "the broker closed the connection after the handshake: it refused the client certificate. On AWS IoT: the certificate is not registered or not ACTIVE, no policy attached to it allows iot:Connect for this client id, the thing is not attached to it, or the client id is not the thing's name";
 
-fn run(r: &Request) -> Result<String, String> {
-    let address = (r.host.as_str(), r.port)
+/// Resolves `host` - its first IPv4 address, as the board's DNS query asks
+/// for no other - and connects to it.
+fn connect(host: &str, port: u16) -> Result<TcpStream, String> {
+    let address = (host, port)
         .to_socket_addrs()
-        .map_err(|e| format!("{} could not be resolved: {e}", r.host))?
+        .map_err(|e| format!("{host} could not be resolved: {e}"))?
         .find(|a| a.is_ipv4())
-        .ok_or_else(|| format!("{} has no IPv4 address", r.host))?;
+        .ok_or_else(|| format!("{host} has no IPv4 address"))?;
     println!("INFO resolved {address}");
     let tcp = TcpStream::connect_timeout(&address, Duration::from_secs(10))
         .map_err(|e| format!("no TCP connection to {address}: {e}"))?;
     let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = tcp.set_write_timeout(Some(Duration::from_secs(15)));
     println!("INFO TCP connected");
+    Ok(tcp)
+}
 
-    let mut rx = vec![0u8; 16_640];
-    let mut tx = vec![0u8; 2048];
-    let mut tls: TlsConnection<'_, FromStd<TcpStream>, Aes128GcmSha256> =
-        TlsConnection::new(FromStd::new(tcp), &mut rx, &mut tx);
-    let ip = r.server_name.parse::<Ipv4Addr>().is_ok();
+/// What a handshake is made with: the name the certificate must carry, the
+/// board's CAs, and what else the board's ClientHello carries.
+struct Dial<'r> {
+    server_name: &'r str,
+    verify: bool,
+    ca: &'r [u8],
+    alpn: Option<&'r [&'r [u8]]>,
+    /// The client certificate and its key as PEM - empty: none.
+    client_cert: &'r str,
+    client_key: &'r str,
+    peer: Peer,
+}
+
+/// A connection through its handshake, and what the handshake showed.
+struct Opened<'b> {
+    tls: Tls<'b>,
+    /// The server asked for the client certificate.
+    asked: bool,
+    /// A client certificate is set - sent when it was asked for.
+    identity: bool,
+    /// The checked chain needs P-384 (`INFO p384` printed).
+    p384: bool,
+}
+
+/// The board's handshake over `tcp`, with its own certificate checks
+/// (`tls_verify.rs`): what happened as `INFO` lines, a refusal in the user's
+/// terms. MQTT and HTTP open their connections alike, so one tests both.
+fn handshake<'b>(tcp: TcpStream, rx: &'b mut [u8], tx: &'b mut [u8], dial: &Dial<'_>) -> Result<Opened<'b>, String> {
+    let Peer { the, ca_file, ec_ca, .. } = dial.peer;
+    let mut tls: Tls<'b> = TlsConnection::new(FromStd::new(tcp), rx, tx);
+    let ip = dial.server_name.parse::<Ipv4Addr>().is_ok();
     let config = if ip {
         TlsConfig::new()
     } else {
-        TlsConfig::new().with_server_name(&r.server_name)
+        TlsConfig::new().with_server_name(dial.server_name)
     };
-    const AWS_ALPN: &[&[u8]] = &[b"x-amzn-mqtt-ca"];
-    let config = if r.alpn { config.with_alpn(AWS_ALPN) } else { config };
-    if r.verify && ip {
+    let config = match dial.alpn {
+        Some(alpn) => config.with_alpn(alpn),
+        None => config,
+    };
+    if dial.verify && ip {
         return Err("the server name is an address, and a certificate names DNS names".into());
     }
-    let identity = client_identity_of(&r.client_cert, &r.client_key)?;
+    let identity = client_identity_of(dial.client_cert, dial.client_key)?;
     if identity.is_some() {
         println!("INFO client certificate and key belong together (P-256)");
     }
     let (asked, signed) = (Cell::new(false), Cell::new(false));
-    let mut verifier = HostVerifier { inner: Verifier::new(&r.ca), p384: false, chain_seen: false };
+    let mut verifier = HostVerifier { inner: Verifier::new(dial.ca), p384: false, chain_seen: false };
     let provider = Provider {
         rng: rand_core::OsRng,
-        verifier: if r.verify { Some(&mut verifier) } else { None },
+        verifier: if dial.verify { Some(&mut verifier) } else { None },
         client: identity.as_ref().map(|(cert, d)| (cert.as_slice(), *d)),
         asked: &asked,
         signed: &signed,
@@ -299,25 +418,25 @@ fn run(r: &Request) -> Result<String, String> {
     if let Err(e) = opened {
         // embedded-tls reads the broker's certificate request too, and some
         // list a signature it does not know: then nothing of the chain came.
-        if r.verify && !verifier.chain_seen && matches!(e, embedded_tls::TlsError::DecodeError) {
-            return Err(format!("embedded-tls could not read the broker's handshake - likely its request for a client certificate ({e:?})"));
+        if dial.verify && !verifier.chain_seen && matches!(e, embedded_tls::TlsError::DecodeError) {
+            return Err(format!("embedded-tls could not read {the}'s handshake - likely its request for a client certificate ({e:?})"));
         }
         // A CA whose key is not the kind the chain is signed with (an EC CA
         // for an RSA chain) fails to parse as that key, not as a bad chain.
-        if r.verify && verifier.chain_seen && !verifier.inner.chain_ok && matches!(e, embedded_tls::TlsError::DecodeError) {
+        if dial.verify && verifier.chain_seen && !verifier.inner.chain_ok && matches!(e, embedded_tls::TlsError::DecodeError) {
             return Err(format!(
-                "the broker's certificate did not check out: its chain is signed with another kind of key than mqtt_ca.rs's CA holds (an EC CA for an RSA chain - AWS IoT's ends in Amazon Root CA 1) ({e:?})"
+                "{the}'s certificate did not check out: its chain is signed with another kind of key than {ca_file}'s CA holds (an EC CA for an RSA chain{ec_ca}) ({e:?})"
             ));
         }
-        return Err(format!("{} ({e:?})", explain(&e)));
+        return Err(format!("{} ({e:?})", explain(&e, dial.peer)));
     }
-    if r.verify {
+    if dial.verify {
         if !verifier.inner.authenticated {
-            return Err("the broker finished the handshake without proving a certificate".into());
+            return Err(format!("{the} finished the handshake without proving a certificate"));
         }
         println!(
-            "INFO certificate checked: its chain ends in a CA of mqtt_ca.rs, it names {}, and it is in date by this PC's clock",
-            r.server_name
+            "INFO certificate checked: its chain ends in a CA of {ca_file}, it names {}, and it is in date by this PC's clock",
+            dial.server_name
         );
         if verifier.p384 {
             println!("INFO p384");
@@ -326,19 +445,41 @@ fn run(r: &Request) -> Result<String, String> {
         println!("INFO encrypted, the certificate not checked (encrypt only)");
     }
     match (asked.get(), identity.is_some()) {
-        (true, true) if signed.get() => println!("INFO the broker asked for the client certificate: sent, and the handshake signed with its key"),
-        (true, false) => println!("INFO the broker asked for a client certificate, and none is set"),
-        (false, true) => println!("INFO the broker did not ask for the client certificate, so it was not sent"),
+        (true, true) if signed.get() => println!("INFO {the} asked for the client certificate: sent, and the handshake signed with its key"),
+        (true, false) => println!("INFO {the} asked for a client certificate, and none is set"),
+        (false, true) => println!("INFO {the} did not ask for the client certificate, so it was not sent"),
         _ => {}
     }
+    Ok(Opened {
+        tls,
+        asked: asked.get(),
+        identity: identity.is_some(),
+        p384: dial.verify && verifier.p384,
+    })
+}
+
+fn run(r: &Request) -> Result<String, String> {
+    let tcp = connect(&r.host, r.port)?;
+    let mut rx = vec![0u8; RECORD_RX];
+    let mut tx = vec![0u8; RECORD_TX];
+    const AWS_ALPN: &[&[u8]] = &[b"x-amzn-mqtt-ca"];
+    let dial = Dial {
+        server_name: &r.server_name,
+        verify: r.verify,
+        ca: &r.ca,
+        alpn: r.alpn.then_some(AWS_ALPN),
+        client_cert: &r.client_cert,
+        client_key: &r.client_key,
+        peer: BROKER,
+    };
+    let Opened { mut tls, asked, identity: has_identity, .. } = handshake(tcp, &mut rx, &mut tx, &dial)?;
     // What a hang-up from here on means - a broker that asked for the
     // board's certificate and then closes is refusing it. (Silence is not a
     // hang-up.)
-    let has_identity = identity.is_some();
     let refused = |e: String| {
         // A read that times out is `TimedOut` on Windows, `Other` (from
         // `WouldBlock`) on Linux and macOS.
-        if !asked.get() || e.contains("TimedOut") || e.contains("Io(Other)") {
+        if !asked || e.contains("TimedOut") || e.contains("Io(Other)") {
             e
         } else if !has_identity {
             format!("the broker wants a client certificate and hangs up without one: switch \"Client certificate\" on and set it in secrets.rs ({e})")
@@ -374,7 +515,7 @@ fn run(r: &Request) -> Result<String, String> {
         .iter()
         .find(|(p, _)| *p == 0x12)
         .map(|(_, v)| String::from_utf8_lossy(v).into_owned());
-    let untested = if identity.is_some() && !asked.get() {
+    let untested = if has_identity && !asked {
         " - the client certificate untested: this broker never asks for one (test.mosquitto.org asks on 8884 only)"
     } else {
         ""
@@ -383,7 +524,7 @@ fn run(r: &Request) -> Result<String, String> {
         0x00 => {}
         // The broker asked for the certificate and still refuses, with the
         // login (if any) sent: its policy - AWS IoT's.
-        code @ (0x87 | 0x05) if asked.get() && identity.is_some() && !login_untested => {
+        code @ (0x87 | 0x05) if asked && has_identity && !login_untested => {
             let id = if r.client_id.is_empty() || assigned.is_some() {
                 " The client id is empty, so the broker made one up - no AWS IoT policy allows it: set it to the thing's name."
             } else {
@@ -832,4 +973,629 @@ fn csr() -> Result<String, String> {
     }
     println!("CSR {}", hex(&to_pem("CERTIFICATE REQUEST", &request_der)));
     Ok(if made { "a new P-256 key and its request".into() } else { "a request for the key in secrets.rs".into() })
+}
+
+// ── The `http` mode ──────────────────────────────────────────────────────
+
+/// The longest host name the board takes: its TLS name check holds 64.
+const HOST_MAX: usize = 64;
+/// Interim answers (100 Continue, 103 Early Hints) the board passes over
+/// before the real one.
+const INTERIM_MAX: usize = 4;
+/// The longest chunk-size line and trailer section the board reads.
+const CHUNK_LINE_MAX: usize = 256;
+const TRAILERS_MAX: usize = 1024;
+/// How much of a head, and of a body, this PC reads to measure it: far past
+/// the board's buffers, short of a download.
+const HEAD_LIMIT: usize = 64 * 1024;
+const BODY_LIMIT: usize = 1 << 20;
+
+/// The `http` mode: one GET as the board's `http.rs` makes it, and the
+/// answer held against the board's buffers. What the board would refuse, or
+/// not follow, fails here; a body it would cut is a success that says so.
+fn http(r: &HttpRequest) -> Result<String, String> {
+    let url = Url::parse(&r.url)?;
+    if r.user_agent.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return Err("the User-Agent holds a line break: the request would come apart".into());
+    }
+    let request = url.get(&r.user_agent);
+    if r.request_head_max > 0 && request.len() > r.request_head_max {
+        return Err(format!(
+            "the request head is {} bytes, over the board's {} - get() returns HttpError::TooLarge before connecting",
+            request.len(),
+            r.request_head_max
+        ));
+    }
+    let tcp = connect(url.host, url.port)?;
+    let mut rx = vec![0u8; RECORD_RX];
+    let mut tx = vec![0u8; RECORD_TX];
+    let mut conn = if url.https {
+        let dial = Dial {
+            server_name: url.host,
+            verify: r.verify,
+            ca: &r.ca,
+            alpn: None,
+            client_cert: "",
+            client_key: "",
+            peer: SERVER,
+        };
+        let opened = handshake(tcp, &mut rx, &mut tx, &dial)?;
+        // This PC checks P-384 whatever the switch says; the board only with
+        // it on, and fails the handshake without.
+        if opened.p384 && !r.p384 {
+            return Err("the server's chain is signed with P-384: switch \"P-384 chains\" on for HTTP".into());
+        }
+        Conn::Tls(Box::new(opened.tls))
+    } else {
+        println!("INFO plain HTTP: nothing encrypted, nothing checked");
+        Conn::Plain(tcp)
+    };
+    conn.send(request.as_bytes())
+        .map_err(|e| format!("the request could not be sent ({e})"))?;
+    println!("INFO sent GET {}", url.path());
+
+    let mut src = Incoming { conn: &mut conn, buf: Vec::new(), pos: 0, ended: false };
+    let mut interim = 0;
+    let (head, size) = loop {
+        let bytes = match src.head() {
+            Ok(HeadRead::Whole(bytes)) => bytes,
+            Ok(HeadRead::Ended(0)) => return Err("the server closed the connection without an answer".into()),
+            Ok(HeadRead::Ended(n)) => {
+                return Err(format!("the server closed the connection {n} bytes into the answer's head - the board reports it cut short"));
+            }
+            Ok(HeadRead::TooLong) => {
+                return Err(format!("the response head is over {HEAD_LIMIT} bytes, over the board's {} - it would refuse it", r.head_max));
+            }
+            Err(e) => return Err(format!("no answer came ({e})")),
+        };
+        let line = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
+        println!("INFO the server answered {}", String::from_utf8_lossy(line).trim_end());
+        let size = bytes.len();
+        // Before anything in it is read: the board's head buffer is full.
+        if size > r.head_max {
+            return Err(format!("the response head is {size} bytes, over the board's {} - it would refuse it", r.head_max));
+        }
+        let head = parse_head(&bytes).map_err(|why| format!("the answer does not read as HTTP/1.1: {why} - the board would refuse it"))?;
+        if !(100..200).contains(&head.status) {
+            println!("INFO the response head is {size} bytes - the board takes {}", r.head_max);
+            break (head, size);
+        }
+        // 101 would switch protocols - the board never asks for that.
+        if head.status == 101 {
+            return Err("the server answered 101 Switching Protocols, which the board never asks for".into());
+        }
+        interim += 1;
+        if interim > INTERIM_MAX {
+            return Err(format!("the server sent more than {INTERIM_MAX} interim answers - the board stops at {INTERIM_MAX}"));
+        }
+        println!("INFO an interim answer: the board passes over it to the next");
+    };
+
+    let what = if head.reason.is_empty() {
+        head.status.to_string()
+    } else {
+        format!("{} {}", head.status, head.reason)
+    };
+    if head.status >= 400 {
+        return Err(format!("the server answered {what}"));
+    }
+    // 304 Not Modified is no redirect (and a plain GET never gets one).
+    if (300..400).contains(&head.status) && head.status != 304 {
+        return Err(match &head.location {
+            Some(to) => format!("redirected to {to} - the board reports redirects and does not follow them"),
+            None => format!("the server answered {what}, a redirect without a Location - the board reports redirects and does not follow them"),
+        });
+    }
+    // RFC 9112 6.3, as the board frames it: Transfer-Encoding wins over
+    // Content-Length; neither, and the body runs until the server closes.
+    let framing = if head.status == 204 || head.status == 304 {
+        Framing::None
+    } else if head.coded {
+        if head.chunked { Framing::Chunked } else { Framing::Close }
+    } else {
+        head.length.map_or(Framing::Close, Framing::Length)
+    };
+    match framing {
+        Framing::None => println!("INFO no body: a {} has none", head.status),
+        Framing::Length(n) => println!("INFO the body: Content-Length {n}"),
+        Framing::Chunked => println!("INFO the body: chunked"),
+        Framing::Close => println!("INFO the body: until the server closes (no Content-Length, not chunked)"),
+    }
+    let body = read_body(&mut src, framing, r.body_max)?;
+    let len = if body.exact { body.len.to_string() } else { format!("at least {}", body.len) };
+    let head_part = format!("head {size} bytes (the board takes {})", r.head_max);
+    Ok(if body.len > r.body_max {
+        println!(
+            "INFO the body is {len} bytes, over the board's {}: it keeps the first {} and flags it truncated",
+            r.body_max, r.body_max
+        );
+        format!(
+            "HTTP {what} - {head_part}, body {len} bytes: the board keeps the first {} bytes and flags it truncated",
+            r.body_max
+        )
+    } else {
+        println!("INFO the body is {len} bytes - the board keeps {}", r.body_max);
+        format!("HTTP {what} - {head_part}, body {len} bytes (the board keeps {})", r.body_max)
+    })
+}
+
+/// A URL by the board's rules: `http[s]://host[:port][/path][?query]`, the
+/// host a name or an IPv4 address. The fragment never leaves.
+struct Url<'a> {
+    https: bool,
+    host: &'a str,
+    port: u16,
+    /// Path and query as given ("" = "/").
+    target: &'a str,
+}
+
+impl<'a> Url<'a> {
+    fn parse(url: &'a str) -> Result<Self, String> {
+        let refused = |why: String| format!("the board refuses this URL: {why}");
+        let (scheme, rest) = url
+            .split_once("://")
+            .ok_or_else(|| refused("it does not start with http:// or https://".into()))?;
+        let https = if scheme.eq_ignore_ascii_case("https") {
+            true
+        } else if scheme.eq_ignore_ascii_case("http") {
+            false
+        } else {
+            return Err(refused(format!("`{scheme}://` is neither http:// nor https://")));
+        };
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, target) = rest.split_at(end);
+        let target = target.split('#').next().unwrap_or("");
+        // A login goes in a header, never in the URL.
+        if authority.contains('@') {
+            return Err(refused("it carries user info (user@host) - a login goes in a header".into()));
+        }
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, "")) => (host, None),
+            Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => {
+                let port = port.parse::<u16>().ok().filter(|&p| p != 0);
+                (host, Some(port.ok_or_else(|| refused("its port is not one from 1 to 65535".into()))?))
+            }
+            Some((host, _)) if !host.contains(['[', ':']) => {
+                return Err(refused("its port is not a number".into()));
+            }
+            _ => (authority, None),
+        };
+        if host.contains(['[', ']', ':']) {
+            return Err(refused("its host is an IPv6 address, and the board's network speaks IPv4 only".into()));
+        }
+        let port = port.unwrap_or(if https { 443 } else { 80 });
+        if host.is_empty() {
+            return Err(refused("it names no host".into()));
+        }
+        let name = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_';
+        if !host.bytes().all(name) {
+            return Err(refused(format!("its host `{host}` is not a name or an IPv4 address")));
+        }
+        if host.len() > HOST_MAX {
+            return Err(refused(format!("its host is {} characters, more than the {HOST_MAX} it takes", host.len())));
+        }
+        // A space, CR or LF would end the request line early.
+        if !target.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            return Err(refused("its path holds a space, a line break or a character outside ASCII - percent-encode it".into()));
+        }
+        Ok(Url { https, host, port, target })
+    }
+
+    /// What the request line asks for.
+    fn path(&self) -> String {
+        if self.target.starts_with('/') {
+            self.target.to_owned()
+        } else {
+            format!("/{}", self.target)
+        }
+    }
+
+    /// The request the board sends for a GET: the port in Host only when it
+    /// is not the scheme's, one connection per request.
+    fn get(&self, user_agent: &str) -> String {
+        let default = self.port == if self.https { 443 } else { 80 };
+        let port = if default { String::new() } else { format!(":{}", self.port) };
+        format!(
+            "GET {} HTTP/1.1\r\nHost: {}{port}\r\nUser-Agent: {user_agent}\r\nConnection: close\r\n\r\n",
+            self.path(),
+            self.host
+        )
+    }
+}
+
+/// The connection an answer comes over (TLS boxed: its state is a kilobyte).
+enum Conn<'b> {
+    Plain(TcpStream),
+    Tls(Box<Tls<'b>>),
+}
+
+impl Conn<'_> {
+    fn send(&mut self, data: &[u8]) -> Result<(), String> {
+        match self {
+            Conn::Plain(tcp) => std::io::Write::write_all(tcp, data)
+                .and_then(|()| std::io::Write::flush(tcp))
+                .map_err(|e| format!("Io({:?})", e.kind())),
+            Conn::Tls(tls) => send(tls, data),
+        }
+    }
+
+    /// Some bytes; 0 = the end. The server's close_notify, which embedded-tls
+    /// 0.19 returns as an error, is the end too - as the board's `Closing`
+    /// reads it. A TCP close without it stays an error (`IoError`).
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+        match self {
+            Conn::Plain(tcp) => std::io::Read::read(tcp, buf).map_err(|e| format!("Io({:?})", e.kind())),
+            Conn::Tls(tls) => match tls.read(buf) {
+                Err(embedded_tls::TlsError::ConnectionClosed) => Ok(0),
+                other => other.map_err(|e| format!("{e:?}")),
+            },
+        }
+    }
+}
+
+/// The answer as it arrives: what was read and not taken yet first, then
+/// the connection.
+struct Incoming<'c, 'b> {
+    conn: &'c mut Conn<'b>,
+    buf: Vec<u8>,
+    pos: usize,
+    /// The connection ended: nothing more is read from it (embedded-tls
+    /// refuses a read after the close_notify).
+    ended: bool,
+}
+
+enum HeadRead {
+    /// Status line, headers and the empty line.
+    Whole(Vec<u8>),
+    /// The connection ended this many bytes into the head.
+    Ended(usize),
+    /// Longer than HEAD_LIMIT, and still no end.
+    TooLong,
+}
+
+impl Incoming<'_, '_> {
+    /// Reads more; `false` once the connection ended.
+    fn more(&mut self) -> Result<bool, String> {
+        if self.ended {
+            return Ok(false);
+        }
+        self.buf.drain(..self.pos);
+        self.pos = 0;
+        let mut chunk = [0u8; 4096];
+        let n = self.conn.read(&mut chunk)?;
+        self.buf.extend_from_slice(&chunk[..n]);
+        self.ended = n == 0;
+        Ok(n > 0)
+    }
+
+    /// The next head, whatever its length: the board's limit is checked by
+    /// the caller, which then can say how long it was.
+    fn head(&mut self) -> Result<HeadRead, String> {
+        loop {
+            if let Some(end) = head_end(&self.buf[self.pos..]) {
+                let head = self.buf[self.pos..self.pos + end].to_vec();
+                self.pos += end;
+                return Ok(HeadRead::Whole(head));
+            }
+            if self.buf.len() - self.pos > HEAD_LIMIT {
+                return Ok(HeadRead::TooLong);
+            }
+            if !self.more()? {
+                return Ok(HeadRead::Ended(self.buf.len() - self.pos));
+            }
+        }
+    }
+
+    /// Passes over up to `n` (> 0) bytes; 0 = the connection ended.
+    fn skip(&mut self, n: usize) -> Result<usize, String> {
+        if self.pos == self.buf.len() && !self.more()? {
+            return Ok(0);
+        }
+        let k = n.min(self.buf.len() - self.pos);
+        self.pos += k;
+        Ok(k)
+    }
+
+    /// One byte; `None` = the connection ended.
+    fn byte(&mut self) -> Result<Option<u8>, String> {
+        if self.pos == self.buf.len() && !self.more()? {
+            return Ok(None);
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Ok(Some(b))
+    }
+}
+
+/// Just past the head's empty line (CRLF CRLF; a bare LF taken too), where
+/// the board finds it.
+fn head_end(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(p) = buf[i..].iter().position(|&b| b == b'\n') {
+        let lf = i + p;
+        match buf[lf + 1..] {
+            [b'\n', ..] => return Some(lf + 2),
+            [b'\r', b'\n', ..] => return Some(lf + 3),
+            _ => i = lf + 1,
+        }
+    }
+    None
+}
+
+/// What the board reads of a head.
+struct Head {
+    status: u16,
+    /// The reason phrase ("OK", "Not Found"); may be empty.
+    reason: String,
+    length: Option<usize>,
+    /// A Transfer-Encoding came...
+    coded: bool,
+    /// ...and its last coding is chunked.
+    chunked: bool,
+    location: Option<String>,
+}
+
+/// A head by the board's rules: HTTP/1.x and a three-digit status, header
+/// names that are tokens, no folded lines, one Content-Length (repeated at
+/// most), Transfer-Encoding's last coding. `Err`: why the board refuses it.
+fn parse_head(head: &[u8]) -> Result<Head, String> {
+    let mut lines = head
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let first = lines.next().unwrap_or_default();
+    let status = match *first {
+        [b'H', b'T', b'T', b'P', b'/', b'1', b'.', minor, b' ', a, b, c, ref rest @ ..]
+            if minor.is_ascii_digit()
+                && [a, b, c].iter().all(u8::is_ascii_digit)
+                && rest.first().is_none_or(|&s| s == b' ') =>
+        {
+            u16::from(a - b'0') * 100 + u16::from(b - b'0') * 10 + u16::from(c - b'0')
+        }
+        _ => return Err(format!("its status line `{}` is not HTTP/1.x's", String::from_utf8_lossy(first))),
+    };
+    if !(100..=599).contains(&status) {
+        return Err(format!("{status} is no HTTP status"));
+    }
+    let reason = String::from_utf8_lossy(first.get(13..).unwrap_or_default()).trim().to_owned();
+    let mut h = Head {
+        status,
+        reason,
+        length: None,
+        coded: false,
+        chunked: false,
+        location: None,
+    };
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if line[0] == b' ' || line[0] == b'\t' {
+            return Err("a header line folded onto the one before it".into());
+        }
+        let text = String::from_utf8_lossy(line);
+        let colon = line
+            .iter()
+            .position(|&b| b == b':')
+            .ok_or_else(|| format!("the header line `{text}` has no colon"))?;
+        let (name, value) = (&line[..colon], trim(&line[colon + 1..]));
+        // A space before the colon fails here too (RFC 9112 5.1).
+        if !is_token(name) {
+            return Err(format!("the header name `{}` is not a token", String::from_utf8_lossy(name)));
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            // "5", or the same number repeated ("5, 5").
+            for part in value.split(|&b| b == b',') {
+                let n = decimal(trim(part)).ok_or_else(|| format!("`{text}` is not a length"))?;
+                if h.length.is_some_and(|m| m != n) {
+                    return Err("two Content-Lengths that differ".into());
+                }
+                h.length = Some(n);
+            }
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            for coding in value.split(|&b| b == b',').map(trim).filter(|c| !c.is_empty()) {
+                h.coded = true;
+                h.chunked = coding.eq_ignore_ascii_case(b"chunked");
+            }
+        } else if name.eq_ignore_ascii_case(b"location") {
+            h.location = Some(String::from_utf8_lossy(value).into_owned());
+        }
+    }
+    Ok(h)
+}
+
+/// A header name: RFC 9110's token characters.
+fn is_token(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+fn trim(mut s: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = s {
+        s = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = s {
+        s = rest;
+    }
+    s
+}
+
+fn decimal(s: &[u8]) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+    s.iter().try_fold(0usize, |n, &b| {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n.checked_mul(10)?.checked_add(usize::from(b - b'0'))
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Framing {
+    /// 204, 304: no body whatever the headers say.
+    None,
+    Length(usize),
+    Chunked,
+    /// Neither: the body ends when the server closes.
+    Close,
+}
+
+/// How long the body is.
+struct Body {
+    len: usize,
+    /// `false`: at least `len` - this PC stopped reading where the board had
+    /// long stopped (past BODY_LIMIT, or broken off after the board's buffer
+    /// was full).
+    exact: bool,
+}
+
+/// The body read as the board reads it, and measured. What breaks only
+/// after the board's buffer is full does not matter to the board: it stops
+/// there.
+fn read_body(src: &mut Incoming<'_, '_>, framing: Framing, body_max: usize) -> Result<Body, String> {
+    match framing {
+        Framing::None => Ok(Body { len: 0, exact: true }),
+        Framing::Length(n) => {
+            // The board reads no further than its buffer; nor does this PC.
+            let want = n.min(body_max);
+            let mut got = 0;
+            while got < want {
+                match src.skip(want - got) {
+                    Ok(0) => {
+                        return Err(format!("the server closed the connection {got} bytes into a body of {n} - the board reports it cut short"));
+                    }
+                    Ok(k) => got += k,
+                    Err(e) => return Err(format!("the body broke off after {got} of its {n} bytes ({e})")),
+                }
+            }
+            Ok(Body { len: n, exact: true })
+        }
+        Framing::Chunked => {
+            // The sizes say how long the body is; what came says whether the
+            // board's buffer was full before a break.
+            let (mut total, mut received) = (0, 0);
+            match chunked(src, &mut total, &mut received) {
+                Ok(whole) => Ok(Body { len: total, exact: whole }),
+                Err(_) if received >= body_max => Ok(Body { len: total, exact: false }),
+                Err(why) => Err(why),
+            }
+        }
+        Framing::Close => {
+            let mut got = 0;
+            loop {
+                match src.skip(usize::MAX) {
+                    Ok(0) => return Ok(Body { len: got, exact: true }),
+                    Ok(k) => got += k,
+                    // The board took a byte past its buffer, and stopped.
+                    Err(_) if got > body_max => return Ok(Body { len: got, exact: false }),
+                    Err(e) if e == "IoError" => {
+                        return Err(format!(
+                            "the server ended the body by closing TCP without TLS's close_notify, after {got} bytes - the board takes that for a broken connection ({e})"
+                        ));
+                    }
+                    Err(e) if e.contains("TimedOut") || e.contains("Io(Other)") => {
+                        return Err(format!(
+                            "the body runs until the server closes, and after {got} bytes it went silent without closing - the board waits out its timeout ({e})"
+                        ));
+                    }
+                    Err(e) => return Err(format!("the body broke off after {got} bytes ({e})")),
+                }
+                if got > BODY_LIMIT {
+                    return Ok(Body { len: got, exact: false });
+                }
+            }
+        }
+    }
+}
+
+/// A chunked body as the board decodes it - `size [; extensions] CRLF data
+/// CRLF` ... `0 CRLF [trailers] CRLF` - counted into `total` as the sizes
+/// come. `Ok(false)`: past BODY_LIMIT, not read to its end.
+fn chunked(src: &mut Incoming<'_, '_>, total: &mut usize, received: &mut usize) -> Result<bool, String> {
+    let bad = |why: &str| format!("the chunked body does not decode: {why} - the board would refuse it");
+    let cut = "the server closed the connection inside the chunked body - the board reports it cut short";
+    let byte = |src: &mut Incoming<'_, '_>| -> Result<u8, String> {
+        src.byte()
+            .map_err(|e| format!("the chunked body broke off ({e})"))?
+            .ok_or_else(|| cut.to_owned())
+    };
+    loop {
+        let mut size = 0usize;
+        let mut digits = 0;
+        let mut b = byte(src)?;
+        while let Some(d) = char::from(b).to_digit(16) {
+            // The board counts in 32 bits.
+            if digits == 8 {
+                return Err(bad("a chunk size past 32 bits"));
+            }
+            size = size << 4 | d as usize;
+            digits += 1;
+            b = byte(src)?;
+        }
+        if digits == 0 {
+            return Err(bad("a chunk without its size"));
+        }
+        // Whitespace, then `;name=value` extensions - passed over - up to LF.
+        let (mut extension, mut n) = (false, 0);
+        while b != b'\n' {
+            match b {
+                b';' => extension = true,
+                b'\r' | b' ' | b'\t' => {}
+                _ if b < 0x20 || b == 0x7f || !extension => return Err(bad("something else after a chunk's size")),
+                _ => {}
+            }
+            n += 1;
+            if n > CHUNK_LINE_MAX {
+                return Err(bad("a chunk-size line longer than the board reads"));
+            }
+            b = byte(src)?;
+        }
+        if size == 0 {
+            break;
+        }
+        *total += size;
+        if *total > BODY_LIMIT {
+            return Ok(false);
+        }
+        let mut left = size;
+        while left > 0 {
+            match src.skip(left).map_err(|e| format!("the chunked body broke off ({e})"))? {
+                0 => return Err(cut.to_owned()),
+                k => {
+                    left -= k;
+                    *received += k;
+                }
+            }
+        }
+        let mut b = byte(src)?;
+        if b == b'\r' {
+            b = byte(src)?;
+        }
+        if b != b'\n' {
+            return Err(bad("a chunk longer than its size"));
+        }
+    }
+    // Trailer fields, passed over, up to the empty line.
+    let mut all = 0;
+    loop {
+        let mut line = 0;
+        loop {
+            let b = byte(src)?;
+            all += 1;
+            if all > TRAILERS_MAX {
+                return Err(bad("trailer fields longer than the board reads"));
+            }
+            match b {
+                b'\n' => break,
+                b'\r' => {}
+                _ => line += 1,
+            }
+        }
+        if line == 0 {
+            return Ok(true);
+        }
+    }
 }

@@ -1,56 +1,19 @@
 
-// Everything below is editable — your changes are preserved on regeneration.
-//
-// How mqtt.rs reaches the broker: TLS 1.3 (embedded-tls) over TCP on
-// BROKER_PORT. With VERIFY the broker must present a chain that ends in the CA
-// of mqtt_ca.rs and names SERVER_NAME, and prove it holds that certificate's
-// key - or the connection is refused, and tried again RETRY_S later.
-// Checked: every signature along the chain, that each certificate after the
-// broker's own is a CA, the name (the first 3 DNS names, or the CN; never an
-// IP address), and the dates once wall_clock() knows the time (SNTP). Not
-// checked: revocation. Without VERIFY the traffic is encrypted but nobody is
-// authenticated: whoever controls the network can pose as the broker and read
-// the MQTT password.
-//
-// With a client certificate (CLIENT, from secrets.rs) the board proves who it
-// is when the broker asks - AWS IoT does: it sends the certificate and signs
-// the handshake with its P-256 key (one scalar multiplication, no heap).
-//
-// TLS 1.3 only, AES-128-GCM with P-256: a broker that speaks only TLS 1.2
-// (broker.hivemq.com) cannot be reached. Every certificate in the broker's
-// chain must be signed with RSA or ECDSA P-256 - or P-384 with the tab's
-// "P-384 chains" (embedded-tls's `p384`, about 114 KiB of flash more), which
-// an ECDSA Let's Encrypt certificate (certbot's default) needs: its issuers
-// are P-384. An RSA one (`--key-type rsa`) works without. Checking RSA takes
-// the heap, about 22 KB at its peak - on a
-// Pico this file brings that heap (32 KiB).
-
-use core::net::Ipv4Addr;
-
-use embassy_net::tcp::{Error as TcpError, State, TcpSocket};
-use embassy_time::Timer;
-use embedded_io_async::{ErrorType, Read, Write};
-use embedded_tls::{
-    Aes128GcmSha256, Certificate, CryptoProvider, CryptoRngCore, SignatureScheme, TlsConfig,
-    TlsConnection, TlsContext, TlsError, TlsVerifier,
-};
-
-use super::mqtt_ca::CA_PEM;
-
-/// The TCP receive buffer mqtt.rs gives its socket: a whole TLS record of one
-/// MQTT packet (1024 + 22 bytes) must fit, so `Gate` can hold it back until
-/// all of it has arrived.
+/// The TCP receive buffer a TLS client gives its socket: a whole TLS record of
+/// one MQTT packet (1024 + 22 bytes) must fit, so `Gate` can hold it back
+/// until all of it has arrived.
 pub const TCP_RX: usize = 2048;
 /// TLS records: up to 16 KiB of plaintext and its overhead in; packets out.
 const RECORD_RX: usize = 16_640;
 const RECORD_TX: usize = 2048;
-/// The longest certificate chain the broker may send.
+/// The longest certificate chain a server may send.
 const MAX_CHAIN: usize = 8192;
 
-/// What rust-mqtt talks through: TLS over the socket.
+/// A connection: TLS over the socket.
 pub type Link<'s> = TlsConnection<'s, Gate<'s>, Aes128GcmSha256>;
 
-/// The TLS record buffers, kept between connections.
+/// One connection's TLS record buffers, kept between connections: each
+/// client has its own (MQTT keeps its connection open for good).
 pub struct LinkBuffers {
     rx: [u8; RECORD_RX],
     tx: [u8; RECORD_TX],
@@ -71,69 +34,28 @@ impl Default for LinkBuffers {
     }
 }
 
-// ── This chip's pieces ──
-/// The chip's raw entropy - `entropy()` in the block above: the ring
-/// oscillator on the Pico W, the TRNG and the oscillator on the Pico 2 W -
-/// whitened: each 32 bytes out are the SHA-256 of ENTROPY_BYTES raw bytes
-/// and a counter.
-struct TlsRng {
-    counter: u64,
+/// Where a connection goes, and how the server is checked.
+pub struct Target<'a> {
+    /// The name the server's certificate must carry, sent as SNI.
+    pub server_name: &'a str,
+    /// Check the server's certificate. `false` = encrypted, but anyone on
+    /// the path can pose as the server.
+    pub verify: bool,
+    /// The CAs the server's chain may end in, as DER one after the other.
+    pub cas: &'a [u8],
+    /// The board's certificate and P-256 key, sent when the server asks.
+    pub client: Option<(&'a [u8], [u8; 32])>,
+    /// ALPN protocols - AWS IoT on 443 picks MQTT by one.
+    pub alpn: &'a [&'a [u8]],
 }
 
-impl rand_core_06::RngCore for TlsRng {
-    fn next_u32(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        self.fill_bytes(&mut b);
-        u32::from_le_bytes(b)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.fill_bytes(&mut b);
-        u64::from_le_bytes(b)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        use sha2::Digest as _;
-        for chunk in dest.chunks_mut(32) {
-            let mut raw = [0u8; ENTROPY_BYTES];
-            entropy(&mut raw);
-            let mut hash = sha2::Sha256::new();
-            hash.update(raw);
-            hash.update(self.counter.to_le_bytes());
-            self.counter = self.counter.wrapping_add(1);
-            let out = hash.finalize();
-            chunk.copy_from_slice(&out[..chunk.len()]);
-        }
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core_06::Error> {
-        self.fill_bytes(dest);
-        Ok(())
-    }
-}
-
-impl rand_core_06::CryptoRng for TlsRng {}
-
-fn tls_rng() -> Result<TlsRng, ()> {
-    Ok(TlsRng { counter: 0 })
-}
-
-/// RSA (num-bigint) allocates, and the Pico has no heap of its own: TLS
-/// brings one. Only the handshake's certificate checks use it (about 22 KB
-/// at their peak, verifying a Let's Encrypt chain).
-#[global_allocator]
-static HEAP: embedded_alloc::LlffHeap = embedded_alloc::LlffHeap::empty();
-const HEAP_SIZE: usize = 32 * 1024;
-
-/// Called once, before the first connection: gives the heap its memory.
-pub fn init() {
-    static mut MEMORY: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-    // SAFETY: called once, before the first allocation; nothing else
-    // touches MEMORY.
-    unsafe { HEAP.init(&raw mut MEMORY as usize, HEAP_SIZE) }
-}
-// ── end of this chip's pieces ──
+/// One handshake at a time: checking an RSA chain borrows about 22 KB of
+/// the heap, and two at once would not fit what TLS brings.
+static HANDSHAKE: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
+/// The longest a handshake may hold that turn: a server that took the TCP
+/// connection and then says nothing must not keep the other client waiting
+/// for its whole timeout. An RP2040 checks an RSA-4096 chain in a few seconds.
+const OPEN_S: u64 = 20;
 
 /// The certificates' dates are checked against `wall_clock()`.
 struct CertClock;
@@ -144,54 +66,61 @@ impl embedded_tls::TlsClock for CertClock {
     }
 }
 
-/// The CAs as DER, one after the other, decoded by the compiler: a broken
-/// paste fails the build.
-static CA_DER: [u8; pem_len(CA_PEM.as_bytes(), b"CERTIFICATE", true)] =
-    pem_der(CA_PEM, b"CERTIFICATE", true, false, "CA_PEM in mqtt_ca.rs holds no PEM certificate");
-
 /// The connected socket, wrapped in TLS: the handshake, awaited whole.
-pub(super) async fn open<'s>(socket: TcpSocket<'s>, links: &'s mut LinkBuffers) -> Result<Link<'s>, ()> {
+pub async fn open<'s>(
+    socket: TcpSocket<'s>,
+    links: &'s mut LinkBuffers,
+    to: &Target<'_>,
+) -> Result<Link<'s>, ()> {
+    init();
     clock_ready().await;
     let mut link: Link<'s> = TlsConnection::new(Gate::new(socket), &mut links.rx, &mut links.tx);
     // A certificate names DNS names, and an address is never sent as SNI.
-    let ip = SERVER_NAME.parse::<Ipv4Addr>().is_ok();
+    let ip = to.server_name.parse::<Ipv4Addr>().is_ok();
     let config = if ip {
         TlsConfig::new()
     } else {
-        TlsConfig::new().with_server_name(SERVER_NAME)
+        TlsConfig::new().with_server_name(to.server_name)
     };
-    let config = if ALPN.is_empty() {
+    let config = if to.alpn.is_empty() {
         config
     } else {
-        config.with_alpn(ALPN)
+        config.with_alpn(to.alpn)
     };
-    if VERIFY && ip {
+    if to.verify && ip {
         return Err(());
     }
-    let mut verifier = Verifier::new(&CA_DER[..]);
+    let mut verifier = Verifier::new(to.cas);
     let provider = Provider {
         rng: tls_rng()?,
-        verifier: if VERIFY { Some(&mut verifier) } else { None },
+        verifier: if to.verify { Some(&mut verifier) } else { None },
+        client: to.client,
     };
-    link.open(TlsContext::new(&config, provider))
-        .await
-        .map_err(drop)?;
+    let _one = HANDSHAKE.lock().await;
+    embassy_time::with_timeout(
+        embassy_time::Duration::from_secs(OPEN_S),
+        link.open(TlsContext::new(&config, provider)),
+    )
+    .await
+    .map_err(drop)?
+    .map_err(drop)?;
     // embedded-tls 0.19 also completes a handshake in which the server sent
     // no certificate at all (its issue #215): then nobody was authenticated.
-    if VERIFY && !verifier.authenticated {
+    if to.verify && !verifier.authenticated {
         return Err(());
     }
-    // A broker that refuses the board's certificate says so on the first
-    // read, not here: mqtt.rs then finds the connection closed and retries.
+    // A server that refuses the board's certificate says so on the first
+    // read, not here.
     Ok(link)
 }
 
 /// What embedded-tls asks for during the handshake: randomness, the verifier
-/// that checks the broker's chain, its signature and its name (none: encrypt
-/// only) - and, when the broker asks, the board's certificate and signature.
+/// that checks the server's chain, its signature and its name (none: encrypt
+/// only) - and, when the server asks, the board's certificate and signature.
 struct Provider<'v, 'a> {
     rng: TlsRng,
     verifier: Option<&'v mut Verifier<'a>>,
+    client: Option<(&'a [u8], [u8; 32])>,
 }
 
 impl CryptoProvider for Provider<'_, '_> {
@@ -209,12 +138,41 @@ impl CryptoProvider for Provider<'_, '_> {
     }
 
     fn signer(&mut self) -> Result<(impl ecdsa::signature::SignerMut<Self::Signature>, SignatureScheme), TlsError> {
-        let (_, key) = CLIENT.ok_or(TlsError::Unimplemented)?;
+        let (_, key) = self.client.ok_or(TlsError::Unimplemented)?;
         Ok((ClientKey::new(key)?, SignatureScheme::EcdsaSecp256r1Sha256))
     }
 
     fn client_cert(&mut self) -> Option<Certificate<impl AsRef<[u8]>>> {
-        CLIENT.map(|(cert, _)| Certificate::X509(cert))
+        self.client.map(|(cert, _)| Certificate::X509(cert))
+    }
+}
+
+/// A connection whose end - the server's close_notify, which embedded-tls
+/// 0.19 returns as an error - reads as the end of the stream: an HTTP body
+/// may run until the server closes.
+#[allow(dead_code)]
+pub struct Closing<'l, 's>(pub &'l mut Link<'s>);
+
+impl ErrorType for Closing<'_, '_> {
+    type Error = TlsError;
+}
+
+impl Read for Closing<'_, '_> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
+        match self.0.read(buf).await {
+            Err(TlsError::ConnectionClosed) => Ok(0),
+            other => other,
+        }
+    }
+}
+
+impl Write for Closing<'_, '_> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, TlsError> {
+        self.0.write(buf).await
+    }
+
+    async fn flush(&mut self) -> Result<(), TlsError> {
+        self.0.flush().await
     }
 }
 
@@ -290,7 +248,7 @@ impl Read for Gate<'_> {
             }
             // A record bigger than the socket's buffer can never be queued
             // whole: it streams through (only the handshake's, which is never
-            // dropped halfway). Nor once the broker can send nothing more - a
+            // dropped halfway). Nor once the server can send nothing more - a
             // closed socket keeps what it holds, and `may_recv` stays true then.
             while len <= self.socket.recv_capacity()
                 && self.socket.recv_queue() < len

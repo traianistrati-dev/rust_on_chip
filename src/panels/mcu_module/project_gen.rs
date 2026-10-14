@@ -1045,9 +1045,11 @@ pub fn ensure_iot_deps(
     let mqtt = active.is_some_and(|a| a.mqtt);
     let ble = active.is_some_and(|a| a.ble);
     let thread = active.is_some_and(|a| a.thread);
-    // MQTT over TLS: embedded-tls, on every platform the station runs on.
-    let tls = active.is_some_and(|a| a.mqtt_tls);
-    let p384_chains = active.is_some_and(|a| a.mqtt_p384);
+    // TLS - MQTT's, HTTP's or both, through tls.rs: embedded-tls, on every
+    // platform the station runs on.
+    let tls = active.is_some_and(|a| a.tls());
+    let p384_chains = active.is_some_and(|a| a.p384());
+    let http = active.is_some_and(|a| a.http);
     let tls_pico = tls && active.is_some_and(|a| a.platform == Platform::Cyw43);
     // Thread on an ESP: esp-radio's `ieee802154`, openthread 0.2 and the
     // Mbed TLS profile that links prebuilt. On an nRF: openthread 0.4 and an
@@ -1154,9 +1156,9 @@ pub fn ensure_iot_deps(
         "rust-mqtt = { version = \"0.6\", default-features = false, features = [\"v5\", \"bump\"] }",
         sources,
     );
-    // MQTT over TLS 1.3. `rsa`: every public broker probed presents an RSA
-    // chain, and without it embedded-tls does not even offer RSA signatures.
-    // `p384` with the tab's "P-384 chains" (ECDSA Let's Encrypt).
+    // TLS 1.3. `rsa`: every public broker probed presents an RSA chain, and
+    // without it embedded-tls does not even offer RSA signatures. `p384` with
+    // the tab's "P-384 chains" (ECDSA Let's Encrypt, Discord).
     let p384 = tls && p384_chains;
     let etls = if p384 {
         "embedded-tls = { version = \"0.19\", default-features = false, features = [\"rsa\", \"p384\"] }"
@@ -1167,9 +1169,10 @@ pub fn ensure_iot_deps(
     if tls {
         s = set_owned_dep_line(&s, "embedded-tls", etls);
     }
-    // mqtt_link.rs names embedded-io-async's traits. Added, never removed:
-    // the async USART's config files use it too, and those are not `sources`.
-    if tls {
+    // tls.rs and http.rs name embedded-io-async's traits. Added, never
+    // removed: the async USART's config files use it too, and those are not
+    // `sources`.
+    if tls || http {
         s = ensure_dep(
             &s,
             "embedded-io-async",
@@ -5614,6 +5617,9 @@ mod iot_deps_tests {
             ble: false,
             thread: false,
             panic: false,
+            http: false,
+            http_tls: false,
+            http_p384: false,
         })
     }
 
@@ -5689,6 +5695,9 @@ mod iot_deps_tests {
                 ble: false,
                 thread: false,
                 panic: false,
+                http: false,
+                http_tls: false,
+                http_p384: false,
             }),
             "",
             "rp2040",
@@ -5728,6 +5737,9 @@ mod iot_deps_tests {
             ble: false,
             thread: false,
             panic: false,
+            http: false,
+            http_tls: false,
+            http_p384: false,
         });
         let on = ensure_iot_deps(ESP_ASYNC, both, "esp32c3", "esp32c3", &[]);
         assert!(
@@ -5759,6 +5771,9 @@ mod iot_deps_tests {
             ble: false,
             thread: false,
             panic: false,
+            http: false,
+            http_tls: false,
+            http_p384: false,
         });
         let a = ensure_iot_deps(ESP_ASYNC, alone, "esp32c3", "esp32c3", &[]);
         assert!(a.contains("\"esp-now\"") && a.contains("esp-alloc"), "{a}");
@@ -5799,6 +5814,9 @@ mod iot_deps_tests {
             ble,
             thread: false,
             panic: false,
+            http: false,
+            http_tls: false,
+            http_p384: false,
         })
     }
 

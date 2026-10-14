@@ -328,6 +328,10 @@ $ALL_CASES = @(
     @{ n = "ESP32-C3 IoT, everything on";   t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $true; fam = "esp"; lk = $true }
     @{ n = "ESP32-C3 ESP-NOW alone";        t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "espnow" }; q = $true; fam = "esp" }
     @{ n = "ESP32-C3 Wi-Fi only (IoT)";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "wifi" }; q = $false; fam = "esp" }
+    # The HTTP client: plain only, and HTTPS alone - tls.rs for HTTP without
+    # MQTT. Beside MQTT over TLS it rides in the "everything" rows below.
+    @{ n = "ESP32-C3 HTTP, plain (IoT)";    t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "http" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 HTTPS alone (IoT)";    t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "https"; CMAKE = "eide-no-cmake" }; q = $true; fam = "esp"; lk = $true }
     @{ n = "ESP32 IoT, everything (Xtensa)";    t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
     @{ n = "ESP32 ESP-NOW alone (Xtensa)";      t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "espnow" }; q = $false; fam = "esp" }
     @{ n = "ESP32-S2 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
@@ -487,9 +491,11 @@ $ALL_CASES = @(
     # network, `control` handed to the Wi-Fi task, embassy-net + rust-mqtt
     # (bump buffer, no heap) + SNTP over it; then MQTT over TLS on both, with
     # the heap TLS brings and keys whitened by SHA-256 - the ring oscillator's,
-    # and on the Pico 2 W its TRNG's, bound in main. Linked,
-    # like the radio row; CMAKE naming nothing keeps them pure Rust.
-    @{ n = "Raspberry Pi Pico W Wi-Fi/BLE/TLS x6"; t = "emit_rp_iot_project"; e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "rp"; lk = $true }
+    # and on the Pico 2 W its TRNG's, bound in main; the HTTP client plain,
+    # HTTPS alone, and HTTPS beside MQTT over TLS on the RP2040 (two TLS
+    # sessions on the smallest chip). Linked, like the radio row; CMAKE naming
+    # nothing keeps them pure Rust.
+    @{ n = "Raspberry Pi Pico W Wi-Fi/BLE/TLS/HTTP x6"; t = "emit_rp_iot_project"; e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "rp"; lk = $true }
 
     # The pico2-ice, Blocking and Async: the only RP2350B board, so the only
     # rows of the FUNCSEL table past GP29 (UART1 on GP36/37, SPI0 on 32/34/35,

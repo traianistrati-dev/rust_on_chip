@@ -3,10 +3,14 @@
 //! test publication - what an AWS IoT policy allows or refuses?
 //!
 //! The checks are the firmware's - `iot_templates/tls_verify.rs`, the text
-//! every TLS `mqtt_link.rs` carries - compiled into a small host program
+//! every `tls.rs` carries, for MQTT and HTTP - compiled into a small host program
 //! (`iot_gen::tls_check_files`) beside this instance's workspace, built once with
 //! the user's own cargo (about a minute; seconds after) and run with the
 //! request on stdin. Nothing of it is in the IDE's own dependencies.
+//!
+//! The same program probes a URL for the HTTP client (`http` mode): the
+//! handshake and checks of `http.rs`, then one GET, its head and body held
+//! against the board's buffers.
 
 use std::hash::{Hash as _, Hasher as _};
 use std::io::{Read as _, Write as _};
@@ -63,10 +67,59 @@ impl Request {
     }
 }
 
+/// What the HTTP probe tests: a URL, by the board's own checks (the CAs of
+/// `http_ca.rs`) and against its buffers. No `Debug`: a query may carry an
+/// API key.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct HttpRequest {
+    /// `http://` or `https://`, a host name or an IPv4 address, a port, the
+    /// path and the query - as the firmware's `get()` takes it.
+    pub url: String,
+    pub verify: bool,
+    pub ca: Vec<u8>,
+    /// "P-384 chains" is on: without it the board fails a chain signed with
+    /// P-384, which this PC checks either way.
+    pub p384: bool,
+    /// The board's buffer for the response head (HEAD_MAX), and for the
+    /// body (BODY_MAX).
+    pub head_max: usize,
+    pub body_max: usize,
+    /// What the board calls itself (some APIs refuse a request without).
+    pub user_agent: String,
+    /// The board's buffer for the request head (REQUEST_HEAD_MAX).
+    pub request_head_max: usize,
+}
+
+impl HttpRequest {
+    /// Which URL a result was for: shown beside it once it changes.
+    pub fn key(&self) -> String {
+        self.url.clone()
+    }
+
+    /// What a result remembers of its request: every field counts as a
+    /// change - the CA, the check, the switch and the limits as much as the
+    /// URL.
+    pub fn tested(&self) -> Tested {
+        let mut h = std::hash::DefaultHasher::new();
+        self.hash(&mut h);
+        Tested {
+            key: self.key(),
+            fingerprint: h.finish(),
+            // Plain http:// checks no certificate, and so no dates either.
+            verify: self.verify && https(&self.url),
+        }
+    }
+}
+
+/// The URL's scheme is https, in any case.
+fn https(url: &str) -> bool {
+    url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+}
+
 /// The request a result was for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tested {
-    /// `Request::key`, to show.
+    /// `Request::key` (or `HttpRequest::key`), to show.
     pub key: String,
     /// A hash of the whole request: anything changed makes the result stale.
     pub fingerprint: u64,
@@ -81,7 +134,7 @@ pub enum State {
     Idle,
     /// Building the checker - about a minute the first time.
     Building,
-    /// Connecting to the broker.
+    /// Connecting to the broker (the server, for a URL).
     Connecting,
     Done {
         ok: bool,
@@ -100,10 +153,23 @@ pub type Shared = Arc<Mutex<State>>;
 
 /// Run a test in the background; `ctx` repaints the tab as it moves on.
 pub fn start(request: Request, ctx: egui::Context) -> Shared {
+    in_background(ctx, move |shared, ctx| run(&request, shared, ctx))
+}
+
+/// Probe a URL in the background, as `start` tests a broker.
+pub fn start_http(request: HttpRequest, ctx: egui::Context) -> Shared {
+    in_background(ctx, move |shared, ctx| run_http(&request, shared, ctx))
+}
+
+/// `test` on its own thread, its answer in the returned state at the end.
+fn in_background(
+    ctx: egui::Context,
+    test: impl FnOnce(&Shared, &egui::Context) -> State + Send + 'static,
+) -> Shared {
     let shared: Shared = Arc::new(Mutex::new(State::Building));
     let out = Arc::clone(&shared);
     std::thread::spawn(move || {
-        let done = run(&request, &out, &ctx);
+        let done = test(&out, &ctx);
         if let Ok(mut s) = out.lock() {
             *s = done;
         }
@@ -175,6 +241,27 @@ pub fn stdin_lines(r: &Request) -> String {
         o.push('\n');
     }
     o
+}
+
+/// The `http` mode's request as the checker reads it: one hex line per
+/// value - the URL, verify, the CAs as DER, "P-384 chains", HEAD_MAX,
+/// BODY_MAX and the User-Agent.
+pub fn http_stdin_lines(r: &HttpRequest) -> String {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let flag = |on: bool| if on { "1" } else { "0" };
+    [
+        r.url.as_bytes(),
+        flag(r.verify).as_bytes(),
+        &r.ca,
+        flag(r.p384).as_bytes(),
+        r.head_max.to_string().as_bytes(),
+        r.body_max.to_string().as_bytes(),
+        r.user_agent.as_bytes(),
+        r.request_head_max.to_string().as_bytes(),
+    ]
+    .iter()
+    .map(|field| hex(field) + "\n")
+    .collect()
 }
 
 /// The checker's answer, read out of what it printed.
@@ -269,9 +356,9 @@ fn build_checker() -> Result<PathBuf, String> {
 }
 
 /// Runs the checker with `args`, `input` on its stdin; what it printed. A
-/// minute at most: a broker that never answers must not leave the tab
-/// waiting for ever.
-fn run_checker(exe: &Path, args: &[&str], input: &str) -> Result<String, String> {
+/// minute at most: a broker (`peer`) that never answers must not leave the
+/// tab waiting for ever.
+fn run_checker(exe: &Path, args: &[&str], input: &str, peer: &str) -> Result<String, String> {
     let mut check = Command::new(exe);
     crate::build::no_window_raw(&mut check)
         .args(args)
@@ -300,9 +387,9 @@ fn run_checker(exe: &Path, args: &[&str], input: &str) -> Result<String, String>
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(
-                    "no answer within a minute - the broker or the network is silent".into(),
-                );
+                return Err(format!(
+                    "no answer within a minute - {peer} or the network is silent"
+                ));
             }
         }
     }
@@ -310,7 +397,25 @@ fn run_checker(exe: &Path, args: &[&str], input: &str) -> Result<String, String>
 }
 
 fn run(request: &Request, shared: &Shared, ctx: &egui::Context) -> State {
-    let tested = request.tested();
+    let input = stdin_lines(request);
+    check(&[], &input, "the broker", request.tested(), shared, ctx)
+}
+
+fn run_http(request: &HttpRequest, shared: &Shared, ctx: &egui::Context) -> State {
+    let input = http_stdin_lines(request);
+    check(&["http"], &input, "the server", request.tested(), shared, ctx)
+}
+
+/// The checker built, then run in the mode `args` names with `input`: its
+/// answer, for `tested`.
+fn check(
+    args: &[&str],
+    input: &str,
+    peer: &str,
+    tested: Tested,
+    shared: &Shared,
+    ctx: &egui::Context,
+) -> State {
     let exe = match build_checker() {
         Ok(exe) => exe,
         Err(why) => return failed(why, &tested),
@@ -319,7 +424,7 @@ fn run(request: &Request, shared: &Shared, ctx: &egui::Context) -> State {
         *s = State::Connecting;
     }
     ctx.request_repaint();
-    match run_checker(&exe, &[], &stdin_lines(request)) {
+    match run_checker(&exe, args, input, peer) {
         Ok(stdout) => parse_output(&stdout, tested),
         Err(why) => failed(why, &tested),
     }
@@ -433,7 +538,7 @@ pub fn parse_csr(stdout: &str, want_key: bool, project: PathBuf) -> Result<CsrDo
 
 fn csr(request: &CsrRequest) -> Result<CsrDone, String> {
     let exe = build_checker()?;
-    let stdout = run_checker(&exe, &["csr"], &csr_lines(request))?;
+    let stdout = run_checker(&exe, &["csr"], &csr_lines(request), "the broker")?;
     parse_csr(&stdout, request.key.is_none(), request.project.clone())
 }
 
@@ -496,6 +601,115 @@ mod tests {
             assert_ne!(changed.tested().fingerprint, before.fingerprint);
         }
         assert_eq!(r.clone().tested(), before);
+    }
+
+    /// The HTTP probe's request goes over as hex lines too, seven of them in
+    /// the order the checker's `http` mode reads them - an empty CA (plain
+    /// http://) still takes its line.
+    #[test]
+    fn the_http_request_is_one_hex_line_per_value() {
+        let r = HttpRequest {
+            url: "https://api.open-meteo.com/v1/forecast?latitude=44.43&current=temperature_2m".into(),
+            verify: true,
+            ca: vec![0x30, 0x82],
+            p384: false,
+            head_max: 2048,
+            body_max: 1024,
+            user_agent: "RustOnChip".into(),
+            request_head_max: 1024,
+        };
+        let unhex = |h: &str| -> Vec<u8> {
+            (0..h.len() / 2)
+                .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let text = http_stdin_lines(&r);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 8);
+        assert_eq!(unhex(lines[0]), r.url.as_bytes());
+        assert_eq!(lines[1], "31", "verify");
+        assert_eq!(lines[2], "3082", "the CAs");
+        assert_eq!(lines[3], "30", "P-384 chains");
+        assert_eq!(lines[4], "32303438", "HEAD_MAX in decimal");
+        assert_eq!(lines[5], "31303234", "BODY_MAX in decimal");
+        assert_eq!(unhex(lines[6]), b"RustOnChip");
+        assert_eq!(lines[7], "31303234", "REQUEST_HEAD_MAX in decimal");
+        let plain = HttpRequest {
+            url: "http://192.168.1.10:8123/api/".into(),
+            ca: Vec::new(),
+            ..r.clone()
+        };
+        let text = http_stdin_lines(&plain);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[4], "32303438", "the lines after the CA stay in place");
+    }
+
+    /// A probe's result is for its URL, and goes stale when anything it was
+    /// tested with changes - the check, the CA, the switch, the limits.
+    #[test]
+    fn an_http_result_goes_stale_with_any_field() {
+        let r = HttpRequest {
+            url: "https://letsencrypt.org/".into(),
+            verify: true,
+            ca: vec![0x30, 0x82],
+            p384: true,
+            head_max: 2048,
+            body_max: 1024,
+            user_agent: "RustOnChip".into(),
+            request_head_max: 1024,
+        };
+        assert_eq!(r.key(), "https://letsencrypt.org/");
+        let before = r.tested();
+        assert!(before.verify);
+        for changed in [
+            HttpRequest {
+                verify: false,
+                ..r.clone()
+            },
+            HttpRequest {
+                ca: vec![0x30, 0x83],
+                ..r.clone()
+            },
+            HttpRequest {
+                p384: false,
+                ..r.clone()
+            },
+            HttpRequest {
+                head_max: 4096,
+                ..r.clone()
+            },
+            HttpRequest {
+                body_max: 512,
+                ..r.clone()
+            },
+            HttpRequest {
+                user_agent: "curl/8".into(),
+                ..r.clone()
+            },
+        ] {
+            assert_eq!(changed.key(), before.key);
+            assert_ne!(changed.tested().fingerprint, before.fingerprint);
+        }
+        let other = HttpRequest {
+            url: "https://letsencrypt.org/docs/".into(),
+            ..r.clone()
+        };
+        assert_ne!(other.tested().key, before.key);
+        assert_ne!(other.tested().fingerprint, before.fingerprint);
+        assert_eq!(r.clone().tested(), before);
+        // Plain http:// checks no certificate, so no dates were checked.
+        let plain = HttpRequest {
+            url: "http://neverssl.com/".into(),
+            ..r.clone()
+        };
+        assert!(!plain.tested().verify);
+        let upper = HttpRequest {
+            url: "HTTPS://letsencrypt.org/".into(),
+            ..r.clone()
+        };
+        assert!(upper.tested().verify);
     }
 
     /// The checker's printout read back: the steps, P-384, the verdict.
@@ -651,6 +865,49 @@ mod tests {
             assert!(
                 matches!(done, State::Done { ok, .. } if ok == want),
                 "{port} {name}: {done:?}"
+            );
+        }
+    }
+
+    /// The `http` mode for real: Open-Meteo answers with ISRG Root X1, a
+    /// TLS 1.2-only host and a chain no CA of the list ends in do not. Network
+    /// and a minute of cargo, so by hand only.
+    ///
+    /// ```text
+    /// cargo test --bin rust_on_chip http_check_against_public_hosts -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "builds the checker and connects to public HTTPS hosts"]
+    fn http_check_against_public_hosts() {
+        let ca = crate::panels::mcu_module::iot::pem_der(include_str!(
+            "codegen/iot_templates/ca/isrg_root_x1.pem"
+        ))
+        .unwrap();
+        let request = |url: &str| HttpRequest {
+            url: url.into(),
+            verify: true,
+            ca: ca.clone(),
+            p384: true,
+            head_max: 2048,
+            body_max: 1024,
+            user_agent: "RustOnChip".into(),
+            request_head_max: 1024,
+        };
+        let ctx = egui::Context::default();
+        for (url, want) in [
+            (
+                "https://api.open-meteo.com/v1/forecast?latitude=44.43&longitude=26.10&current=temperature_2m",
+                true,
+            ),
+            ("https://httpbin.org/get", false),
+            ("https://api.thingspeak.com/channels/9/feeds.json?results=1", false),
+        ] {
+            let shared = Shared::default();
+            let done = run_http(&request(url), &shared, &ctx);
+            println!("{url}: {done:?}");
+            assert!(
+                matches!(done, State::Done { ok, .. } if ok == want),
+                "{url}: {done:?}"
             );
         }
     }

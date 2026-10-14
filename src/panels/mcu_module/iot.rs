@@ -72,6 +72,10 @@ pub struct IotConfig {
     /// the IDE edits it only once the box is ticked.
     #[serde(default)]
     pub restart_on_panic: bool,
+    /// The HTTP client (`src/pins/configs/http.rs`), `Some` while it is
+    /// switched on. Needs the station.
+    #[serde(default)]
+    pub http: Option<HttpConfig>,
 }
 
 impl Default for IotConfig {
@@ -86,8 +90,96 @@ impl Default for IotConfig {
             ble: None,
             thread: None,
             restart_on_panic: true,
+            http: None,
         }
     }
+}
+
+/// The HTTP client. The URLs are the firmware's own, given at each call;
+/// these are what every request shares.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpConfig {
+    /// https:// URLs: TLS 1.3 (tls.rs), checked against http_ca.rs's CAs.
+    /// Off, an https:// URL is refused - never sent in clear.
+    pub tls: bool,
+    /// Check the server's certificate. Off = encrypted, but anyone on the
+    /// path can pose as the server.
+    pub verify: bool,
+    /// Accept chains signed with P-384 (embedded-tls's `p384`): Discord,
+    /// ECDSA Let's Encrypt certificates.
+    pub p384: bool,
+    /// The largest response body a request keeps, in bytes.
+    pub body_max: u32,
+    /// The largest request body, in bytes.
+    pub payload_max: u32,
+    /// Seconds a whole request may take.
+    pub timeout_s: u16,
+    /// The User-Agent header; some APIs (Discord) refuse a request without
+    /// one.
+    pub user_agent: String,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            tls: true,
+            verify: true,
+            p384: false,
+            body_max: 2048,
+            payload_max: 1024,
+            timeout_s: 30,
+            user_agent: "RustOnChip".to_owned(),
+        }
+    }
+}
+
+/// The User-Agent as the request carries it: visible ASCII and spaces only (a
+/// line break would end the header), 64 bytes at most, "RustOnChip" when
+/// nothing is left.
+pub fn http_user_agent(text: &str) -> String {
+    let mut ua: String = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    while ua.len() > 64 {
+        ua.pop();
+    }
+    if ua.is_empty() {
+        ua = "RustOnChip".to_owned();
+    }
+    ua
+}
+
+/// The longest response head (status line and headers) the board takes -
+/// http_core.rs's HEAD_MAX, which a test holds this to.
+pub const HTTP_HEAD_MAX: usize = 2048;
+
+/// The longest request head (request line and headers) the board builds -
+/// http_core.rs's REQUEST_HEAD_MAX: an Authorization with a JWT fits.
+pub const HTTP_REQUEST_HEAD_MAX: usize = 1024;
+
+/// The body limits the tab offers, in bytes: below 64 nothing useful fits,
+/// above 16 KiB the RAM of a small chip runs out.
+pub const HTTP_BODY_RANGE: core::ops::RangeInclusive<u32> = 64..=16_384;
+
+/// Can HTTP run over TLS on `family`? As MQTT ([`tls_available`]), and one
+/// more: beside MQTT over TLS a second TLS session takes about 40 KB of RAM
+/// more (measured), which the ESP32-C2 has not. `Err` says why not.
+pub fn https_available(family: &str, coex: bool, mqtt_tls: bool) -> Result<(), &'static str> {
+    tls_available(family, coex)?;
+    if mqtt_tls && family == "esp32c2" {
+        return Err("beside MQTT over TLS the ESP32-C2 has no RAM for a second TLS session (about 40 KB)");
+    }
+    Ok(())
+}
+
+/// A second TLS session beside MQTT's leaves these chips about 15 KB of
+/// stack (measured: it links, but was never run on a board).
+pub fn https_tight(family: &str, mqtt_tls: bool) -> bool {
+    mqtt_tls && matches!(family, "esp32" | "esp32s2")
 }
 
 /// Thread: the UDP port the device listens on. Which network it joins is the
@@ -1071,6 +1163,24 @@ pub struct Active {
     /// Restart on panic: `src/pins/configs/panic.rs`, the handler in main.rs's
     /// header and the boot report.
     pub panic: bool,
+    /// The HTTP client - only with the station.
+    pub http: bool,
+    /// ... https:// URLs, where the chip has what it takes ([`https_available`]).
+    pub http_tls: bool,
+    /// ... accepting P-384 chains.
+    pub http_p384: bool,
+}
+
+impl Active {
+    /// Some client speaks TLS: tls.rs, embedded-tls and (on a Pico) the heap.
+    pub fn tls(&self) -> bool {
+        self.mqtt_tls || self.http_tls
+    }
+
+    /// Some TLS client accepts P-384 chains: embedded-tls's `p384`.
+    pub fn p384(&self) -> bool {
+        self.mqtt_p384 || self.http_p384
+    }
 }
 
 /// `Some` when a link is on, the chip can carry it, and the runtime is Async:
@@ -1093,7 +1203,15 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     if !station && !esp_now && !ble && !thread {
         return None;
     }
-    let tls_ok = tls_available(&mcu.family, ble && (station || esp_now)).is_ok();
+    let coex = ble && (station || esp_now);
+    let tls_ok = tls_available(&mcu.family, coex).is_ok();
+    let mqtt_tls = station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls) && tls_ok;
+    let http = station && mcu.iot.http.is_some();
+    // HTTPS where it cannot be carried: http.rs refuses https:// URLs, so
+    // nothing ever goes out in clear - HTTP itself stays.
+    let http_tls = http
+        && mcu.iot.http.as_ref().is_some_and(|h| h.tls)
+        && https_available(&mcu.family, coex, mqtt_tls).is_ok();
     Some(Active {
         platform: wifi.or(bt)?,
         station,
@@ -1101,7 +1219,7 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
         // TLS asked for where the chip cannot carry it: no MQTT at all, never
         // the password in clear to a port that expects TLS.
         mqtt: station && mcu.iot.mqtt.as_ref().is_some_and(|m| !m.tls || tls_ok),
-        mqtt_tls: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls) && tls_ok,
+        mqtt_tls,
         mqtt_p384: station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls && m.p384) && tls_ok,
         mqtt_client_cert: station
             && mcu
@@ -1114,6 +1232,9 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
         ble,
         thread,
         panic: mcu.iot.restart_on_panic,
+        http,
+        http_tls,
+        http_p384: http_tls && mcu.iot.http.as_ref().is_some_and(|h| h.p384),
     })
 }
 

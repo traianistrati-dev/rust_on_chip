@@ -384,11 +384,12 @@ Generated today, on the **Async** runtime: a **Wi-Fi station** on every ESP
 chip with Wi-Fi (`esp-radio` 0.18, the release on the esp-hal 1.1 line, with
 an `esp-alloc` heap set in the tab) and on the **Pico W / Pico 2 W** (the CYW43
 radio, brought up once for both the LED and the network); **embassy-net** with
-DHCP or a static address; an **MQTT 5 client** (`rust-mqtt` 0.6); **SNTP**
-network time, hand-written over embassy-net's UDP socket; and **ESP-NOW** on
+DHCP or a static address; an **MQTT 5 client** (`rust-mqtt` 0.6); an **HTTP
+client** (HTTP/1.1, hand-written); **SNTP** network time, hand-written over
+embassy-net's UDP socket; and **ESP-NOW** on
 the ESP chips with Wi-Fi — beside the station or on its own, on a channel and
 with a peer list set in the tab. It all lands in
-`src/pins/configs/{net,wifi,mqtt,sntp,espnow}.rs`, constants from the tab in
+`src/pins/configs/{net,wifi,mqtt,http,sntp,espnow}.rs`, constants from the tab in
 the generated block, the tasks below it, editable. Your code calls
 `pins::configs::mqtt::publish("topic", b"payload").await` /
 `incoming().await`, `pins::configs::sntp::now_unix()`, and
@@ -474,7 +475,8 @@ on top of it. SNTP is unauthenticated UDP.
 **MQTT over TLS** is a switch on the MQTT client, on the ESP chips and the
 Pico W / Pico 2 W: TLS 1.3 through embedded-tls — pure Rust, so nothing but
 rustc and cargo is needed on any of them. `mqtt.rs` itself never changes with
-the switch; `mqtt_link.rs` beside it is plain TCP or TLS. With TLS the broker
+the switch; `mqtt_link.rs` beside it is plain TCP or TLS, the TLS being
+`tls.rs`'s, which the HTTP client shares. With TLS the broker
 must present a chain that ends in the CA of `mqtt_ca.rs` and names the server
 name (the host, unless set), and prove it holds that key; the dates are checked
 once SNTP has the time. `mqtt_ca.rs` is written once with ISRG Root X1 (Let's
@@ -495,7 +497,7 @@ message after the handshake, an RSA key the `rsa` crate refuses — and with
 **Restart on panic** each one costs a restart, not the board. "Encrypt only,
 no check" is offered, with
 the warning it deserves; it is never the default. **Test from this PC** runs
-those same checks — the very text of the firmware's `mqtt_link.rs`, built into
+those same checks — the very text of the firmware's `tls.rs`, built into
 a small program with your own cargo (about a minute the first time, seconds
 after; nothing of it in the IDE's dependencies) — against the broker, then the
 board's own MQTT 5 CONNECT with the login from `secrets.rs`, each of its
@@ -540,6 +542,29 @@ oscillator alone on the Pico W. Not on the
 ESP32-C5 / C61 (no TRNG in esp-hal 1.1), nor on an ESP32 or ESP32-C2 with
 Bluetooth beside Wi-Fi (no RAM left) — and where TLS is switched on but cannot
 run, no MQTT is generated at all, never the password in clear.
+
+**HTTP client**: `pins::configs::http::get(url, &mut body).await`, `post(url,
+content_type, payload, &mut body)` and `request()` for the method, an
+Authorization (Bearer, Basic or as given) and more headers - the URL given at
+each call, so one board talks to several services. One task makes the
+requests, one at a time, each on its own connection (`Connection: close`),
+within a timeout; a caller's own task stays small. The protocol is
+hand-written (as SNTP is) and tested in the IDE's own suite - chunked bodies
+with extensions and trailers, interim answers, HEAD/204/304, conflicting
+lengths, and 40,000 fuzzed inputs without a panic or a spin; a body larger
+than the tab's limit is cut and flagged, a redirect is reported, never
+followed. **HTTPS** goes through `tls.rs`, the TLS 1.3 that MQTT now shares:
+one verifier, one heap, one handshake at a time (checking RSA borrows about
+22 KB), the Pico 2 W's TRNG - and a second session's buffers, about 40 KB
+beside MQTT's (measured; too much for the ESP32-C2, tight on the ESP32 and
+the S2). Where a chip cannot carry it, `https://` URLs are refused, never sent
+in clear. Its CAs are `http_ca.rs`, apart from the broker's: "Add a known CA"
+appends ISRG Root X1, Amazon's, DigiCert Global Root G2 (ThingSpeak),
+USERTrust (OpenWeatherMap) or GTS Root R4 (Google, Discord - with "P-384
+chains"), each fingerprint checked against two published lists. **Test from
+this PC** takes a URL: the board's own handshake, its CAs and its buffers -
+it says, before anything is flashed, when a server speaks only TLS 1.2, wants
+a CA or P-384, sends a head over the board's 2 KB, redirects or answers 404.
 
 ### Virtual device modules
 Instead of wiring a peripheral pin by pin, you can drop a **device** onto the

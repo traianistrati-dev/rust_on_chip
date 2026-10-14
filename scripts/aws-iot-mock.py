@@ -22,6 +22,16 @@ unregistered client certificate. The MQTT side follows what AWS documents
 (developerguide/mqtt.html and the message-broker limits in
 general/latest/gr/iot-core.html), not captured traffic.
 
+HTTPS publish (`aws_publish()`, the helper's `http` mode): `POST
+/topics/<topic>?qos=0|1` on "8443", or on "443" with the ALPN x-amzn-http-ca,
+with the board's certificate - checked as on the MQTT side (a reset for a
+missing or unregistered one: AWS's on 8443 probed, on 443 assumed alike) -
+and delivered to the MQTT subscribers. What it answers follows AWS's
+documentation and the captures others published, NOT traffic this mock was
+built from: 200 {"message":"OK","traceId":...}, 403 {"message":"Forbidden",
+...} outside the policy (the documented ForbiddenException), 400 for a QoS
+other than 0 or 1, 413 over 128 KB. AWS's own status for those may differ.
+
 Needs Python 3.8+ (standard library only) and openssl: $OPENSSL, then PATH,
 then Git for Windows' copy. The PKI and scratch files go to --work (default:
 a folder in the temp directory); they are made once and reused.
@@ -35,7 +45,7 @@ PASS / FAIL / SKIP line each, and exit code 1 on any FAIL. CASE picks some by id
 1a, 1b and 1c, `5b` just that one. -v prints every case's helper output and
 broker log.
 
-    python scripts/aws-iot-mock.py serve [--bind 127.0.0.1] [--port-443 18443] [--port-8883 18883]
+    python scripts/aws-iot-mock.py serve [--bind 127.0.0.1] [--port-443 18443] [--port-8883 18883] [--port-8443 28443]
 
 runs only the broker, for a real board, and prints what to set in the IoT
 tab. serve also takes --allow FILTER, --deny rst, --reason-strings,
@@ -74,6 +84,9 @@ REGION = "eu-south-1"
 ENDPOINT = "a1b2c3d4e5f6g7-ats.iot." + REGION + ".amazonaws.com"
 THING = "rustonchip-test"
 ALPN_MQTT = "x-amzn-mqtt-ca"
+ALPN_HTTP = "x-amzn-http-ca"
+# HTTPS publish: AWS's documented payload limit.
+HTTP_PUBLISH_MAX = 128 * 1024
 
 # Where the IDE builds the helper for "Test from this PC": beside its
 # workspace, for the host's triple (Windows).
@@ -720,19 +733,23 @@ class Broker:
             ctx.sni_callback = lambda sock, name, c: None
             return ctx
 
-        def mqtt():
+        def client_cert(alpn):
             ctx = base()
             ctx.load_verify_locations(str(self.pki.path("iotca.pem")))
             ctx.verify_mode = ssl.CERT_REQUIRED if self.o.nocert == "alert" else ssl.CERT_OPTIONAL
-            ctx.set_alpn_protocols([ALPN_MQTT])
-            if self.o.aws_sigalgs:
-                self.sigalgs_set = set_cr_sigalgs(ctx)
+            ctx.set_alpn_protocols([alpn])
             return ctx
 
-        return {"mqtt": mqtt(), "https": base()}
+        mqtt = client_cert(ALPN_MQTT)
+        http = client_cert(ALPN_HTTP)
+        if self.o.aws_sigalgs:
+            # wire_check reads the MQTT side's.
+            self.sigalgs_set = set_cr_sigalgs(mqtt)
+            set_cr_sigalgs(http)
+        return {"mqtt": mqtt, "http": http, "https": base()}
 
-    def start(self, bind, port_443, port_8883):
-        for kind, port in (("443", port_443), ("8883", port_8883)):
+    def start(self, bind, port_443, port_8883, port_8443=0):
+        for kind, port in (("443", port_443), ("8883", port_8883), ("8443", port_8443)):
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             if os.name != "nt":
                 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # (on Windows it would share the port)
@@ -805,15 +822,17 @@ class Broker:
             log("TLS 1.3 alone, to a TLS 1.2 endpoint: close_notify, then a reset (as AWS)")
             reset(conn)
             return
-        mqtt = kind == "8883" or ALPN_MQTT in hello["alpn"]
+        http = kind == "8443" or (kind == "443" and ALPN_HTTP in hello["alpn"])
+        mqtt = not http and (kind == "8883" or ALPN_MQTT in hello["alpn"])
+        side = "http" if http else ("mqtt" if mqtt else "https")
         try:
-            s = self.ctx["mqtt" if mqtt else "https"].wrap_socket(conn, server_side=True)
+            s = self.ctx[side].wrap_socket(conn, server_side=True)
         except (OSError, ssl.SSLError) as e:
             log("TLS handshake failed: %s" % e)
             close_quietly(conn)
             return
         log("%s %s, ALPN %r" % (s.version(), s.cipher()[0], s.selected_alpn_protocol()))
-        if not mqtt:
+        if side == "https":
             self.https_side(s, log)
             return
         cert = s.getpeercert(binary_form=True)
@@ -828,7 +847,10 @@ class Broker:
             reset(s)
             return
         log("client certificate %s... is registered, attached to the thing %r" % (fp[:16], thing))
-        Session(self, s, thing, log).run()
+        if http:
+            HttpsPublish(self, s, thing, log).run()
+        else:
+            Session(self, s, thing, log).run()
 
     def https_side(self, s, log):
         """443 without the MQTT ALPN is AWS's HTTPS / WebSocket side: it asked for no
@@ -1188,6 +1210,110 @@ class Session:
             self.log("delivered `%s` to %r at QoS 0" % (topic, self.client_id))
 
 
+class HttpsPublish:
+    """AWS IoT's HTTPS publish, after the certificate was found in the registry:
+    one request, then the connection ends. What it answers is AWS's documentation
+    (and published captures), not probed traffic - see the docstring at the top."""
+
+    def __init__(self, broker, sock, thing, log):
+        self.broker, self.sock, self.thing, self.log = broker, sock, thing, log
+
+    def run(self):
+        self.sock.settimeout(20)
+        try:
+            self.serve()
+        except (OSError, ssl.SSLError, ValueError) as e:
+            self.log("HTTPS publish ended: %s" % e)
+        close_quietly(self.sock)
+
+    def answer(self, status, reason, message):
+        import uuid
+        body = ('{"message":%s,"traceId":"%s"}' % (
+            '"%s"' % message if message is not None else "null", uuid.uuid4())).encode()
+        head = ("HTTP/1.1 %d %s\r\ncontent-type: application/json\r\ncontent-length: %d\r\n"
+                "connection: close\r\n\r\n" % (status, reason, len(body))).encode()
+        self.sock.sendall(head + body)
+        return status
+
+    def serve(self):
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                self.log("HTTPS publish: the client closed before a whole head")
+                return
+            data += chunk
+            if len(data) > 16 * 1024:
+                self.log("HTTPS publish: a head over 16 KB")
+                return self.answer(400, "Bad Request", "Bad Request")
+        head, _, body = data.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        method, target, _ = (lines[0].split(" ") + ["", "", ""])[:3]
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+        length = int(headers.get("content-length", "0") or 0)
+        if length > HTTP_PUBLISH_MAX:
+            self.log("HTTPS %s: %d bytes, over %d" % (method, length, HTTP_PUBLISH_MAX))
+            return self.answer(413, "Payload Too Large", "Payload Too Large")
+        while len(body) < length:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+        body = body[:length]
+        self.log("HTTPS %s %s, Host %r, %d byte(s)" % (method, target, headers.get("host"), len(body)))
+        path, _, query = target.partition("?")
+        if method != "POST" or not path.startswith("/topics/"):
+            if method != "POST":
+                return self.answer(405, "Method Not Allowed", "Method Not Allowed")
+            return self.answer(404, "Not Found", "Not Found")
+        import urllib.parse
+        try:
+            topic = urllib.parse.unquote_to_bytes(path[len("/topics/"):]).decode("utf-8")
+        except UnicodeDecodeError:
+            return self.answer(400, "Bad Request", "Bad Request")
+        params = urllib.parse.parse_qs(query)
+        qos = params.get("qos", ["0"])[0]
+        what = "HTTPS POST `%s` qos %s %r" % (topic, qos, body[:48])
+        if qos not in ("0", "1"):
+            self.log(what + ": a QoS other than 0 or 1 -> 400")
+            return self.answer(400, "Bad Request", "Bad Request")
+        counted = topic.split("/", 3)[3] if topic.startswith("$aws/rules/") and topic.count("/") >= 3 else topic
+        if (not topic or "+" in topic or "#" in topic or slashes(counted) > MAX_SLASHES
+                or (topic.startswith("$") and not topic.startswith("$aws/"))):
+            self.log(what + ": not a topic AWS takes -> 400")
+            return self.answer(400, "Bad Request", "Bad Request")
+        if not self.broker.may(self.thing, "publish", topic):
+            self.log(what + ": iot:Publish on topic/%s denied -> 403" % topic)
+            return self.answer(403, "Forbidden", "Forbidden")
+        if params.get("retain", ["false"])[0] == "true" and not self.broker.may(self.thing, "retainpublish", topic):
+            self.log(what + ": iot:RetainPublish on topic/%s denied -> 403" % topic)
+            return self.answer(403, "Forbidden", "Forbidden")
+        receivers = self.broker.deliver(topic, body, None)
+        # HTTP has no "no matching subscribers": a 200 either way.
+        self.log("%s: allowed, %d receiver(s) -> 200" % (what, receivers))
+        return self.answer(200, "OK", "OK")
+
+
+class Listener:
+    """A subscriber on the MQTT side, in the broker's sessions: what an HTTPS
+    publish reaches. It records instead of sending."""
+
+    def __init__(self, broker, flt):
+        self.broker, self.flt = broker, flt
+        self.thing, self.client_id = THING, "listener"
+        self.got = []
+
+    def takes(self, topic, sender):
+        return filter_matches(self.flt, topic)
+
+    def queue(self, topic, payload):
+        self.got.append((topic, payload))
+        self.broker.log("delivered `%s` to %r: %r" % (topic, self.client_id, payload[:48]))
+
+
 # --- The cases ---------------------------------------------------------------------
 
 GOOD_FILTERS = ("rustonchip-test/cmd", "rustonchip-test/+/set")
@@ -1201,12 +1327,16 @@ GOOD_INFO = ("subscribed to", "published a test message")
 class Case:
     def __init__(self, cid, title, port="443", alpn=True, cert="device", client_id=THING, ca=("root1", "root3"),
                  filters=GOOD_FILTERS, topic=GOOD_TOPIC, keep_alive=60, broker=None, real_443=False, wire=False,
-                 result="ok", result_has=GOOD_RESULT, info_has=GOOD_INFO, info_lacks=(), log_has=()):
+                 result="ok", result_has=GOOD_RESULT, info_has=GOOD_INFO, info_lacks=(), log_has=(),
+                 https=False, qos=1, payload=b'{"t":21.5}', listener=GOOD_TOPIC):
         self.cid, self.title, self.port, self.alpn, self.cert = cid, title, port, alpn, cert
         self.client_id, self.ca, self.filters, self.topic, self.keep_alive = client_id, ca, filters, topic, keep_alive
         self.broker, self.real_443, self.wire = broker or {}, real_443, wire
         self.result, self.result_has, self.info_has = result, result_has, info_has
         self.info_lacks, self.log_has = info_lacks, log_has
+        # HTTPS publish: the helper's `http` mode, a POST of `payload` on `topic`,
+        # an MQTT subscriber to `listener` (None: nobody subscribed).
+        self.https, self.qos, self.payload, self.listener = https, qos, payload, listener
 
     def picked_by(self, arg):
         return self.cid == arg or (self.cid.startswith(arg) and self.cid[len(arg):].isalpha())
@@ -1214,6 +1344,19 @@ class Case:
 
 def fails(cid, title, has, info=(), **kw):
     return Case(cid, title, result="fail", result_has=has, info_has=info, **kw)
+
+
+SENT_CERT = ("asked for the client certificate: sent",)
+
+
+def publish(cid, title, has=("AWS IoT took the message on `rustonchip-test/test`",), info=SENT_CERT, **kw):
+    kw.setdefault("port", "8443")
+    return Case(cid, title, https=True, result_has=has, info_has=info, **kw)
+
+
+def publish_fails(cid, title, has, info=(), **kw):
+    kw.setdefault("port", "8443")
+    return Case(cid, title, https=True, result="fail", result_has=has, info_has=info, **kw)
 
 
 CASES = [
@@ -1262,6 +1405,25 @@ CASES = [
     fails("15c", "no client certificate, refused by an alert instead", ("hangs up without one",), cert=None,
           broker={"nocert": "alert"}),
     Case("15d", "two NewSessionTickets before the CONNACK (AWS sends none)", broker={"tickets": 2}),
+    publish("16a", "HTTPS publish on 8443: delivered to the MQTT subscriber",
+            log_has=("HTTPS POST /topics/rustonchip-test/test?qos=1", "allowed, 1 receiver(s) -> 200",
+                     "delivered `rustonchip-test/test` to 'listener'", "Host '" + ENDPOINT + ":8443'")),
+    publish("16b", 'HTTPS publish on "443" with the ALPN x-amzn-http-ca', port="443",
+            log_has=("ALPN 'x-amzn-http-ca'", "allowed, 1 receiver(s) -> 200", "Host '" + ENDPOINT + "'")),
+    publish_fails("16c", "a topic outside the policy: 403", ("403", "iot:Publish on topic/elsewhere/test"),
+                  SENT_CERT, topic="elsewhere/test", log_has=("denied -> 403",)),
+    publish_fails("16d", "a certificate nobody registered: a reset", ("refused the board's certificate",),
+                  cert="other", log_has=("is not registered: TCP reset",)),
+    publish_fails("16e", "no client certificate: a reset", ("hung up without one",), cert=None),
+    publish("16f", "a topic with a space, a % and a ?, percent-encoded",
+            ("AWS IoT took the message on `rustonchip-test/a b%c?d`",), topic="rustonchip-test/a b%c?d",
+            listener="rustonchip-test/#", log_has=("HTTPS POST `rustonchip-test/a b%c?d` qos 1",
+                                                    "delivered `rustonchip-test/a b%c?d`")),
+    publish("16g", "QoS 0", qos=0, log_has=("qos 0", "-> 200")),
+    publish("16h", "nobody subscribed: still 200 (HTTP says nothing of subscribers)", listener=None,
+            log_has=("allowed, 0 receiver(s) -> 200",)),
+    publish_fails("16i", "an endpoint on a TLS 1.2 security policy", ("TLS 1.3 security policy",),
+                  broker={"tls12": True, "chain": "chain4.pem"}),
 ]
 
 
@@ -1273,6 +1435,23 @@ def helper_request(case, pki, port):
     ca = b"".join(pki.der(name) for name in case.ca)
     values = ["127.0.0.1", str(port), ENDPOINT, "1", ca, case.client_id, "", "", "1" if case.alpn else "0",
               cert, key, str(case.keep_alive), "\n".join(case.filters), case.topic]
+    return "".join(hexl(v) + "\n" for v in values).encode("ascii")
+
+
+def helper_http_request(case, pki, port):
+    """The 16 lines of the helper's `http` mode: a POST as aws_publish() sends it,
+    dialled at the mock while named and checked as the endpoint."""
+    import urllib.parse
+    cert = key = ""
+    if case.cert:
+        cert = pki.path(case.cert + ".pem").read_text()
+        key = pki.path(("device" if case.cert == "device" else "other") + ".key").read_text()
+    ca = b"".join(pki.der(name) for name in case.ca)
+    on_443 = case.port == "443"
+    url = "https://%s%s/topics/%s?qos=%d" % (ENDPOINT, "" if on_443 else ":8443",
+                                             urllib.parse.quote(case.topic, safe="/"), case.qos)
+    values = [url, "1", ca, "0", "2048", "2048", "RustOnChip", "1024", "POST", "", case.payload, cert, key,
+              ALPN_HTTP if on_443 else "", "127.0.0.1:%d" % port, "1"]
     return "".join(hexl(v) + "\n" for v in values).encode("ascii")
 
 
@@ -1326,8 +1505,10 @@ def run_case(case, pki, helper, aws_sigalgs):
     broker = Broker(pki, options)
     t0 = time.monotonic()
     out = {"status": "PASS", "why": [], "output": [], "log": broker.lines, "seconds": 0.0}
+    if case.https and case.listener:
+        broker.sessions["listener"] = Listener(broker, case.listener)
     try:
-        broker.start("127.0.0.1", 443 if case.real_443 else 0, 0)
+        broker.start("127.0.0.1", 443 if case.real_443 else 0, 0, 0)
     except OSError as e:
         out.update(status="SKIP", why=["cannot listen on 127.0.0.1:%d (%s)" % (443 if case.real_443 else 0, e)])
         return out
@@ -1336,8 +1517,12 @@ def run_case(case, pki, helper, aws_sigalgs):
             out["why"], out["output"] = wire_check(broker)
         else:
             port = broker.ports[case.port]
+            if case.https:
+                command, request = [helper, "http"], helper_http_request(case, pki, port)
+            else:
+                command, request = [helper], helper_request(case, pki, port)
             try:
-                r = subprocess.run([helper], input=helper_request(case, pki, port), capture_output=True, timeout=60)
+                r = subprocess.run(command, input=request, capture_output=True, timeout=60)
                 out["output"] = r.stdout.decode("utf-8", "replace").splitlines()
                 if r.stderr.strip():
                     out["output"].append("STDERR " + r.stderr.decode("utf-8", "replace").strip()[:800])
@@ -1431,6 +1616,7 @@ def serve(argv):
     ap.add_argument("--bind", default="127.0.0.1", help="0.0.0.0 lets a board reach it (default: %(default)s)")
     ap.add_argument("--port-443", type=int, default=18443, help='the "443" side (default: %(default)s)')
     ap.add_argument("--port-8883", type=int, default=18883, help='the "8883" side (default: %(default)s)')
+    ap.add_argument("--port-8443", type=int, default=28443, help='the "8443" side, HTTPS publish (default: %(default)s)')
     ap.add_argument("--work", default=default_work(), help="where the PKI lives (default: %(default)s)")
     ap.add_argument("--helper", help="makes the board's key and CSR the first time (else openssl does)")
     ap.add_argument("--aws-sigalgs", action="store_true", help="AWS's CertificateRequest signature list (ctypes)")
@@ -1460,11 +1646,11 @@ def serve(argv):
         pem = pki.sign_csr(csr)
         broker.registry[fingerprint(ssl.PEM_cert_to_DER_cert(pem.read_text()))] = THING
         certs.append((pem, None))
-    broker.start(args.bind, args.port_443, args.port_8883)
+    broker.start(args.bind, args.port_443, args.port_8883, args.port_8443)
     loopback = args.bind.startswith("127.") or args.bind == "localhost"
     host = this_pc_address("0.0.0.0" if loopback else args.bind)
-    print('AWS IoT Core look-alike, thing %s, on %s: "8883" side :%d, "443" side :%d'
-          % (THING, args.bind, broker.ports["8883"], broker.ports["443"]))
+    print('AWS IoT Core look-alike, thing %s, on %s: "8883" side :%d, "443" side :%d, "8443" side :%d'
+          % (THING, args.bind, broker.ports["8883"], broker.ports["443"], broker.ports["8443"]))
     print("\nSet in the IoT tab (MQTT, TLS, Client certificate on):")
     print("  Broker host   %s (this PC)%s" % (host, " - restart with --bind 0.0.0.0 first: only this PC reaches "
                                                  "%s" % args.bind if loopback else ""))
@@ -1481,6 +1667,12 @@ def serve(argv):
         print("                MQTT_CLIENT_KEY  = %s" % (key or "the key the IDE made with that CSR"))
     print("Policy: iot:Connect client/%s; iot:Publish + iot:Receive topic/%s/*; iot:Subscribe topicfilter/%s/*%s"
           % (THING, THING, THING, "".join("; + " + f for f in args.allow)))
+    print("\nHTTPS publish (HTTP, HTTPS, Client certificate on, sent only to %s; http_ca.rs holds the two"
+          % ENDPOINT)
+    print("roots above): the board dials %s on 8443 (or 443) by name, so a real board reaches" % ENDPOINT)
+    print("this side only with --port-8443 8443 and a DNS entry pointing that name at this PC. From this")
+    print("PC the helper (the mock's cases, `python scripts/aws-iot-mock.py 16`) dials it directly:")
+    print("  POST https://%s:8443/topics/%s/test?qos=1  ->  127.0.0.1:%d" % (ENDPOINT, THING, broker.ports["8443"]))
     print("Ctrl+C stops it.\n", flush=True)
     try:
         while True:

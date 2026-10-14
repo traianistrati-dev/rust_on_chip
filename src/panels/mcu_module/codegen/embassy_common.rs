@@ -2066,7 +2066,9 @@ mod emit_for_manual_compile {
         // openthread 0.2, prebuilt OpenThread and Mbed TLS), `mqtts` = the
         // station + MQTT over TLS with no SNTP (dates unchecked), `http` = the
         // station + the HTTP client, plain only, `https` = the station + HTTPS
-        // alone (tls.rs for HTTP only). `all` and `ble+all` are over TLS
+        // alone (tls.rs for HTTP only), `awshttps` = HTTPS with the board's
+        // certificate for AWS IoT on 443 (its ALPN) and aws_publish() called -
+        // the identity seeded, so the signing is linked. `all` and `ble+all` are over TLS
         // wherever the chip can carry it, HTTPS beside MQTT's included - two
         // TLS sessions, where `iot::https_available` allows the second.
         // `EIDE_ESP_SNTP=1` adds SNTP to any mode and `EIDE_ESP_P384=1` builds
@@ -2078,11 +2080,16 @@ mod emit_for_manual_compile {
                 BleConfig, EspNowConfig, HttpConfig, MqttConfig, SntpConfig, ThreadConfig,
             };
             let all = matches!(mode, "all" | "ble+all");
-            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt" | "mqtts" | "http" | "https") || all;
-            if matches!(mode, "http" | "https") || all {
+            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt" | "mqtts" | "http" | "https" | "awshttps") || all;
+            if matches!(mode, "http" | "https" | "awshttps") || all {
+                let aws = mode == "awshttps";
                 mcu.iot.http = Some(HttpConfig {
                     tls: mode != "http",
                     p384: std::env::var_os("EIDE_ESP_P384").is_some(),
+                    client_cert: aws,
+                    cert_host: if aws { "a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com".into() } else { String::new() },
+                    aws_port: 443,
+                    aws_thing: "rustonchip-test".into(),
                     ..HttpConfig::default()
                 });
             }
@@ -2132,7 +2139,7 @@ mod emit_for_manual_compile {
             );
             assert_eq!(
                 main_rs.contains("pins::configs::http::start(_spawner, net_stack);"),
-                matches!(mode, "http" | "https") || all,
+                matches!(mode, "http" | "https" | "awshttps") || all,
                 "the HTTP task exactly with HTTP:\n{main_rs}"
             );
             assert_eq!(
@@ -2172,7 +2179,13 @@ mod emit_for_manual_compile {
                 used.push_str("        let d = pins::configs::thread::receive().await;\n");
                 used.push_str("        pins::configs::thread::send_to(*d.from.ip(), d.from.port(), &d.data).await.ok();\n");
             }
-            if matches!(mode, "http" | "https") || all {
+            if mode == "awshttps" {
+                used.push_str("        let mut reply = [0u8; 128];\n");
+                used.push_str("        if let Ok(r) = pins::configs::http::aws_publish(\"rustonchip-test/data\", b\"{}\", &mut reply).await {\n");
+                used.push_str("            let _ = (r.status, r.len);\n");
+                used.push_str("        }\n");
+            }
+            if matches!(mode, "http" | "https" | "awshttps") || all {
                 used.push_str("        let mut body = [0u8; 256];\n");
                 used.push_str("        if let Ok(r) = pins::configs::http::get(\"http://example.com/\", &mut body).await {\n");
                 used.push_str("            let _ = (r.status, r.len, r.truncated, r.location());\n");
@@ -2301,6 +2314,12 @@ mod emit_for_manual_compile {
                 "{chip}: https is HTTPS alone"
             );
         }
+        if matches!(iot_mode.as_deref(), Some("awshttps")) {
+            assert!(
+                iot_active.is_some_and(|a| a.http_client_cert && !a.mqtt),
+                "{chip}: awshttps is HTTPS with the board's certificate, MQTT off"
+            );
+        }
         if tls {
             assert!(
                 files.cargo_toml.contains("embedded-tls = "),
@@ -2349,18 +2368,18 @@ mod emit_for_manual_compile {
         }
         let mut user: Vec<(String, String)> = mcu.pin_tree_files();
         // The client certificate: the dummy identity, so the signing code is
-        // built and linked, not folded away as `CLIENT = None`.
-        if iot_active.is_some_and(|a| a.mqtt_client_cert) {
+        // built and linked, not folded away as `IDENTITY = None`.
+        if iot_active.is_some_and(|a| a.client_cert()) {
             use crate::panels::mcu_module::codegen::iot_gen;
             iot_gen::seed_test_identity(&mut user);
-            let link = user
+            let tls = user
                 .iter()
-                .find(|(p, _)| p == "src/pins/configs/mqtt_link.rs")
+                .find(|(p, _)| p == "src/pins/configs/tls.rs")
                 .map(|(_, c)| c.as_str())
                 .unwrap_or("");
             assert!(
-                link.contains("client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER)"),
-                "{link}"
+                tls.contains("client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER)"),
+                "{tls}"
             );
         }
         // Thread with a real dataset: an empty one makes `commissioned()` a

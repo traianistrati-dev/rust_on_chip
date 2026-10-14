@@ -138,12 +138,29 @@ impl CryptoProvider for Provider<'_, '_> {
     }
 
     fn signer(&mut self) -> Result<(impl ecdsa::signature::SignerMut<Self::Signature>, SignatureScheme), TlsError> {
+        if !self.proven() {
+            return Err(TlsError::Unimplemented);
+        }
         let (_, key) = self.client.ok_or(TlsError::Unimplemented)?;
         Ok((ClientKey::new(key)?, SignatureScheme::EcdsaSecp256r1Sha256))
     }
 
     fn client_cert(&mut self) -> Option<Certificate<impl AsRef<[u8]>>> {
+        if !self.proven() {
+            return None;
+        }
         self.client.map(|(cert, _)| Certificate::X509(cert))
+    }
+}
+
+impl Provider<'_, '_> {
+    /// The server proved who it is - or nothing is checked (encrypt only).
+    /// embedded-tls 0.19 asks for the board's certificate once the server's
+    /// Finished came, even when no Certificate came before it: without this,
+    /// whoever answered in the server's name would get the certificate and a
+    /// signature, before `open()` refuses the link.
+    fn proven(&self) -> bool {
+        self.verifier.as_ref().is_none_or(|v| v.authenticated)
     }
 }
 

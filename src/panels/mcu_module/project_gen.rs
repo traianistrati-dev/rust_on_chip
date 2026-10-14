@@ -5626,6 +5626,7 @@ mod iot_deps_tests {
             http: false,
             http_tls: false,
             http_p384: false,
+            http_client_cert: false,
         })
     }
 
@@ -5704,6 +5705,7 @@ mod iot_deps_tests {
                 http: false,
                 http_tls: false,
                 http_p384: false,
+                http_client_cert: false,
             }),
             "",
             "rp2040",
@@ -5746,6 +5748,7 @@ mod iot_deps_tests {
             http: false,
             http_tls: false,
             http_p384: false,
+            http_client_cert: false,
         });
         let on = ensure_iot_deps(ESP_ASYNC, both, "esp32c3", "esp32c3", &[]);
         assert!(
@@ -5780,6 +5783,7 @@ mod iot_deps_tests {
             http: false,
             http_tls: false,
             http_p384: false,
+            http_client_cert: false,
         });
         let a = ensure_iot_deps(ESP_ASYNC, alone, "esp32c3", "esp32c3", &[]);
         assert!(a.contains("\"esp-now\"") && a.contains("esp-alloc"), "{a}");
@@ -5840,6 +5844,7 @@ mod iot_deps_tests {
             http: false,
             http_tls: false,
             http_p384: false,
+            http_client_cert: false,
         })
     }
 

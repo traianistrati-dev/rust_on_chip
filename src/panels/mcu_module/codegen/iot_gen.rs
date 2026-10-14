@@ -190,7 +190,10 @@ const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 /// - `mqtt_link_tls_esp_v3` / `mqtt_link_tls_cyw43_v4`: the TLS links before
 ///   tls.rs, each with its own handshake, checks and (on a Pico) heap - now
 ///   shared with HTTP.
-const LEGACY_TAILS: [(&str, &str); 12] = [
+/// - `http_v1`: the first `http.rs`, before `aws_publish()` and `aws_url`.
+/// - `tls_esp_v1` / `tls_cyw43_v1`: the first `tls.rs`, whose Provider sent the
+///   board's certificate to a server that had not proven who it is.
+const LEGACY_TAILS: [(&str, &str); 15] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
     (
@@ -227,10 +230,13 @@ const LEGACY_TAILS: [(&str, &str); 12] = [
         MQTT_LINK,
         include_str!("iot_templates/legacy/mqtt_link_tls_cyw43_v4.rs"),
     ),
+    (HTTP, include_str!("iot_templates/legacy/http_v1.rs")),
+    (TLS, include_str!("iot_templates/legacy/tls_esp_v1.rs")),
+    (TLS, include_str!("iot_templates/legacy/tls_cyw43_v1.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 28] = [
+const TAILS: [(&str, &str); 31] = [
     (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
@@ -259,6 +265,9 @@ const TAILS: [(&str, &str); 28] = [
     LEGACY_TAILS[9],
     LEGACY_TAILS[10],
     LEGACY_TAILS[11],
+    LEGACY_TAILS[12],
+    LEGACY_TAILS[13],
+    LEGACY_TAILS[14],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -377,7 +386,7 @@ pub fn config_files(cfg: &IotConfig, active: Active, family: &str) -> Vec<(Strin
     if active.station || active.thread {
         out.push((
             SECRETS.to_owned(),
-            secrets_body_with(active.station, active.thread, active.mqtt_client_cert),
+            secrets_body_with(active.station, active.thread, active.client_cert()),
         ));
     }
     if let (true, Some(m)) = (active.mqtt, &cfg.mqtt) {
@@ -539,11 +548,7 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
         return o;
     }
     o.push_str("// MQTT over TLS (from the IoT tab) — auto-updated; edit it in the tab.\n");
-    o.push_str(if active.mqtt_client_cert {
-        "use super::tls::{client_identity, key_label, pem_der, pem_len};\n"
-    } else {
-        "use super::tls::{pem_der, pem_len};\n"
-    });
+    o.push_str("use super::tls::{pem_der, pem_len};\n");
     o.push_str("/// Check the broker's certificate: its chain must end in a CA of mqtt_ca.rs\n");
     o.push_str("/// and name SERVER_NAME. `false` = encrypted, but anyone on the path can pose\n");
     o.push_str("/// as the broker and read the MQTT password.\n");
@@ -559,20 +564,10 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
     o.push_str("    pem_der(super::mqtt_ca::CA_PEM, b\"CERTIFICATE\", true, false, \"CA_PEM in mqtt_ca.rs holds no PEM certificate\");\n");
     if active.mqtt_client_cert {
         o.push_str(
-            "/// The board's certificate and P-256 key (secrets.rs), sent when the broker\n",
+            "/// The board's certificate and P-256 key (secrets.rs, decoded in tls.rs),\n",
         );
-        o.push_str("/// asks - none while either is empty there. A key that is not P-256, or a\n");
-        o.push_str("/// certificate that is not its own, fails the build.\n");
-        o.push_str("const CLIENT_CERT_DER: [u8; pem_len(super::secrets::MQTT_CLIENT_CERT.as_bytes(), b\"CERTIFICATE\", false)] = pem_der(\n");
-        o.push_str(
-            "    super::secrets::MQTT_CLIENT_CERT,\n    b\"CERTIFICATE\",\n    false,\n    true,\n",
-        );
-        o.push_str("    \"MQTT_CLIENT_CERT in secrets.rs holds no PEM certificate\",\n);\n");
-        o.push_str("const CLIENT_KEY_DER: [u8; pem_len(\n    super::secrets::MQTT_CLIENT_KEY.as_bytes(),\n");
-        o.push_str("    key_label(super::secrets::MQTT_CLIENT_KEY.as_bytes()),\n    false,\n)] = pem_der(\n");
-        o.push_str("    super::secrets::MQTT_CLIENT_KEY,\n    key_label(super::secrets::MQTT_CLIENT_KEY.as_bytes()),\n    false,\n    true,\n");
-        o.push_str("    \"MQTT_CLIENT_KEY in secrets.rs holds no P-256 key (EC PRIVATE KEY or PRIVATE KEY, not encrypted)\",\n);\n");
-        o.push_str("pub const CLIENT: Option<(&[u8], [u8; 32])> = client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER);\n");
+        o.push_str("/// sent when the broker asks - none while either is empty there.\n");
+        o.push_str("pub const CLIENT: Option<(&[u8], [u8; 32])> = super::tls::IDENTITY;\n");
     } else {
         o.push_str(
             "/// No client certificate - switch it on in the tab when the broker wants one.\n",
@@ -591,9 +586,36 @@ fn mqtt_link_file(m: &MqttConfig, active: Active) -> String {
     o
 }
 
+/// tls.rs's `IDENTITY`: the board's certificate and P-256 key from
+/// secrets.rs, decoded once for MQTT and HTTP - `None` while either is empty
+/// there, or when no client presents one. A key that is not P-256, or a
+/// certificate that is not its own, fails the build.
+fn identity_lines(client: bool) -> String {
+    let mut o = String::new();
+    if !client {
+        o.push_str("/// No client certificate: no client presents one (switch it on in the tab).\n");
+        o.push_str("#[allow(dead_code)]\n");
+        o.push_str("pub const IDENTITY: Option<(&[u8], [u8; 32])> = None;\n");
+        return o;
+    }
+    o.push_str("/// The board's certificate and P-256 key (secrets.rs), for the server that\n");
+    o.push_str("/// asks - MQTT's broker, HTTP's one host. None while either is empty there;\n");
+    o.push_str("/// a key that is not P-256, or a certificate that is not its own, fails the\n");
+    o.push_str("/// build.\n");
+    o.push_str("const CLIENT_CERT_DER: [u8; pem_len(super::secrets::MQTT_CLIENT_CERT.as_bytes(), b\"CERTIFICATE\", false)] = pem_der(\n");
+    o.push_str("    super::secrets::MQTT_CLIENT_CERT,\n    b\"CERTIFICATE\",\n    false,\n    true,\n");
+    o.push_str("    \"MQTT_CLIENT_CERT in secrets.rs holds no PEM certificate\",\n);\n");
+    o.push_str("const CLIENT_KEY_DER: [u8; pem_len(\n    super::secrets::MQTT_CLIENT_KEY.as_bytes(),\n");
+    o.push_str("    key_label(super::secrets::MQTT_CLIENT_KEY.as_bytes()),\n    false,\n)] = pem_der(\n");
+    o.push_str("    super::secrets::MQTT_CLIENT_KEY,\n    key_label(super::secrets::MQTT_CLIENT_KEY.as_bytes()),\n    false,\n    true,\n");
+    o.push_str("    \"MQTT_CLIENT_KEY in secrets.rs holds no P-256 key (EC PRIVATE KEY or PRIVATE KEY, not encrypted)\",\n);\n");
+    o.push_str("pub const IDENTITY: Option<(&[u8], [u8; 32])> = client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER);\n");
+    o
+}
+
 /// `tls.rs`: the clock the certificates' dates are checked against (SNTP's,
-/// when it is on) and, on a Pico, the chip's entropy - over the radio's
-/// editable half.
+/// when it is on), on a Pico the chip's entropy, and the board's identity -
+/// over the radio's editable half.
 fn tls_file(active: Active, family: &str) -> String {
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
@@ -626,6 +648,7 @@ fn tls_file(active: Active, family: &str) -> String {
     if active.platform == Platform::Cyw43 {
         o.push_str(if iot::tls_trng(family) { RP2350_ENTROPY } else { RP2040_ENTROPY });
     }
+    o.push_str(&identity_lines(active.client_cert()));
     o.push_str(GEN_END_CFG);
     o.push('\n');
     o.push_str(&lf(match active.platform {
@@ -668,6 +691,21 @@ fn http_file(h: &iot::HttpConfig, active: Active) -> String {
         "pub const USER_AGENT: &str = {};\n",
         lit(&iot::http_user_agent(&h.user_agent))
     ));
+    // Always written, so aws_publish() below the block builds either way.
+    let cert = active.http_client_cert;
+    let host = if cert { iot::http_cert_host(h) } else { String::new() };
+    let aws = cert && iot::http_aws(h).is_some();
+    o.push_str("/// The one host the board's certificate (secrets.rs) goes to, when its server\n");
+    o.push_str("/// asks: \"\" = none - every server that asks gets no certificate.\n");
+    o.push_str(&format!("pub const CERT_HOST: &str = {};\n", lit(&host)));
+    o.push_str("/// AWS IoT's HTTPS publish to CERT_HOST - `aws_publish()`: the port (8443,\n");
+    o.push_str("/// or 443 with the ALPN x-amzn-http-ca; 0 = CERT_HOST is not AWS IoT) and the\n");
+    o.push_str("/// QoS (0 or 1; over HTTP a 200 is the only acknowledgement).\n");
+    o.push_str(&format!(
+        "pub const AWS_PORT: u16 = {};\n",
+        if aws { if h.aws_port == 443 { 443 } else { 8443 } } else { 0 }
+    ));
+    o.push_str(&format!("pub const AWS_QOS: u8 = {};\n", u8::from(h.aws_qos >= 1)));
     if active.http_tls {
         o.push_str("use super::tls::{pem_der, pem_len};\n");
         o.push_str("pub use super::tls::LinkBuffers;\n");
@@ -677,7 +715,23 @@ fn http_file(h: &iot::HttpConfig, active: Active) -> String {
         o.push_str("    pem_der(super::http_ca::CA_PEM, b\"CERTIFICATE\", true, false, \"CA_PEM in http_ca.rs holds no PEM certificate\");\n");
         o.push_str("/// One request over TLS: the handshake (tls.rs), then the exchange.\n");
         o.push_str("async fn over_tls<'s>(\n    socket: embassy_net::tcp::TcpSocket<'s>,\n    links: &'s mut LinkBuffers,\n    x: &mut Exchange,\n) -> Result<Response, HttpError> {\n");
-        o.push_str("    let to = super::tls::Target {\n        server_name: &x.host,\n        verify: VERIFY,\n        cas: &CA_DER,\n        client: None,\n        alpn: &[],\n    };\n");
+        if cert {
+            o.push_str("    // The board's certificate goes to CERT_HOST alone: any other server that\n");
+            o.push_str("    // asks for one gets none.\n");
+            o.push_str("    let mine = x.host.eq_ignore_ascii_case(CERT_HOST);\n");
+            o.push_str("    let to = super::tls::Target {\n        server_name: &x.host,\n        verify: VERIFY,\n        cas: &CA_DER,\n");
+            o.push_str("        client: if mine { super::tls::IDENTITY } else { None },\n");
+            if aws {
+                o.push_str("        // AWS IoT on 443 asks for the certificate only when the hello names\n");
+                o.push_str("        // this ALPN; on 8443 it always does.\n");
+                o.push_str("        alpn: if mine && x.port == 443 { &[b\"x-amzn-http-ca\"] } else { &[] },\n");
+            } else {
+                o.push_str("        alpn: &[],\n");
+            }
+            o.push_str("    };\n");
+        } else {
+            o.push_str("    let to = super::tls::Target {\n        server_name: &x.host,\n        verify: VERIFY,\n        cas: &CA_DER,\n        client: None,\n        alpn: &[],\n    };\n");
+        }
         o.push_str("    let mut link = super::tls::open(socket, links, &to)\n        .await\n        .map_err(|()| HttpError::Tls)?;\n");
         o.push_str("    exchange(&mut super::tls::Closing(&mut link), x).await\n}\n");
     } else {
@@ -3696,10 +3750,31 @@ mod tests {
             mq.host = "abc-ats.iot.eu-west-1.amazonaws.com".into();
             mq.port = 443;
         }
+        // Off, tls.rs has no identity to decode - and no secrets to read.
+        assert!(
+            tls.contains("pub const IDENTITY: Option<(&[u8], [u8; 32])> = None;"),
+            "{tls}"
+        );
+        assert!(!tls.contains("super::secrets::"), "{tls}");
         let on = link(&m);
-        assert!(on.contains("pub const CLIENT: Option<(&[u8], [u8; 32])> = client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER);"), "{on}");
-        assert!(on.contains("super::secrets::MQTT_CLIENT_KEY"));
+        // The link names tls.rs's identity, decoded there once for MQTT and
+        // HTTP alike.
+        assert!(
+            on.contains("pub const CLIENT: Option<(&[u8], [u8; 32])> = super::tls::IDENTITY;"),
+            "{on}"
+        );
+        assert!(!on.contains("super::secrets::"), "{on}");
         assert!(on.contains("pub const ALPN: &[&[u8]] = &[b\"x-amzn-mqtt-ca\"];"));
+        let tls_on = config_files_for(&m)
+            .into_iter()
+            .find(|(n, _)| n == TLS)
+            .map(|(_, b)| b)
+            .unwrap();
+        assert!(
+            tls_on.contains("pub const IDENTITY: Option<(&[u8], [u8; 32])> = client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER);"),
+            "{tls_on}"
+        );
+        assert!(tls_on.contains("super::secrets::MQTT_CLIENT_KEY"));
         let secrets = config_files_for(&m)
             .into_iter()
             .find(|(n, _)| n == SECRETS)
@@ -3995,6 +4070,126 @@ mod tests {
         let kept = kept_paths(&[], &tree);
         for name in [HTTP, TLS, HTTP_CA] {
             assert!(kept.contains(&format!("src/pins/configs/{name}")), "{name}: {kept:?}");
+        }
+    }
+
+    fn aws_http_mcu(port: u16) -> Mcu {
+        let mut m = http_mcu("esp32c3", false, true);
+        if let Some(h) = m.iot.http.as_mut() {
+            h.client_cert = true;
+            h.cert_host = " A1B2C3D4E5F6G7-ats.iot.eu-south-1.amazonaws.com ".into();
+            h.aws_port = port;
+        }
+        m
+    }
+
+    /// The board's certificate for HTTP: decoded once in tls.rs, given to
+    /// CERT_HOST alone, AWS IoT's ALPN only to it and only on 443 - and no
+    /// certificate, no host, no AWS port while it is off.
+    #[test]
+    fn the_http_certificate_goes_to_its_host_alone() {
+        let off = http_mcu("esp32c3", false, true);
+        let http = file_of(&off, HTTP).unwrap();
+        assert!(http.contains("pub const CERT_HOST: &str = \"\";"), "{http}");
+        assert!(http.contains("pub const AWS_PORT: u16 = 0;") && http.contains("pub const AWS_QOS: u8 = 1;"));
+        assert!(http.contains("        client: None,\n        alpn: &[],\n"), "{http}");
+        assert!(!file_of(&off, SECRETS).unwrap().contains("MQTT_CLIENT_CERT"));
+        // Plain HTTP still names them: aws_publish() below the block builds.
+        let plain = file_of(&http_mcu("esp32c3", false, false), HTTP).unwrap();
+        assert!(plain.contains("pub const CERT_HOST: &str = \"\";") && plain.contains("pub const AWS_PORT: u16 = 0;"));
+
+        let m = aws_http_mcu(8443);
+        let a = iot::active(&m).unwrap();
+        assert!(a.http_client_cert && a.client_cert() && !a.mqtt_client_cert, "{a:?}");
+        let http = file_of(&m, HTTP).unwrap();
+        assert!(
+            http.contains("pub const CERT_HOST: &str = \"a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com\";"),
+            "trimmed and in lower case:\n{http}"
+        );
+        assert!(http.contains("pub const AWS_PORT: u16 = 8443;"), "{http}");
+        assert!(http.contains("let mine = x.host.eq_ignore_ascii_case(CERT_HOST);"));
+        assert!(http.contains("client: if mine { super::tls::IDENTITY } else { None },"));
+        assert!(http.contains("alpn: if mine && x.port == 443 { &[b\"x-amzn-http-ca\"] } else { &[] },"));
+        assert!(!http.contains("super::secrets::"), "the identity is tls.rs's");
+        let tls = file_of(&m, TLS).unwrap();
+        assert!(tls.contains("client_identity(&CLIENT_CERT_DER, &CLIENT_KEY_DER)"), "{tls}");
+        let secrets = file_of(&m, SECRETS).unwrap();
+        assert!(
+            secrets.contains("pub const MQTT_CLIENT_CERT: &str = \"\";")
+                && secrets.contains("pub const MQTT_CLIENT_KEY: &str = \"\";"),
+            "HTTP alone brings the identity's lines:\n{secrets}"
+        );
+        assert!(is_pristine(HTTP, &http));
+        assert!(file_of(&aws_http_mcu(443), HTTP).unwrap().contains("pub const AWS_PORT: u16 = 443;"));
+
+        // Another host takes the certificate, never AWS's ALPN.
+        let mut other = aws_http_mcu(8443);
+        other.iot.http.as_mut().unwrap().cert_host = "api.example.com".into();
+        let http = file_of(&other, HTTP).unwrap();
+        assert!(http.contains("pub const AWS_PORT: u16 = 0;") && http.contains("        alpn: &[],\n"), "{http}");
+        assert!(http.contains("client: if mine { super::tls::IDENTITY } else { None },"));
+
+        // No certificate where the server goes unchecked, to an address, or to nobody.
+        for spoil in [
+            |h: &mut iot::HttpConfig| h.verify = false,
+            |h: &mut iot::HttpConfig| h.cert_host = "192.168.1.10".into(),
+            |h: &mut iot::HttpConfig| h.cert_host = " ".into(),
+            |h: &mut iot::HttpConfig| h.cert_host = "https://x.example/".into(),
+        ] {
+            let mut m = aws_http_mcu(8443);
+            spoil(m.iot.http.as_mut().unwrap());
+            assert!(iot::http_cert_problem(m.iot.http.as_ref().unwrap()).is_some());
+            assert!(!iot::active(&m).unwrap().http_client_cert);
+            let http = file_of(&m, HTTP).unwrap();
+            assert!(http.contains("pub const CERT_HOST: &str = \"\";") && !http.contains("IDENTITY"), "{http}");
+        }
+
+        // Beside MQTT's own certificate: one identity, both clients.
+        let mut both = aws_http_mcu(8443);
+        let mut mq = MqttConfig::for_chip("esp32c3");
+        mq.tls = true;
+        mq.client_cert = true;
+        mq.port = 8883;
+        both.iot.mqtt = Some(mq);
+        let a = iot::active(&both).unwrap();
+        assert!(a.mqtt_client_cert && a.http_client_cert);
+        assert_eq!(file_of(&both, TLS).unwrap().matches("pub const IDENTITY").count(), 1);
+        assert!(file_of(&both, MQTT_LINK).unwrap().contains("= super::tls::IDENTITY;"));
+    }
+
+    /// An untouched http.rs from before aws_publish() moves to the current
+    /// template; an edited one keeps its tail and gets the block, which still
+    /// fits it (the new names are only added).
+    #[test]
+    fn a_pristine_first_http_rs_is_upgraded() {
+        let m = aws_http_mcu(8443);
+        let body = file_of(&m, HTTP).unwrap();
+        let (block, _) = body.split_once(GEN_END_CFG).unwrap();
+        let old = format!("{block}{GEN_END_CFG}\n{}", lf(LEGACY_TAILS[12].1));
+        assert!(is_pristine(HTTP, &old));
+        assert_eq!(upgraded(HTTP, &old, &body).as_deref(), Some(body.as_str()));
+        assert!(!lf(LEGACY_TAILS[12].1).contains("aws_publish"), "the first one had none");
+        let edited = format!("{old}// mine\n");
+        assert_eq!(upgraded(HTTP, &edited, &body), None);
+        assert!(lf(HTTP_TAIL).contains("pub async fn aws_publish(topic: &str, payload: &[u8], body: &mut [u8])"));
+    }
+
+    /// An untouched tls.rs from before the Provider waited for the server's
+    /// proof moves to the current one, on either radio; the board's identity
+    /// then goes only to a server that proved who it is.
+    #[test]
+    fn a_pristine_first_tls_rs_is_upgraded() {
+        for (m, legacy) in [
+            (aws_http_mcu(8443), LEGACY_TAILS[13].1),
+            (tls_mcu("rp2040_pico_w", false), LEGACY_TAILS[14].1),
+        ] {
+            let body = file_of(&m, TLS).unwrap();
+            assert!(body.contains("fn proven(&self) -> bool"), "{body}");
+            let (block, _) = body.split_once(GEN_END_CFG).unwrap();
+            let old = format!("{block}{GEN_END_CFG}\n{}", lf(legacy));
+            assert!(!lf(legacy).contains("fn proven("));
+            assert!(is_pristine(TLS, &old));
+            assert_eq!(upgraded(TLS, &old, &body).as_deref(), Some(body.as_str()));
         }
     }
 

@@ -160,6 +160,22 @@ pub struct HttpConfig {
     /// The User-Agent header; some APIs (Discord) refuse a request without
     /// one.
     pub user_agent: String,
+    /// The board's client certificate (secrets.rs - MQTT's, one identity),
+    /// for `cert_host` alone: sent when that server asks, never to another.
+    pub client_cert: bool,
+    /// The one host the certificate goes to: AWS IoT's endpoint for
+    /// `aws_publish()`, or any server that takes a client certificate.
+    pub cert_host: String,
+    /// AWS IoT's HTTPS publish port: 8443, or 443 (the ALPN x-amzn-http-ca
+    /// added) where a firewall lets only 443 out.
+    pub aws_port: u16,
+    /// `aws_publish()`'s QoS: 0 or 1. Over HTTP neither gets a PUBACK - a 200
+    /// means the broker took the message.
+    pub aws_qos: u8,
+    /// AWS IoT's thing for the certificate: the policy, the CSR's name and
+    /// the steps name it (MQTT's client id when MQTT talks to AWS too). Not
+    /// in the firmware: HTTPS publish carries no client id.
+    pub aws_thing: String,
 }
 
 impl Default for HttpConfig {
@@ -172,8 +188,62 @@ impl Default for HttpConfig {
             payload_max: 1024,
             timeout_s: 30,
             user_agent: "RustOnChip".to_owned(),
+            client_cert: false,
+            cert_host: String::new(),
+            aws_port: 8443,
+            aws_qos: 1,
+            aws_thing: String::new(),
         }
     }
+}
+
+/// What keeps the HTTP client certificate from being generated. `None` =
+/// it goes to `cert_host` when that server asks.
+pub fn http_cert_problem(h: &HttpConfig) -> Option<&'static str> {
+    if !h.client_cert {
+        return None;
+    }
+    if !h.tls {
+        return Some("a client certificate travels inside TLS: switch HTTPS on");
+    }
+    if !h.verify {
+        return Some(
+            "with the server unchecked, anyone on the path could pose as it and get the board's certificate: switch \"Check the server's certificate\" on",
+        );
+    }
+    let host = h.cert_host.trim();
+    if host.is_empty() {
+        return Some("name the host the certificate goes to - AWS IoT's endpoint, say");
+    }
+    if host.len() > 64 {
+        return Some("longer than 64 bytes - a request's host holds 64");
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    {
+        return Some("a host name: letters, digits, `-`, `.` - no scheme, port or path");
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Some(
+            "a certificate names DNS names, never an address, so the server could not be checked: give its name",
+        );
+    }
+    None
+}
+
+/// The host the board's certificate goes to as the firmware compares it:
+/// trimmed and in lower case (a host name is case-blind).
+pub fn http_cert_host(h: &HttpConfig) -> String {
+    h.cert_host.trim().to_ascii_lowercase()
+}
+
+/// AWS IoT's HTTPS publish when the certificate goes to one of its
+/// endpoints: the endpoint, read off the host.
+pub fn http_aws(h: &HttpConfig) -> Option<super::aws_iot::Endpoint> {
+    h.client_cert
+        .then(|| super::aws_iot::endpoint(&h.cert_host))
+        .flatten()
 }
 
 /// The User-Agent as the request carries it: visible ASCII and spaces only (a
@@ -1211,12 +1281,21 @@ pub struct Active {
     pub http_tls: bool,
     /// ... accepting P-384 chains.
     pub http_p384: bool,
+    /// ... the board presenting its client certificate to one host
+    /// ([`http_cert_problem`] has nothing against it).
+    pub http_client_cert: bool,
 }
 
 impl Active {
     /// Some client speaks TLS: tls.rs, embedded-tls and (on a Pico) the heap.
     pub fn tls(&self) -> bool {
         self.mqtt_tls || self.http_tls
+    }
+
+    /// Some client presents the board's certificate: its secrets, and the
+    /// identity tls.rs decodes once for both.
+    pub fn client_cert(&self) -> bool {
+        self.mqtt_client_cert || self.http_client_cert
     }
 
     /// Some TLS client accepts P-384 chains: embedded-tls's `p384`.
@@ -1277,6 +1356,12 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
         http,
         http_tls,
         http_p384: http_tls && mcu.iot.http.as_ref().is_some_and(|h| h.p384),
+        http_client_cert: http_tls
+            && mcu
+                .iot
+                .http
+                .as_ref()
+                .is_some_and(|h| h.client_cert && http_cert_problem(h).is_none()),
     })
 }
 

@@ -332,6 +332,9 @@ $ALL_CASES = @(
     # MQTT. Beside MQTT over TLS it rides in the "everything" rows below.
     @{ n = "ESP32-C3 HTTP, plain (IoT)";    t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "http" }; q = $true; fam = "esp" }
     @{ n = "ESP32-C3 HTTPS alone (IoT)";    t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "https"; CMAKE = "eide-no-cmake" }; q = $true; fam = "esp"; lk = $true }
+    # AWS IoT's HTTPS publish: the board's certificate to one host, the ALPN
+    # on 443, aws_publish() - the identity seeded, so the signing is linked.
+    @{ n = "ESP32-C3 AWS HTTPS publish (IoT)"; t = "emit_esp32c3_project";    e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "awshttps"; CMAKE = "eide-no-cmake" }; q = $true; fam = "esp"; lk = $true }
     @{ n = "ESP32 IoT, everything (Xtensa)";    t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
     @{ n = "ESP32 ESP-NOW alone (Xtensa)";      t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "espnow" }; q = $false; fam = "esp" }
     @{ n = "ESP32-S2 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }

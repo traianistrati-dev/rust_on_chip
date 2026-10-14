@@ -571,6 +571,19 @@ about a second, a P-384 chain (most Let's Encrypt sites now) in about 12 s, a
 plain request in 40 ms; ten callers at once get nine answers and one `Busy`;
 the heap peaks at 79 of 104 KiB and comes back to where it started.
 
+**AWS IoT over HTTPS**: with "Client certificate" on, the HTTP client presents
+the board's certificate - the one MQTT uses, decoded once in `tls.rs` - to one
+host alone, the one the tab names; every other server that asks gets none.
+For an AWS IoT endpoint `aws_publish("topic", payload, &mut body)` POSTs to
+`/topics/<topic>?qos=N` on 8443, or on 443 with the ALPN `x-amzn-http-ca`, the
+topic percent-encoded and checked as AWS checks it before anything is sent; a
+200 is the broker's yes, a 403 its policy's no, and a refused certificate a
+reset. The tab writes the CLI steps and the policy for the thing it names, and
+**Publish from this PC** sends the very request the board sends. The local AWS
+IoT look-alike (`scripts/aws-iot-mock.py`) takes it on 8443 and 443 and hands
+it to its MQTT subscribers - its HTTP answers follow AWS's documentation, not
+captured traffic.
+
 The ESP radio's **transmit power** is capped in the tab, 13 dBm unless chosen:
 esp-radio 0.18 leaves it at 20 dBm, and at that cheap ESP32-C3 boards never
 join - `AuthenticationExpired`, then `ConnectionFailed`, forever (measured: 0

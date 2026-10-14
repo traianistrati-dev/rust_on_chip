@@ -69,8 +69,8 @@ impl Request {
 
 /// What the HTTP probe tests: a URL, by the board's own checks (the CAs of
 /// `http_ca.rs`) and against its buffers. No `Debug`: a query may carry an
-/// API key.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// API key, and the client key is a secret.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct HttpRequest {
     /// `http://` or `https://`, a host name or an IPv4 address, a port, the
     /// path and the query - as the firmware's `get()` takes it.
@@ -88,6 +88,27 @@ pub struct HttpRequest {
     pub user_agent: String,
     /// The board's buffer for the request head (REQUEST_HEAD_MAX).
     pub request_head_max: usize,
+    /// A POST of `payload` - as `aws_publish()` sends it - instead of a GET.
+    pub post: Option<HttpPost>,
+    /// The board's certificate and key as PEM (secrets.rs), for a server
+    /// that asks: empty for any host but the tab's certificate host.
+    pub client_cert: String,
+    pub client_key: String,
+    /// The ALPN the board's hello names: x-amzn-http-ca to AWS IoT on 443.
+    pub alpn: Option<String>,
+    /// `host:port` to dial instead of the URL's: a look-alike on this PC,
+    /// still named and checked as the URL's host.
+    pub connect_to: Option<String>,
+    /// The URL is AWS IoT's HTTPS publish: refusals said in its terms.
+    pub aws: bool,
+}
+
+/// What a POST carries.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct HttpPost {
+    /// "" = no Content-Type header (`aws_publish()` sends none).
+    pub content_type: String,
+    pub payload: Vec<u8>,
 }
 
 impl HttpRequest {
@@ -245,7 +266,10 @@ pub fn stdin_lines(r: &Request) -> String {
 
 /// The `http` mode's request as the checker reads it: one hex line per
 /// value - the URL, verify, the CAs as DER, "P-384 chains", HEAD_MAX,
-/// BODY_MAX and the User-Agent.
+/// BODY_MAX, the User-Agent, REQUEST_HEAD_MAX, then the method (POST or a
+/// GET), the Content-Type, the payload, the client certificate and key, the
+/// ALPN, a host:port to dial instead, and AWS IoT ("1"/"0") - sixteen lines,
+/// an empty value still taking its own.
 pub fn http_stdin_lines(r: &HttpRequest) -> String {
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let flag = |on: bool| if on { "1" } else { "0" };
@@ -258,6 +282,14 @@ pub fn http_stdin_lines(r: &HttpRequest) -> String {
         r.body_max.to_string().as_bytes(),
         r.user_agent.as_bytes(),
         r.request_head_max.to_string().as_bytes(),
+        if r.post.is_some() { b"POST" } else { b"GET" },
+        r.post.as_ref().map_or(&b""[..], |p| p.content_type.as_bytes()),
+        r.post.as_ref().map_or(&b""[..], |p| &p.payload[..]),
+        r.client_cert.as_bytes(),
+        r.client_key.as_bytes(),
+        r.alpn.as_deref().unwrap_or_default().as_bytes(),
+        r.connect_to.as_deref().unwrap_or_default().as_bytes(),
+        flag(r.aws).as_bytes(),
     ]
     .iter()
     .map(|field| hex(field) + "\n")
@@ -603,9 +635,10 @@ mod tests {
         assert_eq!(r.clone().tested(), before);
     }
 
-    /// The HTTP probe's request goes over as hex lines too, seven of them in
-    /// the order the checker's `http` mode reads them - an empty CA (plain
-    /// http://) still takes its line.
+    /// The HTTP probe's request goes over as hex lines too, sixteen of them
+    /// in the order the checker's `http` mode reads them - an empty CA (plain
+    /// http://) still takes its line, and a GET without a certificate leaves
+    /// the last eight empty but there.
     #[test]
     fn the_http_request_is_one_hex_line_per_value() {
         let r = HttpRequest {
@@ -617,6 +650,7 @@ mod tests {
             body_max: 1024,
             user_agent: "RustOnChip".into(),
             request_head_max: 1024,
+            ..HttpRequest::default()
         };
         let unhex = |h: &str| -> Vec<u8> {
             (0..h.len() / 2)
@@ -625,7 +659,9 @@ mod tests {
         };
         let text = http_stdin_lines(&r);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 16);
+        assert_eq!(unhex(lines[8]), b"GET");
+        assert_eq!(&lines[9..], ["", "", "", "", "", "", "30"], "a GET, nothing more");
         assert_eq!(unhex(lines[0]), r.url.as_bytes());
         assert_eq!(lines[1], "31", "verify");
         assert_eq!(lines[2], "3082", "the CAs");
@@ -641,9 +677,40 @@ mod tests {
         };
         let text = http_stdin_lines(&plain);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 16);
         assert_eq!(lines[2], "");
         assert_eq!(lines[4], "32303438", "the lines after the CA stay in place");
+        // AWS IoT's publish: a POST, the board's identity, the ALPN, the
+        // look-alike's address - each in its line, an empty payload too.
+        let publish = HttpRequest {
+            url: "https://a-ats.iot.eu-south-1.amazonaws.com/topics/t?qos=1".into(),
+            post: Some(HttpPost {
+                content_type: String::new(),
+                payload: b"{}".to_vec(),
+            }),
+            client_cert: "CERT".into(),
+            client_key: "KEY".into(),
+            alpn: Some("x-amzn-http-ca".into()),
+            connect_to: Some("127.0.0.1:18443".into()),
+            aws: true,
+            ..r.clone()
+        };
+        let text = http_stdin_lines(&publish);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 16);
+        assert_eq!(unhex(lines[8]), b"POST");
+        assert_eq!(lines[9], "", "no Content-Type");
+        assert_eq!(unhex(lines[10]), b"{}");
+        assert_eq!(unhex(lines[11]), b"CERT");
+        assert_eq!(unhex(lines[12]), b"KEY");
+        assert_eq!(unhex(lines[13]), b"x-amzn-http-ca");
+        assert_eq!(unhex(lines[14]), b"127.0.0.1:18443");
+        assert_eq!(lines[15], "31");
+        let empty = HttpRequest {
+            post: Some(HttpPost::default()),
+            ..publish
+        };
+        assert_eq!(http_stdin_lines(&empty).lines().count(), 16);
     }
 
     /// A probe's result is for its URL, and goes stale when anything it was
@@ -659,6 +726,7 @@ mod tests {
             body_max: 1024,
             user_agent: "RustOnChip".into(),
             request_head_max: 1024,
+            ..HttpRequest::default()
         };
         assert_eq!(r.key(), "https://letsencrypt.org/");
         let before = r.tested();
@@ -892,6 +960,7 @@ mod tests {
             body_max: 1024,
             user_agent: "RustOnChip".into(),
             request_head_max: 1024,
+            ..HttpRequest::default()
         };
         let ctx = egui::Context::default();
         for (url, want) in [

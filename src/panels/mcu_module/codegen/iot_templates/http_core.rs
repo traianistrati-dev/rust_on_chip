@@ -293,6 +293,62 @@ pub fn build(
     Ok(o.n)
 }
 
+/// AWS IoT's longest topic, in bytes.
+#[allow(dead_code)]
+pub const AWS_TOPIC_MAX: usize = 256;
+
+/// The URL of AWS IoT's HTTPS publish - `https://<host>[:<port>]/topics/
+/// <topic>?qos=<qos>` - written into `out`; its length back. The topic goes
+/// percent-encoded byte by byte (its UTF-8), all but RFC 3986's unreserved
+/// characters and the `/` between levels, which stays as AWS's own examples
+/// send it. What AWS refuses is refused here, before anything is sent
+/// (`Url`): an empty topic or one over 256 bytes, more than 7 `/` (a Basic
+/// Ingest `$aws/rules/<rule>/` not counted), an MQTT wildcard (`+`, `#`), a
+/// NUL, a `$` topic other than AWS's own `$aws/...`, a QoS other than 0 or
+/// 1. `TooLarge` when `out` cannot hold it all.
+#[allow(dead_code)]
+pub fn aws_url(out: &mut [u8], host: &str, port: u16, topic: &str, qos: u8) -> Result<usize, HttpError> {
+    let t = topic.as_bytes();
+    let counted = match topic.strip_prefix("$aws/rules/").and_then(|r| r.split_once('/')) {
+        Some((_, rest)) => rest,
+        None => topic,
+    };
+    let host_ok = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'));
+    if !host_ok
+        || port == 0
+        || t.is_empty()
+        || t.len() > AWS_TOPIC_MAX
+        || counted.bytes().filter(|&b| b == b'/').count() > 7
+        || t.iter().any(|&b| matches!(b, b'+' | b'#' | 0))
+        || (t[0] == b'$' && !topic.starts_with("$aws/"))
+        || qos > 1
+    {
+        return Err(HttpError::Url);
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut o = Out { buf: out, n: 0 };
+    o.put(b"https://")?;
+    o.put(host.as_bytes())?;
+    if port != 443 {
+        o.put(b":")?;
+        o.number(usize::from(port))?;
+    }
+    o.put(b"/topics/")?;
+    for &b in t {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            o.put(&[b])?;
+        } else {
+            o.put(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]])?;
+        }
+    }
+    o.put(b"?qos=")?;
+    o.put(&[b'0' + qos])?;
+    Ok(o.n)
+}
+
 /// The request head as it is built: `buf[..n]` so far.
 #[allow(dead_code)]
 struct Out<'b> {

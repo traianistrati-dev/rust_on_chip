@@ -18,14 +18,19 @@
 //! one). It prints `KEY <hex PEM>` (a key it made), `CSR <hex PEM>`, then the
 //! `RESULT` line.
 //!
-//! `http` as its argument: one GET of a URL as the firmware's `http.rs` makes
-//! it - for https:// the same handshake and checks as above, nothing for
-//! http:// - and the answer measured against the board's buffers: a head the
-//! board would refuse, a redirect it would not follow, a body it would cut,
-//! show here before flashing. stdin: the URL, verify ("1"/"0"), the CAs as
-//! DER (http_ca.rs's), "P-384 chains" ("1"/"0"), the board's HEAD_MAX and
-//! BODY_MAX (decimal), and its User-Agent. It prints `INFO ...` lines, then
-//! the `RESULT` line.
+//! `http` as its argument: one request as the firmware's `http.rs` makes it
+//! - a GET, or a POST as `post()` and `aws_publish()` send it - for https://
+//! the same handshake and checks as above, nothing for http:// - and the
+//! answer measured against the board's buffers: a head the board would
+//! refuse, a redirect it would not follow, a body it would cut, a client
+//! certificate refused, show here before flashing. stdin: the URL, verify
+//! ("1"/"0"), the CAs as DER (http_ca.rs's), "P-384 chains" ("1"/"0"), the
+//! board's HEAD_MAX and BODY_MAX (decimal), its User-Agent, its
+//! REQUEST_HEAD_MAX (0: unchecked); then, each absent from an older IDE's
+//! request: the method ("POST", else a GET), the Content-Type, the payload,
+//! the client certificate and its key as PEM, the ALPN, a host:port to dial
+//! instead of the URL's (a look-alike on this PC), and AWS IoT ("1"/"0").
+//! It prints `INFO ...` lines, then the `RESULT` line.
 #![allow(dead_code)]
 
 use std::cell::Cell;
@@ -116,6 +121,22 @@ struct HttpRequest {
     user_agent: String,
     /// The board's buffer for the request head; 0: not checked.
     request_head_max: usize,
+    /// POST `payload` (as `aws_publish()` and `post()` send it) instead of
+    /// a GET; `content_type` "" = no Content-Type header.
+    post: bool,
+    content_type: String,
+    payload: Vec<u8>,
+    /// The board's certificate and key as PEM, for the server that asks -
+    /// empty: none.
+    client_cert: String,
+    client_key: String,
+    /// The ALPN the hello names ("" = none): x-amzn-http-ca for AWS IoT on 443.
+    alpn: String,
+    /// `host:port` to connect to instead of the URL's - the name, the check
+    /// and the Host header stay the URL's (a look-alike on this PC).
+    connect_to: String,
+    /// The URL is AWS IoT's HTTPS publish: refusals said in its terms.
+    aws: bool,
 }
 
 fn read_http_request() -> Option<HttpRequest> {
@@ -129,8 +150,17 @@ fn read_http_request() -> Option<HttpRequest> {
         head_max: text(4)?.parse().ok()?,
         body_max: text(5)?.parse().ok()?,
         user_agent: text(6)?,
-        // Absent from an older IDE's request: not checked.
+        // Absent from an older IDE's request: not checked - and, below, a
+        // GET without a certificate, as before.
         request_head_max: text(7).and_then(|v| v.parse().ok()).unwrap_or(0),
+        post: text(8).is_some_and(|m| m == "POST"),
+        content_type: text(9).unwrap_or_default(),
+        payload: lines.get(10).cloned().unwrap_or_default(),
+        client_cert: text(11).unwrap_or_default(),
+        client_key: text(12).unwrap_or_default(),
+        alpn: text(13).unwrap_or_default(),
+        connect_to: text(14).unwrap_or_default(),
+        aws: text(15).is_some_and(|a| a == "1"),
     })
 }
 
@@ -314,6 +344,15 @@ const SERVER: Peer = Peer {
     ca_file: "http_ca.rs",
     tls12: "httpbin.org",
     ec_ca: "",
+};
+
+/// AWS IoT's HTTPS publish: the endpoint, checked against http_ca.rs.
+const AWS_HTTPS: Peer = Peer {
+    the: "AWS IoT",
+    a: "an endpoint",
+    ca_file: "http_ca.rs",
+    tls12: "an AWS IoT endpoint without a TLS 1.3 security policy",
+    ec_ca: " - AWS IoT's ends in Amazon Root CA 1",
 };
 
 /// What a refused handshake means, in the user's terms.
@@ -998,26 +1037,45 @@ fn http(r: &HttpRequest) -> Result<String, String> {
     if r.user_agent.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         return Err("the User-Agent holds a line break: the request would come apart".into());
     }
-    let request = url.get(&r.user_agent);
+    if r.content_type.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return Err("the Content-Type holds a line break: the request would come apart".into());
+    }
+    let mut request = if r.post {
+        url.post(&r.user_agent, &r.content_type, r.payload.len())
+    } else {
+        url.get(&r.user_agent)
+    }
+    .into_bytes();
     if r.request_head_max > 0 && request.len() > r.request_head_max {
         return Err(format!(
-            "the request head is {} bytes, over the board's {} - get() returns HttpError::TooLarge before connecting",
+            "the request head is {} bytes, over the board's {} - the board returns HttpError::TooLarge before connecting",
             request.len(),
             r.request_head_max
         ));
     }
-    let tcp = connect(url.host, url.port)?;
+    request.extend_from_slice(&r.payload);
+    // A look-alike on this PC: dialled where it listens, named as the URL.
+    let (host, port) = match r.connect_to.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => {
+            let port = port.parse::<u16>().map_err(|_| format!("`{}` is not host:port", r.connect_to))?;
+            println!("INFO connecting to {host}:{port}, in the name of {}", url.host);
+            (host, port)
+        }
+        _ => (url.host, url.port),
+    };
+    let tcp = connect(host, port)?;
     let mut rx = vec![0u8; RECORD_RX];
     let mut tx = vec![0u8; RECORD_TX];
-    let mut conn = if url.https {
+    let alpn = [r.alpn.as_bytes()];
+    let (mut conn, asked, identity) = if url.https {
         let dial = Dial {
             server_name: url.host,
             verify: r.verify,
             ca: &r.ca,
-            alpn: None,
-            client_cert: "",
-            client_key: "",
-            peer: SERVER,
+            alpn: (!r.alpn.is_empty()).then_some(&alpn[..]),
+            client_cert: &r.client_cert,
+            client_key: &r.client_key,
+            peer: if r.aws { AWS_HTTPS } else { SERVER },
         };
         let opened = handshake(tcp, &mut rx, &mut tx, &dial)?;
         // This PC checks P-384 whatever the switch says; the board only with
@@ -1025,28 +1083,46 @@ fn http(r: &HttpRequest) -> Result<String, String> {
         if opened.p384 && !r.p384 {
             return Err("the server's chain is signed with P-384: switch \"P-384 chains\" on for HTTP".into());
         }
-        Conn::Tls(Box::new(opened.tls))
+        (Conn::Tls(Box::new(opened.tls)), opened.asked, opened.identity)
     } else {
         println!("INFO plain HTTP: nothing encrypted, nothing checked");
-        Conn::Plain(tcp)
+        (Conn::Plain(tcp), false, false)
     };
-    conn.send(request.as_bytes())
-        .map_err(|e| format!("the request could not be sent ({e})"))?;
-    println!("INFO sent GET {}", url.path());
+    // A server that asked for the board's certificate and then hangs up is
+    // refusing it - AWS IoT resets the connection, it answers no 403.
+    let refused = |e: String| {
+        if !asked || e.contains("TimedOut") || e.contains("Io(Other)") {
+            e
+        } else if !identity {
+            format!(
+                "the server asked for a client certificate and hung up without one: the board sends its certificate only to the host named under HTTP > Client certificate (Sent only to), once secrets.rs holds it ({e})"
+            )
+        } else if r.aws {
+            format!("AWS IoT reset the connection after the handshake: it refused the board's certificate - not registered, not ACTIVE, or no policy attached to it ({e})")
+        } else {
+            format!("the server hung up after the handshake: it refused the board's certificate ({e})")
+        }
+    };
+    conn.send(&request)
+        .map_err(|e| refused(format!("the request could not be sent ({e})")))?;
+    println!("INFO sent {} {}", if r.post { "POST" } else { "GET" }, url.path());
+    if r.post {
+        println!("INFO the payload: {} bytes", r.payload.len());
+    }
 
-    let mut src = Incoming { conn: &mut conn, buf: Vec::new(), pos: 0, ended: false };
+    let mut src = Incoming { conn: &mut conn, buf: Vec::new(), pos: 0, ended: false, kept: Vec::new() };
     let mut interim = 0;
     let (head, size) = loop {
         let bytes = match src.head() {
             Ok(HeadRead::Whole(bytes)) => bytes,
-            Ok(HeadRead::Ended(0)) => return Err("the server closed the connection without an answer".into()),
+            Ok(HeadRead::Ended(0)) => return Err(refused("the server closed the connection without an answer".into())),
             Ok(HeadRead::Ended(n)) => {
                 return Err(format!("the server closed the connection {n} bytes into the answer's head - the board reports it cut short"));
             }
             Ok(HeadRead::TooLong) => {
                 return Err(format!("the response head is over {HEAD_LIMIT} bytes, over the board's {} - it would refuse it", r.head_max));
             }
-            Err(e) => return Err(format!("no answer came ({e})")),
+            Err(e) => return Err(refused(format!("no answer came ({e})"))),
         };
         let line = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
         println!("INFO the server answered {}", String::from_utf8_lossy(line).trim_end());
@@ -1076,9 +1152,6 @@ fn http(r: &HttpRequest) -> Result<String, String> {
     } else {
         format!("{} {}", head.status, head.reason)
     };
-    if head.status >= 400 {
-        return Err(format!("the server answered {what}"));
-    }
     // 304 Not Modified is no redirect (and a plain GET never gets one).
     if (300..400).contains(&head.status) && head.status != 304 {
         return Err(match &head.location {
@@ -1095,6 +1168,21 @@ fn http(r: &HttpRequest) -> Result<String, String> {
     } else {
         head.length.map_or(Framing::Close, Framing::Length)
     };
+    // A refusal says why in its body: read it first.
+    if head.status >= 400 {
+        // What came is kept even when the body then breaks off.
+        let _ = read_body(&mut src, framing, r.body_max);
+        let said = text_of(&src.kept);
+        let said = if said.is_empty() { String::new() } else { format!(": {said}") };
+        return Err(if r.aws && head.status == 403 {
+            format!(
+                "AWS IoT answered {what}{said} - the policy on the board's certificate allows no iot:Publish on topic/{}",
+                topic_in(&url.path())
+            )
+        } else {
+            format!("the server answered {what}{said}")
+        });
+    }
     match framing {
         Framing::None => println!("INFO no body: a {} has none", head.status),
         Framing::Length(n) => println!("INFO the body: Content-Length {n}"),
@@ -1102,6 +1190,20 @@ fn http(r: &HttpRequest) -> Result<String, String> {
         Framing::Close => println!("INFO the body: until the server closes (no Content-Length, not chunked)"),
     }
     let body = read_body(&mut src, framing, r.body_max)?;
+    if r.post && !src.kept.is_empty() {
+        println!("INFO the answer: {}", text_of(&src.kept));
+    }
+    if r.aws {
+        // A 200 is AWS's only acknowledgement - its body varies.
+        return if head.status == 200 {
+            Ok(format!(
+                "AWS IoT took the message on `{}` (HTTP {what}) - the board's aws_publish() gets the same",
+                topic_in(&url.path())
+            ))
+        } else {
+            Err(format!("AWS IoT answered {what}, not 200 - aws_publish() reports it as a refusal"))
+        };
+    }
     let len = if body.exact { body.len.to_string() } else { format!("at least {}", body.len) };
     let head_part = format!("head {size} bytes (the board takes {})", r.head_max);
     Ok(if body.len > r.body_max {
@@ -1193,14 +1295,70 @@ impl<'a> Url<'a> {
     /// The request the board sends for a GET: the port in Host only when it
     /// is not the scheme's, one connection per request.
     fn get(&self, user_agent: &str) -> String {
+        format!("GET {} HTTP/1.1\r\n{}\r\n", self.path(), self.headers(user_agent))
+    }
+
+    /// The head the board sends for a POST of `len` bytes, in its `build()`'s
+    /// order: Content-Type when given, Content-Length always.
+    fn post(&self, user_agent: &str, content_type: &str, len: usize) -> String {
+        let kind = if content_type.is_empty() {
+            String::new()
+        } else {
+            format!("Content-Type: {content_type}\r\n")
+        };
+        format!(
+            "POST {} HTTP/1.1\r\n{}{kind}Content-Length: {len}\r\n\r\n",
+            self.path(),
+            self.headers(user_agent)
+        )
+    }
+
+    /// Host, User-Agent and Connection, as `build()` writes them.
+    fn headers(&self, user_agent: &str) -> String {
         let default = self.port == if self.https { 443 } else { 80 };
         let port = if default { String::new() } else { format!(":{}", self.port) };
         format!(
-            "GET {} HTTP/1.1\r\nHost: {}{port}\r\nUser-Agent: {user_agent}\r\nConnection: close\r\n\r\n",
-            self.path(),
+            "Host: {}{port}\r\nUser-Agent: {user_agent}\r\nConnection: close\r\n",
             self.host
         )
     }
+}
+
+/// The first bytes of an answer's body as one line of text: what a server
+/// says when it refuses (AWS: `{"message":...}`).
+fn text_of(body: &[u8]) -> String {
+    let text: String = String::from_utf8_lossy(body)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(200)
+        .collect();
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The topic in an AWS IoT publish path, percent-decoded: `/topics/a%20b?qos=1`
+/// is `a b`.
+fn topic_in(path: &str) -> String {
+    let encoded = path.strip_prefix("/topics/").unwrap_or(path);
+    let encoded = encoded.split('?').next().unwrap_or_default().as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < encoded.len() {
+        let hex = encoded
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (encoded[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The connection an answer comes over (TLS boxed: its state is a kilobyte).
@@ -1242,6 +1400,8 @@ struct Incoming<'c, 'b> {
     /// The connection ended: nothing more is read from it (embedded-tls
     /// refuses a read after the close_notify).
     ended: bool,
+    /// The body's first bytes, as they passed: what a refusal says.
+    kept: Vec<u8>,
 }
 
 enum HeadRead {
@@ -1292,6 +1452,8 @@ impl Incoming<'_, '_> {
             return Ok(0);
         }
         let k = n.min(self.buf.len() - self.pos);
+        let room = 512usize.saturating_sub(self.kept.len()).min(k);
+        self.kept.extend_from_slice(&self.buf[self.pos..self.pos + room]);
         self.pos += k;
         Ok(k)
     }

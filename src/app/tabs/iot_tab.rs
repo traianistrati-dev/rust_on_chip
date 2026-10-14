@@ -184,6 +184,8 @@ impl AppIde {
                         iot_gen::read_secret(s, iot_gen::CLIENT_SECRETS[0])
                             .map(|c| iot::client_cert(&c))
                     }),
+                    client_lines: file(iot_gen::SECRETS)
+                        .is_some_and(|s| s.contains(&format!("pub const {}:", iot_gen::CLIENT_SECRETS[1]))),
                     client_left: iot_gen::client_link_left(
                         file(iot_gen::MQTT_LINK),
                         mcu.iot
@@ -231,10 +233,21 @@ impl AppIde {
                     ca: ca_file
                         .as_deref()
                         .map(|c| iot_gen::ca_pem_of(c).map(iot::ca_summary)),
+                    amazon_ca: iot_gen::http_ca_with(
+                        ca_file.as_deref().unwrap_or(&iot_gen::http_ca_file()),
+                        iot_gen::HttpCa::Amazon,
+                    )
+                    .is_none(),
                     ca_der: iot_gen::ca_pem_of(
                         ca_file.unwrap_or_else(iot_gen::http_ca_file).as_str(),
                     )
                     .and_then(iot::cas_der),
+                    no_aws_publish: self
+                        .project_tree
+                        .user_src_files
+                        .iter()
+                        .find(|(p, _)| *p == format!("src/pins/configs/{}", iot_gen::HTTP))
+                        .is_some_and(|(_, c)| !c.contains("pub async fn aws_publish(")),
                     project: project_dir.clone(),
                 }
             };
@@ -1216,6 +1229,9 @@ struct TlsFacts {
     /// inner `None`: not a plain string the tab can read.
     client_key: Option<Option<Result<iot::ClientKey, &'static str>>>,
     client_cert: Option<Option<Result<iot::ClientCert, &'static str>>>,
+    /// secrets.rs has the key and certificate lines: written once a client
+    /// presents the certificate (the next regeneration after the switch).
+    client_lines: bool,
     /// An edited mqtt_link.rs that cannot send the certificate.
     client_left: Option<&'static str>,
     /// The project's folder: a key made for one project never lands in another.
@@ -1256,6 +1272,12 @@ struct HttpFacts {
     /// Its CAs as DER, for "Test from this PC" (the one it will be written
     /// with, until it is).
     ca_der: Option<Vec<u8>>,
+    /// http_ca.rs holds Amazon Root CA 1 and 3 (or a CA_PEM the tab cannot
+    /// extend, which it does not second-guess).
+    amazon_ca: bool,
+    /// An http.rs the user edited from before aws_publish(): the IDE left its
+    /// tail, so the line the tab offers would not build.
+    no_aws_publish: bool,
     project: Option<std::path::PathBuf>,
 }
 
@@ -1314,8 +1336,20 @@ fn application_card(
             ui.label(egui::RichText::new("HTTP client").strong());
             ui.label(dim("HTTP/1.1, HTTPS through tls.rs - src/pins/configs/http.rs"));
         });
+        // MQTT's card shows the board's key and certificate while its own
+        // certificate is on: the HTTP card then only points there.
+        let mqtt_identity = tls.available.is_ok()
+            && cfg.mqtt.as_ref().is_some_and(|m| m.tls && m.client_cert);
+        // MQTT on AWS with the certificate: the thing, its certificate and
+        // its policy (iot:Publish under `<client id>/`) are already set up.
+        let mqtt_aws = cfg
+            .mqtt
+            .as_ref()
+            .filter(|m| mqtt_identity && iot::aws_iot(m))
+            .map(|m| m.client_id.clone());
+        let thing = mqtt_aws.clone().unwrap_or_else(|| format!("rustonchip-{chip_id}"));
         if let Some(h) = cfg.http.as_mut() {
-            http_body(ui, h, http, actions);
+            http_body(ui, h, http, tls, mqtt_identity, mqtt_aws.as_deref(), &thing, actions);
         }
     });
 }
@@ -1524,6 +1558,277 @@ fn command_line(ui: &mut egui::Ui, text: &str) {
     });
 }
 
+/// The board's key, its certificate request and its certificate, in
+/// secrets.rs: one identity, MQTT's and HTTP's. `cn` is the request's name
+/// until one is typed. `false` while secrets.rs is not written yet.
+fn identity_section(ui: &mut egui::Ui, cn: &str, tls: &TlsFacts, actions: &mut Vec<TlsAction>) -> bool {
+    use crate::panels::mcu_module::tls_check::{self, CsrRequest, CsrShared, CsrState};
+    let (Some(key), true) = (&tls.client_key, tls.client_lines) else {
+        ui.label(dim("secrets.rs gets its key and certificate lines with the next regeneration."));
+        return false;
+    };
+    // ── the key ──
+    let key_point = match key {
+        Some(Ok((_, point))) => {
+            ui.label(dim("Key: P-256, in secrets.rs (MQTT_CLIENT_KEY) - never shown, never in mcu.config or git."));
+            Some(*point)
+        }
+        Some(Err(why)) => {
+            ui.label(if tls.client_key_pem.trim().is_empty() { dim(format!("Key: {why}.")) } else { warn(format!("MQTT_CLIENT_KEY: {why}")) });
+            None
+        }
+        None => {
+            ui.label(warn("MQTT_CLIENT_KEY in secrets.rs is not a plain string literal - the tab cannot read it"));
+            None
+        }
+    };
+    let has_key = key_point.is_some();
+    // Anything in MQTT_CLIENT_KEY - readable here or not - is a key a new
+    // one would replace.
+    let key_present = has_key || !tls.client_key_pem.trim().is_empty() || matches!(key, None);
+    // ── a key and its request ──
+    let csr_id = egui::Id::new("iot_csr");
+    let confirm_id = egui::Id::new("iot_csr_confirm");
+    let shared: Option<CsrShared> = ui.data_mut(|d| d.get_temp::<CsrShared>(csr_id));
+    // A new key comes back once: into secrets.rs (and its old certificate
+    // out - it is not this key's), never kept in the tab's memory.
+    if let Some(shared) = &shared
+        && let Ok(mut state) = shared.lock()
+        && let CsrState::Done(Ok(done)) = &mut *state
+        && tls.project.as_ref() == Some(&done.project)
+        && let Some(new_key) = done.key.take()
+    {
+        actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[1], new_key));
+        actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[0], String::new()));
+    }
+    let busy = shared.as_ref().is_some_and(|s| s.lock().is_ok_and(|s| matches!(*s, CsrState::Building)));
+    let mut subject: [String; 3] = ui.data_mut(|d| {
+        d.get_temp::<[String; 3]>(egui::Id::new("iot_csr_subject"))
+            .unwrap_or_else(|| [String::new(), String::new(), cn.to_owned()])
+    });
+    ui.horizontal(|ui| {
+        ui.label(dim("Request for"));
+        ui.add(egui::TextEdit::singleline(&mut subject[0]).hint_text("C").desired_width(28.0));
+        ui.add(egui::TextEdit::singleline(&mut subject[1]).hint_text("organization").desired_width(110.0));
+        ui.add(egui::TextEdit::singleline(&mut subject[2]).hint_text("common name (CN)").desired_width(170.0));
+    });
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("iot_csr_subject"), subject.clone()));
+    let names = crate::panels::mcu_module::iot::csr::Subject {
+        country: subject[0].trim(),
+        organization: &subject[1],
+        common_name: &subject[2],
+    };
+    let problem = names.problem();
+    let ctx = ui.ctx().clone();
+    let start = |key: Option<String>| {
+        if let Some(project) = tls.project.clone() {
+            let request = CsrRequest {
+                country: subject[0].trim().to_owned(),
+                organization: subject[1].clone(),
+                common_name: subject[2].clone(),
+                key,
+                project,
+            };
+            let started = tls_check::start_csr(request, ctx.clone());
+            ctx.data_mut(|d| d.insert_temp(csr_id, started));
+        }
+    };
+    // Bound to the project it was asked in.
+    let confirming = tls.project.is_some()
+        && ui.data_mut(|d| d.get_temp::<Option<std::path::PathBuf>>(confirm_id)) == Some(tls.project.clone());
+    let load_error_id = egui::Id::new("iot_client_load_error");
+    ui.horizontal(|ui| {
+        let can = !busy && problem.is_none() && tls.project.is_some();
+        if ui
+            .add_enabled(can, egui::Button::new(format!("{} Generate key + CSR", ph::KEY)))
+            .on_hover_text("A new P-256 key into secrets.rs, and a certificate request to have it signed")
+            .clicked()
+        {
+            if key_present {
+                ui.data_mut(|d| d.insert_temp(confirm_id, tls.project.clone()));
+            } else {
+                ui.data_mut(|d| d.remove_temp::<String>(load_error_id));
+                start(None);
+            }
+        }
+        if has_key
+            && ui
+                .add_enabled(can, egui::Button::new("CSR for this key"))
+                .on_hover_text("A certificate request for the key secrets.rs holds")
+                .clicked()
+        {
+            start(Some(tls.client_key_pem.clone()));
+        }
+        if ui.button("Load key...").on_hover_text("A P-256 key from a .pem / .key file").clicked()
+            && let Some(path) = rfd::FileDialog::new().add_filter("PEM key", &["pem", "key"]).pick_file()
+        {
+            match read_pem_file(&path).and_then(|text| iot::client_key(&text).map(|_| text)) {
+                Ok(text) => {
+                    actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[1], text.trim().to_owned() + "\n"));
+                    ui.data_mut(|d| d.remove_temp::<String>(load_error_id));
+                }
+                Err(why) => {
+                    let error = format!("{}: {why}", path.display());
+                    ui.data_mut(|d| d.insert_temp(load_error_id, error));
+                }
+            }
+        }
+        if busy {
+            ui.spinner();
+            ui.label(dim("Building the helper - about a minute the first time."));
+        }
+    });
+    if let Some(why) = problem {
+        ui.label(dim(why));
+    }
+    if confirming {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(warn("Replace the key? The certificate made for the old one stops working, and the old key is gone for good."));
+            if ui.small_button("Replace").clicked() {
+                ui.data_mut(|d| {
+                    d.remove_temp::<Option<std::path::PathBuf>>(confirm_id);
+                    d.remove_temp::<String>(load_error_id);
+                });
+                start(None);
+            }
+            if ui.small_button("Keep").clicked() {
+                ui.data_mut(|d| d.remove_temp::<Option<std::path::PathBuf>>(confirm_id));
+            }
+        });
+    }
+    if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(load_error_id)) {
+        ui.label(warn(error));
+    }
+    if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(egui::Id::new("iot_secrets_write_error"))) {
+        ui.label(warn(error));
+    }
+    if let Some(shared) = &shared
+        && let Ok(state) = shared.lock()
+    {
+        match &*state {
+            CsrState::Done(Ok(done)) if tls.project.as_ref() == Some(&done.project) => {
+                ui.label(dim("The certificate request - have it signed by the broker's CA, then paste the certificate below:"));
+                let mut text = done.csr.clone();
+                ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_rows(4).desired_width(f32::INFINITY));
+                ui.horizontal(|ui| {
+                    if ui.small_button(format!("{} Copy", ph::COPY)).clicked() {
+                        ui.ctx().copy_text(done.csr.clone());
+                    }
+                    if ui.small_button("Save as...").clicked()
+                        && let Some(path) = rfd::FileDialog::new().set_file_name("device.csr").save_file()
+                    {
+                        match std::fs::write(&path, &done.csr) {
+                            Ok(()) => {
+                                // The AWS lines run where device.csr is.
+                                if let Some(dir) = path.parent() {
+                                    ui.data_mut(|d| d.insert_temp(aws_dir_id(tls), dir.to_path_buf()));
+                                }
+                            }
+                            Err(e) => {
+                                let error = format!("{}: {e}", path.display());
+                                ui.data_mut(|d| d.insert_temp(load_error_id, error));
+                            }
+                        }
+                    }
+                });
+            }
+            CsrState::Done(Err(why)) => {
+                ui.label(warn(format!("No request: {why}")));
+            }
+            CsrState::Done(Ok(_)) => {}
+            _ => {}
+        }
+    }
+    // ── the certificate ──
+    match &tls.client_cert {
+        Some(Some(Ok((der, cert, cert_point)))) => {
+            ui.label(dim(format!("Certificate: {} · valid to {} (MQTT_CLIENT_CERT).", cert.name, cert.not_after)));
+            if cert.key != iot::CaKey::EcP256 {
+                ui.label(warn("its key is not P-256 - the board signs with P-256 only: make a key and a CSR here, and have that signed"));
+            } else if cert.is_ca == Some(true) {
+                ui.label(warn("this is a CA's certificate, not the board's - paste the one the CA issued for the board"));
+            }
+            match (key_point, cert_point) {
+                (Some(Some(k)), Some(c)) if k == *c => {
+                    ui.label(egui::RichText::new(format!("{}  it belongs to the key", ph::CHECK_CIRCLE)).size(11.0).color(egui::Color32::from_rgb(120, 200, 140)));
+                }
+                (Some(Some(_)), Some(_)) => {
+                    ui.label(warn("it is NOT the certificate of this key - the build stops on it; paste the one issued for this key's CSR"));
+                }
+                (Some(None), _) => {
+                    ui.label(dim("The key carries no public half, so the tab cannot match them: Test from this PC does."));
+                }
+                _ => {}
+            }
+            if der.len() > 2013 {
+                ui.label(warn("over 2013 bytes: it does not fit the board's TLS send buffer"));
+            }
+        }
+        Some(Some(Err(why))) => {
+            ui.label(if tls.client_cert_pem.trim().is_empty() { dim(format!("Certificate: {why}.")) } else { warn(format!("MQTT_CLIENT_CERT: {why}")) });
+        }
+        Some(None) => {
+            ui.label(warn("MQTT_CLIENT_CERT in secrets.rs is not a plain string literal - the tab cannot read it"));
+        }
+        None => {}
+    }
+    let paste_id = egui::Id::new("iot_client_cert_paste");
+    let mut pasting: Option<String> = ui.data_mut(|d| d.get_temp::<String>(paste_id));
+    ui.horizontal(|ui| {
+        if ui.button("Paste certificate...").clicked() {
+            pasting = Some(String::new());
+        }
+        if ui.button("Load certificate...").clicked()
+            && let Some(path) = rfd::FileDialog::new().add_filter("PEM certificate", &["pem", "crt", "cer"]).pick_file()
+        {
+            match read_pem_file(&path)
+                .map(|text| iot::unescape_pem(&text))
+                .and_then(|text| iot::client_cert(&text).map(|_| text))
+            {
+                Ok(text) => {
+                    actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[0], text + "\n"));
+                    ui.data_mut(|d| d.remove_temp::<String>(load_error_id));
+                }
+                Err(why) => {
+                    let error = format!("{}: {why}", path.display());
+                    ui.data_mut(|d| d.insert_temp(load_error_id, error));
+                }
+            }
+        }
+    });
+    let mut close = false;
+    if let Some(text) = pasting.as_mut() {
+        ui.add(egui::TextEdit::multiline(text).hint_text("-----BEGIN CERTIFICATE-----").font(egui::TextStyle::Monospace).desired_rows(4).desired_width(f32::INFINITY));
+        let cleaned = iot::unescape_pem(text);
+        let check = iot::client_cert(&cleaned);
+        let typed = !text.trim().is_empty();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(check.is_ok(), egui::Button::new("Use it")).clicked() {
+                actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[0], cleaned.clone() + "\n"));
+                close = true;
+            } else if ui.button("Cancel").clicked() {
+                close = true;
+            }
+            if let Err(why) = &check
+                && typed
+            {
+                ui.label(warn(*why));
+            }
+        });
+    }
+    if close {
+        pasting = None;
+    }
+    ui.data_mut(|d| match pasting {
+        Some(p) => {
+            d.insert_temp(paste_id, p);
+        }
+        None => d.remove::<String>(paste_id),
+    });
+    ui.label(dim("Until both are in secrets.rs the board connects without a certificate - and a server that wants one hangs up."));
+    true
+}
+
 /// The board's own certificate: the switch, its key (made here with a CSR,
 /// or loaded), the certificate the broker's CA signed - and whether the two
 /// belong together.
@@ -1533,7 +1838,6 @@ fn client_cert_section(
     tls: &TlsFacts,
     actions: &mut Vec<TlsAction>,
 ) {
-    use crate::panels::mcu_module::tls_check::{self, CsrRequest, CsrShared, CsrState};
     ui.horizontal(|ui| {
         ui.checkbox(&mut m.client_cert, "Client certificate (P-256)")
             .on_hover_text("The board sends a certificate and signs the handshake with its key when the broker asks");
@@ -1543,269 +1847,9 @@ fn client_cert_section(
         return;
     }
     ui.indent("iot_client_cert", |ui| {
-        let Some(key) = &tls.client_key else {
-            ui.label(dim("secrets.rs is written with the next regeneration; its key and certificate lines with it."));
+        if !identity_section(ui, &m.client_id, tls, actions) {
             return;
-        };
-        // ── the key ──
-        let key_point = match key {
-            Some(Ok((_, point))) => {
-                ui.label(dim("Key: P-256, in secrets.rs (MQTT_CLIENT_KEY) - never shown, never in mcu.config or git."));
-                Some(*point)
-            }
-            Some(Err(why)) => {
-                ui.label(if tls.client_key_pem.trim().is_empty() { dim(format!("Key: {why}.")) } else { warn(format!("MQTT_CLIENT_KEY: {why}")) });
-                None
-            }
-            None => {
-                ui.label(warn("MQTT_CLIENT_KEY in secrets.rs is not a plain string literal - the tab cannot read it"));
-                None
-            }
-        };
-        let has_key = key_point.is_some();
-        // Anything in MQTT_CLIENT_KEY - readable here or not - is a key a new
-        // one would replace.
-        let key_present = has_key || !tls.client_key_pem.trim().is_empty() || matches!(key, None);
-        // ── a key and its request ──
-        let csr_id = egui::Id::new("iot_csr");
-        let confirm_id = egui::Id::new("iot_csr_confirm");
-        let shared: Option<CsrShared> = ui.data_mut(|d| d.get_temp::<CsrShared>(csr_id));
-        // A new key comes back once: into secrets.rs (and its old certificate
-        // out - it is not this key's), never kept in the tab's memory.
-        if let Some(shared) = &shared
-            && let Ok(mut state) = shared.lock()
-            && let CsrState::Done(Ok(done)) = &mut *state
-            && tls.project.as_ref() == Some(&done.project)
-            && let Some(new_key) = done.key.take()
-        {
-            actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[1], new_key));
-            actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[0], String::new()));
         }
-        let busy = shared.as_ref().is_some_and(|s| s.lock().is_ok_and(|s| matches!(*s, CsrState::Building)));
-        let mut subject: [String; 3] = ui.data_mut(|d| {
-            d.get_temp::<[String; 3]>(egui::Id::new("iot_csr_subject"))
-                .unwrap_or_else(|| [String::new(), String::new(), m.client_id.clone()])
-        });
-        ui.horizontal(|ui| {
-            ui.label(dim("Request for"));
-            ui.add(egui::TextEdit::singleline(&mut subject[0]).hint_text("C").desired_width(28.0));
-            ui.add(egui::TextEdit::singleline(&mut subject[1]).hint_text("organization").desired_width(110.0));
-            ui.add(egui::TextEdit::singleline(&mut subject[2]).hint_text("common name (CN)").desired_width(170.0));
-        });
-        ui.data_mut(|d| d.insert_temp(egui::Id::new("iot_csr_subject"), subject.clone()));
-        let names = crate::panels::mcu_module::iot::csr::Subject {
-            country: subject[0].trim(),
-            organization: &subject[1],
-            common_name: &subject[2],
-        };
-        let problem = names.problem();
-        let ctx = ui.ctx().clone();
-        let start = |key: Option<String>| {
-            if let Some(project) = tls.project.clone() {
-                let request = CsrRequest {
-                    country: subject[0].trim().to_owned(),
-                    organization: subject[1].clone(),
-                    common_name: subject[2].clone(),
-                    key,
-                    project,
-                };
-                let started = tls_check::start_csr(request, ctx.clone());
-                ctx.data_mut(|d| d.insert_temp(csr_id, started));
-            }
-        };
-        // Bound to the project it was asked in.
-        let confirming = tls.project.is_some()
-            && ui.data_mut(|d| d.get_temp::<Option<std::path::PathBuf>>(confirm_id)) == Some(tls.project.clone());
-        let load_error_id = egui::Id::new("iot_client_load_error");
-        ui.horizontal(|ui| {
-            let can = !busy && problem.is_none() && tls.project.is_some();
-            if ui
-                .add_enabled(can, egui::Button::new(format!("{} Generate key + CSR", ph::KEY)))
-                .on_hover_text("A new P-256 key into secrets.rs, and a certificate request to have it signed")
-                .clicked()
-            {
-                if key_present {
-                    ui.data_mut(|d| d.insert_temp(confirm_id, tls.project.clone()));
-                } else {
-                    ui.data_mut(|d| d.remove_temp::<String>(load_error_id));
-                    start(None);
-                }
-            }
-            if has_key
-                && ui
-                    .add_enabled(can, egui::Button::new("CSR for this key"))
-                    .on_hover_text("A certificate request for the key secrets.rs holds")
-                    .clicked()
-            {
-                start(Some(tls.client_key_pem.clone()));
-            }
-            if ui.button("Load key...").on_hover_text("A P-256 key from a .pem / .key file").clicked()
-                && let Some(path) = rfd::FileDialog::new().add_filter("PEM key", &["pem", "key"]).pick_file()
-            {
-                match read_pem_file(&path).and_then(|text| iot::client_key(&text).map(|_| text)) {
-                    Ok(text) => {
-                        actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[1], text.trim().to_owned() + "\n"));
-                        ui.data_mut(|d| d.remove_temp::<String>(load_error_id));
-                    }
-                    Err(why) => {
-                        let error = format!("{}: {why}", path.display());
-                        ui.data_mut(|d| d.insert_temp(load_error_id, error));
-                    }
-                }
-            }
-            if busy {
-                ui.spinner();
-                ui.label(dim("Building the helper - about a minute the first time."));
-            }
-        });
-        if let Some(why) = problem {
-            ui.label(dim(why));
-        }
-        if confirming {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(warn("Replace the key? The certificate made for the old one stops working, and the old key is gone for good."));
-                if ui.small_button("Replace").clicked() {
-                    ui.data_mut(|d| {
-                        d.remove_temp::<Option<std::path::PathBuf>>(confirm_id);
-                        d.remove_temp::<String>(load_error_id);
-                    });
-                    start(None);
-                }
-                if ui.small_button("Keep").clicked() {
-                    ui.data_mut(|d| d.remove_temp::<Option<std::path::PathBuf>>(confirm_id));
-                }
-            });
-        }
-        if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(load_error_id)) {
-            ui.label(warn(error));
-        }
-        if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(egui::Id::new("iot_secrets_write_error"))) {
-            ui.label(warn(error));
-        }
-        if let Some(shared) = &shared
-            && let Ok(state) = shared.lock()
-        {
-            match &*state {
-                CsrState::Done(Ok(done)) if tls.project.as_ref() == Some(&done.project) => {
-                    ui.label(dim("The certificate request - have it signed by the broker's CA, then paste the certificate below:"));
-                    let mut text = done.csr.clone();
-                    ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_rows(4).desired_width(f32::INFINITY));
-                    ui.horizontal(|ui| {
-                        if ui.small_button(format!("{} Copy", ph::COPY)).clicked() {
-                            ui.ctx().copy_text(done.csr.clone());
-                        }
-                        if ui.small_button("Save as...").clicked()
-                            && let Some(path) = rfd::FileDialog::new().set_file_name("device.csr").save_file()
-                        {
-                            match std::fs::write(&path, &done.csr) {
-                                Ok(()) => {
-                                    // The AWS lines run where device.csr is.
-                                    if let Some(dir) = path.parent() {
-                                        ui.data_mut(|d| d.insert_temp(aws_dir_id(tls), dir.to_path_buf()));
-                                    }
-                                }
-                                Err(e) => {
-                                    let error = format!("{}: {e}", path.display());
-                                    ui.data_mut(|d| d.insert_temp(load_error_id, error));
-                                }
-                            }
-                        }
-                    });
-                }
-                CsrState::Done(Err(why)) => {
-                    ui.label(warn(format!("No request: {why}")));
-                }
-                CsrState::Done(Ok(_)) => {}
-                _ => {}
-            }
-        }
-        // ── the certificate ──
-        match &tls.client_cert {
-            Some(Some(Ok((der, cert, cert_point)))) => {
-                ui.label(dim(format!("Certificate: {} · valid to {} (MQTT_CLIENT_CERT).", cert.name, cert.not_after)));
-                if cert.key != iot::CaKey::EcP256 {
-                    ui.label(warn("its key is not P-256 - the board signs with P-256 only: make a key and a CSR here, and have that signed"));
-                } else if cert.is_ca == Some(true) {
-                    ui.label(warn("this is a CA's certificate, not the board's - paste the one the CA issued for the board"));
-                }
-                match (key_point, cert_point) {
-                    (Some(Some(k)), Some(c)) if k == *c => {
-                        ui.label(egui::RichText::new(format!("{}  it belongs to the key", ph::CHECK_CIRCLE)).size(11.0).color(egui::Color32::from_rgb(120, 200, 140)));
-                    }
-                    (Some(Some(_)), Some(_)) => {
-                        ui.label(warn("it is NOT the certificate of this key - the build stops on it; paste the one issued for this key's CSR"));
-                    }
-                    (Some(None), _) => {
-                        ui.label(dim("The key carries no public half, so the tab cannot match them: Test from this PC does."));
-                    }
-                    _ => {}
-                }
-                if der.len() > 2013 {
-                    ui.label(warn("over 2013 bytes: it does not fit the board's TLS send buffer"));
-                }
-            }
-            Some(Some(Err(why))) => {
-                ui.label(if tls.client_cert_pem.trim().is_empty() { dim(format!("Certificate: {why}.")) } else { warn(format!("MQTT_CLIENT_CERT: {why}")) });
-            }
-            Some(None) => {
-                ui.label(warn("MQTT_CLIENT_CERT in secrets.rs is not a plain string literal - the tab cannot read it"));
-            }
-            None => {}
-        }
-        let paste_id = egui::Id::new("iot_client_cert_paste");
-        let mut pasting: Option<String> = ui.data_mut(|d| d.get_temp::<String>(paste_id));
-        ui.horizontal(|ui| {
-            if ui.button("Paste certificate...").clicked() {
-                pasting = Some(String::new());
-            }
-            if ui.button("Load certificate...").clicked()
-                && let Some(path) = rfd::FileDialog::new().add_filter("PEM certificate", &["pem", "crt", "cer"]).pick_file()
-            {
-                match read_pem_file(&path)
-                    .map(|text| iot::unescape_pem(&text))
-                    .and_then(|text| iot::client_cert(&text).map(|_| text))
-                {
-                    Ok(text) => {
-                        actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[0], text + "\n"));
-                        ui.data_mut(|d| d.remove_temp::<String>(load_error_id));
-                    }
-                    Err(why) => {
-                        let error = format!("{}: {why}", path.display());
-                        ui.data_mut(|d| d.insert_temp(load_error_id, error));
-                    }
-                }
-            }
-        });
-        let mut close = false;
-        if let Some(text) = pasting.as_mut() {
-            ui.add(egui::TextEdit::multiline(text).hint_text("-----BEGIN CERTIFICATE-----").font(egui::TextStyle::Monospace).desired_rows(4).desired_width(f32::INFINITY));
-            let cleaned = iot::unescape_pem(text);
-            let check = iot::client_cert(&cleaned);
-            let typed = !text.trim().is_empty();
-            ui.horizontal(|ui| {
-                if ui.add_enabled(check.is_ok(), egui::Button::new("Use it")).clicked() {
-                    actions.push(TlsAction::Secret(iot_gen::CLIENT_SECRETS[0], cleaned.clone() + "\n"));
-                    close = true;
-                } else if ui.button("Cancel").clicked() {
-                    close = true;
-                }
-                if let Err(why) = &check
-                    && typed
-                {
-                    ui.label(warn(*why));
-                }
-            });
-        }
-        if close {
-            pasting = None;
-        }
-        ui.data_mut(|d| match pasting {
-            Some(p) => {
-                d.insert_temp(paste_id, p);
-            }
-            None => d.remove::<String>(paste_id),
-        });
-        ui.label(dim("Until both are in secrets.rs the board connects without a certificate - and a broker that wants one hangs up."));
         if let Some(left) = tls.client_left {
             ui.label(warn(left));
         }
@@ -1907,35 +1951,7 @@ fn aws_section(
                 )));
             }
             let policy = aws_iot::policy(m, &arn);
-            let error_id = egui::Id::new("iot_aws_policy_error");
-            ui.horizontal(|ui| {
-                let mut dialog = rfd::FileDialog::new().set_file_name("policy.json");
-                if let Some(dir) = &dir {
-                    dialog = dialog.set_directory(dir);
-                }
-                if ui
-                    .button("Save policy.json...")
-                    .on_hover_text("UTF-8, where the commands run - a shell's `>` could make it UTF-16")
-                    .clicked()
-                    && let Some(path) = dialog.save_file()
-                {
-                    match std::fs::write(&path, &policy) {
-                        Ok(()) => {
-                            ui.data_mut(|d| d.remove_temp::<String>(error_id));
-                        }
-                        Err(e) => {
-                            let error = format!("{}: {e}", path.display());
-                            ui.data_mut(|d| d.insert_temp(error_id, error));
-                        }
-                    }
-                }
-                if ui.small_button(format!("{} Copy", ph::COPY)).on_hover_text("Copy the policy").clicked() {
-                    ui.ctx().copy_text(policy.clone());
-                }
-            });
-            if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(error_id)) {
-                ui.label(warn(error));
-            }
+            policy_buttons(ui, &policy, dir.as_deref());
             let outside: Vec<String> = iot::subscriptions(m)
                 .into_iter()
                 .filter(|f| !f.starts_with(&format!("{id}/")))
@@ -1967,6 +1983,40 @@ fn aws_section(
                 actions.push(TlsAction::Ca(iot_gen::CaPreset::Aws));
             }
         });
+    }
+}
+
+/// policy.json saved where the AWS lines run (UTF-8 - a shell's `>` could
+/// make it UTF-16), or copied.
+fn policy_buttons(ui: &mut egui::Ui, policy: &str, dir: Option<&std::path::Path>) {
+    let error_id = egui::Id::new("iot_aws_policy_error");
+    ui.horizontal(|ui| {
+        let mut dialog = rfd::FileDialog::new().set_file_name("policy.json");
+        if let Some(dir) = dir {
+            dialog = dialog.set_directory(dir);
+        }
+        if ui
+            .button("Save policy.json...")
+            .on_hover_text("UTF-8, where the commands run - a shell's `>` could make it UTF-16")
+            .clicked()
+            && let Some(path) = dialog.save_file()
+        {
+            match std::fs::write(&path, policy) {
+                Ok(()) => {
+                    ui.data_mut(|d| d.remove_temp::<String>(error_id));
+                }
+                Err(e) => {
+                    let error = format!("{}: {e}", path.display());
+                    ui.data_mut(|d| d.insert_temp(error_id, error));
+                }
+            }
+        }
+        if ui.small_button(format!("{} Copy", ph::COPY)).on_hover_text("Copy the policy").clicked() {
+            ui.ctx().copy_text(policy.to_owned());
+        }
+    });
+    if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(error_id)) {
+        ui.label(warn(error));
     }
 }
 
@@ -2101,7 +2151,16 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
 
 /// The HTTP client's settings: HTTPS and its checks, the limits, the
 /// User-Agent - and a URL tested from this PC.
-fn http_body(ui: &mut egui::Ui, h: &mut HttpConfig, f: &HttpFacts, actions: &mut Vec<TlsAction>) {
+fn http_body(
+    ui: &mut egui::Ui,
+    h: &mut HttpConfig,
+    f: &HttpFacts,
+    tls: &TlsFacts,
+    mqtt_identity: bool,
+    mqtt_aws: Option<&str>,
+    thing: &str,
+    actions: &mut Vec<TlsAction>,
+) {
     ui.indent("http", |ui| {
         ui.horizontal(|ui| {
             ui.checkbox(&mut h.tls, "HTTPS")
@@ -2115,6 +2174,7 @@ fn http_body(ui: &mut egui::Ui, h: &mut HttpConfig, f: &HttpFacts, actions: &mut
                 )));
             } else {
                 https_settings(ui, h, f, actions);
+                http_cert_section(ui, h, f, tls, mqtt_identity, mqtt_aws, thing, actions);
             }
         } else {
             ui.label(dim("https:// URLs are refused (HttpError::NoTls); http:// ones go in clear."));
@@ -2167,8 +2227,296 @@ fn http_body(ui: &mut egui::Ui, h: &mut HttpConfig, f: &HttpFacts, actions: &mut
                 ui.ctx().copy_text(HTTP_USAGE.to_owned());
             }
         });
-        http_test_from_pc(ui, h, f);
+        http_test_from_pc(ui, h, f, tls);
     });
+}
+
+const AWS_PUBLISH_USAGE: &str = "pins::configs::http::aws_publish(\"<thing>/data\", b\"{\\\"t\\\":21.5}\", &mut body).await";
+
+/// The board's certificate for one host - AWS IoT's HTTPS publish above all:
+/// the host, the identity, and for AWS the steps and a publish from this PC.
+#[allow(clippy::too_many_arguments)]
+fn http_cert_section(
+    ui: &mut egui::Ui,
+    h: &mut HttpConfig,
+    f: &HttpFacts,
+    tls: &TlsFacts,
+    mqtt_identity: bool,
+    mqtt_aws: Option<&str>,
+    thing: &str,
+    actions: &mut Vec<TlsAction>,
+) {
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut h.client_cert, "Client certificate (P-256)")
+            .on_hover_text("The board's certificate and key (secrets.rs) - sent to one host alone, when it asks")
+            .changed()
+            && h.client_cert
+            && h.aws_thing.trim().is_empty()
+        {
+            h.aws_thing = thing.to_owned();
+        }
+        ui.label(dim("AWS IoT's HTTPS publish, or a server that takes a client certificate"));
+    });
+    if !h.client_cert {
+        return;
+    }
+    ui.indent("iot_http_cert", |ui| {
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Sent only to"));
+            ui.add(
+                egui::TextEdit::singleline(&mut h.cert_host)
+                    .hint_text("<prefix>-ats.iot.<region>.amazonaws.com")
+                    .desired_width(300.0),
+            );
+        });
+        let problem = iot::http_cert_problem(h);
+        match problem {
+            Some(why) => {
+                ui.label(warn(format!("{why} - no certificate is generated until then")));
+            }
+            None => {
+                ui.label(dim("Every other server that asks gets none: the board's identity goes to this host alone."));
+            }
+        }
+        if mqtt_identity {
+            ui.label(dim("The key and the certificate: the MQTT card's, in secrets.rs - one identity for both clients."));
+        } else if !identity_section(ui, &h.aws_thing, tls, actions) {
+            return;
+        }
+        // AWS's part only while the certificate goes out at all: the board's
+        // aws_publish() returns Err(Url) until then.
+        if let (Some(e), None) = (iot::http_aws(h), problem) {
+            aws_https_section(ui, h, &e, f, tls, mqtt_aws, actions);
+        }
+    });
+}
+
+/// AWS IoT's HTTPS publish: the port and QoS, the thing, the CLI steps and
+/// the policy filled in, and one publish from this PC as the board makes it.
+fn aws_https_section(
+    ui: &mut egui::Ui,
+    h: &mut HttpConfig,
+    e: &aws_iot::Endpoint,
+    f: &HttpFacts,
+    tls: &TlsFacts,
+    mqtt_aws: Option<&str>,
+    actions: &mut Vec<TlsAction>,
+) {
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("AWS IoT - HTTPS publish").strong());
+    if let Some(why) = aws_iot::endpoint_problem(e) {
+        ui.label(warn(why));
+    }
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, 18.0], egui::Label::new("Port"));
+        ui.radio_value(&mut h.aws_port, 8443, "8443");
+        ui.radio_value(&mut h.aws_port, 443, "443 (ALPN x-amzn-http-ca)");
+        ui.label(dim("443 where a firewall lets only it out"));
+    });
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, 18.0], egui::Label::new("QoS"));
+        ui.radio_value(&mut h.aws_qos, 0, "0");
+        ui.radio_value(&mut h.aws_qos, 1, "1");
+        ui.label(dim("either way a 200 is the only acknowledgement: no PUBACK over HTTP"));
+    });
+    // MQTT on AWS: its thing, certificate and policy serve HTTPS too.
+    if let Some(id) = mqtt_aws {
+        h.aws_thing = id.to_owned();
+    } else {
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Thing"));
+            ui.add(egui::TextEdit::singleline(&mut h.aws_thing).desired_width(200.0));
+            ui.label(dim("for the policy and the steps - HTTPS carries no client id"));
+        });
+    }
+    let thing = h.aws_thing.trim().to_owned();
+    if let Some(why) = aws_iot::thing_problem(&thing) {
+        ui.label(warn(why));
+    }
+    if f.no_aws_publish {
+        ui.label(warn(
+            "src/pins/configs/http.rs is from before aws_publish(), and you edited it, so the IDE left it: the line below would not build. Move your changes into the current template (delete the file to get it).",
+        ));
+    }
+    let usage = AWS_PUBLISH_USAGE.replace("<thing>", if thing.is_empty() { "my-thing" } else { &thing });
+    ui.label(dim("From anywhere in the firmware - the topic percent-encoded for you, each call a connection of its own (about a second on an ESP32-C3):"));
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(&usage).monospace().size(11.0));
+        if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+            ui.ctx().copy_text(usage.clone());
+        }
+    });
+    if !f.amazon_ca {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(warn("http_ca.rs does not hold Amazon's CAs: AWS IoT's chain ends in Amazon Root CA 1"));
+            if ui.small_button("Add Amazon Root CA 1 + 3").clicked() {
+                actions.push(TlsAction::HttpCa(iot_gen::HttpCa::Amazon));
+            }
+        });
+    }
+    if let Some(id) = mqtt_aws {
+        ui.label(dim(format!(
+            "The thing, the certificate and the policy: the MQTT card's AWS steps - its policy allows iot:Publish under `{id}/`, HTTPS included."
+        )));
+    } else if aws_iot::thing_problem(&thing).is_none() {
+        ui.label(dim("AWS CLI 2.11.17 or newer, run where device.csr is:"));
+        let dir: Option<std::path::PathBuf> = ui.data_mut(|d| d.get_temp(aws_dir_id(tls)));
+        if let Some(dir) = &dir {
+            command_line(ui, &format!("pushd \"{}\"", dir.display()));
+        }
+        let mut n = 0;
+        for step in aws_iot::https_steps(&thing, e) {
+            aws_step(ui, &mut n, &step);
+        }
+        let arn_id = egui::Id::new(("iot_aws_arn", tls.project.clone()));
+        let mut arn_text: String = ui.data_mut(|d| d.get_temp(arn_id)).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(dim(format!("{}. The ARN step {n} printed:", n + 1)));
+            ui.add(
+                egui::TextEdit::singleline(&mut arn_text)
+                    .hint_text("arn:aws:iot:<region>:<account>:cert/<id>")
+                    .desired_width(300.0),
+            );
+        });
+        n += 1;
+        ui.data_mut(|d| d.insert_temp(arn_id, arn_text.clone()));
+        match aws_iot::cert_arn(&arn_text) {
+            Err(why) if !arn_text.trim().is_empty() => {
+                ui.label(warn(why));
+            }
+            Err(_) => {
+                ui.label(dim("Then policy.json and the lines that attach it follow, filled in."));
+            }
+            Ok(arn) => {
+                if arn.region != e.region {
+                    ui.label(warn(format!(
+                        "this certificate is in {}, the endpoint in {} - a certificate works only in its own region",
+                        arn.region, e.region
+                    )));
+                }
+                let policy = aws_iot::policy_for(&thing, &[], &arn);
+                policy_buttons(ui, &policy, dir.as_deref());
+                ui.label(dim(format!(
+                    "policy.json: publish under `{thing}/` (its iot:Connect line is harmless: whether AWS checks it for HTTPS is undocumented). Publish elsewhere, and add that topic to it."
+                )));
+                for step in aws_iot::attach_steps_for(&thing, &arn) {
+                    aws_step(ui, &mut n, &step);
+                }
+            }
+        }
+    }
+    aws_publish_from_pc(ui, h, f, tls, &thing);
+}
+
+/// "Publish from this PC": one `aws_publish()` as the board makes it - its
+/// handshake, its certificate, its URL to the byte - and AWS's answer.
+fn aws_publish_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &TlsFacts, thing: &str) {
+    use crate::panels::mcu_module::tls_check::{self, HttpPost, HttpRequest, Shared, State};
+    let topic_id = egui::Id::new(("iot_aws_publish_topic", f.project.clone()));
+    let payload_id = egui::Id::new(("iot_aws_publish_payload", f.project.clone()));
+    let id = egui::Id::new(("iot_aws_publish_check", f.project.clone()));
+    let mut topic: String = ui
+        .data_mut(|d| d.get_temp(topic_id))
+        .unwrap_or_else(|| format!("{}/test", if thing.is_empty() { "my-thing" } else { thing }));
+    let mut payload: String = ui
+        .data_mut(|d| d.get_temp(payload_id))
+        .unwrap_or_else(|| "{\"from\":\"RustOnChip: Test from this PC\"}".to_owned());
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, 18.0], egui::Label::new("Topic"));
+        ui.add(egui::TextEdit::singleline(&mut topic).desired_width(220.0));
+    });
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, 18.0], egui::Label::new("Payload"));
+        ui.add(egui::TextEdit::singleline(&mut payload).desired_width(320.0));
+    });
+    ui.data_mut(|d| {
+        d.insert_temp(topic_id, topic.clone());
+        d.insert_temp(payload_id, payload.clone());
+    });
+    let port = if h.aws_port == 443 { 443 } else { 8443 };
+    let payload_max = h.payload_max.clamp(*iot::HTTP_BODY_RANGE.start(), *iot::HTTP_BODY_RANGE.end()) as usize;
+    let url = aws_iot::publish_url(&iot::http_cert_host(h), port, &topic, u8::from(h.aws_qos >= 1));
+    let refused = match &url {
+        Err(why) => Some((*why).to_owned()),
+        Ok(_) if f.ca_der.is_none() => Some("http_ca.rs holds no certificate the checker can read".to_owned()),
+        Ok(_) if tls.client_key_pem.trim().is_empty() || tls.client_cert_pem.trim().is_empty() => Some(
+            "secrets.rs holds no key and certificate yet - AWS IoT would reset the connection".to_owned(),
+        ),
+        Ok(_) if payload.len() > payload_max => Some(format!(
+            "{} bytes, over the board's {payload_max} (Send up to)",
+            payload.len(),
+        )),
+        Ok(_) => None,
+    };
+    let request = HttpRequest {
+        url: url.clone().unwrap_or_default(),
+        verify: true,
+        ca: f.ca_der.clone().unwrap_or_default(),
+        p384: h.p384 || f.p384_built,
+        head_max: iot::HTTP_HEAD_MAX,
+        body_max: h.body_max.clamp(*iot::HTTP_BODY_RANGE.start(), *iot::HTTP_BODY_RANGE.end()) as usize,
+        user_agent: iot::http_user_agent(&h.user_agent),
+        request_head_max: iot::HTTP_REQUEST_HEAD_MAX,
+        post: Some(HttpPost {
+            content_type: String::new(),
+            payload: payload.as_bytes().to_vec(),
+        }),
+        client_cert: tls.client_cert_pem.clone(),
+        client_key: tls.client_key_pem.clone(),
+        alpn: (port == 443).then(|| "x-amzn-http-ca".to_owned()),
+        connect_to: None,
+        aws: true,
+    };
+    let shared: Option<Shared> = ui.data_mut(|d| d.get_temp::<Shared>(id));
+    let state = shared
+        .as_ref()
+        .and_then(|s| s.lock().ok().map(|s| s.clone()))
+        .unwrap_or_default();
+    let busy = matches!(state, State::Building | State::Connecting);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!busy && refused.is_none(), egui::Button::new(format!("{} Publish from this PC", ph::PLUGS_CONNECTED)))
+            .on_hover_text("aws_publish() as the board makes it - its handshake, certificate and URL - from this PC")
+            .clicked()
+        {
+            let started = tls_check::start_http(request.clone(), ui.ctx().clone());
+            ui.data_mut(|d| d.insert_temp(id, started));
+        }
+        match &state {
+            State::Building => {
+                ui.spinner();
+                ui.label(dim("Building the checker - about a minute the first time."));
+            }
+            State::Connecting => {
+                ui.spinner();
+            }
+            _ => {}
+        }
+    });
+    if let Some(why) = &refused {
+        ui.label(warn(why.as_str()));
+    }
+    let State::Done { ok, summary, steps, tested, .. } = &state else {
+        return;
+    };
+    if request.tested().fingerprint != tested.fingerprint {
+        ui.label(dim("For an earlier topic, payload or setting."));
+    }
+    for step in steps {
+        ui.label(dim(format!("{}  {step}", ph::CHECK)));
+    }
+    if *ok {
+        ui.label(
+            egui::RichText::new(format!("{}  {summary}", ph::CHECK_CIRCLE))
+                .size(11.0)
+                .color(egui::Color32::from_rgb(120, 200, 140)),
+        );
+        ui.label(dim("In the AWS console's MQTT test client, a subscription to the topic shows it."));
+    } else {
+        ui.label(warn(summary.as_str()));
+    }
 }
 
 /// HTTPS's checks and CAs, where the chip carries it.
@@ -2243,7 +2591,7 @@ fn https_settings(ui: &mut egui::Ui, h: &mut HttpConfig, f: &HttpFacts, actions:
 }
 
 /// "Test from this PC" for a URL: the board's checks and buffers, here.
-fn http_test_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts) {
+fn http_test_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &TlsFacts) {
     use crate::panels::mcu_module::tls_check::{self, HttpRequest, Shared, State};
     let url_id = egui::Id::new(("iot_http_test_url", f.project.clone()));
     let id = egui::Id::new(("iot_http_check", f.project.clone()));
@@ -2271,6 +2619,23 @@ fn http_test_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts) {
     } else {
         None
     };
+    // The board's certificate goes where the board sends it: to the tab's
+    // host alone, AWS IoT's ALPN with it on 443.
+    let after = url.trim().split_once("://").map_or("", |(_, rest)| rest);
+    let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
+    let default_port = if https_url { 443 } else { 80 };
+    let (url_host, url_port) = match authority.rsplit_once(':') {
+        Some((host, "")) => (host, default_port),
+        Some((host, port)) => (host, port.parse::<u16>().unwrap_or(0)),
+        None => (authority, default_port),
+    };
+    let mine = https_url
+        && h.client_cert
+        && iot::http_cert_problem(h).is_none()
+        && url_host.eq_ignore_ascii_case(&iot::http_cert_host(h));
+    // AWS's ALPN goes with the certificate on 443, as the board sends it; a
+    // GET is not a publish, so the answer is read as any server's.
+    let aws_host = mine && iot::http_aws(h).is_some();
     // The board's own limits, as http.rs gets them.
     let request = HttpRequest {
         url: url.trim().to_owned(),
@@ -2282,6 +2647,10 @@ fn http_test_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts) {
         body_max: h.body_max.clamp(*iot::HTTP_BODY_RANGE.start(), *iot::HTTP_BODY_RANGE.end()) as usize,
         user_agent: iot::http_user_agent(&h.user_agent),
         request_head_max: iot::HTTP_REQUEST_HEAD_MAX,
+        client_cert: if mine { tls.client_cert_pem.clone() } else { String::new() },
+        client_key: if mine { tls.client_key_pem.clone() } else { String::new() },
+        alpn: (aws_host && url_port == 443).then(|| "x-amzn-http-ca".to_owned()),
+        ..HttpRequest::default()
     };
     ui.horizontal(|ui| {
         if ui

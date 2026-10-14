@@ -12,6 +12,11 @@
 // `request()` takes the rest: the method, an Authorization (Bearer, Basic or
 // as given), more headers. Tokens belong in secrets.rs, never in a commit.
 //
+// AWS IoT, with the board's certificate (IoT tab: HTTP > Client certificate):
+//
+//     let r = pins::configs::http::aws_publish("my-thing/temperature", b"{\"t\":21.5}", &mut body).await;
+//     // Ok(r) with r.status == 200: the broker took it
+//
 // One task makes the requests, one at a time: it holds the socket, the TLS
 // buffers and the handshake, so a caller's own task stays small. Each request
 // opens its own connection (`Connection: close`) and takes TIMEOUT_S at most.
@@ -127,6 +132,42 @@ pub async fn request(req: Request<'_>, body: &mut [u8]) -> Result<Response, Http
         response.truncated = true;
     }
     Ok(response)
+}
+
+/// The longest URL `aws_publish()` builds: the endpoint, its port, and a
+/// 256-byte topic percent-encoded throughout.
+const AWS_URL_MAX: usize = "https://".len() + HOST_MAX + ":65535/topics/?qos=1".len() + 3 * AWS_TOPIC_MAX;
+
+/// Publishes `payload` on `topic` in AWS IoT over HTTPS, with the board's
+/// certificate: the endpoint, port and QoS the tab gave (CERT_HOST,
+/// AWS_PORT, AWS_QOS). The answer lands in `body`, as `request()`'s does:
+///
+/// - `Ok(r)`, `r.status == 200`: the broker took the message - whether
+///   anyone is subscribed or not. Any other status is a refusal; 403: the
+///   policy allows no iot:Publish on this topic (`body` may say more).
+/// - `Err(Io)` or `Err(Closed)`: AWS reset the connection after the
+///   handshake - the certificate is not registered, not active, or no
+///   policy is attached to it.
+/// - `Err(Url)`: no AWS endpoint in the tab, or a topic AWS would refuse
+///   (empty, over 256 bytes, more than 7 `/`, `+` or `#`, a `$` topic other
+///   than `$aws/...`).
+///
+/// Each call is a connection and a handshake of its own: about a second on
+/// an ESP32-C3. A lost answer and a retry can publish the message twice.
+pub async fn aws_publish(topic: &str, payload: &[u8], body: &mut [u8]) -> Result<Response, HttpError> {
+    if AWS_PORT == 0 {
+        return Err(HttpError::Url);
+    }
+    let mut url = [0u8; AWS_URL_MAX];
+    let n = aws_url(&mut url, CERT_HOST, AWS_PORT, topic, AWS_QOS)?;
+    // Every byte aws_url wrote is ASCII.
+    let url = core::str::from_utf8(&url[..n]).map_err(|_| HttpError::Url)?;
+    let req = Request {
+        method: Method::Post,
+        payload,
+        ..Request::get(url)
+    };
+    request(req, body).await
 }
 
 /// Starts the task that makes the requests.

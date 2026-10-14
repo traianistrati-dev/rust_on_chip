@@ -228,7 +228,77 @@ pub fn thing(m: &MqttConfig) -> &str {
 
 /// The policy's name: the thing's, where `:` is not allowed.
 pub fn policy_name(m: &MqttConfig) -> String {
-    format!("{}-policy", thing(m).replace(':', "_"))
+    policy_name_for(thing(m))
+}
+
+/// ... for a thing named `thing`.
+pub fn policy_name_for(thing: &str) -> String {
+    format!("{}-policy", thing.replace(':', "_"))
+}
+
+/// The thing's name, for HTTPS publish (where no client id names it): AWS
+/// takes letters, digits, `:`, `_` and `-`, 128 at most.
+pub fn thing_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("name the thing: the policy, the certificate and the steps below name it");
+    }
+    if name.len() > 128 {
+        return Some("longer than AWS IoT's 128 bytes");
+    }
+    (!name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-')))
+        .then_some("a thing's name holds only letters, digits, `:`, `_` and `-`")
+}
+
+/// The URL `aws_publish()` sends a topic to: `https://<host>[:<port>]/topics/
+/// <topic>?qos=<qos>` - the topic percent-encoded byte by byte but for RFC
+/// 3986's unreserved characters and `/`. The firmware's `aws_url`, rule for
+/// rule (`http_core_tests` holds them to the same bytes): what AWS refuses,
+/// refused here with why.
+pub fn publish_url(host: &str, port: u16, topic: &str, qos: u8) -> Result<String, &'static str> {
+    let counted = topic
+        .strip_prefix("$aws/rules/")
+        .and_then(|rest| rest.split_once('/'))
+        .map_or(topic, |(_, rest)| rest);
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        || port == 0
+    {
+        return Err("no endpoint to publish to");
+    }
+    if topic.is_empty() {
+        return Err("an empty topic");
+    }
+    if topic.len() > 256 {
+        return Err("over AWS IoT's 256 bytes");
+    }
+    if counted.matches('/').count() > 7 {
+        return Err("more than 7 `/`: AWS IoT refuses it");
+    }
+    if topic.contains(['+', '#', '\0']) {
+        return Err("`+` and `#` are wildcards - a topic to publish on holds neither");
+    }
+    if topic.starts_with('$') && !topic.starts_with("$aws/") {
+        return Err("a `$` topic other than `$aws/...` is AWS IoT's own");
+    }
+    if qos > 1 {
+        return Err("QoS 0 or 1 - HTTP has no QoS 2");
+    }
+    let mut url = format!("https://{host}");
+    if port != 443 {
+        url.push_str(&format!(":{port}"));
+    }
+    url.push_str("/topics/");
+    for b in topic.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            url.push(char::from(b));
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url.push_str(&format!("?qos={qos}"));
+    Ok(url)
 }
 
 /// The subscriptions the board makes that lie outside `<thing>/`: each
@@ -245,12 +315,17 @@ fn outside_filters(m: &MqttConfig) -> Vec<&str> {
 /// under `<thing>/` (the panic report's topic and the test's are there),
 /// subscribe there and to each filter the board subscribes to.
 pub fn policy(m: &MqttConfig, arn: &CertArn) -> String {
+    policy_for(thing(m), &outside_filters(m), arn)
+}
+
+/// ... for the thing `id`, subscribed to `outside` beyond `<id>/`: HTTPS
+/// publish alone subscribes to nothing - and whether AWS checks iot:Connect
+/// for it is undocumented, so the line stays.
+pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn) -> String {
     let base = format!("arn:{}:iot:{}:{}:", arn.partition, arn.region, arn.account);
-    let id = thing(m);
-    let outside = outside_filters(m);
     let mut subscribe = vec![format!("{base}topicfilter/{id}/*")];
     let mut receive = vec![format!("{base}topic/{id}/*")];
-    for f in &outside {
+    for f in outside {
         subscribe.push(format!("{base}topicfilter/{f}"));
         // What a filter receives, in the policy's wildcard `*` - a shared
         // subscription's messages on their own topic, without `$share/<name>/`.
@@ -317,15 +392,28 @@ fn tls13_policy(e: &Endpoint) -> Option<&'static str> {
 /// The AWS CLI lines up to the certificate: each one line without `$` or
 /// `\`, so it runs alike in PowerShell, cmd and bash.
 pub fn steps(m: &MqttConfig, e: &Endpoint) -> Vec<Step> {
+    steps_for(thing(m), e, false)
+}
+
+/// ... for HTTPS publish, the thing named in the HTTP card.
+pub fn https_steps(thing: &str, e: &Endpoint) -> Vec<Step> {
+    steps_for(thing, e, true)
+}
+
+fn steps_for(thing: &str, e: &Endpoint, https: bool) -> Vec<Step> {
     let region = format!("--region {}", e.region);
     let mut steps = vec![Step {
-        what: "Your account's endpoint - what Broker must hold:",
+        what: if https {
+            "Your account's endpoint - what \"Sent only to\" must hold:"
+        } else {
+            "Your account's endpoint - what Broker must hold:"
+        },
         command: format!("aws iot describe-endpoint --endpoint-type iot:Data-ATS {region} --query endpointAddress --output text"),
         also: None,
     }];
     if let Some(policy) = tls13_policy(e) {
         steps.push(Step {
-            what: "TLS 1.3 on it - once per account and region; devices on TLS 1.2 keep working:",
+            what: "TLS 1.3 on it - once per account and region, for 443, 8443 and 8883 alike; devices on TLS 1.2 keep working:",
             command: format!("aws iot update-domain-configuration --domain-configuration-name \"iot:Data-ATS\" --tls-config securityPolicy={policy} {region}"),
             also: Some((
                 "and to check it:",
@@ -334,8 +422,12 @@ pub fn steps(m: &MqttConfig, e: &Endpoint) -> Vec<Step> {
         });
     }
     steps.push(Step {
-        what: "The thing - its name is the client id:",
-        command: format!("aws iot create-thing --thing-name {} {region}", thing(m)),
+        what: if https {
+            "The thing:"
+        } else {
+            "The thing - its name is the client id:"
+        },
+        command: format!("aws iot create-thing --thing-name {thing} {region}"),
         also: None,
     });
     steps.push(Step {
@@ -348,8 +440,13 @@ pub fn steps(m: &MqttConfig, e: &Endpoint) -> Vec<Step> {
 
 /// The lines after the certificate: its policy, and the thing attached.
 pub fn attach_steps(m: &MqttConfig, arn: &CertArn) -> Vec<Step> {
+    attach_steps_for(thing(m), arn)
+}
+
+/// ... for the thing `thing`.
+pub fn attach_steps_for(thing: &str, arn: &CertArn) -> Vec<Step> {
     let region = format!("--region {}", arn.region);
-    let name = policy_name(m);
+    let name = policy_name_for(thing);
     vec![
         Step {
             what: "The policy, from policy.json:",
@@ -366,7 +463,7 @@ pub fn attach_steps(m: &MqttConfig, arn: &CertArn) -> Vec<Step> {
         },
         Step {
             what: "The certificate on the thing:",
-            command: format!("aws iot attach-thing-principal --thing-name {} --principal {} {region}", thing(m), arn.arn),
+            command: format!("aws iot attach-thing-principal --thing-name {thing} --principal {} {region}", arn.arn),
             also: None,
         },
     ]
@@ -527,5 +624,57 @@ mod tests {
         let mut colon = m.clone();
         colon.client_id = "dev:1".to_owned();
         assert_eq!(policy_name(&colon), "dev_1-policy");
+    }
+
+    /// HTTPS publish alone: the same seven lines for the thing the HTTP card
+    /// names, MQTT's words left out; its policy publishes under `<thing>/`
+    /// and subscribes to nothing beyond it.
+    #[test]
+    fn https_publish_gets_the_steps_by_thing_name() {
+        let e = endpoint("a1-ats.iot.eu-south-1.amazonaws.com").unwrap();
+        let arn = cert_arn(ARN).unwrap();
+        let all: Vec<Step> = https_steps("sensor-7", &e)
+            .into_iter()
+            .chain(attach_steps_for("sensor-7", &arn))
+            .collect();
+        assert_eq!(all.len(), 7);
+        assert!(all[0].what.contains("Sent only to"), "{}", all[0].what);
+        assert!(!all.iter().any(|s| s.what.contains("client id") || s.what.contains("Broker")));
+        assert!(all[2].command.contains("create-thing --thing-name sensor-7 --region eu-south-1"));
+        assert!(all[4].command.contains("--policy-name sensor-7-policy"));
+        assert!(all[6].command.contains("--thing-name sensor-7 --principal"));
+        let text = policy_for("sensor-7", &[], &arn);
+        assert!(text.contains("\"arn:aws:iot:eu-central-1:123456789012:topic/sensor-7/*\""), "{text}");
+        assert!(text.contains("client/sensor-7"));
+        assert!(!policy_too_long(&text));
+        // The MQTT policy is the same text by the client id, its outside
+        // filters added.
+        let m = aws("a1-ats.iot.eu-central-1.amazonaws.com");
+        let outside = outside_filters(&m);
+        assert_eq!(policy(&m, &arn), policy_for("rustonchip-esp32c3", &outside, &arn));
+
+        assert!(thing_problem("sensor-7").is_none() && thing_problem("a:b_c-1").is_none());
+        for bad in ["", "a b", "a/b", "caf\u{e9}"] {
+            assert!(thing_problem(bad).is_some(), "{bad:?}");
+        }
+        assert!(thing_problem(&"t".repeat(129)).is_some());
+    }
+
+    /// The URL "Test from this PC" sends: as the board's, refusals said.
+    #[test]
+    fn publish_url_writes_what_aws_publish_sends() {
+        let host = "a1-ats.iot.eu-south-1.amazonaws.com";
+        assert_eq!(
+            publish_url(host, 8443, "sensor-7/t", 1).unwrap(),
+            "https://a1-ats.iot.eu-south-1.amazonaws.com:8443/topics/sensor-7/t?qos=1"
+        );
+        assert_eq!(
+            publish_url(host, 443, "a b/\u{e9}", 0).unwrap(),
+            "https://a1-ats.iot.eu-south-1.amazonaws.com/topics/a%20b/%C3%A9?qos=0"
+        );
+        for (topic, qos) in [("", 1), ("a/#", 1), ("a/+/b", 1), ("$SYS/x", 1), ("a", 2)] {
+            assert!(publish_url(host, 8443, topic, qos).is_err(), "{topic:?}");
+        }
+        assert!(publish_url("", 8443, "a", 1).is_err());
     }
 }

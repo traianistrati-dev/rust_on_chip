@@ -761,3 +761,147 @@ fn mutated_urls_never_break_the_request_line() {
     // The mutations must leave enough URLs whole for the check to mean anything.
     assert!(parsed > FUZZ_RUNS / 6, "only {parsed} mutated URLs parsed");
 }
+
+/// The target `aws_url` wrote, percent-decoded: the topic's bytes back.
+fn topic_of(url: &str) -> Vec<u8> {
+    let target = url.split_once("/topics/").unwrap().1;
+    let path = target.rsplit_once("?qos=").unwrap().0.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < path.len() {
+        if path[i] == b'%' {
+            let hex = std::str::from_utf8(&path[i + 1..i + 3]).unwrap();
+            out.push(u8::from_str_radix(hex, 16).unwrap());
+            i += 3;
+        } else {
+            out.push(path[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn aws(host: &str, port: u16, topic: &str, qos: u8) -> Result<String, HttpError> {
+    let mut buf = [0u8; 2048];
+    let n = aws_url(&mut buf, host, port, topic, qos)?;
+    Ok(String::from_utf8(buf[..n].to_vec()).unwrap())
+}
+
+const ENDPOINT: &str = "a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com";
+
+#[test]
+fn aws_url_writes_the_topic_as_aws_reads_it() {
+    assert_eq!(
+        aws(ENDPOINT, 8443, "my-thing/temp", 1).unwrap(),
+        format!("https://{ENDPOINT}:8443/topics/my-thing/temp?qos=1")
+    );
+    // 443 is https's own: no port in the URL, nor in the Host header.
+    assert_eq!(aws("h", 443, "a", 0).unwrap(), "https://h/topics/a?qos=0");
+    // `/` stays between levels; every byte outside the unreserved set goes
+    // percent-encoded - `?` and `#` would end the path, a space the line.
+    assert_eq!(
+        aws("h", 443, "a b%c?d/\u{e9}~x", 1).unwrap(),
+        "https://h/topics/a%20b%25c%3Fd/%C3%A9~x?qos=1"
+    );
+    // AWS's own topics: the shadow takes HTTPS publishes.
+    assert_eq!(
+        aws("h", 443, "$aws/things/t/shadow/update", 0).unwrap(),
+        "https://h/topics/%24aws/things/t/shadow/update?qos=0"
+    );
+    // At most 7 `/`, Basic Ingest's `$aws/rules/<rule>/` not counted.
+    assert!(aws("h", 443, "a/b/c/d/e/f/g/h", 1).is_ok());
+    assert_eq!(aws("h", 443, "a/b/c/d/e/f/g/h/i", 1), Err(HttpError::Url));
+    assert!(aws("h", 443, "$aws/rules/r/a/b/c/d/e/f/g/h", 1).is_ok());
+    // At most 256 bytes - UTF-8 bytes, not characters.
+    assert!(aws("h", 443, &"t".repeat(256), 1).is_ok());
+    assert_eq!(aws("h", 443, &"t".repeat(257), 1), Err(HttpError::Url));
+    assert_eq!(aws("h", 443, &"\u{e9}".repeat(129), 1), Err(HttpError::Url));
+    // What AWS refuses never leaves the board.
+    for bad in ["", "a/+/b", "a/#", "a\0b", "$SYS/x", "$share/g/t"] {
+        assert_eq!(aws("h", 443, bad, 1), Err(HttpError::Url), "{bad:?}");
+    }
+    assert_eq!(aws("h", 443, "a", 2), Err(HttpError::Url), "QoS 2 is not HTTP's");
+    for host in ["", "h:1", "h/x", "a b"] {
+        assert_eq!(aws(host, 443, "a", 1), Err(HttpError::Url), "{host:?}");
+    }
+    assert_eq!(aws("h", 0, "a", 1), Err(HttpError::Url));
+    // Too small a buffer is TooLarge, never a cut URL.
+    let mut small = [0u8; 24];
+    assert_eq!(aws_url(&mut small, ENDPOINT, 8443, "a", 1), Err(HttpError::TooLarge));
+}
+
+/// Whatever the topic, `aws_url` either refuses it or writes a URL the
+/// client parses and sends as it is: the endpoint, the port, and the topic
+/// intact once AWS percent-decodes it.
+#[test]
+fn aws_urls_always_parse_and_carry_the_topic() {
+    let mut rnd = xorshift(0x1234_5678_9ABC_DEF1);
+    let alphabet = [
+        "a", "Z", "0", "-", "_", ".", "~", "/", "/", " ", "%", "?", "$", "&", "=", ":", "@", "\u{e9}",
+        "\u{20ac}", "\u{1f600}", "\t", "\"", "'", "\\",
+    ];
+    // What AWS refuses, now and then: most topics must build.
+    let refused = ["#", "+", "\0"];
+    let mut built = 0;
+    for i in 0..FUZZ_RUNS {
+        let len = (rnd() as usize) % 40;
+        let mut topic = String::new();
+        if rnd() % 8 == 0 {
+            topic.push_str("$aws/things/t/shadow/");
+        }
+        for _ in 0..len {
+            topic.push_str(if rnd() % 64 == 0 {
+                refused[(rnd() as usize) % refused.len()]
+            } else {
+                alphabet[(rnd() as usize) % alphabet.len()]
+            });
+        }
+        let port = if rnd() % 2 == 0 { 443 } else { 8443 };
+        let qos = (rnd() % 3) as u8;
+        let Ok(url) = aws(ENDPOINT, port, &topic, qos) else {
+            continue;
+        };
+        built += 1;
+        let parsed = Url::parse(&url).unwrap_or_else(|e| panic!("run {i}: {topic:?} -> {url:?}: {e:?}"));
+        assert_eq!((parsed.host, parsed.port, parsed.https), (ENDPOINT, port, true));
+        assert_eq!(parsed.target(), url.split_once(".com").unwrap().1.trim_start_matches(":8443"));
+        assert_eq!(topic_of(&url), topic.as_bytes(), "run {i}: {url:?}");
+        assert!(url.ends_with(&format!("?qos={qos}")), "{url}");
+        let mut head = [0u8; REQUEST_HEAD_MAX];
+        // A long topic, encoded three bytes a byte, may not fit the head:
+        // TooLarge, never a broken request line.
+        if let Ok(n) = build(&mut head, Method::Post, &parsed, Auth::None, None, &[], 5) {
+            let line = std::str::from_utf8(&head[..n]).unwrap().lines().next().unwrap().to_owned();
+            assert_eq!(line.split(' ').count(), 3, "run {i}: {line:?}");
+        }
+    }
+    assert!(built > FUZZ_RUNS / 4, "only {built} topics built");
+}
+
+/// The IDE builds "Test from this PC"'s URL with `aws_iot::publish_url`: for
+/// the PC to test what the board sends, both must refuse alike and write the
+/// same bytes.
+#[test]
+fn the_ide_and_the_board_build_the_same_aws_url() {
+    use crate::panels::mcu_module::aws_iot::publish_url;
+    let mut rnd = xorshift(0x0DDB_A11C_0FFE_E123);
+    let alphabet = ["a", "Z", "9", "-", "_", ".", "~", "/", " ", "%", "?", "$", "+", "#", "&", "\u{e9}", "\u{1f600}"];
+    for i in 0..FUZZ_RUNS {
+        let mut topic = String::new();
+        if rnd() % 6 == 0 {
+            topic.push_str(["$aws/things/t/shadow/", "$aws/rules/r/", "$SYS/"][(rnd() % 3) as usize]);
+        }
+        for _ in 0..(rnd() as usize) % 300 {
+            topic.push_str(alphabet[(rnd() as usize) % alphabet.len()]);
+        }
+        let port = [443, 8443, 0][(rnd() % 3) as usize];
+        let qos = (rnd() % 3) as u8;
+        let board = aws(ENDPOINT, port, &topic, qos);
+        let ide = publish_url(ENDPOINT, port, &topic, qos);
+        match (&board, &ide) {
+            (Ok(b), Ok(p)) => assert_eq!(b, p, "run {i}: {topic:?}"),
+            (Err(HttpError::Url), Err(_)) => {}
+            _ => panic!("run {i}: {topic:?} port {port} qos {qos}: board {board:?}, IDE {ide:?}"),
+        }
+    }
+}

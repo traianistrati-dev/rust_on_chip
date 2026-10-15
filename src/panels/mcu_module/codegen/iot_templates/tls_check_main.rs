@@ -55,6 +55,11 @@ const RECORD_TX: usize = 2048;
 include!("tls_verify.rs");
 include!("pem_der.rs");
 include!("csr_der.rs");
+/// The board's JSON reader: the shadow's answer read as the board reads it.
+#[allow(dead_code)]
+mod json {
+    include!("json.rs");
+}
 
 struct Request {
     host: String,
@@ -71,6 +76,12 @@ struct Request {
     keep_alive: u16,
     subscribe: Vec<String>,
     test_topic: String,
+    /// The Device Shadow over MQTT: the answer topics the board subscribes
+    /// first, 7 a shadow (none: no shadow), the board's SHADOW_MAX and the
+    /// packet it takes (WORK).
+    shadow_filters: Vec<String>,
+    shadow_max: usize,
+    shadow_work: usize,
 }
 
 fn unhex(line: &str) -> Vec<u8> {
@@ -106,6 +117,12 @@ fn read_request() -> Option<Request> {
             .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
             .unwrap_or_default(),
         test_topic: text(13).unwrap_or_default(),
+        // Absent from an IDE from before the Device Shadow: no shadow.
+        shadow_filters: text(14)
+            .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
+            .unwrap_or_default(),
+        shadow_max: text(15).and_then(|n| n.parse().ok()).unwrap_or(0),
+        shadow_work: text(16).and_then(|n| n.parse().ok()).unwrap_or(0),
     })
 }
 
@@ -548,7 +565,15 @@ fn run(r: &Request) -> Result<String, String> {
             r.client_id
         );
     }
-    let packet = connect_packet(&r.client_id, r.keep_alive, credentials.then_some((r.user.as_str(), r.password.as_str())));
+    // With the Device Shadow, any size of answer is let in - and then held
+    // to what the board takes, which this can then say.
+    let max_packet = if r.shadow_filters.is_empty() { 1024 } else { 65536 };
+    let packet = connect_packet(
+        &r.client_id,
+        r.keep_alive,
+        credentials.then_some((r.user.as_str(), r.password.as_str())),
+        max_packet,
+    );
     send(&mut tls, &packet).map_err(|e| refused(format!("the CONNECT could not be sent: {e}")))?;
     let (kind, connack) = read_packet(&mut tls, "a CONNACK").map_err(|e| silent_443(r, refused(e)))?;
     if kind != 0x20 {
@@ -610,6 +635,42 @@ fn run(r: &Request) -> Result<String, String> {
     // refuses one answers here, where the board says nothing.
     let mut refusals = Vec::new();
     let mut problem_info = false;
+    // The Device Shadow's answer topics first, as the board subscribes them:
+    // a shadow with one refused is off on the board for that connection.
+    let shadow_filters: &[String] = if login_untested { &[] } else { &r.shadow_filters };
+    let mut shadow_refused = vec![false; shadow_filters.len().div_ceil(7)];
+    for (i, filter) in shadow_filters.iter().enumerate() {
+        let id = u16::try_from(0x5A00 + i).unwrap_or(u16::MAX);
+        let at = format!("the shadow's answers `{filter}`");
+        send(&mut tls, &subscribe_packet(id, filter)).map_err(|e| Wait::Ended(e).explain(&at, AWS_SUBSCRIBE_LOST))?;
+        let suback = read_until(&mut tls, 0x90, id, "a SUBACK").map_err(|w| w.explain(&at, AWS_SUBSCRIBE_LOST))?;
+        let (props, codes) = suback.get(2..).and_then(split_properties).ok_or("a SUBACK too short to read")?;
+        problem_info |= props.iter().any(|(p, _)| *p == 0x1F);
+        match codes.first() {
+            Some(&code) if code >= 0x80 => {
+                shadow_refused[i / 7] = true;
+                refusals.push(format!(
+                    "{at}: {} (0x{code:02X}){}",
+                    ack_reason(code),
+                    if code == 0x87 {
+                        format!(
+                            " - on AWS IoT the policy needs iot:Subscribe on topicfilter/{}/*: every call on {} answers Refused",
+                            shadow_root(filter),
+                            shadow_label(filter)
+                        )
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            Some(_) => {}
+            None => return Err("a SUBACK without its reason code".into()),
+        }
+    }
+    let shadow_ready = std::time::Instant::now() + Duration::from_secs(2);
+    if !shadow_filters.is_empty() {
+        println!("INFO subscribed to the Device Shadow's {} answer topics, before the board's own", shadow_filters.len());
+    }
     for (i, filter) in subscribe.iter().enumerate() {
         let id = u16::try_from(i + 1).unwrap_or(u16::MAX);
         let at = format!("the subscription to `{filter}`");
@@ -655,6 +716,32 @@ fn run(r: &Request) -> Result<String, String> {
             }
         }
     }
+    // Each shadow's get, as the board asks it after every connect - once AWS
+    // delivers to the new subscriptions, a little after their SUBACKs.
+    let mut shadow_read = false;
+    let mut shadow_problems = Vec::new();
+    for (k, answers) in shadow_filters.chunks(7).enumerate() {
+        if shadow_refused[k] {
+            continue;
+        }
+        if let Some(wait) = shadow_ready.checked_duration_since(std::time::Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        match shadow_probe(&mut tls, r, &answers[0]) {
+            Ok(note) => {
+                println!("INFO {note}");
+                shadow_read = true;
+            }
+            Err(Probe::Refused(why)) => refusals.push(why),
+            Err(Probe::TooLarge(why)) => shadow_problems.push(why),
+            Err(Probe::Failed(why)) => return Err(why),
+        }
+    }
+    if !shadow_problems.is_empty() {
+        let _ = tls.write(&[0xE0, 0x00]);
+        let _ = tls.flush();
+        return Err(shadow_problems.join("; "));
+    }
     let _ = tls.write(&[0xE0, 0x00]);
     let _ = tls.flush();
 
@@ -674,12 +761,161 @@ fn run(r: &Request) -> Result<String, String> {
     if published {
         did.push("a publication".to_owned());
     }
+    if shadow_read {
+        did.push(if shadow_filters.len() > 7 { "the shadows' gets" } else { "the shadow's get" }.to_owned());
+    }
     let did = if did.is_empty() { String::new() } else { format!(", then {}", did.join(" and ")) };
     Ok(if credentials {
         format!("the broker accepted the connection (CONNACK: success){did}{untested}")
     } else {
         format!("the broker accepted the connection without credentials (encrypt only sends none from here){did}{untested}")
     })
+}
+
+/// How a shadow's get ended short of an answer the board takes.
+enum Probe {
+    /// A refusal, listed with the others.
+    Refused(String),
+    /// An answer over what the board takes: said, and the other shadows
+    /// still asked.
+    TooLarge(String),
+    /// The result itself: the connection ended, or nothing came.
+    Failed(String),
+}
+
+/// A shadow's root topic, from one of its answer topics.
+fn shadow_root(answer: &str) -> &str {
+    ["/get/accepted", "/get/rejected", "/update/accepted", "/update/rejected", "/update/delta",
+     "/delete/accepted", "/delete/rejected"]
+        .iter()
+        .find_map(|suffix| answer.strip_suffix(suffix))
+        .unwrap_or(answer)
+}
+
+/// What a shadow is called, from one of its answer topics.
+fn shadow_label(answer: &str) -> String {
+    match shadow_root(answer).split_once("/shadow/name/") {
+        Some((_, name)) => format!("the shadow `{name}`"),
+        None => "the classic shadow".to_owned(),
+    }
+}
+
+/// One shadow's get as the board sends it after a connect - at QoS 0, with a
+/// clientToken as long as the board's longest - and the answer that carries
+/// the token, measured against what the board takes. `answer` is its
+/// get/accepted topic, already subscribed.
+fn shadow_probe(tls: &mut Tls<'_>, r: &Request, answer: &str) -> Result<String, Probe> {
+    let p = shadow_root(answer);
+    let label = shadow_label(answer);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (u64::from(std::process::id()) << 32);
+    // 19 bytes, as the board's longest (`<8 hex>-<10 digits>`): AWS echoes it.
+    let token = format!("pc-{seed:016x}");
+    let body = format!("{{\"clientToken\":\"{token}\"}}");
+    send(tls, &publish0_packet(&format!("{p}/get"), body.as_bytes()))
+        .map_err(|e| Probe::Failed(format!("{label}'s get could not be sent ({e})")))?;
+    println!("INFO asked {label}: `{p}/get` at QoS 0, as the board does");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let (kind, packet) = read_packet(tls, "the shadow's answer").map_err(|e| {
+            Probe::Failed(match Wait::of(e) {
+                Wait::Silent(e) => format!("{label}'s get got no answer ({e})"),
+                Wait::Ended(e) => format!("the broker ended the connection after {label}'s get ({e})"),
+            })
+        })?;
+        if kind == 0xE0 {
+            let code = packet.first().copied().unwrap_or(0x00);
+            return Err(Probe::Failed(match code {
+                0x87 => format!(
+                    "AWS ended the connection over {label}'s get: not authorized (0x87) - the policy needs iot:Publish on topic/{p}/*; on the board that call fails, its connection ends once, and the same call then answers Refused for 10 minutes"
+                ),
+                0x8E => format!(
+                    "the broker ended the connection while {label}'s get waited: another connection took this client id over (0x8E) - the board itself, if it is online"
+                ),
+                code => format!("the broker ended the connection while {label}'s get waited: {} (0x{code:02X})", ack_reason(code)),
+            }));
+        }
+        if kind & 0xF0 != 0x30 {
+            continue;
+        }
+        let Some((topic, payload)) = publish_parts(kind, &packet) else {
+            continue;
+        };
+        let accepted = topic == format!("{p}/get/accepted");
+        if !accepted && topic != format!("{p}/get/rejected") {
+            continue;
+        }
+        // Another client's get, or one from before: not ours.
+        let mut text = [0u8; 64];
+        if json::json_str(payload, &["clientToken"], &mut text) != Some(token.as_str()) {
+            continue;
+        }
+        let size = 1 + varint_len(packet.len()) + packet.len();
+        if !accepted {
+            let code = json::json_i64(payload, &["code"]).unwrap_or(0);
+            let mut message = [0u8; 160];
+            let said = json::json_str(payload, &["message"], &mut message).unwrap_or("");
+            return if code == 404 {
+                Ok(format!("{label} does not exist yet (404): the policy lets the board ask, and its first shadow_report() makes it"))
+            } else {
+                Err(Probe::Refused(format!("{label}'s get: AWS answered {code} {said}")))
+            };
+        }
+        let version = json::json_i64(payload, &["version"]).map_or_else(|| "?".to_owned(), |v| v.to_string());
+        return if size > r.shadow_work {
+            Err(Probe::TooLarge(format!(
+                "{label}'s answer is {size} bytes as a packet, over the {} the board takes (Document up to {}): it never reaches the board - raise Document up to, keep the state smaller, or split it into named shadows",
+                r.shadow_work, r.shadow_max
+            )))
+        } else if payload.len() > r.shadow_max + 64 {
+            Ok(format!(
+                "{label} answered {} bytes, version {version} - over what the board keeps (Document up to {}): shadow_get() gets it cut, `truncated` set",
+                payload.len(),
+                r.shadow_max
+            ))
+        } else {
+            Ok(format!(
+                "{label} answered {} bytes, version {version} - the board takes it whole (Document up to {})",
+                payload.len(),
+                r.shadow_max
+            ))
+        };
+    }
+    Err(Probe::Failed(format!("{label}'s get got no answer within 15 s - other publications kept coming")))
+}
+
+/// A PUBLISH at QoS 0, as the board sends its shadow requests.
+fn publish0_packet(topic: &str, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    field(&mut body, topic.as_bytes());
+    body.push(0x00);
+    body.extend_from_slice(payload);
+    packet(0x30, &body)
+}
+
+/// A PUBLISH's topic and payload, past its packet id and properties.
+fn publish_parts(first: u8, body: &[u8]) -> Option<(String, &[u8])> {
+    let len = usize::from(u16::from_be_bytes([*body.first()?, *body.get(1)?]));
+    let topic = String::from_utf8(body.get(2..2 + len)?.to_vec()).ok()?;
+    let mut rest = body.get(2 + len..)?;
+    if (first >> 1) & 3 > 0 {
+        rest = rest.get(2..)?;
+    }
+    let (n, after) = varint(rest)?;
+    Some((topic, after.get(n..)?))
+}
+
+/// The bytes a remaining length of `n` takes in a fixed header.
+fn varint_len(n: usize) -> usize {
+    match n {
+        0..=127 => 1,
+        128..=16_383 => 2,
+        16_384..=2_097_151 => 3,
+        _ => 4,
+    }
 }
 
 /// What a CONNACK 0x87 means when the broker asked for the board's
@@ -808,8 +1044,9 @@ fn read_until(tls: &mut Tls<'_>, ack: u8, id: u16, what: &str) -> Result<Vec<u8>
 
 /// An MQTT 5 CONNECT as the board's rust-mqtt sends it: clean start, its
 /// keep-alive, and the properties Receive Maximum 1, Maximum Packet Size
-/// 1024 (the board's buffer) and Request Problem Information 0.
-fn connect_packet(client_id: &str, keep_alive: u16, credentials: Option<(&str, &str)>) -> Vec<u8> {
+/// `max_packet` (the board's buffer: 1024, more with the Device Shadow) and
+/// Request Problem Information 0.
+fn connect_packet(client_id: &str, keep_alive: u16, credentials: Option<(&str, &str)>, max_packet: u32) -> Vec<u8> {
     let mut flags = 0x02u8;
     let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05];
     let mut payload = Vec::new();
@@ -826,7 +1063,9 @@ fn connect_packet(client_id: &str, keep_alive: u16, credentials: Option<(&str, &
     }
     body.push(flags);
     body.extend_from_slice(&keep_alive.to_be_bytes());
-    body.extend_from_slice(&[10, 0x21, 0x00, 0x01, 0x27, 0x00, 0x00, 0x04, 0x00, 0x17, 0x00]);
+    body.extend_from_slice(&[10, 0x21, 0x00, 0x01, 0x27]);
+    body.extend_from_slice(&max_packet.to_be_bytes());
+    body.extend_from_slice(&[0x17, 0x00]);
     body.extend_from_slice(&payload);
     packet(0x10, &body)
 }

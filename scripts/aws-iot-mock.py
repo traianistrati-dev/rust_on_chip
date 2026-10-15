@@ -706,6 +706,7 @@ class Options:
         self.nocert = "rst"                # no client certificate: a reset (AWS), or "alert"
         self.allow_retain = False          # iot:RetainPublish on topic/<thing>/* (--allow-retain)
         self.allow_shadow = False          # iot:*ThingShadow on thing/<thing>[/*] (--allow-shadow)
+        self.allow_mqtt_shadow = False     # Publish/Subscribe/Receive on $aws/things/<thing>/shadow/* (--allow-mqtt-shadow)
         self.shadows = {}                  # (thing, name or None) -> {"desired":.., "reported":..}, there at the start
         for key, value in changes.items():
             if not hasattr(self, key):
@@ -888,12 +889,15 @@ class Broker:
         # --allow FILTER grants Subscribe on the filter as written, and Receive on what it
         # matches - its + and # turned into the policy's own wildcard.
         allow = self.o.allow
+        # The tab's policy with the Device Shadow over MQTT: its topics, `*` spanning `/`.
+        shadow = ["$aws/things/%s/shadow/*" % thing] if self.o.allow_mqtt_shadow else []
         return {
             "connect": ["client/" + thing],
-            "publish": ["topic/%s/*" % thing],
-            "receive": ["topic/%s/*" % thing]
+            "publish": ["topic/%s/*" % thing] + ["topic/" + t for t in shadow],
+            "receive": ["topic/%s/*" % thing] + ["topic/" + t for t in shadow]
                        + ["topic/" + strip_share(f).replace("+", "*").replace("#", "*") for f in allow],
-            "subscribe": ["topicfilter/%s/*" % thing] + ["topicfilter/" + f for f in allow],
+            "subscribe": ["topicfilter/%s/*" % thing] + ["topicfilter/" + t for t in shadow]
+                         + ["topicfilter/" + f for f in allow],
             "retainpublish": ["topic/%s/*" % thing] if self.o.allow_retain else [],
             # The shadow's REST actions: the classic shadow is thing/<thing>, a named
             # one thing/<thing>/<name> - which thing/<thing> alone does not cover.
@@ -903,6 +907,87 @@ class Broker:
     def may(self, thing, action, value):
         prefix = {"connect": "client/", "subscribe": "topicfilter/", "shadow": ""}.get(action, "topic/")
         return any(policy_match(r, prefix + value) for r in self.policy(thing)[action])
+
+    def shadow_op(self, thing, name, op, body, token=None):
+        """One shadow request, REST or MQTT alike, by AWS's documented rules:
+        (status, document, broadcasts, note). The document is the answer - an
+        error document {code, message, timestamp[, clientToken]} for a refusal;
+        broadcasts are (topic suffix, document) for the shadow's MQTT topics;
+        note says what happened, for the log. `token`: an MQTT get's or
+        delete's clientToken, echoed. No policy check, no log, and no deliver()
+        inside the lock."""
+        key = (thing, name)
+        now = int(time.time())
+
+        def error(status, message, echo=None):
+            doc = {"code": status, "message": message, "timestamp": now}
+            if echo is not None:
+                doc["clientToken"] = echo
+            return status, doc, [], None
+
+        tagged = lambda doc: {**doc, "clientToken": token} if token is not None else doc
+        missing = "No shadow exists with name: '%s'" % (name or thing)
+        if op == "get":
+            with self.lock:
+                current = self.shadows.get(key)
+                doc = None if current is None else current.document(now)
+            if doc is None:
+                return error(404, missing, token)
+            return 200, tagged(doc), [], "version %d" % doc["version"]
+        if op == "delete":
+            # Taken and recorded at once: an update in between cannot be lost.
+            with self.lock:
+                current = self.shadows.pop(key, None)
+                if current is not None:
+                    self.deleted[key] = current.version
+            if current is None:
+                return error(404, missing, token)
+            doc = tagged({"version": current.version, "timestamp": now})
+            return 200, doc, [("/delete/accepted", doc)], "deleted at version %d" % current.version
+
+        # UpdateThingShadow. Python's json takes NaN and Infinity; JSON does not.
+        def not_json(constant):
+            raise ValueError("not JSON: " + constant)
+        try:
+            request = json.loads(body.decode("utf-8"), parse_constant=not_json)
+        except UnicodeDecodeError:
+            return error(415, "Unsupported documented encoding; supported encoding is UTF-8")
+        except ValueError:
+            return error(400, "Invalid JSON")
+        token = request.get("clientToken") if isinstance(request, dict) else None
+        problem = update_problem(request)
+        if problem:
+            return error(400, problem, token)
+        with self.lock:
+            current = self.shadows.get(key)
+            # Only that version is updated - none at all when there is no shadow.
+            conflict = "version" in request and (current is None or request["version"] != current.version)
+            before = None if current is None else current.snapshot()
+            version = (current.version if current else self.deleted.get(key, 0)) + 1
+            merged = Shadow.merged(current, request["state"], now, version)
+            too_big = merged.size() > SHADOW_STATE_MAX
+            if not conflict and not too_big:
+                self.shadows[key] = merged
+        if conflict:
+            return error(409, "Version conflict", token)
+        if too_big:
+            return error(413, "The payload exceeds the maximum size allowed", token)
+        tagged = lambda doc: {**doc, "clientToken": token} if token is not None else doc
+        accepted = tagged({"state": request["state"] or {}, "metadata": metadata_of(request["state"] or {}, now),
+                           "version": version, "timestamp": now})
+        broadcasts = [("/update/accepted", accepted),
+                      ("/update/documents", tagged({"previous": before, "current": merged.snapshot(), "timestamp": now}))]
+        delta = merged.delta()
+        if delta:
+            broadcasts.append(("/update/delta", tagged({"state": delta, "metadata": merged.delta_metadata(delta),
+                                                        "version": version, "timestamp": now})))
+        return 200, accepted, broadcasts, "version %d, %d bytes of state" % (version, merged.size())
+
+    def shadow_broadcast(self, thing, name, broadcasts):
+        """The shadow's MQTT messages, to every subscriber the policy lets receive them."""
+        topic = "$aws/things/%s/shadow%s" % (thing, "" if name is None else "/name/" + name)
+        for leaf, doc in broadcasts:
+            self.deliver(topic + leaf, json.dumps(doc, separators=(",", ":")).encode(), None)
 
     def adopt(self, session):
         """AWS takes the newer of two connections with one client id, and drops the older."""
@@ -1203,7 +1288,39 @@ class Session:
         if qos == 1:
             self.puback(pid, code, "accepted" if receivers else "no matching subscribers")
         self.log("%s: allowed, %d receiver(s)%s" % (what, receivers, " -> PUBACK 0x%02X" % code if qos else ""))
+        request = re.fullmatch(r"\$aws/things/([^/]+)/shadow(?:/name/([^/]+))?/(get|update|delete)", topic)
+        if request:
+            self.shadow_request(request.group(1), request.group(2), request.group(3), payload)
         return True
+
+    def shadow_request(self, thing, name, op, payload):
+        """The Device Shadow over MQTT: the answer on <op>/accepted or
+        <op>/rejected, to every subscriber - the clientToken echoed - and an
+        update's documents and delta."""
+        prefix = "$aws/things/%s/shadow%s" % (thing, "" if name is None else "/name/" + name)
+        what = "shadow over MQTT %s %s%s" % (op, thing, "" if name is None else "/" + name)
+        token = None
+        if op != "update" and payload:
+            # get and delete: the content is ignored but its clientToken.
+            try:
+                doc = json.loads(payload.decode("utf-8"))
+                token = doc.get("clientToken") if isinstance(doc, dict) else None
+            except (UnicodeDecodeError, ValueError):
+                token = None
+            if token is not None and (not isinstance(token, str) or len(token.encode()) > 64):
+                return self.shadow_reply(prefix, op, what, 400, {"code": 400, "message": "Invalid clientToken",
+                                                                 "timestamp": int(time.time())})
+        status, doc, broadcasts, note = self.broker.shadow_op(thing, name, op, payload, token)
+        if status != 200:
+            return self.shadow_reply(prefix, op, what, status, doc)
+        self.log("%s: %s -> %s/accepted" % (what, note, op))
+        if op == "get":
+            self.broker.deliver(prefix + "/get/accepted", json.dumps(doc, separators=(",", ":")).encode(), None)
+        self.broker.shadow_broadcast(thing, name, broadcasts)
+
+    def shadow_reply(self, prefix, op, what, status, doc):
+        self.log("%s: %d %s -> %s/rejected" % (what, status, doc.get("message"), op))
+        self.broker.deliver(prefix + "/%s/rejected" % op, json.dumps(doc, separators=(",", ":")).encode(), None)
 
     def refuse_publish(self, qos, pid, code, why):
         if qos == 1 and self.v5:
@@ -1439,72 +1556,18 @@ class HttpsPublish:
         if not self.broker.may(self.thing, "shadow", resource):
             self.log(what + ": iot:%s on %s denied -> 403" % (action, resource))
             return self.shadow_error(403, "Forbidden", "Forbidden")
-        key = (thing, name)
-        topic = "$aws/things/%s/shadow%s" % (thing, "" if name is None else "/name/" + name)
-        now = int(time.time())
-        missing = "No shadow exists with name: '%s'" % (name or thing)
-        if method == "GET":
-            with self.broker.lock:
-                current = self.broker.shadows.get(key)
-                doc = None if current is None else current.document(now)
-            if doc is None:
-                return self.shadow_error(404, "Not Found", missing)
-            self.log("%s: version %d -> 200" % (what, doc["version"]))
-            return self.shadow_answer(200, "OK", doc)
-        if method == "DELETE":
-            # Taken and recorded at once: an update in between cannot be lost.
-            with self.broker.lock:
-                current = self.broker.shadows.pop(key, None)
-                if current is not None:
-                    self.broker.deleted[key] = current.version
-            if current is None:
-                return self.shadow_error(404, "Not Found", missing)
-            doc = {"version": current.version, "timestamp": now}
-            self.log("%s: deleted at version %d -> 200" % (what, current.version))
-            self.broker.deliver(topic + "/delete/accepted", json.dumps(doc).encode(), None)
-            return self.shadow_answer(200, "OK", doc)
-        # UpdateThingShadow. Python's json takes NaN and Infinity; JSON does not.
-        def not_json(constant):
-            raise ValueError("not JSON: " + constant)
-        try:
-            request = json.loads(body.decode("utf-8"), parse_constant=not_json)
-        except UnicodeDecodeError:
-            return self.shadow_error(415, "Unsupported Media Type", "Unsupported documented encoding; supported encoding is UTF-8")
-        except ValueError:
-            return self.shadow_error(400, "Bad Request", "Invalid JSON")
-        token = request.get("clientToken") if isinstance(request, dict) else None
-        problem = update_problem(request)
-        if problem:
-            return self.shadow_error(400, "Bad Request", problem, token)
-        with self.broker.lock:
-            current = self.broker.shadows.get(key)
-            # Only that version is updated - none at all when there is no shadow.
-            conflict = "version" in request and (current is None or request["version"] != current.version)
-            before = None if current is None else current.snapshot()
-            version = (current.version if current else self.broker.deleted.get(key, 0)) + 1
-            merged = Shadow.merged(current, request["state"], now, version)
-            too_big = merged.size() > SHADOW_STATE_MAX
-            if not conflict and not too_big:
-                self.broker.shadows[key] = merged
-        if conflict:
-            return self.shadow_error(409, "Conflict", "Version conflict", token)
-        if too_big:
-            return self.shadow_error(413, "Payload Too Large", "The payload exceeds the maximum size allowed", token)
-        accepted = {"state": request["state"] or {}, "metadata": metadata_of(request["state"] or {}, now),
-                    "version": version, "timestamp": now}
-        if token is not None:
-            accepted["clientToken"] = token
-        self.log("%s: version %d, %d bytes of state -> 200" % (what, version, merged.size()))
-        tagged = lambda doc: {**doc, "clientToken": token} if token is not None else doc
-        deliver = lambda leaf, doc: self.broker.deliver(topic + leaf, json.dumps(doc, separators=(",", ":")).encode(), None)
-        deliver("/update/accepted", accepted)
-        deliver("/update/documents", tagged({"previous": before, "current": merged.snapshot(), "timestamp": now}))
-        delta = merged.delta()
-        if delta:
-            deliver("/update/delta", tagged({"state": delta, "metadata": merged.delta_metadata(delta),
-                                             "version": version, "timestamp": now}))
-        return self.shadow_answer(200, "OK", accepted)
+        op = {"GET": "get", "POST": "update", "DELETE": "delete"}[method]
+        status, doc, broadcasts, note = self.broker.shadow_op(thing, name, op, body)
+        if status != 200:
+            return self.shadow_error(status, REASONS[status], doc["message"], doc.get("clientToken"))
+        self.log("%s: %s -> 200" % (what, note))
+        self.broker.shadow_broadcast(thing, name, broadcasts)
+        return self.shadow_answer(200, "OK", doc)
 
+
+# The REST answers' reason phrases.
+REASONS = {400: "Bad Request", 404: "Not Found", 409: "Conflict", 413: "Payload Too Large",
+           415: "Unsupported Media Type"}
 
 # The Device Shadow, as AWS documents it (developerguide/device-shadow-document.html,
 # device-shadow-data-flow.html, device-shadow-error-messages.html; general/latest/gr/iot-core.html).
@@ -1712,7 +1775,7 @@ class Case:
                  filters=GOOD_FILTERS, topic=GOOD_TOPIC, keep_alive=60, broker=None, real_443=False, wire=False,
                  result="ok", result_has=GOOD_RESULT, info_has=GOOD_INFO, info_lacks=(), log_has=(),
                  https=False, qos=1, payload=b'{"t":21.5}', listener=GOOD_TOPIC, retain=False, query="",
-                 headers=(), shadow=None, direct=None):
+                 headers=(), shadow=None, direct=None, shadow_filters=(), shadow_max=0, shadow_work=0):
         self.cid, self.title, self.port, self.alpn, self.cert = cid, title, port, alpn, cert
         self.client_id, self.ca, self.filters, self.topic, self.keep_alive = client_id, ca, filters, topic, keep_alive
         self.broker, self.real_443, self.wire = broker or {}, real_443, wire
@@ -1727,6 +1790,9 @@ class Case:
         # `payload` the update. `direct`: a check the mock runs itself, as
         # direct(broker, pki) -> (problems, notes) - for what the helper cannot send.
         self.shadow, self.direct = shadow, direct
+        # The MQTT mode's Device Shadow probe: the board's SHADOW_SUBSCRIBE
+        # (none = no shadow), its SHADOW_MAX and WORK.
+        self.shadow_filters, self.shadow_max, self.shadow_work = shadow_filters, shadow_max, shadow_work
 
     def picked_by(self, arg):
         return self.cid == arg or (self.cid.startswith(arg) and self.cid[len(arg):].isalpha())
@@ -1749,6 +1815,12 @@ def publish(cid, title, has=("AWS IoT took the message on `rustonchip-test/test`
 def publish_fails(cid, title, has, info=(), **kw):
     kw.setdefault("port", "8443")
     return Case(cid, title, https=True, result="fail", result_has=has, info_has=info, **kw)
+
+
+def answers_of(root):
+    """A shadow's 7 answer topics, in the board's order (SHADOW_SUBSCRIBE)."""
+    return tuple(root + "/" + k for k in ("get/accepted", "get/rejected", "update/accepted", "update/rejected",
+                                          "update/delta", "delete/accepted", "delete/rejected"))
 
 
 SHADOW_THING = "thing/" + THING
@@ -1832,6 +1904,145 @@ def shadow_update_check(broker, pki):
         status, doc = ask("POST", target, bad)
         if status != 400 or (doc or {}).get("message") != text:
             problems.append("%s: %d %r, not 400 %r" % (bad.decode(), status, doc, text))
+    return problems, notes
+
+
+class MqttProbe:
+    """A minimal MQTT 5 client with the board's certificate, on the "8883"
+    side - for the shadow requests the helper does not send."""
+
+    def __init__(self, broker, pki, max_packet=None):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.load_verify_locations(str(pki.path("root1.pem")))
+        ctx.load_cert_chain(str(pki.path("device.pem")), str(pki.path("device.key")))
+        raw = socket.create_connection(("127.0.0.1", broker.ports["8883"]), timeout=10)
+        self.s = ctx.wrap_socket(raw, server_hostname=ENDPOINT)
+        props = properties(p32(0x27, max_packet)) if max_packet else properties()
+        self.s.sendall(packet(0x10, b"\x00\x04MQTT\x05\x02\x00\x3c" + props + field(THING)))
+        first, body = read_packet(self.s)
+        if first != 0x20 or body[1] != 0:
+            raise ConnectionError("CONNACK 0x%02X" % body[1])
+        self.pid = 0
+
+    def subscribe(self, flt):
+        self.pid += 1
+        self.s.sendall(packet(0x82, self.pid.to_bytes(2, "big") + properties() + field(flt) + b"\x00"))
+        while True:
+            first, body = read_packet(self.s)
+            if first == 0x90:
+                n, p = read_vbi(body, 2)
+                return body[p + n]
+
+    def publish(self, topic, payload):
+        self.s.sendall(packet(0x30, field(topic) + properties() + payload))
+
+    def messages(self, want, seconds=3):
+        """Publications until `want` of them came, or `seconds` passed: [(topic, doc)]."""
+        got = []
+        deadline = time.monotonic() + seconds
+        while len(got) < want and time.monotonic() < deadline:
+            self.s.settimeout(max(0.05, deadline - time.monotonic()))
+            try:
+                first, body = read_packet(self.s)
+            except (socket.timeout, ssl.SSLError, OSError):
+                break
+            if first & 0xF0 != 0x30:
+                continue
+            name, p = mstr(body, 0)
+            if (first >> 1) & 3:
+                p += 2
+            n, p = read_vbi(body, p)
+            payload = body[p + n:]
+            try:
+                doc = json.loads(payload)
+            except ValueError:
+                doc = payload
+            got.append((name.decode("utf-8"), doc))
+        return got
+
+    def close(self):
+        close_quietly(self.s)
+
+
+SHADOW_ANSWERS = list(answers_of(SHADOW_TOPIC))
+
+
+def mqtt_shadow_check(broker, pki):
+    """The Device Shadow over MQTT as the board uses it: its 7 answer topics
+    subscribed, an update answered on update/accepted and the delta it leaves
+    - both carrying the board's token - another version refused with 409, a
+    document AWS cannot read refused with 400 and no token, a delete, then a
+    get answered 404, and a token over 64 bytes refused."""
+    problems, notes = [], []
+    c = MqttProbe(broker, pki)
+    try:
+        for t in SHADOW_ANSWERS:
+            code = c.subscribe(t)
+            if code >= 0x80:
+                problems.append("SUBACK 0x%02X for %s" % (code, t))
+
+        def ask(op, payload, want):
+            c.publish(SHADOW_TOPIC + "/" + op, payload)
+            got = c.messages(want)
+            notes.append("%s %s -> %s" % (op, payload.decode("utf-8", "replace"), got))
+            return dict(got)
+
+        got = ask("update", b'{"state":{"reported":{"color":"GREEN"}},"clientToken":"b-1"}', 2)
+        accepted, delta = got.get(SHADOW_TOPIC + "/update/accepted"), got.get(SHADOW_TOPIC + "/update/delta")
+        if not accepted or accepted.get("clientToken") != "b-1" or accepted.get("version") != 2:
+            problems.append("update: no update/accepted with token b-1 and version 2: %r" % accepted)
+        if not delta or delta.get("clientToken") != "b-1" or delta.get("state") != {"led": True, "color": "RED"}:
+            problems.append("update: no delta {led: true, color: RED} carrying the board's token: %r" % delta)
+        got = ask("update", b'{"state":{"reported":{"led":true}},"version":7,"clientToken":"b-2"}', 1)
+        rejected = got.get(SHADOW_TOPIC + "/update/rejected")
+        if not rejected or rejected.get("code") != 409 or rejected.get("clientToken") != "b-2":
+            problems.append("another version: no update/rejected 409 with token b-2: %r" % rejected)
+        got = ask("update", b'{"state":', 1)
+        rejected = got.get(SHADOW_TOPIC + "/update/rejected")
+        if not rejected or rejected.get("code") != 400 or "clientToken" in rejected:
+            problems.append("a document AWS cannot read: no update/rejected 400 without a token: %r" % rejected)
+        got = ask("delete", b'{"clientToken":"b-3"}', 1)
+        deleted = got.get(SHADOW_TOPIC + "/delete/accepted")
+        if not deleted or deleted.get("clientToken") != "b-3" or deleted.get("version") != 2:
+            problems.append("delete: no delete/accepted version 2 with token b-3: %r" % deleted)
+        got = ask("get", b'{"clientToken":"b-4"}', 1)
+        missing = got.get(SHADOW_TOPIC + "/get/rejected")
+        if not missing or missing.get("code") != 404 or missing.get("clientToken") != "b-4":
+            problems.append("get after delete: no get/rejected 404 with token b-4: %r" % missing)
+        got = ask("get", ('{"clientToken":"%s"}' % ("k" * 65)).encode(), 1)
+        bad = got.get(SHADOW_TOPIC + "/get/rejected")
+        if not bad or bad.get("code") != 400 or bad.get("message") != "Invalid clientToken":
+            problems.append("a token over 64 bytes: no get/rejected 400 Invalid clientToken: %r" % bad)
+    finally:
+        c.close()
+    return problems, notes
+
+
+def mqtt_shadow_oversize_check(broker, pki):
+    """A shadow answer over the Maximum Packet Size the client announced is
+    dropped whole - never cut, never a disconnect: the board's call then
+    times out (MQTT 5, and what the board must expect of AWS)."""
+    problems, notes = [], []
+    c = MqttProbe(broker, pki, max_packet=1024)
+    try:
+        for t in SHADOW_ANSWERS[:2]:
+            c.subscribe(t)
+        c.publish(SHADOW_TOPIC + "/get", b'{"clientToken":"b-9"}')
+        got = c.messages(1, seconds=2)
+        notes.append("get -> %r" % got)
+        if got:
+            problems.append("an answer over 1024 bytes reached the client: %r" % [t for t, _ in got])
+        # The connection still stands: a small request still gets its answer.
+        c.publish(SHADOW_TOPIC + "/name/none/get", b'{"clientToken":"b-10"}')
+        c.subscribe(SHADOW_TOPIC + "/name/none/get/rejected")
+        c.publish(SHADOW_TOPIC + "/name/none/get", b'{"clientToken":"b-11"}')
+        got = c.messages(1, seconds=2)
+        notes.append("a named shadow's get -> %r" % got)
+        if not got or got[0][1].get("clientToken") != "b-11":
+            problems.append("after the dropped answer the connection did not answer a small get: %r" % got)
+    finally:
+        c.close()
     return problems, notes
 
 
@@ -1972,6 +2183,54 @@ CASES = [
          broker={"allow_shadow": True, "shadows": SHADOW_SEED}),
     Case("17l", "updates read back: merged, null removes, the version matched, true is no 1, NaN refused",
          direct=shadow_update_check, broker={"allow_shadow": True, "shadows": SHADOW_SEED}),
+    Case("18a", "Test from this PC with the Device Shadow over MQTT: the get answered", port="8883", alpn=False,
+         shadow_filters=answers_of(SHADOW_TOPIC), shadow_max=2048, shadow_work=2368,
+         broker={"allow_mqtt_shadow": True, "shadows": SHADOW_SEED},
+         result_has=("all 2 subscriptions", "a publication", "the shadow's get"),
+         info_has=GOOD_INFO + ("subscribed to the Device Shadow's 7 answer topics, before the board's own",
+                               "the classic shadow answered", "version 1 - the board takes it whole"),
+         log_has=("Maximum Packet Size=65536", "shadow over MQTT get rustonchip-test: version 1 -> get/accepted")),
+    Case("18b", "the shadow over MQTT, none yet: 404 - the policy let the get through", port="8883", alpn=False,
+         shadow_filters=answers_of(SHADOW_TOPIC), shadow_max=2048, shadow_work=2368, broker={"allow_mqtt_shadow": True},
+         result_has=("the shadow's get",), info_has=GOOD_INFO + ("the classic shadow does not exist yet (404)",),
+         log_has=("shadow over MQTT get rustonchip-test: 404 No shadow exists",)),
+    fails("18c", "no subscription to the shadow's answers in the policy: SUBACK 0x87",
+          ("the shadow's answers `$aws/things/rustonchip-test/shadow/get/accepted`", "0x87",
+           "iot:Subscribe on topicfilter/$aws/things/rustonchip-test/shadow/*",
+           "every call on the classic shadow answers Refused"), GOOD_INFO,
+          port="8883", alpn=False, shadow_filters=answers_of(SHADOW_TOPIC), shadow_max=2048, shadow_work=2368),
+    fails("18d", "the answers subscribed, the get not allowed: AWS ends the connection",
+          ("AWS ended the connection over the classic shadow's get", "0x87",
+           "iot:Publish on topic/$aws/things/rustonchip-test/shadow/*"),
+          GOOD_INFO + ("subscribed to the Device Shadow's 7 answer topics",),
+          port="8883", alpn=False, shadow_filters=answers_of(SHADOW_TOPIC), shadow_max=2048, shadow_work=2368,
+          broker={"allow": list(answers_of(SHADOW_TOPIC))}),
+    fails("18e", "a shadow over what the board takes: said before it is flashed",
+          ("the classic shadow's answer is", "bytes as a packet, over the 1024 the board takes (Document up to 512)"),
+          GOOD_INFO,
+          port="8883", alpn=False, shadow_filters=answers_of(SHADOW_TOPIC), shadow_max=512, shadow_work=1024,
+          broker={"allow_mqtt_shadow": True, "shadows": {(THING, None): {"reported": {"blob": "x" * 1500}}}}),
+    fails("18h", "a named shadow over what the board takes, the classic one fine: both asked, the named one said",
+          ("the shadow `config`'s answer is", "over the 2368 the board takes"),
+          GOOD_INFO + ("the classic shadow answered",),
+          port="8883", alpn=False,
+          shadow_filters=answers_of(SHADOW_TOPIC) + answers_of(SHADOW_TOPIC + "/name/config"),
+          shadow_max=2048, shadow_work=2368,
+          broker={"allow_mqtt_shadow": True,
+                  "shadows": {**SHADOW_SEED, (THING, "config"): {"reported": {"blob": "x" * 2600}}}}),
+    Case("18i", "the Device Shadow's topics subscribed first: AWS's 50 a connection refuse the user's last",
+         result="fail", result_has=("0x97",), info_has=("subscribed to the Device Shadow's 14 answer topics",),
+         port="8883", alpn=False, topic="",
+         filters=tuple("rustonchip-test/f%d" % k for k in range(40)),
+         shadow_filters=answers_of(SHADOW_TOPIC) + answers_of(SHADOW_TOPIC + "/name/config"),
+         shadow_max=2048, shadow_work=2368, broker={"allow_mqtt_shadow": True}),
+    Case("18f", "shadow requests over MQTT: answers carry the token, delta pushed, 409, 400 without a token, "
+         "delete, 404, a long token refused", direct=mqtt_shadow_check,
+         broker={"allow_mqtt_shadow": True, "shadows": SHADOW_SEED}),
+    Case("18g", "an answer over the client's Maximum Packet Size is dropped whole, the connection kept",
+         direct=mqtt_shadow_oversize_check,
+         broker={"allow_mqtt_shadow": True, "shadows": {(THING, None): {"reported": {"blob": "x" * 1500}}}},
+         log_has=("over the client's Maximum Packet Size: dropped",)),
 ]
 
 
@@ -1982,7 +2241,8 @@ def helper_request(case, pki, port):
         key = pki.path(("device" if case.cert == "device" else "other") + ".key").read_text()
     ca = b"".join(pki.der(name) for name in case.ca)
     values = ["127.0.0.1", str(port), ENDPOINT, "1", ca, case.client_id, "", "", "1" if case.alpn else "0",
-              cert, key, str(case.keep_alive), "\n".join(case.filters), case.topic]
+              cert, key, str(case.keep_alive), "\n".join(case.filters), case.topic,
+              "\n".join(case.shadow_filters), str(case.shadow_max), str(case.shadow_work)]
     return "".join(hexl(v) + "\n" for v in values).encode("ascii")
 
 
@@ -2079,6 +2339,7 @@ def run_case(case, pki, helper, aws_sigalgs):
             except Exception as e:  # a FAIL line, never the end of the run
                 out["why"] = ["%s: %s" % (type(e).__name__, e)]
             broker.wait_idle(5)
+            out["why"] += ["the mock never logged %r" % s for s in case.log_has if not any(s in line for line in broker.lines)]
         else:
             port = broker.ports[case.port]
             if case.https:
@@ -2197,6 +2458,8 @@ def serve(argv):
     ap.add_argument("--allow-retain", action="store_true", help="also allow iot:RetainPublish on topic/<thing>/*")
     ap.add_argument("--allow-shadow", action="store_true",
                     help="also allow iot:Get/Update/DeleteThingShadow on thing/<thing> and thing/<thing>/*")
+    ap.add_argument("--allow-mqtt-shadow", action="store_true",
+                    help="also allow iot:Publish, iot:Subscribe and iot:Receive on $aws/things/<thing>/shadow/*")
     args = ap.parse_args(argv)
     helper = find_helper(args.helper)
     pki = Pki(args.work, find_openssl(), helper if os.path.isfile(helper) else None).ensure()
@@ -2207,7 +2470,8 @@ def serve(argv):
     options = Options(allow=args.allow, deny=args.deny, reason_strings=args.reason_strings,
                       retained_before_suback=args.retained_before_suback, retained=retained,
                       aws_sigalgs=args.aws_sigalgs, tls12=args.tls12, chain="chain4.pem" if args.tls12 else "chain3.pem",
-                      allow_retain=args.allow_retain, allow_shadow=args.allow_shadow)
+                      allow_retain=args.allow_retain, allow_shadow=args.allow_shadow,
+                      allow_mqtt_shadow=args.allow_mqtt_shadow)
     broker = Broker(pki, options, echo=True)
     certs = [(pki.path("device.pem"), pki.path("device.key"))]
     for csr in args.csr:

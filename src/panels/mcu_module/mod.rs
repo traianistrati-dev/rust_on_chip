@@ -3,6 +3,8 @@ pub mod aws_iot;
 pub(crate) mod board_notes;
 #[cfg(test)]
 mod http_core_tests;
+#[cfg(test)]
+mod mqtt_shadow_core_tests;
 pub mod builtins;
 pub mod chip_filter;
 pub mod chip_search;

@@ -335,6 +335,7 @@ $ALL_CASES = @(
     # AWS IoT's HTTPS publish: the board's certificate to one host, the ALPN
     # on 443, aws_publish() - the identity seeded, so the signing is linked.
     @{ n = "ESP32-C3 AWS HTTPS publish (IoT)"; t = "emit_esp32c3_project";    e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "awshttps"; CMAKE = "eide-no-cmake" }; q = $true; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C3 AWS MQTT shadow (IoT)"; t = "emit_esp32c3_project";     e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "awsmqtt"; CMAKE = "eide-no-cmake" }; q = $true; fam = "esp"; lk = $true }
     @{ n = "ESP32 IoT, everything (Xtensa)";    t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
     @{ n = "ESP32 ESP-NOW alone (Xtensa)";      t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32";    EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "espnow" }; q = $false; fam = "esp" }
     @{ n = "ESP32-S2 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
@@ -343,6 +344,8 @@ $ALL_CASES = @(
     # the note and cargo's count) - nothing the generated code can change.
     @{ n = "ESP32-S3 IoT, everything (Xtensa)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_CHIP = "esp32s3";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true; w = 2 }
     @{ n = "ESP32-C2 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
+    @{ n = "ESP32-S2 AWS MQTT shadow";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32s2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "awsmqtt"; CMAKE = "eide-no-cmake" }; q = $false; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C2 AWS MQTT shadow";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c2";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "awsmqtt"; CMAKE = "eide-no-cmake" }; q = $false; fam = "esp"; lk = $true }
     @{ n = "ESP32-C5 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c5";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
     @{ n = "ESP32-C6 IoT, everything";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c6";  EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
     @{ n = "ESP32-C61 IoT, everything";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_CHIP = "esp32c61"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "all" }; q = $false; fam = "esp"; lk = $true }
@@ -498,7 +501,7 @@ $ALL_CASES = @(
     # HTTPS alone, and HTTPS beside MQTT over TLS on the RP2040 (two TLS
     # sessions on the smallest chip). Linked, like the radio row; CMAKE naming
     # nothing keeps them pure Rust.
-    @{ n = "Raspberry Pi Pico W Wi-Fi/BLE/TLS/HTTP x6"; t = "emit_rp_iot_project"; e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "rp"; lk = $true }
+    @{ n = "Raspberry Pi Pico W Wi-Fi/BLE/TLS/HTTP/shadow x7"; t = "emit_rp_iot_project"; e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "rp"; lk = $true }
 
     # The pico2-ice, Blocking and Async: the only RP2350B board, so the only
     # rows of the FUNCSEL table past GP29 (UART1 on GP36/37, SPI0 on 32/34/35,

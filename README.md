@@ -604,6 +604,21 @@ not grant them), and **Read the shadow from this PC** asks for it as the board
 does. The look-alike keeps shadows too: merges, versions, the delta, the
 `.../update/delta` message to MQTT subscribers, AWS's documented refusals.
 
+Over **MQTT** the shadow comes pushed: with "Device Shadow over MQTT" on, the
+MQTT client subscribes to the shadows' answers after every connect (the
+classic shadow and up to three named ones, seven topics each), and
+`shadow_delta(&mut doc)` hands over each delta the moment `desired` changes -
+or `resync`, after every reconnect, when deltas sent meanwhile are gone and
+the shadow is read again with `shadow_get`. `shadow_report`, `shadow_update`
+and `shadow_delete` go over the same connection, each answer matched to its
+call by the board's own clientToken, duplicates and late deltas dropped by
+version. "Document up to" sizes the board's buffers (about three times it in
+RAM, held per chip: 1 KB on an ESP32-C2), and the board tells AWS the largest
+packet it takes; the policy gets `$aws/things/<thing>/shadow/*`. **Test from
+this PC** asks the shadow's get as the board will and says when the answer is
+too large for it - all of it run against the look-alike, which answers shadow
+requests over MQTT as well.
+
 The ESP radio's **transmit power** is capped in the tab, 13 dBm unless chosen:
 esp-radio 0.18 leaves it at 20 dBm, and at that cheap ESP32-C3 boards never
 join - `AuthenticationExpired`, then `ConnectionFailed`, forever (measured: 0

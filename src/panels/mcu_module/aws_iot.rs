@@ -361,7 +361,11 @@ fn outside_filters(m: &MqttConfig) -> Vec<&str> {
 /// under `<thing>/` (the panic report's topic and the test's are there),
 /// subscribe there and to each filter the board subscribes to.
 pub fn policy(m: &MqttConfig, arn: &CertArn) -> String {
-    policy_for(thing(m), &outside_filters(m), arn, Extras::default())
+    let extras = Extras {
+        mqtt_shadow: iot::mqtt_shadow(m).is_some(),
+        ..Extras::default()
+    };
+    policy_for(thing(m), &outside_filters(m), arn, extras)
 }
 
 /// What a policy grants beyond publishing and receiving under `<thing>/`.
@@ -374,6 +378,10 @@ pub struct Extras {
     /// on the thing's classic shadow and its named ones - the REST API's
     /// own actions: iot:Publish on `$aws/things/...` does not grant them.
     pub shadow: bool,
+    /// The Device Shadow over MQTT: iot:Publish, iot:Subscribe and
+    /// iot:Receive on `$aws/things/<thing>/shadow/*` - its requests and
+    /// answers, the classic shadow's and the named ones' (`*` spans `/`).
+    pub mqtt_shadow: bool,
 }
 
 /// The policy statement `extras.shadow` adds - for the MQTT card's
@@ -394,6 +402,18 @@ pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn, extras: Extras) -> 
     let base = format!("arn:{}:iot:{}:{}:", arn.partition, arn.region, arn.account);
     let mut subscribe = vec![format!("{base}topicfilter/{id}/*")];
     let mut receive = vec![format!("{base}topic/{id}/*")];
+    let publish = if extras.mqtt_shadow {
+        let shadow = format!("$aws/things/{id}/shadow/*");
+        subscribe.push(format!("{base}topicfilter/{shadow}"));
+        receive.push(format!("{base}topic/{shadow}"));
+        format!(
+            "[\n        {},\n        {}\n      ]",
+            json_string(&format!("{base}topic/{id}/*")),
+            json_string(&format!("{base}topic/{shadow}"))
+        )
+    } else {
+        json_string(&format!("{base}topic/{id}/*"))
+    };
     for f in outside {
         subscribe.push(format!("{base}topicfilter/{f}"));
         // What a filter receives, in the policy's wildcard `*` - a shared
@@ -425,7 +445,7 @@ pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn, extras: Extras) -> 
     format!(
         "{{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Connect\",\n      \"Resource\": {}\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Publish\",\n      \"Resource\": {}\n    }},{extra}\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Subscribe\",\n      \"Resource\": [\n{}\n      ]\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Receive\",\n      \"Resource\": [\n{}\n      ]\n    }}\n  ]\n}}\n",
         json_string(&format!("{base}client/{id}")),
-        json_string(&format!("{base}topic/{id}/*")),
+        publish,
         list(&subscribe),
         list(&receive),
     )
@@ -733,7 +753,7 @@ mod tests {
         let outside = outside_filters(&m);
         assert_eq!(policy(&m, &arn), policy_for("rustonchip-esp32c3", &outside, &arn, Extras::default()));
         // Retained messages: iot:RetainPublish under the thing, beside Publish.
-        let kept = policy_for("sensor-7", &[], &arn, Extras { retain: true, shadow: false });
+        let kept = policy_for("sensor-7", &[], &arn, Extras { retain: true, ..Extras::default() });
         assert!(kept.contains("\"Action\": \"iot:RetainPublish\",\n      \"Resource\": \"arn:aws:iot:eu-central-1:123456789012:topic/sensor-7/*\""), "{kept}");
         let parsed: serde_json::Value = serde_json::from_str(&kept).expect("valid JSON");
         assert_eq!(parsed["Statement"].as_array().map(Vec::len), Some(5));
@@ -742,7 +762,7 @@ mod tests {
         // The Device Shadow: its three REST actions on the thing - the
         // classic shadow - and on thing/<name>/* - the named ones, which
         // thing/<name> alone does not cover.
-        let both = policy_for("sensor-7", &[], &arn, Extras { retain: true, shadow: true });
+        let both = policy_for("sensor-7", &[], &arn, Extras { retain: true, shadow: true, ..Extras::default() });
         let parsed: serde_json::Value = serde_json::from_str(&both).expect("valid JSON");
         let statements = parsed["Statement"].as_array().unwrap();
         assert_eq!(statements.len(), 6);
@@ -762,7 +782,7 @@ mod tests {
             serde_json::from_str(&shadow_statement("sensor-7", &arn)).expect("one statement, valid JSON");
         assert_eq!(&alone, shadow);
         // The longest thing AWS takes, everything on: still within AWS's 2048.
-        let longest = policy_for(&"t".repeat(128), &[], &arn, Extras { retain: true, shadow: true });
+        let longest = policy_for(&"t".repeat(128), &[], &arn, Extras { retain: true, shadow: true, ..Extras::default() });
         assert!(!policy_too_long(&longest), "{}", longest.len());
 
         assert!(thing_problem("sensor-7").is_none() && thing_problem("a:b_c-1").is_none());
@@ -793,6 +813,36 @@ mod tests {
             "https://a1-ats.iot.eu-south-1.amazonaws.com:8443/topics/sensor-7/state?qos=1&retain=true"
         );
         assert!(publish_url(host, 8443, "$aws/things/t/shadow/update", 1, true).is_err());
+    }
+
+    /// The Device Shadow over MQTT: Publish, Subscribe and Receive on
+    /// `$aws/things/<id>/shadow/*` - no statement more - and only when the
+    /// MQTT card runs it.
+    #[test]
+    fn the_mqtt_shadow_policy_adds_three_resources() {
+        let arn = cert_arn(ARN).unwrap();
+        let mut m = aws("a1-ats.iot.eu-central-1.amazonaws.com");
+        m.tls = true;
+        m.client_cert = true;
+        let off = policy(&m, &arn);
+        assert!(!off.contains("shadow"), "{off}");
+        m.aws_shadow = true;
+        let on = policy(&m, &arn);
+        let parsed: serde_json::Value = serde_json::from_str(&on).expect("valid JSON");
+        let statements = parsed["Statement"].as_array().unwrap();
+        assert_eq!(statements.len(), 4, "no statement more: {on}");
+        let shadow = |kind: &str| format!("arn:aws:iot:eu-central-1:123456789012:{kind}/$aws/things/{}/shadow/*", m.client_id);
+        assert_eq!(
+            statements[1]["Resource"],
+            serde_json::json!([format!("arn:aws:iot:eu-central-1:123456789012:topic/{}/*", m.client_id), shadow("topic")])
+        );
+        assert!(statements[2]["Resource"].as_array().unwrap().contains(&serde_json::json!(shadow("topicfilter"))));
+        assert!(statements[3]["Resource"].as_array().unwrap().contains(&serde_json::json!(shadow("topic"))));
+        // The longest client id AWS takes for the board, everything on: within 2048.
+        m.client_id = "t".repeat(58);
+        assert!(!policy_too_long(&policy(&m, &arn)));
+        let all = policy_for(&"t".repeat(58), &[], &arn, Extras { retain: true, shadow: true, mqtt_shadow: true });
+        assert!(!policy_too_long(&all), "{}", all.len());
     }
 
     /// The shadow's URL "Read the shadow from this PC" sends: as the

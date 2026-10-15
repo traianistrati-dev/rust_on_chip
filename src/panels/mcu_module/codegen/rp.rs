@@ -4997,8 +4997,10 @@ mod emit_async_for_manual_compile {
         // Bluetooth alone with the LED in main, and MQTT over TLS - its heap,
         // its whitened RNG, SNTP's clock - the RP2040's with the board's own
         // certificate, so P-256 signing links on the M0+, and HTTPS beside it:
-        // two TLS sessions on the smallest chip.
-        for (id, dir_name, wifi, ble, tls, cert, http) in [
+        // two TLS sessions on the smallest chip. The last: MQTT on AWS IoT with
+        // the Device Shadow (a named one too) beside HTTPS - every shadow call
+        // and the JSON reader on the M0+, no read-modify-write atomics.
+        for (id, dir_name, wifi, ble, tls, cert, http, shadow) in [
             (
                 "rp2040_pico_w",
                 "eide_rp2040w_iot_check",
@@ -5007,6 +5009,7 @@ mod emit_async_for_manual_compile {
                 false,
                 false,
                 Some(false),
+                false,
             ),
             (
                 "rp2350_pico2_w",
@@ -5016,6 +5019,7 @@ mod emit_async_for_manual_compile {
                 false,
                 false,
                 Some(true),
+                false,
             ),
             (
                 "rp2040_pico_w",
@@ -5025,6 +5029,7 @@ mod emit_async_for_manual_compile {
                 false,
                 false,
                 None,
+                false,
             ),
             (
                 "rp2350_pico2_w",
@@ -5034,6 +5039,7 @@ mod emit_async_for_manual_compile {
                 false,
                 false,
                 None,
+                false,
             ),
             (
                 "rp2040_pico_w",
@@ -5043,6 +5049,7 @@ mod emit_async_for_manual_compile {
                 true,
                 true,
                 Some(true),
+                false,
             ),
             (
                 "rp2350_pico2_w",
@@ -5052,6 +5059,17 @@ mod emit_async_for_manual_compile {
                 true,
                 false,
                 None,
+                false,
+            ),
+            (
+                "rp2040_pico_w",
+                "eide_rp2040w_shadow_check",
+                true,
+                false,
+                true,
+                true,
+                Some(true),
+                true,
             ),
         ] {
             let def = builtins::builtin_definitions()
@@ -5071,6 +5089,14 @@ mod emit_async_for_manual_compile {
             if wifi {
                 let mut m = MqttConfig::for_chip(id);
                 m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/+/set".into()];
+                if shadow {
+                    m.host = "a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com".into();
+                    m.client_id = "rustonchip-test".into();
+                    m.subscribe = vec!["rustonchip-test/cmd".into()];
+                    m.aws_shadow = true;
+                    m.shadow_names = vec!["config".into()];
+                    m.shadow_max = 2048;
+                }
                 m.tls = tls;
                 // The Pico 2 W's TLS also builds embedded-tls's P-384 checks.
                 m.p384 = tls && id == "rp2350_pico2_w";
@@ -5097,6 +5123,11 @@ mod emit_async_for_manual_compile {
             );
             let https = http == Some(true);
             assert_eq!(active.is_some_and(|a| a.http_tls), https, "{id}: HTTPS");
+            assert_eq!(
+                mcu.iot.mqtt.as_ref().and_then(iot::mqtt_shadow).is_some(),
+                shadow,
+                "{id}: the Device Shadow exactly when asked"
+            );
             // tls.rs whenever either client speaks TLS.
             let any_tls = tls || https;
 
@@ -5113,6 +5144,21 @@ mod emit_async_for_manual_compile {
                 used.push_str(
                     "        wl_led.gpio_set(0, pins::configs::ble::connected()).await;\n",
                 );
+            }
+            if shadow {
+                used.push_str("        let mut doc = [0u8; 1024];\n");
+                used.push_str("        if let Ok(d) = pins::configs::mqtt::shadow_delta(&mut doc).await {\n");
+                used.push_str("            if d.resync {\n");
+                used.push_str("                if let Ok(r) = pins::configs::mqtt::shadow_get(d.shadow, &mut doc).await {\n");
+                used.push_str("                    let _ = (r.code, pins::configs::mqtt::json_i64(&doc[..r.len], &[\"version\"]));\n");
+                used.push_str("                }\n");
+                used.push_str("            } else {\n");
+                used.push_str("                let _ = (d.own, pins::configs::mqtt::json_f64(&doc[..d.len], &[\"state\", \"t\"]));\n");
+                used.push_str("                pins::configs::mqtt::shadow_report(d.shadow, br#\"{\"t\":21.5}\"#, &mut doc).await.ok();\n");
+                used.push_str("            }\n");
+                used.push_str("        }\n");
+                used.push_str("        pins::configs::mqtt::shadow_update(Some(\"config\"), br#\"{\"state\":{\"reported\":null}}\"#, &mut doc).await.ok();\n");
+                used.push_str("        pins::configs::mqtt::shadow_delete(None, &mut doc).await.ok();\n");
             }
             if http.is_some() {
                 used.push_str("        let mut body = [0u8; 256];\n");

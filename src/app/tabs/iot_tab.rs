@@ -209,6 +209,22 @@ impl AppIde {
                             p,
                         )
                     }),
+                    no_mqtt_shadow: file(iot_gen::MQTT)
+                        .is_some_and(|c| !c.contains(iot_gen::MQTT_SHADOW_SIGNATURE)),
+                    shadow_cap: iot::shadow_max_cap(
+                        &family,
+                        iot::active(mcu).is_some_and(|a| a.http_tls),
+                    ),
+                    shadow_warning: iot::mqtt_shadow_ram_warning(
+                        &family,
+                        mcu.iot.http.is_some(),
+                        iot::active(mcu).is_some_and(|a| a.http_tls),
+                    ),
+                    http_shadow: mcu
+                        .iot
+                        .http
+                        .as_ref()
+                        .is_some_and(|h| h.client_cert && h.aws_shadow),
                 }
             };
             // The HTTP client: whether HTTPS fits beside what else runs, and
@@ -1275,6 +1291,14 @@ struct TlsFacts {
     client_left: Option<&'static str>,
     /// The project's folder: a key made for one project never lands in another.
     project: Option<std::path::PathBuf>,
+    /// An mqtt.rs edited from before the Device Shadow: no shadow_* calls.
+    no_mqtt_shadow: bool,
+    /// The largest "Document up to" this chip takes, beside what else runs.
+    shadow_cap: u32,
+    /// What the measured RAM says against the Device Shadow here.
+    shadow_warning: Option<&'static str>,
+    /// The HTTP card's Device Shadow (REST) is on too.
+    http_shadow: bool,
 }
 
 /// What the TLS section changes in the project's files, applied once the tab
@@ -1906,6 +1930,7 @@ fn client_cert_section(
         // ── where to have it signed ──
         if let Some(e) = aws_iot::of(m) {
             aws_section(ui, m, &e, tls, actions);
+            mqtt_shadow_section(ui, m, tls);
         } else if m.host.trim().eq_ignore_ascii_case("test.mosquitto.org") {
             ui.label(dim("test.mosquitto.org asks for a client certificate on port 8884: paste the CSR at https://test.mosquitto.org/ssl/ (it wants C, O and CN; its page shows an RSA key - whether it signs P-256 is untested). Its CA is mosquitto.org's."));
             if !matches!(&tls.ca, Some(Some(Ok(ca))) if ca.name.contains("mosquitto")) {
@@ -1922,6 +1947,120 @@ fn client_cert_section(
         } else {
             "Signing the handshake takes tens of milliseconds (one P-256 multiplication)."
         }));
+    });
+}
+
+const MQTT_SHADOW_DELTA_USAGE: &str = "if let Ok(d) = pins::configs::mqtt::shadow_delta(&mut doc).await { if d.resync { /* shadow_get(d.shadow, &mut doc) */ } else { let led = pins::configs::mqtt::json_bool(&doc[..d.len], &[\"state\", \"led\"]); } }";
+const MQTT_SHADOW_REPORT_USAGE: &str = "pins::configs::mqtt::shadow_report(None, br#\"{\"led\":true}\"#, &mut doc).await";
+
+/// AWS IoT's Device Shadow over this connection: the switch, the named
+/// shadows, the largest document and what it costs, how to call it.
+fn mqtt_shadow_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut m.aws_shadow, "Device Shadow over MQTT").on_hover_text(
+            "shadow_delta() gets a delta the moment `desired` changes; shadow_get(), shadow_report(), shadow_update(), shadow_delete() over this connection",
+        );
+        ui.label(dim("deltas pushed - policy.json above gets $aws/things/<thing>/shadow/*"));
+    });
+    if !m.aws_shadow {
+        return;
+    }
+    ui.indent("iot_mqtt_shadow", |ui| {
+        if let Some(why) = aws_iot::client_id_problem(&m.client_id) {
+            ui.label(warn(format!("Off until the client id is the thing's name: {why}")));
+            return;
+        }
+        ui.label(dim(format!(
+            "The classic shadow of `{}`, and up to {} named ones - each subscribes 7 answer topics after every connect:",
+            m.client_id,
+            iot::SHADOW_NAMES_MAX
+        )));
+        let kept = iot::shadow_names(m);
+        let mut remove = None;
+        let mut seen: Vec<String> = Vec::new();
+        for (i, name) in m.shadow_names.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(name)
+                        .hint_text("a named shadow")
+                        .desired_width(160.0),
+                );
+                if ui.small_button(ph::X).on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                }
+                let why = iot::shadow_name_problem(name)
+                    .or_else(|| seen.contains(name).then_some("named twice"))
+                    .or_else(|| (!kept.contains(name)).then_some("over the 3 a board takes"));
+                if let Some(why) = why {
+                    ui.label(warn(format!("{why} - left out")));
+                }
+            });
+            seen.push(name.clone());
+        }
+        if let Some(i) = remove {
+            m.shadow_names.remove(i);
+        }
+        if m.shadow_names.len() <= iot::SHADOW_NAMES_MAX
+            && ui.small_button(format!("{} Named shadow", ph::PLUS)).clicked()
+        {
+            m.shadow_names.push(String::new());
+        }
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Document up to"));
+            ui.add(
+                crate::panels::drag_value(ui, &mut m.shadow_max)
+                    .range(*iot::SHADOW_RANGE.start()..=tls.shadow_cap.max(*iot::SHADOW_RANGE.start()))
+                    .clamp_existing_to_range(false)
+                    .suffix(" B"),
+            );
+            ui.label(dim("an answer or a delta - more is cut, `truncated` set"));
+        });
+        let max = (m.shadow_max.clamp(*iot::SHADOW_RANGE.start(), tls.shadow_cap.max(*iot::SHADOW_RANGE.start())))
+            as usize;
+        if m.shadow_max as usize != max {
+            ui.label(warn(format!("held at {max} B on this chip")));
+        }
+        ui.label(dim(format!(
+            "About {:.1} KB of RAM (the larger MQTT buffers, one slot for a request and its answer, one for a delta), plus the buffer each call is given. The broker is told to send no packet over {} B: a larger answer never arrives (Timeout), or ends the connection (TooLarge).",
+            iot::mqtt_shadow_ram(max) as f32 / 1024.0,
+            iot::mqtt_work(max)
+        )));
+        ui.label(dim(
+            "A get's answer carries a timestamp for every key - about three times the state: keep the state under a third of it, or split it into named shadows.",
+        ));
+        let subs = iot::subscriptions(m).len() + 7 * (1 + kept.len());
+        if subs > 50 {
+            ui.label(warn(format!(
+                "AWS IoT takes 50 subscriptions a connection: the Device Shadow's {} come first, so the last {} of yours are refused",
+                7 * (1 + kept.len()),
+                subs - 50
+            )));
+        }
+        if let Some(why) = tls.shadow_warning {
+            ui.label(warn(why));
+        }
+        if tls.no_mqtt_shadow {
+            ui.label(warn(
+                "src/pins/configs/mqtt.rs is from before the Device Shadow, and you edited it, so the IDE left it: its shadow_* calls are missing. Move your changes into the current template (delete the file to get it).",
+            ));
+        }
+        if tls.http_shadow {
+            ui.label(dim(
+                "The HTTP card's Device Shadow is on too: one thing, two ways - http::shadow_* (REST, a connection each call) and mqtt::shadow_* (this connection, deltas pushed).",
+            ));
+        }
+        ui.label(dim(
+            "After every connect each shadow comes back as `resync`: read it with shadow_get() - deltas sent while the board was away are gone. A delta its own mqtt::shadow_report() caused has `own` set (one after an http::shadow_* report does not): never report again a key the board cannot take.",
+        ));
+        for usage in [MQTT_SHADOW_DELTA_USAGE, MQTT_SHADOW_REPORT_USAGE] {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(usage).monospace().size(11.0));
+                if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                    ui.ctx().copy_text(usage.to_owned());
+                }
+            });
+        }
     });
 }
 
@@ -2082,6 +2221,9 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
         .and_then(|s| s.lock().ok().map(|s| s.clone()))
         .unwrap_or_default();
     let busy = matches!(state, State::Building | State::Connecting);
+    let shadow_max = m
+        .shadow_max
+        .clamp(*iot::SHADOW_RANGE.start(), tls.shadow_cap.max(*iot::SHADOW_RANGE.start())) as usize;
     let request = tls.ca_der.clone().map(|ca| Request {
         host: m.host.trim().to_owned(),
         port: m.port,
@@ -2113,6 +2255,13 @@ fn test_from_pc(ui: &mut egui::Ui, m: &MqttConfig, tls: &TlsFacts) {
         } else {
             String::new()
         },
+        // The Device Shadow's answers, subscribed as the board does, and each
+        // shadow's get, held to its sizes.
+        shadow_filters: iot::mqtt_shadow(m)
+            .map(|s| iot::shadow_filters(&s.thing, &s.names))
+            .unwrap_or_default(),
+        shadow_max,
+        shadow_work: iot::mqtt_work(shadow_max),
     });
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -2513,7 +2662,7 @@ fn aws_https_section(
                         arn.region, e.region
                     )));
                 }
-                let extras = aws_iot::Extras { retain: h.aws_retain, shadow: h.aws_shadow };
+                let extras = aws_iot::Extras { retain: h.aws_retain, shadow: h.aws_shadow, ..Default::default() };
                 let policy = aws_iot::policy_for(&thing, &[], &arn, extras);
                 policy_buttons(ui, &policy, dir.as_deref());
                 ui.label(dim(format!(
@@ -3026,6 +3175,8 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
         ui.add_space(4.0);
         ui.label("Subscribe to");
         let mut remove = None;
+        let shadow_on = iot::mqtt_shadow(m).is_some();
+        let notes: Vec<Option<&'static str>> = m.subscribe.iter().map(|f| iot::shadow_filter_note(m, f)).collect();
         for (i, topic) in m.subscribe.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(topic).desired_width(200.0));
@@ -3037,6 +3188,8 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
                     .or_else(|| aws.as_ref().and_then(|_| aws_iot::filter_problem(topic)));
                 if let Some(p) = problem {
                     ui.label(warn(format!("{p} - left out")));
+                } else if let Some(note) = notes[i] {
+                    ui.label(dim(note));
                 }
             });
         }
@@ -3046,7 +3199,9 @@ fn mqtt_body(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts, actions: &mu
         if ui.small_button(format!("{} Add topic", ph::PLUS)).clicked() {
             m.subscribe.push("rustonchip/cmd".to_owned());
         }
-        ui.label(dim(if aws.is_some() {
+        ui.label(dim(if shadow_on {
+            "`+` matches one level, `#` the rest - on AWS IoT `a/#` does not match `a`, and a wildcard filter gets no retained message. What arrives comes out of incoming() - the Device Shadow's answer topics excepted."
+        } else if aws.is_some() {
             "`+` matches one level, `#` the rest - on AWS IoT `a/#` does not match `a`, and a wildcard filter gets no retained message. What arrives comes out of incoming()."
         } else {
             "`+` matches one level, `#` the rest. What arrives comes out of incoming()."

@@ -24,7 +24,7 @@ use crate::panels::mcu_module::codegen::iot_gen;
 /// What to test: the tab's settings, the CAs of `mqtt_ca.rs`, and the
 /// credentials of `secrets.rs` (sent only after the certificate checked out).
 /// No `Debug`: it carries the password and the client key.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Request {
     pub host: String,
     pub port: u16,
@@ -46,6 +46,13 @@ pub struct Request {
     /// One QoS 1 message goes there - under the board's own name, where the
     /// AWS IoT policy the tab writes allows it. Empty: none.
     pub test_topic: String,
+    /// The Device Shadow over MQTT: the answer topics the board subscribes
+    /// first (SHADOW_SUBSCRIBE, 7 a shadow) - empty: none. Each shadow's get
+    /// is asked as the board would, its answer held to the board's
+    /// SHADOW_MAX and to the packet it takes (WORK).
+    pub shadow_filters: Vec<String>,
+    pub shadow_max: usize,
+    pub shadow_work: usize,
 }
 
 impl Request {
@@ -260,6 +267,10 @@ pub fn stdin_lines(r: &Request) -> String {
         r.subscribe.join("
 ").as_bytes(),
         r.test_topic.as_bytes(),
+        r.shadow_filters.join("
+").as_bytes(),
+        r.shadow_max.to_string().as_bytes(),
+        r.shadow_work.to_string().as_bytes(),
     ] {
         o.push_str(&hex(field));
         o.push('\n');
@@ -606,10 +617,15 @@ mod tests {
             keep_alive: 60,
             subscribe: vec!["a/b".into(), "c/#".into()],
             test_topic: "rustonchip/test".into(),
+            shadow_filters: vec!["$aws/things/t/shadow/get/accepted".into(), "x".into()],
+            shadow_max: 2048,
+            shadow_work: 2368,
         };
         let text = stdin_lines(&r);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 14);
+        assert_eq!(lines.len(), 17);
+        assert_eq!(lines[14], "246177732f7468696e67732f742f736861646f772f6765742f61636365707465640a78");
+        assert_eq!((lines[15], lines[16]), ("32303438", "32333638"));
         assert_eq!(lines[11], "3630");
         assert_eq!(lines[12], "612f620a632f23", "the filters one per line inside their hex line");
         assert_eq!(lines[1], "38383833");
@@ -937,6 +953,7 @@ mod tests {
             keep_alive: 60,
             subscribe: vec!["rustonchip-ide-test/#".into()],
             test_topic: "rustonchip-ide-test/test".into(),
+            ..Request::default()
         };
         let ctx = egui::Context::default();
         for (port, name, want) in [

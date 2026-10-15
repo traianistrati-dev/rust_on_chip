@@ -2080,7 +2080,7 @@ mod emit_for_manual_compile {
                 BleConfig, EspNowConfig, HttpConfig, MqttConfig, SntpConfig, ThreadConfig,
             };
             let all = matches!(mode, "all" | "ble+all");
-            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt" | "mqtts" | "http" | "https" | "awshttps") || all;
+            mcu.iot.wifi = matches!(mode, "wifi" | "mqtt" | "mqtts" | "http" | "https" | "awshttps" | "awsmqtt") || all;
             if matches!(mode, "http" | "https" | "awshttps") || all {
                 let aws = mode == "awshttps";
                 mcu.iot.http = Some(HttpConfig {
@@ -2115,6 +2115,22 @@ mod emit_for_manual_compile {
                 m.client_cert = all && m.tls;
                 m.port = m.port_for_tls(m.tls);
                 mcu.iot.mqtt = Some(m);
+            }
+            // MQTT on AWS IoT with the board's certificate and the Device
+            // Shadow, a named one beside the classic: every shadow call linked.
+            if mode == "awsmqtt" {
+                mcu.iot.mqtt = Some(MqttConfig {
+                    host: "a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com".into(),
+                    port: 8883,
+                    client_id: "rustonchip-test".into(),
+                    tls: true,
+                    client_cert: true,
+                    aws_shadow: true,
+                    shadow_names: vec!["config".into()],
+                    shadow_max: 2048,
+                    subscribe: vec!["rustonchip-test/cmd".into()],
+                    ..MqttConfig::for_chip(&chip)
+                });
             }
             if all || std::env::var_os("EIDE_ESP_SNTP").is_some() {
                 mcu.iot.sntp = Some(SntpConfig::default());
@@ -2158,7 +2174,7 @@ mod emit_for_manual_compile {
             // The user's code names `main`'s spawner as `_spawner`, whatever
             // the IoT tab turns on: it must still be there by that name.
             used.push_str("        let _ = _spawner;\n");
-            if matches!(mode, "mqtt" | "mqtts") || all {
+            if matches!(mode, "mqtt" | "mqtts" | "awsmqtt") || all {
                 used.push_str("        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n");
                 used.push_str("        let msg = pins::configs::mqtt::incoming().await;\n");
                 used.push_str("        let _ = (msg.topic.as_str(), &msg.payload[..]);\n");
@@ -2178,6 +2194,32 @@ mod emit_for_manual_compile {
                 used.push_str("        let _ = (pins::configs::thread::role(), pins::configs::thread::addresses());\n");
                 used.push_str("        let d = pins::configs::thread::receive().await;\n");
                 used.push_str("        pins::configs::thread::send_to(*d.from.ip(), d.from.port(), &d.data).await.ok();\n");
+            }
+            if mode == "awsmqtt" {
+                // The Device Shadow over MQTT: the delta loop, a get on a
+                // resync, a report, an update and a delete of the named one,
+                // and the JSON reader on what comes back.
+                used.push_str("        let mut doc = [0u8; 1024];\n");
+                used.push_str("        match pins::configs::mqtt::shadow_delta(&mut doc).await {\n");
+                used.push_str("            Ok(d) if d.resync => {\n");
+                used.push_str("                if let Ok(r) = pins::configs::mqtt::shadow_get(d.shadow, &mut doc).await {\n");
+                used.push_str("                    let s = &doc[..r.len];\n");
+                used.push_str("                    let _ = (r.code, r.truncated, pins::configs::mqtt::json_bool(s, &[\"state\", \"delta\", \"led\"]), pins::configs::mqtt::json_i64(s, &[\"version\"]));\n");
+                used.push_str("                }\n");
+                used.push_str("            }\n");
+                used.push_str("            Ok(d) => {\n");
+                used.push_str("                let mut name = [0u8; 16];\n");
+                used.push_str("                let s = &doc[..d.len];\n");
+                used.push_str("                let _ = (d.version, d.own, d.truncated, pins::configs::mqtt::json_f64(s, &[\"state\", \"t\"]));\n");
+                used.push_str("                let _ = (pins::configs::mqtt::json_str(s, &[\"state\", \"name\"], &mut name).map(|n| n.len()), pins::configs::mqtt::json_get(s, &[\"state\"]).is_some());\n");
+                used.push_str("                pins::configs::mqtt::shadow_report(d.shadow, br#\"{\"led\":true}\"#, &mut doc).await.ok();\n");
+                used.push_str("            }\n");
+                used.push_str("            Err(e) => {\n");
+                used.push_str("                let _ = e;\n");
+                used.push_str("            }\n");
+                used.push_str("        }\n");
+                used.push_str("        pins::configs::mqtt::shadow_update(Some(\"config\"), br#\"{\"state\":{\"desired\":null}}\"#, &mut doc).await.ok();\n");
+                used.push_str("        pins::configs::mqtt::shadow_delete(Some(\"config\"), &mut doc).await.ok();\n");
             }
             if mode == "awshttps" {
                 used.push_str("        let mut reply = [0u8; 128];\n");
@@ -2344,6 +2386,17 @@ mod emit_for_manual_compile {
             assert!(
                 iot_active.is_some_and(|a| a.http_client_cert && !a.mqtt),
                 "{chip}: awshttps is HTTPS with the board's certificate, MQTT off"
+            );
+        }
+        if matches!(iot_mode.as_deref(), Some("awsmqtt")) {
+            assert!(
+                iot_active.is_some_and(|a| a.mqtt_client_cert && !a.http),
+                "{chip}: awsmqtt is MQTT on AWS IoT with the board's certificate, HTTP off"
+            );
+            let m = mcu.iot.mqtt.as_ref().expect("awsmqtt has MQTT");
+            assert!(
+                crate::panels::mcu_module::iot::mqtt_shadow(m).is_some(),
+                "{chip}: awsmqtt runs the Device Shadow"
             );
         }
         if tls {

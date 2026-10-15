@@ -50,6 +50,7 @@ mod embedded_io_async {
 const USER_AGENT: &str = "RustOnChip";
 
 include!("codegen/iot_templates/http_core.rs");
+include!("codegen/iot_templates/json.rs");
 
 /// An in-memory connection: the server's bytes, handed out at most `step`
 /// at a time; what the client wrote is kept.

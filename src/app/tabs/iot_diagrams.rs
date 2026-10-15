@@ -472,11 +472,26 @@ pub(super) fn mqtt_chain(f: &Facts) -> Option<Chain> {
         "CONNECT, the broker answers CONNACK",
         format!("up to {} s; then connected()", n.mqtt_answer_s),
     ));
-    let subs = iot::subscriptions(m).len();
+    // The Device Shadow's answer topics go first, 7 a shadow, then the tab's
+    // own filters - the order mqtt.rs subscribes in, skipping a filter of the
+    // tab's that is one of the shadow's already.
+    let shadow_topics = iot::mqtt_shadow(m)
+        .map(|s| iot::shadow_filters(&s.thing, &s.names))
+        .unwrap_or_default();
+    let shadow = shadow_topics.len();
+    let own = iot::subscriptions(m)
+        .into_iter()
+        .filter(|f| !shadow_topics.iter().any(|t| t == f))
+        .count();
+    let subs = shadow + own;
     if subs > 0 {
         steps.push(step(
             Some(iot_gen::MQTT),
-            format!("SUBSCRIBE x{subs}"),
+            if shadow > 0 {
+                format!("SUBSCRIBE x{subs}, the Device Shadow's {shadow} first")
+            } else {
+                format!("SUBSCRIBE x{subs}")
+            },
             format!("up to {} s each", n.mqtt_answer_s),
         ));
     }
@@ -1249,6 +1264,43 @@ mod tests {
         // Not generated: no chain.
         mcu.runtime = Runtime::Blocking;
         assert!(mqtt_chain(&Facts::of(&mcu)).is_none());
+    }
+
+    /// Found by the session that added it: with the Device Shadow on, mqtt.rs
+    /// subscribes its answer topics - 7 a shadow - before the tab's filters,
+    /// and the chain counted only the tab's.
+    #[test]
+    fn the_subscribe_count_includes_the_device_shadows_topics() {
+        let mut mcu = c3_everything();
+        if let Some(m) = mcu.iot.mqtt.as_mut() {
+            m.host = "a1b2c3d4e5f6g7-ats.iot.eu-central-1.amazonaws.com".into();
+            m.aws_shadow = true;
+            m.shadow_names = vec!["config".into()];
+        }
+        let m = mcu.iot.mqtt.clone().unwrap();
+        let shadow = iot::mqtt_shadow(&m).expect("the shadow runs on AWS with the certificate");
+        let topics = iot::shadow_filters(&shadow.thing, &shadow.names).len();
+        assert_eq!(topics, 14, "the classic shadow and one named, 7 each");
+        let total = iot::subscriptions(&m).len() + topics;
+        let chain = mqtt_chain(&Facts::of(&mcu)).unwrap();
+        let want = format!("SUBSCRIBE x{total}, the Device Shadow's 14 first");
+        assert!(
+            chain.steps.iter().any(|s| s.text == want),
+            "{want}: {:?}",
+            chain.steps
+        );
+        // A filter of the tab's that IS one of the shadow's: the firmware
+        // subscribes it once, and so does the count.
+        if let Some(m) = mcu.iot.mqtt.as_mut() {
+            m.subscribe
+                .push(format!("$aws/things/{}/shadow/update/delta", shadow.thing));
+        }
+        let chain = mqtt_chain(&Facts::of(&mcu)).unwrap();
+        assert!(
+            chain.steps.iter().any(|s| s.text == want),
+            "still {want}: {:?}",
+            chain.steps
+        );
     }
 
     #[test]

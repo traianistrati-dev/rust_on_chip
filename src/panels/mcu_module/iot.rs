@@ -658,6 +658,16 @@ pub struct MqttConfig {
     /// and MQTT_CLIENT_KEY, P-256) when the broker asks - AWS IoT does.
     #[serde(default)]
     pub client_cert: bool,
+    /// AWS IoT's Device Shadow over this connection (`shadow_delta()` and
+    /// the rest): its answers subscribed after every connect, deltas pushed.
+    /// Only on AWS IoT with the certificate - see [`mqtt_shadow`].
+    pub aws_shadow: bool,
+    /// Named shadows beside the thing's classic one: at most
+    /// [`SHADOW_NAMES_MAX`], see [`shadow_names`].
+    pub shadow_names: Vec<String>,
+    /// The largest shadow document the board keeps, in bytes ("Document up
+    /// to"); clamped per chip by [`mqtt_shadow_max`].
+    pub shadow_max: u32,
 }
 
 impl Default for MqttConfig {
@@ -673,7 +683,141 @@ impl Default for MqttConfig {
             server_name: String::new(),
             p384: false,
             client_cert: false,
+            aws_shadow: false,
+            shadow_names: Vec::new(),
+            shadow_max: SHADOW_DEFAULT,
         }
+    }
+}
+
+/// Named shadows over MQTT: each subscribes 7 answer topics, and AWS IoT takes
+/// 50 subscriptions a connection.
+pub const SHADOW_NAMES_MAX: usize = 3;
+/// "Document up to", and its default.
+pub const SHADOW_RANGE: std::ops::RangeInclusive<u32> = 512..=8192;
+pub const SHADOW_DEFAULT: u32 = 2048;
+
+/// What keeps a shadow name from AWS IoT: 1 to 64 bytes of letters, digits,
+/// `:`, `_`, `-` - and `$`, of AWS's own `$package`.
+pub fn shadow_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("empty - the classic shadow needs no name");
+    }
+    if name.len() > 64 {
+        return Some("longer than AWS IoT's 64 bytes");
+    }
+    (!name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'$')))
+    .then_some("a shadow's name holds only letters, digits, `:`, `_`, `-` and `$`")
+}
+
+/// The named shadows the board subscribes to: the valid ones, each once, the
+/// first [`SHADOW_NAMES_MAX`], in order - byte for byte, never trimmed.
+pub fn shadow_names(m: &MqttConfig) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for n in &m.shadow_names {
+        if shadow_name_problem(n).is_none() && !names.contains(n) && names.len() < SHADOW_NAMES_MAX {
+            names.push(n.clone());
+        }
+    }
+    names
+}
+
+/// The Device Shadow over MQTT as the board runs it: its thing - the client
+/// id, which on AWS IoT is the thing's name - and the named shadows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MqttShadow {
+    pub thing: String,
+    pub names: Vec<String>,
+}
+
+/// The Device Shadow over MQTT, when it can run: switched on, AWS IoT with
+/// TLS and the board's certificate, and a client id AWS takes as a thing's
+/// name (untrimmed: CLIENT_ID and the policy carry it as it is).
+pub fn mqtt_shadow(m: &MqttConfig) -> Option<MqttShadow> {
+    (m.aws_shadow
+        && m.tls
+        && m.client_cert
+        && aws_iot(m)
+        && super::aws_iot::client_id_problem(&m.client_id).is_none())
+    .then(|| MqttShadow {
+        thing: m.client_id.clone(),
+        names: shadow_names(m),
+    })
+}
+
+/// The answer topics a shadow's calls wait on, 7 a shadow - the classic one
+/// first, then the named ones in order - in the template's KINDS order:
+/// get/accepted, get/rejected, update/accepted, update/rejected,
+/// update/delta, delete/accepted, delete/rejected. Never update/documents:
+/// the largest, and nothing the board needs.
+pub fn shadow_filters(thing: &str, names: &[String]) -> Vec<String> {
+    const KINDS: [&str; 7] = [
+        "get/accepted",
+        "get/rejected",
+        "update/accepted",
+        "update/rejected",
+        "update/delta",
+        "delete/accepted",
+        "delete/rejected",
+    ];
+    let roots = std::iter::once(format!("$aws/things/{thing}/shadow"))
+        .chain(names.iter().map(|n| format!("$aws/things/{thing}/shadow/name/{n}")));
+    roots
+        .flat_map(|root| KINDS.iter().map(move |k| format!("{root}/{k}")))
+        .collect()
+}
+
+/// The largest "Document up to" a chip takes: what the measured RAM leaves.
+/// An ESP32-C2 had about 2 KB left with MQTT over TLS; an ESP32 or S2 about
+/// 7.7 KB of stack beside HTTPS.
+pub fn shadow_max_cap(family: &str, https: bool) -> u32 {
+    match family {
+        "esp32c2" => 1024,
+        "esp32" | "esp32s2" if https => 1024,
+        "esp32" | "esp32s2" => 2048,
+        _ => *SHADOW_RANGE.end(),
+    }
+}
+
+/// SHADOW_MAX as the block writes it: "Document up to" within the range and
+/// the chip's cap.
+pub fn mqtt_shadow_max(m: &MqttConfig, family: &str, https: bool) -> usize {
+    m.shadow_max
+        .clamp(*SHADOW_RANGE.start(), shadow_max_cap(family, https).max(*SHADOW_RANGE.start())) as usize
+}
+
+/// The template's WORK for SHADOW_MAX `s`: the MQTT packet the board takes -
+/// the document, the longest named topic and MQTT 5's framing - never under
+/// the 1024 it had.
+pub fn mqtt_work(s: usize) -> usize {
+    (s + 320).max(1024)
+}
+
+/// The template's RX: a TLS record of the largest packet held whole, when
+/// the shadow is on (else the link's own 2048 or 1024).
+pub fn mqtt_shadow_rx(s: usize) -> usize {
+    if s == 0 { 2048 } else { (mqtt_work(s) + 64).max(2048) }
+}
+
+/// What the Device Shadow adds to RAM at SHADOW_MAX `s`: the larger work
+/// and socket buffers, the request-and-answer slot, the delta slot and its
+/// state - about 3 x `s`. The buffer each caller passes comes on top.
+pub fn mqtt_shadow_ram(s: usize) -> usize {
+    (mqtt_work(s) - 1024) + (mqtt_shadow_rx(s) - 2048) + (s + 64) + s + 320
+}
+
+/// What the measured RAM says against the Device Shadow on this chip.
+pub fn mqtt_shadow_ram_warning(family: &str, http: bool, https: bool) -> Option<&'static str> {
+    match family {
+        "esp32c2" if http => Some(
+            "beside the HTTP client an ESP32-C2 had about 2 KB of RAM left (measured with MQTT over TLS): the Device Shadow may not link unless HTTP goes",
+        ),
+        "esp32" | "esp32s2" if https => Some(
+            "beside HTTPS about 7.7 KB of stack was left (measured on an ESP32-S2): \"Document up to\" is held at 1024",
+        ),
+        _ => None,
     }
 }
 
@@ -1141,6 +1285,37 @@ pub fn filter_left_out(m: &MqttConfig, filter: &str) -> Option<&'static str> {
             None
         }
     })
+}
+
+/// A topic filter covers a topic, by AWS IoT's rules: `+` one level, a last
+/// `#` one level or more (on AWS `a/#` does not match `a`).
+pub fn filter_covers(filter: &str, topic: &str) -> bool {
+    let mut f = filter.split('/');
+    let mut t = topic.split('/');
+    loop {
+        match (f.next(), t.next()) {
+            (Some("#"), next) => return next.is_some(),
+            (Some("+"), Some(_)) => {}
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// What a user's filter says while the Device Shadow runs: the shadow's
+/// answer topics it covers go to `shadow_delta()` and the shadow calls,
+/// never `incoming()` - the filter itself stays.
+pub fn shadow_filter_note(m: &MqttConfig, filter: &str) -> Option<&'static str> {
+    let shadow = mqtt_shadow(m)?;
+    let topics = shadow_filters(&shadow.thing, &shadow.names);
+    if topics.iter().any(|t| t == filter) {
+        Some("the Device Shadow subscribes to it already: what comes on it goes to shadow_delta() and the shadow calls, not incoming()")
+    } else if topics.iter().any(|t| filter_covers(filter, t)) {
+        Some("covers the Device Shadow's answers: those go to shadow_delta() and the shadow calls, never incoming()")
+    } else {
+        None
+    }
 }
 
 /// The filters the board subscribes to, in order.
@@ -2409,5 +2584,108 @@ mod tests {
             ..IotConfig::default()
         };
         assert!(!on.is_default());
+    }
+
+    fn aws_mqtt() -> MqttConfig {
+        MqttConfig {
+            host: "a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com".into(),
+            port: 8883,
+            client_id: "board-1".into(),
+            tls: true,
+            client_cert: true,
+            aws_shadow: true,
+            ..MqttConfig::default()
+        }
+    }
+
+    #[test]
+    fn shadow_names_are_checked() {
+        for good in ["config", "a:b_c-1", "$package", &"n".repeat(64)] {
+            assert_eq!(shadow_name_problem(good), None, "{good}");
+        }
+        for bad in ["", "a b", "a/b", "a.b", "+", &"n".repeat(65)] {
+            assert!(shadow_name_problem(bad).is_some(), "{bad:?}");
+        }
+        let m = MqttConfig {
+            shadow_names: ["a", "bad name", "a", "b", "c", "d"].map(String::from).to_vec(),
+            ..aws_mqtt()
+        };
+        assert_eq!(shadow_names(&m), ["a", "b", "c"], "valid, once, at most 3, in order");
+    }
+
+    /// The shadow runs only on AWS IoT, over TLS with the board's
+    /// certificate, under a client id AWS takes as a thing's name.
+    #[test]
+    fn mqtt_shadow_needs_aws_tls_a_certificate_and_a_thing_name() {
+        let on = aws_mqtt();
+        assert_eq!(mqtt_shadow(&on), Some(MqttShadow { thing: "board-1".into(), names: Vec::new() }));
+        let spoiled = [
+            MqttConfig { aws_shadow: false, ..aws_mqtt() },
+            MqttConfig { host: "broker.example.com".into(), ..aws_mqtt() },
+            MqttConfig { tls: false, ..aws_mqtt() },
+            MqttConfig { client_cert: false, ..aws_mqtt() },
+            MqttConfig { client_id: " board-1".into(), ..aws_mqtt() },
+            MqttConfig { client_id: "t".repeat(59), ..aws_mqtt() },
+        ];
+        for m in &spoiled {
+            assert_eq!(mqtt_shadow(m), None, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn shadow_filters_are_seven_a_shadow_in_order() {
+        let f = shadow_filters("t", &["cfg".into()]);
+        assert_eq!(f.len(), 14);
+        assert_eq!(f[0], "$aws/things/t/shadow/get/accepted");
+        assert_eq!(f[4], "$aws/things/t/shadow/update/delta");
+        assert_eq!(f[13], "$aws/things/t/shadow/name/cfg/delete/rejected");
+        assert!(f.iter().all(|t| !t.contains("documents") && !t.contains(['+', '#'])));
+        // AWS's 7 slashes, a named shadow's longest topic included.
+        assert!(f.iter().all(|t| t.matches('/').count() <= 7), "{f:?}");
+    }
+
+    /// A user's filter beside the shadow stays in SUBSCRIBE - an mqtt.rs from
+    /// before the shadow still needs it, the current one skips a duplicate -
+    /// and the tab notes what of it goes to the shadow instead.
+    #[test]
+    fn a_user_filter_beside_the_shadow_stays_and_is_noted() {
+        let f = "$aws/things/board-1/shadow/update/delta";
+        let on = MqttConfig { subscribe: vec![f.into(), "board-1/cmd".into()], ..aws_mqtt() };
+        assert_eq!(subscriptions(&on), [f, "board-1/cmd"]);
+        assert!(shadow_filter_note(&on, f).is_some_and(|why| why.contains("already")));
+        assert!(shadow_filter_note(&on, "$aws/things/board-1/shadow/+/accepted").is_some_and(|why| why.contains("covers")));
+        assert!(shadow_filter_note(&on, "$aws/things/board-1/shadow/#").is_some());
+        assert_eq!(shadow_filter_note(&on, "board-1/cmd"), None);
+        // update/documents is not the shadow's: the user may have it.
+        assert_eq!(shadow_filter_note(&on, "$aws/things/board-1/shadow/update/documents"), None);
+        assert_eq!(shadow_filter_note(&MqttConfig { aws_shadow: false, ..on.clone() }, f), None);
+        assert!(filter_covers("a/+/c", "a/b/c") && filter_covers("a/#", "a/b/c") && !filter_covers("a/#", "a"));
+        assert!(!filter_covers("a/+", "a/b/c") && !filter_covers("a/b", "a/c"));
+    }
+
+    #[test]
+    fn shadow_caps_follow_the_chip() {
+        assert_eq!(shadow_max_cap("esp32c3", true), 8192);
+        assert_eq!(shadow_max_cap("rp2040", false), 8192);
+        assert_eq!(shadow_max_cap("esp32c2", false), 1024);
+        assert_eq!(shadow_max_cap("esp32s2", false), 2048);
+        assert_eq!(shadow_max_cap("esp32", true), 1024);
+        let m = MqttConfig { shadow_max: 4096, ..aws_mqtt() };
+        assert_eq!(mqtt_shadow_max(&m, "esp32c3", false), 4096);
+        assert_eq!(mqtt_shadow_max(&m, "esp32s2", false), 2048);
+        assert_eq!(mqtt_shadow_max(&MqttConfig { shadow_max: 0, ..aws_mqtt() }, "esp32c3", false), 512);
+        assert!(mqtt_shadow_ram_warning("esp32c2", true, false).is_some());
+        assert!(mqtt_shadow_ram_warning("esp32c3", true, true).is_none());
+    }
+
+    /// An @iot line from before the shadow reads it as off.
+    #[test]
+    fn an_mqtt_config_from_before_the_shadow_reads_it_off() {
+        let old = r#"(host:"h",port:8883,client_id:"c",keep_alive_s:60,subscribe:[],tls:true,verify:true,server_name:"",p384:false,client_cert:true)"#;
+        let m: MqttConfig = ron::from_str(old).unwrap();
+        assert!(!m.aws_shadow && m.shadow_names.is_empty() && m.shadow_max == SHADOW_DEFAULT);
+        let on = MqttConfig { shadow_names: vec!["cfg".into()], shadow_max: 1024, ..aws_mqtt() };
+        let back: MqttConfig = ron::from_str(&ron::to_string(&on).unwrap()).unwrap();
+        assert_eq!(back, on);
     }
 }

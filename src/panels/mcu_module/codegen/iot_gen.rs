@@ -76,7 +76,14 @@ pub const SECRETS_IGNORE: &str = "/src/pins/configs/secrets.rs";
 const WIFI_ESP_TAIL: &str = include_str!("iot_templates/wifi_esp.rs");
 const WIFI_CYW43_TAIL: &str = include_str!("iot_templates/wifi_cyw43.rs");
 const NET_TAIL: &str = include_str!("iot_templates/net.rs");
-const MQTT_TAIL: &str = include_str!("iot_templates/mqtt.rs");
+/// mqtt.rs: the task and the API, then the Device Shadow's pure part and the
+/// JSON reader - which the IDE's own tests run (`mqtt_shadow_core_tests`,
+/// `http_core_tests`). mqtt.rs first: the diagrams read its constants by name.
+const MQTT_TAIL: &str = concat!(
+    include_str!("iot_templates/mqtt.rs"),
+    include_str!("iot_templates/mqtt_shadow_core.rs"),
+    include_str!("iot_templates/json.rs")
+);
 const SNTP_TAIL: &str = include_str!("iot_templates/sntp.rs");
 const ESPNOW_TAIL: &str = include_str!("iot_templates/espnow.rs");
 const BLE_TAIL: &str = include_str!("iot_templates/ble.rs");
@@ -106,15 +113,16 @@ const TLS_CYW43_TAIL: &str = concat!(
     include_str!("iot_templates/tls_verify.rs"),
     include_str!("iot_templates/pem_der.rs")
 );
-/// http.rs: the task and the API, then the protocol - which the IDE's own
-/// tests run (`http_core_tests`).
+/// http.rs: the task and the API, then the protocol and the JSON reader -
+/// which the IDE's own tests run (`http_core_tests`). Three files, the same
+/// bytes as before json.rs was split off: no legacy tail for it.
 const HTTP_TAIL: &str = concat!(
     include_str!("iot_templates/http.rs"),
-    include_str!("iot_templates/http_core.rs")
+    include_str!("iot_templates/http_core.rs"),
+    include_str!("iot_templates/json.rs")
 );
-/// The HTTP protocol alone, for the IDE's tests.
-#[cfg(test)]
-pub const HTTP_CORE: &str = include_str!("iot_templates/http_core.rs");
+/// The JSON reader alone, for the PC's helper.
+pub const JSON: &str = include_str!("iot_templates/json.rs");
 /// The certificate checks alone, for the PC's check.
 pub const TLS_VERIFY: &str = include_str!("iot_templates/tls_verify.rs");
 /// The PEM and DER code, for the PC's check (the IDE reads it too: `iot::pem`).
@@ -230,6 +238,7 @@ opt-level = 2
         ("src/tls_verify.rs", lf(TLS_VERIFY)),
         ("src/pem_der.rs", lf(PEM_DER)),
         ("src/csr_der.rs", lf(CSR_DER)),
+        ("src/json.rs", lf(JSON)),
     ]
 }
 /// The CA `mqtt_ca.rs` starts with: ISRG Root X1, Let's Encrypt's root (SHA-256
@@ -270,7 +279,9 @@ const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 ///   aws_publish_with() (retained, MQTT 5's properties).
 /// - `http_v3`: `http.rs` before the Device Shadow (`shadow_get()` and the
 ///   rest, AWS_THING) and the JSON reader (`json_get()` and the rest).
-const LEGACY_TAILS: [(&str, &str); 17] = [
+/// - `mqtt_v3`: `mqtt.rs` before the Device Shadow over MQTT
+///   (`shadow_delta()` and the rest, SHADOW_THING) and its JSON reader.
+const LEGACY_TAILS: [(&str, &str); 18] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
     (
@@ -312,10 +323,11 @@ const LEGACY_TAILS: [(&str, &str); 17] = [
     (TLS, include_str!("iot_templates/legacy/tls_cyw43_v1.rs")),
     (HTTP, include_str!("iot_templates/legacy/http_v2.rs")),
     (HTTP, include_str!("iot_templates/legacy/http_v3.rs")),
+    (MQTT, include_str!("iot_templates/legacy/mqtt_v3.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 33] = [
+const TAILS: [(&str, &str); 34] = [
     (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
@@ -349,6 +361,7 @@ const TAILS: [(&str, &str); 33] = [
     LEGACY_TAILS[14],
     LEGACY_TAILS[15],
     LEGACY_TAILS[16],
+    LEGACY_TAILS[17],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -471,7 +484,7 @@ pub fn config_files(cfg: &IotConfig, active: Active, family: &str) -> Vec<(Strin
         ));
     }
     if let (true, Some(m)) = (active.mqtt, &cfg.mqtt) {
-        out.push((MQTT.to_owned(), mqtt_file(m)));
+        out.push((MQTT.to_owned(), mqtt_file(m, family, active.http_tls)));
         out.push((MQTT_LINK.to_owned(), mqtt_link_file(m, active)));
         if active.mqtt_tls {
             out.push((MQTT_CA.to_owned(), mqtt_ca_file()));
@@ -584,8 +597,20 @@ fn wifi_file(platform: Platform) -> String {
     o
 }
 
-fn mqtt_file(m: &MqttConfig) -> String {
+fn mqtt_file(m: &MqttConfig, family: &str, https: bool) -> String {
     let topics: Vec<String> = iot::subscriptions(m).into_iter().map(lit).collect();
+    // Always written, so the tail's shadow calls build either way: off = "",
+    // nothing to subscribe, and no buffer (0).
+    let shadow = iot::mqtt_shadow(m);
+    let (thing, names, max, filters) = match &shadow {
+        Some(s) => (
+            s.thing.clone(),
+            s.names.iter().map(|n| lit(n)).collect::<Vec<_>>(),
+            iot::mqtt_shadow_max(m, family, https),
+            iot::shadow_filters(&s.thing, &s.names).iter().map(|f| lit(f)).collect::<Vec<_>>(),
+        ),
+        None => (String::new(), Vec::new(), 0, Vec::new()),
+    };
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
@@ -608,6 +633,17 @@ fn mqtt_file(m: &MqttConfig) -> String {
         "pub const SUBSCRIBE: &[&str] = &[{}];\n",
         topics.join(", ")
     ));
+    o.push_str("/// AWS IoT's Device Shadow over this connection: its thing - the client\n");
+    o.push_str("/// id - \"\" = off.\n");
+    o.push_str(&format!("pub const SHADOW_THING: &str = {};\n", lit(&thing)));
+    o.push_str("/// Its named shadows, beside the classic one.\n");
+    o.push_str(&format!("pub const SHADOW_NAMES: &[&str] = &[{}];\n", names.join(", ")));
+    o.push_str("/// The largest shadow document the board keeps - an answer, a delta - in\n");
+    o.push_str("/// bytes; 0 = off.\n");
+    o.push_str(&format!("pub const SHADOW_MAX: usize = {max};\n"));
+    o.push_str("/// The shadows' answers, subscribed before SUBSCRIBE after every connect:\n");
+    o.push_str("/// 7 a shadow.\n");
+    o.push_str(&format!("pub const SHADOW_SUBSCRIBE: &[&str] = &[{}];\n", filters.join(", ")));
     o.push_str(GEN_END_CFG);
     o.push('\n');
     o.push_str(&lf(MQTT_TAIL));
@@ -1619,6 +1655,10 @@ fn esp_uart0_taken(mcu: &Mcu) -> bool {
 pub const MQTT_PUBLISH_SIGNATURE: &str =
     "pub async fn publish(topic: &str, payload: &[u8]) -> Result<(), PublishError>";
 
+/// A line mqtt.rs's template has since the Device Shadow: the tab warns when
+/// an edited mqtt.rs from before lacks it.
+pub const MQTT_SHADOW_SIGNATURE: &str = "pub async fn shadow_report(";
+
 /// Is the chip's USB Serial/JTAG the user's (its pads wired, not as OTG)?
 /// esp-println would write there too once a host is attached.
 fn esp_usb_jtag_taken(mcu: &Mcu) -> bool {
@@ -2610,7 +2650,7 @@ mod tests {
     #[test]
     fn mqtt_rs_and_its_link_follow_the_tab() {
         let m = MqttConfig::default();
-        let v2 = mqtt_file(&m);
+        let v2 = mqtt_file(&m, "esp32c3", false);
         let v1 = format!(
             "{}{}",
             &v2[..v2.find(GEN_END_CFG).unwrap() + GEN_END_CFG.len() + 1],
@@ -2987,7 +3027,7 @@ mod tests {
             subscribe: vec!["a/#".into(), "bad/#/x".into(), "b/+".into()],
             ..MqttConfig::default()
         };
-        let f = mqtt_file(&m);
+        let f = mqtt_file(&m, "esp32c3", false);
         assert!(
             f.contains(r#"pub const BROKER_HOST: &str = "broker\"x";"#),
             "{f}"
@@ -3515,7 +3555,7 @@ mod tests {
     #[test]
     fn an_untouched_mqtt_v2_moves_to_the_current_template() {
         let m = MqttConfig::default();
-        let now = mqtt_file(&m);
+        let now = mqtt_file(&m, "esp32c3", false);
         let head = &now[..now.find(GEN_END_CFG).unwrap() + GEN_END_CFG.len() + 1];
         let v2 = format!("{head}{}", lf(LEGACY_TAILS[9].1));
         assert!(is_pristine(MQTT, &v2));
@@ -3527,6 +3567,106 @@ mod tests {
         assert!(now.contains("pub fn try_publish(topic: &str, payload: &[u8]) -> Result<(), PublishError>"));
         assert!(now.contains("pub fn connected() -> bool"));
         assert!(now.contains("client.shared_config().keep_alive"), "the broker's keep-alive");
+    }
+
+    /// An untouched mqtt.rs from before the Device Shadow moves to the
+    /// current one, the user's block kept; one edited stays, and the tab says
+    /// so by the signature it lacks.
+    #[test]
+    fn an_untouched_mqtt_v3_moves_to_the_current_template() {
+        let m = MqttConfig::default();
+        let now = mqtt_file(&m, "esp32c3", false);
+        let head = &now[..now.find(GEN_END_CFG).unwrap() + GEN_END_CFG.len() + 1];
+        let v3 = format!("{head}{}", lf(LEGACY_TAILS[17].1));
+        assert!(is_pristine(MQTT, &v3));
+        assert_eq!(upgraded(MQTT, &v3, &now).as_deref(), Some(now.as_str()));
+        assert!(!v3.contains(MQTT_SHADOW_SIGNATURE) && now.contains(MQTT_SHADOW_SIGNATURE));
+        assert!(lf(LEGACY_TAILS[17].1).contains(MQTT_PUBLISH_SIGNATURE));
+        assert_eq!(upgraded(MQTT, &format!("{v3}// mine\n"), &now), None);
+    }
+
+    fn aws_mqtt_mcu(names: &[&str], max: u32) -> Mcu {
+        let mut m = tls_mcu("esp32c3", false);
+        if let Some(mq) = m.iot.mqtt.as_mut() {
+            mq.host = "a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com".into();
+            mq.client_cert = true;
+            mq.client_id = "rustonchip-test".into();
+            mq.aws_shadow = true;
+            mq.shadow_names = names.iter().map(|n| (*n).to_owned()).collect();
+            mq.shadow_max = max;
+        }
+        m
+    }
+
+    /// The Device Shadow's block: always written, "" / 0 / nothing when off;
+    /// on AWS IoT with the certificate the thing, the valid names, the size
+    /// held to the chip, and 7 answer topics a shadow.
+    #[test]
+    fn the_shadow_block_follows_the_tab() {
+        let off = file_of(&mcu("esp32c3", Runtime::Async, true), MQTT).unwrap();
+        for line in [
+            "pub const SHADOW_THING: &str = \"\";",
+            "pub const SHADOW_NAMES: &[&str] = &[];",
+            "pub const SHADOW_MAX: usize = 0;",
+            "pub const SHADOW_SUBSCRIBE: &[&str] = &[];",
+        ] {
+            assert!(off.contains(line), "{line}\n{off}");
+        }
+        let on = file_of(&aws_mqtt_mcu(&["config", "bad name", "config"], 2048), MQTT).unwrap();
+        assert!(on.contains("pub const SHADOW_THING: &str = \"rustonchip-test\";"), "{on}");
+        assert!(on.contains("pub const SHADOW_NAMES: &[&str] = &[\"config\"];"), "{on}");
+        assert!(on.contains("pub const SHADOW_MAX: usize = 2048;"));
+        let filters = iot::shadow_filters("rustonchip-test", &["config".to_owned()]);
+        assert_eq!(filters.len(), 14);
+        let listed: Vec<String> = filters.iter().map(|f| lit(f)).collect();
+        assert!(on.contains(&format!("pub const SHADOW_SUBSCRIBE: &[&str] = &[{}];", listed.join(", "))));
+        // The tail is the same either way: the block alone switches it.
+        assert_eq!(tail_of(&on), tail_of(&off));
+        // Held to the range, and to what the chip has room for.
+        let max = |m: &Mcu| file_of(m, MQTT).unwrap();
+        assert!(max(&aws_mqtt_mcu(&[], 100)).contains("pub const SHADOW_MAX: usize = 512;"));
+        assert!(max(&aws_mqtt_mcu(&[], 16384)).contains("pub const SHADOW_MAX: usize = 8192;"));
+        let mut c2 = aws_mqtt_mcu(&[], 2048);
+        c2.family = "esp32c2".into();
+        assert_eq!(iot::mqtt_shadow_max(c2.iot.mqtt.as_ref().unwrap(), "esp32c2", false), 1024);
+        assert_eq!(iot::mqtt_shadow_max(c2.iot.mqtt.as_ref().unwrap(), "esp32s2", true), 1024);
+        assert_eq!(iot::mqtt_shadow_max(c2.iot.mqtt.as_ref().unwrap(), "esp32s2", false), 2048);
+        // Not on AWS IoT, no certificate, no TLS, a client id AWS refuses:
+        // off, whatever the switch says.
+        let spoils: [fn(&mut MqttConfig); 3] = [
+            |m: &mut MqttConfig| m.host = "broker.example.com".into(),
+            |m: &mut MqttConfig| m.client_cert = false,
+            |m: &mut MqttConfig| m.client_id = " rustonchip-test".into(),
+        ];
+        for spoil in spoils {
+            let mut m = aws_mqtt_mcu(&[], 2048);
+            spoil(m.iot.mqtt.as_mut().unwrap());
+            let f = file_of(&m, MQTT).unwrap_or_default();
+            assert!(!f.contains("SHADOW_THING: &str = \"rustonchip-test\""), "{f}");
+        }
+    }
+
+    /// The tab's RAM and packet figures are the template's own.
+    #[test]
+    fn the_template_sizes_match_the_tab() {
+        for line in [
+            "const WORK: usize = if SHADOW_MAX + 320 > 1024 { SHADOW_MAX + 320 } else { 1024 };",
+            "const RX: usize = if SHADOW_MAX > 0 && WORK + 64 > link::TCP_RX { WORK + 64 } else { link::TCP_RX };",
+            "const SLOT: usize = if SHADOW_MAX == 0 { 0 } else { SHADOW_MAX + 64 };",
+        ] {
+            assert!(MQTT_TAIL.contains(line), "{line}");
+        }
+        assert_eq!((iot::mqtt_work(0), iot::mqtt_work(512), iot::mqtt_work(1024), iot::mqtt_work(2048)), (1024, 1024, 1344, 2368));
+        assert_eq!(iot::mqtt_shadow_rx(2048), 2432);
+        assert_eq!(iot::mqtt_shadow_rx(512), 2048);
+        let ram = iot::mqtt_shadow_ram(2048);
+        assert!((5800..6400).contains(&ram), "{ram}");
+    }
+
+    #[test]
+    fn the_shadow_signature_is_the_templates() {
+        assert!(lf(MQTT_TAIL).contains(MQTT_SHADOW_SIGNATURE));
+        assert!(!lf(LEGACY_TAILS[17].1).contains(MQTT_SHADOW_SIGNATURE));
     }
 
     #[test]
@@ -4278,6 +4418,27 @@ mod tests {
         assert!(v3.contains("pub async fn aws_publish_with(") && !v3.contains("shadow_get") && !v3.contains("json_get"));
         // The line the tab checks for, in the current one.
         assert!(lf(HTTP_TAIL).contains("pub async fn shadow_report("));
+    }
+
+    /// FNV-1a 64 of a tail's text, LF line ends.
+    fn pin(text: &str) -> (usize, u64) {
+        let text = lf(text);
+        let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        (text.len(), hash)
+    }
+
+    /// The tails that live in several template files, pinned: a change to any
+    /// piece changes what a project's file holds, and an untouched file from
+    /// before is then upgraded only if its old text is in LEGACY_TAILS.
+    #[test]
+    fn the_tails_are_pinned() {
+        let why = "a template changed: freeze the old tail in LEGACY_TAILS first, then update this pin";
+        // Pinned before json.rs was split out of http_core.rs: the same bytes.
+        assert_eq!(pin(HTTP_TAIL), (64639, 0xd5e2_4952_6998_a2ff), "http.rs: {why}");
+        // mqtt.rs with the Device Shadow (its tail before: legacy/mqtt_v3.rs).
+        assert_eq!(pin(MQTT_TAIL), (61135, 0xcd2f_8d18_58d2_a2dc), "mqtt.rs: {why}");
     }
 
     /// AWS_THING: the HTTP card's thing while the certificate goes to AWS IoT,

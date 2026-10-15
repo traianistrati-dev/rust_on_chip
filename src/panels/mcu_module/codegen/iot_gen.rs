@@ -151,6 +151,8 @@ pub struct TemplateNumbers {
     pub mqtt_queue: u64,
     /// mqtt.rs: the largest payload either way.
     pub mqtt_max_payload: u64,
+    /// mqtt.rs: the Device Shadow is ready this long after its last SUBACK.
+    pub mqtt_settle_s: u64,
     /// tls.rs: a handshake's deadline.
     pub tls_open_s: u64,
     /// http.rs: the callers that may wait for their turn.
@@ -175,6 +177,7 @@ pub fn template_numbers() -> &'static TemplateNumbers {
             mqtt_answer_s: n(template_const(MQTT_TAIL, "ANSWER_S")),
             mqtt_queue: n(template_queue(MQTT_TAIL, "OUTGOING")),
             mqtt_max_payload: n(template_const(MQTT_TAIL, "MAX_PAYLOAD")),
+            mqtt_settle_s: n(template_const(MQTT_TAIL, "SETTLE_S")),
             tls_open_s: n(template_const(TLS_ESP_TAIL, "OPEN_S")),
             http_queue: n(template_const(HTTP_TAIL, "QUEUE")),
             espnow_queue: n(template_queue(ESPNOW_TAIL, "OUTGOING")),
@@ -4541,6 +4544,7 @@ mod template_number_tests {
             ("mqtt_answer_s", n.mqtt_answer_s),
             ("mqtt_queue", n.mqtt_queue),
             ("mqtt_max_payload", n.mqtt_max_payload),
+            ("mqtt_settle_s", n.mqtt_settle_s),
             ("tls_open_s", n.tls_open_s),
             ("http_queue", n.http_queue),
             ("espnow_queue", n.espnow_queue),

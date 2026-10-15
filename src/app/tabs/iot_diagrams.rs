@@ -483,16 +483,31 @@ pub(super) fn mqtt_chain(f: &Facts) -> Option<Chain> {
         .into_iter()
         .filter(|f| !shadow_topics.iter().any(|t| t == f))
         .count();
-    let subs = shadow + own;
-    if subs > 0 {
+    if shadow > 0 {
+        steps.push(step(
+            Some(iot_gen::MQTT),
+            format!("SUBSCRIBE x{shadow}: the Device Shadow's answer topics"),
+            format!("up to {} s each", n.mqtt_answer_s),
+        ));
+    }
+    if own > 0 {
         steps.push(step(
             Some(iot_gen::MQTT),
             if shadow > 0 {
-                format!("SUBSCRIBE x{subs}, the Device Shadow's {shadow} first")
+                format!("SUBSCRIBE x{own}: your filters")
             } else {
-                format!("SUBSCRIBE x{subs}")
+                format!("SUBSCRIBE x{own}")
             },
             format!("up to {} s each", n.mqtt_answer_s),
+        ));
+    }
+    if shadow > 0 {
+        // Counted from the shadow's last SUBACK, so your filters' subscribing
+        // overlaps it: AWS delivers to a new subscription a little after.
+        steps.push(step(
+            Some(iot_gen::MQTT),
+            "the Device Shadow is ready",
+            format!("{} s after its last SUBACK", n.mqtt_settle_s),
         ));
     }
     steps.push(step(
@@ -1281,13 +1296,26 @@ mod tests {
         let shadow = iot::mqtt_shadow(&m).expect("the shadow runs on AWS with the certificate");
         let topics = iot::shadow_filters(&shadow.thing, &shadow.names).len();
         assert_eq!(topics, 14, "the classic shadow and one named, 7 each");
-        let total = iot::subscriptions(&m).len() + topics;
-        let chain = mqtt_chain(&Facts::of(&mcu)).unwrap();
-        let want = format!("SUBSCRIBE x{total}, the Device Shadow's 14 first");
+        let own = iot::subscriptions(&m).len();
+        let f = Facts::of(&mcu);
+        let texts =
+            |chain: &Chain| -> Vec<String> { chain.steps.iter().map(|s| s.text.clone()).collect() };
+        let chain = mqtt_chain(&f).unwrap();
+        let shadow_step = "SUBSCRIBE x14: the Device Shadow's answer topics".to_owned();
+        let own_step = format!("SUBSCRIBE x{own}: your filters");
+        let ready = "the Device Shadow is ready".to_owned();
+        let at = |t: &str| texts(&chain).iter().position(|s| s == t);
+        // The shadow's topics, then yours, then the shadow ready - in that
+        // order, as mqtt.rs runs them.
         assert!(
-            chain.steps.iter().any(|s| s.text == want),
-            "{want}: {:?}",
+            at(&shadow_step) < at(&own_step) && at(&own_step) < at(&ready) && at(&ready).is_some(),
+            "{:?}",
             chain.steps
+        );
+        let settle = chain.steps.iter().find(|s| s.text == ready).unwrap();
+        assert_eq!(
+            settle.note,
+            format!("{} s after its last SUBACK", f.numbers.mqtt_settle_s)
         );
         // A filter of the tab's that IS one of the shadow's: the firmware
         // subscribes it once, and so does the count.
@@ -1297,8 +1325,8 @@ mod tests {
         }
         let chain = mqtt_chain(&Facts::of(&mcu)).unwrap();
         assert!(
-            chain.steps.iter().any(|s| s.text == want),
-            "still {want}: {:?}",
+            texts(&chain).contains(&shadow_step) && texts(&chain).contains(&own_step),
+            "still x14 and x{own}: {:?}",
             chain.steps
         );
     }

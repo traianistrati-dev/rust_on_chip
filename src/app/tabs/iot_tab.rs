@@ -282,6 +282,8 @@ impl AppIde {
             // What the diagrams draw: the generator's decision, as it stands
             // before the cards edit anything this frame.
             let how = super::iot_diagrams::Facts::of(mcu);
+            // Every chip the IDE knows, for "which chip carries what".
+            let registry = &self.mcu_registry;
             let files = &mut self.project_tree.user_src_files;
             let mut changed = false;
             let mut tls_actions: Vec<TlsAction> = Vec::new();
@@ -306,6 +308,8 @@ impl AppIde {
                         "{what} Wi-Fi, Bluetooth and the protocols over them come with an ESP32, \
                          a Pico W or Pico 2 W, or an nRF."
                     )));
+                    ui.add_space(4.0);
+                    super::iot_chips::section(ui, registry, &chip_id);
                     return;
                 }
                 ui.label(dim(concat!(
@@ -314,6 +318,7 @@ impl AppIde {
                 )));
                 ui.add_space(4.0);
                 super::iot_diagrams::overview(ui, &how);
+                super::iot_chips::section(ui, registry, &chip_id);
                 ui.add_space(8.0);
 
                 if (platform.is_some() || ble.platform.is_some() || ble.thread) && !is_async {

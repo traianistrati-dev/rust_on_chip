@@ -1441,10 +1441,13 @@ pub fn platform(family: &str, cyw43: bool) -> Option<Platform> {
     }
 }
 
+/// The pad only a board with the CYW43 radio has: the radio's GPIO0.
+pub const CYW43_PAD: &str = "WL_LED";
+
 /// Does this board carry the CYW43 radio? The `WL_LED` pad is the radio's
 /// GPIO0, and only a W board has it - the same fact the codegen keys on.
 pub fn has_cyw43(mcu: &crate::panels::mcu_module::mcu::Mcu) -> bool {
-    mcu.iter_all_pins().any(|p| p.name == "WL_LED")
+    mcu.iter_all_pins().any(|p| p.name == CYW43_PAD)
 }
 
 /// The Wi-Fi platform of `mcu`.
@@ -1770,7 +1773,7 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         Link::Ble if nrf => Planned(
             "not tried on this part yet: the SoftDevice Controller and trouble need 20 KB of RAM",
         ),
-        Link::Ble if family.starts_with("stm32") => {
+        Link::Ble if family.starts_with("stm32wb") => {
             NotHere("embassy-stm32-wpan is not published on crates.io")
         }
         Link::Ble => NotHere("no Bluetooth radio on this chip"),
@@ -1788,6 +1791,7 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
         Link::Thread if family.starts_with("stm32wb") => NotHere(
             "the WB55 / WB35 radio runs Thread inside ST's co-processor firmware, reached through embassy-stm32-wpan - not published on crates.io (the WB15 / WB10 have no 802.15.4)",
         ),
+        Link::Thread if !has_ieee802154_radio(family) => NotHere("no 802.15.4 radio on this chip"),
         Link::Thread => NotHere(
             "the chip has an 802.15.4 radio, but no Thread stack is generated for this part",
         ),

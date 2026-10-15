@@ -7,6 +7,7 @@ pub mod configuration_tab;
 pub mod debug_tab;
 pub mod dfu_tab;
 pub mod git_tab;
+pub mod iot_chips;
 pub mod iot_diagrams;
 pub mod iot_tab;
 pub mod mcu_tab;

@@ -22,9 +22,9 @@ use crate::panels::mcu_module::mcu::model::Runtime;
 use eframe::egui;
 
 /// Generated: the tab's own green.
-const GENERATED: egui::Color32 = egui::Color32::from_rgb(120, 200, 140);
+pub(super) const GENERATED: egui::Color32 = egui::Color32::from_rgb(120, 200, 140);
 /// Switched on in the tab, not generated: the tab's own orange.
-const BLOCKED: egui::Color32 = egui::Color32::from_rgb(235, 150, 90);
+pub(super) const BLOCKED: egui::Color32 = egui::Color32::from_rgb(235, 150, 90);
 /// The path an error takes back.
 const ERROR_PATH: egui::Color32 = egui::Color32::from_rgb(200, 160, 95);
 const FG: egui::Color32 = egui::Color32::from_rgb(210, 214, 226);

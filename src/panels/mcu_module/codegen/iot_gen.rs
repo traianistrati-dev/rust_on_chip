@@ -122,6 +122,79 @@ pub const PEM_DER: &str = include_str!("iot_templates/pem_der.rs");
 /// A key and its certificate request laid out as DER, for the PC's helper.
 pub const CSR_DER: &str = include_str!("iot_templates/csr_der.rs");
 
+/// How long the first TLS handshake waits for SNTP's first answer, so the
+/// certificates' dates are checked from the first connection on (tls.rs's
+/// `clock_ready`).
+pub const CLOCK_WAIT_S: u64 = 10;
+
+/// The numbers the IoT tab's diagrams quote, read off the templates the
+/// firmware is generated from - so a template change moves the diagram with
+/// it. `0` where a template no longer has the constant: a test holds every one
+/// non-zero, so such a change breaks that test, never the drawing.
+#[derive(Clone, Copy, Debug)]
+pub struct TemplateNumbers {
+    /// wifi.rs: the pause before rejoining the access point.
+    pub wifi_retry_s: u64,
+    /// mqtt.rs: the pause before reconnecting, after any error.
+    pub mqtt_retry_s: u64,
+    /// mqtt.rs: the CONNACK's and each SUBACK's deadline.
+    pub mqtt_answer_s: u64,
+    /// mqtt.rs: the messages waiting each way.
+    pub mqtt_queue: u64,
+    /// mqtt.rs: the largest payload either way.
+    pub mqtt_max_payload: u64,
+    /// tls.rs: a handshake's deadline.
+    pub tls_open_s: u64,
+    /// http.rs: the callers that may wait for their turn.
+    pub http_queue: u64,
+    /// espnow.rs: the frames waiting each way.
+    pub espnow_queue: u64,
+    /// ble.rs: the messages waiting each way, and their largest size.
+    pub ble_queue: u64,
+    pub ble_max_data: u64,
+    /// thread.rs: the datagrams waiting each way, and their largest size.
+    pub thread_queue: u64,
+    pub thread_max_data: u64,
+}
+
+/// [`TemplateNumbers`], read once.
+pub fn template_numbers() -> &'static TemplateNumbers {
+    static NUMBERS: std::sync::LazyLock<TemplateNumbers> = std::sync::LazyLock::new(|| {
+        let n = |v: Option<u64>| v.unwrap_or(0);
+        TemplateNumbers {
+            wifi_retry_s: n(template_const(WIFI_ESP_TAIL, "RETRY_S")),
+            mqtt_retry_s: n(template_const(MQTT_TAIL, "RETRY_S")),
+            mqtt_answer_s: n(template_const(MQTT_TAIL, "ANSWER_S")),
+            mqtt_queue: n(template_queue(MQTT_TAIL, "OUTGOING")),
+            mqtt_max_payload: n(template_const(MQTT_TAIL, "MAX_PAYLOAD")),
+            tls_open_s: n(template_const(TLS_ESP_TAIL, "OPEN_S")),
+            http_queue: n(template_const(HTTP_TAIL, "QUEUE")),
+            espnow_queue: n(template_queue(ESPNOW_TAIL, "OUTGOING")),
+            ble_queue: n(template_queue(BLE_TAIL, "OUTGOING")),
+            ble_max_data: n(template_const(BLE_TAIL, "MAX_DATA")),
+            thread_queue: n(template_queue(THREAD_NRF_TAIL, "OUTGOING")),
+            thread_max_data: n(template_const(THREAD_NRF_TAIL, "MAX_DATA")),
+        }
+    });
+    &NUMBERS
+}
+
+/// `const NAME: T = <number>;` in a template: the number.
+fn template_const(text: &str, name: &str) -> Option<u64> {
+    let at = text.find(&format!("const {name}: "))?;
+    let line = text[at..].lines().next()?;
+    let value = line.split_once('=')?.1.trim().trim_end_matches(';').trim();
+    value.parse().ok()
+}
+
+/// `static NAME: Channel<..., <number>> =` in a template: the queue's length.
+fn template_queue(text: &str, name: &str) -> Option<u64> {
+    let at = text.find(&format!("static {name}: Channel<"))?;
+    let decl = &text[at..];
+    let end = decl.find("> =")?;
+    decl[..end].rsplit(',').next()?.trim().parse().ok()
+}
+
 /// The IoT tab's "Test from this PC": a small host program the IDE builds
 /// once and runs, with the same embedded-tls (`std` for the PC, `p384` so it
 /// can say whether the board needs it) and the same certificate checks
@@ -195,7 +268,9 @@ const CA_ISRG_ROOT_X1: &str = include_str!("iot_templates/ca/isrg_root_x1.pem");
 ///   board's certificate to a server that had not proven who it is.
 /// - `http_v2`: `http.rs` with aws_publish() alone, before `AwsMessage` and
 ///   aws_publish_with() (retained, MQTT 5's properties).
-const LEGACY_TAILS: [(&str, &str); 16] = [
+/// - `http_v3`: `http.rs` before the Device Shadow (`shadow_get()` and the
+///   rest, AWS_THING) and the JSON reader (`json_get()` and the rest).
+const LEGACY_TAILS: [(&str, &str); 17] = [
     (WIFI, include_str!("iot_templates/legacy/wifi_esp_v1.rs")),
     (WIFI, include_str!("iot_templates/legacy/wifi_cyw43_v1.rs")),
     (
@@ -236,10 +311,11 @@ const LEGACY_TAILS: [(&str, &str); 16] = [
     (TLS, include_str!("iot_templates/legacy/tls_esp_v1.rs")),
     (TLS, include_str!("iot_templates/legacy/tls_cyw43_v1.rs")),
     (HTTP, include_str!("iot_templates/legacy/http_v2.rs")),
+    (HTTP, include_str!("iot_templates/legacy/http_v3.rs")),
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 32] = [
+const TAILS: [(&str, &str); 33] = [
     (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
@@ -272,6 +348,7 @@ const TAILS: [(&str, &str); 32] = [
     LEGACY_TAILS[13],
     LEGACY_TAILS[14],
     LEGACY_TAILS[15],
+    LEGACY_TAILS[16],
 ];
 
 const GEN_BEGIN_CFG: &str = "// <<< GENERATED>>>";
@@ -414,7 +491,7 @@ pub fn config_files(cfg: &IotConfig, active: Active, family: &str) -> Vec<(Strin
     }
     // After the others, so they keep their places in the list.
     if let (true, Some(h)) = (active.http, &cfg.http) {
-        out.push((HTTP.to_owned(), http_file(h, active)));
+        out.push((HTTP.to_owned(), http_file(h, &iot::http_aws_thing(cfg, &active), active)));
         if active.http_tls {
             out.push((HTTP_CA.to_owned(), http_ca_file()));
         }
@@ -631,14 +708,18 @@ fn tls_file(active: Active, family: &str) -> String {
         o.push_str(
             "/// Before a handshake: SNTP's first answer, so the dates are checked from\n",
         );
-        o.push_str("/// the first connection on - waited for until 10 s after the first\n");
+        o.push_str(&format!(
+            "/// the first connection on - waited for until {CLOCK_WAIT_S} s after the first\n"
+        ));
         o.push_str("/// handshake, once: later ones (an HTTP request each) do not wait again.\n");
         o.push_str("async fn clock_ready() {\n");
         o.push_str("    use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};\n");
         o.push_str("    static UNTIL: Mutex<CriticalSectionRawMutex, core::cell::Cell<Option<embassy_time::Instant>>> =\n");
         o.push_str("        Mutex::new(core::cell::Cell::new(None));\n");
         o.push_str("    let until = UNTIL.lock(|until| {\n");
-        o.push_str("        let at = until\n            .get()\n            .unwrap_or_else(|| embassy_time::Instant::now() + embassy_time::Duration::from_secs(10));\n");
+        o.push_str(&format!(
+            "        let at = until\n            .get()\n            .unwrap_or_else(|| embassy_time::Instant::now() + embassy_time::Duration::from_secs({CLOCK_WAIT_S}));\n"
+        ));
         o.push_str("        until.set(Some(at));\n        at\n    });\n");
         o.push_str(
             "    let _ = embassy_time::with_deadline(until, super::sntp::wait_synced()).await;\n",
@@ -664,7 +745,7 @@ fn tls_file(active: Active, family: &str) -> String {
 
 /// `http.rs`: HTTPS on or off, the limits and the User-Agent; with HTTPS the
 /// CAs and the way a request goes through tls.rs, without it a refusal.
-fn http_file(h: &iot::HttpConfig, active: Active) -> String {
+fn http_file(h: &iot::HttpConfig, thing: &str, active: Active) -> String {
     let mut o = String::new();
     o.push_str(GEN_BEGIN_CFG);
     o.push('\n');
@@ -710,6 +791,12 @@ fn http_file(h: &iot::HttpConfig, active: Active) -> String {
         if aws { if h.aws_port == 443 { 443 } else { 8443 } } else { 0 }
     ));
     o.push_str(&format!("pub const AWS_QOS: u8 = {};\n", u8::from(h.aws_qos >= 1)));
+    o.push_str("/// The thing whose Device Shadow `shadow_get()` and the rest read and\n");
+    o.push_str("/// update: \"\" = none (`Err(Url)`).\n");
+    o.push_str(&format!(
+        "pub const AWS_THING: &str = {};\n",
+        lit(&if aws { thing.to_owned() } else { String::new() })
+    ));
     if active.http_tls {
         o.push_str("use super::tls::{pem_der, pem_len};\n");
         o.push_str("pub use super::tls::LinkBuffers;\n");
@@ -4183,6 +4270,49 @@ mod tests {
         let v2 = lf(LEGACY_TAILS[15].1);
         assert!(v2.contains("pub async fn aws_publish(") && !v2.contains("AwsMessage"));
         assert!(lf(HTTP_TAIL).contains("pub async fn aws_publish_with(m: &AwsMessage<'_>, body: &mut [u8])"));
+        // The third: AwsMessage, before the Device Shadow and the JSON reader.
+        let third = format!("{block}{GEN_END_CFG}\n{}", lf(LEGACY_TAILS[16].1));
+        assert!(is_pristine(HTTP, &third));
+        assert_eq!(upgraded(HTTP, &third, &body).as_deref(), Some(body.as_str()));
+        let v3 = lf(LEGACY_TAILS[16].1);
+        assert!(v3.contains("pub async fn aws_publish_with(") && !v3.contains("shadow_get") && !v3.contains("json_get"));
+        // The line the tab checks for, in the current one.
+        assert!(lf(HTTP_TAIL).contains("pub async fn shadow_report("));
+    }
+
+    /// AWS_THING: the HTTP card's thing while the certificate goes to AWS IoT,
+    /// MQTT's client id when MQTT is there with the certificate too, and ""
+    /// otherwise or for a name AWS refuses: the shadow calls then fail with
+    /// Url, never naming a wrong thing.
+    #[test]
+    fn the_shadow_names_the_cards_thing() {
+        let mut m = aws_http_mcu(8443);
+        m.iot.http.as_mut().unwrap().aws_thing = " sensor-7 ".into();
+        let http = file_of(&m, HTTP).unwrap();
+        assert!(http.contains("pub const AWS_THING: &str = \"sensor-7\";"), "{http}");
+        m.iot.http.as_mut().unwrap().aws_thing = "two words".into();
+        assert!(file_of(&m, HTTP).unwrap().contains("pub const AWS_THING: &str = \"\";"));
+        // No AWS endpoint: no thing either.
+        let mut plain = http_mcu("esp32c3", false, true);
+        plain.iot.http.as_mut().unwrap().aws_thing = "sensor-7".into();
+        assert!(file_of(&plain, HTTP).unwrap().contains("pub const AWS_THING: &str = \"\";"));
+        // MQTT on AWS IoT with the board's certificate: its client id is the
+        // thing, whatever the HTTP card still holds.
+        let mut both = http_mcu("esp32c3", true, true);
+        if let Some(h) = both.iot.http.as_mut() {
+            h.client_cert = true;
+            h.cert_host = "a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com".into();
+            h.aws_thing = "stale".into();
+        }
+        if let Some(mq) = both.iot.mqtt.as_mut() {
+            mq.client_cert = true;
+            mq.host = "a1b2c3d4e5f6g7-ats.iot.eu-south-1.amazonaws.com".into();
+            mq.client_id = " board-1".into();
+        }
+        let a = iot::active(&both).unwrap();
+        assert!(a.mqtt_client_cert && a.http_client_cert, "{a:?}");
+        let http = file_of(&both, HTTP).unwrap();
+        assert!(http.contains("pub const AWS_THING: &str = \"board-1\";"), "{http}");
     }
 
     /// An untouched tls.rs from before the Provider waited for the server's
@@ -4231,5 +4361,84 @@ mod tests {
         )];
         assert_eq!(kept_paths(&[], &edited), ["src/pins/configs/panic.rs"]);
         assert!(runtime_free(PANIC));
+    }
+}
+
+/// The numbers the IoT tab's diagrams quote.
+#[cfg(test)]
+mod template_number_tests {
+    use super::*;
+
+    /// Every number is found in its template - a template that renames or
+    /// drops one fails here, not as a "0" in the drawing.
+    #[test]
+    fn every_number_the_diagrams_quote_is_in_its_template() {
+        let n = template_numbers();
+        let all = [
+            ("wifi_retry_s", n.wifi_retry_s),
+            ("mqtt_retry_s", n.mqtt_retry_s),
+            ("mqtt_answer_s", n.mqtt_answer_s),
+            ("mqtt_queue", n.mqtt_queue),
+            ("mqtt_max_payload", n.mqtt_max_payload),
+            ("tls_open_s", n.tls_open_s),
+            ("http_queue", n.http_queue),
+            ("espnow_queue", n.espnow_queue),
+            ("ble_queue", n.ble_queue),
+            ("ble_max_data", n.ble_max_data),
+            ("thread_queue", n.thread_queue),
+            ("thread_max_data", n.thread_max_data),
+        ];
+        for (name, value) in all {
+            assert!(value > 0, "{name} is not in its template any more");
+        }
+        // Read from one template, true of its twins: the diagrams name one
+        // figure for every radio.
+        assert_eq!(
+            template_const(WIFI_CYW43_TAIL, "RETRY_S"),
+            Some(n.wifi_retry_s)
+        );
+        assert_eq!(template_queue(BLE_NRF_TAIL, "OUTGOING"), Some(n.ble_queue));
+        assert_eq!(
+            template_const(BLE_NRF_TAIL, "MAX_DATA"),
+            Some(n.ble_max_data)
+        );
+        assert_eq!(
+            template_queue(THREAD_ESP_TAIL, "OUTGOING"),
+            Some(n.thread_queue)
+        );
+        assert_eq!(
+            template_const(THREAD_ESP_TAIL, "MAX_DATA"),
+            Some(n.thread_max_data)
+        );
+        assert_eq!(template_queue(MQTT_TAIL, "INCOMING"), Some(n.mqtt_queue));
+        assert_eq!(template_const(TLS_CYW43_TAIL, "OPEN_S"), Some(n.tls_open_s));
+    }
+
+    /// The constant the tls.rs wait is written from is the one the diagram
+    /// quotes.
+    #[test]
+    fn the_clock_wait_in_tls_rs_is_the_constant() {
+        let a = iot::Active {
+            platform: Platform::Esp,
+            station: true,
+            esp_now: false,
+            mqtt: true,
+            mqtt_tls: true,
+            mqtt_p384: false,
+            mqtt_client_cert: false,
+            sntp: true,
+            ble: false,
+            thread: false,
+            panic: false,
+            http: false,
+            http_tls: false,
+            http_p384: false,
+            http_client_cert: false,
+        };
+        let body = tls_file(a, "esp32c3");
+        assert!(
+            body.contains(&format!("Duration::from_secs({CLOCK_WAIT_S})")),
+            "{body}"
+        );
     }
 }

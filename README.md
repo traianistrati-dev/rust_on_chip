@@ -590,6 +590,20 @@ IoT look-alike (`scripts/aws-iot-mock.py`) takes it on 8443 and 443 and hands
 it to its MQTT subscribers - its HTTP answers follow AWS's documentation, not
 captured traffic.
 
+The thing's **Device Shadow** goes over the same connection, through AWS's
+REST API - the answer is the shadow itself, so a board that speaks only HTTPS
+reads it without subscribing to anything: `shadow_get(None, &mut body)` (or
+`Some("name")` for a named shadow), `shadow_report(None, br#"{"led":true}"#,
+..)`, `shadow_update` with a whole request document, `shadow_delete`. The
+answer is read in place with `json_bool`, `json_f64`, `json_i64`, `json_str`
+or `json_get(doc, &["state", "delta", "led"])` - no heap, no recursion, a body
+cut short giving no half value, fuzzed against serde_json on the PC. The tab's
+"Device Shadow" switch adds iot:Get/Update/DeleteThingShadow on the thing and
+its named shadows to the policy (an MQTT policy's `$aws/things/...` topics do
+not grant them), and **Read the shadow from this PC** asks for it as the board
+does. The look-alike keeps shadows too: merges, versions, the delta, the
+`.../update/delta` message to MQTT subscribers, AWS's documented refusals.
+
 The ESP radio's **transmit power** is capped in the tab, 13 dBm unless chosen:
 esp-radio 0.18 leaves it at 20 dBm, and at that cheap ESP32-C3 boards never
 join - `AuthenticationExpired`, then `ConnectionFailed`, forever (measured: 0

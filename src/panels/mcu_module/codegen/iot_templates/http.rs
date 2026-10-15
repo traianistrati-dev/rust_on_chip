@@ -24,6 +24,14 @@
 //     let m = AwsMessage { retain: true, ..AwsMessage::new("my-thing/state", b"{\"on\":true}") };
 //     pins::configs::http::aws_publish_with(&m, &mut body).await.ok();
 //
+// The thing's Device Shadow - read, reported to; the answer is the shadow:
+//
+//     use pins::configs::http;
+//     if let Ok(r) = http::shadow_get(None, &mut body).await {
+//         let led = http::json_bool(&body[..r.len], &["state", "delta", "led"]);
+//     }
+//     http::shadow_report(None, br#"{"led":true}"#, &mut body).await.ok();
+//
 // One task makes the requests, one at a time: it holds the socket, the TLS
 // buffers and the handshake, so a caller's own task stays small. Each request
 // opens its own connection (`Connection: close`) and takes TIMEOUT_S at most.
@@ -103,6 +111,13 @@ pub async fn post(url: &str, content_type: &str, payload: &[u8], body: &mut [u8]
 /// Sends `req` and waits for the answer: its body lands in `body`, and what
 /// does not fit there or in BODY_MAX is dropped (`truncated`).
 pub async fn request(req: Request<'_>, body: &mut [u8]) -> Result<Response, HttpError> {
+    send(&req, &[req.payload], body).await
+}
+
+/// `request()` with the body in pieces, sent one after the other -
+/// `req.payload` aside - so a body put together is never put together on a
+/// stack.
+async fn send(req: &Request<'_>, payload: &[&[u8]], body: &mut [u8]) -> Result<Response, HttpError> {
     let url = Url::parse(req.url)?;
     if url.https && !HTTPS {
         return Err(HttpError::NoTls);
@@ -122,9 +137,15 @@ pub async fn request(req: Request<'_>, body: &mut [u8]) -> Result<Response, Http
         x.head
             .resize_default(REQUEST_HEAD_MAX)
             .map_err(|_| HttpError::TooLarge)?;
-        let n = build(&mut x.head, req.method, &url, req.auth, req.content_type, req.headers, req.payload.len())?;
+        let len = payload.iter().map(|p| p.len()).sum();
+        let n = build(&mut x.head, req.method, &url, req.auth, req.content_type, req.headers, len)?;
         x.head.truncate(n);
-        x.payload = heapless::Vec::from_slice(req.payload).map_err(|_| HttpError::TooLarge)?;
+        x.payload.clear();
+        for piece in payload {
+            x.payload
+                .extend_from_slice(piece)
+                .map_err(|_| HttpError::TooLarge)?;
+        }
         x.id
     };
     START.signal(id);
@@ -193,6 +214,81 @@ pub async fn aws_publish_with(m: &AwsMessage<'_>, body: &mut [u8]) -> Result<Res
         ..Request::get(url)
     };
     request(req, body).await
+}
+
+/// The board's Device Shadow in AWS IoT: the thing the tab names
+/// (AWS_THING), over HTTPS with the board's certificate - AWS's REST API,
+/// whose answer is the shadow itself, so nothing needs subscribing.
+/// `shadow`: `None` = the thing's classic shadow, `Some("config")` a named
+/// one.
+///
+/// - `Ok(r)`, `r.status == 200`: `body[..r.len]` holds the document -
+///   `state.desired`, `state.reported`, `state.delta` (what desired asks
+///   and reported does not show yet), `metadata`, `version`. Read it with
+///   `json_bool`, `json_f64`, `json_i64`, `json_str`, `json_get`:
+///
+///       let doc = &body[..r.len];
+///       if let Some(on) = http::json_bool(doc, &["state", "delta", "led"]) { /* ... */ }
+///
+///   The metadata - a timestamp for every key - makes it about three times
+///   the state: an answer over BODY_MAX comes `truncated`, and what was cut
+///   reads `None`.
+/// - 404: no such shadow yet (or no such thing: AWS answers alike).
+/// - 401 or 403: the policy allows no iot:GetThingShadow on this thing.
+/// - `Err(Io)` or `Err(Closed)`: the certificate, as for `aws_publish()`.
+///   `Err(Url)`: no AWS endpoint or no thing in the tab, or a shadow name
+///   that is not 1 to 64 letters, digits, `:`, `_`, `-`, `$`.
+pub async fn shadow_get(shadow: Option<&str>, body: &mut [u8]) -> Result<Response, HttpError> {
+    shadow_request(Method::Get, shadow, &[], body).await
+}
+
+/// Updates the shadow with `document` - AWS's request document, `state`
+/// holding `desired` and/or `reported`, nothing else:
+///
+///     http::shadow_update(None, br#"{"state":{"reported":{"led":true}}}"#, &mut body).await
+///
+/// Only the keys it names change; a key set to `null` goes. `"version": N`
+/// beside `state` updates only that version (409 otherwise);
+/// `"clientToken"` (64 bytes at most) comes back in the answer. 200: the
+/// answer holds what was taken, and `version`, the new one. 400: AWS says
+/// why in `body` - `{}` alone, or a key beside desired and reported inside
+/// `state`, are refused. 413: the shadow would pass 8 KB. A change to
+/// `desired` that `reported` does not show reaches MQTT subscribers on
+/// `$aws/things/<thing>/shadow/update/delta` - a named shadow's on
+/// `$aws/things/<thing>/shadow/name/<shadow>/update/delta`. Needs
+/// iot:UpdateThingShadow.
+pub async fn shadow_update(shadow: Option<&str>, document: &[u8], body: &mut [u8]) -> Result<Response, HttpError> {
+    shadow_request(Method::Post, shadow, &[document], body).await
+}
+
+/// `shadow_update()` with `{"state":{"reported":<reported>}}` - the board
+/// saying what it is; `reported` is a JSON object:
+///
+///     http::shadow_report(None, br#"{"t":21.5,"led":true}"#, &mut body).await
+pub async fn shadow_report(shadow: Option<&str>, reported: &[u8], body: &mut [u8]) -> Result<Response, HttpError> {
+    let pieces: [&[u8]; 3] = [br#"{"state":{"reported":"#, reported, b"}}"];
+    shadow_request(Method::Post, shadow, &pieces, body).await
+}
+
+/// Deletes the shadow. 200 alone says it went (AWS documents two different
+/// answers for it); 404: there was none. Its version goes on from where it
+/// was if it comes back within 48 hours. Needs iot:DeleteThingShadow.
+pub async fn shadow_delete(shadow: Option<&str>, body: &mut [u8]) -> Result<Response, HttpError> {
+    shadow_request(Method::Delete, shadow, &[], body).await
+}
+
+/// One call to the shadow's REST API: its URL built on the caller's task,
+/// a kilobyte while the request runs. Another thing's shadow: build its URL
+/// with `aws_shadow_url()` and send it with `request()`.
+async fn shadow_request(method: Method, shadow: Option<&str>, payload: &[&[u8]], body: &mut [u8]) -> Result<Response, HttpError> {
+    if AWS_PORT == 0 {
+        return Err(HttpError::Url);
+    }
+    let mut buf = [0u8; REQUEST_HEAD_MAX];
+    let n = aws_shadow_url(&mut buf, CERT_HOST, AWS_PORT, AWS_THING, shadow)?;
+    // Every byte aws_shadow_url wrote is ASCII.
+    let url = core::str::from_utf8(&buf[..n]).map_err(|_| HttpError::Url)?;
+    send(&Request { method, ..Request::get(url) }, payload, body).await
 }
 
 /// Starts the task that makes the requests.

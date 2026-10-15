@@ -254,9 +254,18 @@ impl AppIde {
                         .iter()
                         .find(|(p, _)| *p == format!("src/pins/configs/{}", iot_gen::HTTP))
                         .is_some_and(|(_, c)| !c.contains("pub async fn aws_publish_with(")),
+                    no_shadow: self
+                        .project_tree
+                        .user_src_files
+                        .iter()
+                        .find(|(p, _)| *p == format!("src/pins/configs/{}", iot_gen::HTTP))
+                        .is_some_and(|(_, c)| !c.contains("pub async fn shadow_report(")),
                     project: project_dir.clone(),
                 }
             };
+            // What the diagrams draw: the generator's decision, as it stands
+            // before the cards edit anything this frame.
+            let how = super::iot_diagrams::Facts::of(mcu);
             let files = &mut self.project_tree.user_src_files;
             let mut changed = false;
             let mut tls_actions: Vec<TlsAction> = Vec::new();
@@ -287,6 +296,8 @@ impl AppIde {
                     "What this chip's radio can carry, in layers: a card is live once the one ",
                     "below it is. A link the IDE does not generate yet says why."
                 )));
+                ui.add_space(4.0);
+                super::iot_diagrams::overview(ui, &how);
                 ui.add_space(8.0);
 
                 if (platform.is_some() || ble.platform.is_some() || ble.thread) && !is_async {
@@ -303,7 +314,17 @@ impl AppIde {
                     ui.add_space(8.0);
                 }
 
-                link_card(ui, &mut mcu.iot, &links, &family, cyw43, platform, &ble, is_async);
+                link_card(
+                    ui,
+                    &mut mcu.iot,
+                    &links,
+                    &family,
+                    cyw43,
+                    platform,
+                    &ble,
+                    is_async,
+                    &how,
+                );
                 if stale_wifi {
                     ui.add_space(4.0);
                     ui.label(warn(concat!(
@@ -363,7 +384,15 @@ impl AppIde {
                     ui.add_space(12.0);
 
                     ui.add_enabled_ui(link_up, |ui| {
-                        application_card(ui, &mut mcu.iot, &chip_id, &tls, &http, &mut tls_actions);
+                        application_card(
+                            ui,
+                            &mut mcu.iot,
+                            &chip_id,
+                            &tls,
+                            &http,
+                            &mut tls_actions,
+                            &how,
+                        );
                     });
                 }
             });
@@ -584,6 +613,7 @@ fn link_card(
     platform: Option<Platform>,
     ble: &BleFacts,
     is_async: bool,
+    how: &super::iot_diagrams::Facts,
 ) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(egui::RichText::new(format!("{}  LINK", ph::SHARE_NETWORK)).strong());
@@ -679,6 +709,7 @@ fn link_card(
             if let Some(n) = cfg.esp_now.as_mut() {
                 esp_now_body(ui, n, station);
             }
+            super::iot_diagrams::how_espnow(ui, how);
         }
         let ble_here = ble.platform.is_some() && cfg.ble.is_some();
         let wifi_here = (cfg.wifi && platform.is_some()) || esp_now_here;
@@ -686,11 +717,13 @@ fn link_card(
             if let Some(b) = cfg.ble.as_mut() {
                 ble_body(ui, b, ble, wifi_here);
             }
+            super::iot_diagrams::how_ble(ui, how);
         }
         let wifi_taken = platform == Some(Platform::Esp) && (cfg.wifi || cfg.esp_now.is_some());
         let thread_here = ble.thread && cfg.thread.is_some() && cfg.ble.is_none() && !wifi_taken;
         if thread_here && let Some(th) = cfg.thread.as_mut() {
             thread_body(ui, th, ble);
+            super::iot_diagrams::how_thread(ui, how);
         }
         if wifi_here || ble_here || thread_here {
             ui.add_space(6.0);
@@ -1287,6 +1320,9 @@ struct HttpFacts {
     /// ... from before AwsMessage and aws_publish_with(): aws_publish() is
     /// there, the retained line is not.
     no_aws_message: bool,
+    /// ... from before the Device Shadow: no shadow_get() and the rest, no
+    /// json_bool().
+    no_shadow: bool,
     project: Option<std::path::PathBuf>,
 }
 
@@ -1301,6 +1337,7 @@ fn application_card(
     tls: &TlsFacts,
     http: &HttpFacts,
     actions: &mut Vec<TlsAction>,
+    how: &super::iot_diagrams::Facts,
 ) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(egui::RichText::new(format!("{}  APPLICATION", ph::CLOUD)).strong());
@@ -1323,6 +1360,7 @@ fn application_card(
         });
         if let Some(m) = cfg.mqtt.as_mut() {
             mqtt_body(ui, m, tls, actions);
+            super::iot_diagrams::how_mqtt(ui, how);
         }
         ui.add_space(6.0);
         let mut sntp_on = cfg.sntp.is_some();
@@ -1351,14 +1389,17 @@ fn application_card(
             && cfg.mqtt.as_ref().is_some_and(|m| m.tls && m.client_cert);
         // MQTT on AWS with the certificate: the thing, its certificate and
         // its policy (iot:Publish under `<client id>/`) are already set up.
+        // Trimmed, as the firmware's AWS_THING is (`iot::http_aws_thing`): the
+        // policy lines the HTTP card hands out name what the board asks for.
         let mqtt_aws = cfg
             .mqtt
             .as_ref()
             .filter(|m| mqtt_identity && iot::aws_iot(m))
-            .map(|m| m.client_id.clone());
+            .map(|m| m.client_id.trim().to_owned());
         let thing = mqtt_aws.clone().unwrap_or_else(|| format!("rustonchip-{chip_id}"));
         if let Some(h) = cfg.http.as_mut() {
             http_body(ui, h, http, tls, mqtt_identity, mqtt_aws.as_deref(), &thing, actions);
+            super::iot_diagrams::how_http(ui, how);
         }
     });
 }
@@ -2242,6 +2283,10 @@ fn http_body(
 
 const AWS_PUBLISH_USAGE: &str = "pins::configs::http::aws_publish(\"<thing>/data\", b\"{\\\"t\\\":21.5}\", &mut body).await";
 const AWS_RETAIN_USAGE: &str = "let m = pins::configs::http::AwsMessage { retain: true, ..pins::configs::http::AwsMessage::new(\"<thing>/state\", b\"{\\\"on\\\":true}\") }; pins::configs::http::aws_publish_with(&m, &mut body).await";
+const SHADOW_GET_USAGE: &str = "if let Ok(r) = pins::configs::http::shadow_get(None, &mut body).await { let led = pins::configs::http::json_bool(&body[..r.len], &[\"state\", \"delta\", \"led\"]); }";
+const SHADOW_REPORT_USAGE: &str = "pins::configs::http::shadow_report(None, br#\"{\"led\":true}\"#, &mut body).await";
+/// Below this "Answer up to", the tab says a shadow's answer may not fit.
+const SHADOW_BODY_HINT: u32 = 4096;
 
 /// The board's certificate for one host - AWS IoT's HTTPS publish above all:
 /// the host, the identity, and for AWS the steps and a publish from this PC.
@@ -2372,6 +2417,34 @@ fn aws_https_section(
             "A retained message stays for whoever subscribes later - an empty one deletes the topic's; at most one a second per topic, none on a `$` topic. AwsMessage also carries MQTT 5's content type, expiry, response topic, correlation data and user properties.",
         ));
     }
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, 18.0], egui::Label::new("Device Shadow"));
+        ui.checkbox(&mut h.aws_shadow, "the firmware reads and updates the thing's shadow")
+            .on_hover_text(if mqtt_aws.is_some() {
+                "shadow_get(), shadow_report(), shadow_update(), shadow_delete(): the MQTT card's policy.json needs the shadow's actions - see below"
+            } else {
+                "shadow_get(), shadow_report(), shadow_update(), shadow_delete(): the policy.json below gets iot:GetThingShadow, iot:UpdateThingShadow, iot:DeleteThingShadow"
+            });
+    });
+    if h.aws_shadow && f.no_shadow && !f.no_aws_publish {
+        ui.label(warn(
+            "src/pins/configs/http.rs is from before the Device Shadow, and you edited it, so the IDE left it: aws_publish() works, the shadow lines below would not build. Move your changes into the current template (delete the file to get it).",
+        ));
+    }
+    if h.aws_shadow {
+        lines.push(SHADOW_GET_USAGE.to_owned());
+        lines.push(SHADOW_REPORT_USAGE.to_owned());
+        ui.label(dim(format!(
+            "The shadow of `{named}` (AWS_THING) over AWS's REST API: the answer is the document itself - desired, reported, the delta between them, a version - read with json_bool(), json_f64(), json_i64(), json_str(); shadow_report() says what the board is, and the delta reaches MQTT subscribers. None = the classic shadow, Some(\"name\") a named one."
+        )));
+        // The metadata - a timestamp per key - about triples the state.
+        if h.body_max < SHADOW_BODY_HINT {
+            ui.label(dim(format!(
+                "Answer up to is {} B: a shadow's answer carries a timestamp for every key, about three times its state - a longer one comes truncated, and what was cut reads None.",
+                h.body_max
+            )));
+        }
+    }
     for usage in lines {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&usage).monospace().size(11.0));
@@ -2396,6 +2469,12 @@ fn aws_https_section(
             ui.label(warn(format!(
                 "Retained messages need iot:RetainPublish, which the MQTT card's policy.json does not grant: add {{\"Effect\": \"Allow\", \"Action\": \"iot:RetainPublish\", \"Resource\": \"arn:{}:iot:{}:<account>:topic/{id}/*\"}} to its Statement, then create-policy-version.",
                 e.partition, e.region
+            )));
+        }
+        if h.aws_shadow {
+            let thing = format!("arn:{}:iot:{}:<account>:thing/{id}", e.partition, e.region);
+            ui.label(warn(format!(
+                "The Device Shadow needs its own actions, which the MQTT card's policy.json does not grant (its iot:Publish on $aws/things/... does not): add {{\"Effect\": \"Allow\", \"Action\": [\"iot:GetThingShadow\", \"iot:UpdateThingShadow\", \"iot:DeleteThingShadow\"], \"Resource\": [\"{thing}\", \"{thing}/*\"]}} to its Statement, then create-policy-version."
             )));
         }
     } else if aws_iot::thing_problem(&thing).is_none() {
@@ -2434,11 +2513,13 @@ fn aws_https_section(
                         arn.region, e.region
                     )));
                 }
-                let policy = aws_iot::policy_for(&thing, &[], &arn, h.aws_retain);
+                let extras = aws_iot::Extras { retain: h.aws_retain, shadow: h.aws_shadow };
+                let policy = aws_iot::policy_for(&thing, &[], &arn, extras);
                 policy_buttons(ui, &policy, dir.as_deref());
                 ui.label(dim(format!(
-                    "policy.json: publish{} under `{thing}/` (its iot:Connect line is harmless: whether AWS checks it for HTTPS is undocumented). Publish elsewhere, and add that topic to it.",
-                    if h.aws_retain { " and keep retained messages" } else { "" }
+                    "policy.json: publish{} under `{thing}/`{} (its iot:Connect line is harmless: whether AWS checks it for HTTPS is undocumented). Publish elsewhere, and add that topic to it.",
+                    if h.aws_retain { " and keep retained messages" } else { "" },
+                    if h.aws_shadow { ", read, update and delete the thing's shadows" } else { "" }
                 )));
                 for step in aws_iot::attach_steps_for(&thing, &arn) {
                     aws_step(ui, &mut n, &step);
@@ -2447,12 +2528,15 @@ fn aws_https_section(
         }
     }
     aws_publish_from_pc(ui, h, f, tls, &thing);
+    if h.aws_shadow {
+        aws_shadow_from_pc(ui, h, f, tls, &thing);
+    }
 }
 
 /// "Publish from this PC": one `aws_publish()` as the board makes it - its
 /// handshake, its certificate, its URL to the byte - and AWS's answer.
 fn aws_publish_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &TlsFacts, thing: &str) {
-    use crate::panels::mcu_module::tls_check::{self, HttpPost, HttpRequest, Shared, State};
+    use crate::panels::mcu_module::tls_check::{HttpPost, HttpRequest};
     let topic_id = egui::Id::new(("iot_aws_publish_topic", f.project.clone()));
     let payload_id = egui::Id::new(("iot_aws_publish_payload", f.project.clone()));
     let id = egui::Id::new(("iot_aws_publish_check", f.project.clone()));
@@ -2518,6 +2602,90 @@ fn aws_publish_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &T
         aws: true,
         headers: Vec::new(),
     };
+    let ran = run_from_pc(
+        ui,
+        id,
+        &request,
+        refused.as_deref(),
+        &format!("{} Publish from this PC", ph::PLUGS_CONNECTED),
+        "aws_publish() as the board makes it - its handshake, certificate and URL - from this PC",
+        "For an earlier topic, payload or setting.",
+    );
+    if ran == Some(true) {
+        ui.label(dim("In the AWS console's MQTT test client, a subscription to the topic shows it."));
+    }
+}
+
+/// "Read the shadow from this PC": one `shadow_get()` as the board makes it,
+/// with its handshake, its certificate and its URL to the byte, and the
+/// shadow - or why AWS would not give it. A read only: nothing changes.
+fn aws_shadow_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &TlsFacts, thing: &str) {
+    use crate::panels::mcu_module::tls_check::HttpRequest;
+    let name_id = egui::Id::new(("iot_aws_shadow_name", f.project.clone()));
+    let id = egui::Id::new(("iot_aws_shadow_check", f.project.clone()));
+    let mut name: String = ui.data_mut(|d| d.get_temp(name_id)).unwrap_or_default();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_sized([90.0, 18.0], egui::Label::new("Shadow"));
+        ui.add(
+            egui::TextEdit::singleline(&mut name)
+                .hint_text("empty: the classic shadow")
+                .desired_width(160.0),
+        );
+    });
+    ui.data_mut(|d| d.insert_temp(name_id, name.clone()));
+    let port = if h.aws_port == 443 { 443 } else { 8443 };
+    let shadow = Some(name.trim()).filter(|n| !n.is_empty());
+    let url = aws_iot::shadow_url(&iot::http_cert_host(h), port, thing, shadow);
+    let refused = match &url {
+        Err(why) => Some((*why).to_owned()),
+        Ok(_) if f.ca_der.is_none() => Some("http_ca.rs holds no certificate the checker can read".to_owned()),
+        Ok(_) if tls.client_key_pem.trim().is_empty() || tls.client_cert_pem.trim().is_empty() => Some(
+            "secrets.rs holds no key and certificate yet - AWS IoT would reset the connection".to_owned(),
+        ),
+        Ok(_) => None,
+    };
+    let request = HttpRequest {
+        url: url.clone().unwrap_or_default(),
+        verify: true,
+        ca: f.ca_der.clone().unwrap_or_default(),
+        p384: h.p384 || f.p384_built,
+        head_max: iot::HTTP_HEAD_MAX,
+        body_max: h.body_max.clamp(*iot::HTTP_BODY_RANGE.start(), *iot::HTTP_BODY_RANGE.end()) as usize,
+        user_agent: iot::http_user_agent(&h.user_agent),
+        request_head_max: iot::HTTP_REQUEST_HEAD_MAX,
+        post: None,
+        client_cert: tls.client_cert_pem.clone(),
+        client_key: tls.client_key_pem.clone(),
+        alpn: (port == 443).then(|| "x-amzn-http-ca".to_owned()),
+        connect_to: None,
+        aws: true,
+        headers: Vec::new(),
+    };
+    run_from_pc(
+        ui,
+        id,
+        &request,
+        refused.as_deref(),
+        &format!("{} Read the shadow from this PC", ph::PLUGS_CONNECTED),
+        "shadow_get() as the board makes it - its handshake, certificate and URL - from this PC; it changes nothing",
+        "For an earlier shadow or setting.",
+    );
+}
+
+/// The button that runs `request` from this PC - refused, it is greyed and
+/// says why - and what came back: the steps, then the summary. `Some(ok)`
+/// once it ran.
+fn run_from_pc(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    request: &crate::panels::mcu_module::tls_check::HttpRequest,
+    refused: Option<&str>,
+    button: &str,
+    hover: &str,
+    stale: &str,
+) -> Option<bool> {
+    use crate::panels::mcu_module::tls_check::{self, Shared, State};
     let shared: Option<Shared> = ui.data_mut(|d| d.get_temp::<Shared>(id));
     let state = shared
         .as_ref()
@@ -2526,8 +2694,8 @@ fn aws_publish_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &T
     let busy = matches!(state, State::Building | State::Connecting);
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(!busy && refused.is_none(), egui::Button::new(format!("{} Publish from this PC", ph::PLUGS_CONNECTED)))
-            .on_hover_text("aws_publish() as the board makes it - its handshake, certificate and URL - from this PC")
+            .add_enabled(!busy && refused.is_none(), egui::Button::new(button))
+            .on_hover_text(hover)
             .clicked()
         {
             let started = tls_check::start_http(request.clone(), ui.ctx().clone());
@@ -2544,14 +2712,14 @@ fn aws_publish_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &T
             _ => {}
         }
     });
-    if let Some(why) = &refused {
-        ui.label(warn(why.as_str()));
+    if let Some(why) = refused {
+        ui.label(warn(why));
     }
     let State::Done { ok, summary, steps, tested, .. } = &state else {
-        return;
+        return None;
     };
     if request.tested().fingerprint != tested.fingerprint {
-        ui.label(dim("For an earlier topic, payload or setting."));
+        ui.label(dim(stale));
     }
     for step in steps {
         ui.label(dim(format!("{}  {step}", ph::CHECK)));
@@ -2562,10 +2730,10 @@ fn aws_publish_from_pc(ui: &mut egui::Ui, h: &HttpConfig, f: &HttpFacts, tls: &T
                 .size(11.0)
                 .color(egui::Color32::from_rgb(120, 200, 140)),
         );
-        ui.label(dim("In the AWS console's MQTT test client, a subscription to the topic shows it."));
     } else {
         ui.label(warn(summary.as_str()));
     }
+    Some(*ok)
 }
 
 /// HTTPS's checks and CAs, where the chip carries it.

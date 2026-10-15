@@ -173,12 +173,17 @@ pub struct HttpConfig {
     /// means the broker took the message.
     pub aws_qos: u8,
     /// AWS IoT's thing for the certificate: the policy, the CSR's name and
-    /// the steps name it (MQTT's client id when MQTT talks to AWS too). Not
-    /// in the firmware: HTTPS publish carries no client id.
+    /// the steps name it (MQTT's client id when MQTT talks to AWS too), and
+    /// the Device Shadow is its (AWS_THING, [`http_aws_thing`]). HTTPS
+    /// publish itself carries no client id.
     pub aws_thing: String,
     /// The firmware publishes retained messages (`AwsMessage::retain`):
-    /// policy.json gets iot:RetainPublish. Tab-only, as `aws_thing`.
+    /// policy.json gets iot:RetainPublish. Tab-only.
     pub aws_retain: bool,
+    /// The firmware reads and updates the thing's Device Shadow
+    /// (`shadow_get()`, ...): policy.json gets iot:Get/Update/
+    /// DeleteThingShadow on it. Tab-only, as `aws_retain`.
+    pub aws_shadow: bool,
 }
 
 impl Default for HttpConfig {
@@ -197,6 +202,7 @@ impl Default for HttpConfig {
             aws_qos: 1,
             aws_thing: String::new(),
             aws_retain: false,
+            aws_shadow: false,
         }
     }
 }
@@ -248,6 +254,26 @@ pub fn http_aws(h: &HttpConfig) -> Option<super::aws_iot::Endpoint> {
     h.client_cert
         .then(|| super::aws_iot::endpoint(&h.cert_host))
         .flatten()
+}
+
+/// The thing the board's HTTPS calls name - its Device Shadow's, AWS_THING:
+/// MQTT's client id while MQTT talks to AWS IoT with the board's certificate
+/// (one identity, one thing, as the tab shows it), the HTTP card's own
+/// otherwise. "" while that is no name AWS takes for a thing.
+pub fn http_aws_thing(cfg: &IotConfig, active: &Active) -> String {
+    let thing = match cfg.mqtt.as_ref().filter(|m| active.mqtt_client_cert && aws_iot(m)) {
+        Some(m) => m.client_id.trim().to_owned(),
+        None => cfg
+            .http
+            .as_ref()
+            .map(|h| h.aws_thing.trim().to_owned())
+            .unwrap_or_default(),
+    };
+    if super::aws_iot::thing_problem(&thing).is_some() {
+        String::new()
+    } else {
+        thing
+    }
 }
 
 /// The User-Agent as the request carries it: visible ASCII and spaces only (a

@@ -308,6 +308,45 @@ pub fn publish_url(host: &str, port: u16, topic: &str, qos: u8, retain: bool) ->
     Ok(url)
 }
 
+/// The URL of the thing's Device Shadow - `https://<host>[:<port>]/things/
+/// <thing>/shadow[?name=<shadow>]`, `:` and `$` percent-encoded. The
+/// firmware's `aws_shadow_url`, rule for rule (`http_core_tests` holds them
+/// to the same bytes).
+pub fn shadow_url(host: &str, port: u16, thing: &str, shadow: Option<&str>) -> Result<String, &'static str> {
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        || port == 0
+    {
+        return Err("no endpoint to ask");
+    }
+    if let Some(why) = thing_problem(thing) {
+        return Err(why);
+    }
+    if let Some(name) = shadow {
+        if name.is_empty() || name.len() > 64 {
+            return Err("a shadow's name is 1 to 64 bytes - none at all is the classic shadow");
+        }
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'$'))
+        {
+            return Err("a shadow's name holds only letters, digits, `:`, `_`, `-` (and `$` of AWS's `$package`)");
+        }
+    }
+    let encoded = |s: &str| s.replace(':', "%3A").replace('$', "%24");
+    let mut url = format!("https://{host}");
+    if port != 443 {
+        url.push_str(&format!(":{port}"));
+    }
+    url.push_str(&format!("/things/{}/shadow", encoded(thing)));
+    if let Some(name) = shadow {
+        url.push_str(&format!("?name={}", encoded(name)));
+    }
+    Ok(url)
+}
+
 /// The subscriptions the board makes that lie outside `<thing>/`: each
 /// needs its own lines in the policy.
 fn outside_filters(m: &MqttConfig) -> Vec<&str> {
@@ -322,14 +361,36 @@ fn outside_filters(m: &MqttConfig) -> Vec<&str> {
 /// under `<thing>/` (the panic report's topic and the test's are there),
 /// subscribe there and to each filter the board subscribes to.
 pub fn policy(m: &MqttConfig, arn: &CertArn) -> String {
-    policy_for(thing(m), &outside_filters(m), arn, false)
+    policy_for(thing(m), &outside_filters(m), arn, Extras::default())
+}
+
+/// What a policy grants beyond publishing and receiving under `<thing>/`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Extras {
+    /// iot:RetainPublish under `<thing>/`, which a retained message needs
+    /// beside iot:Publish.
+    pub retain: bool,
+    /// iot:GetThingShadow, iot:UpdateThingShadow and iot:DeleteThingShadow
+    /// on the thing's classic shadow and its named ones - the REST API's
+    /// own actions: iot:Publish on `$aws/things/...` does not grant them.
+    pub shadow: bool,
+}
+
+/// The policy statement `extras.shadow` adds - for the MQTT card's
+/// policy.json too, which the tab shows to be added by hand.
+pub fn shadow_statement(id: &str, arn: &CertArn) -> String {
+    let base = format!("arn:{}:iot:{}:{}:", arn.partition, arn.region, arn.account);
+    format!(
+        "{{\n      \"Effect\": \"Allow\",\n      \"Action\": [\n        \"iot:GetThingShadow\",\n        \"iot:UpdateThingShadow\",\n        \"iot:DeleteThingShadow\"\n      ],\n      \"Resource\": [\n        {},\n        {}\n      ]\n    }}",
+        json_string(&format!("{base}thing/{id}")),
+        json_string(&format!("{base}thing/{id}/*")),
+    )
 }
 
 /// ... for the thing `id`, subscribed to `outside` beyond `<id>/`: HTTPS
 /// publish alone subscribes to nothing - and whether AWS checks iot:Connect
-/// for it is undocumented, so the line stays. `retain`: iot:RetainPublish
-/// under `<id>/` too, which a retained message needs beside iot:Publish.
-pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn, retain: bool) -> String {
+/// for it is undocumented, so the line stays.
+pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn, extras: Extras) -> String {
     let base = format!("arn:{}:iot:{}:{}:", arn.partition, arn.region, arn.account);
     let mut subscribe = vec![format!("{base}topicfilter/{id}/*")];
     let mut receive = vec![format!("{base}topic/{id}/*")];
@@ -350,7 +411,7 @@ pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn, retain: bool) -> St
             .collect::<Vec<_>>()
             .join(",\n")
     };
-    let retained = if retain {
+    let mut extra = if extras.retain {
         format!(
             "\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:RetainPublish\",\n      \"Resource\": {}\n    }},",
             json_string(&format!("{base}topic/{id}/*"))
@@ -358,8 +419,11 @@ pub fn policy_for(id: &str, outside: &[&str], arn: &CertArn, retain: bool) -> St
     } else {
         String::new()
     };
+    if extras.shadow {
+        extra.push_str(&format!("\n    {},", shadow_statement(id, arn)));
+    }
     format!(
-        "{{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Connect\",\n      \"Resource\": {}\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Publish\",\n      \"Resource\": {}\n    }},{retained}\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Subscribe\",\n      \"Resource\": [\n{}\n      ]\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Receive\",\n      \"Resource\": [\n{}\n      ]\n    }}\n  ]\n}}\n",
+        "{{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Connect\",\n      \"Resource\": {}\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Publish\",\n      \"Resource\": {}\n    }},{extra}\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Subscribe\",\n      \"Resource\": [\n{}\n      ]\n    }},\n    {{\n      \"Effect\": \"Allow\",\n      \"Action\": \"iot:Receive\",\n      \"Resource\": [\n{}\n      ]\n    }}\n  ]\n}}\n",
         json_string(&format!("{base}client/{id}")),
         json_string(&format!("{base}topic/{id}/*")),
         list(&subscribe),
@@ -659,7 +723,7 @@ mod tests {
         assert!(all[2].command.contains("create-thing --thing-name sensor-7 --region eu-south-1"));
         assert!(all[4].command.contains("--policy-name sensor-7-policy"));
         assert!(all[6].command.contains("--thing-name sensor-7 --principal"));
-        let text = policy_for("sensor-7", &[], &arn, false);
+        let text = policy_for("sensor-7", &[], &arn, Extras::default());
         assert!(text.contains("\"arn:aws:iot:eu-central-1:123456789012:topic/sensor-7/*\""), "{text}");
         assert!(text.contains("client/sensor-7"));
         assert!(!policy_too_long(&text));
@@ -667,14 +731,39 @@ mod tests {
         // filters added.
         let m = aws("a1-ats.iot.eu-central-1.amazonaws.com");
         let outside = outside_filters(&m);
-        assert_eq!(policy(&m, &arn), policy_for("rustonchip-esp32c3", &outside, &arn, false));
+        assert_eq!(policy(&m, &arn), policy_for("rustonchip-esp32c3", &outside, &arn, Extras::default()));
         // Retained messages: iot:RetainPublish under the thing, beside Publish.
-        let kept = policy_for("sensor-7", &[], &arn, true);
+        let kept = policy_for("sensor-7", &[], &arn, Extras { retain: true, shadow: false });
         assert!(kept.contains("\"Action\": \"iot:RetainPublish\",\n      \"Resource\": \"arn:aws:iot:eu-central-1:123456789012:topic/sensor-7/*\""), "{kept}");
         let parsed: serde_json::Value = serde_json::from_str(&kept).expect("valid JSON");
         assert_eq!(parsed["Statement"].as_array().map(Vec::len), Some(5));
         let plain: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(plain["Statement"].as_array().map(Vec::len), Some(4));
+        // The Device Shadow: its three REST actions on the thing - the
+        // classic shadow - and on thing/<name>/* - the named ones, which
+        // thing/<name> alone does not cover.
+        let both = policy_for("sensor-7", &[], &arn, Extras { retain: true, shadow: true });
+        let parsed: serde_json::Value = serde_json::from_str(&both).expect("valid JSON");
+        let statements = parsed["Statement"].as_array().unwrap();
+        assert_eq!(statements.len(), 6);
+        let shadow = &statements[3];
+        assert_eq!(
+            shadow["Action"],
+            serde_json::json!(["iot:GetThingShadow", "iot:UpdateThingShadow", "iot:DeleteThingShadow"])
+        );
+        assert_eq!(
+            shadow["Resource"],
+            serde_json::json!([
+                "arn:aws:iot:eu-central-1:123456789012:thing/sensor-7",
+                "arn:aws:iot:eu-central-1:123456789012:thing/sensor-7/*"
+            ])
+        );
+        let alone: serde_json::Value =
+            serde_json::from_str(&shadow_statement("sensor-7", &arn)).expect("one statement, valid JSON");
+        assert_eq!(&alone, shadow);
+        // The longest thing AWS takes, everything on: still within AWS's 2048.
+        let longest = policy_for(&"t".repeat(128), &[], &arn, Extras { retain: true, shadow: true });
+        assert!(!policy_too_long(&longest), "{}", longest.len());
 
         assert!(thing_problem("sensor-7").is_none() && thing_problem("a:b_c-1").is_none());
         for bad in ["", "a b", "a/b", "caf\u{e9}"] {
@@ -704,5 +793,25 @@ mod tests {
             "https://a1-ats.iot.eu-south-1.amazonaws.com:8443/topics/sensor-7/state?qos=1&retain=true"
         );
         assert!(publish_url(host, 8443, "$aws/things/t/shadow/update", 1, true).is_err());
+    }
+
+    /// The shadow's URL "Read the shadow from this PC" sends: as the
+    /// board's, refusals said.
+    #[test]
+    fn shadow_url_writes_what_the_board_asks() {
+        let host = "a1-ats.iot.eu-south-1.amazonaws.com";
+        assert_eq!(
+            shadow_url(host, 8443, "sensor-7", None).unwrap(),
+            "https://a1-ats.iot.eu-south-1.amazonaws.com:8443/things/sensor-7/shadow"
+        );
+        assert_eq!(
+            shadow_url(host, 443, "a:b", Some("$package")).unwrap(),
+            "https://a1-ats.iot.eu-south-1.amazonaws.com/things/a%3Ab/shadow?name=%24package"
+        );
+        for (thing, name) in [("", None), ("a b", None), ("t", Some("")), ("t", Some("a/b"))] {
+            assert!(shadow_url(host, 8443, thing, name).is_err(), "{thing:?} {name:?}");
+        }
+        assert!(shadow_url(host, 8443, "t", Some(&"s".repeat(65))).is_err());
+        assert!(shadow_url("", 8443, "t", None).is_err());
     }
 }

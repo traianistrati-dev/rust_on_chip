@@ -1093,3 +1093,337 @@ fn aws_message_headers_always_decode_back() {
         }
     }
 }
+
+// ── The Device Shadow's URL ────────────────────────────────────────────────
+
+fn shadow(host: &str, port: u16, thing: &str, name: Option<&str>) -> Result<String, HttpError> {
+    let mut buf = [0u8; 2048];
+    let n = aws_shadow_url(&mut buf, host, port, thing, name)?;
+    Ok(String::from_utf8(buf[..n].to_vec()).unwrap())
+}
+
+/// AWS's REST path for a thing's shadow: the classic one without `name=`,
+/// a named one with it, `:` and `$` encoded as AWS's SDKs send them - and
+/// what AWS refuses never leaves the board.
+#[test]
+fn aws_shadow_url_names_the_thing_and_the_shadow() {
+    assert_eq!(
+        shadow(ENDPOINT, 8443, "sensor-7", None).unwrap(),
+        format!("https://{ENDPOINT}:8443/things/sensor-7/shadow")
+    );
+    assert_eq!(shadow("h", 443, "t", Some("config")).unwrap(), "https://h/things/t/shadow?name=config");
+    assert_eq!(
+        shadow("h", 443, "site:board_1", Some("$package")).unwrap(),
+        "https://h/things/site%3Aboard_1/shadow?name=%24package"
+    );
+    // AWS's limits, bytes: 128 for a thing, 64 for a shadow name.
+    assert!(shadow("h", 443, &"t".repeat(128), Some(&"s".repeat(64))).is_ok());
+    assert_eq!(shadow("h", 443, &"t".repeat(129), None), Err(HttpError::Url));
+    assert_eq!(shadow("h", 443, "t", Some(&"s".repeat(65))), Err(HttpError::Url));
+    for thing in ["", "a b", "a/b", "$aws", "a.b", "\u{e9}", "a?b", "a#b", "a%b"] {
+        assert_eq!(shadow("h", 443, thing, None), Err(HttpError::Url), "{thing:?}");
+    }
+    // An empty name is no classic shadow: `None` is.
+    for name in ["", "a b", "a/b", "a.b", "a&b=c", "\u{e9}"] {
+        assert_eq!(shadow("h", 443, "t", Some(name)), Err(HttpError::Url), "{name:?}");
+    }
+    for host in ["", "h:1", "h/x", "a b"] {
+        assert_eq!(shadow(host, 443, "t", None), Err(HttpError::Url), "{host:?}");
+    }
+    assert_eq!(shadow("h", 0, "t", None), Err(HttpError::Url));
+    let mut small = [0u8; 24];
+    assert_eq!(aws_shadow_url(&mut small, ENDPOINT, 8443, "t", None), Err(HttpError::TooLarge));
+    // The longest there is fits the buffer the board builds it in, and the
+    // request it goes out in: GET and DELETE without a length, POST with one.
+    let longest = shadow(&"h".repeat(64), 8443, &":".repeat(128), Some(&"$".repeat(64))).unwrap();
+    assert!(longest.len() <= REQUEST_HEAD_MAX, "{}", longest.len());
+    let url = Url::parse(&longest).unwrap();
+    assert_eq!(url.target(), format!("/things/{}/shadow?name={}", "%3A".repeat(128), "%24".repeat(64)));
+    let url = Url::parse("https://h:8443/things/t/shadow?name=config").unwrap();
+    for (method, length) in [(Method::Get, None), (Method::Delete, None), (Method::Post, Some(12))] {
+        let mut head = [0u8; REQUEST_HEAD_MAX];
+        let n = build(&mut head, method, &url, Auth::None, None, &[], length.unwrap_or(0)).unwrap();
+        let text = std::str::from_utf8(&head[..n]).unwrap();
+        assert!(text.starts_with(&format!("{} /things/t/shadow?name=config HTTP/1.1\r\nHost: h:8443\r\n", std::str::from_utf8(method.as_bytes()).unwrap())));
+        assert_eq!(text.contains("Content-Length: 12\r\n"), length.is_some(), "{text}");
+        assert!(!text.contains("Content-Type"), "AWS's SDKs send none: {text}");
+    }
+}
+
+/// "Read the shadow from this PC" builds its URL with
+/// `aws_iot::shadow_url`: it must refuse what the board refuses and write
+/// the same bytes.
+#[test]
+fn the_ide_and_the_board_build_the_same_shadow_url() {
+    use crate::panels::mcu_module::aws_iot::shadow_url;
+    let mut rnd = xorshift(0x5AD0_0B0A_4D51_7E00);
+    let alphabet = ["a", "Z", "9", "-", "_", ":", "$", " ", "/", ".", "%", "?", "&", "\u{e9}"];
+    for i in 0..FUZZ_RUNS {
+        let word = |rnd: &mut dyn FnMut() -> u64, max: u64| -> String {
+            (0..rnd() % max).map(|_| alphabet[(rnd() as usize) % alphabet.len()]).collect()
+        };
+        let thing = word(&mut rnd, 140);
+        let name = (rnd() % 2 == 0).then(|| word(&mut rnd, 70));
+        let port = [443, 8443, 0][(rnd() % 3) as usize];
+        let board = shadow(ENDPOINT, port, &thing, name.as_deref());
+        let ide = shadow_url(ENDPOINT, port, &thing, name.as_deref());
+        match (&board, &ide) {
+            (Ok(b), Ok(p)) => assert_eq!(b, p, "run {i}"),
+            (Err(HttpError::Url), Err(_)) => {}
+            _ => panic!("run {i}: {thing:?} {name:?} port {port}: board {board:?}, IDE {ide:?}"),
+        }
+    }
+}
+
+// ── JSON ──────────────────────────────────────────────────────────────────
+
+/// A GET's answer, as AWS's documentation shows one: the state with its
+/// delta, the metadata, the version.
+const SHADOW_DOC: &str = r#"{
+  "state": {
+    "desired": { "color": "RED", "led": true, "sequence": [ "RED", "GREEN", "BLUE" ] },
+    "reported": { "color": "GREEN", "led": false, "t": -21.5e0 },
+    "delta": { "color": "RED", "led": true }
+  },
+  "metadata": {
+    "desired": { "color": { "timestamp": 12345 }, "sequence": [ { "timestamp": 12345 } ] }
+  },
+  "version": 10,
+  "timestamp": 1591057529,
+  "clientToken": "tok-\u00e9\"\\\ud83d\ude00"
+}"#;
+
+#[test]
+fn json_reads_what_a_shadow_answers() {
+    let doc = SHADOW_DOC.as_bytes();
+    assert_eq!(json_bool(doc, &["state", "delta", "led"]), Some(true));
+    assert_eq!(json_bool(doc, &["state", "reported", "led"]), Some(false));
+    let mut out = [0u8; 64];
+    assert_eq!(json_str(doc, &["state", "desired", "color"], &mut out), Some("RED"));
+    assert_eq!(json_str(doc, &["state", "desired", "sequence", "2"], &mut out), Some("BLUE"));
+    assert_eq!(json_get(doc, &["state", "desired", "sequence", "1"]), Some(&b"\"GREEN\""[..]));
+    assert_eq!(json_get(doc, &["state", "delta"]), Some(&br#"{ "color": "RED", "led": true }"#[..]));
+    assert_eq!(json_i64(doc, &["version"]), Some(10));
+    assert_eq!(json_i64(doc, &["metadata", "desired", "sequence", "0", "timestamp"]), Some(12345));
+    assert_eq!(json_f64(doc, &["state", "reported", "t"]), Some(-21.5));
+    assert_eq!(json_f64(doc, &["version"]), Some(10.0));
+    assert_eq!(json_str(doc, &["clientToken"], &mut out), Some("tok-\u{e9}\"\\\u{1f600}"));
+    // Not there, past the end of an array, through a value that is not an
+    // object, the wrong kind: None.
+    assert_eq!(json_get(doc, &["state", "delta", "sequence"]), None);
+    assert_eq!(json_get(doc, &["state", "desired", "sequence", "3"]), None);
+    assert_eq!(json_get(doc, &["state", "desired", "sequence", "x"]), None);
+    assert_eq!(json_get(doc, &["version", "x"]), None);
+    assert_eq!(json_bool(doc, &["version"]), None);
+    assert_eq!(json_i64(doc, &["state", "reported", "t"]), None, "-21.5e0 is no whole number");
+    assert_eq!(json_str(doc, &["version"], &mut out), None);
+    // A string that does not fit `out`: None, never half of it.
+    assert_eq!(json_str(doc, &["clientToken"], &mut [0u8; 8]), None);
+    // The whole document, and a value alone.
+    assert_eq!(json_get(doc, &[]).map(<[u8]>::len), Some(doc.len()));
+    assert_eq!(json_get(b" 42 ", &[]), Some(&b"42"[..]));
+    assert_eq!(json_get(b"", &[]), None);
+    // An empty key is a key; a key's escapes are decoded before it is
+    // compared.
+    let keys = br#"{"":1,"a\"b":2,"\u00e9":3,"\ud83d\ude00":4,"a\/b":5}"#;
+    for (key, value) in [("", 1), ("a\"b", 2), ("\u{e9}", 3), ("\u{1f600}", 4), ("a/b", 5)] {
+        assert_eq!(json_i64(keys, &[key]), Some(value), "{key:?}");
+    }
+    assert_eq!(json_i64(br#"{"a":1,"a":2}"#, &["a"]), Some(1), "the first of a repeated key");
+}
+
+/// A body cut short loses what was cut: a value the cut runs through reads
+/// `None`, never as a shorter one - `21` of `21.5`, `tru` of `true`.
+#[test]
+fn a_cut_document_never_gives_half_a_value() {
+    let doc = SHADOW_DOC.as_bytes();
+    let paths: [&[&str]; 9] = [
+        &["state", "delta", "led"],
+        &["state", "desired", "color"],
+        &["state", "desired", "sequence", "2"],
+        &["state", "reported", "t"],
+        &["state", "reported"],
+        &["metadata"],
+        &["version"],
+        &["timestamp"],
+        &["clientToken"],
+    ];
+    for path in paths {
+        let whole = json_get(doc, path).unwrap_or_else(|| panic!("{path:?}"));
+        for cut in 0..doc.len() {
+            if let Some(v) = json_get(&doc[..cut], path) {
+                assert_eq!(v, whole, "{path:?} cut at {cut}");
+            }
+        }
+    }
+    assert_eq!(json_f64(br#"{"t":21.5"#, &["t"]), None);
+    assert_eq!(json_f64(br#"{"t":21.5 "#, &["t"]), Some(21.5));
+    assert_eq!(json_bool(br#"{"on":tru"#, &["on"]), None);
+    assert_eq!(json_bool(br#"[true"#, &["0"]), None);
+    assert_eq!(json_get(br#"{"s":"ab"#, &["s"]), None);
+    assert_eq!(json_get(br#"{"s":"ab\"#, &["s"]), None);
+}
+
+/// Numbers as RFC 8259 writes them, and only those.
+#[test]
+fn json_numbers_are_rfc_8259_s() {
+    let num = |text: &str| json_f64(format!("[{text}]").as_bytes(), &["0"]);
+    let int = |text: &str| json_i64(format!("[{text}]").as_bytes(), &["0"]);
+    for good in ["0", "-0", "1", "-12", "0.5", "1e3", "1E+3", "2.5e-3", "-0.0"] {
+        assert_eq!(num(good), Some(good.parse().unwrap()), "{good}");
+    }
+    for bad in ["+1", ".5", "01", "1.", "1e", "1e+", "-", "--1", "inf", "NaN", "Infinity", "0x10", "1_000", "1e999", "true"] {
+        assert_eq!(num(bad), None, "{bad}");
+    }
+    assert_eq!(int("9223372036854775807"), Some(i64::MAX));
+    assert_eq!(int("-9223372036854775808"), Some(i64::MIN));
+    for bad in ["9223372036854775808", "1.0", "1e3", "+1", "01", "\"1\""] {
+        assert_eq!(int(bad), None, "{bad}");
+    }
+}
+
+/// Escapes as RFC 8259 writes them, characters past U+FFFF as surrogate
+/// pairs - and a half pair, a bad escape, raw control bytes refused.
+#[test]
+fn json_strings_decode_their_escapes() {
+    let mut out = [0u8; 32];
+    let mut s = |text: &str| json_str(format!("[{text}]").as_bytes(), &["0"], &mut out).map(str::to_owned);
+    assert_eq!(s(r#""a\"b\\c\/d\b\f\n\r\t""#).as_deref(), Some("a\"b\\c/d\u{8}\u{c}\n\r\t"));
+    assert_eq!(s(r#""\u0041\u00e9\u20AC\ud83d\ude00""#).as_deref(), Some("A\u{e9}\u{20ac}\u{1f600}"));
+    assert_eq!(s("\"\u{e9}\"").as_deref(), Some("\u{e9}"), "UTF-8 as it is");
+    for bad in [r#""\ud83d""#, r#""\ud83dx""#, r#""\ud83d\u0041""#, r#""\ude00""#, r#""\x""#, r#""\u12""#, r#""\u12g4""#, "\"a\u{1}b\"", "\"a\nb\""] {
+        assert_eq!(s(bad), None, "{bad:?}");
+    }
+    // Bytes that are no UTF-8 inside a string: no &str of them.
+    assert_eq!(json_str(b"[\"\xff\"]", &["0"], &mut [0u8; 8]), None);
+}
+
+/// A random JSON value: objects, arrays, strings with what needs escaping,
+/// numbers of every kind.
+fn random_value(rnd: &mut dyn FnMut() -> u64, depth: u32) -> serde_json::Value {
+    use serde_json::Value;
+    const KEYS: [&str; 10] = ["a", "led", "state", "", "a\"b", "back\\slash", "\u{e9}", "\u{1f600}", "tab\t", "\u{1}"];
+    match rnd() % if depth == 0 { 5 } else { 7 } {
+        0 => Value::Null,
+        1 => Value::Bool(rnd() % 2 == 0),
+        2 => Value::from(rnd() as i64 >> (rnd() % 64)),
+        3 => {
+            let f = f64::from_bits(rnd());
+            Value::from(if f.is_finite() { f } else { (rnd() % 1000) as f64 / 7.0 })
+        }
+        4 => Value::from(KEYS[(rnd() as usize) % KEYS.len()].repeat((rnd() % 3) as usize)),
+        5 => Value::Array((0..rnd() % 4).map(|_| random_value(rnd, depth - 1)).collect()),
+        _ => Value::Object(
+            (0..rnd() % 5)
+                .map(|_| (KEYS[(rnd() as usize) % KEYS.len()].to_owned(), random_value(rnd, depth - 1)))
+                .collect(),
+        ),
+    }
+}
+
+/// Every value inside `v`, with its path.
+fn every_path(v: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<(Vec<String>, serde_json::Value)>) {
+    out.push((path.clone(), v.clone()));
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map {
+                path.push(k.clone());
+                every_path(child, path, out);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                path.push(i.to_string());
+                every_path(child, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whatever the document, compact or spread out, every value is found at
+/// its path and reads back as serde_json reads it; a path that is not there
+/// is None.
+#[test]
+fn json_finds_every_value_as_serde_json_does() {
+    let mut rnd = xorshift(0x0C0F_FEE0_15A1_7ED5);
+    let mut checked = 0;
+    for i in 0..FUZZ_RUNS / 4 {
+        let value = random_value(&mut rnd, 5);
+        let text = if rnd() % 2 == 0 { serde_json::to_string(&value) } else { serde_json::to_string_pretty(&value) }.unwrap();
+        let doc = text.as_bytes();
+        let mut all = Vec::new();
+        every_path(&value, &mut Vec::new(), &mut all);
+        for (path, expected) in &all {
+            let path: Vec<&str> = path.iter().map(String::as_str).collect();
+            let got = json_get(doc, &path).unwrap_or_else(|| panic!("run {i}: {path:?} in {text}"));
+            // Both through serde_json's own float parser, which is not
+            // always the correctly rounded one.
+            let parsed: serde_json::Value = serde_json::from_slice(got).unwrap();
+            let same: serde_json::Value = serde_json::from_str(&serde_json::to_string(expected).unwrap()).unwrap();
+            assert_eq!(parsed, same, "run {i}: {path:?} in {text}");
+            let mut out = [0u8; 256];
+            assert_eq!(json_str(doc, &path, &mut out), expected.as_str(), "run {i}: {path:?}");
+            assert_eq!(json_bool(doc, &path), expected.as_bool(), "run {i}: {path:?}");
+            if expected.is_i64() {
+                assert_eq!(json_i64(doc, &path), expected.as_i64(), "run {i}: {path:?}");
+            }
+            if expected.is_number() {
+                assert_eq!(json_f64(doc, &path), expected.as_f64(), "run {i}: {path:?} in {text}");
+            }
+            checked += 1;
+            // One step more that is not there.
+            let mut past = path.clone();
+            past.push("missing");
+            assert_eq!(json_get(doc, &past), None, "run {i}: {past:?}");
+        }
+    }
+    assert!(checked > FUZZ_RUNS / 3, "only {checked} values checked");
+}
+
+/// Bytes from anywhere - a document broken, cut, scrambled - give `None`
+/// or a value, never a panic or a loop; and what a cut document gives is
+/// what the whole one gives.
+#[test]
+fn mutated_documents_neither_panic_nor_spin() {
+    let mut rnd = xorshift(0x7E57_ED0C_5BAD_F00D);
+    let pieces: [&[u8]; 14] = [b"{", b"}", b"[", b"]", b"\"", b":", b",", b"\\", b"\\u", b"\\ud83d", b" ", b"1", b"e", b"\xff"];
+    for i in 0..FUZZ_RUNS / 2 {
+        let value = random_value(&mut rnd, 4);
+        let whole = serde_json::to_string(&value).unwrap().into_bytes();
+        let mut all = Vec::new();
+        every_path(&value, &mut Vec::new(), &mut all);
+        let paths: Vec<Vec<String>> = all.into_iter().map(|(p, _)| p).filter(|p| !p.is_empty()).collect();
+        let mut doc = whole.clone();
+        for _ in 0..1 + rnd() % 3 {
+            let at = (rnd() as usize) % (doc.len() + 1);
+            match rnd() % 4 {
+                0 if at < doc.len() => {
+                    doc.remove(at);
+                }
+                1 => {
+                    let p = pieces[(rnd() as usize) % pieces.len()];
+                    doc.splice(at..at, p.iter().copied());
+                }
+                2 if at < doc.len() => doc[at] = rnd() as u8,
+                _ => doc.truncate(at),
+            }
+        }
+        let mut out = [0u8; 64];
+        for path in paths.iter().chain([&vec!["a".to_owned()], &vec!["0".to_owned(), "a".to_owned()]]) {
+            let path: Vec<&str> = path.iter().map(String::as_str).collect();
+            json_get(&doc, &path);
+            json_str(&doc, &path, &mut out);
+            json_f64(&doc, &path);
+            json_i64(&doc, &path);
+            json_bool(&doc, &path);
+            // A cut: the whole document's value, or none.
+            let cut = (rnd() as usize) % (whole.len() + 1);
+            if let Some(v) = json_get(&whole[..cut], &path) {
+                assert_eq!(Some(v), json_get(&whole, &path), "run {i}: {path:?} cut at {cut}");
+            }
+        }
+    }
+}

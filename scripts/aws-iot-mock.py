@@ -32,6 +32,18 @@ built from: 200 {"message":"OK","traceId":...}, 403 {"message":"Forbidden",
 ...} outside the policy (the documented ForbiddenException), 400 for a QoS
 other than 0 or 1, 413 over 128 KB. AWS's own status for those may differ.
 
+The Device Shadow's REST API (`shadow_get()` and the rest), on the same
+side: `GET|POST|DELETE /things/<thing>/shadow[?name=<shadow>]`, allowed by
+iot:Get/Update/DeleteThingShadow on thing/<thing> and thing/<thing>/* only
+with --allow-shadow. It keeps the documents, merges updates (a key set to
+null goes), counts versions, works out the delta, answers with AWS's
+documented error texts ("Missing required node: state", "Version conflict",
+...) in `{"code":..,"message":..}` - a shape AWS shows for its MQTT errors,
+assumed for REST - and publishes .../update/accepted, /documents and /delta
+to MQTT subscribers that may receive them (--allow '$aws/things/<thing>/shadow/#').
+Its limits: 8 KB of state (compact JSON; whitespace is not counted), 6
+levels. Again documentation, not traffic.
+
 Needs Python 3.8+ (standard library only) and openssl: $OPENSSL, then PATH,
 then Git for Windows' copy. The PKI and scratch files go to --work (default:
 a folder in the temp directory); they are made once and reused.
@@ -693,6 +705,8 @@ class Options:
         self.tickets = 0                   # AWS sends no NewSessionTicket
         self.nocert = "rst"                # no client certificate: a reset (AWS), or "alert"
         self.allow_retain = False          # iot:RetainPublish on topic/<thing>/* (--allow-retain)
+        self.allow_shadow = False          # iot:*ThingShadow on thing/<thing>[/*] (--allow-shadow)
+        self.shadows = {}                  # (thing, name or None) -> {"desired":.., "reported":..}, there at the start
         for key, value in changes.items():
             if not hasattr(self, key):
                 raise TypeError("no option " + key)
@@ -708,6 +722,8 @@ class Broker:
         self.lock = threading.Lock()
         self.registry = {fingerprint(pki.der("device")): THING}   # certificate -> its attached thing
         self.retained = dict(options.retained)
+        self.shadows = {key: Shadow(state, 1) for key, state in options.shadows.items()}
+        self.deleted = {}                                          # (thing, name) -> the version it was deleted at
         self.sessions = {}                                         # client id -> live Session
         self.listeners = []
         self.ports = {}
@@ -879,10 +895,13 @@ class Broker:
                        + ["topic/" + strip_share(f).replace("+", "*").replace("#", "*") for f in allow],
             "subscribe": ["topicfilter/%s/*" % thing] + ["topicfilter/" + f for f in allow],
             "retainpublish": ["topic/%s/*" % thing] if self.o.allow_retain else [],
+            # The shadow's REST actions: the classic shadow is thing/<thing>, a named
+            # one thing/<thing>/<name> - which thing/<thing> alone does not cover.
+            "shadow": ["thing/%s" % thing, "thing/%s/*" % thing] if self.o.allow_shadow else [],
         }
 
     def may(self, thing, action, value):
-        prefix = {"connect": "client/", "subscribe": "topicfilter/"}.get(action, "topic/")
+        prefix = {"connect": "client/", "subscribe": "topicfilter/", "shadow": ""}.get(action, "topic/")
         return any(policy_match(r, prefix + value) for r in self.policy(thing)[action])
 
     def adopt(self, session):
@@ -1276,6 +1295,8 @@ class HttpsPublish:
         body = body[:length]
         self.log("HTTPS %s %s, Host %r, %d byte(s)" % (method, target, headers.get("host"), len(body)))
         path, _, query = target.partition("?")
+        if path.startswith("/things/"):
+            return self.shadow(method, path, query, body)
         if method != "POST" or not path.startswith("/topics/"):
             if method != "POST":
                 return self.answer(405, "Method Not Allowed", "Method Not Allowed")
@@ -1382,6 +1403,282 @@ class HttpsPublish:
             out.append(("payloadFormat", indicator))
         return out
 
+    def shadow_answer(self, status, reason, doc):
+        body = json.dumps(doc, separators=(",", ":")).encode()
+        head = ("HTTP/1.1 %d %s\r\ncontent-type: application/json\r\ncontent-length: %d\r\n"
+                "connection: close\r\n\r\n" % (status, reason, len(body))).encode()
+        self.sock.sendall(head + body)
+        return status
+
+    def shadow_error(self, status, reason, message, token=None):
+        doc = {"code": status, "message": message, "timestamp": int(time.time())}
+        if token is not None:
+            doc["clientToken"] = token
+        self.log("shadow: %d %s" % (status, message))
+        return self.shadow_answer(status, reason, doc)
+
+    def shadow(self, method, path, query, body):
+        """AWS IoT's Device Shadow REST API: GetThingShadow, UpdateThingShadow,
+        DeleteThingShadow - by its documented rules and texts."""
+        import urllib.parse
+        m = re.fullmatch(r"/things/([^/]+)/shadow", path)
+        if m is None:
+            return self.shadow_error(404, "Not Found", "Not Found")
+        thing = urllib.parse.unquote(m.group(1))
+        params = urllib.parse.parse_qs(query, keep_blank_values=True)
+        name = params.get("name", [None])[0]
+        action = {"GET": "GetThingShadow", "POST": "UpdateThingShadow", "DELETE": "DeleteThingShadow"}.get(method)
+        if action is None:
+            return self.shadow_error(405, "Method Not Allowed", "The specified combination of HTTP verb and URI is not supported.")
+        # Names AWS takes; its status for one it does not is undocumented (400 here).
+        if (not re.fullmatch(r"[a-zA-Z0-9:_-]{1,128}", thing)
+                or (name is not None and not re.fullmatch(r"[$a-zA-Z0-9:_-]{1,64}", name))):
+            return self.shadow_error(400, "Bad Request", "Invalid name")
+        resource = "thing/%s%s" % (thing, "" if name is None else "/" + name)
+        what = "shadow %s %s" % (method, resource)
+        if not self.broker.may(self.thing, "shadow", resource):
+            self.log(what + ": iot:%s on %s denied -> 403" % (action, resource))
+            return self.shadow_error(403, "Forbidden", "Forbidden")
+        key = (thing, name)
+        topic = "$aws/things/%s/shadow%s" % (thing, "" if name is None else "/name/" + name)
+        now = int(time.time())
+        missing = "No shadow exists with name: '%s'" % (name or thing)
+        if method == "GET":
+            with self.broker.lock:
+                current = self.broker.shadows.get(key)
+                doc = None if current is None else current.document(now)
+            if doc is None:
+                return self.shadow_error(404, "Not Found", missing)
+            self.log("%s: version %d -> 200" % (what, doc["version"]))
+            return self.shadow_answer(200, "OK", doc)
+        if method == "DELETE":
+            # Taken and recorded at once: an update in between cannot be lost.
+            with self.broker.lock:
+                current = self.broker.shadows.pop(key, None)
+                if current is not None:
+                    self.broker.deleted[key] = current.version
+            if current is None:
+                return self.shadow_error(404, "Not Found", missing)
+            doc = {"version": current.version, "timestamp": now}
+            self.log("%s: deleted at version %d -> 200" % (what, current.version))
+            self.broker.deliver(topic + "/delete/accepted", json.dumps(doc).encode(), None)
+            return self.shadow_answer(200, "OK", doc)
+        # UpdateThingShadow. Python's json takes NaN and Infinity; JSON does not.
+        def not_json(constant):
+            raise ValueError("not JSON: " + constant)
+        try:
+            request = json.loads(body.decode("utf-8"), parse_constant=not_json)
+        except UnicodeDecodeError:
+            return self.shadow_error(415, "Unsupported Media Type", "Unsupported documented encoding; supported encoding is UTF-8")
+        except ValueError:
+            return self.shadow_error(400, "Bad Request", "Invalid JSON")
+        token = request.get("clientToken") if isinstance(request, dict) else None
+        problem = update_problem(request)
+        if problem:
+            return self.shadow_error(400, "Bad Request", problem, token)
+        with self.broker.lock:
+            current = self.broker.shadows.get(key)
+            # Only that version is updated - none at all when there is no shadow.
+            conflict = "version" in request and (current is None or request["version"] != current.version)
+            before = None if current is None else current.snapshot()
+            version = (current.version if current else self.broker.deleted.get(key, 0)) + 1
+            merged = Shadow.merged(current, request["state"], now, version)
+            too_big = merged.size() > SHADOW_STATE_MAX
+            if not conflict and not too_big:
+                self.broker.shadows[key] = merged
+        if conflict:
+            return self.shadow_error(409, "Conflict", "Version conflict", token)
+        if too_big:
+            return self.shadow_error(413, "Payload Too Large", "The payload exceeds the maximum size allowed", token)
+        accepted = {"state": request["state"] or {}, "metadata": metadata_of(request["state"] or {}, now),
+                    "version": version, "timestamp": now}
+        if token is not None:
+            accepted["clientToken"] = token
+        self.log("%s: version %d, %d bytes of state -> 200" % (what, version, merged.size()))
+        tagged = lambda doc: {**doc, "clientToken": token} if token is not None else doc
+        deliver = lambda leaf, doc: self.broker.deliver(topic + leaf, json.dumps(doc, separators=(",", ":")).encode(), None)
+        deliver("/update/accepted", accepted)
+        deliver("/update/documents", tagged({"previous": before, "current": merged.snapshot(), "timestamp": now}))
+        delta = merged.delta()
+        if delta:
+            deliver("/update/delta", tagged({"state": delta, "metadata": merged.delta_metadata(delta),
+                                             "version": version, "timestamp": now}))
+        return self.shadow_answer(200, "OK", accepted)
+
+
+# The Device Shadow, as AWS documents it (developerguide/device-shadow-document.html,
+# device-shadow-data-flow.html, device-shadow-error-messages.html; general/latest/gr/iot-core.html).
+SHADOW_STATE_MAX = 8192      # "8KB": 8192 assumed; compact JSON, metadata not counted
+SHADOW_DEPTH_MAX = 6         # the error text says 6, the quota page 8: the stricter
+
+
+def depth(value):
+    if isinstance(value, dict):
+        return 1 + max((depth(v) for v in value.values()), default=0)
+    if isinstance(value, list):
+        return 1 + max((depth(v) for v in value), default=0)
+    return 0
+
+
+def null_in_array(value):
+    """An array holding null, anywhere: "Arrays can't have null values ... will be rejected"."""
+    if isinstance(value, dict):
+        return any(null_in_array(v) for v in value.values())
+    if isinstance(value, list):
+        return any(v is None or null_in_array(v) for v in value)
+    return False
+
+
+def same(a, b):
+    """JSON equality: `true` is no `1` (Python's == says it is), an array or an
+    object equals only one of its own kind, element by element."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, list) or isinstance(b, list):
+        return isinstance(a, list) and isinstance(b, list) and len(a) == len(b) and all(map(same, a, b))
+    if isinstance(a, dict) or isinstance(b, dict):
+        return (isinstance(a, dict) and isinstance(b, dict) and a.keys() == b.keys()
+                and all(same(a[k], b[k]) for k in a))
+    return a == b
+
+
+def update_problem(request):
+    """What AWS answers 400 for in an update's request document, its text - or None."""
+    if not isinstance(request, dict) or "state" not in request:
+        return "Missing required node: state"
+    state = request["state"]
+    if state is not None and not isinstance(state, dict):
+        return "State node must be an object"
+    if isinstance(state, dict):
+        if any(k not in ("desired", "reported") for k in state):
+            return "State contains an invalid node"
+        for section in ("desired", "reported"):
+            value = state.get(section)
+            if section in state and value is not None and not isinstance(value, dict):
+                return "%s node must be an object" % section.capitalize()
+            if isinstance(value, dict) and depth(value) > SHADOW_DEPTH_MAX:
+                return "JSON contains too many levels of nesting; maximum is %d" % SHADOW_DEPTH_MAX
+            if null_in_array(value):
+                return "Arrays can't have null values"   # AWS rejects it; its text is not documented
+    if "version" in request and (not isinstance(request["version"], int) or isinstance(request["version"], bool)):
+        return "Invalid version"
+    token = request.get("clientToken")
+    if token is not None and (not isinstance(token, str) or len(token.encode()) > 64):
+        return "Invalid clientToken"
+    return None
+
+
+def merge(into, change):
+    """An update's section merged into what is kept: only the keys it names
+    change, a key set to null goes, objects merge, anything else replaces."""
+    out = dict(into or {})
+    for k, v in change.items():
+        if v is None:
+            out.pop(k, None)
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge(out[k], v)
+        elif isinstance(v, dict):
+            out[k] = merge({}, v)
+        else:
+            out[k] = v
+    return out
+
+
+def metadata_of(value, now):
+    """A timestamp for every leaf - per element in an array, as AWS keeps it."""
+    if isinstance(value, dict):
+        return {k: metadata_of(v, now) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [{"timestamp": now} for _ in value]
+    return {"timestamp": now}
+
+
+def merge_metadata(kept, change, now):
+    """The metadata beside `merge`: the keys an update names get its time, the
+    ones it sets to null go, the rest keep theirs."""
+    out = dict(kept or {})
+    for k, v in change.items():
+        if v is None:
+            out.pop(k, None)
+        elif isinstance(v, dict):
+            old = out.get(k)
+            out[k] = merge_metadata(old if isinstance(old, dict) and not is_leaf(old) else {}, v, now)
+        else:
+            out[k] = metadata_of(v, now)
+    return out
+
+
+def is_leaf(meta):
+    """A leaf's metadata, {"timestamp": <int>} - not an object's that has a
+    key named "timestamp", whose metadata is itself a dict."""
+    return isinstance(meta, dict) and isinstance(meta.get("timestamp"), int) and not isinstance(meta.get("timestamp"), bool)
+
+
+class Shadow:
+    """One shadow: its desired and reported state, and its version."""
+
+    def __init__(self, state, version, metadata=None):
+        self.state = {k: v for k, v in state.items() if v is not None}
+        self.version = version
+        self.metadata = metadata if metadata is not None else metadata_of(self.state, int(time.time()))
+
+    @staticmethod
+    def merged(current, change, now, version):
+        state = dict(current.state) if current else {}
+        metadata = dict(current.metadata) if current else {}
+        if change is None:
+            # `"state": null` clears both, the shadow stays.
+            return Shadow({}, version, {})
+        for section, value in change.items():
+            if value is None:
+                state.pop(section, None)
+                metadata.pop(section, None)
+                continue
+            state[section] = merge(state.get(section), value)
+            metadata[section] = merge_metadata(metadata.get(section), value, now)
+        return Shadow(state, version, metadata)
+
+    def size(self):
+        # UTF-8 bytes, not Python's \u-escaped text.
+        return len(json.dumps(self.state, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+    def delta(self):
+        def walk(desired, reported):
+            out = {}
+            for k, v in desired.items():
+                r = reported.get(k) if isinstance(reported, dict) else None
+                if isinstance(v, dict) and isinstance(r, dict):
+                    d = walk(v, r)
+                    if d:
+                        out[k] = d
+                elif not isinstance(reported, dict) or k not in reported or not same(r, v):
+                    out[k] = v
+            return out
+        return walk(self.state.get("desired", {}), self.state.get("reported", {}))
+
+    def delta_metadata(self, delta):
+        """The delta's metadata: "equal to the metadata in the desired field"."""
+        def pick(d, meta):
+            out = {}
+            for k, v in d.items():
+                m = meta.get(k) if isinstance(meta, dict) else None
+                out[k] = pick(v, m) if isinstance(v, dict) and isinstance(m, dict) and not is_leaf(m) else m
+            return out
+        return pick(delta, self.metadata.get("desired", {}))
+
+    def snapshot(self):
+        """previous / current in .../update/documents: no delta, no timestamp of their own."""
+        return {"state": dict(self.state), "metadata": self.metadata, "version": self.version}
+
+    def document(self, now):
+        state = dict(self.state)
+        metadata = dict(self.metadata)
+        delta = self.delta()
+        if delta:
+            state["delta"] = delta
+            metadata["delta"] = self.delta_metadata(delta)
+        return {"state": state, "metadata": metadata, "version": self.version, "timestamp": now}
+
 
 class Listener:
     """A subscriber on the MQTT side, in the broker's sessions: what an HTTPS
@@ -1415,7 +1712,7 @@ class Case:
                  filters=GOOD_FILTERS, topic=GOOD_TOPIC, keep_alive=60, broker=None, real_443=False, wire=False,
                  result="ok", result_has=GOOD_RESULT, info_has=GOOD_INFO, info_lacks=(), log_has=(),
                  https=False, qos=1, payload=b'{"t":21.5}', listener=GOOD_TOPIC, retain=False, query="",
-                 headers=()):
+                 headers=(), shadow=None, direct=None):
         self.cid, self.title, self.port, self.alpn, self.cert = cid, title, port, alpn, cert
         self.client_id, self.ca, self.filters, self.topic, self.keep_alive = client_id, ca, filters, topic, keep_alive
         self.broker, self.real_443, self.wire = broker or {}, real_443, wire
@@ -1426,6 +1723,10 @@ class Case:
         self.https, self.qos, self.payload, self.listener = https, qos, payload, listener
         # ... retained, more of the query (MQTT 5's), and headers as `Name: value`.
         self.retain, self.query, self.headers = retain, query, headers
+        # The Device Shadow instead: {"method": "GET"|"POST", "name": None|str},
+        # `payload` the update. `direct`: a check the mock runs itself, as
+        # direct(broker, pki) -> (problems, notes) - for what the helper cannot send.
+        self.shadow, self.direct = shadow, direct
 
     def picked_by(self, arg):
         return self.cid == arg or (self.cid.startswith(arg) and self.cid[len(arg):].isalpha())
@@ -1448,6 +1749,115 @@ def publish(cid, title, has=("AWS IoT took the message on `rustonchip-test/test`
 def publish_fails(cid, title, has, info=(), **kw):
     kw.setdefault("port", "8443")
     return Case(cid, title, https=True, result="fail", result_has=has, info_has=info, **kw)
+
+
+SHADOW_THING = "thing/" + THING
+SHADOW_SEED = {(THING, None): {"desired": {"led": True, "color": "RED"}, "reported": {"led": False, "color": "RED"}}}
+SHADOW_TOPIC = "$aws/things/%s/shadow" % THING
+
+
+def shadow(cid, title, has, method="GET", name=None, info=SENT_CERT, result="ok", allow=True, **kw):
+    """The Device Shadow from the helper: a GET as shadow_get() sends it, or a
+    POST of `payload` as shadow_update() does; iot:*ThingShadow allowed
+    unless `allow` is False."""
+    kw.setdefault("port", "8443")
+    kw.setdefault("listener", None)
+    kw.setdefault("payload", b"")
+    broker = dict(kw.pop("broker", {}))
+    broker.setdefault("allow_shadow", allow)
+    return Case(cid, title, https=True, result=result, result_has=has, info_has=info,
+                shadow={"method": method, "name": name}, broker=broker, **kw)
+
+
+def shadow_asker(broker, pki, notes):
+    """One request at a time to the "8443" side with the board's certificate,
+    as the board's shadow calls send them: (status, the answer as JSON)."""
+    def ask(method, target, body=b""):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.load_verify_locations(str(pki.path("root1.pem")))
+        ctx.load_cert_chain(str(pki.path("device.pem")), str(pki.path("device.key")))
+        raw = socket.create_connection(("127.0.0.1", broker.ports["8443"]), timeout=10)
+        with ctx.wrap_socket(raw, server_hostname=ENDPOINT) as s:
+            length = "Content-Length: %d\r\n" % len(body) if method == "POST" else ""
+            s.sendall(("%s %s HTTP/1.1\r\nHost: %s:8443\r\nUser-Agent: RustOnChip\r\nConnection: close\r\n%s\r\n"
+                       % (method, target, ENDPOINT, length)).encode() + body)
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        head, _, doc = data.partition(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1])
+        notes.append("%s %s %s -> %d %s" % (method, target, body.decode("utf-8", "replace"), status,
+                                             doc.decode("utf-8", "replace")))
+        return status, json.loads(doc) if doc else None
+    return ask
+
+
+def shadow_update_check(broker, pki):
+    """What an update does to the kept shadow, read back with GET: only the
+    keys it names change, null removes one (and its metadata), the matching
+    version is taken, `true` is no `1` for the delta, and what is no JSON for
+    AWS - NaN, an array holding null - is refused."""
+    problems, notes = [], []
+    ask = shadow_asker(broker, pki, notes)
+    target = "/things/%s/shadow" % THING
+    status, doc = ask("POST", target, b'{"state":{"reported":{"color":"GREEN"}},"version":1}')
+    if status != 200 or (doc or {}).get("version") != 2:
+        problems.append("an update naming the shadow's own version: %d %r, not 200 with version 2" % (status, doc))
+    status, doc = ask("GET", target)
+    reported = (doc or {}).get("state", {}).get("reported")
+    if reported != {"led": False, "color": "GREEN"}:
+        problems.append("after reporting color alone, reported is %r - not merged into {led: false, color: GREEN}"
+                        % reported)
+    if (doc or {}).get("metadata", {}).get("delta") != {"led": {"timestamp": doc["metadata"]["desired"]["led"]["timestamp"]},
+                                                         "color": {"timestamp": doc["metadata"]["desired"]["color"]["timestamp"]}}:
+        problems.append("metadata.delta is not desired's metadata: %r" % (doc or {}).get("metadata"))
+    ask("POST", target, b'{"state":{"reported":{"led":null}}}')
+    status, doc = ask("GET", target)
+    reported = (doc or {}).get("state", {}).get("reported")
+    meta = (doc or {}).get("metadata", {}).get("reported", {})
+    if reported != {"color": "GREEN"} or "led" in meta:
+        problems.append("a key set to null stays: reported %r, its metadata %r" % (reported, meta))
+    # desired led true, reported led 1: different JSON values, so a delta.
+    ask("POST", target, b'{"state":{"reported":{"led":1,"color":"RED"}}}')
+    status, doc = ask("GET", target)
+    if (doc or {}).get("state", {}).get("delta") != {"led": True}:
+        problems.append("reported 1 against desired true gives delta %r, not {led: true}"
+                        % (doc or {}).get("state", {}).get("delta"))
+    for bad, text in ((b'{"state":{"reported":{"t":NaN}}}', "Invalid JSON"),
+                      (b'{"state":{"desired":{"colors":[null,"RED"]}}}', "Arrays can't have null values")):
+        status, doc = ask("POST", target, bad)
+        if status != 400 or (doc or {}).get("message") != text:
+            problems.append("%s: %d %r, not 400 %r" % (bad.decode(), status, doc, text))
+    return problems, notes
+
+
+def shadow_delete_check(broker, pki):
+    """DELETE, as shadow_delete() sends it - the helper sends GET and POST only:
+    200 with the version, then 404, then an update that goes on from that
+    version, as AWS's do within 48 hours."""
+    problems, notes = [], []
+    ask = shadow_asker(broker, pki, notes)
+    target = "/things/%s/shadow" % THING
+    status, doc = ask("DELETE", target)
+    if status != 200 or not doc or doc.get("version") != 1:
+        problems.append("DELETE: %d %r, not 200 with version 1" % (status, doc))
+    status, doc = ask("GET", target)
+    if status != 404 or "No shadow exists" not in (doc or {}).get("message", ""):
+        problems.append("GET after DELETE: %d %r, not 404" % (status, doc))
+    status, doc = ask("DELETE", target)
+    if status != 404:
+        problems.append("a second DELETE: %d, not 404" % status)
+    status, doc = ask("POST", target, b'{"state":{"reported":{"led":true}}}')
+    if status != 200 or not doc or doc.get("version") != 2:
+        problems.append("an update after DELETE: %d %r, not 200 with version 2" % (status, doc))
+    status, doc = ask("PUT", target, b"{}")
+    if status != 405:
+        problems.append("PUT: %d, not 405" % status)
+    return problems, notes
 
 
 CASES = [
@@ -1531,6 +1941,37 @@ CASES = [
             log_has=("contentType='application/json'", "messageExpiry=60", "responseTopic='rustonchip-test/reply'",
                      "userProperties=%r" % [("name", "alpha"), (UP_KEY, UP_VALUE)], "correlationData='000102feff'",
                      "payloadFormat='UTF8_DATA'")),
+    shadow("17a", "the Device Shadow, none yet: 404 - the policy let the read through",
+           ("has no shadow yet", SHADOW_THING), info=SENT_CERT + ("sent GET /things/rustonchip-test/shadow",),
+           log_has=("shadow: 404 No shadow exists with name: 'rustonchip-test'",)),
+    shadow("17b", "no iot:GetThingShadow: 403", ("403", "iot:GetThingShadow on " + SHADOW_THING), result="fail",
+           allow=False, log_has=("iot:GetThingShadow on thing/rustonchip-test denied -> 403",)),
+    shadow("17c", "the shadow, with its delta", ("with the shadow of " + SHADOW_THING, "the board keeps 2048 - all of it"),
+           info=SENT_CERT + ('the shadow: {"state":{"desired":{"led":true,"color":"RED"}', '"delta":{"led":true}'),
+           broker={"shadows": SHADOW_SEED}, log_has=("shadow GET thing/rustonchip-test: version 1 -> 200",)),
+    shadow("17d", "a named shadow: ?name=", ("with the shadow of " + SHADOW_THING + "/config",), name="config",
+           info=SENT_CERT + ("sent GET /things/rustonchip-test/shadow?name=config",),
+           broker={"shadows": {(THING, "config"): {"desired": {"rate": 5}}}}),
+    shadow("17e", "an update: merged, version 2, the delta to an MQTT subscriber", (SHADOW_THING + " took the update",),
+           method="POST", payload=b'{"state":{"reported":{"color":"GREEN"}},"clientToken":"t-1"}',
+           listener=SHADOW_TOPIC + "/update/delta",
+           broker={"shadows": SHADOW_SEED, "allow": [SHADOW_TOPIC + "/#"]},
+           log_has=("shadow POST thing/rustonchip-test: version 2", "delivered `" + SHADOW_TOPIC + "/update/delta`",
+                    '{"state":{"led":true,"color":"RED"}')),
+    shadow("17f", "an update for another version: 409", ("409", "Version conflict"), result="fail", method="POST",
+           payload=b'{"state":{"reported":{"led":true}},"version":7}', broker={"shadows": SHADOW_SEED}),
+    shadow("17g", "an update without `state`: 400", ("400", "Missing required node: state"), result="fail",
+           method="POST", payload=b'{"reported":{"led":true}}'),
+    shadow("17h", "a shadow over the board's Answer up to", ("over the board's 2048 (Answer up to)",),
+           broker={"shadows": {(THING, None): {"reported": {"blob": "x" * 2500}}}}),
+    shadow("17i", 'the shadow on "443" with the ALPN x-amzn-http-ca', ("has no shadow yet",), port="443",
+           log_has=("ALPN 'x-amzn-http-ca'",)),
+    shadow("17j", "a certificate nobody registered: a reset", ("refused the board's certificate",), result="fail",
+           cert="other", info=(), log_has=("is not registered: TCP reset",)),
+    Case("17k", "DELETE: the version kept, 404 after, the next update goes on from it", direct=shadow_delete_check,
+         broker={"allow_shadow": True, "shadows": SHADOW_SEED}),
+    Case("17l", "updates read back: merged, null removes, the version matched, true is no 1, NaN refused",
+         direct=shadow_update_check, broker={"allow_shadow": True, "shadows": SHADOW_SEED}),
 ]
 
 
@@ -1555,10 +1996,18 @@ def helper_http_request(case, pki, port):
         key = pki.path(("device" if case.cert == "device" else "other") + ".key").read_text()
     ca = b"".join(pki.der(name) for name in case.ca)
     on_443 = case.port == "443"
-    url = "https://%s%s/topics/%s?qos=%d%s%s" % (ENDPOINT, "" if on_443 else ":8443",
-                                                 urllib.parse.quote(case.topic, safe="/"), case.qos,
-                                                 "&retain=true" if case.retain else "", case.query)
-    values = [url, "1", ca, "0", "2048", "2048", "RustOnChip", "1024", "POST", "", case.payload, cert, key,
+    method = "POST"
+    if case.shadow:
+        # As aws_shadow_url writes it.
+        name = case.shadow["name"]
+        url = "https://%s%s/things/%s/shadow%s" % (ENDPOINT, "" if on_443 else ":8443", urllib.parse.quote(THING, safe=""),
+                                                   "" if name is None else "?name=" + urllib.parse.quote(name, safe=""))
+        method = case.shadow["method"]
+    else:
+        url = "https://%s%s/topics/%s?qos=%d%s%s" % (ENDPOINT, "" if on_443 else ":8443",
+                                                     urllib.parse.quote(case.topic, safe="/"), case.qos,
+                                                     "&retain=true" if case.retain else "", case.query)
+    values = [url, "1", ca, "0", "2048", "2048", "RustOnChip", "1024", method, "", case.payload, cert, key,
               ALPN_HTTP if on_443 else "", "127.0.0.1:%d" % port, "1", "\n".join(case.headers)]
     return "".join(hexl(v) + "\n" for v in values).encode("ascii")
 
@@ -1624,6 +2073,12 @@ def run_case(case, pki, helper, aws_sigalgs):
     try:
         if case.wire:
             out["why"], out["output"] = wire_check(broker)
+        elif case.direct:
+            try:
+                out["why"], out["output"] = case.direct(broker, pki)
+            except Exception as e:  # a FAIL line, never the end of the run
+                out["why"] = ["%s: %s" % (type(e).__name__, e)]
+            broker.wait_idle(5)
         else:
             port = broker.ports[case.port]
             if case.https:
@@ -1740,6 +2195,8 @@ def serve(argv):
                     help="sign this CSR (the IDE's) and register it to the thing, as create-certificate-from-csr")
     ap.add_argument("--tls12", action="store_true", help="act as an endpoint with no TLS 1.3 security policy")
     ap.add_argument("--allow-retain", action="store_true", help="also allow iot:RetainPublish on topic/<thing>/*")
+    ap.add_argument("--allow-shadow", action="store_true",
+                    help="also allow iot:Get/Update/DeleteThingShadow on thing/<thing> and thing/<thing>/*")
     args = ap.parse_args(argv)
     helper = find_helper(args.helper)
     pki = Pki(args.work, find_openssl(), helper if os.path.isfile(helper) else None).ensure()
@@ -1750,7 +2207,7 @@ def serve(argv):
     options = Options(allow=args.allow, deny=args.deny, reason_strings=args.reason_strings,
                       retained_before_suback=args.retained_before_suback, retained=retained,
                       aws_sigalgs=args.aws_sigalgs, tls12=args.tls12, chain="chain4.pem" if args.tls12 else "chain3.pem",
-                      allow_retain=args.allow_retain)
+                      allow_retain=args.allow_retain, allow_shadow=args.allow_shadow)
     broker = Broker(pki, options, echo=True)
     certs = [(pki.path("device.pem"), pki.path("device.key"))]
     for csr in args.csr:
@@ -1784,6 +2241,8 @@ def serve(argv):
     print("this side only with --port-8443 8443 and a DNS entry pointing that name at this PC. From this")
     print("PC the helper (the mock's cases, `python scripts/aws-iot-mock.py 16`) dials it directly:")
     print("  POST https://%s:8443/topics/%s/test?qos=1  ->  127.0.0.1:%d" % (ENDPOINT, THING, broker.ports["8443"]))
+    if args.allow_shadow:
+        print("  GET  https://%s:8443/things/%s/shadow     (the Device Shadow, --allow-shadow)" % (ENDPOINT, THING))
     print("Ctrl+C stops it.\n", flush=True)
     try:
         while True:

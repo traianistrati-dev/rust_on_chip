@@ -5118,6 +5118,13 @@ mod emit_async_for_manual_compile {
                 used.push_str("        let mut body = [0u8; 256];\n");
                 used.push_str("        if let Ok(r) = pins::configs::http::get(\"http://example.com/\", &mut body).await {\n");
                 used.push_str("            let _ = (r.status, r.len, r.truncated, r.location());\n");
+                // The JSON reader on an M0+: f64 in software.
+                used.push_str("            let mut text = [0u8; 32];\n");
+                used.push_str("            let _ = (\n");
+                used.push_str("                pins::configs::http::json_f64(&body[..r.len], &[\"t\"]),\n");
+                used.push_str("                pins::configs::http::json_i64(&body[..r.len], &[\"version\"]),\n");
+                used.push_str("                pins::configs::http::json_str(&body[..r.len], &[\"name\"], &mut text).map(|s| s.len()),\n");
+                used.push_str("            );\n");
                 used.push_str("        }\n");
                 used.push_str("        pins::configs::http::post(\"https://example.com/in\", \"application/json\", b\"{}\", &mut body).await.ok();\n");
                 used.push_str("        let req = pins::configs::http::Request {\n");

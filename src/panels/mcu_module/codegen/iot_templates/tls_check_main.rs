@@ -1187,12 +1187,29 @@ fn http(r: &HttpRequest) -> Result<String, String> {
     } else {
         head.length.map_or(Framing::Close, Framing::Length)
     };
+    // AWS IoT's Device Shadow REST API, beside its HTTPS publish.
+    let shadow = r.aws && url.path().starts_with("/things/");
     // A refusal says why in its body: read it first.
     if head.status >= 400 {
         // What came is kept even when the body then breaks off.
         let _ = read_body(&mut src, framing, r.body_max);
-        let said = text_of(&src.kept);
+        let said = text_of(&src.kept, 200);
         let said = if said.is_empty() { String::new() } else { format!(": {said}") };
+        if shadow {
+            let (action, which) = if r.post { ("UpdateThingShadow", "update") } else { ("GetThingShadow", "read") };
+            let resource = shadow_in(&url.path());
+            return match head.status {
+                // AWS looks for the shadow once the policy let the request
+                // through: the certificate and the policy work.
+                404 if !r.post => Ok(format!(
+                    "AWS IoT answered {what}{said} - {resource} has no shadow yet: the certificate and the policy let the board {which} it, and shadow_report() creates it"
+                )),
+                401 | 403 => Err(format!(
+                    "AWS IoT answered {what}{said} - the policy on the board's certificate allows no iot:{action} on {resource} (iot:Publish on $aws/things/... does not grant it)"
+                )),
+                _ => Err(format!("AWS IoT answered {what}{said}")),
+            };
+        }
         return Err(if r.aws && head.status == 403 {
             let retained = url.path().contains("retain=true");
             format!(
@@ -1211,8 +1228,27 @@ fn http(r: &HttpRequest) -> Result<String, String> {
         Framing::Close => println!("INFO the body: until the server closes (no Content-Length, not chunked)"),
     }
     let body = read_body(&mut src, framing, r.body_max)?;
+    if shadow {
+        println!("INFO {}: {}", if r.post { "the answer" } else { "the shadow" }, text_of(&src.kept, 480));
+        let len = if body.exact { body.len.to_string() } else { format!("at least {}", body.len) };
+        let size = if body.len > r.body_max {
+            format!(
+                "over the board's {} (Answer up to): shadow_get() gets it truncated, and what was cut reads None - raise it",
+                r.body_max
+            )
+        } else {
+            format!("the board keeps {} - all of it", r.body_max)
+        };
+        return if head.status == 200 && r.post {
+            Ok(format!("AWS IoT answered {what}: {} took the update, {len} bytes back - {size}", shadow_in(&url.path())))
+        } else if head.status == 200 {
+            Ok(format!("AWS IoT answered {what} with the shadow of {}, {len} bytes - {size}", shadow_in(&url.path())))
+        } else {
+            Err(format!("AWS IoT answered {what}, not 200 - the board's shadow calls report it as it is"))
+        };
+    }
     if r.post && !src.kept.is_empty() {
-        println!("INFO the answer: {}", text_of(&src.kept));
+        println!("INFO the answer: {}", text_of(&src.kept, 200));
     }
     if r.aws {
         // A 200 is AWS's only acknowledgement - its body varies.
@@ -1345,13 +1381,13 @@ impl<'a> Url<'a> {
     }
 }
 
-/// The first bytes of an answer's body as one line of text: what a server
-/// says when it refuses (AWS: `{"message":...}`).
-fn text_of(body: &[u8]) -> String {
+/// The first `max` characters of an answer's body as one line of text: what
+/// a server says when it refuses (AWS: `{"message":...}`).
+fn text_of(body: &[u8], max: usize) -> String {
     let text: String = String::from_utf8_lossy(body)
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .take(200)
+        .take(max)
         .collect();
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1360,7 +1396,24 @@ fn text_of(body: &[u8]) -> String {
 /// is `a b`.
 fn topic_in(path: &str) -> String {
     let encoded = path.strip_prefix("/topics/").unwrap_or(path);
-    let encoded = encoded.split('?').next().unwrap_or_default().as_bytes();
+    decoded(encoded.split('?').next().unwrap_or_default())
+}
+
+/// The shadow a Device Shadow path asks for, as its policy resource names
+/// it: `/things/a%3Ab/shadow?name=cfg` is `thing/a:b/cfg`.
+fn shadow_in(path: &str) -> String {
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let thing = path.strip_prefix("/things/").and_then(|p| p.strip_suffix("/shadow")).unwrap_or(path);
+    let name = query.split('&').find_map(|p| p.strip_prefix("name="));
+    match name {
+        Some(name) => format!("thing/{}/{}", decoded(thing), decoded(name)),
+        None => format!("thing/{}", decoded(thing)),
+    }
+}
+
+/// `%XX` back to its byte.
+fn decoded(encoded: &str) -> String {
+    let encoded = encoded.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < encoded.len() {

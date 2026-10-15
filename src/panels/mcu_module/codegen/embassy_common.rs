@@ -2192,11 +2192,29 @@ mod emit_for_manual_compile {
                 used.push_str("            correlation_data: Some(b\"7\"),\n            user_properties: &props,\n            utf8: true,\n");
                 used.push_str("            ..pins::configs::http::AwsMessage::new(\"rustonchip-test/state\", b\"{}\")\n        };\n");
                 used.push_str("        pins::configs::http::aws_publish_with(&m, &mut reply).await.ok();\n");
+                // The Device Shadow: each call, classic and named.
+                used.push_str("        let mut doc = [0u8; 1024];\n");
+                used.push_str("        if let Ok(r) = pins::configs::http::shadow_get(None, &mut doc).await {\n");
+                used.push_str("            let _ = pins::configs::http::json_bool(&doc[..r.len], &[\"state\", \"delta\", \"led\"]);\n");
+                used.push_str("        }\n");
+                used.push_str("        pins::configs::http::shadow_report(Some(\"config\"), br#\"{\"led\":true}\"#, &mut doc).await.ok();\n");
+                used.push_str("        pins::configs::http::shadow_update(None, br#\"{\"state\":{\"desired\":null},\"version\":3}\"#, &mut doc).await.ok();\n");
+                used.push_str("        pins::configs::http::shadow_delete(Some(\"config\"), &mut doc).await.ok();\n");
             }
             if matches!(mode, "http" | "https" | "awshttps") || all {
                 used.push_str("        let mut body = [0u8; 256];\n");
                 used.push_str("        if let Ok(r) = pins::configs::http::get(\"http://example.com/\", &mut body).await {\n");
                 used.push_str("            let _ = (r.status, r.len, r.truncated, r.location());\n");
+                // The JSON reader, on the answer.
+                used.push_str("            let doc = &body[..r.len];\n");
+                used.push_str("            let mut text = [0u8; 32];\n");
+                used.push_str("            let _ = (\n");
+                used.push_str("                pins::configs::http::json_get(doc, &[\"a\", \"0\"]),\n");
+                used.push_str("                pins::configs::http::json_f64(doc, &[\"t\"]),\n");
+                used.push_str("                pins::configs::http::json_i64(doc, &[\"version\"]),\n");
+                used.push_str("                pins::configs::http::json_bool(doc, &[\"on\"]),\n");
+                used.push_str("                pins::configs::http::json_str(doc, &[\"name\"], &mut text).map(|s| s.len()),\n");
+                used.push_str("            );\n");
                 used.push_str("        }\n");
                 used.push_str("        pins::configs::http::post(\"https://example.com/in\", \"application/json\", b\"{}\", &mut body).await.ok();\n");
                 used.push_str("        let req = pins::configs::http::Request {\n");

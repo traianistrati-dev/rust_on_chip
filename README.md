@@ -466,11 +466,42 @@ needed on either:
   coexistence for 802.15.4, hence one link on the radio. openthread names the
   C6 and H2; the C5 builds and links the same way.
 
+**Bluetooth Mesh** is a link of its own on the ESP32-C3 and the Pico W /
+Pico 2 W: a Bluetooth SIG Mesh node written for the IDE in pure Rust (no mesh
+crate exists to build on), the IDE its provisioner. The network is its NetKey
+and AppKey, the node's own DevKey beside them — random keys the tab puts in
+`secrets.rs` the moment the link is on — and an IV index; "Copy network" gives
+one `mesh1:…` line that "Join" takes in the next project, and every node gets
+an address of its own. On one element: a **Generic OnOff Server** (a light:
+`onoff_changed().await`, `onoff()`, `set_onoff(on)`, with Transition Time and
+Delay), a **Generic OnOff Client** (a switch: `onoff_set(on)` to its group,
+`onoff_set_to(addr, on)`, `onoff_status().await`), a **Sensor Server** with
+its Setup Server (`sensor_set(property, value)`, published every period and on
+a change) and a **Sensor Client** (`sensor_get(..)`, `sensor_reading().await`),
+for eight common properties (temperatures, humidity, light, motion, people,
+voltage) in their own units. Under them, in `src/pins/configs/ble_mesh.rs`: the
+network layer (obfuscation, AES-CCM, the message cache, relaying), the lower
+and upper transport with segmentation and Segment Acknowledgments, the replay
+list, the access layer and a Configuration Server that answers what a
+provisioner asks — checked byte for byte against the specification's sample
+messages by the IDE's own tests. The bearer is trouble-host 0.6: one passive
+scan that never stops (duplicates reported, through raw HCI commands, since
+trouble's own scanner filters them) and each PDU advertised non-connectable
+for a few events. The node never sends a sequence number twice: it keeps the
+next free one in the **flash store** (Configuration tab), which the link needs
+— an item of its own beside your `Data`, through one `Flash` handle the store
+and the node share. Not beside the Nordic UART link (one Bluetooth host),
+beside Wi-Fi with esp-radio's `coex`. For your own projects: a new stack, not
+qualified by the Bluetooth SIG; no IV Update, Secure Network Beacon, Health
+Server, Friend / Low Power or GATT bearer yet — so phone apps (nRF Mesh), which
+provision over GATT, cannot join it.
+
 Only what the chip's radio can carry is listed. Of that, what is not generated
-says why: BLE Mesh, Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to
-generate for —
-ESP-NOW is the mesh-capable link, and `espnow.rs` describes a flooding relay
-on top of it. SNTP is unauthenticated UDP.
+says why: Zigbee and ESP-WIFI-MESH have no `no_std` Rust stack to generate
+for, and Bluetooth Mesh waits on the other Bluetooth chips for a flash store
+(or, on an nRF, the SoftDevice Controller's multirole library) —
+ESP-NOW is the mesh-capable link there, and `espnow.rs` describes a flooding
+relay on top of it. SNTP is unauthenticated UDP.
 
 **MQTT over TLS** is a switch on the MQTT client, on the ESP chips and the
 Pico W / Pico 2 W: TLS 1.3 through embedded-tls — pure Rust, so nothing but
@@ -1069,8 +1100,8 @@ work is dual licensed as above, with no additional terms.
 
 ### What the dependencies bring
 
-`Cargo.lock` pins 475 crates: the IDE plus 474 dependencies, every platform
-included. A build compiles fewer of them — 230 for Windows
+`Cargo.lock` pins 489 crates: the IDE plus 488 dependencies, every platform
+and the test-only ones included. A build compiles fewer of them — 231 for Windows
 (`cargo tree -e normal,build --target x86_64-pc-windows-msvc --prefix none
 --no-dedupe | sort -u | wc -l`); Linux and macOS swap in their own windowing
 crates.

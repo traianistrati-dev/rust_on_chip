@@ -117,6 +117,11 @@ pub struct IotConfig {
     /// switched on. Needs the station.
     #[serde(default)]
     pub http: Option<HttpConfig>,
+    /// Bluetooth Mesh (`src/pins/configs/ble_mesh.rs`), `Some` while it is
+    /// switched on. The radio's Bluetooth is either this or the Nordic UART
+    /// link, never both; the network's keys are secrets, in `secrets.rs`.
+    #[serde(default)]
+    pub ble_mesh: Option<BleMeshConfig>,
 }
 
 impl Default for IotConfig {
@@ -133,6 +138,7 @@ impl Default for IotConfig {
             thread: None,
             restart_on_panic: true,
             http: None,
+            ble_mesh: None,
         }
     }
 }
@@ -503,6 +509,217 @@ pub fn ble_name_problem(name: &str) -> Option<&'static str> {
         return Some("longer than 22 bytes - the generated code uses the default");
     }
     None
+}
+
+/// Bluetooth Mesh: the node's place in the network and its models, on its one
+/// element. The network itself is its keys: the NetKey and the AppKey (the
+/// same on every node) and the node's own DevKey, all three in `secrets.rs`.
+/// The IDE provisions the node: no phone, no provisioner.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BleMeshConfig {
+    /// The node's unicast address, 0x0001..=0x7FFF - different on every node.
+    pub address: u16,
+    /// The network's IV index, the same on every node.
+    pub iv_index: u32,
+    /// Relay what the neighbours send, so the network reaches further.
+    pub relay: bool,
+    /// The TTL the node sends with: 0, or 2..=127 hops.
+    pub default_ttl: u8,
+    /// Generic OnOff Server: a state the network switches (a light).
+    pub onoff_server: bool,
+    /// Generic OnOff Client: switches the servers of its group (a switch).
+    pub onoff_client: bool,
+    /// The group the on/off messages travel in: the servers listen and
+    /// publish their state there, the clients send there and hear it.
+    pub onoff_group: u16,
+    /// Sensor Server (with the Sensor Setup Server beside it): values others
+    /// read and the node publishes.
+    pub sensor_server: bool,
+    /// Sensor Client: reads servers and hears what they publish.
+    pub sensor_client: bool,
+    /// The group of the sensor messages, as `onoff_group`.
+    pub sensor_group: u16,
+    /// The Sensor Server's properties (Mesh Device Property ids, from
+    /// [`MESH_SENSOR_PROPERTIES`]).
+    pub sensor_properties: Vec<u16>,
+    /// The Sensor Server publishes every this many seconds (0: only when
+    /// asked).
+    pub sensor_period_s: u16,
+}
+
+impl Default for BleMeshConfig {
+    fn default() -> Self {
+        Self {
+            address: 0x0001,
+            iv_index: 0,
+            relay: true,
+            default_ttl: DEFAULT_MESH_TTL,
+            onoff_server: true,
+            onoff_client: false,
+            onoff_group: 0xC000,
+            sensor_server: false,
+            sensor_client: false,
+            sensor_group: 0xC001,
+            sensor_properties: vec![0x004F],
+            sensor_period_s: 10,
+        }
+    }
+}
+
+/// Zephyr's default TTL (`CONFIG_BT_MESH_DEFAULT_TTL`).
+pub const DEFAULT_MESH_TTL: u8 = 7;
+
+/// Properties one Sensor Server offers at most (the template's SENSORS_MAX).
+pub const MESH_SENSORS_MAX: usize = 8;
+
+/// The sensor properties the generated Sensor Server and Client know: the
+/// Mesh Device Property id, its name, and the unit the board's code reads and
+/// writes it in. The template's `PROPERTIES` table carries their formats; a
+/// test keeps the two lists the same.
+pub const MESH_SENSOR_PROPERTIES: [(u16, &str, &str); 8] = [
+    (0x004F, "Present Ambient Temperature", "degC, 0.5 steps"),
+    (0x0056, "Present Indoor Ambient Temperature", "degC, 0.5 steps"),
+    (0x0054, "Present Device Operating Temperature", "degC, 0.01 steps"),
+    (0x0076, "Present Ambient Relative Humidity", "%, 0.01 steps"),
+    (0x004E, "Present Ambient Light Level", "lux, 0.01 steps"),
+    (0x0042, "Motion Sensed", "%, 0.5 steps"),
+    (0x004C, "People Count", "people"),
+    (0x0059, "Present Input Voltage", "V, 1/64 steps"),
+];
+
+/// The name of a sensor property, or `None` for one the IDE does not know.
+pub fn mesh_property_name(id: u16) -> Option<&'static str> {
+    MESH_SENSOR_PROPERTIES.iter().find(|p| p.0 == id).map(|p| p.1)
+}
+
+/// What is wrong with a node's unicast address. `None` = fine.
+pub fn mesh_address_problem(a: u16) -> Option<&'static str> {
+    match a {
+        0 => Some("0x0000 is the unassigned address"),
+        0x8000.. => Some("a node's address is unicast: 0x0001 to 0x7FFF"),
+        _ => None,
+    }
+}
+
+/// What is wrong with a group address. `None` = fine.
+pub fn mesh_group_problem(g: u16) -> Option<&'static str> {
+    match g {
+        0xC000..=0xFEFF => None,
+        0xFF00.. => Some("0xFF00 and up are the fixed groups (all nodes, all relays...)"),
+        _ => Some("a group address is 0xC000 to 0xFEFF"),
+    }
+}
+
+/// What is wrong with a TTL. `None` = fine.
+pub fn mesh_ttl_problem(ttl: u8) -> Option<&'static str> {
+    match ttl {
+        1 => Some("TTL 1 is not allowed: 0 (neighbours only) or 2 to 127"),
+        0x80.. => Some("at most 127"),
+        _ => None,
+    }
+}
+
+/// What is wrong with the models chosen. `None` = fine.
+pub fn mesh_models_problem(m: &BleMeshConfig) -> Option<&'static str> {
+    if !(m.onoff_server || m.onoff_client || m.sensor_server || m.sensor_client) {
+        return Some("no model: the node would only relay");
+    }
+    if m.sensor_server && m.sensor_properties.is_empty() {
+        return Some("the Sensor Server has no property");
+    }
+    if m.sensor_properties.len() > MESH_SENSORS_MAX {
+        return Some("at most 8 properties");
+    }
+    None
+}
+
+/// The secret lines of Bluetooth Mesh, in `secrets.rs`: the network's NetKey
+/// and AppKey, the node's DevKey - 32 hex digits each.
+pub const MESH_SECRETS: [&str; 3] = ["MESH_NET_KEY", "MESH_APP_KEY", "MESH_DEV_KEY"];
+
+/// A 128-bit key from 32 hex digits - exactly what the firmware's `hex16`
+/// takes: no spaces, no sign, ASCII only (bytes are checked before any
+/// slicing, so no input can panic here).
+pub fn parse_mesh_key(text: &str) -> Result<[u8; 16], &'static str> {
+    let b = text.as_bytes();
+    if b.len() != 32 || !b.iter().all(u8::is_ascii_hexdigit) {
+        return Err("a key is 32 hex digits");
+    }
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => c - b'A' + 10,
+    };
+    let mut k = [0u8; 16];
+    for (i, out) in k.iter_mut().enumerate() {
+        *out = (digit(b[2 * i]) << 4) | digit(b[2 * i + 1]);
+    }
+    Ok(k)
+}
+
+/// The Sensor Server's period as the firmware publishes it: steps of 1 s up
+/// to 63 s, of 10 s up to 630 s, then of 10 minutes (the template's
+/// `period_of`, rounding down).
+pub fn mesh_period_s(s: u16) -> u32 {
+    let s = u32::from(s);
+    match s {
+        0..=63 => s,
+        64..=630 => s / 10 * 10,
+        _ => (s / 600).min(63) * 600,
+    }
+}
+
+pub fn fmt_mesh_key(k: &[u8; 16]) -> String {
+    k.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A new random key, from the operating system.
+pub fn new_mesh_key() -> Result<[u8; 16], String> {
+    let mut k = [0u8; 16];
+    getrandom::fill(&mut k).map_err(|e| e.to_string())?;
+    Ok(k)
+}
+
+/// A unicast address picked at random, for a node switched on: two boards
+/// switched on the same way still land apart (1 in 32767 they do not).
+pub fn new_mesh_address() -> u16 {
+    let mut b = [0u8; 2];
+    match getrandom::fill(&mut b) {
+        Ok(()) => (u16::from_le_bytes(b) % 0x7FFF) + 1,
+        Err(_) => 0x0001,
+    }
+}
+
+/// What every node of a network shares, as one line to copy from one project
+/// and paste into the next: `mesh1:<NetKey>:<AppKey>:<IV index>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshNetwork {
+    pub net_key: [u8; 16],
+    pub app_key: [u8; 16],
+    pub iv_index: u32,
+}
+
+impl MeshNetwork {
+    pub fn to_line(&self) -> String {
+        format!("mesh1:{}:{}:{:08x}", fmt_mesh_key(&self.net_key), fmt_mesh_key(&self.app_key), self.iv_index)
+    }
+
+    pub fn from_line(line: &str) -> Result<Self, &'static str> {
+        let mut parts = line.trim().split(':');
+        if parts.next() != Some("mesh1") {
+            return Err("not a network line: it starts with mesh1:");
+        }
+        let (Some(net), Some(app), Some(iv), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+            return Err("a network line is mesh1:<NetKey>:<AppKey>:<IV index>");
+        };
+        let iv = iv.trim();
+        if iv.is_empty() || iv.len() > 8 || !iv.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err("the IV index is 8 hex digits");
+        }
+        let iv_index = u32::from_str_radix(iv, 16).map_err(|_| "the IV index is 8 hex digits")?;
+        Ok(Self { net_key: parse_mesh_key(net.trim())?, app_key: parse_mesh_key(app.trim())?, iv_index })
+    }
 }
 
 /// ESP-NOW: the channel it uses while the station is off, and the peers it
@@ -1477,6 +1694,8 @@ pub struct Active {
     pub sntp: bool,
     /// Bluetooth LE.
     pub ble: bool,
+    /// Bluetooth Mesh - on the same Bluetooth radio, never beside `ble`.
+    pub ble_mesh: bool,
     /// Thread, with OpenThread's UDP - on an nRF or an ESP with 802.15.4,
     /// never beside another link on the radio (see [`thread_blocked`]).
     pub thread: bool,
@@ -1495,6 +1714,13 @@ pub struct Active {
 }
 
 impl Active {
+    /// The radio's Bluetooth is up: the Nordic UART link or Bluetooth Mesh.
+    /// The controller, the host crate and (on an ESP beside Wi-Fi) coexistence
+    /// are the same for both.
+    pub fn bluetooth(&self) -> bool {
+        self.ble || self.ble_mesh
+    }
+
     /// Some client speaks TLS: tls.rs, embedded-tls and (on a Pico) the heap.
     pub fn tls(&self) -> bool {
         self.mqtt_tls || self.http_tls
@@ -1529,10 +1755,13 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
     let esp_now = mcu.iot.esp_now.is_some() && ESP_WIFI.contains(&mcu.family.as_str());
     let ble = mcu.iot.ble.is_some() && bt.is_some() && !nrf_ble_blocked_by_usb(mcu);
     let thread = mcu.iot.thread.is_some() && thread_platform(&mcu.family) && !thread_blocked(mcu);
-    if !station && !esp_now && !ble && !thread {
+    let ble_mesh = mcu.iot.ble_mesh.is_some()
+        && mesh_platform(&mcu.family, cyw43).is_some()
+        && mesh_blocked(mcu).is_none();
+    if !station && !esp_now && !ble && !thread && !ble_mesh {
         return None;
     }
-    let coex = ble && (station || esp_now);
+    let coex = (ble || ble_mesh) && (station || esp_now);
     let tls_ok = tls_available(&mcu.family, coex).is_ok();
     let mqtt_tls = station && mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls) && tls_ok;
     let http = station && mcu.iot.http.is_some();
@@ -1559,6 +1788,7 @@ pub fn active(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<Active> {
             && tls_ok,
         sntp: station && mcu.iot.sntp.is_some(),
         ble,
+        ble_mesh,
         thread,
         panic: mcu.iot.restart_on_panic,
         http,
@@ -1609,7 +1839,45 @@ pub fn thread_blocked(mcu: &crate::panels::mcu_module::mcu::Mcu) -> bool {
     let family = mcu.family.as_str();
     let wifi = (mcu.iot.wifi && platform(family, has_cyw43(mcu)).is_some())
         || (mcu.iot.esp_now.is_some() && ESP_WIFI.contains(&family));
-    thread_platform(family) && (mcu.iot.ble.is_some() || wifi)
+    // Bluetooth Mesh counts where it is generated (on no Thread chip today).
+    let mesh = mcu.iot.ble_mesh.is_some() && mesh_platform(family, has_cyw43(mcu)).is_some();
+    thread_platform(family) && (mcu.iot.ble.is_some() || mesh || wifi)
+}
+
+/// The chips Bluetooth Mesh is generated for: the ESP32-C3 and a Pico W /
+/// Pico 2 W - trouble-host 0.6 on their radios, and a flash store to keep the
+/// node's sequence number in (`flash_store::supported` is the C3 alone among
+/// the ESPs; the RP boards have theirs on Async).
+pub fn mesh_platform(family: &str, cyw43: bool) -> Option<Platform> {
+    match family {
+        "esp32c3" => Some(Platform::Esp),
+        "rp2040" | "rp235x" if cyw43 => Some(Platform::Cyw43),
+        _ => None,
+    }
+}
+
+/// Does `mcu` generate its flash store's code - where Bluetooth Mesh keeps
+/// its sequence number?
+pub fn mesh_store_ready(mcu: &crate::panels::mcu_module::mcu::Mcu) -> bool {
+    mcu.flash_store.is_some() && crate::panels::mcu_module::flash_store::platform_of(mcu).is_ok()
+}
+
+/// Why Bluetooth Mesh, switched on where it is generated, is not - `None`
+/// when nothing holds it back:
+///
+/// - the Nordic UART link: one Bluetooth host on the radio, and its switch
+///   wins, as Bluetooth's does over Thread;
+/// - no flash store: a node that forgets its sequence number on a reset sends
+///   numbers its neighbours have already seen, and they drop its messages
+///   until it passes them.
+pub fn mesh_blocked(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Option<&'static str> {
+    if mcu.iot.ble.is_some() {
+        return Some("one Bluetooth radio: the Nordic UART link has it");
+    }
+    if !mesh_store_ready(mcu) {
+        return Some("needs the flash store (Configuration tab): the node's sequence number must outlive a reset");
+    }
+    None
 }
 
 /// Bluetooth beside USB on an nRF: both bind the CLOCK_POWER vector (the MPSL
@@ -1668,7 +1936,9 @@ impl Link {
             Link::Thread => {
                 "IPv6 mesh over 802.15.4, the network under Matter. Nodes route for each other."
             }
-            Link::BleMesh => "Flooding mesh over Bluetooth LE advertisements.",
+            Link::BleMesh => {
+                "Bluetooth SIG Mesh: messages flooded over advertisements and relayed by the nodes, Generic OnOff and Sensor models."
+            }
             Link::Zigbee => "Mesh over 802.15.4 with its own application layer.",
             Link::EspWifiMesh => "Espressif's tree of Wi-Fi nodes relaying to one root.",
         }
@@ -1796,7 +2066,22 @@ pub fn availability(link: Link, family: &str, cyw43: bool) -> Availability {
             "the chip has an 802.15.4 radio, but no Thread stack is generated for this part",
         ),
 
-        Link::BleMesh => NotHere("no maintained no_std Rust stack"),
+        Link::BleMesh if mesh_platform(family, cyw43).is_some() => Ready,
+        Link::BleMesh if family == "esp32s2" => NotHere("the ESP32-S2 has no Bluetooth radio"),
+        Link::BleMesh if family.starts_with("esp32") && ESP_BT.contains(&family) => Planned(
+            "the node keeps its sequence number in the flash store, generated on the ESP32-C3 alone among the ESPs",
+        ),
+        Link::BleMesh if family == "nrf54l15" || family == "nrf5340" => {
+            NotHere("the IDE does not generate Bluetooth for this part yet")
+        }
+        Link::BleMesh if nrf => Planned(
+            "a node scans all the time: it needs the SoftDevice Controller's multirole library and a flash store on the nRF",
+        ),
+        Link::BleMesh if family.starts_with("stm32wb") => {
+            NotHere("embassy-stm32-wpan is not published on crates.io")
+        }
+        Link::BleMesh if rp => NotHere("no radio on this board - the Pico W and Pico 2 W carry one"),
+        Link::BleMesh => NotHere("no Bluetooth radio on this chip"),
         Link::Zigbee => NotHere("no Rust Zigbee stack"),
         Link::EspWifiMesh if esp_wifi => NotHere(
             "ESP-IDF only (esp-idf-svc, std); projects here are no_std esp-hal - ESP-NOW is the mesh-capable link",
@@ -2142,6 +2427,11 @@ mod tests {
                         thread_platform(family),
                         "{family}"
                     ),
+                    Link::BleMesh => assert_eq!(
+                        a == Availability::Ready,
+                        mesh_platform(family, cyw43).is_some(),
+                        "{family}"
+                    ),
                     _ => assert_ne!(a, Availability::Ready, "{family} {link:?}"),
                 }
             }
@@ -2250,6 +2540,57 @@ mod tests {
         assert!(cfg.wifi);
         assert_eq!(cfg.esp_now, None);
         assert_eq!(cfg.sntp, None);
+    }
+
+    /// A key is exactly what the firmware's `hex16` takes, and no input - not
+    /// even a two-byte character where a hex digit pair starts - panics.
+    #[test]
+    fn a_mesh_key_is_32_ascii_hex_digits_and_nothing_panics() {
+        let k = "7dd7364cd842ad18c17c2b820c84c3d6";
+        assert_eq!(parse_mesh_key(k).map(|k| k[0]), Ok(0x7d));
+        assert_eq!(fmt_mesh_key(&parse_mesh_key(&k.to_uppercase()).unwrap()), k);
+        for bad in [
+            "",
+            " 7dd7364cd842ad18c17c2b820c84c3d6",
+            "+dd7364cd842ad18c17c2b820c84c3d6",
+            "7dd7364cd842ad18c17c2b820c84c3dg",
+            // 32 bytes, a character boundary off the pairs.
+            "7éd7364cd842ad18c17c2b820c84c3d",
+            "éééééééééééééééé",
+        ] {
+            assert!(parse_mesh_key(bad).is_err(), "{bad:?}");
+        }
+        let line = MeshNetwork { net_key: [1; 16], app_key: [2; 16], iv_index: 0x1234 }.to_line();
+        assert_eq!(MeshNetwork::from_line(&format!("  {line} ")).map(|n| n.iv_index), Ok(0x1234));
+        assert!(MeshNetwork::from_line("mesh1:aa:bb:cc:dd").is_err());
+        assert!(MeshNetwork::from_line(&line.replace(":00001234", ":+1234")).is_err());
+    }
+
+    /// The period the tab shows is the one the firmware publishes with.
+    #[test]
+    fn a_mesh_period_is_what_its_encoding_can_say() {
+        assert_eq!(
+            [0, 10, 63, 64, 75, 630, 631, 1_199, 1_200, 40_000].map(mesh_period_s),
+            [0, 10, 63, 60, 70, 630, 600, 600, 1_200, 37_800]
+        );
+    }
+
+    /// A Bluetooth Mesh switch carried onto a chip that does not generate it
+    /// blocks nothing there.
+    #[test]
+    fn a_stale_mesh_switch_blocks_nothing() {
+        use crate::panels::mcu_module::builtins;
+        use crate::panels::mcu_module::mcu::model::Runtime;
+        let mut c6 = builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.family == "esp32c6")
+            .expect("built-in C6")
+            .build_mcu();
+        c6.runtime = Runtime::Async;
+        c6.iot.ble_mesh = Some(BleMeshConfig::default());
+        c6.iot.thread = Some(ThreadConfig::default());
+        assert!(!thread_blocked(&c6));
+        assert!(active(&c6).is_some_and(|a| a.thread && !a.ble_mesh));
     }
 
     /// The mesh options are answered, never silently absent - that was the

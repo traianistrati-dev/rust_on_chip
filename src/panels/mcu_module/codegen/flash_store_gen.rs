@@ -792,7 +792,31 @@ const GEN_END_CFG: &str = "// <<< GENERATED END >>>";
 /// The generated-block lines in `main.rs` for `mcu`'s store - see
 /// [`init_lines`].
 pub fn init_lines_for(mcu: &Mcu) -> String {
-    init_lines(mcu.flash_store.as_ref(), platform_of(mcu))
+    let lines = init_lines(mcu.flash_store.as_ref(), platform_of(mcu));
+    if crate::panels::mcu_module::iot::active(mcu).is_some_and(|a| a.ble_mesh) {
+        shared_with_mesh(&lines)
+    } else {
+        lines
+    }
+}
+
+/// The flash handed over as Bluetooth Mesh's `Flash` instead: one handle the
+/// store and the mesh node both take (it is `Copy`), each writing its own
+/// items of the one map - the node keeps its sequence number there.
+fn shared_with_mesh(lines: &str) -> String {
+    let Some(at) = lines.find("    let mut flash = ") else {
+        return lines.to_owned();
+    };
+    let head = at + "    let mut flash = ".len();
+    let Some(end) = lines[head..].find(";\n") else {
+        return lines.to_owned();
+    };
+    format!(
+        "{}crate::pins::configs::ble_mesh::Flash::share({}){}",
+        &lines[..head],
+        &lines[head..head + end],
+        &lines[head + end..]
+    )
 }
 
 /// The generated-block lines in `main.rs`: the module in scope, and the flash

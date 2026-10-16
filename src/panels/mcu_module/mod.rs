@@ -2,6 +2,8 @@ pub mod aws_iot;
 #[cfg(test)]
 pub(crate) mod board_notes;
 #[cfg(test)]
+mod ble_mesh_core_tests;
+#[cfg(test)]
 mod http_core_tests;
 #[cfg(test)]
 mod mqtt_shadow_core_tests;

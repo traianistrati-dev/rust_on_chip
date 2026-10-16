@@ -1044,6 +1044,10 @@ pub fn ensure_iot_deps(
     let esp_now = active.is_some_and(|a| a.esp_now);
     let mqtt = active.is_some_and(|a| a.mqtt);
     let ble = active.is_some_and(|a| a.ble);
+    // Bluetooth Mesh: the same radio, controller and host crate as the Nordic
+    // UART link (never both), with scanning instead of GATT, and the crypto.
+    let ble_mesh = active.is_some_and(|a| a.ble_mesh);
+    let bluetooth = ble || ble_mesh;
     let thread = active.is_some_and(|a| a.thread);
     // TLS - MQTT's, HTTP's or both, through tls.rs: embedded-tls, on every
     // platform the station runs on.
@@ -1058,11 +1062,11 @@ pub fn ensure_iot_deps(
     let thread_nrf = thread && active.is_some_and(|a| a.platform == Platform::Nrf);
     // Wi-Fi on an ESP: the station or ESP-NOW; with Bluetooth too, `coex`.
     let wifi = esp && (station || esp_now);
-    let esp_ble = esp && ble;
+    let esp_ble = esp && bluetooth;
     let coex = wifi && esp_ble;
     // Bluetooth on trouble-host 0.6 (ESP, CYW43: bt-hci 0.8) or 0.8 (nRF:
     // nrf-sdc's bt-hci 0.10). One version cannot serve both.
-    let trouble06 = ble && active.is_some_and(|a| a.platform != Platform::Nrf);
+    let trouble06 = bluetooth && active.is_some_and(|a| a.platform != Platform::Nrf);
     let nrf_feature = active
         .filter(|a| a.ble && a.platform == Platform::Nrf)
         .and_then(|_| iot::nrf_ble_feature(family));
@@ -1242,8 +1246,12 @@ pub fn ensure_iot_deps(
     // 0.7, a crate apart from the 0.8 the IDE's channels use: its mutex is
     // named through a renamed dependency, which esp-sync and cyw43 already pull
     // in, so no new crate is built.
+    // A mesh node scans all the time - `scan` is what hands the advertising
+    // reports to its handler - and has no GATT server.
     let trouble = if nrf_feature.is_some() {
         "trouble-host = { version = \"0.8\", default-features = false, features = [\"peripheral\", \"gatt\", \"default-packet-pool\"] }"
+    } else if ble_mesh {
+        "trouble-host = { version = \"0.6\", default-features = false, features = [\"peripheral\", \"scan\", \"default-packet-pool\"] }"
     } else {
         "trouble-host = { version = \"0.6\", default-features = false, features = [\"gatt\", \"peripheral\", \"default-packet-pool\"] }"
     };
@@ -1260,6 +1268,18 @@ pub fn ensure_iot_deps(
         "embassy-sync-0-7 = { package = \"embassy-sync\", version = \"0.7\" }",
         sources,
     );
+    // Bluetooth Mesh's keys, network layer and transport: AES, AES-CCM and
+    // AES-CMAC of the cipher generation embedded-tls uses (aes 0.8), so a
+    // project with TLS builds no second AES.
+    s = ensure_dep(&s, "aes", ble_mesh, "aes = \"0.8\"", sources);
+    s = ensure_dep(
+        &s,
+        "ccm",
+        ble_mesh,
+        "ccm = { version = \"0.5\", default-features = false }",
+        sources,
+    );
+    s = ensure_dep(&s, "cmac", ble_mesh, "cmac = \"0.7\"", sources);
     // The nRF's controller: the SoftDevice Controller on the MPSL, bt-hci for
     // its vendor commands, rand_core for the RNG it is seeded from.
     let sdc = nrf_feature.map(|f| {
@@ -1282,13 +1302,15 @@ pub fn ensure_iot_deps(
         "nrf-mpsl = { version = \"0.4\", features = [\"critical-section-impl\"] }",
         sources,
     );
-    s = ensure_dep(
-        &s,
-        "bt-hci",
-        nrf_feature.is_some(),
-        "bt-hci = \"0.10\"",
-        sources,
-    );
+    // bt-hci: the nRF's for its controller's vendor commands; a mesh node's
+    // for the raw scan and advertising commands trouble-host 0.6 does not
+    // re-export - the 0.8 that esp-radio 0.18 and cyw43 0.7 already build.
+    let bt_hci = if nrf_feature.is_some() { "bt-hci = \"0.10\"" } else { "bt-hci = \"0.8\"" };
+    let want_bt_hci = nrf_feature.is_some() || ble_mesh;
+    s = ensure_dep(&s, "bt-hci", want_bt_hci, bt_hci, sources);
+    if want_bt_hci {
+        s = set_owned_dep_line(&s, "bt-hci", bt_hci);
+    }
     s = ensure_dep(
         &s,
         "rand_core",
@@ -5621,6 +5643,7 @@ mod iot_deps_tests {
             mqtt_client_cert: false,
             sntp: false,
             ble: false,
+            ble_mesh: false,
             thread: false,
             panic: false,
             http: false,
@@ -5700,6 +5723,7 @@ mod iot_deps_tests {
                 mqtt_client_cert: false,
                 sntp: true,
                 ble: false,
+                ble_mesh: false,
                 thread: false,
                 panic: false,
                 http: false,
@@ -5743,6 +5767,7 @@ mod iot_deps_tests {
             mqtt_client_cert: false,
             sntp: true,
             ble: false,
+            ble_mesh: false,
             thread: false,
             panic: false,
             http: false,
@@ -5778,6 +5803,7 @@ mod iot_deps_tests {
             mqtt_client_cert: false,
             sntp: false,
             ble: false,
+            ble_mesh: false,
             thread: false,
             panic: false,
             http: false,
@@ -5839,6 +5865,7 @@ mod iot_deps_tests {
             mqtt_client_cert: false,
             sntp: false,
             ble,
+            ble_mesh: false,
             thread: false,
             panic: false,
             http: false,

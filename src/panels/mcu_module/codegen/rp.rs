@@ -4029,13 +4029,13 @@ pub fn needs_radio(mcu: &Mcu) -> bool {
 /// Does the radio come up with its Bluetooth half (`new_with_bluetooth`, a
 /// fourth firmware, cyw43's `bluetooth` feature)? `pub` for the manifest.
 pub fn needs_bluetooth(mcu: &Mcu) -> bool {
-    iot_radio(mcu).is_some_and(|a| a.ble)
+    iot_radio(mcu).is_some_and(|a| a.bluetooth())
 }
 
 /// What the IoT tab runs on this board's CYW43: Wi-Fi, Bluetooth or both.
 fn iot_radio(mcu: &Mcu) -> Option<crate::panels::mcu_module::iot::Active> {
     use crate::panels::mcu_module::iot::{self, Platform};
-    iot::active(mcu).filter(|a| a.platform == Platform::Cyw43 && (a.station || a.ble))
+    iot::active(mcu).filter(|a| a.platform == Platform::Cyw43 && (a.station || a.bluetooth()))
 }
 
 /// TLS (MQTT's or HTTP's) on an RP2350: tls.rs draws its keys from the TRNG,
@@ -4091,7 +4091,7 @@ async fn cyw43_task(
     };
     // With Bluetooth, the radio comes up with its Bluetooth half too: a fourth
     // firmware, and the call that hands that half out.
-    let ble = iot.is_some_and(|a| a.ble);
+    let ble = iot.is_some_and(|a| a.bluetooth());
     let btfw = if ble {
         concat!(
             "    // The radio's Bluetooth half runs a firmware of its own, uploaded beside\n",
@@ -5692,6 +5692,143 @@ mod emit_async_for_manual_compile {
         }
         println!("wrote {}", dir.display());
         println!("target: {}", project.target);
+    }
+
+    /// Bluetooth Mesh on a W board: the Pico W alone (the LED on the radio
+    /// following the light's state), the Pico 2 W beside Wi-Fi and MQTT - the
+    /// mesh task, its bearer on the CYW43's Bluetooth half, the node and its
+    /// four models, and its sequence number in the flash store it shares,
+    /// through `build_cfg` and the manifest chain `app.rs` runs.
+    ///
+    /// %TEMP%\eide_rp2040w_mesh_check, %TEMP%\eide_rp2350w_mesh_check
+    #[test]
+    #[ignore = "writes projects to disk for a manual cross-compile"]
+    fn emit_rp_mesh_project() {
+        use crate::panels::mcu_module::codegen::flash_store_gen::{TAIL_SEED, in_files};
+        use crate::panels::mcu_module::codegen::iot_gen;
+        use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig};
+        use crate::panels::mcu_module::iot::{self, BleMeshConfig, MqttConfig, SntpConfig};
+        for (id, dir_name, wifi, node) in [
+            ("rp2040_pico_w", "eide_rp2040w_mesh_check", false, 3u8),
+            ("rp2350_pico2_w", "eide_rp2350w_mesh_check", true, 4u8),
+        ] {
+            let def = builtins::builtin_definitions()
+                .into_iter()
+                .find(|d| d.id == id)
+                .unwrap_or_else(|| panic!("built-in {id}"));
+            let mut mcu = def.build_mcu();
+            mcu.runtime = Runtime::Async;
+            mcu.pending_runtime = Runtime::Async;
+            for p in mcu.iter_all_pins_mut() {
+                if p.name == "WL_LED" {
+                    p.selected_function = PinFunction::GpioOutput;
+                }
+            }
+            mcu.reconcile_modules();
+            let platform = flash_store::platform_of(&mcu)
+                .unwrap_or_else(|why| panic!("[{id}] no store: {why}"));
+            mcu.flash_store = Some(FlashStoreConfig::default_on(&platform, &mcu.family));
+            mcu.iot.ble_mesh = Some(BleMeshConfig {
+                address: u16::from(node),
+                onoff_server: true,
+                onoff_client: true,
+                sensor_server: true,
+                sensor_client: true,
+                sensor_properties: vec![0x0054, 0x0059],
+                ..BleMeshConfig::default()
+            });
+            if wifi {
+                mcu.iot.wifi = true;
+                mcu.iot.mqtt = Some(MqttConfig::for_chip(id));
+                mcu.iot.sntp = Some(SntpConfig::default());
+            }
+            let active = iot::active(&mcu);
+            assert!(active.is_some_and(|a| a.ble_mesh), "{id}: Bluetooth Mesh on");
+
+            let mut used = String::from("        // Your main loop code here.\n");
+            if wifi {
+                used.push_str("        pins::configs::wifi::set_led(pins::configs::ble_mesh::onoff());\n");
+                used.push_str("        pins::configs::mqtt::publish(\"rustonchip/hello\", b\"hi\").await.ok();\n");
+            } else {
+                used.push_str("        wl_led.gpio_set(0, pins::configs::ble_mesh::onoff()).await;\n");
+            }
+            used.push_str("        pins::configs::ble_mesh::onoff_set(true).await.ok();\n");
+            used.push_str("        pins::configs::ble_mesh::onoff_set_to(0x0002, false).await.ok();\n");
+            used.push_str("        pins::configs::ble_mesh::onoff_get(Some(0x0002)).await.ok();\n");
+            used.push_str("        let st = pins::configs::ble_mesh::onoff_status().await;\n");
+            used.push_str("        let set = pins::configs::ble_mesh::onoff_changed().await;\n");
+            used.push_str("        pins::configs::ble_mesh::set_onoff(!set.on).await.ok();\n");
+            used.push_str("        pins::configs::ble_mesh::sensor_set(0x0054, 36.6).await.ok();\n");
+            used.push_str("        pins::configs::ble_mesh::sensor_publish().await.ok();\n");
+            used.push_str("        pins::configs::ble_mesh::sensor_get(Some(0x0002), None).await.ok();\n");
+            used.push_str("        let r = pins::configs::ble_mesh::sensor_reading().await;\n");
+            used.push_str("        let s = pins::configs::ble_mesh::stats();\n");
+            used.push_str("        let _ = (st.src, set.src, r.value(), s.seq, s.exclusive, pins::configs::ble_mesh::address());\n");
+            let main_rs = mcu
+                .fresh_main_rs()
+                .replacen("        // Your main loop code here.\n", &used, 1);
+            assert!(main_rs.contains(&used), "the user loop was seeded:\n{main_rs}");
+            assert!(main_rs.contains(TAIL_SEED), "the store's line:\n{main_rs}");
+            assert_eq!(main_rs.matches("cyw43::new_with_bluetooth(").count(), 1, "{main_rs}");
+            let share = "let mut flash = crate::pins::configs::ble_mesh::Flash::share(crate::pins::configs::flash_store_hal::RpFlash::new(p.FLASH));";
+            let start = "pins::configs::ble_mesh::start(_spawner, bt_device, Some(mac), flash);";
+            let (Some(a), Some(b)) = (main_rs.find(share), main_rs.find(start)) else {
+                panic!("{id}: the shared flash and the mesh start:\n{main_rs}");
+            };
+            assert!(a < b, "{id}: `flash` before the mesh takes it:\n{main_rs}");
+
+            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
+            let mut files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            let configs = mcu.config_files();
+            let sources = [main_rs.as_str()];
+            files.cargo_toml = project_gen::ensure_async_deps(
+                &files.cargo_toml,
+                true,
+                project_gen::async_flavor_for(&mcu.family, ""),
+                super::needs_async_usart(&mcu),
+                false,
+                false,
+                &sources,
+            );
+            files.cargo_toml = project_gen::ensure_cyw43_deps(
+                &files.cargo_toml,
+                super::needs_radio(&mcu),
+                super::needs_bluetooth(&mcu),
+                &sources,
+            );
+            files.cargo_toml =
+                project_gen::ensure_m0_atomics(&files.cargo_toml, true, &project.target, &sources);
+            files.cargo_toml = project_gen::ensure_flash_store_deps(
+                &files.cargo_toml,
+                in_files(&configs),
+                None,
+                &sources,
+            );
+            files.cargo_toml =
+                project_gen::ensure_iot_deps(&files.cargo_toml, active, "", &mcu.family, &sources);
+            for want in ["trouble-host = ", "bt-hci = \"0.8\"", "aes = ", "ccm = ", "cmac = ", "sequential-storage = "] {
+                assert!(files.cargo_toml.contains(want), "{id}: {want}:\n{}", files.cargo_toml);
+            }
+            let reservation = flash_store::memory_x_reservation(&mcu);
+            assert!(reservation.is_some(), "{id}: nothing reserved");
+            files.memory_x = project_gen::splice_memory_x_store(&files.memory_x, &project, reservation);
+            let mut user = mcu.pin_tree_files();
+            iot_gen::seed_test_mesh_keys(&mut user, node);
+            assert!(
+                user.iter().any(|(p, _)| p == "src/pins/configs/ble_mesh.rs"),
+                "{id}: ble_mesh.rs"
+            );
+            let dir = std::env::temp_dir().join(dir_name);
+            project_gen::clear_project_dir_keep_target(&dir);
+            project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
+                .expect("write rp mesh project");
+            let btfw = std::fs::metadata(dir.join("firmware").join("43439A0_btfw.bin"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            assert_eq!(btfw, 6_164, "43439A0_btfw.bin shipped whole");
+            println!("wrote {}", dir.display());
+            println!("target: {}", project.target);
+        }
     }
 }
 

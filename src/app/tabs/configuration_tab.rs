@@ -154,12 +154,19 @@ impl AppIde {
             ui.add_space(12.0);
 
             // Before the watchdogs, whose section can end the tab early.
+            let mesh = mcu.iot.ble_mesh.is_some()
+                && crate::panels::mcu_module::iot::mesh_platform(
+                    &family,
+                    crate::panels::mcu_module::iot::has_cyw43(mcu),
+                )
+                .is_some();
             flash_store_card(
                 ui,
                 &mut mcu.flash_store,
                 &family,
                 &store_platform,
                 &store_facts,
+                mesh,
             );
             ui.add_space(12.0);
 
@@ -300,6 +307,7 @@ fn flash_store_card(
     family: &str,
     platform: &Result<crate::panels::mcu_module::flash_store::Platform, String>,
     facts: &StoreFacts,
+    mesh: bool,
 ) {
     use crate::panels::mcu_module::flash_store::{FlashStoreConfig, Layout, Platform};
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -316,6 +324,15 @@ fn flash_store_card(
             ui.label(egui::RichText::new(format!("{}  FLASH STORE", ph::FLOPPY_DISK)).strong());
             ui.label(dim("settings kept in the flash the program runs from"));
         });
+        // The node's sequence number lives here: lost with a moved, resized
+        // or removed store, and a number sent again repeats its nonce.
+        if mesh {
+            ui.label(egui::RichText::new(if on {
+                "Bluetooth Mesh keeps the node's sequence number here (key 0xB0 of the map). Moving or resizing the store loses it: give the node a new address in the IoT tab afterwards, or it sends numbers its neighbours already heard."
+            } else {
+                "Bluetooth Mesh needs the store: the node keeps its sequence number in it, and sends nothing without it."
+            }).color(egui::Color32::from_rgb(230, 170, 80)));
+        }
         let platform = match platform {
             Ok(p) => *p,
             Err(why) => {

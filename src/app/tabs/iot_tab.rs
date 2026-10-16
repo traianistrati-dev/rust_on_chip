@@ -14,8 +14,8 @@ use crate::app::{AppIde, McuTab};
 use crate::panels::mcu_module::aws_iot;
 use crate::panels::mcu_module::codegen::iot_gen;
 use crate::panels::mcu_module::iot::{
-    self, Availability, BleConfig, EspNowConfig, HttpConfig, IotConfig, Link, MqttConfig, Platform,
-    SntpConfig, ThreadConfig,
+    self, Availability, BleConfig, BleMeshConfig, EspNowConfig, HttpConfig, IotConfig, Link,
+    MqttConfig, Platform, SntpConfig, ThreadConfig,
 };
 use crate::panels::mcu_module::mcu::model::Runtime;
 use eframe::egui;
@@ -59,6 +59,29 @@ impl AppIde {
                 family: family.clone(),
                 thread: iot::thread_platform(&family),
             };
+            // Bluetooth Mesh: where it is generated, the flash store it keeps its
+            // sequence number in, and the keys secrets.rs holds.
+            let secrets_file = self
+                .project_tree
+                .user_src_files
+                .iter()
+                .find(|(p, _)| p == iot_gen::SECRETS_PATH)
+                .map(|(_, c)| c.as_str());
+            let mesh = MeshFacts {
+                platform: iot::mesh_platform(&family, cyw43),
+                active: iot::active(mcu).is_some_and(|a| a.ble_mesh),
+                store_on: mcu.flash_store.is_some(),
+                store_platform: crate::panels::mcu_module::flash_store::platform_of(mcu).ok(),
+                keys: secrets_file.map(|c| iot_gen::MESH_SECRETS.map(|n| iot_gen::read_secret(c, n))),
+                lines: secrets_file.map_or([false; 3], |c| {
+                    iot_gen::MESH_SECRETS.map(|n| iot_gen::has_secret_line(c, n))
+                }),
+                // The stash and the key fill belong to this project and chip:
+                // another project must not get this node's address back.
+                stash: egui::Id::new(("iot_stash_ble_mesh", project_dir.clone(), chip_id.clone())),
+                fill: egui::Id::new(("iot_mesh_fill", project_dir.clone())),
+                unsaved: project_dir.is_none(),
+            };
             let is_async = matches!(mcu.runtime, Runtime::Async);
             // Errata the radio walks into (ESP32 ADC2): shown here as well as
             // on the pads, since this is where the switch that causes it is.
@@ -80,6 +103,7 @@ impl AppIde {
             let foreign: Vec<&'static str> = [
                 (iot_gen::WIFI, platform),
                 (iot_gen::BLE, ble.platform),
+                (iot_gen::BLE_MESH, mesh.platform),
                 // Thread's radio is the Bluetooth one on every Thread chip.
                 (iot_gen::THREAD, ble.platform.filter(|_| ble.thread)),
                 // tls.rs carries the radio's randomness and (Pico) heap.
@@ -123,6 +147,7 @@ impl AppIde {
                         links: mcu.iot.wifi
                             || mcu.iot.esp_now.is_some()
                             || mcu.iot.ble.is_some()
+                            || mcu.iot.ble_mesh.is_some()
                             || mcu.iot.thread.is_some(),
                         active: active.is_some(),
                         sinks: active.map(|a| iot_gen::panic_sinks(mcu, a)),
@@ -147,7 +172,9 @@ impl AppIde {
                         .find(|(p, _)| *p == path)
                         .map(|(_, c)| c.as_str())
                 };
-                let coex = mcu.iot.ble.is_some() && (mcu.iot.wifi || mcu.iot.esp_now.is_some());
+                let coex = (mcu.iot.ble.is_some()
+                    || (mcu.iot.ble_mesh.is_some() && iot::mesh_platform(&family, cyw43).is_some()))
+                    && (mcu.iot.wifi || mcu.iot.esp_now.is_some());
                 let want = mcu.iot.mqtt.as_ref().is_some_and(|m| m.tls);
                 TlsFacts {
                     available: iot::tls_available(&family, coex),
@@ -236,7 +263,9 @@ impl AppIde {
                     .iter()
                     .find(|(p, _)| *p == format!("src/pins/configs/{}", iot_gen::HTTP_CA))
                     .map(|(_, c)| c.clone());
-                let coex = mcu.iot.ble.is_some() && (mcu.iot.wifi || mcu.iot.esp_now.is_some());
+                let coex = (mcu.iot.ble.is_some()
+                    || (mcu.iot.ble_mesh.is_some() && iot::mesh_platform(&family, cyw43).is_some()))
+                    && (mcu.iot.wifi || mcu.iot.esp_now.is_some());
                 let mqtt_tls = iot::active(mcu).is_some_and(|a| a.mqtt_tls);
                 HttpFacts {
                     https: iot::https_available(&family, coex, mqtt_tls),
@@ -287,6 +316,28 @@ impl AppIde {
             let files = &mut self.project_tree.user_src_files;
             let mut changed = false;
             let mut tls_actions: Vec<TlsAction> = Vec::new();
+            let mut mesh_actions: Vec<MeshAction> = Vec::new();
+            // Bluetooth Mesh's keys: random ones once, right after the link was
+            // switched on, when secrets.rs has its three lines - on disk at once,
+            // like a client key: the network exists nowhere else. Not later: a
+            // key emptied by hand, or a secrets.rs lost with a clone, is the
+            // user's to fill (Join, New network), not a new network behind
+            // their back.
+            let fill = ui.data_mut(|d| d.get_temp::<bool>(mesh.fill)).unwrap_or(false);
+            if fill
+                && mesh.active
+                && let Some(keys) = &mesh.keys
+                && mesh.lines.iter().all(|l| *l)
+            {
+                for (name, key) in iot_gen::MESH_SECRETS.iter().zip(keys) {
+                    if key.as_deref() == Some("")
+                        && let Ok(k) = iot::new_mesh_key()
+                    {
+                        tls_actions.push(TlsAction::Secret(*name, iot::fmt_mesh_key(&k)));
+                    }
+                }
+                ui.data_mut(|d| d.remove_temp::<bool>(mesh.fill));
+            }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(4.0);
@@ -343,8 +394,11 @@ impl AppIde {
                     cyw43,
                     platform,
                     &ble,
+                    &mesh,
                     is_async,
                     &how,
+                    &mut mesh_actions,
+                    &mut tls_actions,
                 );
                 if stale_wifi {
                     ui.add_space(4.0);
@@ -417,6 +471,17 @@ impl AppIde {
                     });
                 }
             });
+            for action in mesh_actions {
+                match action {
+                    MeshAction::EnableStore => {
+                        if let Some(p) = &mesh.store_platform {
+                            mcu.flash_store = Some(
+                                crate::panels::mcu_module::flash_store::FlashStoreConfig::default_on(p, &family),
+                            );
+                        }
+                    }
+                }
+            }
             // What the TLS section changed: secrets.rs (on disk at once) and
             // mqtt_ca.rs.
             for action in tls_actions {
@@ -622,6 +687,35 @@ struct BleFacts {
     thread: bool,
 }
 
+/// What the Bluetooth Mesh card needs to know.
+struct MeshFacts {
+    /// The radio Bluetooth Mesh is generated for, `None` where it is not.
+    platform: Option<Platform>,
+    /// The node's code is generated right now (`iot::active`).
+    active: bool,
+    /// The Configuration tab's flash store is switched on (generated or not).
+    store_on: bool,
+    /// The store's platform on this chip, to switch it on with its defaults.
+    store_platform: Option<crate::panels::mcu_module::flash_store::Platform>,
+    /// NetKey, AppKey and DevKey as secrets.rs holds them: `None` while there
+    /// is no secrets.rs; a `None` key, a line missing or not a plain string.
+    keys: Option<[Option<String>; 3]>,
+    /// secrets.rs declares each key, plain string or not (`has_secret_line`).
+    lines: [bool; 3],
+    /// Where the switch keeps the node while it is off, per project and chip.
+    stash: egui::Id,
+    /// Set on a switch-on: the keys are filled once secrets.rs has them.
+    fill: egui::Id,
+    /// No project folder yet: a stashed node may be another project's.
+    unsaved: bool,
+}
+
+/// What the Bluetooth Mesh card asks of the rest of the tab.
+enum MeshAction {
+    /// The Configuration tab's flash store on, with its defaults.
+    EnableStore,
+}
+
 /// The links, each with its state on this chip. Wi-Fi, ESP-NOW and Bluetooth
 /// have a switch where they are generated; the rest say why not.
 #[allow(clippy::too_many_arguments)]
@@ -633,8 +727,11 @@ fn link_card(
     cyw43: bool,
     platform: Option<Platform>,
     ble: &BleFacts,
+    mesh: &MeshFacts,
     is_async: bool,
     how: &super::iot_diagrams::Facts,
+    mesh_actions: &mut Vec<MeshAction>,
+    secret_actions: &mut Vec<TlsAction>,
 ) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(egui::RichText::new(format!("{}  LINK", ph::SHARE_NETWORK)).strong());
@@ -665,15 +762,45 @@ fn link_card(
                     }
                 } else if link == Link::Ble && avail == Availability::Ready {
                     let mut on = cfg.ble.is_some();
-                    // The radio is Thread's while it is on: switch that off first.
-                    let free = on || !thread_holds;
+                    // The radio is Thread's while it is on, its Bluetooth
+                    // Mesh's: switch that off first.
+                    let mesh_holds = cfg.ble_mesh.is_some() && mesh.platform.is_some();
+                    let free = on || (!thread_holds && !mesh_holds);
                     if ui
                         .add_enabled(free, egui::Checkbox::new(&mut on, ""))
                         .on_hover_text("Generate a Bluetooth LE peripheral with the Nordic UART Service: send(), receive(), connected()")
-                        .on_disabled_hover_text("Thread has the radio: switch it off first")
+                        .on_disabled_hover_text(if mesh_holds {
+                            "Bluetooth Mesh has the radio's Bluetooth: switch it off first"
+                        } else {
+                            "Thread has the radio: switch it off first"
+                        })
                         .changed()
                     {
                         toggle_kept(ui, &mut cfg.ble, on, "iot_stash_ble");
+                    }
+                } else if link == Link::BleMesh && avail == Availability::Ready {
+                    let mut on = cfg.ble_mesh.is_some();
+                    let free = on || cfg.ble.is_none();
+                    if ui
+                        .add_enabled(free, egui::Checkbox::new(&mut on, ""))
+                        .on_hover_text("Generate a Bluetooth Mesh node: Generic OnOff and Sensor models, the network's keys in secrets.rs")
+                        .on_disabled_hover_text("The Nordic UART link has the radio's Bluetooth: switch it off first")
+                        .changed()
+                    {
+                        let fresh = mesh.unsaved || ui.data_mut(|d| d.get_temp::<BleMeshConfig>(mesh.stash)).is_none();
+                        toggle_kept_id(ui, &mut cfg.ble_mesh, on, mesh.stash);
+                        if on {
+                            ui.data_mut(|d| d.insert_temp(mesh.fill, true));
+                        }
+                        // A node switched on for the first time gets an
+                        // address of its own: two boards set up the same way
+                        // still differ.
+                        if on
+                            && fresh
+                            && let Some(m) = cfg.ble_mesh.as_mut()
+                        {
+                            m.address = iot::new_mesh_address();
+                        }
                     }
                 } else if link == Link::Thread && avail == Availability::Ready {
                     let mut on = cfg.thread.is_some();
@@ -687,6 +814,18 @@ fn link_card(
                     {
                         toggle_kept(ui, &mut cfg.thread, on, "iot_stash_thread");
                     }
+                } else if link == Link::BleMesh && cfg.ble_mesh.is_some() {
+                    // Carried over from a chip that generates it: here it can
+                    // only be switched off.
+                    let mut on = true;
+                    if ui
+                        .checkbox(&mut on, "")
+                        .on_hover_text("Not generated on this chip: switch it off")
+                        .changed()
+                        && !on
+                    {
+                        cfg.ble_mesh = None;
+                    }
                 } else {
                     ui.add_enabled(false, egui::Checkbox::new(&mut false, ""));
                 }
@@ -697,6 +836,16 @@ fn link_card(
                         Some(("not with Thread", "one radio: Thread has it"))
                     }
                     Link::Ble if ble.usb_blocks => Some(("not with USB", "unwire USB to generate it")),
+                    Link::Ble if cfg.ble_mesh.is_some() && mesh.platform.is_some() && cfg.ble.is_none() => {
+                        Some(("not with Bluetooth Mesh", "one Bluetooth host: Bluetooth Mesh has it"))
+                    }
+                    Link::BleMesh if cfg.ble.is_some() => {
+                        Some(("not with Bluetooth LE", "one Bluetooth host: the Nordic UART link has it"))
+                    }
+                    Link::BleMesh if cfg.ble_mesh.is_some() && !mesh.store_on => Some((
+                        "needs the flash store",
+                        "Configuration tab: the node's sequence number must outlive a reset",
+                    )),
                     Link::Thread if cfg.ble.is_some() => {
                         Some(("not with Bluetooth", "one radio: Bluetooth has it"))
                     }
@@ -740,19 +889,23 @@ fn link_card(
             }
             super::iot_diagrams::how_ble(ui, how);
         }
+        let mesh_here = mesh.platform.is_some() && cfg.ble_mesh.is_some() && cfg.ble.is_none();
+        if mesh_here && let Some(m) = cfg.ble_mesh.as_mut() {
+            ble_mesh_body(ui, m, mesh, wifi_here, mesh_actions, secret_actions);
+        }
         let wifi_taken = platform == Some(Platform::Esp) && (cfg.wifi || cfg.esp_now.is_some());
         let thread_here = ble.thread && cfg.thread.is_some() && cfg.ble.is_none() && !wifi_taken;
         if thread_here && let Some(th) = cfg.thread.as_mut() {
             thread_body(ui, th, ble);
             super::iot_diagrams::how_thread(ui, how);
         }
-        if wifi_here || ble_here || thread_here {
+        if wifi_here || ble_here || thread_here || mesh_here {
             ui.add_space(6.0);
             // Thread on an ESP is esp-radio too: its receive queue is on the heap.
             let esp_radio = (wifi_here && platform == Some(Platform::Esp))
-                || ((ble_here || thread_here) && ble.platform == Some(Platform::Esp));
+                || ((ble_here || thread_here || mesh_here) && ble.platform == Some(Platform::Esp));
             if esp_radio {
-                let coex = ble_here && wifi_here;
+                let coex = (ble_here || mesh_here) && wifi_here;
                 ui.horizontal(|ui| {
                     ui.label("Heap");
                     ui.add_enabled(
@@ -795,7 +948,7 @@ fn link_card(
                 )));
             }
             // Bluetooth that USB blocks waits for more than the runtime.
-            if !is_async && (wifi_here || thread_here || !ble.usb_blocks) {
+            if !is_async && (wifi_here || thread_here || mesh_here || !ble.usb_blocks) {
                 ui.label(dim("Kept, and generated once the runtime is Async."));
             }
         }
@@ -893,6 +1046,323 @@ fn ble_body(ui: &mut egui::Ui, b: &mut BleConfig, ble: &BleFacts, wifi: bool) {
     });
 }
 
+const MESH_USAGE: &str = "pins::configs::ble_mesh::onoff_set(true).await.ok();";
+
+/// A u16 typed in hex (`0xC000`, or without the prefix): what the field
+/// shows follows the value unless it is being typed in.
+fn hex_u16(ui: &mut egui::Ui, salt: &str, v: &mut u16) {
+    let id = ui.id().with(salt);
+    let mut text = ui
+        .data_mut(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| format!("0x{:04X}", *v));
+    let r = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .font(egui::TextStyle::Monospace)
+            .desired_width(64.0),
+    );
+    if r.changed() {
+        let t = text.trim();
+        let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+        if let Ok(n) = u16::from_str_radix(t, 16) {
+            *v = n;
+        }
+    }
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, text));
+    } else {
+        ui.data_mut(|d| d.remove_temp::<String>(id));
+    }
+}
+
+/// Bluetooth Mesh's settings: the node, its models and their groups, and the
+/// network - its keys in secrets.rs, one line to carry to the other projects.
+fn ble_mesh_body(
+    ui: &mut egui::Ui,
+    m: &mut BleMeshConfig,
+    mesh: &MeshFacts,
+    wifi: bool,
+    actions: &mut Vec<MeshAction>,
+    secrets: &mut Vec<TlsAction>,
+) {
+    ui.indent("ble_mesh", |ui| {
+        ui.add_space(4.0);
+        ui.label(dim(concat!(
+            "A Bluetooth SIG Mesh node the IDE provisions: the network's keys are in secrets.rs, ",
+            "no phone or provisioner takes part. Every node of a network gets the same network ",
+            "line (below) and an address of its own; the models talk in groups. For your own ",
+            "projects: a new stack, not qualified by the Bluetooth SIG, and phone apps (nRF Mesh) ",
+            "cannot join it yet - they provision over GATT, which a later phase brings."
+        )));
+        // Off: the tab can switch it on. On but not generated (the runtime):
+        // the Async banner above says why.
+        if !mesh.store_on {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(warn(concat!(
+                    "Needs the flash store (Configuration tab): the node keeps its sequence ",
+                    "number there. One that forgets it on a reset is ignored by its neighbours ",
+                    "until it passes what they heard last."
+                )));
+                if mesh.store_platform.is_some() && ui.small_button("Switch the flash store on").clicked() {
+                    actions.push(MeshAction::EnableStore);
+                }
+            });
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Address"));
+            hex_u16(ui, "iot_mesh_address", &mut m.address);
+            if ui
+                .small_button("Random")
+                .on_hover_text("Another unicast address, picked at random")
+                .clicked()
+            {
+                m.address = iot::new_mesh_address();
+            }
+        });
+        if let Some(p) = iot::mesh_address_problem(m.address) {
+            ui.label(warn(p));
+        }
+        ui.label(dim("Different on every node: two nodes on one address drop each other's messages."));
+        ui.horizontal(|ui| {
+            ui.add_sized([90.0, 18.0], egui::Label::new("Default TTL"));
+            ui.add(crate::panels::drag_value(ui, &mut m.default_ttl).range(0..=127));
+            ui.checkbox(&mut m.relay, "Relay").on_hover_text(
+                "Pass on what the neighbours send (TTL 2 and up), so the network reaches past one hop",
+            );
+        });
+        if let Some(p) = iot::mesh_ttl_problem(m.default_ttl) {
+            ui.label(warn(p));
+        }
+
+        ui.add_space(4.0);
+        ui.label("Models");
+        ui.checkbox(&mut m.onoff_server, "Generic OnOff Server - a light")
+            .on_hover_text("onoff_changed(), onoff(), set_onoff()");
+        ui.checkbox(&mut m.onoff_client, "Generic OnOff Client - a switch")
+            .on_hover_text("onoff_set(), onoff_set_to(), onoff_get(), onoff_status()");
+        if m.onoff_server || m.onoff_client {
+            ui.horizontal(|ui| {
+                ui.add_sized([90.0, 18.0], egui::Label::new("OnOff group"));
+                hex_u16(ui, "iot_mesh_onoff_group", &mut m.onoff_group);
+                ui.label(dim("lights listen and publish here, switches send here"));
+            });
+            if let Some(p) = iot::mesh_group_problem(m.onoff_group) {
+                ui.label(warn(p));
+            }
+        }
+        ui.checkbox(&mut m.sensor_server, "Sensor Server - values the others read")
+            .on_hover_text("sensor_set(), sensor_publish(); the Sensor Setup Server comes with it");
+        if m.sensor_server {
+            ui.indent("iot_mesh_properties", |ui| {
+                for (id, name, unit) in iot::MESH_SENSOR_PROPERTIES {
+                    let mut on = m.sensor_properties.contains(&id);
+                    if ui
+                        .checkbox(&mut on, format!("0x{id:04X} {name}"))
+                        .on_hover_text(unit)
+                        .changed()
+                    {
+                        if on {
+                            m.sensor_properties.push(id);
+                        } else {
+                            m.sensor_properties.retain(|p| *p != id);
+                        }
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Publish every");
+                    ui.add(
+                        crate::panels::drag_value(ui, &mut m.sensor_period_s)
+                            .range(0..=37_800)
+                            .suffix(" s"),
+                    );
+                });
+                let actual = iot::mesh_period_s(m.sensor_period_s);
+                if actual != u32::from(m.sensor_period_s) {
+                    ui.label(dim(format!(
+                        "published every {actual} s: the period goes in steps of 1 s up to 63 s, of 10 s up to 630 s, then of 10 minutes"
+                    )));
+                }
+                ui.label(dim("0: only when asked (sensor_get) or on sensor_publish()."));
+            });
+        }
+        ui.checkbox(&mut m.sensor_client, "Sensor Client - reads them")
+            .on_hover_text("sensor_get(), sensor_reading()");
+        if m.sensor_server || m.sensor_client {
+            ui.horizontal(|ui| {
+                ui.add_sized([90.0, 18.0], egui::Label::new("Sensor group"));
+                hex_u16(ui, "iot_mesh_sensor_group", &mut m.sensor_group);
+            });
+            if let Some(p) = iot::mesh_group_problem(m.sensor_group) {
+                ui.label(warn(p));
+            }
+        }
+        if let Some(p) = iot::mesh_models_problem(m) {
+            ui.label(warn(p));
+        }
+
+        ui.add_space(4.0);
+        ui.label("Network");
+        if let Some(e) = ui.data_mut(|d| d.get_temp::<String>(egui::Id::new("iot_secrets_write_error"))) {
+            ui.label(warn(e));
+        }
+        match &mesh.keys {
+            _ if !mesh.active => {
+                ui.label(dim("secrets.rs gets the network's keys once Bluetooth Mesh is generated."));
+            }
+            None => {
+                ui.label(dim("secrets.rs gets the network's keys with the next regeneration."));
+            }
+            Some(keys) => {
+                // A key line the tab may write: a plain string, or none yet.
+                let writable = |i: usize| keys[i].is_some() || !mesh.lines[i];
+                for (i, (name, key)) in iot_gen::MESH_SECRETS.iter().zip(keys).enumerate() {
+                    match key.as_deref() {
+                        None if mesh.lines[i] => {
+                            ui.label(warn(format!(
+                                "{name} in secrets.rs is not a plain string - edit it there"
+                            )));
+                        }
+                        None => {
+                            ui.label(dim(format!("{name} goes into secrets.rs with the next regeneration")));
+                        }
+                        Some("") => {}
+                        Some(k) => {
+                            if let Err(e) = iot::parse_mesh_key(k) {
+                                ui.label(warn(format!("{name} in secrets.rs: {e}")));
+                            }
+                        }
+                    }
+                }
+                let empty = |i: usize| keys[i].as_deref() == Some("");
+                if (0..3).any(empty) {
+                    ui.label(warn(concat!(
+                        "secrets.rs has empty network keys: Join a network below, or make a New ",
+                        "network. Until then the build stops at them (hex16)."
+                    )));
+                }
+                let parsed = |i: usize| keys[i].as_deref().and_then(|k| iot::parse_mesh_key(k).ok());
+                if let (Some(net_key), Some(app_key)) = (parsed(0), parsed(1)) {
+                    let line = iot::MeshNetwork { net_key, app_key, iv_index: m.iv_index }.to_line();
+                    ui.horizontal(|ui| {
+                        // The keys are secrets: the start of each, enough to
+                        // tell two networks apart.
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "mesh1:{}...:{}...:{:08x}",
+                                &line[6..14],
+                                &line[39..47],
+                                m.iv_index
+                            ))
+                            .monospace(),
+                        );
+                        if ui
+                            .button(format!("{} Copy network", ph::COPY))
+                            .on_hover_text("The NetKey, the AppKey and the IV index, as one line to paste into another project")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(line.clone());
+                        }
+                    });
+                }
+                ui.label(dim(concat!(
+                    "The DevKey (MESH_DEV_KEY) is this node's alone - it stays when a network ",
+                    "line is pasted."
+                )));
+                let id = ui.id().with("iot_mesh_join");
+                let mut text: String = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .hint_text("mesh1:...")
+                            .desired_width(220.0),
+                    );
+                    let line = iot::MeshNetwork::from_line(&text);
+                    if ui
+                        .add_enabled(line.is_ok(), egui::Button::new("Join"))
+                        .on_hover_text("This node into the network of the line: its keys into secrets.rs, its IV index here")
+                        .clicked()
+                        && let Ok(n) = line
+                    {
+                        if writable(0) {
+                            secrets.push(TlsAction::Secret(iot_gen::MESH_SECRETS[0], iot::fmt_mesh_key(&n.net_key)));
+                        }
+                        if writable(1) {
+                            secrets.push(TlsAction::Secret(iot_gen::MESH_SECRETS[1], iot::fmt_mesh_key(&n.app_key)));
+                        }
+                        // A node with no DevKey yet gets its own.
+                        if empty(2)
+                            && let Ok(k) = iot::new_mesh_key()
+                        {
+                            secrets.push(TlsAction::Secret(iot_gen::MESH_SECRETS[2], iot::fmt_mesh_key(&k)));
+                        }
+                        m.iv_index = n.iv_index;
+                        text.clear();
+                    }
+                    if let (false, Err(e)) = (text.trim().is_empty(), line) {
+                        ui.label(warn(e));
+                    }
+                });
+                ui.data_mut(|d| d.insert_temp(id, text));
+                let confirm = ui.id().with("iot_mesh_new_network");
+                let asked = ui.data_mut(|d| d.get_temp::<bool>(confirm)).unwrap_or(false);
+                ui.horizontal(|ui| {
+                    if !asked {
+                        if ui
+                            .small_button("New network")
+                            .on_hover_text("New NetKey and AppKey: every other node then needs the new line")
+                            .clicked()
+                        {
+                            ui.data_mut(|d| d.insert_temp(confirm, true));
+                        }
+                    } else {
+                        ui.label(warn("New keys: the other nodes stop hearing this one until they join again."));
+                        if ui.small_button("Make new keys").clicked() {
+                            // The NetKey and the AppKey; the DevKey only when
+                            // this node has none.
+                            for (i, name) in iot_gen::MESH_SECRETS.iter().enumerate() {
+                                if (i < 2 || empty(2))
+                                    && writable(i)
+                                    && let Ok(k) = iot::new_mesh_key()
+                                {
+                                    secrets.push(TlsAction::Secret(*name, iot::fmt_mesh_key(&k)));
+                                }
+                            }
+                            m.iv_index = 0;
+                            ui.data_mut(|d| d.insert_temp(confirm, false));
+                        }
+                        if ui.small_button("Cancel").clicked() {
+                            ui.data_mut(|d| d.insert_temp(confirm, false));
+                        }
+                    }
+                });
+            }
+        }
+
+        match mesh.platform {
+            Some(Platform::Esp) if wifi => {
+                ui.label(dim(concat!(
+                    "Beside Wi-Fi or ESP-NOW, esp-radio's coexistence (`coex`) shares the antenna: ",
+                    "a mesh node scans all the time, and misses more while Wi-Fi has the air."
+                )));
+            }
+            Some(Platform::Cyw43) => {
+                ui.label(dim(concat!(
+                    "A fourth radio firmware, 43439A0_btfw.bin, is written into firmware/ with the ",
+                    "project. The node advertises on a random static address made of the radio's MAC."
+                )));
+            }
+            _ => {}
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(MESH_USAGE).monospace().size(11.0));
+            if ui.button(ph::COPY).on_hover_text("Copy the line").clicked() {
+                ui.ctx().copy_text(MESH_USAGE.to_owned());
+            }
+        });
+    });
+}
+
 const THREAD_USAGE: &str =
     "pins::configs::thread::send_to(addr, pins::configs::thread::UDP_PORT, b\"21.5\").await.ok();";
 
@@ -975,7 +1445,16 @@ fn toggle_kept<T: Clone + Default + Send + Sync + 'static>(
     on: bool,
     stash: &str,
 ) {
-    let id = egui::Id::new(stash);
+    toggle_kept_id(ui, slot, on, egui::Id::new(stash));
+}
+
+/// `toggle_kept` with the stash under an id of the caller's.
+fn toggle_kept_id<T: Clone + Default + Send + Sync + 'static>(
+    ui: &egui::Ui,
+    slot: &mut Option<T>,
+    on: bool,
+    id: egui::Id,
+) {
     if on {
         *slot = Some(ui.data_mut(|d| d.get_temp::<T>(id)).unwrap_or_default());
     } else if let Some(old) = slot.take() {

@@ -2074,12 +2074,16 @@ mod emit_for_manual_compile {
         // `EIDE_ESP_SNTP=1` adds SNTP to any mode and `EIDE_ESP_P384=1` builds
         // HTTPS's P-384 checks: a board test reaching real servers, whose
         // dates are checked and whose ECDSA Let's Encrypt chains need P-384.
+        // `mesh` = Bluetooth Mesh alone with all four models (and the flash
+        // store it keeps its sequence number in), `mesh+all` = the same beside
+        // `all` - coexistence, the scan beside Wi-Fi.
         let iot_mode = std::env::var("EIDE_ESP_IOT").ok();
         if let Some(mode) = iot_mode.as_deref() {
             use crate::panels::mcu_module::iot::{
-                BleConfig, EspNowConfig, HttpConfig, MqttConfig, SntpConfig, ThreadConfig,
+                BleConfig, BleMeshConfig, EspNowConfig, HttpConfig, MqttConfig, SntpConfig,
+                ThreadConfig,
             };
-            let all = matches!(mode, "all" | "ble+all");
+            let all = matches!(mode, "all" | "ble+all" | "mesh+all");
             mcu.iot.wifi = matches!(mode, "wifi" | "mqtt" | "mqtts" | "http" | "https" | "awshttps" | "awsmqtt") || all;
             if matches!(mode, "http" | "https" | "awshttps") || all {
                 let aws = mode == "awshttps";
@@ -2099,13 +2103,28 @@ mod emit_for_manual_compile {
             if mode == "thread" {
                 mcu.iot.thread = Some(ThreadConfig::default());
             }
+            if matches!(mode, "mesh" | "mesh+all") {
+                mcu.iot.ble_mesh = Some(BleMeshConfig {
+                    address: 0x0002,
+                    onoff_server: true,
+                    onoff_client: true,
+                    sensor_server: true,
+                    sensor_client: true,
+                    sensor_properties: vec![0x004F, 0x004C, 0x004E],
+                    ..BleMeshConfig::default()
+                });
+                if mcu.flash_store.is_none() {
+                    use crate::panels::mcu_module::flash_store::FlashStoreConfig;
+                    mcu.flash_store = Some(FlashStoreConfig::default_for(&chip));
+                }
+            }
             if matches!(mode, "mqtt" | "mqtts") || all {
                 let mut m = MqttConfig::for_chip(&chip);
                 m.subscribe = vec!["rustonchip/cmd".into(), "rustonchip/#".into()];
                 // TLS where the chip can carry it: asked for anywhere else, it
                 // generates no MQTT at all (never the password in clear), and
                 // the loop below calls MQTT.
-                let coex = mode == "ble+all";
+                let coex = matches!(mode, "ble+all" | "mesh+all");
                 m.tls = (mode == "mqtts" || all)
                     && crate::panels::mcu_module::iot::tls_available(&mcu.family, coex).is_ok();
                 // The C3's TLS row also builds embedded-tls's P-384 checks.
@@ -2146,12 +2165,21 @@ mod emit_for_manual_compile {
 
         let mut main_rs = mcu.fresh_main_rs();
         if let Some(mode) = iot_mode.as_deref() {
-            let all = matches!(mode, "all" | "ble+all");
+            let all = matches!(mode, "all" | "ble+all" | "mesh+all");
             let ble = matches!(mode, "ble" | "ble+espnow" | "ble+all");
+            let mesh = matches!(mode, "mesh" | "mesh+all");
             assert_eq!(
                 main_rs.contains("esp_radio::wifi::new(peripherals.WIFI"),
-                !matches!(mode, "ble" | "thread"),
+                !matches!(mode, "ble" | "thread" | "mesh"),
                 "the Wi-Fi radio exactly when a Wi-Fi link is on:\n{main_rs}"
+            );
+            assert_eq!(
+                main_rs.contains("pins::configs::ble_mesh::start(_spawner, ble, None, flash);")
+                    && main_rs.contains(
+                        "let mut flash = crate::pins::configs::ble_mesh::Flash::share(esp_storage::FlashStorage::new(peripherals.FLASH));"
+                    ),
+                mesh,
+                "Bluetooth Mesh, on the shared flash, exactly when it is on:\n{main_rs}"
             );
             assert_eq!(
                 main_rs.contains("pins::configs::http::start(_spawner, net_stack);"),
@@ -2165,7 +2193,7 @@ mod emit_for_manual_compile {
             );
             assert_eq!(
                 main_rs.contains("BleConnector::new(peripherals.BT"),
-                ble,
+                ble || mesh,
                 "the Bluetooth controller exactly when it is on:\n{main_rs}"
             );
             // The user's loop calls everything the files offer, as a user
@@ -2188,6 +2216,23 @@ mod emit_for_manual_compile {
                 used.push_str("        if pins::configs::ble::connected() {\n");
                 used.push_str("            pins::configs::ble::send(&packet.data).await.ok();\n");
                 used.push_str("        }\n");
+            }
+            if mesh {
+                // Every call of the four models, as a light, a switch, a
+                // sensor and a reader would make them.
+                used.push_str("        pins::configs::ble_mesh::onoff_set(true).await.ok();\n");
+                used.push_str("        pins::configs::ble_mesh::onoff_set_to(0x0003, false).await.ok();\n");
+                used.push_str("        pins::configs::ble_mesh::onoff_get(None).await.ok();\n");
+                used.push_str("        let st = pins::configs::ble_mesh::onoff_status().await;\n");
+                used.push_str("        let set = pins::configs::ble_mesh::onoff_changed().await;\n");
+                used.push_str("        pins::configs::ble_mesh::set_onoff(!set.on).await.ok();\n");
+                used.push_str("        let _ = (st.src, st.on, set.src, pins::configs::ble_mesh::onoff());\n");
+                used.push_str("        pins::configs::ble_mesh::sensor_set(0x004F, 21.5).await.ok();\n");
+                used.push_str("        pins::configs::ble_mesh::sensor_publish().await.ok();\n");
+                used.push_str("        pins::configs::ble_mesh::sensor_get(None, Some(0x004F)).await.ok();\n");
+                used.push_str("        let r = pins::configs::ble_mesh::sensor_reading().await;\n");
+                used.push_str("        let s = pins::configs::ble_mesh::stats();\n");
+                used.push_str("        let _ = (r.src, r.property, r.value(), s.seq, s.rx_frames, pins::configs::ble_mesh::address());\n");
             }
             if mode == "thread" {
                 used.push_str("        pins::configs::thread::wait_attached().await;\n");
@@ -2275,9 +2320,13 @@ mod emit_for_manual_compile {
             main_rs = main_rs.replacen("        // Your main loop code here.\n", &used, 1);
         }
         if store.is_some() {
+            // Bluetooth Mesh shares the store's flash: the same driver, wrapped.
             assert!(
                 main_rs
-                    .contains("let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);"),
+                    .contains("let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);")
+                    || main_rs.contains(
+                        "let mut flash = crate::pins::configs::ble_mesh::Flash::share(esp_storage::FlashStorage::new(peripherals.FLASH));"
+                    ),
                 "no flash in main.rs:\n{main_rs}"
             );
             assert!(
@@ -2472,6 +2521,10 @@ mod emit_for_manual_compile {
                 .find(|(p, _)| p == iot_gen::SECRETS_PATH)
                 .expect("secrets.rs with Thread");
             secrets.1 = iot_gen::write_secret(&secrets.1, iot_gen::THREAD_DATASET, DATASET);
+        }
+        // Bluetooth Mesh with real keys: empty ones fail the build on purpose.
+        if iot_active.is_some_and(|a| a.ble_mesh) {
+            crate::panels::mcu_module::codegen::iot_gen::seed_test_mesh_keys(&mut user, 2);
         }
         let dir = std::env::temp_dir().join(format!("eide_esp_check_{chip}"));
         project_gen::clear_project_dir_keep_target(&dir);

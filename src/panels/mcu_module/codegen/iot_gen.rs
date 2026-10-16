@@ -45,8 +45,8 @@
 //!   it. A link switched on later only ADDS its missing lines ([`topped_up`]).
 
 use crate::panels::mcu_module::iot::{
-    self, Active, BleConfig, EspNowConfig, IotConfig, IpConfig, MqttConfig, Platform, SntpConfig,
-    ThreadConfig,
+    self, Active, BleConfig, BleMeshConfig, EspNowConfig, IotConfig, IpConfig, MqttConfig,
+    Platform, SntpConfig, ThreadConfig,
 };
 use crate::panels::mcu_module::mcu::Mcu;
 
@@ -56,6 +56,7 @@ pub const MQTT: &str = "mqtt.rs";
 pub const SNTP: &str = "sntp.rs";
 pub const ESPNOW: &str = "espnow.rs";
 pub const BLE: &str = "ble.rs";
+pub const BLE_MESH: &str = "ble_mesh.rs";
 pub const THREAD: &str = "thread.rs";
 pub const MQTT_LINK: &str = "mqtt_link.rs";
 pub const MQTT_CA: &str = "mqtt_ca.rs";
@@ -88,6 +89,24 @@ const SNTP_TAIL: &str = include_str!("iot_templates/sntp.rs");
 const ESPNOW_TAIL: &str = include_str!("iot_templates/espnow.rs");
 const BLE_TAIL: &str = include_str!("iot_templates/ble.rs");
 const BLE_NRF_TAIL: &str = include_str!("iot_templates/ble_nrf.rs");
+/// ble_mesh.rs: the bearer and the API on trouble-host 0.6, then the node
+/// itself and its models - which the IDE's own tests run
+/// (`ble_mesh_core_tests`). The ESP's adds what its flash store's `verify`
+/// needs of the shared flash.
+const BLE_MESH_TAIL_ESP: &str = concat!(
+    include_str!("iot_templates/ble_mesh.rs"),
+    include_str!("iot_templates/ble_mesh_esp.rs"),
+    include_str!("iot_templates/ble_mesh_core.rs"),
+    include_str!("iot_templates/ble_mesh_models.rs")
+);
+const BLE_MESH_TAIL_CYW43: &str = concat!(
+    include_str!("iot_templates/ble_mesh.rs"),
+    include_str!("iot_templates/ble_mesh_core.rs"),
+    include_str!("iot_templates/ble_mesh_models.rs")
+);
+/// What only the ESP's ble_mesh.rs carries - how [`foreign_radio_file`]
+/// tells the two apart.
+const BLE_MESH_ESP_MARK: &str = "impl embedded_storage::Storage for Flash";
 const THREAD_NRF_TAIL: &str = include_str!("iot_templates/thread_nrf.rs");
 const THREAD_ESP_TAIL: &str = include_str!("iot_templates/thread_esp.rs");
 const LINK_PLAIN_TAIL: &str = include_str!("iot_templates/mqtt_link_plain.rs");
@@ -330,10 +349,12 @@ const LEGACY_TAILS: [(&str, &str); 18] = [
 ];
 
 /// Every editable half, current and legacy, for `is_pristine`.
-const TAILS: [(&str, &str); 34] = [
+const TAILS: [(&str, &str); 36] = [
     (PANIC, PANIC_TAIL),
     (BLE, BLE_TAIL),
     (BLE, BLE_NRF_TAIL),
+    (BLE_MESH, BLE_MESH_TAIL_ESP),
+    (BLE_MESH, BLE_MESH_TAIL_CYW43),
     (THREAD, THREAD_NRF_TAIL),
     (THREAD, THREAD_ESP_TAIL),
     (MQTT_LINK, LINK_PLAIN_TAIL),
@@ -392,6 +413,7 @@ pub fn runtime_free(name: &str) -> bool {
             | SNTP
             | ESPNOW
             | BLE
+            | BLE_MESH
             | THREAD
             | SECRETS
             | PANIC
@@ -419,8 +441,11 @@ pub const THREAD_DATASET: &str = "THREAD_DATASET";
 /// be undone: the broker knows the board by the certificate made for it.
 pub const CLIENT_SECRETS: [&str; 2] = ["MQTT_CLIENT_CERT", "MQTT_CLIENT_KEY"];
 
+/// Bluetooth Mesh's: the network's NetKey and AppKey, the node's DevKey.
+pub const MESH_SECRETS: [&str; 3] = iot::MESH_SECRETS;
+
 /// Every secret the tab edits.
-pub const SECRET_NAMES: [&str; 7] = [
+pub const SECRET_NAMES: [&str; 10] = [
     WIFI_SECRETS[0],
     WIFI_SECRETS[1],
     WIFI_SECRETS[2],
@@ -428,6 +453,9 @@ pub const SECRET_NAMES: [&str; 7] = [
     THREAD_DATASET,
     CLIENT_SECRETS[0],
     CLIENT_SECRETS[1],
+    MESH_SECRETS[0],
+    MESH_SECRETS[1],
+    MESH_SECRETS[2],
 ];
 
 /// What a fresh `secrets.rs` holds for the Wi-Fi station: every value empty.
@@ -443,6 +471,13 @@ pub fn secrets_body_for(station: bool, thread: bool) -> String {
 
 /// The same, with the client certificate's lines when `client`.
 pub fn secrets_body_with(station: bool, thread: bool, client: bool) -> String {
+    secrets_body_all(station, thread, client, false)
+}
+
+/// The same, with Bluetooth Mesh's keys when `mesh` - empty like the rest:
+/// the tab puts random ones in the moment it sees them, and an empty key
+/// fails the build (`hex16`) rather than joining a network of zeros.
+pub fn secrets_body_all(station: bool, thread: bool, client: bool, mesh: bool) -> String {
     let mut o = String::new();
     o.push_str("// Credentials for the IoT tab. This file is listed in .gitignore, so it stays\n");
     o.push_str("// on this machine: edit the values here or in the tab, never in a commit.\n");
@@ -450,7 +485,8 @@ pub fn secrets_body_with(station: bool, thread: bool, client: bool) -> String {
         .iter()
         .filter(|_| station)
         .chain(std::iter::once(&THREAD_DATASET).filter(|_| thread))
-        .chain(CLIENT_SECRETS.iter().filter(|_| client));
+        .chain(CLIENT_SECRETS.iter().filter(|_| client))
+        .chain(MESH_SECRETS.iter().filter(|_| mesh));
     for name in names {
         o.push_str(&format!("pub const {name}: &str = \"\";\n"));
     }
@@ -480,10 +516,10 @@ pub fn config_files(cfg: &IotConfig, active: Active, family: &str) -> Vec<(Strin
         out.push((NET.to_owned(), net_file(&cfg.ip, active)));
         out.push((WIFI.to_owned(), wifi_file(active.platform)));
     }
-    if active.station || active.thread {
+    if active.station || active.thread || active.ble_mesh {
         out.push((
             SECRETS.to_owned(),
-            secrets_body_with(active.station, active.thread, active.client_cert()),
+            secrets_body_all(active.station, active.thread, active.client_cert(), active.ble_mesh),
         ));
     }
     if let (true, Some(m)) = (active.mqtt, &cfg.mqtt) {
@@ -514,6 +550,9 @@ pub fn config_files(cfg: &IotConfig, active: Active, family: &str) -> Vec<(Strin
     }
     if active.tls() {
         out.push((TLS.to_owned(), tls_file(active, family)));
+    }
+    if let (true, Some(m)) = (active.ble_mesh, &cfg.ble_mesh) {
+        out.push((BLE_MESH.to_owned(), ble_mesh_file(m, active.platform)));
     }
     out
 }
@@ -1209,6 +1248,76 @@ fn ble_file(b: &BleConfig, platform: Platform) -> String {
     o
 }
 
+/// `ble_mesh.rs`: the node's address, the network's IV index, the models and
+/// their groups - numbers under fixed names (the editable half builds the
+/// node of them) - and the radio's and the shared flash's types, which are
+/// all that differs between the ESP and the Pico W.
+fn ble_mesh_file(m: &BleMeshConfig, platform: Platform) -> String {
+    let mut o = String::new();
+    o.push_str(GEN_BEGIN_CFG);
+    o.push('\n');
+    o.push_str("// Bluetooth Mesh (from the IoT tab) — auto-updated; edit it in the tab.\n");
+    o.push_str("// The models switched off leave parts of the node below unused.\n");
+    o.push_str("#![allow(dead_code)]\n");
+    match platform {
+        Platform::Cyw43 => {
+            o.push_str("/// The radio's Bluetooth half, which `main.rs` hands to `start`: the\n");
+            o.push_str("/// CYW43 beside the chip.\n");
+            o.push_str("pub type Radio = cyw43::bluetooth::BtDriver<'static>;\n");
+            o.push_str("/// The flash the node keeps its sequence number in: the flash store's.\n");
+            o.push_str("pub type StoreFlash = crate::pins::configs::flash_store_hal::RpFlash;\n");
+        }
+        _ => {
+            o.push_str("/// The radio's Bluetooth half, which `main.rs` hands to `start`: the\n");
+            o.push_str("/// chip's own (esp-radio).\n");
+            o.push_str("pub type Radio = esp_radio::ble::controller::BleConnector<'static>;\n");
+            o.push_str("/// The flash the node keeps its sequence number in: the flash store's.\n");
+            o.push_str("pub type StoreFlash = esp_storage::FlashStorage<'static>;\n");
+        }
+    }
+    let address = if iot::mesh_address_problem(m.address).is_none() { m.address } else { 0x0001 };
+    let ttl = if iot::mesh_ttl_problem(m.default_ttl).is_none() { m.default_ttl } else { iot::DEFAULT_MESH_TTL };
+    let group = |g: u16, fallback: u16| if iot::mesh_group_problem(g).is_none() { g } else { fallback };
+    o.push_str("/// This node's unicast address - different on every node.\n");
+    o.push_str(&format!("pub const ADDRESS: u16 = 0x{address:04X};\n"));
+    o.push_str("/// The network's IV index - the same on every node.\n");
+    o.push_str(&format!("pub const IV_INDEX: u32 = 0x{:08X};\n", m.iv_index));
+    o.push_str("/// Relay what the neighbours send.\n");
+    o.push_str(&format!("pub const RELAY: bool = {};\n", m.relay));
+    o.push_str("/// The TTL the node sends with: 0 (neighbours only) or 2..=127 hops.\n");
+    o.push_str(&format!("pub const DEFAULT_TTL: u8 = {ttl};\n"));
+    o.push_str("/// The models on the node's element, after the Configuration Server.\n");
+    o.push_str(&format!("pub const HAS_ONOFF_SERVER: bool = {};\n", m.onoff_server));
+    o.push_str(&format!("pub const HAS_ONOFF_CLIENT: bool = {};\n", m.onoff_client));
+    o.push_str(&format!("pub const HAS_SENSOR_SERVER: bool = {};\n", m.sensor_server));
+    o.push_str(&format!("pub const HAS_SENSOR_CLIENT: bool = {};\n", m.sensor_client));
+    o.push_str("/// The group the Generic OnOff messages travel in.\n");
+    o.push_str(&format!("pub const ONOFF_GROUP: u16 = 0x{:04X};\n", group(m.onoff_group, 0xC000)));
+    o.push_str("/// The group the Sensor messages travel in.\n");
+    o.push_str(&format!("pub const SENSOR_GROUP: u16 = 0x{:04X};\n", group(m.sensor_group, 0xC001)));
+    // Only properties the template knows, each once, at most SENSORS_MAX -
+    // and none without the Sensor Server.
+    let mut props: Vec<u16> = Vec::new();
+    for p in m.sensor_properties.iter().filter(|_| m.sensor_server) {
+        if iot::mesh_property_name(*p).is_some() && !props.contains(p) && props.len() < iot::MESH_SENSORS_MAX {
+            props.push(*p);
+        }
+    }
+    let list = props.iter().map(|p| format!("0x{p:04X}")).collect::<Vec<_>>().join(", ");
+    o.push_str("/// The Sensor Server's properties (Mesh Device Property ids).\n");
+    o.push_str(&format!("pub const SENSOR_PROPERTIES: &[u16] = &[{list}];\n"));
+    o.push_str("/// The Sensor Server publishes its values every this many seconds (0: only\n");
+    o.push_str("/// when asked).\n");
+    o.push_str(&format!("pub const SENSOR_PERIOD_S: u16 = {};\n", m.sensor_period_s));
+    o.push_str(GEN_END_CFG);
+    o.push('\n');
+    o.push_str(&lf(match platform {
+        Platform::Cyw43 => BLE_MESH_TAIL_CYW43,
+        _ => BLE_MESH_TAIL_ESP,
+    }));
+    o
+}
+
 /// `thread.rs`: the UDP port. Which network is the dataset in `secrets.rs`.
 /// The editable half per radio: openthread 0.4 on an nRF, 0.2 on an ESP -
 /// the same API for the user's code.
@@ -1552,6 +1661,18 @@ pub(crate) fn seed_test_identity(files: &mut [(String, String)]) {
     }
 }
 
+/// Bluetooth Mesh's keys, for the harnesses: the Mesh Profile's sample NetKey
+/// and AppKey (nothing secret), and a DevKey made of `node`. An empty key
+/// fails the build (`hex16`), which is what the tab's own keys prevent.
+#[cfg(test)]
+pub(crate) fn seed_test_mesh_keys(files: &mut [(String, String)], node: u8) {
+    if let Some(secrets) = files.iter_mut().find(|(p, _)| p == SECRETS_PATH) {
+        secrets.1 = write_secret(&secrets.1, MESH_SECRETS[0], "7dd7364cd842ad18c17c2b820c84c3d6");
+        secrets.1 = write_secret(&secrets.1, MESH_SECRETS[1], "63964771734fbd76e3b40519d1d94a48");
+        secrets.1 = write_secret(&secrets.1, MESH_SECRETS[2], &format!("{node:02x}{}", "5a".repeat(15)));
+    }
+}
+
 /// An edited mqtt_link.rs from before the client certificate, which the IDE
 /// left: with the certificate on, its generated block calls what that tail
 /// does not have.
@@ -1588,6 +1709,11 @@ pub fn entropy_link_left(link: Option<&str>, trng: bool) -> Option<&'static str>
 pub fn foreign_radio_file(name: &str, content: &str, platform: Platform) -> bool {
     match name {
         BLE => content.contains("nrf_sdc::") != (platform == Platform::Nrf),
+        // The block names each radio's crates: read the tail.
+        BLE_MESH => {
+            let tail = tail_of(content).unwrap_or_else(|| lf(content));
+            tail.contains(BLE_MESH_ESP_MARK) != (platform == Platform::Esp)
+        }
         THREAD => content.contains("openthread::nrf::") != (platform == Platform::Nrf),
         // The radio's half is tls.rs's now: read the tail, since the Pico's
         // block names embassy-rp itself.
@@ -1622,8 +1748,8 @@ fn tail_of(content: &str) -> Option<String> {
 pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
     for name in [
-        NET, WIFI, MQTT, MQTT_LINK, MQTT_CA, SNTP, ESPNOW, BLE, THREAD, SECRETS, PANIC, TLS, HTTP,
-        HTTP_CA,
+        NET, WIFI, MQTT, MQTT_LINK, MQTT_CA, SNTP, ESPNOW, BLE, BLE_MESH, THREAD, SECRETS, PANIC, TLS,
+        HTTP, HTTP_CA,
     ] {
         if files.iter().any(|(n, _)| n == name) {
             continue;
@@ -2168,7 +2294,7 @@ fn esp_panic_start(code: String, lines: &str) -> String {
 /// Wi-Fi (or ESP-NOW) and Bluetooth at once: coexistence, which needs esp-radio's
 /// `coex` and a larger heap.
 pub fn coex(active: Active) -> bool {
-    active.ble && (active.station || active.esp_now)
+    active.bluetooth() && (active.station || active.esp_now)
 }
 
 /// The heap lines for `active`. Bluetooth beside Wi-Fi takes two regions, the
@@ -2261,6 +2387,14 @@ fn esp_main_with(code: String, cfg: &IotConfig, active: Active, family: &str) ->
         );
         block.push_str("    pins::configs::ble::start(_spawner, ble, None);\n");
     }
+    if active.ble_mesh {
+        block.push_str("    // Bluetooth Mesh: the chip's own controller, on its public address. It\n");
+        block.push_str("    // shares `flash` with the flash store, for its sequence number.\n");
+        block.push_str(
+            "    let ble = esp_radio::ble::controller::BleConnector::new(peripherals.BT, Default::default()).unwrap();\n",
+        );
+        block.push_str("    pins::configs::ble_mesh::start(_spawner, ble, None, flash);\n");
+    }
     if active.station || active.esp_now {
         block.push_str(
             "    let (mut wifi_controller, radio) = esp_radio::wifi::new(peripherals.WIFI, Default::default()).unwrap();\n",
@@ -2335,6 +2469,16 @@ pub fn cyw43_main_lines(active: Active) -> String {
         );
         o.push_str("    let mac = control.address().await;\n");
         o.push_str("    pins::configs::ble::start(_spawner, bt_device, Some(mac));\n");
+    }
+    if active.ble_mesh {
+        o.push_str(
+            "    // Bluetooth Mesh: the radio's Bluetooth half goes to the mesh task, on an\n",
+        );
+        o.push_str(
+            "    // address made of the radio's Wi-Fi MAC; `flash` it shares with the flash store.\n",
+        );
+        o.push_str("    let mac = control.address().await;\n");
+        o.push_str("    pins::configs::ble_mesh::start(_spawner, bt_device, Some(mac), flash);\n");
     }
     if active.station {
         o.push_str(
@@ -4593,6 +4737,7 @@ mod template_number_tests {
             mqtt_client_cert: false,
             sntp: true,
             ble: false,
+            ble_mesh: false,
             thread: false,
             panic: false,
             http: false,

@@ -65,6 +65,9 @@ pub(super) struct Facts {
     /// Bluetooth kept off an nRF by USB; Thread kept off by another link.
     ble_usb: bool,
     thread_blocked: bool,
+    /// The chip's Bluetooth Mesh radio, and what keeps Mesh off it.
+    mesh: Option<Platform>,
+    mesh_blocked: Option<&'static str>,
     numbers: &'static TemplateNumbers,
 }
 
@@ -82,6 +85,8 @@ impl Facts {
             esp_now: iot::availability(Link::EspNow, &mcu.family, cyw43) == Availability::Ready,
             ble_usb: iot::nrf_ble_blocked_by_usb(mcu),
             thread_blocked: iot::thread_blocked(mcu),
+            mesh: iot::mesh_platform(&mcu.family, cyw43),
+            mesh_blocked: iot::mesh_blocked(mcu),
             numbers: iot_gen::template_numbers(),
         }
     }
@@ -216,6 +221,40 @@ pub(super) fn overview_bands(f: &Facts) -> Vec<Band> {
             tip:
                 "ble.rs advertises the name; a phone connects, writes and subscribes - no pairing."
                     .into(),
+        });
+    }
+    if f.mesh.is_some()
+        && let Some(m) = &f.iot.ble_mesh
+    {
+        let mut groups = Vec::new();
+        if m.onoff_server || m.onoff_client {
+            groups.push(format!("on/off 0x{:04X}", m.onoff_group));
+        }
+        if m.sensor_server || m.sensor_client {
+            groups.push(format!("sensor 0x{:04X}", m.sensor_group));
+        }
+        link.push(Item {
+            name: "Bluetooth Mesh".into(),
+            file: Some(iot_gen::BLE_MESH),
+            detail: format!(
+                "node 0x{:04X}{}",
+                m.address,
+                if m.relay { ", relays" } else { "" }
+            ),
+            remote: if groups.is_empty() {
+                "the mesh".into()
+            } else {
+                format!("mesh groups: {}", groups.join(", "))
+            },
+            blocked: f.missing(f.on(|a| a.ble_mesh), || {
+                f.mesh_blocked.unwrap_or("not generated").into()
+            }),
+            tip: concat!(
+                "ble_mesh.rs: a node the IDE provisioned (its keys in secrets.rs). It sends ",
+                "and hears mesh packets over advertising, relays them when Relay is on, and ",
+                "keeps its sequence number in the flash store."
+            )
+            .into(),
         });
     }
     if f.thread
@@ -365,6 +404,27 @@ pub(super) fn overview_bands(f: &Facts) -> Vec<Band> {
     }
     if f.on(|a| a.thread) {
         code.push(api("thread::send_to / receive / role", iot_gen::THREAD));
+    }
+    if f.on(|a| a.ble_mesh)
+        && let Some(m) = &f.iot.ble_mesh
+    {
+        // The model's own call: the light hears, the switch sends, the
+        // sensor sets, the reader asks.
+        let calls: Vec<&str> = [
+            (m.onoff_server, "onoff_changed"),
+            (m.onoff_client, "onoff_set"),
+            (m.sensor_server, "sensor_set"),
+            (m.sensor_client, "sensor_get"),
+        ]
+        .into_iter()
+        .filter_map(|(on, call)| on.then_some(call))
+        .collect();
+        let calls = if calls.is_empty() {
+            "stats".to_owned()
+        } else {
+            calls.join(" / ")
+        };
+        code.push(api(&format!("ble_mesh::{calls}"), iot_gen::BLE_MESH));
     }
 
     [
@@ -1138,6 +1198,72 @@ mod tests {
         mcu.iot.sntp = Some(SntpConfig::default());
         mcu.iot.http = Some(HttpConfig::default());
         mcu
+    }
+
+    /// Bluetooth Mesh on a C3, with the flash store it keeps its sequence
+    /// number in when `store`.
+    fn c3_mesh(store: bool) -> Mcu {
+        use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig};
+        let mut mcu = board("esp32c3", Runtime::Async);
+        mcu.iot.ble_mesh = Some(crate::panels::mcu_module::iot::BleMeshConfig::default());
+        if store {
+            let p = flash_store::platform_of(&mcu).expect("the C3 has a flash store");
+            mcu.flash_store = Some(FlashStoreConfig::default_on(&p, &mcu.family));
+        }
+        mcu
+    }
+
+    /// Mesh is a link of its own: alone, it draws the link and your calls -
+    /// never "switch a link on".
+    #[test]
+    fn mesh_alone_draws_its_link_and_your_calls() {
+        let mut mcu = c3_mesh(true);
+        let f = Facts::of(&mcu);
+        assert!(f.on(|a| a.ble_mesh), "generated");
+        let bands = overview_bands(&f);
+        let layers: Vec<Layer> = bands.iter().map(|b| b.layer).collect();
+        assert_eq!(layers, vec![Layer::Code, Layer::Link], "{bands:#?}");
+        let mesh = item(&bands, Layer::Link, "Bluetooth Mesh");
+        assert!(mesh.blocked.is_none() && mesh.file == Some(iot_gen::BLE_MESH));
+        assert_eq!(mesh.detail, "node 0x0001, relays");
+        assert_eq!(mesh.remote, "mesh groups: on/off 0xC000");
+        item(&bands, Layer::Code, "ble_mesh::onoff_changed");
+
+        // The calls follow the models.
+        let m = mcu.iot.ble_mesh.as_mut().unwrap();
+        m.onoff_server = false;
+        m.onoff_client = true;
+        m.sensor_client = true;
+        let bands = overview_bands(&Facts::of(&mcu));
+        item(&bands, Layer::Code, "ble_mesh::onoff_set / sensor_get");
+        assert_eq!(
+            item(&bands, Layer::Link, "Bluetooth Mesh").remote,
+            "mesh groups: on/off 0xC000, sensor 0xC001"
+        );
+    }
+
+    /// Switched on and held back: orange, with the generator's reason.
+    #[test]
+    fn mesh_says_what_keeps_it_off() {
+        let why = |mcu: &Mcu| {
+            let bands = overview_bands(&Facts::of(mcu));
+            let calls = band(&bands, Layer::Code).map_or(&[][..], |b| &b.items[..]);
+            assert!(
+                !calls.iter().any(|i| i.name.starts_with("ble_mesh::")),
+                "{calls:?}"
+            );
+            item(&bands, Layer::Link, "Bluetooth Mesh")
+                .blocked
+                .clone()
+                .unwrap_or_default()
+        };
+        assert!(why(&c3_mesh(false)).contains("flash store"));
+        let mut nus = c3_mesh(true);
+        nus.iot.ble = Some(BleConfig::default());
+        assert!(why(&nus).contains("Nordic UART"));
+        let mut blocking = c3_mesh(true);
+        blocking.runtime = Runtime::Blocking;
+        assert!(why(&blocking).contains("Async"));
     }
 
     #[test]

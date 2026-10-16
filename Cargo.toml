@@ -29,6 +29,8 @@ roxmltree = "0.21.1"
 # Cargo.toml, so comments, ordering and line endings have to survive. Already in
 # the lockfile transitively, so this costs no extra build.
 toml_edit  = "0.25"
+# Bluetooth Mesh keys made for a project (already in the tree through eframe).
+getrandom  = "0.3"
 
 # Decoding the images attached to Virtual Module notes. Already in the tree -
 # eframe pulls `image` 0.25 through arboard, with png and bmp - so this adds no
@@ -81,6 +83,11 @@ libc = "0.2.189"
 
 [dev-dependencies]
 tempfile = "3.8"
+# The Bluetooth Mesh template's crypto, at the versions the firmware uses
+# (the cipher generation of embedded-tls): `ble_mesh_core_tests`.
+aes  = "=0.8.4"
+ccm  = { version = "=0.5.0", default-features = false }
+cmac = "=0.7.2"
 
 [profile.dev.package."*"]
 opt-level = 2

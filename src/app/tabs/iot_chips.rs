@@ -19,6 +19,10 @@ const USB_WIRED: &str = "not while USB is wired: both need the CLOCK_POWER vecto
 const THREAD_BESIDE_WIFI: &str =
     "alone on the radio: not beside Wi-Fi, ESP-NOW or Bluetooth (the other link's switch wins)";
 const THREAD_BESIDE_BLE: &str = "alone on the radio: not beside Bluetooth (its switch wins)";
+const MESH_BESIDE_BLE: &str =
+    "one Bluetooth host: not beside the Nordic UART link (its switch wins)";
+const MESH_NEEDS_STORE: &str =
+    "needs the flash store (Configuration tab): it keeps the node's sequence number there";
 const HTTPS_TIGHT: &str =
     "beside MQTT over TLS about 15 KB of stack is left: it links, but was never run on a board";
 const SUB_GHZ: &str = "its radio is sub-GHz (LoRa, FSK), which carries none of these links";
@@ -30,6 +34,7 @@ pub(super) enum Column {
     EspNow,
     Ble,
     Thread,
+    BleMesh,
     Mqtt,
     MqttTls,
     Http,
@@ -38,11 +43,12 @@ pub(super) enum Column {
 }
 
 impl Column {
-    pub(super) const ALL: [Column; 9] = [
+    pub(super) const ALL: [Column; 10] = [
         Column::Wifi,
         Column::EspNow,
         Column::Ble,
         Column::Thread,
+        Column::BleMesh,
         Column::Mqtt,
         Column::MqttTls,
         Column::Http,
@@ -56,6 +62,7 @@ impl Column {
             Column::EspNow => "ESP-NOW",
             Column::Ble => "Bluetooth LE",
             Column::Thread => "Thread",
+            Column::BleMesh => "Bluetooth Mesh",
             Column::Mqtt => "MQTT",
             Column::MqttTls => "MQTT + TLS",
             Column::Http => "HTTP",
@@ -71,6 +78,7 @@ impl Column {
             Column::EspNow => Some(Link::EspNow),
             Column::Ble => Some(Link::Ble),
             Column::Thread => Some(Link::Thread),
+            Column::BleMesh => Some(Link::BleMesh),
             _ => None,
         }
     }
@@ -104,6 +112,7 @@ pub(super) fn cell(column: Column, family: &str, cyw43: bool) -> Cell {
                 ]),
                 Column::Thread if wifi => notes([Some(THREAD_BESIDE_WIFI), None, None]),
                 Column::Thread => notes([Some(THREAD_BESIDE_BLE), None, None]),
+                Column::BleMesh => notes([Some(MESH_BESIDE_BLE), Some(MESH_NEEDS_STORE), None]),
                 _ => Cell::Yes(Vec::new()),
             },
             Availability::Planned(why) => Cell::Later(why),
@@ -371,9 +380,10 @@ fn body(ui: &mut egui::Ui, t: &Table, current: &str) {
 mod tests {
     use super::*;
     use crate::panels::mcu_module::builtin_definitions;
+    use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig};
     use crate::panels::mcu_module::iot::{
-        Active, BleConfig, EspNowConfig, HttpConfig, IotConfig, MqttConfig, SntpConfig,
-        ThreadConfig,
+        Active, BleConfig, BleMeshConfig, EspNowConfig, HttpConfig, IotConfig, MqttConfig,
+        SntpConfig, ThreadConfig,
     };
     use crate::panels::mcu_module::mcu::model::Runtime;
 
@@ -441,6 +451,26 @@ mod tests {
                 on(&|i| i.thread = Some(ThreadConfig::default())),
                 |a| a.thread,
             );
+            // Bluetooth Mesh keeps its sequence number in the flash store: on
+            // with it, as the tab switches it - and the notes are the
+            // combinations the generator drops.
+            let mesh = |ble: bool, store: bool| {
+                let mut mcu = base.clone();
+                mcu.iot.ble_mesh = Some(BleMeshConfig::default());
+                if ble {
+                    mcu.iot.ble = Some(BleConfig::default());
+                }
+                if let (true, Ok(p)) = (store, flash_store::platform_of(&mcu)) {
+                    mcu.flash_store = Some(FlashStoreConfig::default_on(&p, &mcu.family));
+                }
+                iot::active(&mcu)
+            };
+            has(Column::BleMesh, mesh(false, true), |a| a.ble_mesh);
+            if yes(&cells, Column::BleMesh) {
+                assert!(!mesh(true, true).is_some_and(|a| a.ble_mesh), "{id}: Mesh beside the Nordic UART link");
+                assert!(!mesh(false, false).is_some_and(|a| a.ble_mesh), "{id}: Mesh without the flash store");
+                assert_eq!(notes(&cells, Column::BleMesh), 2, "{id}: Bluetooth Mesh");
+            }
             let wifi = |i: &mut IotConfig| i.wifi = true;
             has(
                 Column::Mqtt,
@@ -563,9 +593,10 @@ mod tests {
             );
         }
         let never: Vec<Link> = t.never.iter().map(|(l, _)| *l).collect();
-        assert_eq!(never, [Link::BleMesh, Link::Zigbee, Link::EspWifiMesh]);
+        assert_eq!(never, [Link::Zigbee, Link::EspWifiMesh]);
         // Asked of a chip that can carry it: the ESP's reason, not "only on an ESP".
-        assert!(t.never[2].1.contains("ESP-IDF only"), "{}", t.never[2].1);
+        let esp = t.never.iter().find(|(l, _)| *l == Link::EspWifiMesh).map(|(_, why)| why.as_str());
+        assert!(esp.is_some_and(|why| why.contains("ESP-IDF only")), "{esp:?}");
     }
 
     /// A cell's reason never names a radio the chip has not: availability's

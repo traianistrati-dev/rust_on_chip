@@ -363,6 +363,14 @@ $ALL_CASES = @(
     @{ n = "ESP32-C3 BLE + ESP-NOW, station off"; t = "emit_esp32c3_project"; e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble+espnow" }; q = $true; fam = "esp"; lk = $true }
     @{ n = "ESP32-C6 BLE + ESP-NOW, station off"; t = "emit_esp32c3_project"; e = @{ EIDE_ESP_CHIP = "esp32c6"; EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "ble+espnow" }; q = $false; fam = "esp"; lk = $true }
 
+    # Bluetooth Mesh (the IDE's own node on trouble-host 0.6, scanning through
+    # raw HCI commands): alone on the C3 with all four models and the flash
+    # store its sequence number lives in - the `Flash` handle the store and
+    # the node share - and beside everything else with `coex`. Linked: the
+    # bearer's HCI commands and the AES crates only show at the link.
+    @{ n = "ESP32-C3 Bluetooth Mesh";       t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mesh" }; q = $true; fam = "esp"; lk = $true }
+    @{ n = "ESP32-C3 Mesh + everything (coex)"; t = "emit_esp32c3_project";   e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IOT = "mesh+all" }; q = $false; fam = "esp"; lk = $true }
+
     # The IoT tab's Thread on the ESP parts with 802.15.4 (openthread 0.2 on
     # esp-radio 0.18's `ieee802154`), every peripheral wired, with a real
     # dataset so the whole attach / UDP path links. OpenThread and Mbed TLS
@@ -502,6 +510,11 @@ $ALL_CASES = @(
     # sessions on the smallest chip). Linked, like the radio row; CMAKE naming
     # nothing keeps them pure Rust.
     @{ n = "Raspberry Pi Pico W Wi-Fi/BLE/TLS/HTTP/shadow x7"; t = "emit_rp_iot_project"; e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "rp"; lk = $true }
+
+    # Bluetooth Mesh on the CYW43's Bluetooth half, the flash store beside it:
+    # the Pico W alone (thumbv6m, no read-modify-write atomics) and the Pico 2 W
+    # beside Wi-Fi and MQTT. Linked.
+    @{ n = "Pico W / Pico 2 W Bluetooth Mesh x2"; t = "emit_rp_mesh_project"; e = @{ CMAKE = "eide-no-cmake" }; q = $true; fam = "rp"; lk = $true }
 
     # The pico2-ice, Blocking and Async: the only RP2350B board, so the only
     # rows of the FUNCSEL table past GP29 (UART1 on GP36/37, SPI0 on 32/34/35,

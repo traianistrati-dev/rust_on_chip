@@ -63,7 +63,8 @@ pub fn convert_xml_with_af(xml: &str, af: Option<&GpioAf>) -> Result<Vec<Convert
     let package = mcu.attribute("Package").unwrap_or("").trim().to_string();
     let line = mcu.attribute("Line").unwrap_or("").trim().to_string();
 
-    let mut core = String::new();
+    // Every `<Core>`: a dual-core part lists two - see `application_core`.
+    let mut cores: Vec<String> = Vec::new();
     let mut max_mhz: Option<u32> = None;
     let mut rams: Vec<u64> = Vec::new();
     let mut flashes: Vec<u64> = Vec::new();
@@ -74,7 +75,7 @@ pub fn convert_xml_with_af(xml: &str, af: Option<&GpioAf>) -> Result<Vec<Convert
 
     for ch in mcu.children().filter(|n| n.is_element()) {
         match ch.tag_name().name() {
-            "Core" => core = ch.text().unwrap_or("").trim().to_string(),
+            "Core" => cores.push(ch.text().unwrap_or("").trim().to_string()),
             // A DISPLAY fact only: the clock editor's ceilings come from
             // `ClockLimits`, which is a per-family table. Roughly a third of
             // the database states no <Frequency> at all (the whole C0 series
@@ -180,7 +181,8 @@ pub fn convert_xml_with_af(xml: &str, af: Option<&GpioAf>) -> Result<Vec<Convert
     };
 
     let clock = clock_for_family(&family);
-    let target = core_to_target(&core).to_string();
+    let core = application_core(&cores);
+    let target = target_for(&family, &core).to_string();
     let cpu = core.trim_start_matches("Arm ").trim().to_string();
 
     // Balls become a grid layout; the four sides stay empty for such a package,
@@ -254,6 +256,10 @@ pub fn convert_xml_with_af(xml: &str, af: Option<&GpioAf>) -> Result<Vec<Convert
         form.flash_size = flash_k.map(|k| format!("{k}K")).unwrap_or_default();
         form.ram_origin = "0x20000000".into();
         form.ram_size = ram_k.map(|k| format!("{k}K")).unwrap_or_default();
+        // On a dual-core part probe-rs lists the cores in the order the
+        // vendor does, so its core 0 - the one flashing, RTT and the debugger
+        // attach to - is the application core this firmware is built for
+        // (`probe-rs chip info STM32H745ZITx`: cm7 then cm4; WL55: cm4, cm0p).
         form.probe_chip = name.clone();
         form.hal_dep = hal_dep_for(&family, &line, &name);
         form.memory_comment = format!("Imported from STM32 open-pin-data ({ref_name})");
@@ -969,6 +975,37 @@ pub(crate) fn core_to_target(core: &str) -> &'static str {
     }
 }
 
+/// [`core_to_target`] for a part of `family`, corrected for the one family
+/// whose Cortex-M4 has no FPU.
+///
+/// Every STM32WL M4 - the single-core WLE4/WLE5 and the application core of
+/// the dual-core WL54/WL55 - is built without the floating-point unit, so the
+/// hard-float `thumbv7em-none-eabihf` would emit VFP instructions that fault on
+/// the first float. embassy's own STM32WL examples build `thumbv7em-none-eabi`.
+pub(crate) fn target_for(family: &str, core: &str) -> &'static str {
+    match core_to_target(core) {
+        "thumbv7em-none-eabihf" if family.eq_ignore_ascii_case("stm32wl") => "thumbv7em-none-eabi",
+        t => t,
+    }
+}
+
+/// The core the generated firmware runs on, out of a part's `<Core>` list.
+///
+/// A dual-core part lists two, and the APPLICATION core comes first: all 34
+/// such files in STM32_open_pin_data agree - M7 then M4 on H745/H747/H755/H757,
+/// M4 then M0+ on WL54/WL55. Keeping the LAST one, as this used to, made every
+/// WL5x an M0+ (`thumbv6m-none-eabi`) and labelled every dual-core H7 an M4.
+/// The first Cortex-M rather than simply the first, because the STM32MP files
+/// lead with a Cortex-A that no target here can build for.
+fn application_core(cores: &[String]) -> String {
+    cores
+        .iter()
+        .find(|c| c.to_ascii_lowercase().contains("cortex-m"))
+        .or_else(|| cores.first())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Which built-in clock model fits a family (others get a plain reset clock).
 /// Delegates to the single source of truth so XML import and AI import agree.
 fn clock_for_family(family: &str) -> ClockChoice {
@@ -1069,8 +1106,10 @@ fn hal_dep_for(family: &str, line: &str, name: &str) -> String {
         );
     }
     if family.starts_with("stm32") {
-        // Generic embassy backend. The chip feature is the part number, plus a
-        // flash-bank feature on the parts that need one (see `needs_bank_feature`).
+        // Generic embassy backend. The chip feature is the part number (with
+        // the application core's suffix on a dual-core part, see
+        // `DUAL_CORE_PARTS`), plus a flash-bank feature on the parts that need
+        // one (see `needs_bank_feature`).
         let mut feats = format!("\"{}\"", embassy_chip_feature(name));
         if needs_bank_feature(name) {
             feats.push_str(", \"single-bank\"");
@@ -1283,8 +1322,64 @@ pub fn embassy_feature_in(dep_line: &str) -> Option<&str> {
 
 /// The embassy-stm32 chip feature for a concrete part: the part number without
 /// the trailing package + temperature code (open-pin-data names end in a
-/// `<PackageLetter>x` pair — `STM32F411RETx` → `stm32f411re`).
+/// `<PackageLetter>x` pair — `STM32F411RETx` → `stm32f411re`), plus the core
+/// suffix on a dual-core part (`STM32H745ZITx` → `stm32h745zi-cm7`).
 fn embassy_chip_feature(name: &str) -> String {
+    let base = embassy_part_feature(name);
+    match DUAL_CORE_PARTS.binary_search_by(|(part, _)| (*part).cmp(base.as_str())) {
+        Ok(i) => format!("{base}-{}", DUAL_CORE_PARTS[i].1),
+        Err(_) => base,
+    }
+}
+
+/// Every part embassy-stm32 0.6 publishes ONLY per core, with the core the
+/// generated firmware targets. Sorted, for the binary search.
+///
+/// For these 30 there is no bare `stm32h745zi` feature at all, only
+/// `stm32h745zi-cm4` and `stm32h745zi-cm7`, so the plain part number made a
+/// Cargo.toml no resolver can satisfy. The IDE builds ONE firmware, for the
+/// application core: the Cortex-M7 of the H745/H747/H755/H757, the Cortex-M4
+/// of the WL54/WL55. The other core (the H7's M4, the WL's M0+) is not
+/// targeted: nothing generated here runs on it.
+///
+/// Generated from embassy-stm32 0.6's Cargo.toml (every `-cm4`, `-cm7` and
+/// `-cm0p` feature, grouped by part); `per_core_parts_match_the_published_features`
+/// checks it against that file.
+const DUAL_CORE_PARTS: [(&str, &str); 30] = [
+    ("stm32h745bg", "cm7"),
+    ("stm32h745bi", "cm7"),
+    ("stm32h745ig", "cm7"),
+    ("stm32h745ii", "cm7"),
+    ("stm32h745xg", "cm7"),
+    ("stm32h745xi", "cm7"),
+    ("stm32h745zg", "cm7"),
+    ("stm32h745zi", "cm7"),
+    ("stm32h747ag", "cm7"),
+    ("stm32h747ai", "cm7"),
+    ("stm32h747bg", "cm7"),
+    ("stm32h747bi", "cm7"),
+    ("stm32h747ig", "cm7"),
+    ("stm32h747ii", "cm7"),
+    ("stm32h747xg", "cm7"),
+    ("stm32h747xi", "cm7"),
+    ("stm32h747zi", "cm7"),
+    ("stm32h755bi", "cm7"),
+    ("stm32h755ii", "cm7"),
+    ("stm32h755xi", "cm7"),
+    ("stm32h755zi", "cm7"),
+    ("stm32h757ai", "cm7"),
+    ("stm32h757bi", "cm7"),
+    ("stm32h757ii", "cm7"),
+    ("stm32h757xi", "cm7"),
+    ("stm32h757zi", "cm7"),
+    ("stm32wl54cc", "cm4"),
+    ("stm32wl54jc", "cm4"),
+    ("stm32wl55cc", "cm4"),
+    ("stm32wl55jc", "cm4"),
+];
+
+/// The part-number half of [`embassy_chip_feature`], before any core suffix.
+fn embassy_part_feature(name: &str) -> String {
     let slug = slugify(name);
     // `x` stands for the temperature range, and embassy's feature stops just
     // before the package letter that precedes it: STM32F103C8Tx -> stm32f103c8.
@@ -1847,6 +1942,190 @@ mod tests {
         );
         // And it must not fall through to the M3 default any more.
         assert_ne!(core_to_target("Arm Cortex-M55"), "thumbv7m-none-eabi");
+    }
+
+    /// embassy-stm32 0.6 publishes the dual-core parts ONLY per core, so the
+    /// bare part number made a Cargo.toml no resolver can satisfy. The
+    /// application core's feature is the one written; every other part keeps
+    /// the bare number.
+    #[test]
+    fn a_dual_core_part_gets_its_application_core_feature() {
+        assert_eq!(embassy_chip_feature("STM32H745ZITx"), "stm32h745zi-cm7");
+        assert_eq!(embassy_chip_feature("STM32H757ZIYx"), "stm32h757zi-cm7");
+        // What the range RefName `STM32H747A(G-I)Ix` expands to.
+        assert_eq!(embassy_chip_feature("STM32H747AGIx"), "stm32h747ag-cm7");
+        assert_eq!(embassy_chip_feature("STM32WL55JCIx"), "stm32wl55jc-cm4");
+        assert_eq!(embassy_chip_feature("STM32WL54CCUx"), "stm32wl54cc-cm4");
+        // The name-only route (Auto-fill, AI import) carries no package code.
+        assert_eq!(embassy_chip_feature("STM32H755ZI"), "stm32h755zi-cm7");
+        // Single-core siblings are unchanged.
+        assert_eq!(embassy_chip_feature("STM32H743ZITx"), "stm32h743zi");
+        assert_eq!(embassy_chip_feature("STM32WLE5JCIx"), "stm32wle5jc");
+        assert_eq!(embassy_chip_feature("STM32F411RETx"), "stm32f411re");
+
+        // Both dependency-line routes write it, and the import check reads the
+        // same feature back out.
+        let line = hal_dep_for("stm32h7", "STM32H745/755", "STM32H745ZITx");
+        assert_eq!(embassy_feature_in(&line), Some("stm32h745zi-cm7"), "{line}");
+        let line = hal_dep_for_name("stm32wl", "STM32WL55JCIx");
+        assert_eq!(embassy_feature_in(&line), Some("stm32wl55jc-cm4"), "{line}");
+    }
+
+    /// The binary search needs the table sorted, and each line has exactly
+    /// one application core: the M7 on the H7, the M4 on the WL.
+    #[test]
+    fn the_dual_core_table_is_sorted_and_names_the_application_core() {
+        assert!(
+            DUAL_CORE_PARTS.windows(2).all(|w| w[0].0 < w[1].0),
+            "unsorted, so the binary search would miss parts"
+        );
+        for (part, core) in DUAL_CORE_PARTS {
+            let want = if part.starts_with("stm32h7") {
+                "cm7"
+            } else if part.starts_with("stm32wl5") {
+                "cm4"
+            } else {
+                panic!("{part}: a dual-core line nobody has decided the main core of")
+            };
+            assert_eq!(core, want, "{part}");
+        }
+    }
+
+    /// The table against the list it was generated from: embassy-stm32 0.6's
+    /// own Cargo.toml, unpacked in the local cargo registry. Ignored because
+    /// it reads outside the repo.
+    ///
+    /// `cargo test -- --ignored per_core_parts_match --nocapture`
+    #[test]
+    #[ignore]
+    fn per_core_parts_match_the_published_features() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::PathBuf;
+
+        let home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .map(|h| PathBuf::from(h).join(".cargo"))
+            })
+            .expect("a cargo home");
+        let prefix = format!("{EMBASSY_CRATE}-{EMBASSY_VERSION}.");
+        let mut unpacked: Vec<PathBuf> = std::fs::read_dir(home.join("registry").join("src"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|reg| {
+                std::fs::read_dir(reg.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+            })
+            .collect();
+        unpacked.sort();
+        let dir = unpacked
+            .last()
+            .expect("embassy-stm32 0.6 in the cargo registry: build any STM32 project once");
+        let text = std::fs::read_to_string(dir.join("Cargo.toml")).expect("a readable manifest");
+        println!("checking against {}", dir.display());
+
+        // Feature keys sit at column 0: `stm32h745zi-cm7 = [`.
+        let features: BTreeSet<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once(" = "))
+            .map(|(k, _)| k.trim())
+            .filter(|k| k.starts_with("stm32"))
+            .collect();
+        let mut per_core: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for f in &features {
+            // `stm32l151c6-a` is a die revision, not a core.
+            if let Some((part, core)) = f.split_once('-').filter(|(_, c)| c.starts_with("cm")) {
+                per_core.entry(part).or_default().push(core);
+            }
+        }
+        let table: Vec<&str> = DUAL_CORE_PARTS.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            per_core.keys().copied().collect::<Vec<_>>(),
+            table,
+            "the per-core parts moved: regenerate DUAL_CORE_PARTS"
+        );
+        for (part, core) in DUAL_CORE_PARTS {
+            assert!(
+                features.contains(format!("{part}-{core}").as_str()),
+                "{part}-{core} is not published"
+            );
+            assert!(
+                !features.contains(part),
+                "{part}: a bare feature is published after all"
+            );
+        }
+    }
+
+    /// The real STM32WL55JCIx header: two cores, the application core first.
+    const WL55: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Mcu ClockTree="STM32WL" Family="STM32WL" Line="STM32WL5x" Package="UFBGA73" RefName="STM32WL55JCIx" xmlns="http://dummy.com">
+    <Core>ARM Cortex-M4</Core>
+    <Core>ARM Cortex-M0+</Core>
+    <Frequency>48</Frequency>
+    <Ram>64</Ram>
+    <Flash>256</Flash>
+    <Pin Name="PA2" Position="A1" Type="I/O">
+        <Signal Name="USART2_TX"/>
+        <Signal Name="GPIO"/>
+    </Pin>
+</Mcu>"#;
+
+    /// The real STM32H745ZITx header.
+    const H745: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Mcu ClockTree="STM32H7" Family="STM32H7" Line="STM32H745/755" Package="LQFP144" RefName="STM32H745ZITx" xmlns="http://dummy.com">
+    <Core>ARM Cortex-M7</Core>
+    <Core>ARM Cortex-M4</Core>
+    <Frequency>480</Frequency>
+    <Ram>864</Ram>
+    <Flash>2048</Flash>
+    <Pin Name="PA9" Position="101" Type="I/O">
+        <Signal Name="USART1_TX"/>
+        <Signal Name="GPIO"/>
+    </Pin>
+</Mcu>"#;
+
+    /// The import builds for the application core end to end: the triple, the
+    /// CPU label and the HAL feature all follow it, and probe-rs gets the part
+    /// name, whose core 0 is that same core.
+    #[test]
+    fn a_dual_core_part_imports_for_its_application_core() {
+        let wl = &convert_xml(WL55).expect("parses")[0].form;
+        // The last `<Core>` used to win: an M0+, so `thumbv6m-none-eabi`.
+        assert_eq!(wl.target, "thumbv7em-none-eabi", "the M4, which has no FPU");
+        assert!(wl.cpu.ends_with("Cortex-M4"), "{}", wl.cpu);
+        assert_eq!(embassy_feature_in(&wl.hal_dep), Some("stm32wl55jc-cm4"));
+        assert_eq!(wl.probe_chip, "STM32WL55JCIx");
+
+        let h7 = &convert_xml(H745).expect("parses")[0].form;
+        assert_eq!(h7.target, "thumbv7em-none-eabihf");
+        assert!(h7.cpu.ends_with("Cortex-M7"), "{}", h7.cpu);
+        assert_eq!(embassy_feature_in(&h7.hal_dep), Some("stm32h745zi-cm7"));
+        assert_eq!(h7.probe_chip, "STM32H745ZITx");
+
+        // An STM32MP leads with a Cortex-A: the Cortex-M is still the pick.
+        let mp = ["ARM Cortex-A7".to_owned(), "ARM Cortex-M4".to_owned()];
+        assert_eq!(application_core(&mp), "ARM Cortex-M4");
+        assert_eq!(application_core(&[]), "");
+        // A single-core WL is the same M4 without an FPU.
+        assert_eq!(
+            target_for("stm32wl", "ARM Cortex-M4"),
+            "thumbv7em-none-eabi"
+        );
+        assert_eq!(
+            target_for("stm32l4", "ARM Cortex-M4"),
+            "thumbv7em-none-eabihf"
+        );
     }
 
     #[test]

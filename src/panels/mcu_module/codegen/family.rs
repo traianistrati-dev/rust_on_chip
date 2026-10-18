@@ -987,7 +987,10 @@ impl FamilyBackend for RticBackend {
             &usb,
             &timer,
             mcu.gpio_native(),
-            &mcu.custom_module_inits(),
+            // The Configuration tab's inits too, like every other STM32
+            // backend. Only the Custom modules used to come through, so an
+            // IWDG got its `iwdg.rs` and an `#[init]` that never called it.
+            &mcu.watchdog_and_custom_inits(),
         );
         format!(
             "{}{section}
@@ -1014,7 +1017,7 @@ impl FamilyBackend for RticBackend {
             &usb,
             &timer,
             mcu.gpio_native(),
-            &mcu.custom_module_inits(),
+            &mcu.watchdog_and_custom_inits(),
         );
         rtic::splice_rtic_section(existing, &section, &mcu.name, &mcu.id)
     }
@@ -2413,6 +2416,74 @@ mod tests {
         );
     }
 
+    /// The same on RTIC, wired and not. Its backend passed only the Custom
+    /// modules, so an IWDG got its `iwdg.rs` and an `#[init]` that never
+    /// called it - the watchdog silently never existed. And `#[init]`
+    /// RETURNS: a handle left in a `let` there is dropped with it, so the
+    /// IWDG has to come out as a `Local` a task can start and feed.
+    #[test]
+    fn rtic_inits_what_the_configuration_tab_set() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::watchdog::IwdgConfig;
+        for wired in [false, true] {
+            let mut mcu = builtin_for("stm32f103c8t6")
+                .expect("built-in F103")
+                .build_mcu();
+            mcu.runtime = Runtime::Rtic;
+            mcu.pending_runtime = Runtime::Rtic;
+            if wired {
+                let num = mcu
+                    .iter_all_pins()
+                    .find(|p| p.name == "PC13")
+                    .map(|p| p.number)
+                    .expect("PC13");
+                if let Some(p) = mcu.find_pin_mut(num) {
+                    p.selected_function = PinFunction::GpioOutput;
+                }
+            }
+            mcu.watchdog.iwdg = Some(IwdgConfig {
+                timeout_us: 2_000_000,
+            });
+            let main = mcu.fresh_main_rs();
+            let tag = if wired { "wired" } else { "no pins" };
+            assert_eq!(main.contains("Select pins"), !wired, "{tag}:\n{main}");
+            assert!(main.contains("#[rtic::app"), "{tag}:\n{main}");
+
+            // Called inside `#[init]`, after the clocks it may depend on and
+            // before the tuple that ends it.
+            let call = "let iwdg = pins::configs::iwdg::init(dp.IWDG);";
+            let at = main
+                .find(call)
+                .unwrap_or_else(|| panic!("{tag}: no IWDG init\n{main}"));
+            let init = main.find("#[init]").expect("an #[init]");
+            let mono = main.find("Mono::start(").expect("the monotonic");
+            let ret = main.find("(Shared {}, Local {").expect("init's return");
+            assert!(init < mono && mono < at && at < ret, "{tag}:\n{main}");
+            // ...and handed to the framework rather than dropped with init.
+            assert!(
+                main.contains("iwdg: pins::configs::iwdg::Handle,"),
+                "{tag}: no Local field\n{main}"
+            );
+            assert!(
+                main[ret..].contains("iwdg,"),
+                "{tag}: not moved into Local\n{main}"
+            );
+            assert!(
+                !main.contains("_iwdg"),
+                "{tag}: still a dropped binding\n{main}"
+            );
+            // An unread field must not warn in a project nobody edited yet.
+            assert!(
+                main.contains("#[allow(dead_code)]\nmod app"),
+                "{tag}:\n{main}"
+            );
+            assert!(
+                mcu.config_files().iter().any(|(n, _)| n == "iwdg.rs"),
+                "{tag}: no iwdg.rs"
+            );
+        }
+    }
+
     /// The flash store, end to end on the model: on, it writes the config
     /// file, the GEN lines and the line at the head of an untouched tail; off,
     /// all three go. A tail the user wrote in is never touched, and a Runtime
@@ -3318,7 +3389,7 @@ mod tests {
             AsyncBusMode, I2sModuleConfig, ModuleConfig, ModuleKind, SpiModuleConfig, VirtualModule,
         };
         use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
-        use crate::panels::mcu_module::project_gen::{self, AsyncFlavor, ConfigFile};
+        use crate::panels::mcu_module::project_gen;
         use std::fs;
         use std::path::PathBuf;
 
@@ -3843,24 +3914,11 @@ mod tests {
         .expect("an ESP backend")
         .fresh_main_rs(&mcu);
 
-        let cargo_toml =
-            project_gen::gen_config(ConfigFile::CargoToml, &def.project, &def.toolchain);
-        let cargo_toml = project_gen::ensure_async_deps(
-            &cargo_toml,
-            true,
-            AsyncFlavor::Esp(&def.project.probe_chip),
-            false,
-            false,
-            false,
-            &[],
-        );
+        // The manifests the app writes for this model - see `manifest_sync`.
+        let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
         fs::create_dir_all(out.join(".cargo")).unwrap();
-        fs::write(out.join("Cargo.toml"), cargo_toml).unwrap();
-        fs::write(
-            out.join(".cargo/config.toml"),
-            project_gen::gen_config(ConfigFile::CargoConfig, &def.project, &def.toolchain),
-        )
-        .unwrap();
+        fs::write(out.join("Cargo.toml"), &files.cargo_toml).unwrap();
+        fs::write(out.join(".cargo/config.toml"), &files.cargo_config).unwrap();
         // Xtensa parts need the pinned fork, and a real project gets one — see
         // `project_gen::rust_toolchain_for`. Without it an ESP32 or S2 here
         // fails inside `core` with an error that names no toolchain.
@@ -3891,7 +3949,6 @@ mod tests {
     fn write_esp_async_project() {
         use crate::panels::mcu_module::mcu::Runtime;
         use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
-        use crate::panels::mcu_module::project_gen::{self, AsyncFlavor, ConfigFile};
         use std::fs;
         use std::path::PathBuf;
 
@@ -3931,25 +3988,8 @@ mod tests {
             pin.selected_function = func;
         }
 
-        let cargo_toml =
-            project_gen::gen_config(ConfigFile::CargoToml, &def.project, &def.toolchain);
-        let cargo_toml = project_gen::ensure_async_deps(
-            &cargo_toml,
-            async_rt,
-            AsyncFlavor::Esp(&def.project.probe_chip),
-            false,
-            false,
-            false,
-            &[],
-        );
         fs::create_dir_all(out.join("src/pins")).unwrap();
         fs::create_dir_all(out.join(".cargo")).unwrap();
-        fs::write(out.join("Cargo.toml"), cargo_toml).unwrap();
-        fs::write(
-            out.join(".cargo/config.toml"),
-            project_gen::gen_config(ConfigFile::CargoConfig, &def.project, &def.toolchain),
-        )
-        .unwrap();
         // `ESP_ASYNC_IN=<file>` re-splices an EXISTING main.rs instead of writing
         // a fresh one — how a real project (older header, user code around the
         // markers) is put through the generator before compiling it.
@@ -3957,6 +3997,10 @@ mod tests {
             Ok(src) => mcu.update_main_rs(&fs::read_to_string(src).expect("ESP_ASYNC_IN readable")),
             Err(_) => mcu.fresh_main_rs(),
         };
+        // The manifests the app writes for this model - see `manifest_sync`.
+        let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
+        fs::write(out.join("Cargo.toml"), &files.cargo_toml).unwrap();
+        fs::write(out.join(".cargo/config.toml"), &files.cargo_config).unwrap();
         fs::write(out.join("src/main.rs"), main_rs).unwrap();
 
         // The per-peripheral init modules main.rs calls into, plus the `mod`

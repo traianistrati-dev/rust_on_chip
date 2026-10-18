@@ -1,0 +1,10 @@
+# Files the generator `include_str!`s into the projects it writes: their BYTES
+# are its output. With `core.autocrlf=true` and no attribute, a checkout wrote
+# them CRLF or LF depending on how each file last reached the disk - 5 of the 53
+# in iot_templates/ were CRLF in one working tree - so the same commit could
+# generate two different projects. `lf()` at the include sites papered over
+# that; this makes the bytes the same everywhere, and `lf()` stays as a guard.
+src/panels/mcu_module/codegen/iot_templates/** text eol=lf
+src/panels/mcu_module/codegen/templates/** text eol=lf
+# Pushed into the pico2-ice main.rs as it is, with no `lf()`.
+src/panels/mcu_module/codegen/rp_fpga_load.rs text eol=lf

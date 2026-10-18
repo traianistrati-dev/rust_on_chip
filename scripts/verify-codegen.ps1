@@ -19,6 +19,18 @@
   Run every case. Without it, a representative subset that still covers each
   runtime and each "half-wired" shape.
 
+.PARAMETER Snapshot
+  Emit EVERY case into its own directory under this one and write
+  `manifest.txt` there: one SHA-256 per generated file. Nothing is compiled, so
+  a whole snapshot costs minutes. It is the gate for a change that must not move
+  the output - moving a template into a file, splitting a generator: snapshot
+  before, snapshot after, `-Compare`.
+
+.PARAMETER Compare
+  With -Snapshot: the directory of an EARLIER snapshot to hold the new one
+  against. Every file that changed, appeared or vanished is listed with the
+  `git diff --no-index` that shows it, and the run fails if there is any.
+
 .NOTES
   Warnings are checked too, and by COUNT: each case declares how many it is
   allowed (`w`, default none) and anything else fails. There is no "warnings are
@@ -28,6 +40,8 @@
 .EXAMPLE
   pwsh scripts/verify-codegen.ps1
   pwsh scripts/verify-codegen.ps1 -Full
+  pwsh scripts/verify-codegen.ps1 -Snapshot H:\snap\before
+  pwsh scripts/verify-codegen.ps1 -Snapshot H:\snap\after -Compare H:\snap\before
 #>
 [CmdletBinding()]
 param(
@@ -62,11 +76,21 @@ param(
     # dependency recompiles, which is minutes, so it is a switch and not the
     # default. Stale directories are pruned automatically after a full green
     # run without it - see the prune below.
-    [switch]$Clean
+    [switch]$Clean,
+    # Emit only, hash what was written - see .PARAMETER Snapshot.
+    [string]$Snapshot = "",
+    [string]$Compare = ""
 )
 
 $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent $PSScriptRoot
+
+# A usage error says so at once: before the lock below, which can wait forty
+# minutes, and before TMP/TEMP move.
+if ($Compare -and -not $Snapshot) {
+    Write-Host "-Compare needs -Snapshot: the new snapshot to hold against it" -ForegroundColor Red
+    exit 2
+}
 
 # `rtic-macros` counts every CARGO_FEATURE_* variable it can see as an enabled
 # feature, cargo's own and the shell's alike, and refuses to build when there is
@@ -107,7 +131,13 @@ $lockPath = Join-Path $env:TEMP "eide-codegen-matrix.lock"
 $ownerPath = Join-Path $env:TEMP "eide-codegen-matrix.owner"
 $script:lock = $null
 $waited = 0
-while (-not $script:lock) {
+# A snapshot neither takes the lock nor waits for it: every case writes into a
+# directory of its own under -Snapshot and no PROJECT is compiled, so there is
+# no project `target/` to fight over. Waiting would only make a minutes-long
+# check sit out a matrix run of hours. What both still share is the harness
+# binary in the repository's own `target/`: change no source while either
+# runs, or the relink fails on the exe the other one is executing.
+while (-not $script:lock -and -not $Snapshot) {
     try {
         $script:lock = [System.IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
     } catch {
@@ -146,7 +176,9 @@ if ($waited -gt 0) { Write-Host ("waited {0} min for the lock" -f [math]::Round(
 # read by someone who has just seen the lock held.
 # ASCII, not utf8: Windows PowerShell writes a BOM for `-Encoding utf8`, and it
 # shows up inside the "(PID ...)" the next waiter prints. The content is ASCII.
-"PID $PID, started $(Get-Date -Format 'HH:mm:ss')" | Set-Content -Path $ownerPath -Encoding ascii
+if (-not $Snapshot) {
+    "PID $PID, started $(Get-Date -Format 'HH:mm:ss')" | Set-Content -Path $ownerPath -Encoding ascii
+}
 
 # The harnesses warn when they find this lock held, because running one by hand
 # during a matrix run corrupts both. Our own children are exactly the case that
@@ -180,7 +212,9 @@ $script:origTmp = $env:TMP
 $script:origTemp = $env:TEMP
 trap { $env:TMP = $script:origTmp; $env:TEMP = $script:origTemp; break }
 
-if ($WorkDir) {
+# Not for a snapshot: it has its own root, and -Clean must never empty the
+# matrix's warm caches on the way to a check that compiles nothing.
+if ($WorkDir -and -not $Snapshot) {
     if (-not (Test-Path $WorkDir)) {
         New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
     }
@@ -259,7 +293,12 @@ $ALL_CASES = @(
     @{ n = "F1 Async, default pads";       t = "emit_f1_async_project";  e = @{};                       q = $true; fam = "f1"; lk = $true }
     @{ n = "F1 Async, remapped, all DMA";  t = "emit_f1_async_project";  e = @{ EIDE_F1_ASYNC_REMAP = "1"; EIDE_F1_ASYNC_DMA = "1" }; q = $true; fam = "f1"; lk = $true }
     @{ n = "F1 Async -> Blocking switch";  t = "emit_f1_async_project";  e = @{ EIDE_F1_SWITCH = "back" }; q = $false; fam = "f1" }
+    # Both RTIC rows carry the Configuration tab's IWDG (on unless
+    # EIDE_F1_WDG=0): RTIC never called it, and its handle has to leave
+    # `#[init]` as a Local. The second wires NO pin - the "select pins"
+    # skeleton, which used to drop every init. Cheap: same directory, deps built.
     @{ n = "F1 RTIC";                      t = "emit_f1_rtic_project";   e = @{};                       q = $true; fam = "f1" }
+    @{ n = "F1 RTIC, no pins";             t = "emit_f1_rtic_project";   e = @{ EIDE_F1_NOPINS = "1" }; q = $true; fam = "f1" }
     @{ n = "F1 Native";                    t = "emit_f1_native_project"; e = @{};                       q = $true; fam = "f1" }
     # The Configuration tab's flash store on an STM32: stm32f1xx-hal behind the
     # generated `F1Flash` adapter (Blocking, Native), embassy-stm32's `Flash` on
@@ -602,7 +641,7 @@ $ALL_CASES = @(
 # read it, and a stale value there would pick the wrong runtime just as quietly.
 $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
-           "EIDE_F1_SWITCH", "ESP_ASYNC_RUNTIME",
+           "EIDE_F1_SWITCH", "EIDE_F1_WDG", "EIDE_F1_NOPINS", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
@@ -616,6 +655,220 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
 # family", exit 2, and every push touching two families was refused. Split
 # here, so both `-Hook a,b` and `-Hook "a,b"` mean the same.
 $Hook = @($Hook | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+# ── -Snapshot / -Compare ─────────────────────────────────────────────────────
+#
+# What the generator WRITES, file by file, for every case of the matrix. The
+# question it answers is narrower than the matrix's and much cheaper: not "does
+# it build" but "did a byte move". A refactor of the generator - templates
+# moved into files, a backend split in two - must leave every hash alone, and
+# the matrix cannot say that: two different outputs can both compile.
+#
+# Each case gets its OWN directory (TMP/TEMP pointed at it while it runs), named
+# after the case, because several cases share one project directory - both RTIC
+# rows write `eide_f1_check_rtic` - and a file only the first one writes would
+# otherwise survive into the second's hashes.
+#
+# Paths are taken out before hashing: the case directory and the repository
+# show up in what some generators write (a path dependency, a linker search
+# path), and a snapshot taken in another folder or another checkout must still
+# compare equal.
+if ($Snapshot) {
+    # Full paths, no trailing separator: `Resolve-Path` keeps one when it was
+    # typed, so `X` and `X\` used to read as two directories - and the check
+    # below would wipe the baseline and then compare the new manifest with
+    # itself.
+    function Get-FullDir([string]$path) {
+        [System.IO.Path]::GetFullPath($path).TrimEnd('\', '/')
+    }
+    function Test-Within([string]$inner, [string]$outer) {
+        $inner.Equals($outer, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $inner.StartsWith($outer + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    $snapRoot = Get-FullDir $Snapshot
+    if ($Compare) {
+        if (-not (Test-Path (Join-Path $Compare "manifest.txt"))) {
+            Write-Host "no manifest.txt in $Compare - not a snapshot directory" -ForegroundColor Red
+            exit 2
+        }
+        $oldRoot = Get-FullDir $Compare
+        if ((Test-Within $oldRoot $snapRoot) -or (Test-Within $snapRoot $oldRoot)) {
+            Write-Host "-Snapshot $snapRoot and -Compare $oldRoot overlap: emptying the first would destroy the baseline" -ForegroundColor Red
+            exit 2
+        }
+    }
+    # Emptied first: a file the generator STOPPED writing has to vanish from the
+    # manifest, not linger from the last snapshot taken here. ONLY a folder
+    # that is empty or already a snapshot: `-Snapshot $env:TEMP` or `.` would
+    # otherwise delete the matrix's projects or the repository.
+    if (Test-Path $snapRoot) {
+        $present = @(Get-ChildItem $snapRoot -Force -ErrorAction SilentlyContinue)
+        if ($present.Count -gt 0 -and -not (Test-Path (Join-Path $snapRoot "manifest.txt"))) {
+            Write-Host "$snapRoot is not empty and holds no manifest.txt - not a snapshot directory, refusing to empty it" -ForegroundColor Red
+            exit 2
+        }
+        $present | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        New-Item -ItemType Directory -Force -Path $snapRoot | Out-Null
+    }
+
+    # Latin-1 maps every byte to one char and back, so the replacements below
+    # cannot alter a byte they do not match - the file is hashed as written.
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    function ConvertTo-Latin1([string]$text) { $latin1.GetString([System.Text.Encoding]::UTF8.GetBytes($text)) }
+    # The three spellings a path takes in generated text: as is, with forward
+    # slashes, and with its backslashes doubled inside a TOML or Rust string.
+    function Get-PathForms([string]$path) {
+        $l = ConvertTo-Latin1 $path.TrimEnd('\')
+        @($l.Replace('\', '\\'), $l.Replace('\', '/'), $l)
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+
+    # Directory names, checked for clashes BEFORE anything runs: a clash found
+    # at case 14 would cost the thirteen before it. `+` is spelled out because
+    # "USB, D- only" and "USB, D+ only" are both cases.
+    $slugs = @{}
+    $slugOf = @{}
+    foreach ($c in $ALL_CASES) {
+        if ($c.v) { continue }
+        $slug = (($c.n.ToLowerInvariant() -replace '\+', ' plus ') -replace '[^a-z0-9]+', '_').Trim('_')
+        if ($slugs.ContainsKey($slug)) {
+            Write-Host ("two cases reduce to the directory name '{0}': '{1}' and '{2}'" -f $slug, $slugs[$slug], $c.n) -ForegroundColor Red
+            exit 2
+        }
+        $slugs[$slug] = $c.n
+        $slugOf[$c.n] = $slug
+    }
+    $manifest = New-Object System.Collections.Generic.List[string]
+    $snapBad = @()
+    $snapCount = 0
+    foreach ($c in $ALL_CASES) {
+        # A verdict case writes no project; there is nothing to hash.
+        if ($c.v) { continue }
+        $slug = $slugOf[$c.n]
+        if ($c.p -and -not (Test-Path $c.p)) {
+            # Written down, so a comparison against a machine that HAS the
+            # database says why these files are missing instead of "removed".
+            $manifest.Add("# skipped $slug - no vendor database at $($c.p)")
+            Write-Host ("  {0,-34} skipped (no database)" -f $c.n) -ForegroundColor DarkGray
+            continue
+        }
+        $caseDir = Join-Path $snapRoot $slug
+        New-Item -ItemType Directory -Force -Path $caseDir | Out-Null
+        foreach ($k in $KNOBS) { Remove-Item ("Env:\" + $k) -ErrorAction SilentlyContinue }
+        foreach ($k in $c.e.Keys) { Set-Item ("Env:\" + $k) $c.e[$k] }
+        $env:TMP = $caseDir
+        $env:TEMP = $caseDir
+        Set-Location $repo
+        $out = cargo test --bins $c.t -- --ignored --nocapture 2>&1
+        $env:TMP = $script:origTmp
+        $env:TEMP = $script:origTemp
+
+        $why = $null
+        if ($out | Select-String -Pattern "^error: could not compile") { $why = "HARNESS COMPILE FAILED" }
+        elseif ($out | Select-String -Pattern "panicked at|test result: FAILED") { $why = "EMIT FAILED" }
+        elseif (-not ($out | Select-String -Pattern "test result: ok\. [1-9]")) { $why = "NO SUCH TEST" }
+        $dirs = @($out | ForEach-Object { "$_" } | Where-Object { $_ -match "^wrote (\S+)" } |
+            ForEach-Object { if ($_ -match "^wrote (\S+)") { $matches[1] } } |
+            Where-Object { Test-Path $_ } | Sort-Object -Unique)
+        if (-not $why -and -not $dirs) { $why = "NO OUTPUT" }
+        if ($why) {
+            $snapBad += "{0}: {1}" -f $c.n, $why
+            Write-Host ("  {0,-34} {1}" -f $c.n, $why) -ForegroundColor Red
+            continue
+        }
+
+        $forms = @(Get-PathForms $caseDir) + @(Get-PathForms $repo)
+        $marks = @("<CASE>", "<CASE>", "<CASE>", "<REPO>", "<REPO>", "<REPO>")
+        $files = 0
+        foreach ($d in $dirs) {
+            $base = (Resolve-Path $d).Path.TrimEnd('\')
+            $leaf = Split-Path $base -Leaf
+            # `target/` only exists where a case shares a directory outside the
+            # snapshot; it is the compiler's, never the generator's.
+            Get-ChildItem $base -Recurse -File -Force |
+                Where-Object { $_.FullName.Substring($base.Length + 1) -notmatch '^target\\' } |
+                ForEach-Object {
+                    $rel = $_.FullName.Substring($base.Length + 1).Replace('\', '/')
+                    $text = $latin1.GetString([System.IO.File]::ReadAllBytes($_.FullName))
+                    for ($i = 0; $i -lt $forms.Count; $i++) { $text = $text.Replace($forms[$i], $marks[$i]) }
+                    $hash = -join ($sha.ComputeHash($latin1.GetBytes($text)) | ForEach-Object { $_.ToString("x2") })
+                    $manifest.Add("$hash  $slug/$leaf/$rel")
+                    $files++
+                }
+        }
+        $snapCount++
+        Write-Host ("  {0,-34} {1,4} files" -f $c.n, $files) -ForegroundColor Green
+    }
+    Set-Location $repo
+    foreach ($k in $KNOBS) { Remove-Item ("Env:\" + $k) -ErrorAction SilentlyContinue }
+
+    # Sorted, LF, no BOM: two snapshots of the same output are the same file.
+    $sorted = @($manifest | Sort-Object { $_.Substring($_.IndexOf(' ') + 2) })
+    [System.IO.File]::WriteAllText((Join-Path $snapRoot "manifest.txt"), (($sorted -join "`n") + "`n"))
+    $hashed = @($sorted | Where-Object { -not $_.StartsWith('#') }).Count
+    Write-Host ""
+    Write-Host ("{0} cases, {1} files -> {2}" -f $snapCount, $hashed, (Join-Path $snapRoot "manifest.txt")) -ForegroundColor DarkCyan
+    if ($snapBad) {
+        Write-Host "FAILED:" -ForegroundColor Red
+        $snapBad | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    }
+
+    if ($Compare) {
+        # Hashes by path, plus the cases a snapshot SKIPPED (no vendor
+        # database): their files are missing for that reason, which a
+        # comparison has to say instead of calling them gone.
+        function Read-Manifest([string]$dir) {
+            $m = @{}
+            $skipped = @{}
+            foreach ($line in [System.IO.File]::ReadAllLines((Join-Path $dir "manifest.txt"))) {
+                if (-not $line) { continue }
+                if ($line -match '^# skipped (\S+)') { $skipped[$matches[1]] = $true; continue }
+                if ($line.StartsWith('#')) { continue }
+                $m[$line.Substring($line.IndexOf(' ') + 2)] = $line.Substring(0, $line.IndexOf(' '))
+            }
+            @{ Files = $m; Skipped = $skipped }
+        }
+        $oldM = Read-Manifest $oldRoot
+        $newM = Read-Manifest $snapRoot
+        $old = $oldM.Files
+        $new = $newM.Files
+        $skippedSomewhere = { param($path) $slug = $path.Split('/')[0]; $oldM.Skipped.ContainsKey($slug) -or $newM.Skipped.ContainsKey($slug) }
+        $notCompared = @(@($old.Keys) + @($new.Keys) | Where-Object { -not ($old.ContainsKey($_) -and $new.ContainsKey($_)) -and (& $skippedSomewhere $_) } | Sort-Object -Unique)
+        $changed = @($new.Keys | Where-Object { $old.ContainsKey($_) -and $old[$_] -ne $new[$_] } | Sort-Object)
+        $added = @($new.Keys | Where-Object { -not $old.ContainsKey($_) -and -not (& $skippedSomewhere $_) } | Sort-Object)
+        $removed = @($old.Keys | Where-Object { -not $new.ContainsKey($_) -and -not (& $skippedSomewhere $_) } | Sort-Object)
+        Write-Host ""
+        if ($notCompared) {
+            # Not a failure, as in the matrix: a missing optional database must
+            # not block anyone. But never silent - these files were NOT checked.
+            $cases = @($notCompared | ForEach-Object { $_.Split('/')[0] } | Sort-Object -Unique)
+            Write-Host ("NOT COMPARED: {0} files of {1} case(s) skipped in one snapshot (no vendor database): {2}" -f
+                $notCompared.Count, $cases.Count, ($cases -join ", ")) -ForegroundColor Yellow
+        }
+        if (-not ($changed.Count + $added.Count + $removed.Count)) {
+            Write-Host ("identical to {0}: all {1} files" -f $oldRoot, $new.Count) -ForegroundColor Green
+        } else {
+            Write-Host ("against {0}: {1} changed, {2} new, {3} gone" -f $oldRoot, $changed.Count, $added.Count, $removed.Count) -ForegroundColor Red
+            # Capped per list, and the cap SAID: a silent cut reads as "that was all".
+            foreach ($set in @(@("changed", $changed), @("new", $added), @("gone", $removed))) {
+                $label, $list = $set[0], @($set[1])
+                foreach ($f in ($list | Select-Object -First 40)) {
+                    $w = $f.Replace('/', '\')
+                    if ($label -eq "changed") {
+                        Write-Host ("  changed  {0}`n           git diff --no-index `"{1}`" `"{2}`"" -f $f, (Join-Path $oldRoot $w), (Join-Path $snapRoot $w)) -ForegroundColor Yellow
+                    } else {
+                        Write-Host ("  {0,-7}  {1}" -f $label, $f) -ForegroundColor Yellow
+                    }
+                }
+                if ($list.Count -gt 40) { Write-Host ("  ... and {0} more {1}" -f ($list.Count - 40), $label) -ForegroundColor Yellow }
+            }
+            $snapBad += "output differs from $oldRoot"
+        }
+    }
+    if ($snapBad) { exit 1 }
+    exit 0
+}
 
 if ($Hook.Count -gt 0) {
     $known = $ALL_CASES | ForEach-Object { $_.fam } | Sort-Object -Unique

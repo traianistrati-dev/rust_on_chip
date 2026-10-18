@@ -3735,7 +3735,7 @@ mod blocking_codegen {
             .find(|d| d.id == "nrf52833_microbit_v2")
             .expect("built-in micro:bit v2");
         let main_rs = mcu.fresh_main_rs();
-        let files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
+        let files = crate::panels::mcu_module::manifest_sync::project_files(&def, mcu, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join(dir_name);
         project_gen::clear_project_dir_keep_target(&dir);
@@ -4427,43 +4427,17 @@ mod async_codegen {
                 id == "nrf52840_dk",
                 "{main_rs}"
             );
-            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-            let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            // The manifest the app writes - see `manifest_sync`.
+            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf ble project");
 
-            let toml_path = dir.join("Cargo.toml");
-            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-            let sources = [main_rs.as_str()];
-            let toml = project_gen::ensure_async_deps(
-                &toml,
-                true,
-                project_gen::async_flavor_for(&mcu.family, ""),
-                false,
-                false,
-                false,
-                &sources,
-            );
-            let toml = project_gen::ensure_task_priority_deps(
-                &toml,
-                main_rs.contains("InterruptExecutor") || super::needs_static_cell(&mcu),
-                &sources,
-            );
-            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &sources);
-            let toml = project_gen::ensure_iot_deps(
-                &toml,
-                crate::panels::mcu_module::iot::active(&mcu),
-                &project.probe_chip,
-                &mcu.family,
-                &sources,
-            );
-            let toml = project_gen::ensure_mpsl_critical_section(&toml, super::ble_on(&mcu));
+            let toml = &files.cargo_toml;
             assert!(toml.contains("nrf-sdc"), "{toml}");
             assert!(!toml.contains("critical-section-single-core"), "{toml}");
-            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             println!("wrote {}", dir.display());
             println!("target: {}", def.project.target);
         }
@@ -4532,10 +4506,9 @@ mod async_codegen {
             );
             assert!(main_rs.contains("HfclkSource::ExternalXtal;"), "{main_rs}");
             // The project as the app had it before the switch, then the app's
-            // refresh of `.cargo/config.toml`.
+            // sync over it: `.cargo/config.toml` and the manifest.
             let mut files = project_gen::build_project_files(&before, &def.toolchain, &main_rs);
-            files.cargo_config =
-                project_gen::ensure_cargo_target(&files.cargo_config, &project, &def.toolchain);
+            crate::panels::mcu_module::manifest_sync::sync_files(&mut files, &def, &mcu);
             assert!(
                 files.cargo_config.contains("[target.thumbv7em-none-eabi]"),
                 "{}",
@@ -4561,32 +4534,7 @@ mod async_codegen {
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf thread project");
 
-            let toml_path = dir.join("Cargo.toml");
-            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-            let sources = [main_rs.as_str()];
-            let toml = project_gen::ensure_async_deps(
-                &toml,
-                true,
-                project_gen::async_flavor_for(&mcu.family, ""),
-                false,
-                false,
-                false,
-                &sources,
-            );
-            let toml = project_gen::ensure_task_priority_deps(
-                &toml,
-                main_rs.contains("InterruptExecutor") || super::needs_static_cell(&mcu),
-                &sources,
-            );
-            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &sources);
-            let toml = project_gen::ensure_iot_deps(
-                &toml,
-                crate::panels::mcu_module::iot::active(&mcu),
-                &project.probe_chip,
-                &mcu.family,
-                &sources,
-            );
-            let toml = project_gen::ensure_mpsl_critical_section(&toml, super::ble_on(&mcu));
+            let toml = &files.cargo_toml;
             for want in [
                 "openthread = ",
                 "tinyrlibc = ",
@@ -4596,7 +4544,6 @@ mod async_codegen {
                 assert!(toml.contains(want), "{want}:\n{toml}");
             }
             assert!(!toml.contains("nrf-sdc"), "{toml}");
-            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             println!("wrote {}", dir.display());
             println!("target: {}", project.target);
         }
@@ -4652,9 +4599,8 @@ mod async_codegen {
                 project.hal_dep
             );
             let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
-            // The manifest as the blocking project had it, then switched. It
-            // lands byte for byte on the fresh one, so writing `files` below
-            // writes the switched manifest.
+            // The HAL line as the blocking template had it, then switched: it
+            // lands byte for byte on the fresh one.
             let blocking_cfg = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&blocking));
             let blocking_toml =
                 project_gen::build_project_files(&blocking_cfg, &def.toolchain, "").cargo_toml;
@@ -4670,36 +4616,29 @@ mod async_codegen {
             let configs = mcu.config_files();
             let names: Vec<&str> = configs.iter().map(|(n, _)| n.as_str()).collect();
             assert_eq!(names, ["watchdog.rs"], "{dir_name}");
+            // And the whole manifest the app's way: the blocking project as
+            // the app synced it, then the app's sync over what the switch left,
+            // which has to come out as the project a fresh sync writes.
+            use crate::panels::mcu_module::manifest_sync;
+            let before = manifest_sync::project_files(&def, &blocking, &blocking.fresh_main_rs());
+            let files = manifest_sync::switched(&before, &main_rs, &def, &mcu);
+            let fresh = manifest_sync::project_files(&def, &mcu, &main_rs).cargo_toml;
+            assert!(
+                manifest_sync::same_lines(&files.cargo_toml, &fresh),
+                "{dir_name}: the switch left:\n{}\nnot:\n{fresh}",
+                files.cargo_toml
+            );
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf async project");
 
-            let toml_path = dir.join("Cargo.toml");
-            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-            let sources = [main_rs.as_str()];
-            let toml = project_gen::ensure_async_deps(
-                &toml,
-                true,
-                project_gen::async_flavor_for(&mcu.family, ""),
-                false,
-                false,
-                false,
-                &sources,
-            );
-            // The app's static_cell decision, verbatim.
-            let toml = project_gen::ensure_task_priority_deps(
-                &toml,
-                main_rs.contains("InterruptExecutor") || super::needs_static_cell(&mcu),
-                &sources,
-            );
-            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &sources);
+            let toml = &files.cargo_toml;
             assert!(
                 toml.contains("embedded-hal"),
                 "the shared header's import:\n{toml}"
             );
-            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             println!("wrote {}", dir.display());
             println!("target: {}", def.project.target);
         }

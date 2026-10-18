@@ -3676,369 +3676,48 @@ impl AppIde {
             None
         };
         if let Some((all_pins, config_files)) = regen {
-            use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
-            // Peripheral config files pull in standard-trait crates (embedded-io
-            // for USART, embedded-hal 1.0 `SpiBus`/`I2c` for SPI/I2C, bxcan for
-            // CAN, nb for the blocking bridges). Keyed on the config files AND —
-            // for the trait crates — on each module's API style: a NATIVE-style
-            // USART/SPI/I2C module emits a config file but needs NO trait crate.
-            let has_cfg = |p: &str| config_files.iter().any(|(name, _)| name.starts_with(p));
-            // On the async (embassy) path the blocking F1 trait-bridge deps
-            // (embedded-io / embedded-hal-0-2 / nb / bxcan / usb-device) DON'T
-            // apply — the async USART config pulls embedded-io-async + static_cell
-            // via `ensure_async_deps` instead. An F1 on Async is on embassy-stm32
-            // too, so the bridges (and bxcan / usb-device) go with the HAL swap.
-            let is_async = self.mcu.as_ref().is_some_and(|m| m.is_async());
-            // Native runtime → the bus peripherals expose CONCRETE HAL types
-            // (all `ApiStyle::Native`), so NONE of the portable trait-bridge
-            // crates are pulled — same as async, for a different reason.
-            let is_native = self.mcu.as_ref().is_some_and(|m| m.is_native());
-            // ESP config modules speak esp-hal DIRECTLY (`Uart<'d, Blocking>`,
-            // `I2c<'d, Blocking>`) — no portable bridge, so none of the trait
-            // crates below apply. Without this an ESP project with a USART
-            // module collected `embedded-io` / `nb` / `embedded-hal`, which
-            // nothing in its generated code ever mentions.
-            let is_esp = self
-                .selected_build_cfg()
-                .is_some_and(|(_, tc)| tc == ToolchainKind::EspRust);
-            // The nRF config modules speak nrf-hal directly too (`Uarte<UARTE0>`,
-            // `Spim<SPIM2>`), so the same exclusion: without it a USART module
-            // on the micro:bit collected `embedded-io`, `embedded-hal-0-2` and
-            // `nb`, none of which the generated code names.
-            let is_nrf = self
-                .mcu
-                .as_ref()
-                .is_some_and(|m| crate::panels::mcu_module::codegen::nrf::is_nrf(&m.family));
-            let hal_direct = is_esp || is_nrf;
-            let needs_can = !is_async && !hal_direct && has_cfg("can");
-            // Trait crates only for PORTABLE modules on the Blocking path.
-            let (mut needs_usart, mut needs_spi, mut needs_i2c) = (false, false, false);
-            // Async SPI/I2C deps: `embedded-hal` 1.0 for any bus, plus
-            // `embedded-hal-async` when a module is in async-DMA mode.
-            let (mut needs_eh, mut needs_eh_async) = (false, false);
-            // ANY USART on the blocking/native path needs `nb`: a Portable USART
-            // via its `nb::block!` bridge, a Native USART because the concrete
-            // stm32f1xx-hal `Tx`/`Rx` are nb-based (`nb::block!(rx.read())`).
-            // (Async USART uses embedded-io-async → no nb.)
-            let mut any_usart_blocking = false;
-            if let Some(m) = &self.mcu.as_ref().filter(|_| !hal_direct) {
-                use crate::panels::mcu_module::modules::{ApiStyle, AsyncBusMode, ModuleConfig};
-                for md in &m.modules {
-                    if is_async {
-                        let mode = match &md.config {
-                            ModuleConfig::Spi(c) => Some(c.async_mode),
-                            ModuleConfig::I2c(c) => Some(c.async_mode),
-                            _ => None,
-                        };
-                        if let Some(mode) = mode {
-                            needs_eh = true;
-                            needs_eh_async |= mode == AsyncBusMode::AsyncDma;
-                        }
-                    } else {
-                        // Blocking OR Native path.
-                        if matches!(&md.config, ModuleConfig::Usart(_)) {
-                            any_usart_blocking = true;
-                        }
-                        if !is_native {
-                            // Blocking (mixed): trait crates for the Portable modules.
-                            match &md.config {
-                                ModuleConfig::Usart(c) if c.api_style == ApiStyle::Portable => {
-                                    needs_usart = true
-                                }
-                                ModuleConfig::Spi(c) if c.api_style == ApiStyle::Portable => {
-                                    needs_spi = true
-                                }
-                                ModuleConfig::I2c(c) if c.api_style == ApiStyle::Portable => {
-                                    needs_i2c = true
-                                }
-                                _ => {}
-                            }
-                        }
-                        // is_native → all Native → no portable trait crates
-                        // (but still `nb` via `any_usart_blocking` above).
-                    }
-                }
-            }
-            // `nb`: CAN (bxcan), the Portable SPI FullDuplex bridge, and ANY
-            // USART on the non-async path. Kept separate so a Native USART (which
-            // sets no other trait crate) still keeps `nb` — and a user's pinned
-            // `nb = "1.1.0"` survives Save instead of being stripped.
-            let needs_nb = needs_can || needs_spi || any_usart_blocking;
-            // GPIO in/out pins are wrapped in the `pins::configs::io` eh-1.0
-            // bridge, emitted as `io.rs` (always portable).
-            let needs_gpio = !is_async && has_cfg("io");
-            // USB CDC init needs `usb-device`/`usbd-serial` + the `stm32-usbd`
-            // HAL feature, keyed on whether the USB D-/D+ pins are configured.
-            // BOTH pads, matching what `gen_parts` will actually emit: one pad
-            // alone generates no USB init, so the crates would be unused.
-            let usb_pad = |want: PinFunction| all_pins.iter().any(|(_, _, f)| *f == want);
-            let is_esp_family = self
-                .mcu
-                .as_ref()
-                .is_some_and(|m| crate::panels::mcu_module::codegen::family::is_esp(&m.family));
-            let both_usb_pads = usb_pad(PinFunction::UsbDm) && usb_pad(PinFunction::UsbDp);
-            // The STM32F1 `usb-device` 0.2 stack. It used to fire on an ESP too:
-            // both pads wired on a blocking project added two crates nothing
-            // referenced, at versions the ESP bus cannot even use.
-            //
-            // Not on an nRF either: its USB is not this stack (see below).
-            let is_nrf_family = self
-                .mcu
-                .as_ref()
-                .is_some_and(|m| crate::panels::mcu_module::codegen::nrf::is_nrf(&m.family));
-            let needs_usb = !is_async && !is_esp_family && !is_nrf_family && both_usb_pads;
-            // The nRF's: nrf-hal's `Usbd` is a usb-device 0.3 bus (the ESP OTG
-            // versions), embassy-nrf's driver runs under embassy-usb. One
-            // decision, shared with the harness - see `nrf::usb_stack`.
-            let (nrf_usb_device, nrf_embassy_usb) = self.mcu.as_ref().map_or(
-                (false, false),
-                crate::panels::mcu_module::codegen::nrf::usb_stack,
-            );
-            // …and the ESP's own stack, which only the OTG role wants.
-            let needs_esp_otg = is_esp_family
-                && both_usb_pads
-                && self.mcu.as_ref().is_some_and(|m| {
-                    crate::panels::mcu_module::codegen_esp::has_usb_otg(&m.family)
-                        && crate::panels::mcu_module::modules::usb_configs(&m.modules)
-                            .get(&1)
-                            .is_some_and(|c| c.role.is_otg())
-                });
-            // The user's own sources — a dependency referenced by THIS code is
-            // never stripped, whatever the feature flags say (a Runtime switch
-            // used to silently delete a hand-added `embedded-hal`). See
-            // `project_gen::is_crate_referenced`.
-            //
-            // `src/pins/**` is excluded on purpose: those files are generated
-            // from the model and rewritten on the next sync, so a bridge the IDE
-            // is about to stop emitting must not keep its crate alive (that is
-            // what left `embedded-hal` behind after switching to the Native
-            // runtime).
-            let sources: Vec<&str> = std::iter::once(self.generated_code.as_str())
-                .chain(
-                    self.project_tree
-                        .user_src_files
-                        .iter()
-                        .filter(|(path, _)| !path.starts_with("src/pins/"))
-                        .map(|(_, body)| body.as_str()),
-                )
-                .collect();
-            // The HAL crate first: a Runtime switch swaps it on the boards that
-            // change HALs (nrf52833-hal / embassy-nrf, rp2040-hal / embassy-rp),
-            // and every `ensure_*` below edits the manifest that comes out of it.
-            let base_toml = match self.selected_build_cfg() {
-                Some((cfg, tc)) => project_gen::refresh_hal_dependency(&self.cargo_toml, &cfg, &tc),
-                None => self.cargo_toml.clone(),
-            };
-            let new_toml = project_gen::ensure_peripheral_deps(
-                &base_toml,
-                needs_can,
-                needs_usart,
-                needs_spi,
-                needs_i2c,
-                needs_gpio,
-                needs_nb,
-                &sources,
-            );
-            let new_toml = project_gen::ensure_usb_deps(&new_toml, needs_usb, &sources);
-            let new_toml = project_gen::ensure_esp_usb_deps(
-                &new_toml,
-                needs_esp_otg || nrf_usb_device,
-                &sources,
-            );
-            let new_toml =
-                project_gen::ensure_embassy_usb_deps(&new_toml, nrf_embassy_usb, &sources);
-            // Async runtime (embassy-executor + embassy-time + the HAL time
-            // driver), plus — when the respective config files were emitted —
-            // embedded-io-async + static_cell (USART) and embedded-hal /
-            // embedded-hal-async (SPI/I2C). Keyed on the project Runtime being
-            // Async on an embassy-capable STM32 family.
-            //
-            // BOTH `ensure_peripheral_deps` (blocking eh1 = SPI/I2C/GPIO) and this
-            // manage `embedded-hal` 1.0 — so the need passed here MUST include the
-            // blocking case, or the blocking GPIO (io.rs) / SPI / I2C `embedded-hal`
-            // that `ensure_peripheral_deps` just added would be stripped right back
-            // out here (and a user's manual `embedded-hal` line with it).
-            let needs_eh_total = needs_eh || needs_spi || needs_i2c || needs_gpio;
-            // Which async stack: embassy-stm32, or esp-rtos on the ESP32-C3.
-            // Same crate names, different versions — see `AsyncFlavor`. The chip
-            // feature (`esp32c3`) comes from the same `ProjectDef` the base
-            // Cargo.toml template uses.
-            let esp_chip = self
-                .selected_build_cfg()
-                .map(|(p, _)| p.probe_chip)
-                .unwrap_or_default();
-            // One decision, shared with the harness - see `async_flavor_for`.
-            // Choosing here as well is how a Pico on Async came to be saved with
-            // the STM32 executor line while every test stayed green.
-            let async_flavor = project_gen::async_flavor_for(
-                self.mcu.as_ref().map_or("", |m| m.family.as_str()),
-                &esp_chip,
-            );
-            // `has_cfg` matches a config-FILE prefix, and the async RP backend
-            // writes no BUS config files (its only one is the watchdog's) - so a
-            // Pico with a `BufferedUart` in main.rs would ask for `static_cell`
-            // against a manifest that never got the line. A Pico W hides it,
-            // since the radio adds that crate for its own reasons.
-            let needs_async_usart = is_async && has_cfg("usart")
-                || self
-                    .mcu
-                    .as_ref()
-                    .is_some_and(crate::panels::mcu_module::codegen::rp::needs_async_usart);
-            let new_toml = project_gen::ensure_async_deps(
-                &new_toml,
-                is_async,
-                async_flavor,
-                needs_async_usart,
-                needs_eh_total,
-                needs_eh_async,
-                &sources,
-            );
-            // `embassy_stm32::exti` is behind a Cargo feature, so an input the
-            // user armed with an edge needs the FEATURE as well as the code.
-            // Read off the generated main.rs rather than off the pins: a pin
-            // refused for a line clash generates no `exti` use, and asking for a
-            // feature nothing imports would be a lie in the manifest.
-            let new_toml = project_gen::ensure_exti_feature(
-                &new_toml,
-                self.generated_code.contains("embassy_stm32::exti"),
-            );
-            // `static_cell`, when a raised task priority put an interrupt
-            // executor in the generated code. Read off that code for the same
-            // reason as the line above. An async nRF TWIM needs it too, for its
-            // `'static` RAM buffer; no config file names it, so `has_cfg` above
-            // cannot see it, the same gap the Pico's `BufferedUart` had.
-            //
-            // And the async USART, which `ensure_async_deps` just added it for:
-            // its `StaticCell` lives in `src/pins/configs/usart*.rs`, which
-            // `sources` leaves out on purpose, so passing only the executor's
-            // need here took the line straight back out - every async STM32
-            // project with a USART lost `static_cell` on Save.
-            let new_toml = project_gen::ensure_task_priority_deps(
-                &new_toml,
-                needs_async_usart
-                    || self.generated_code.contains("InterruptExecutor")
-                    || self
-                        .mcu
-                        .as_ref()
-                        .is_some_and(crate::panels::mcu_module::codegen::nrf::needs_static_cell),
-                &sources,
-            );
-            // The CYW43 radio, on a Pico W / Pico 2 W whose WL_LED is driven or
-            // whose IoT tab runs Wi-Fi on it. Gated on use rather than on the
-            // board, because a W board that does neither should not carry a
-            // wifi stack it never calls. The generator asks the same function.
-            let needs_radio = self
-                .mcu
-                .as_ref()
-                .is_some_and(crate::panels::mcu_module::codegen::rp::needs_radio);
-            let needs_bluetooth = self
-                .mcu
-                .as_ref()
-                .is_some_and(crate::panels::mcu_module::codegen::rp::needs_bluetooth);
-            let new_toml =
-                project_gen::ensure_cyw43_deps(&new_toml, needs_radio, needs_bluetooth, &sources);
-            // Cortex-M0 async: `static_cell` needs CAS the core does not have.
-            let async_target = self
-                .selected_build_cfg()
-                .map(|(p, _)| p.target)
-                .unwrap_or_default();
-            let new_toml =
-                project_gen::ensure_m0_atomics(&new_toml, is_async, &async_target, &sources);
-            // RTIC runtime: the framework + its SysTick monotonic. The backend
-            // feature follows the chip's Rust target, which only `ProjectDef`
-            // knows — hence reading it here rather than in the codegen backend.
-            let is_rtic = self.mcu.as_ref().is_some_and(|m| m.is_rtic());
-            let rtic_target = self
-                .selected_build_cfg()
-                .map(|(p, _)| p.target)
-                .unwrap_or_default();
-            let new_toml =
-                project_gen::ensure_rtic_deps(&new_toml, is_rtic, &rtic_target, &sources);
-            // The flash store (Configuration tab): needed exactly when its file
-            // is generated - the decision the harnesses make too. esp-storage
-            // only on an ESP; an STM32 writes its flash through its own HAL.
             use crate::panels::mcu_module::codegen::flash_store_gen;
-            let on_esp = self
-                .mcu
-                .as_ref()
-                .is_some_and(|m| crate::panels::mcu_module::flash_store::supported(&m.family));
-            let new_toml = project_gen::ensure_flash_store_deps(
-                &new_toml,
-                flash_store_gen::in_files(&config_files),
-                on_esp.then_some(esp_chip.as_str()),
-                &sources,
-            );
-            // The IoT tab's network stack: after the flash store and the radio,
-            // because it only ADDS the crates it shares with them.
-            let iot_active = self
-                .mcu
-                .as_ref()
-                .and_then(crate::panels::mcu_module::iot::active);
-            let family = self.mcu.as_ref().map_or("", |m| m.family.as_str());
-            let new_toml =
-                project_gen::ensure_iot_deps(&new_toml, iot_active, &esp_chip, family, &sources);
-            // The nRF's MPSL brings its own critical section: cortex-m's goes.
-            let mpsl = self
-                .mcu
-                .as_ref()
-                .is_some_and(crate::panels::mcu_module::codegen::nrf::ble_on);
-            let new_toml = project_gen::ensure_mpsl_critical_section(&new_toml, mpsl);
-            // Strict-lints `[lints.clippy]` block (MCU System toggle).
-            let strict = self.mcu.as_ref().is_some_and(|m| m.strict_lints);
-            let new_toml = project_gen::ensure_strict_lints(&new_toml, strict);
-            // Debug-friendly `[profile.release]` (Debug tab toggle).
-            let debug_build = self.mcu.as_ref().is_some_and(|m| m.debug_build);
-            let new_toml = project_gen::ensure_debug_build(&new_toml, debug_build);
-            if new_toml != self.cargo_toml {
-                self.cargo_toml = new_toml;
-                self.invalidate_project_files_cache();
-            }
-            // partitions.csv follows the flash store: the IDE's block while the
-            // store has a partition of its own, nothing of ours otherwise (a
-            // hand-written table is left as it is). The runner flag goes with it,
-            // so `cargo run` flashes the same table the Flash button does.
-            let rows = self.mcu.as_ref().and_then(|m| {
-                crate::panels::mcu_module::flash_store::table_rows(
-                    m.flash_store.as_ref(),
-                    &m.family,
+            use crate::panels::mcu_module::manifest_sync::{self, Inputs, Manifests};
+            // Crates, target flags, the partition table and memory.x: ONE
+            // decision, the one the emit harnesses make too - see
+            // `manifest_sync`.
+            let synced = self.mcu.as_ref().map(|mcu| {
+                let build = self.selected_build_cfg();
+                let user_sources: Vec<&str> = self
+                    .project_tree
+                    .user_src_files
+                    .iter()
+                    .filter(|(path, _)| !path.starts_with("src/pins/"))
+                    .map(|(_, body)| body.as_str())
+                    .collect();
+                manifest_sync::sync(
+                    &Manifests {
+                        cargo_toml: self.cargo_toml.clone(),
+                        cargo_config: self.cargo_config.clone(),
+                        partitions_csv: self.partitions_csv.clone(),
+                        memory_x: self.memory_x.clone(),
+                    },
+                    &Inputs {
+                        mcu,
+                        build: build.as_ref().map(|(p, tc)| (p, tc)),
+                        config_files: &config_files,
+                        main_rs: &self.generated_code,
+                        user_sources: &user_sources,
+                    },
                 )
             });
-            let csv = project_gen::splice_partitions_csv(&self.partitions_csv, rows.as_deref());
-            // The build target follows the build config: Thread (IoT tab)
-            // moves an nRF52840 / nRF52833 to soft-float and back.
-            let targeted = match self.selected_build_cfg() {
-                Some((cfg, tc)) => project_gen::ensure_cargo_target(&self.cargo_config, &cfg, &tc),
-                None => self.cargo_config.clone(),
-            };
-            let runner =
-                project_gen::ensure_partition_table_runner(&targeted, !csv.trim().is_empty());
-            // esp-radio is built on `alloc`, which the Xtensa toolchain only
-            // has when `build-std` lists it.
-            let runner = project_gen::ensure_build_std_alloc(
-                &runner,
-                iot_active
-                    .is_some_and(|a| a.platform == crate::panels::mcu_module::iot::Platform::Esp),
-            );
-            if csv != self.partitions_csv || runner != self.cargo_config {
-                self.partitions_csv = csv;
-                self.cargo_config = runner;
-                self.invalidate_project_files_cache();
-            }
-            // memory.x follows the flash store on an STM32 and a Raspberry Pi
-            // board: FLASH ends where the store begins (on an F2/F4/F7
-            // `_stext` starts the program after it), so a program that grows
-            // into it fails to link. The same decision as the generated
-            // `flash_store.rs`; a memory.x with no markers is the user's and is
-            // only checked before a flash (not on a Pico under Blocking, where
-            // the store's code is not generated).
-            let reservation = self
-                .mcu
-                .as_ref()
-                .and_then(crate::panels::mcu_module::flash_store::memory_x_reservation);
-            if let Some((def, _)) = self.selected_build_cfg() {
-                let mx = project_gen::splice_memory_x_store(&self.memory_x, &def, reservation);
-                if mx != self.memory_x {
-                    self.memory_x = mx;
+            if let Some(m) = synced {
+                if m.cargo_toml != self.cargo_toml {
+                    self.cargo_toml = m.cargo_toml;
+                    self.invalidate_project_files_cache();
+                }
+                if m.partitions_csv != self.partitions_csv || m.cargo_config != self.cargo_config {
+                    self.partitions_csv = m.partitions_csv;
+                    self.cargo_config = m.cargo_config;
+                    self.invalidate_project_files_cache();
+                }
+                if m.memory_x != self.memory_x {
+                    self.memory_x = m.memory_x;
                     self.invalidate_project_files_cache();
                 }
             }

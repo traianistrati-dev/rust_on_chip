@@ -1382,7 +1382,7 @@ mod emit_for_manual_compile {
                 main_rs.contains("pins::configs::watchdog::init(&mut watchdog);"),
                 "{id}: no watchdog in main.rs:\n{main_rs}"
             );
-            let files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
+            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             // `sync_pin_files` keeps `src/pins/mod.rs` in a real project, and the
             // generated header declares `pub mod pins;` — so the harness has to
             // supply it too, or it compiles a project shape the app never
@@ -4826,29 +4826,16 @@ mod async_pwm_keeps_both_channels {
             .expect("built-in Pico");
         let mcu = pico_with(&[("GP2", 1, 1), ("GP3", 1, 2), ("GP6", 3, 1)]);
         let main_rs = mcu.fresh_main_rs();
-        // Through `build_cfg`, the SAME pairing the app uses. Calling
-        // `for_async` by hand here is what kept every emitted-project test
-        // green while the application shipped a manifest with no embassy in it.
-        let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-        let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+        // Through `manifest_sync`, the SAME build config and manifest the app
+        // writes. Calling `for_async` by hand here is what kept every emitted-
+        // project test green while the application shipped a manifest with no
+        // embassy in it.
+        let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_rp2040_pwm_ab");
         project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write rp pwm project");
-        let toml_path = dir.join("Cargo.toml");
-        let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-        let toml = project_gen::ensure_async_deps(
-            &toml,
-            true,
-            project_gen::async_flavor_for(&mcu.family, ""),
-            super::needs_async_usart(&mcu),
-            false,
-            false,
-            &[],
-        );
-        let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
-        std::fs::write(&toml_path, toml).expect("write Cargo.toml");
         println!("wrote {}", dir.display());
     }
 
@@ -4921,40 +4908,16 @@ mod emit_async_for_manual_compile {
                 "the radio takes the channel after the UART's two:
 {main_rs}"
             );
-            // Through `build_cfg`, the SAME pairing the app uses. Calling
-            // `for_async` by hand here is what kept every emitted-project test
-            // green while the application shipped a manifest with no embassy in it.
-            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-            let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            // Through `manifest_sync`, the SAME build config and manifest the app
+            // writes. Calling `for_async` by hand here is what kept every emitted-
+            // project test green while the application shipped a manifest with no
+            // embassy in it.
+            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write rp radio project");
-            let toml_path = dir.join("Cargo.toml");
-            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-            let toml = project_gen::ensure_async_deps(
-                &toml,
-                true,
-                // Through the SAME chooser the app uses. Naming the flavour
-                // here is what let the app and this harness disagree.
-                project_gen::async_flavor_for(&mcu.family, ""),
-                // This project wires GP0/GP1 as a UART too, so it needs the
-                // same answer - and the radio would MASK a wrong one, because
-                // `ensure_cyw43_deps` below adds `static_cell` for its own
-                // reasons. That is exactly why the plain Pico is the board to
-                // test a BufferedUart on.
-                super::needs_async_usart(&mcu),
-                false,
-                false,
-                &[],
-            );
-            let toml = project_gen::ensure_cyw43_deps(&toml, true, false, &[]);
-            // `static_cell` holds the driver state, and on the Pico's M0 that
-            // needs a CAS the core does not have. The app adds this right after
-            // the same two calls; without it only the RP2350 half builds.
-            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
-            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
 
             // `write_project` put the real blobs in `firmware/` already —
             // this only proves it, because a silent miss here would look like
@@ -5212,8 +5175,7 @@ mod emit_async_for_manual_compile {
             };
             assert_eq!(main_rs.matches(bring_up).count(), 1, "{main_rs}");
 
-            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-            let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             let mut user: Vec<(String, String)> = mcu.pin_tree_files();
             if cert {
                 crate::panels::mcu_module::codegen::iot_gen::seed_test_identity(&mut user);
@@ -5233,26 +5195,8 @@ mod emit_async_for_manual_compile {
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write rp iot project");
-            // The manifest the app builds, call for call and in its order.
-            let toml_path = dir.join("Cargo.toml");
-            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-            let toml = project_gen::ensure_async_deps(
-                &toml,
-                true,
-                project_gen::async_flavor_for(&mcu.family, ""),
-                super::needs_async_usart(&mcu),
-                false,
-                false,
-                &[],
-            );
-            let toml = project_gen::ensure_cyw43_deps(
-                &toml,
-                super::needs_radio(&mcu),
-                super::needs_bluetooth(&mcu),
-                &[],
-            );
-            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
-            let toml = project_gen::ensure_iot_deps(&toml, active, "", &mcu.family, &[]);
+            // The manifest the app builds - `manifest_sync`, as the app calls it.
+            let toml = &files.cargo_toml;
             if any_tls {
                 let tls_rs = user
                     .iter()
@@ -5291,7 +5235,6 @@ mod emit_async_for_manual_compile {
                 }
                 assert_eq!(toml.contains("spin = "), mcu.family == "rp2040", "{toml}");
             }
-            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             // The Bluetooth firmware, whole: `write_project` lays it down when
             // main.rs uploads it, and a stub would build just as well.
             if ble {
@@ -5397,11 +5340,11 @@ mod emit_async_for_manual_compile {
             );
             // The chip names a DIFFERENT HAL crate on async; this is where that
             // choice becomes a Cargo.toml.
-            // Through `build_cfg`, the SAME pairing the app uses. Calling
-            // `for_async` by hand here is what kept every emitted-project test
-            // green while the application shipped a manifest with no embassy in it.
-            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-            let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            // Through `manifest_sync`, the SAME build config and manifest the app
+            // writes. Calling `for_async` by hand here is what kept every emitted-
+            // project test green while the application shipped a manifest with no
+            // embassy in it.
+            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             // What the app writes: every config file `config_files` returns.
             // This used to be an empty `configs/mod.rs` - true while this
             // backend had no config files, and a project shape the app stopped
@@ -5411,29 +5354,6 @@ mod emit_async_for_manual_compile {
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write rp async project");
-            // The async deps the runtime needs, added the way the app adds them.
-            let toml_path = dir.join("Cargo.toml");
-            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-            let toml = project_gen::ensure_async_deps(
-                &toml,
-                true,
-                // Through the SAME chooser the app uses. Naming the flavour
-                // here is what let the app and this harness disagree.
-                project_gen::async_flavor_for(&mcu.family, ""),
-                // And the same computation for `static_cell` + embedded-io-async.
-                // Hard-coded `false` here would keep the matrix green on a
-                // project whose main.rs names `StaticCell` and whose manifest
-                // does not carry it.
-                super::needs_async_usart(&mcu),
-                false,
-                false,
-                &[],
-            );
-            // `static_cell` on the RP2040's M0 needs a CAS the core has not
-            // got. The app runs this for every async project; the radio
-            // harness already did, and this one did not.
-            let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
-            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             // The other half of the firmware gate: a board with no radio
             // must not carry 231 KB of it. The gate reads the GENERATED
             // CODE, so it is exactly the kind of thing that goes wrong
@@ -5523,29 +5443,13 @@ mod emit_async_for_manual_compile {
             );
             assert!(super::fpga_loader(&mcu), "the loader is switched on");
 
-            // Through `build_cfg`, the SAME pairing the app uses.
-            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-            let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            // Through `manifest_sync`, the SAME pairing the app uses.
+            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write pico2-ice project");
-            if matches!(runtime, Runtime::Async) {
-                let toml_path = dir.join("Cargo.toml");
-                let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-                let toml = project_gen::ensure_async_deps(
-                    &toml,
-                    true,
-                    project_gen::async_flavor_for(&mcu.family, ""),
-                    super::needs_async_usart(&mcu),
-                    false,
-                    false,
-                    &[],
-                );
-                let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &[]);
-                std::fs::write(&toml_path, toml).expect("write Cargo.toml");
-            }
             // The gateware `include_bytes!` reaches for: the IDE's own, whole,
             // and an image the FPGA takes. Existence alone proves nothing - a
             // stub compiles just as happily.
@@ -5573,7 +5477,7 @@ mod emit_async_for_manual_compile {
     #[test]
     #[ignore = "writes a project to disk for a manual cross-compile"]
     fn emit_rp_store_project() {
-        use crate::panels::mcu_module::codegen::flash_store_gen::{TAIL_SEED, in_files};
+        use crate::panels::mcu_module::codegen::flash_store_gen::TAIL_SEED;
         use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig, Platform};
         let board = std::env::var("EIDE_RP_STORE_BOARD").unwrap_or_else(|_| "pico".into());
         let id = match board.as_str() {
@@ -5640,37 +5544,10 @@ mod emit_async_for_manual_compile {
         );
         assert!(main_rs.contains("flash_store.save"), "no loop:\n{main_rs}");
 
-        // Through `build_cfg` and the chain `app.rs` runs, in its order.
+        // The app's own sync, memory.x included - see `manifest_sync`.
         let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-        let mut files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
-        let configs = mcu.config_files();
-        let sources = [main_rs.as_str()];
-        files.cargo_toml = project_gen::ensure_async_deps(
-            &files.cargo_toml,
-            true,
-            project_gen::async_flavor_for(&mcu.family, ""),
-            super::needs_async_usart(&mcu),
-            false,
-            false,
-            &sources,
-        );
-        files.cargo_toml = project_gen::ensure_cyw43_deps(
-            &files.cargo_toml,
-            super::needs_radio(&mcu),
-            super::needs_bluetooth(&mcu),
-            &sources,
-        );
-        files.cargo_toml =
-            project_gen::ensure_m0_atomics(&files.cargo_toml, true, &project.target, &sources);
-        files.cargo_toml = project_gen::ensure_flash_store_deps(
-            &files.cargo_toml,
-            in_files(&configs),
-            None,
-            &sources,
-        );
-        let reservation = flash_store::memory_x_reservation(&mcu);
-        assert!(reservation.is_some(), "nothing reserved");
-        files.memory_x = project_gen::splice_memory_x_store(&files.memory_x, &project, reservation);
+        let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
+        assert!(flash_store::memory_x_reservation(&mcu).is_some(), "nothing reserved");
         assert!(
             files.memory_x.contains("_flash_store_start"),
             "{}",
@@ -5704,7 +5581,7 @@ mod emit_async_for_manual_compile {
     #[test]
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_rp_mesh_project() {
-        use crate::panels::mcu_module::codegen::flash_store_gen::{TAIL_SEED, in_files};
+        use crate::panels::mcu_module::codegen::flash_store_gen::TAIL_SEED;
         use crate::panels::mcu_module::codegen::iot_gen;
         use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig};
         use crate::panels::mcu_module::iot::{self, BleMeshConfig, MqttConfig, SntpConfig};
@@ -5778,40 +5655,11 @@ mod emit_async_for_manual_compile {
             assert!(a < b, "{id}: `flash` before the mesh takes it:\n{main_rs}");
 
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-            let mut files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
-            let configs = mcu.config_files();
-            let sources = [main_rs.as_str()];
-            files.cargo_toml = project_gen::ensure_async_deps(
-                &files.cargo_toml,
-                true,
-                project_gen::async_flavor_for(&mcu.family, ""),
-                super::needs_async_usart(&mcu),
-                false,
-                false,
-                &sources,
-            );
-            files.cargo_toml = project_gen::ensure_cyw43_deps(
-                &files.cargo_toml,
-                super::needs_radio(&mcu),
-                super::needs_bluetooth(&mcu),
-                &sources,
-            );
-            files.cargo_toml =
-                project_gen::ensure_m0_atomics(&files.cargo_toml, true, &project.target, &sources);
-            files.cargo_toml = project_gen::ensure_flash_store_deps(
-                &files.cargo_toml,
-                in_files(&configs),
-                None,
-                &sources,
-            );
-            files.cargo_toml =
-                project_gen::ensure_iot_deps(&files.cargo_toml, active, "", &mcu.family, &sources);
+            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             for want in ["trouble-host = ", "bt-hci = \"0.8\"", "aes = ", "ccm = ", "cmac = ", "sequential-storage = "] {
                 assert!(files.cargo_toml.contains(want), "{id}: {want}:\n{}", files.cargo_toml);
             }
-            let reservation = flash_store::memory_x_reservation(&mcu);
-            assert!(reservation.is_some(), "{id}: nothing reserved");
-            files.memory_x = project_gen::splice_memory_x_store(&files.memory_x, &project, reservation);
+            assert!(flash_store::memory_x_reservation(&mcu).is_some(), "{id}: nothing reserved");
             let mut user = mcu.pin_tree_files();
             iot_gen::seed_test_mesh_keys(&mut user, node);
             assert!(

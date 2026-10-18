@@ -280,7 +280,7 @@ mod emit_for_manual_compile {
 
     use crate::panels::mcu_module::builtins::builtin_for;
     use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
-    use crate::panels::mcu_module::{project_gen, stm32_pin_data};
+    use crate::panels::mcu_module::{manifest_sync, project_gen, stm32_pin_data};
 
     /// Where a named vendor file actually is on THIS machine.
     ///
@@ -398,7 +398,7 @@ mod emit_for_manual_compile {
             }
         }
         let main_rs = mcu.fresh_main_rs();
-        let files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
+        let files = manifest_sync::project_files(&def, &mcu, &main_rs);
 
         // `sync_pin_files` always keeps `src/pins/mod.rs` in a real project, and
         // every invariant header declares `pub mod pins;` — so the harness has to
@@ -417,16 +417,7 @@ mod emit_for_manual_compile {
         // SEPARATELY from `embassy-stm32` and have to agree with it.
         mcu.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
         let main_rs = mcu.fresh_main_rs();
-        let mut files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
-        files.cargo_toml = project_gen::ensure_async_deps(
-            &files.cargo_toml,
-            true,
-            project_gen::AsyncFlavor::Stm32,
-            false,
-            false,
-            false,
-            &[],
-        );
+        let files = manifest_sync::project_files(&def, &mcu, &main_rs);
         let adir = std::env::temp_dir().join("eide_embassy_check_async");
         project_gen::clear_project_dir_keep_target(&adir);
         project_gen::write_project(&adir, &files, &mcu.pin_tree_files(), "", "")
@@ -451,20 +442,11 @@ mod emit_for_manual_compile {
         }
         mcu.reconcile_modules();
         let main_rs = mcu.fresh_main_rs();
-        let mut files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
+        let files = manifest_sync::project_files(&def, &mcu, &main_rs);
         let configs = mcu.config_files();
         println!(
             "config files: {:?}",
             configs.iter().map(|(n, _)| n).collect::<Vec<_>>()
-        );
-        files.cargo_toml = project_gen::ensure_async_deps(
-            &files.cargo_toml,
-            true,
-            project_gen::AsyncFlavor::Stm32,
-            !configs.is_empty(),
-            false,
-            false,
-            &[],
         );
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let udir = std::env::temp_dir().join("eide_embassy_check_usart");
@@ -517,7 +499,6 @@ mod emit_for_manual_compile {
             }
         }
         let mut main_rs = mcu.fresh_main_rs();
-        let configs = mcu.config_files();
         // Substitute real channels when the caller supplied them, so the
         // TEMPLATE can be compiled without the product pretending to know a
         // chip's DMA map (that is the next stage).
@@ -577,16 +558,7 @@ mod emit_for_manual_compile {
                 ),
             );
         }
-        let mut files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
-        files.cargo_toml = project_gen::ensure_async_deps(
-            &files.cargo_toml,
-            true,
-            project_gen::AsyncFlavor::Stm32,
-            !configs.is_empty(),
-            true,
-            true,
-            &[],
-        );
+        let files = manifest_sync::project_files(&def, &mcu, &main_rs);
         // One device, so its file and the `pub mod` in the bus's `mod.rs` -
         // which sits right against the END marker in this template - are
         // compiled too.
@@ -649,18 +621,7 @@ mod emit_for_manual_compile {
             }
         }
         let f2_main = f2mcu.fresh_main_rs();
-        let f2cfgs = f2mcu.config_files();
-        let mut f2files =
-            project_gen::build_project_files(&f2def.project, &f2def.toolchain, &f2_main);
-        f2files.cargo_toml = project_gen::ensure_async_deps(
-            &f2files.cargo_toml,
-            true,
-            project_gen::AsyncFlavor::Stm32,
-            !f2cfgs.is_empty(),
-            true,
-            true,
-            &[],
-        );
+        let f2files = manifest_sync::project_files(&f2def, &f2mcu, &f2_main);
         let f2user: Vec<(String, String)> = f2mcu.pin_tree_files();
         let f2dir = std::env::temp_dir().join("eide_embassy_check_dma_f2");
         project_gen::clear_project_dir_keep_target(&f2dir);
@@ -713,18 +674,7 @@ mod emit_for_manual_compile {
             }
         }
         let f7_main = f7mcu.fresh_main_rs();
-        let f7cfgs = f7mcu.config_files();
-        let mut f7files =
-            project_gen::build_project_files(&f7def.project, &f7def.toolchain, &f7_main);
-        f7files.cargo_toml = project_gen::ensure_async_deps(
-            &f7files.cargo_toml,
-            true,
-            project_gen::AsyncFlavor::Stm32,
-            !f7cfgs.is_empty(),
-            true,
-            true,
-            &[],
-        );
+        let f7files = manifest_sync::project_files(&f7def, &f7mcu, &f7_main);
         let f7user: Vec<(String, String)> = f7mcu.pin_tree_files();
         let f7dir = std::env::temp_dir().join("eide_embassy_check_dma_f7");
         project_gen::clear_project_dir_keep_target(&f7dir);
@@ -760,18 +710,7 @@ mod emit_for_manual_compile {
                 ..Default::default()
             };
             let w_main = w.fresh_main_rs();
-            let wcfgs = w.config_files();
-            let mut wfiles =
-                project_gen::build_project_files(&def.project, &def.toolchain, &w_main);
-            wfiles.cargo_toml = project_gen::ensure_async_deps(
-                &wfiles.cargo_toml,
-                false,
-                project_gen::AsyncFlavor::Stm32,
-                !wcfgs.is_empty(),
-                false,
-                false,
-                &[],
-            );
+            let wfiles = manifest_sync::project_files(&def, &w, &w_main);
             let wuser: Vec<(String, String)> = w.pin_tree_files();
             let wdir = std::env::temp_dir().join("eide_embassy_check_wdg");
             project_gen::clear_project_dir_keep_target(&wdir);
@@ -812,7 +751,7 @@ mod emit_for_manual_compile {
                 ..Default::default()
             };
             let w_main = w.fresh_main_rs();
-            let wfiles = project_gen::build_project_files(&wdef.project, &wdef.toolchain, &w_main);
+            let wfiles = manifest_sync::project_files(&wdef, &w, &w_main);
             let wuser: Vec<(String, String)> = w.pin_tree_files();
             let bdir = std::env::temp_dir().join("eide_wba_check_wdg");
             project_gen::clear_project_dir_keep_target(&bdir);
@@ -858,17 +797,7 @@ mod emit_for_manual_compile {
             };
         }
         let main_rs = m1.fresh_main_rs();
-        let mut files = project_gen::build_project_files(&f1.project, &f1.toolchain, &main_rs);
-        files.cargo_toml = project_gen::ensure_peripheral_deps(
-            &files.cargo_toml,
-            false,
-            true,
-            false,
-            false,
-            false,
-            true,
-            &[],
-        );
+        let files = manifest_sync::project_files(&f1, &m1, &main_rs);
         let user: Vec<(String, String)> = m1.pin_tree_files();
         let f1dir = std::env::temp_dir().join("eide_f1_check_usart");
         project_gen::clear_project_dir_keep_target(&f1dir);
@@ -1019,20 +948,11 @@ mod emit_for_manual_compile {
             println!("  bind: {}", line.trim());
         }
 
-        let mut files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
+        let files = manifest_sync::project_files(&def, &mcu, &main_rs);
         let configs = mcu.config_files();
         println!(
             "config files: {:?}",
             configs.iter().map(|(n, _)| n).collect::<Vec<_>>()
-        );
-        files.cargo_toml = project_gen::ensure_async_deps(
-            &files.cargo_toml,
-            true,
-            project_gen::AsyncFlavor::Stm32,
-            !configs.is_empty(),
-            false,
-            false,
-            &[],
         );
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_comp_check");
@@ -1353,27 +1273,7 @@ mod emit_for_manual_compile {
             );
         }
 
-        let mut files = project_gen::build_project_files(&f1.project, &f1.toolchain, &main_rs);
-        files.cargo_toml = project_gen::ensure_peripheral_deps(
-            &files.cargo_toml,
-            // CAN is wired below, so `bxcan` is needed — unless the USB took
-            // its pads, in which case nothing references bxcan at all.
-            usb_pads.is_none(),
-            true,
-            // The SPI and I2C here are wired, so `embedded-hal` is needed exactly
-            // as the app computes it — without DMA the bus is the Portable
-            // `SpiBusIo` bridge, and that bridge IS an `embedded_hal::spi::SpiBus`
-            // impl.
-            true,
-            true,
-            false,
-            true,
-            &[],
-        );
-        // `usb-device` + `usbd-serial` + the HAL's `stm32-usbd` feature, the
-        // same call `AppIde::save` makes.
-        files.cargo_toml =
-            project_gen::ensure_usb_deps(&files.cargo_toml, usb_pads.is_some(), &[&main_rs]);
+        let files = manifest_sync::project_files(&f1, &mcu, &main_rs);
         // Two named devices on I2C1: the bus is a folder, and each device file
         // is a module of it.
         // A half-wired I2C (`EIDE_I2C_HALF`) may have no module to put them on.
@@ -1560,75 +1460,31 @@ mod emit_for_manual_compile {
         ] {
             assert!(names.contains(&want), "{want} missing: {names:?}");
         }
+        // The app's path, manifest included: the blocking project as the app
+        // synced it, then the switch and the app's sync over what it left - so
+        // the bridge crates only Blocking needs have to be STRIPPED, not just
+        // never added. Each landing must be the project a fresh sync writes.
+        let before = manifest_sync::project_files(&def, &blocking, &blocking.fresh_main_rs());
+        assert!(before.cargo_toml.contains("embedded-io "), "{}", before.cargo_toml);
+        let on_async = manifest_sync::switched(&before, &main_rs, &def, &mcu);
+        let fresh = manifest_sync::project_files(&def, &mcu, &main_rs).cargo_toml;
+        assert!(
+            manifest_sync::same_lines(&on_async.cargo_toml, &fresh),
+            "the switch to Async left:\n{}\nnot:\n{fresh}",
+            on_async.cargo_toml
+        );
         let write = |dir_name: &str,
                      files: &project_gen::ProjectFiles,
-                     main_rs: &str,
-                     configs: &[(String, String)],
-                     mcu: &crate::panels::mcu_module::mcu::Mcu,
-                     is_async: bool| {
+                     mcu: &crate::panels::mcu_module::mcu::Mcu| {
             let user = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, files, &user, &mcu.mcu_config_text(), "")
                 .expect("write f1 project");
-            let toml_path = dir.join("Cargo.toml");
-            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-            let sources = [main_rs];
-            let has = |name: &str| configs.iter().any(|(n, _)| n.starts_with(name));
-            let (can, usart, spi, i2c, io) =
-                (has("can"), has("usart"), has("spi"), has("i2c"), has("io"));
-            // The chain `app.rs` runs after the HAL swap, with its inputs as
-            // `app.rs` computes them: the blocking bridges' crates off Async,
-            // the executor's on it, and `embedded-hal` for whichever needs it.
-            let toml = if is_async {
-                toml
-            } else {
-                project_gen::ensure_peripheral_deps(
-                    &toml,
-                    can,
-                    usart,
-                    spi,
-                    i2c,
-                    io,
-                    can || spi || usart,
-                    &sources,
-                )
-            };
-            let toml = project_gen::ensure_async_deps(
-                &toml,
-                is_async,
-                project_gen::async_flavor_for(&mcu.family, ""),
-                is_async && usart,
-                if is_async {
-                    spi || i2c
-                } else {
-                    spi || i2c || io
-                },
-                is_async && dma,
-                &sources,
-            );
-            let toml =
-                project_gen::ensure_exti_feature(&toml, main_rs.contains("embassy_stm32::exti"));
-            // The async USART's `static_cell` too - see the same call in `app.rs`.
-            let toml = project_gen::ensure_task_priority_deps(
-                &toml,
-                (is_async && usart) || main_rs.contains("InterruptExecutor"),
-                &sources,
-            );
-            let toml =
-                project_gen::ensure_m0_atomics(&toml, is_async, &def.project.target, &sources);
-            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
             println!("wrote {}", dir.display());
             println!("target: {}", def.project.target);
         };
-        write(
-            "eide_f1_check_async",
-            &files,
-            &main_rs,
-            &configs,
-            &mcu,
-            true,
-        );
+        write("eide_f1_check_async", &on_async, &mcu);
 
         // And back: the header the Async runtime wrote has to go with it.
         if std::env::var("EIDE_F1_SWITCH").as_deref() == Ok("back") {
@@ -1646,15 +1502,16 @@ mod emit_for_manual_compile {
                 back_files.cargo_toml,
                 "the switch back lands on the blocking manifest"
             );
-            let back_configs = blocking.config_files();
-            write(
-                "eide_f1_check_async_back",
-                &back_files,
-                &back_main,
-                &back_configs,
-                &blocking,
-                false,
+            // ...and the manifest back from the synced Async one, as the app
+            // holds it: the executor's crates have to go again.
+            let back = manifest_sync::switched(&on_async, &back_main, &def, &blocking);
+            let fresh = manifest_sync::project_files(&def, &blocking, &back_main).cargo_toml;
+            assert!(
+                manifest_sync::same_lines(&back.cargo_toml, &fresh),
+                "the switch back left:\n{}\nnot:\n{fresh}",
+                back.cargo_toml
             );
+            write("eide_f1_check_async_back", &back, &blocking);
         }
     }
 
@@ -1669,6 +1526,11 @@ mod emit_for_manual_compile {
     /// cargo test --bin rust_on_chip emit_f1_rtic_project -- --ignored --nocapture
     /// cd %TEMP%\eide_f1_check_rtic && cargo check --target thumbv7m-none-eabi
     /// ```
+    ///
+    /// The Configuration tab's IWDG is on unless `EIDE_F1_WDG=0`: its handle
+    /// has to leave `#[init]` as a `Local` too, and the RTIC backend once did
+    /// not call it at all. `EIDE_F1_NOPINS=1` wires nothing, so the "select
+    /// pins" default block - which used to drop every init - is what builds.
     #[test]
     #[ignore = "writes a project to disk for a manual cross-compile"]
     fn emit_f1_rtic_project() {
@@ -1681,35 +1543,40 @@ mod emit_for_manual_compile {
         let mut mcu = f1.build_mcu();
         mcu.runtime = Runtime::Rtic;
         mcu.pending_runtime = Runtime::Rtic;
-        for (name, func) in [
-            ("PA9", PinFunction::UsartTx(1)),
-            ("PA10", PinFunction::UsartRx(1)),
-            ("PA5", PinFunction::SpiSck(1)),
-            ("PA7", PinFunction::SpiMosi(1)),
-            ("PA6", PinFunction::SpiMiso(1)),
-            ("PB6", PinFunction::I2cScl(1)),
-            ("PB7", PinFunction::I2cSda(1)),
-            ("PA0", PinFunction::AdcChannel { adc: 1, channel: 0 }),
-            (
-                "PA2",
-                PinFunction::TimerPwm {
-                    timer: 2,
-                    channel: 3,
-                },
-            ),
-            (
-                "PA3",
-                PinFunction::TimerPwm {
-                    timer: 2,
-                    channel: 4,
-                },
-            ),
-            ("PC13", PinFunction::GpioOutput),
-            // An interrupt-enabled input is what makes this an RTIC project
-            // rather than a blocking one with extra ceremony: it becomes a
-            // `#[task(binds = EXTI1)]`.
-            ("PB1", PinFunction::GpioInput),
-        ] {
+        let wiring = if std::env::var("EIDE_F1_NOPINS").is_ok() {
+            Vec::new()
+        } else {
+            vec![
+                ("PA9", PinFunction::UsartTx(1)),
+                ("PA10", PinFunction::UsartRx(1)),
+                ("PA5", PinFunction::SpiSck(1)),
+                ("PA7", PinFunction::SpiMosi(1)),
+                ("PA6", PinFunction::SpiMiso(1)),
+                ("PB6", PinFunction::I2cScl(1)),
+                ("PB7", PinFunction::I2cSda(1)),
+                ("PA0", PinFunction::AdcChannel { adc: 1, channel: 0 }),
+                (
+                    "PA2",
+                    PinFunction::TimerPwm {
+                        timer: 2,
+                        channel: 3,
+                    },
+                ),
+                (
+                    "PA3",
+                    PinFunction::TimerPwm {
+                        timer: 2,
+                        channel: 4,
+                    },
+                ),
+                ("PC13", PinFunction::GpioOutput),
+                // An interrupt-enabled input is what makes this an RTIC project
+                // rather than a blocking one with extra ceremony: it becomes a
+                // `#[task(binds = EXTI1)]`.
+                ("PB1", PinFunction::GpioInput),
+            ]
+        };
+        for (name, func) in wiring {
             let num = mcu
                 .iter_all_pins()
                 .find(|p| p.name == name)
@@ -1720,6 +1587,12 @@ mod emit_for_manual_compile {
                     p.irq = Some(Edge::Rising);
                 }
             }
+        }
+        if std::env::var("EIDE_F1_WDG").as_deref() != Ok("0") {
+            use crate::panels::mcu_module::watchdog::IwdgConfig;
+            mcu.watchdog.iwdg = Some(IwdgConfig {
+                timeout_us: 2_000_000,
+            });
         }
         mcu.reconcile_modules();
         for m in &mut mcu.modules {
@@ -1735,19 +1608,7 @@ mod emit_for_manual_compile {
             "not an RTIC project:\n{main_rs}"
         );
 
-        let mut files = project_gen::build_project_files(&f1.project, &f1.toolchain, &main_rs);
-        files.cargo_toml = project_gen::ensure_peripheral_deps(
-            &files.cargo_toml,
-            false,
-            true,
-            true,
-            true,
-            true,
-            true,
-            &[],
-        );
-        files.cargo_toml =
-            project_gen::ensure_rtic_deps(&files.cargo_toml, true, &f1.project.target, &[&main_rs]);
+        let files = manifest_sync::project_files(&f1, &mcu, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_f1_check_rtic");
         project_gen::clear_project_dir_keep_target(&dir);
@@ -1857,20 +1718,10 @@ mod emit_for_manual_compile {
             "not a Native project:\n{main_rs}"
         );
 
-        let mut files = project_gen::build_project_files(&f1.project, &f1.toolchain, &main_rs);
-        // What `AppIde::save` computes on this runtime: NO portable trait crates
-        // (that is the whole point of Native), but `nb` stays — the concrete
+        // What the app computes on this runtime: NO portable trait crates
+        // (that is the whole point of Native), but `nb` stays - the concrete
         // `Tx`/`Rx` are nb-based.
-        files.cargo_toml = project_gen::ensure_peripheral_deps(
-            &files.cargo_toml,
-            false,
-            false,
-            false,
-            false,
-            false,
-            true,
-            &[],
-        );
+        let files = manifest_sync::project_files(&f1, &mcu, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_f1_check_native");
         project_gen::clear_project_dir_keep_target(&dir);
@@ -2377,50 +2228,10 @@ mod emit_for_manual_compile {
             );
         }
 
-        let mut files = project_gen::build_project_files(&esp.project, &esp.toolchain, &main_rs);
-        let configs = mcu.config_files();
-        // What `AppIde::save` computes: the Async runtime pulls esp-rtos and the
-        // executor in, and without them main.rs does not even parse.
-        files.cargo_toml = project_gen::ensure_async_deps(
-            &files.cargo_toml,
-            mcu.runtime == Runtime::Async,
-            project_gen::AsyncFlavor::Esp(&chip),
-            configs
-                .iter()
-                .any(|(n, b)| n.starts_with("uart") && b.contains("init_async")),
-            false,
-            false,
-            &[],
-        );
-        // The flash store's crates and table, by the decisions the app makes
-        // (`flash_store_gen::in_files`, `flash_store::table_rows`).
-        files.cargo_toml = project_gen::ensure_flash_store_deps(
-            &files.cargo_toml,
-            crate::panels::mcu_module::codegen::flash_store_gen::in_files(&configs),
-            Some(&esp.project.probe_chip),
-            &[],
-        );
-        files.partitions_csv = project_gen::splice_partitions_csv(
-            "",
-            crate::panels::mcu_module::flash_store::table_rows(mcu.flash_store.as_ref(), &chip)
-                .as_deref(),
-        );
-        files.cargo_config = project_gen::ensure_partition_table_runner(
-            &files.cargo_config,
-            !files.partitions_csv.is_empty(),
-        );
-        // The IoT tab's crates and `alloc` in build-std, after the flash store
-        // as the app orders them.
+        // Async runtime, flash store, partition table, the IoT tab's crates
+        // and `alloc` in build-std: the app's decision, in the app's order.
+        let files = manifest_sync::project_files(&esp, &mcu, &main_rs);
         let iot_active = crate::panels::mcu_module::iot::active(&mcu);
-        files.cargo_toml = project_gen::ensure_iot_deps(
-            &files.cargo_toml,
-            iot_active,
-            &esp.project.probe_chip,
-            &mcu.family,
-            &[],
-        );
-        files.cargo_config =
-            project_gen::ensure_build_std_alloc(&files.cargo_config, iot_active.is_some());
         let tls = iot_active.is_some_and(|a| a.tls());
         if matches!(iot_mode.as_deref(), Some("mqtts")) {
             assert!(iot_active.is_some_and(|a| a.mqtt_tls), "{chip}: mqtts is MQTT over TLS");
@@ -2550,7 +2361,7 @@ mod emit_for_manual_compile {
     #[ignore]
     fn emit_stm32_store_project() {
         warn_if_matrix_running();
-        use crate::panels::mcu_module::codegen::flash_store_gen::{TAIL_SEED, in_files};
+        use crate::panels::mcu_module::codegen::flash_store_gen::TAIL_SEED;
         use crate::panels::mcu_module::flash_store::{self, FlashStoreConfig, Platform};
         use crate::panels::mcu_module::mcu::model::Runtime;
         use crate::panels::mcu_module::mcu_def::{ClockDef, build_cfg};
@@ -2647,35 +2458,9 @@ mod emit_for_manual_compile {
         );
 
         let project = build_cfg(&def, Some(&mcu));
-        let mut files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
-        let configs = mcu.config_files();
-        let sources = [main_rs.as_str()];
-        // The chain `app.rs` runs, as far as a pin-less project needs it.
-        files.cargo_toml = project_gen::ensure_async_deps(
-            &files.cargo_toml,
-            mcu.is_async(),
-            project_gen::async_flavor_for(&mcu.family, ""),
-            false,
-            false,
-            false,
-            &sources,
-        );
-        files.cargo_toml = project_gen::ensure_m0_atomics(
-            &files.cargo_toml,
-            mcu.is_async(),
-            &project.target,
-            &sources,
-        );
-        files.cargo_toml = project_gen::ensure_flash_store_deps(
-            &files.cargo_toml,
-            in_files(&configs),
-            None,
-            &sources,
-        );
-        // memory.x by the decision the app makes (`flash_store::memory_x_reservation`).
-        let reservation = flash_store::memory_x_reservation(&mcu);
-        assert!(reservation.is_some(), "nothing reserved");
-        files.memory_x = project_gen::splice_memory_x_store(&files.memory_x, &project, reservation);
+        // memory.x included: the app's decision (`flash_store::memory_x_reservation`).
+        let files = manifest_sync::project_files(&def, &mcu, &main_rs);
+        assert!(flash_store::memory_x_reservation(&mcu).is_some(), "nothing reserved");
         assert!(
             files.memory_x.contains("_flash_store_start"),
             "{}",
@@ -2743,7 +2528,7 @@ mod emit_for_manual_compile {
 {main_rs}"
         );
 
-        let files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
+        let files = manifest_sync::project_files(&def, &mcu, &main_rs);
         // `main.rs` declares `pub mod pins;`, and the app writes that module
         // when it saves. A harness that skips it compiles a project the IDE
         // never produces - and fails on the one file it forgot.
@@ -3300,30 +3085,9 @@ mod emit_for_manual_compile {
             !main_rs.contains("DMA_TX_TODO"),
             "a muxed chip should need no TODO:\n{main_rs}"
         );
-        let mut files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
-        let configs = mcu.config_files();
-        // The app adds these when it saves an async project; the harness has to
-        // do the same or it compiles a manifest the IDE never writes.
-        files.cargo_toml = project_gen::ensure_async_deps(
-            &files.cargo_toml,
-            true,
-            project_gen::AsyncFlavor::Stm32,
-            !configs.is_empty(),
-            // SPI/I2C on async DMA return `embedded_hal_async` traits, so
-            // both `embedded-hal` and its async half are needed - the same
-            // two flags `AppIde::save` derives from the modules.
-            true,
-            true,
-            &[],
-        );
-        // Same rule as the app: an armed input needs the `exti` FEATURE, or the
-        // generated `use embassy_stm32::exti` does not resolve.
-        files.cargo_toml = project_gen::ensure_exti_feature(
-            &files.cargo_toml,
-            main_rs.contains("embassy_stm32::exti"),
-        );
-        files.cargo_toml =
-            project_gen::ensure_m0_atomics(&files.cargo_toml, true, &def.project.target, &[]);
+        // What the app writes when it saves this async project - a harness
+        // that wrote anything else would compile a manifest the IDE never does.
+        let files = manifest_sync::project_files(&def, &mcu, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join("eide_dma_check");
         project_gen::clear_project_dir_keep_target(&dir);

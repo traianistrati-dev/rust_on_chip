@@ -1535,43 +1535,16 @@ mod tests {
         for case in &CASES {
             let (def, mcu) = wired(case);
             let main_rs = mcu.fresh_main_rs();
-            let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
-            let files = project_gen::build_project_files(&project, &def.toolchain, &main_rs);
+            // USB crates, the async runtime, `static_cell`: the manifest the
+            // app writes - see `manifest_sync`.
+            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(case.dir);
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf project");
-            let toml_path = dir.join("Cargo.toml");
-            let sources = [main_rs.as_str()];
-            // The USB crates, by the decision `app.rs` asks of the same function.
-            let (usb_device, embassy_usb) = super::super::nrf::usb_stack(&mcu);
-            let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-            let toml = project_gen::ensure_esp_usb_deps(&toml, usb_device, &sources);
-            let toml = project_gen::ensure_embassy_usb_deps(&toml, embassy_usb, &sources);
-            std::fs::write(&toml_path, toml).expect("write Cargo.toml");
-            if mcu.is_async() {
-                let toml = std::fs::read_to_string(&toml_path).expect("read Cargo.toml");
-                let toml = project_gen::ensure_async_deps(
-                    &toml,
-                    true,
-                    project_gen::async_flavor_for(&mcu.family, ""),
-                    false,
-                    false,
-                    false,
-                    &sources,
-                );
-                let toml = project_gen::ensure_task_priority_deps(
-                    &toml,
-                    main_rs.contains("InterruptExecutor")
-                        || super::super::nrf::needs_static_cell(&mcu),
-                    &sources,
-                );
-                let toml = project_gen::ensure_m0_atomics(&toml, true, &project.target, &sources);
-                std::fs::write(&toml_path, toml).expect("write Cargo.toml");
-            }
             println!("wrote {}", dir.display());
-            println!("target: {}", project.target);
+            println!("target: {}", crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu)).target);
         }
     }
 

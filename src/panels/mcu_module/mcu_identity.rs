@@ -38,11 +38,12 @@ pub fn cpu_for_family(family: &str) -> Option<&'static str> {
     })
 }
 
-/// The Rust target triple for a Cortex core label. Delegates to the converter's
-/// [`core_to_target`](super::stm32_pin_data::core_to_target) so the form and the
-/// XML importer agree on the mapping.
-pub fn target_for_cpu(cpu: &str) -> &'static str {
-    super::stm32_pin_data::core_to_target(cpu)
+/// The Rust target triple for a Cortex core label on a part of `family`.
+/// Delegates to the converter's [`target_for`](super::stm32_pin_data::target_for)
+/// so the form and the XML importer agree on the mapping - including the
+/// STM32WL, whose M4 has no FPU.
+pub fn target_for_cpu(family: &str, cpu: &str) -> &'static str {
+    super::stm32_pin_data::target_for(family, cpu)
 }
 
 /// The whole identity a part name implies: `(family, cpu, toolchain, target)`.
@@ -52,12 +53,8 @@ pub fn identity_from_name(
 ) -> Option<(String, &'static str, ToolchainKind, &'static str)> {
     let family = family_from_name(name)?;
     let cpu = cpu_for_family(&family)?;
-    Some((
-        family,
-        cpu,
-        ToolchainKind::RustEmbedded,
-        target_for_cpu(cpu),
-    ))
+    let target = target_for_cpu(&family, cpu);
+    Some((family, cpu, ToolchainKind::RustEmbedded, target))
 }
 
 #[cfg(test)]
@@ -107,6 +104,15 @@ mod tests {
 
         let (_, cpu, _, target) = identity_from_name("STM32G0B1RE").unwrap();
         assert_eq!((cpu, target), ("Cortex-M0+", "thumbv6m-none-eabi"));
+
+        // Dual-core parts are named for their application core: the H7's M7
+        // (hard-float) and the WL's M4, which has no FPU on any STM32WL.
+        let (_, cpu, _, target) = identity_from_name("STM32H745ZI").unwrap();
+        assert_eq!((cpu, target), ("Cortex-M7", "thumbv7em-none-eabihf"));
+        let (_, cpu, _, target) = identity_from_name("STM32WL55JC").unwrap();
+        assert_eq!((cpu, target), ("Cortex-M4", "thumbv7em-none-eabi"));
+        let (_, _, _, target) = identity_from_name("STM32WLE5JC").unwrap();
+        assert_eq!(target, "thumbv7em-none-eabi");
 
         assert!(identity_from_name("RP2040").is_none());
     }

@@ -737,7 +737,18 @@ fn stm32_init_lines(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Str
     let mut s = String::new();
     if w.iwdg.is_some() {
         if super::family::uses_stm32f1xx_hal(family, runtime) {
-            s.push_str("    // Wrapped, NOT started - call start(period()) when ready.\n");
+            if runtime == Runtime::Rtic {
+                // `#[init]` returns, so `rtic::promote_bus_handles` turns this
+                // binding into the `iwdg` Local: a task is where it gets fed.
+                s.push_str(
+                    "    // Wrapped, NOT started - handed to the tasks as `iwdg`: one with\n",
+                );
+                s.push_str(
+                    "    // `local = [iwdg]` calls start(period()), then feed() every period.\n",
+                );
+            } else {
+                s.push_str("    // Wrapped, NOT started - call start(period()) when ready.\n");
+            }
             s.push_str("    let mut _iwdg = pins::configs::iwdg::init(dp.IWDG);\n");
         } else {
             s.push_str("    // Configured, NOT started - call unleash() when ready.\n");

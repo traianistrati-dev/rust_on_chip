@@ -92,6 +92,11 @@ const BUS_HANDLES: &[(&str, &str, bool)] = &[
     // frequency, the duty and the remap live in `pwm{N}.rs`, and with them a
     // `Handle` alias — so RTIC no longer needs the type spelled out by hand.
     ("_pwm", "pwm", true),
+    // Not a bus, but the same trip: the Configuration tab's IWDG is wrapped in
+    // `#[init]` and only STARTED and FED later, so a handle dropped with init
+    // is a watchdog nothing can ever feed. `iwdg.rs` names its `Handle` for
+    // exactly this. No WWDG row: RTIC is F1-only, and stm32f1xx-hal has none.
+    ("_iwdg", "iwdg", false),
 ];
 
 /// Promote the bus handles in `fn_calls` from dropped temporaries to named
@@ -487,6 +492,22 @@ pub fn splice_rtic_section(
     format!("{head}{new_section}\n{tail}")
 }
 
+/// What sits on `mod app` once `struct Local` has fields.
+///
+/// Resources exist for the user's tasks, which a freshly generated project has
+/// not written yet, so every field would be "never read". On the MODULE
+/// because `#[rtic::app]` re-emits `struct Local` itself: an allow on the
+/// struct is consumed with the source and never reaches the fields the lint
+/// reports. Shared by both skeletons, so the two cannot disagree on it.
+const LOCALS_ALLOW: &str = concat!(
+    "// Resources exist for YOUR tasks to use, and a freshly generated\n",
+    "// project has not written those yet. The allow sits on the MODULE\n",
+    "// because `#[rtic::app]` re-emits `struct Local` itself: one on the\n",
+    "// struct is consumed with the source and never reaches the fields the\n",
+    "// lint actually reports.\n",
+    "#[allow(dead_code)]\n",
+);
+
 /// The full `main.rs` GEN block for an RTIC project.
 #[allow(clippy::too_many_arguments)]
 pub fn make_generated_section(
@@ -515,7 +536,7 @@ pub fn make_generated_section(
         gpio_native,
         custom_inits,
     ) else {
-        return default_section(mcu_name, clock);
+        return default_section(mcu_name, clock, custom_inits);
     };
     let GenParts {
         use_block,
@@ -573,12 +594,7 @@ pub fn make_generated_section(
          systick_monotonic!(Mono, 1_000);\n\
          \n\
          #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true)]\n\
-         // Resources exist for YOUR tasks to use, and a freshly generated\n\
-         // project has not written those yet. The allow sits on the MODULE\n\
-         // because `#[rtic::app]` re-emits `struct Local` itself: one on the\n\
-         // struct is consumed with the source and never reaches the fields the\n\
-         // lint actually reports.\n\
-         #[allow(dead_code)]\n\
+         {LOCALS_ALLOW}\
          mod app {{\n\
          \x20   use super::*;\n\
          \n\
@@ -673,18 +689,53 @@ fn indent(block: &str) -> String {
         .collect()
 }
 
-/// An RTIC skeleton for a project with no pins configured yet.
-fn default_section(mcu_name: &str, clock: &ClockConfig) -> String {
+/// An RTIC skeleton for a project with no pins configured yet - still calling
+/// what the Configuration tab and the Custom modules set up (`custom_inits`),
+/// which comes from no pin. It used to take none: an IWDG-only project got its
+/// `iwdg.rs` and an `#[init]` that never called it.
+///
+/// No `pac` import, unlike the bare-metal default: RTIC's macro names the PAC
+/// by path and nothing else here does, so every fresh RTIC project used to
+/// open on an `unused import` warning.
+fn default_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> String {
     let clock_chain = super::stm32::clock_setup_chain(clock);
+    // The wired skeleton's promotion: `#[init]` returns, and a handle left in
+    // a `let` would be dropped with it instead of reaching a task.
+    let (inits, handles) = promote_bus_handles(custom_inits);
+    // Each part opens with its own blank line and header; one more after the
+    // last keeps the "select pins" line apart.
+    let inits = if inits.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", indent(&inits))
+    };
+    let (allow, fields, moved) = if handles.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        let decl: String = handles
+            .iter()
+            .map(|b| format!("        {}: {},\n", b.binding, b.ty))
+            .collect();
+        let init: String = handles
+            .iter()
+            .map(|b| format!("            {},\n", b.binding))
+            .collect();
+        (
+            LOCALS_ALLOW.to_owned(),
+            format!("\n{decl}    "),
+            format!("\n{init}        "),
+        )
+    };
     format!(
         "{GEN_BEGIN}\n\
          // MCU: {mcu_name}\n\
          use rtic_monotonics::systick::prelude::*;\n\
-         use stm32f1xx_hal::{{pac, prelude::*}};\n\
+         use stm32f1xx_hal::prelude::*;\n\
          \n\
          systick_monotonic!(Mono, 1_000);\n\
          \n\
          #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true)]\n\
+         {allow}\
          mod app {{\n\
          \x20   use super::*;\n\
          \n\
@@ -692,7 +743,7 @@ fn default_section(mcu_name: &str, clock: &ClockConfig) -> String {
          \x20   struct Shared {{}}\n\
          \n\
          \x20   #[local]\n\
-         \x20   struct Local {{}}\n\
+         \x20   struct Local {{{fields}}}\n\
          \n\
          \x20   #[init]\n\
          \x20   fn init(cx: init::Context) -> (Shared, Local) {{\n\
@@ -701,8 +752,9 @@ fn default_section(mcu_name: &str, clock: &ClockConfig) -> String {
          \x20       let rcc = dp.RCC.constrain();\n\
          \x20       let clocks = {clock_chain};\n\
          \x20       Mono::start(cx.core.SYST, clocks.sysclk().to_Hz());\n\
+         {inits}\
          \x20       // Select pins in the MCU Configurator to generate code here.\n\
-         \x20       (Shared {{}}, Local {{}})\n\
+         \x20       (Shared {{}}, Local {{{moved}}})\n\
          \x20   }}\n\
          \n\
          \x20   #[idle]\n\
@@ -995,22 +1047,8 @@ mod tests {
 
         mcu.reconcile_modules();
         let main_rs = mcu.fresh_main_rs();
-        let mut files = project_gen::build_project_files(&def.project, &def.toolchain, &main_rs);
-        // The deps the IDE adds on the RTIC runtime (app.rs does this per frame).
-        files.cargo_toml =
-            project_gen::ensure_rtic_deps(&files.cargo_toml, true, &def.project.target, &[]);
-        // The GPIO Portable bridge (`pins/configs/io.rs`) needs the embedded-hal
-        // crates — app.rs adds these from `has_cfg("io")` on every frame.
-        files.cargo_toml = project_gen::ensure_peripheral_deps(
-            &files.cargo_toml,
-            false, // CAN
-            true,  // USART
-            true,  // SPI
-            true,  // I2C
-            true,  // GPIO
-            true,  // nb
-            &[],
-        );
+        // The manifest the IDE writes on this runtime - see `manifest_sync`.
+        let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
 
         // `sync_pin_files` normally writes these two; without them `mod pins;`
         // in the invariant header has nothing to point at.
@@ -1148,5 +1186,8 @@ mod tests {
         }
         // No `fn main` — RTIC generates it.
         assert!(!code.contains("fn main"), "{code}");
+        // Only the macro names the PAC, by path: importing it as well was an
+        // `unused import` warning in every fresh RTIC project.
+        assert!(!code.contains("use stm32f1xx_hal::{pac"), "{code}");
     }
 }

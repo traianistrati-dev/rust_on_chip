@@ -435,14 +435,14 @@ pub fn section_is_rtic(existing: &str) -> bool {
 }
 
 /// The tail of a file leaving RTIC, for a runtime whose entry fn the tail has
-/// to close. RTIC's own seed is swapped for `seed`. A tail the user wrote in
-/// holds module-level helpers, so it is kept AFTER a fresh `seed` that closes
-/// the entry - moving it anywhere else would put `fn`s inside `fn main`.
+/// to close. RTIC's own seed is swapped for `seed` - also when items follow
+/// it (an edge hook's seed, a module model): it is still ours then, and what
+/// follows is kept as it was, as [`retarget_pristine_tail`] does. A tail the
+/// user wrote in holds module-level helpers, so it is kept AFTER a fresh
+/// `seed` that closes the entry - moving it anywhere else would put `fn`s
+/// inside `fn main`.
 pub fn tail_leaving_rtic(after: &str, seed: &str) -> String {
-    if after.trim() == super::rtic::RTIC_USER_TAIL.trim() {
-        return seed.to_owned();
-    }
-    format!("{seed}\n{after}")
+    super::rtic::swap_rtic_tail(after, seed).unwrap_or_else(|| format!("{seed}\n{after}"))
 }
 
 // ── Strict-lints exemption for generated code ─────────────────────────────────
@@ -1260,6 +1260,31 @@ pub fn edge_hook_name(binding: &str) -> String {
     format!("on_{binding}_edge")
 }
 
+/// The binding a hook is named after: the pad's input binding with NO label
+/// (`pb5` → `pb5_in`), so renaming the pin never renames its hook - the rule
+/// nRF's tasks set. The same on every runtime of a family, so a switch finds
+/// the hook it seeded.
+pub fn hook_binding(pin_ident: &str) -> String {
+    pin_binding(pin_ident, &PinFunction::GpioInput, "")
+}
+
+/// The generated lines that call a hook, each indented by `indent`. From a
+/// task, `name(arg).await;`. From an interrupt, `name(arg);` with the
+/// `unused_must_use` lint DENIED on it: a hook the user made an `async fn`,
+/// which an interrupt cannot await, would otherwise only be dropped - a call
+/// that builds and never runs - and is now a compile error that says so
+/// ("futures do nothing unless you `.await` or poll them"). The other way
+/// round, a plain `fn` awaited from a task, is an error too (E0277). The
+/// block never depends on the user's text: the hook fits its caller, and the
+/// compiler says which way when it does not.
+pub fn edge_call(name: &str, arg: &str, is_async: bool, indent: &str) -> String {
+    if is_async {
+        format!("{indent}{name}({arg}).await;\n")
+    } else {
+        format!("{indent}#[deny(unused_must_use)]\n{indent}{name}({arg});\n")
+    }
+}
+
 /// The seed: the hook as it is first written below the tail. Names no crate
 /// on purpose - it has to compile under either runtime, since a switch to a
 /// runtime with no handler leaves it as dead code rather than removing it.
@@ -1268,29 +1293,374 @@ pub fn edge_hook_name(binding: &str) -> String {
 ///
 /// The async seed has no `.await`, and `clippy::unused_async` is in
 /// `pedantic`, which the Strict profile denies - without the `#[allow]` a
-/// file the IDE just wrote would fail `cargo clippy`.
+/// file the IDE just wrote would fail `cargo clippy`. The sync seed, empty,
+/// could be a `const fn`, and `clippy::missing_const_for_fn` is in `nursery`,
+/// which Strict denies too.
+///
+/// The sync hook is called AFTER the handler's critical section (see the
+/// F1 and ESP Blocking handlers), so it may take one itself - to reach a
+/// `Mutex` it shares with `main` - without the pin's `RefCell` still borrowed.
 pub fn hook_seed(hook: &EdgeHook) -> String {
+    seed_text(hook, true)
+}
+
+/// The seed's text, the pin in its first doc line in backticks (`quoted`) -
+/// bare, a board pad name such as `BTN_A` trips `clippy::doc_markdown`, which
+/// Strict denies - or bare, as the IDE wrote it before.
+fn seed_text(hook: &EdgeHook, quoted: bool) -> String {
+    let what = if quoted {
+        format!("`{}`", hook.what)
+    } else {
+        hook.what.clone()
+    };
     if hook.is_async {
         format!(
-            "/// {} - called from the `{}` task\n\
+            "/// {what} - called from the `{}` task\n\
              /// with the level after the edge. Yours: kept across regeneration.\n\
              #[allow(clippy::unused_async)] // drop once the body awaits something\n\
              async fn {}(_high: bool) {{\n\
              \x20   // Your code here.\n\
              }}\n",
-            hook.what, hook.caller, hook.name
+            hook.caller, hook.name
         )
     } else {
         format!(
-            "/// {} - called from `{}` with the level after the edge. Runs in the\n\
-             /// interrupt, inside a critical section: keep it short.\n\
+            "/// {what} - called from the `{}` interrupt with the level\n\
+             /// after the edge. It runs in the interrupt: keep it short, never wait.\n\
              /// Yours: kept across regeneration.\n\
+             #[allow(clippy::missing_const_for_fn)] // drop once the body does real work\n\
              fn {}(_high: bool) {{\n\
              \x20   // Your code here.\n\
              }}\n",
-            hook.what, hook.caller, hook.name
+            hook.caller, hook.name
         )
     }
+}
+
+/// The text of main.rs that is the user's: above the block and below it. No
+/// block: all of it below.
+fn user_regions(file: &str) -> (&str, &str) {
+    match (file.find(GEN_BEGIN), file.find(GEN_END)) {
+        (Some(begin), Some(end)) if begin < end => (&file[..begin], &file[end + GEN_END.len()..]),
+        (_, Some(end)) => ("", &file[end + GEN_END.len()..]),
+        _ => ("", file),
+    }
+}
+
+/// `text` with its comments taken out - `//` to the end of the line, `/* */`
+/// (nested) - and its string and char literals emptied, its line breaks
+/// kept: what is left is the code's shape. A `/*` or a `//` inside a literal
+/// (an `Accept: */*` header, a URL) is text, not a comment.
+fn code_only(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut depth = 0usize;
+    // The line breaks inside a literal, so line structure survives it.
+    let breaks = |s: &str| "\n".repeat(s.matches('\n').count());
+    while let Some(c) = rest.chars().next() {
+        if depth > 0 {
+            if rest.starts_with("*/") {
+                depth -= 1;
+                rest = &rest[2..];
+            } else if rest.starts_with("/*") {
+                depth += 1;
+                rest = &rest[2..];
+            } else {
+                if c == '\n' {
+                    out.push('\n');
+                }
+                rest = &rest[c.len_utf8()..];
+            }
+            continue;
+        }
+        if rest.starts_with("//") {
+            rest = &rest[rest.find('\n').unwrap_or(rest.len())..];
+            continue;
+        }
+        if rest.starts_with("/*") {
+            depth = 1;
+            rest = &rest[2..];
+            continue;
+        }
+        let literal = match c {
+            '"' => Some(quoted_len(rest)),
+            'r' => raw_string_len(rest),
+            '\'' => char_literal_len(rest),
+            _ => None,
+        };
+        if let Some(len) = literal {
+            out.push_str("\"\"");
+            out.push_str(&breaks(&rest[..len]));
+            rest = &rest[len..];
+            continue;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// The length of the `"..."` literal `s` starts with, escapes honoured; all
+/// of `s` when it is never closed.
+fn quoted_len(s: &str) -> usize {
+    let mut escaped = false;
+    for (i, c) in s.char_indices().skip(1) {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return i + 1,
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+/// The length of the raw string `s` starts with (`r"..."`, `r#"..."#`), or
+/// `None` when it starts with no raw string (`r#type` is a raw identifier).
+fn raw_string_len(s: &str) -> Option<usize> {
+    let after_r = s.strip_prefix('r')?;
+    let hashes = after_r.len() - after_r.trim_start_matches('#').len();
+    let body = after_r[hashes..].strip_prefix('"')?;
+    let close = format!("\"{}", "#".repeat(hashes));
+    let end = body.find(&close).map_or(body.len(), |e| e + close.len());
+    Some(1 + hashes + 1 + end)
+}
+
+/// The length of the char literal `s` starts with (`'x'`, `'\n'`), or `None`
+/// for a lifetime (`'a`), which has no closing quote.
+fn char_literal_len(s: &str) -> Option<usize> {
+    let body = &s[1..];
+    if let Some(esc) = body.strip_prefix('\\') {
+        // Past the escaped char first: `'\''` closes on its SECOND quote.
+        let first = esc.chars().next()?.len_utf8();
+        return esc[first..].find('\'').map(|e| 2 + first + e + 1);
+    }
+    let c = body.chars().next()?;
+    body[c.len_utf8()..]
+        .starts_with('\'')
+        .then(|| 1 + c.len_utf8() + 1)
+}
+
+/// Whether the user's code imports with a glob from a module of THIS crate -
+/// `use handlers::*;`, `use crate::{config::*, handlers::*};` - which may
+/// well bring the hook in. A seed beside it would shadow it without a word,
+/// and the user's handler would never run; so none is seeded, and a hook the
+/// glob does not bring is a compile error that names it.
+///
+/// At the crate root only, where the generated code calls the hook: a `use`
+/// or `mod` indented inside another module brings nothing there. Not a glob
+/// from another crate (`use embassy_time::*;`), nor from a module the IDE
+/// writes - `pins`, a Data model - none of which can hold a hook.
+fn local_glob(head: &str, tail: &str) -> bool {
+    let raw = format!("{head}\n{tail}");
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    // The IDE's own modules below the block: each Data model follows its
+    // comment line, which `code_only` takes out - so read from the raw text.
+    let models: Vec<String> = raw
+        .lines()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[0].starts_with("// Data model for "))
+        .filter_map(|w| {
+            w[1].strip_prefix("mod ")
+                .map(|m| m.trim_end_matches([' ', '{']).to_owned())
+        })
+        .collect();
+    let mut mods = Vec::new();
+    let mut uses = Vec::new();
+    for item in top_level_items(&code_only(&raw)) {
+        let item = bare_item(&item);
+        if let Some(name) = item.strip_prefix("mod ") {
+            let end = name.find(|c: char| !is_ident(c)).unwrap_or(name.len());
+            mods.push(name[..end].to_owned());
+        } else if let Some(path) = item.strip_prefix("use ") {
+            uses.push(path.split_whitespace().collect::<String>());
+        }
+    }
+    mods.retain(|m| m != "pins" && !models.contains(m));
+    uses.iter().any(|path| glob_from(path, &mods))
+}
+
+/// The items at the crate root of `code` (see [`code_only`]): the text up to
+/// each `;` or closing `}` at brace depth zero. Whatever stands inside a
+/// module's or a function's braces is part of that one item, not one of its
+/// own - so a `use` there is not seen.
+fn top_level_items(code: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in code.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    items.push(code[start..=i].to_owned());
+                    start = i + 1;
+                }
+            }
+            ';' if depth == 0 => {
+                items.push(code[start..i].to_owned());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+/// `item` without what may stand before its keyword: its attributes
+/// (`#[path = ".."]`, `#![no_std]`, brackets balanced) and its visibility
+/// (`pub`, `pub(crate)`).
+fn bare_item(item: &str) -> &str {
+    let mut rest = item.trim_start();
+    loop {
+        if let Some(attr) = rest.strip_prefix("#!").or_else(|| rest.strip_prefix('#'))
+            && attr.trim_start().starts_with('[')
+        {
+            let attr = attr.trim_start();
+            let mut depth = 0usize;
+            let mut end = attr.len();
+            for (i, c) in attr.char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = attr[end..].trim_start();
+            continue;
+        }
+        if let Some(scoped) = rest.strip_prefix("pub(") {
+            rest = scoped
+                .split_once(')')
+                .map_or(scoped, |(_, r)| r)
+                .trim_start();
+            continue;
+        }
+        if let Some(public) = rest.strip_prefix("pub ") {
+            rest = public.trim_start();
+            continue;
+        }
+        return rest;
+    }
+}
+
+/// Whether the unspaced `use` tree `path` holds a glob under one of `mods`.
+fn glob_from(path: &str, mods: &[String]) -> bool {
+    let path = path.trim_start_matches("::");
+    let path = path
+        .strip_prefix("crate::")
+        .or_else(|| path.strip_prefix("self::"))
+        .unwrap_or(path);
+    if let Some(group) = path.strip_prefix('{').and_then(|p| p.strip_suffix('}')) {
+        let mut depth = 0usize;
+        let mut start = 0;
+        let mut found = false;
+        for (i, c) in group.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    found |= glob_from(&group[start..i], mods);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        return found || glob_from(&group[start..], mods);
+    }
+    let first = path.split([':', '{']).next().unwrap_or("");
+    path.contains('*') && mods.iter().any(|m| m == first)
+}
+
+/// Where a seed of `hook` still exactly as the IDE wrote it sits in `region`,
+/// either flavor, and how long it is: `(offset, len)`. Its caller is read back
+/// from its own first doc line, so a seed whose caller has since been renamed
+/// (a label on the task) is still recognised - but only a caller that is a
+/// plain name, beside this very pin: a word the user wrote in either slot
+/// makes the seed theirs. Also as an earlier IDE wrote it, the pin bare.
+fn pristine_seed(region: &str, hook: &EdgeHook) -> Option<(usize, usize)> {
+    let name = &hook.name;
+    let is_ident =
+        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    for is_async in [true, false] {
+        let sig = if is_async {
+            format!("async fn {name}(_high: bool) {{\n")
+        } else {
+            format!("fn {name}(_high: bool) {{\n")
+        };
+        // The doc and the allow above the signature: 3 lines on the async
+        // seed, 4 on the sync one.
+        let above = if is_async { 3 } else { 4 };
+        for (at, _) in region.match_indices(&sig) {
+            if at != 0 && !region[..at].ends_with('\n') {
+                continue;
+            }
+            let mut start = at;
+            for _ in 0..above {
+                let Some(prev) = region[..start.saturating_sub(1)].rfind('\n') else {
+                    start = 0;
+                    break;
+                };
+                start = prev + 1;
+            }
+            let first = region[start..].lines().next().unwrap_or("");
+            let Some((what, rest)) = first
+                .strip_prefix("/// ")
+                .and_then(|l| l.split_once(" - called from the `"))
+            else {
+                continue;
+            };
+            let Some((caller, _)) = rest.split_once('`') else {
+                continue;
+            };
+            let quoted = what.strip_prefix('`').and_then(|w| w.strip_suffix('`'));
+            if quoted.unwrap_or(what) != hook.what || !is_ident(caller) {
+                continue;
+            }
+            let seed = seed_text(
+                &EdgeHook {
+                    name: name.clone(),
+                    what: hook.what.clone(),
+                    caller: caller.to_owned(),
+                    is_async,
+                },
+                quoted.is_some(),
+            );
+            if region[start..].starts_with(&seed) {
+                return Some((start, seed.len()));
+            }
+        }
+    }
+    None
+}
+
+/// A seed still exactly as the IDE wrote it follows its caller - `fn` and
+/// `async fn` swap with the runtime, a renamed caller is renamed in its doc -
+/// the twin of [`retarget_pristine_tail`]. So a switch of an untouched
+/// project still lands on the project the new runtime writes fresh. A seed
+/// the user changed by one character is theirs and stays - and when it no
+/// longer fits its caller, the call does not compile and says why (see
+/// [`edge_call`]).
+pub fn retarget_pristine_hooks(mut file: String, hooks: &[EdgeHook]) -> String {
+    for hook in hooks {
+        let start = file.find(GEN_END).map_or(0, |i| i + GEN_END.len());
+        let Some((at, len)) = pristine_seed(&file[start..], hook) else {
+            continue;
+        };
+        let want = hook_seed(hook);
+        if file[start + at..start + at + len] != want {
+            file.replace_range(start + at..start + at + len, &want);
+        }
+    }
+    file
 }
 
 /// Seed each hook the user's region does not already have. The precedent is
@@ -1298,16 +1668,20 @@ pub fn hook_seed(hook: &EdgeHook) -> String {
 /// otherwise leave the file alone - the hook is the user's the moment it is
 /// written, and a body they typed is never touched.
 ///
-/// "Has" is the bare identifier anywhere AFTER `GEN_END`, not `fn name(` over
-/// the whole file: a user who moves the hook into `src/handlers.rs` and writes
-/// `use handlers::on_p0_14_in_edge;` in the tail has no definition left here,
-/// and seeding one would collide with the `use`. The block cannot give a false
-/// hit, since it sits before `GEN_END` and holds the call, never a definition.
+/// "Has" is the bare identifier anywhere in the user's text - above the block
+/// or below it - not `fn name(` over the whole file: a user who moves the
+/// hook into `src/handlers.rs` and writes `use handlers::on_p0_14_in_edge;`
+/// has no definition left here, and seeding one would collide with the
+/// `use`. The block cannot give a false hit: it holds the call, never a
+/// definition.
 pub fn ensure_edge_hooks(mut file: String, hooks: &[EdgeHook]) -> String {
-    let user_region_starts = file.find(GEN_END).map_or(0, |i| i + GEN_END.len());
+    let (head, tail) = user_regions(&file);
+    if local_glob(head, tail) {
+        return file;
+    }
     let seeds: Vec<String> = hooks
         .iter()
-        .filter(|h| !has_ident(&file[user_region_starts..], &h.name))
+        .filter(|h| !has_ident(head, &h.name) && !has_ident(tail, &h.name))
         .map(hook_seed)
         .collect();
     if seeds.is_empty() {
@@ -2653,7 +3027,8 @@ mod device_comment_tests {
 #[cfg(test)]
 mod edge_hook_tests {
     use super::{
-        EdgeHook, GEN_BEGIN, GEN_END, USER_TAIL, edge_hook_name, ensure_edge_hooks, hook_seed,
+        EdgeHook, GEN_BEGIN, GEN_END, USER_TAIL, code_only, edge_call, edge_hook_name,
+        ensure_edge_hooks, hook_binding, hook_seed, retarget_pristine_hooks,
     };
 
     fn hook(binding: &str) -> EdgeHook {
@@ -2757,7 +3132,7 @@ mod edge_hook_tests {
     }
 
     /// The sync flavor, for a backend whose handler is an interrupt: no
-    /// `async`, no clippy allow, and the critical-section warning.
+    /// `async`, the const allow Strict needs, and where it runs.
     #[test]
     fn the_sync_seed_has_no_async_and_says_where_it_runs() {
         let seed = hook_seed(&EdgeHook {
@@ -2768,10 +3143,190 @@ mod edge_hook_tests {
             seed.contains("\nfn on_pa0_in_edge(_high: bool) {\n"),
             "{seed}"
         );
+        assert!(!seed.contains("async"), "{seed}");
         assert!(
-            !seed.contains("async") && !seed.contains("allow("),
+            seed.contains("#[allow(clippy::missing_const_for_fn)]"),
             "{seed}"
         );
-        assert!(seed.contains("critical section: keep it short"), "{seed}");
+        assert!(
+            seed.contains("interrupt with the level") && seed.contains("never wait"),
+            "{seed}"
+        );
+    }
+
+    fn sync(binding: &str) -> EdgeHook {
+        EdgeHook {
+            is_async: false,
+            caller: "EXTI9_5".to_owned(),
+            ..hook(binding)
+        }
+    }
+
+    /// A pad's hook is named without its label, so a rename keeps it.
+    #[test]
+    fn the_hook_binding_carries_no_label() {
+        assert_eq!(hook_binding("pb5"), "pb5_in");
+        assert_eq!(edge_hook_name(&hook_binding("gpio9")), "on_gpio9_in_edge");
+        assert_eq!(
+            edge_call("on_x", "high", false, "  "),
+            "  #[deny(unused_must_use)]\n  on_x(high);\n"
+        );
+        assert_eq!(
+            edge_call("on_x", "high", true, "  "),
+            "  on_x(high).await;\n"
+        );
+    }
+
+    /// A seed still as written follows the runtime both ways, and its
+    /// renamed caller; one the user touched stays as it is.
+    #[test]
+    fn an_untouched_seed_follows_the_runtime_and_an_edited_one_stays() {
+        let asynced = ensure_edge_hooks(file(), &[hook("pb5_in")]);
+        let synced = retarget_pristine_hooks(asynced.clone(), &[sync("pb5_in")]);
+        assert_eq!(synced, ensure_edge_hooks(file(), &[sync("pb5_in")]));
+        assert_eq!(retarget_pristine_hooks(synced, &[hook("pb5_in")]), asynced);
+        // A caller renamed since (a label on the task) is renamed in the doc.
+        let renamed = EdgeHook {
+            caller: "pb5_in_button_irq".to_owned(),
+            ..hook("pb5_in")
+        };
+        let again = retarget_pristine_hooks(asynced.clone(), &[renamed.clone()]);
+        assert_eq!(again, ensure_edge_hooks(file(), &[renamed]));
+        // Edited: kept, whatever the runtime wants.
+        let edited = asynced.replace("    // Your code here.\n", "    mine();\n");
+        assert_eq!(
+            retarget_pristine_hooks(edited.clone(), &[sync("pb5_in")]),
+            edited
+        );
+    }
+
+    /// Comments and literals are not code; line breaks are kept.
+    #[test]
+    fn code_only_keeps_the_codes_shape() {
+        assert_eq!(code_only("a // b\nc"), "a \nc");
+        assert_eq!(code_only("a /* b /* c */ d */ e"), "a  e");
+        assert_eq!(
+            code_only("const A: &str = \"Accept: */*\";\nfn f() {}"),
+            "const A: &str = \"\";\nfn f() {}"
+        );
+        assert_eq!(code_only("r#\"x // y\"# z"), "\"\" z");
+        assert_eq!(
+            code_only("fn f<'a>(c: char) { c == '/' }"),
+            "fn f<'a>(c: char) { c == \"\" }"
+        );
+        assert_eq!(code_only("\"a\nb\" c"), "\"\"\n c");
+        assert_eq!(code_only("let q = '\\''; // x\ny"), "let q = \"\"; \ny");
+    }
+
+    /// Text the user wrote in the seed's first doc line - next to the pin,
+    /// or as the caller - makes the seed theirs: no regeneration reverts it.
+    /// The pin bare, as an earlier IDE wrote it, is still the IDE's.
+    #[test]
+    fn the_seeds_doc_line_is_the_users_once_they_write_in_it() {
+        let seeded = ensure_edge_hooks(file(), &[sync("pb5_in")]);
+        for edit in [
+            seeded.replace(
+                "`pb5_in pad` - called",
+                "`pb5_in pad`, the START button - called",
+            ),
+            seeded.replace(
+                "the `EXTI9_5` interrupt",
+                "the `EXTI9_5 (PB5+PB8)` interrupt",
+            ),
+        ] {
+            assert_ne!(edit, seeded, "the edit took");
+            assert_eq!(
+                retarget_pristine_hooks(edit.clone(), &[sync("pb5_in")]),
+                edit
+            );
+            assert_eq!(
+                retarget_pristine_hooks(edit.clone(), &[hook("pb5_in")]),
+                edit
+            );
+        }
+        let bare =
+            ensure_edge_hooks(file(), &[hook("pb5_in")]).replace("`pb5_in pad`", "pb5_in pad");
+        assert_eq!(
+            retarget_pristine_hooks(bare, &[hook("pb5_in")]),
+            ensure_edge_hooks(file(), &[hook("pb5_in")])
+        );
+    }
+
+    /// A glob from a module of this crate may bring the hook in, and a seed
+    /// would shadow it without a word: none is seeded. One from another
+    /// crate, from a module the IDE writes, or indented in another module
+    /// cannot - those still get their seed.
+    #[test]
+    fn a_glob_from_this_crate_seeds_nothing() {
+        for (user, seeds) in [
+            ("mod handlers;\nuse handlers::*;\n", false),
+            ("mod prelude;\nuse crate::prelude::*;\n", false),
+            (
+                "mod handlers;\nuse crate::{config::*, handlers::*};\n",
+                false,
+            ),
+            ("pub(self) mod handlers;\nuse handlers::{*};\n", false),
+            ("mod handlers;\nuse handlers::{\n    *,\n};\n", false),
+            (
+                "mod handlers;\nconst PAT: &str = \"/*\";\nuse handlers::*;\n",
+                false,
+            ),
+            ("use embassy_time::*;\n", true),
+            ("pub mod pins;\nuse pins::configs::*;\n", true),
+            (
+                "#[cfg(test)]\nmod tests {\n    use super::*;\n    use crate::helpers::*;\n}\n",
+                true,
+            ),
+            (
+                "mod sensors {\n    use self::regs::*;\n    mod regs {}\n}\n",
+                true,
+            ),
+            (
+                "// Data model for usart1 (editable — kept across regeneration)\nmod _usart_1 {\n}\nuse _usart_1::*;\n",
+                true,
+            ),
+            // However it is written on its lines.
+            (
+                "#[path = \"irq.rs\"] mod handlers;\nuse handlers::*;\n",
+                false,
+            ),
+            (
+                "mod handlers;\n#[allow(unused_imports)] use handlers::*;\n",
+                false,
+            ),
+            (
+                "mod handlers; use embassy_time::*; use handlers::*;\n",
+                false,
+            ),
+            (
+                "mod handlers;\n/* the handlers */ use handlers::*;\n",
+                false,
+            ),
+            (
+                "#![allow(unused)]\nmod handlers;\nuse handlers::*;\n",
+                false,
+            ),
+            (
+                "fn f() {\n    use crate::handlers::*;\n}\nmod handlers;\n",
+                true,
+            ),
+        ] {
+            let out = ensure_edge_hooks(format!("{user}{}", file()), &[hook("p0_14_in")]);
+            assert_eq!(
+                out.contains("fn on_p0_14_in_edge(_high: bool)"),
+                seeds,
+                "{user}:\n{out}"
+            );
+        }
+    }
+
+    /// A `use` above the block brings the hook in too: no second one.
+    #[test]
+    fn a_use_above_the_block_counts() {
+        let headed = format!("use handlers::on_p0_14_in_edge;\n{}", file());
+        assert_eq!(
+            ensure_edge_hooks(headed.clone(), &[hook("p0_14_in")]),
+            headed
+        );
     }
 }

@@ -39,6 +39,7 @@
 
 use super::clock::ClockConfig;
 use super::clock::graph::evaluate;
+use super::codegen::common::{EdgeHook, edge_call, edge_hook_name, hook_binding};
 use super::codegen::dma_map::DmaUse;
 use super::codegen::{GEN_BEGIN, GEN_END, mcu_id_marker_line, pin_binding, sanitize_label};
 use super::mcu_def::DmaDef;
@@ -231,6 +232,39 @@ fn irq_static(p: &Pin) -> String {
     esp_binding(p).to_ascii_uppercase()
 }
 
+/// The user's hook an armed input's handler or task calls: named after the
+/// pad alone (`on_gpio0_in_edge`), so a label never renames it, and the same
+/// on both runtimes.
+fn esp_hook(p: &Pin) -> String {
+    edge_hook_name(&hook_binding(&pin_var(&p.name)))
+}
+
+/// The hooks the generated code calls, one per armed input, in the order it
+/// calls them: plain `fn`s from the ONE `gpio_irq` handler on Blocking,
+/// `async fn`s awaited from each pin's task on Async. The same pins
+/// `make_gen_section` arms.
+pub fn edge_hooks(pins: &[&Pin], runtime: EspRuntime) -> Vec<EdgeHook> {
+    let configured: Vec<&Pin> = pins
+        .iter()
+        .filter(|p| !p.reserved && p.selected_function != PinFunction::Unset)
+        .copied()
+        .collect();
+    let is_async = runtime == EspRuntime::Async;
+    irq_inputs(&configured)
+        .into_iter()
+        .map(|(p, _, _)| EdgeHook {
+            name: esp_hook(p),
+            what: p.name.clone(),
+            caller: if is_async {
+                format!("{}_irq", esp_binding(p))
+            } else {
+                "gpio_irq".to_owned()
+            },
+            is_async,
+        })
+        .collect()
+}
+
 /// The module-level items the BLOCKING path needs: one static per armed input,
 /// and ONE handler.
 ///
@@ -260,26 +294,59 @@ fn irq_handler_items(armed: &[(&Pin, Edge, TaskPriority)]) -> String {
     // the SOURCE indentation, which drops every line but the first out of
     // column — and in generated Rust that is a syntax error, not a typo.
     out.push_str("/// Every GPIO on this chip shares ONE interrupt, so this handler asks\n");
-    out.push_str("/// each armed pin whether it was the one that fired.\n");
+    out.push_str("/// each armed pin whether it was the one that fired, then calls that\n");
+    out.push_str("/// pin's hook below `main`, a plain `fn`.\n");
+    // Ten lines a pin: past nine, `clippy::too_many_lines` (pedantic, which
+    // Strict denies) would fail a handler the user cannot shorten.
+    if armed.len() > 9 {
+        out.push_str("#[allow(clippy::too_many_lines)] // one block per armed pin\n");
+    }
     out.push_str("#[esp_hal::handler]\n");
     out.push_str("fn gpio_irq() {\n");
+    // The body is NOT here: this handler is rebuilt on every regeneration, so
+    // it calls a hook seeded once below the tail. AFTER the critical section,
+    // with the level it read: the hook may take one itself, and the pin's
+    // `RefCell` is no longer borrowed by then. ONE local, a tuple for several
+    // pins - see the F1's `f1_irq_items` for why not one per pin.
+    let slot = |i: usize| {
+        if armed.len() == 1 {
+            "fired".to_owned()
+        } else {
+            format!("fired.{i}")
+        }
+    };
+    out.push_str(&if armed.len() == 1 {
+        "    let mut fired = None;\n".to_owned()
+    } else {
+        format!(
+            "    let mut fired = ({});\n",
+            vec!["None"; armed.len()].join(", ")
+        )
+    });
     out.push_str("    critical_section::with(|cs| {\n");
-    for (p, edge, _) in armed {
+    for (i, (p, _, _)) in armed.iter().enumerate() {
         out.push_str(&format!(
             "        if let Some(pin) = {s}.borrow_ref_mut(cs).as_mut() {{\n\
              \x20           if pin.is_interrupt_set() {{\n\
              \x20               // Cleared FIRST: leave it set and the handler re-enters\n\
              \x20               // the moment it returns.\n\
              \x20               pin.clear_interrupt();\n\
-             \x20               // {name} {label} edge: your handler code here.\n\
+             \x20               {slot} = Some(Input::is_high(pin));\n\
              \x20           }}\n\
              \x20       }}\n",
             s = irq_static(p),
-            name = p.name,
-            label = edge.label().to_ascii_lowercase(),
+            slot = slot(i),
         ));
     }
-    out.push_str("    });\n}\n\n");
+    out.push_str("    });\n");
+    for (i, (p, _, _)) in armed.iter().enumerate() {
+        out.push_str(&format!(
+            "    if let Some(high) = {} {{\n{}    }}\n",
+            slot(i),
+            edge_call(&esp_hook(p), "high", false, "        ")
+        ));
+    }
+    out.push_str("}\n\n");
     out
 }
 
@@ -287,24 +354,41 @@ fn irq_handler_items(armed: &[(&Pin, Edge, TaskPriority)]) -> String {
 /// block and the entry point — a task cannot live inside `fn main`.
 ///
 /// The task OWNS its pin. That is the honest shape: `wait_for_*` takes
-/// `&mut self`, so the pin cannot also be read from `main` without a mutex, and
-/// a task that borrows nothing is a task the user can freely edit.
+/// `&mut self`, so the pin cannot also be read from `main` without a mutex.
+/// The body is NOT here: the task is rebuilt on every regeneration, so it
+/// calls a hook seeded once below the tail, with the level after the edge.
+///
+/// A raised task runs on an `InterruptExecutor`, whose `SendSpawner` takes
+/// only a `Send` future - the hook's, awaited inside, included - so its doc
+/// says so.
 fn irq_tasks(armed: &[(&Pin, Edge, TaskPriority)]) -> String {
     let mut out = String::new();
-    for (p, edge, _) in armed {
+    for (p, edge, prio) in armed {
         let var = esp_binding(p);
+        let hook = esp_hook(p);
+        let send = if *prio == TaskPriority::Normal {
+            String::new()
+        } else {
+            format!(
+                "/// It runs on the {} interrupt executor, so the hook's future must be `Send`.\n",
+                prio.label()
+            )
+        };
         out.push_str(&format!(
-            "/// {name} — wakes on a {label} edge. The task owns the pin.\n\
+            "/// {name} — wakes on {phrase}. The task owns the pin;\n\
+             /// `{hook}` below `main` is yours.\n\
+             {send}\
              #[embassy_executor::task]\n\
              async fn {var}_irq(mut pin: Input<'static>) {{\n\
              \x20   loop {{\n\
              \x20       pin.{wait}().await;\n\
-             \x20       // {name} {label} edge: your handler code here.\n\
+             {call}\
              \x20   }}\n\
              }}\n\n",
             name = p.name,
-            label = edge.label().to_ascii_lowercase(),
+            phrase = edge.phrase(),
             wait = wait_fn(*edge),
+            call = edge_call(&hook, "pin.is_high()", true, "        "),
         ));
     }
     out
@@ -2695,6 +2779,64 @@ mod tests {
             "{code}"
         );
         assert!(code.contains("gpio1_in.listen(Event::AnyEdge);"), "{code}");
+    }
+
+    /// The handler's body is the user's: one hook per pin, called AFTER the
+    /// critical section with the level read inside it - ONE `fired` local, a
+    /// slot per pin, the calls in pin order.
+    #[test]
+    fn the_blocking_handler_calls_each_hook_after_the_critical_section() {
+        let mut a = pwm_pin("GPIO0", PinFunction::GpioInput);
+        a.custom_label = "mw ot2".into();
+        a.irq = Some(Edge::Rising);
+        let mut b = pwm_pin("GPIO1", PinFunction::GpioInput);
+        b.irq = Some(Edge::Both);
+        let pins = vec![a, b];
+        let refs: Vec<&Pin> = pins.iter().collect();
+        let code = esp_main(&refs, EspRuntime::Blocking);
+        assert!(
+            code.contains("fired.0 = Some(Input::is_high(pin));"),
+            "{code}"
+        );
+        assert!(
+            code.contains(
+                "    });\n    if let Some(high) = fired.0 {\n        #[deny(unused_must_use)]\n        on_gpio0_in_edge(high);\n    }\n    if let Some(high) = fired.1 {\n        #[deny(unused_must_use)]\n        on_gpio1_in_edge(high);\n    }\n}\n"
+            ),
+            "{code}"
+        );
+        assert!(!code.contains("handler code here"), "{code}");
+        let hooks = edge_hooks(&refs, EspRuntime::Blocking);
+        let names: Vec<&str> = hooks.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["on_gpio0_in_edge", "on_gpio1_in_edge"],
+            "no label in it"
+        );
+        assert!(hooks.iter().all(|h| !h.is_async && h.caller == "gpio_irq"));
+    }
+
+    /// A task awaits its hook; one on a raised executor says the hook's
+    /// future must be `Send` (its `SendSpawner` takes no other), a Normal one
+    /// does not.
+    #[test]
+    fn a_task_awaits_its_hook_and_a_raised_one_says_send() {
+        for (prio, send) in [(TaskPriority::Normal, false), (TaskPriority::High, true)] {
+            let mut p = pwm_pin("GPIO0", PinFunction::GpioInput);
+            p.irq = Some(Edge::Both);
+            p.irq_priority = prio;
+            let pins = vec![p];
+            let refs: Vec<&Pin> = pins.iter().collect();
+            let code = esp_main(&refs, EspRuntime::Async);
+            assert!(
+                code.contains("        on_gpio0_in_edge(pin.is_high()).await;\n"),
+                "{code}"
+            );
+            assert!(code.contains("wakes on either edge"), "{code}");
+            assert_eq!(code.contains("must be `Send`"), send, "{prio:?}:\n{code}");
+            let hooks = edge_hooks(&refs, EspRuntime::Async);
+            assert_eq!(hooks[0].caller, "gpio0_in_irq");
+            assert!(hooks[0].is_async);
+        }
     }
 
     /// An unarmed input on the blocking path stays exactly what it was.

@@ -1,5 +1,6 @@
 //! Armed inputs: the EXTI line plan, the tasks that wait on an edge and their spawns.
 
+use super::super::common::{EdgeHook, edge_call, edge_hook_name, hook_binding};
 use super::*;
 
 /// One input the user armed with an edge, resolved to its EXTI line + vector.
@@ -124,27 +125,52 @@ pub(super) fn exti_wait(edge: Edge) -> &'static str {
     }
 }
 
+/// The user's hook an armed input's task calls: named after the pad alone
+/// (`on_pb5_in_edge`), the same name the F1's Blocking and RTIC handlers call.
+fn exti_hook(e: &ExtiPin) -> String {
+    edge_hook_name(&hook_binding(&e.singleton.to_ascii_lowercase()))
+}
+
+/// The hooks the tasks call, one per input that GOT a line - a refused pad has
+/// no task, so no hook - in the order the tasks are emitted.
+pub fn exti_hooks(armed: &[ExtiPin]) -> Vec<EdgeHook> {
+    armed
+        .iter()
+        .map(|e| EdgeHook {
+            name: exti_hook(e),
+            what: e.singleton.clone(),
+            caller: format!("{}_irq", e.binding),
+            is_async: true,
+        })
+        .collect()
+}
+
 /// One `#[embassy_executor::task]` per armed input, placed above the entry —
 /// a task cannot live inside `async fn main`.
 ///
 /// The task OWNS its pin: `wait_for_*` takes `&mut self`, so the pin cannot also
-/// be read from `main` without a mutex.
+/// be read from `main` without a mutex. The body is NOT here: the task is
+/// rebuilt on every regeneration, so it calls a hook seeded once below the
+/// tail, with the level after the edge.
 pub fn exti_tasks(armed: &[ExtiPin]) -> String {
     let mut out = String::new();
     for e in armed {
+        let hook = exti_hook(e);
         out.push_str(&format!(
-            "/// {sing} — wakes on a {label} edge. The task owns the pin.\n\
+            "/// {sing} — wakes on {phrase}. The task owns the pin;\n\
+             /// `{hook}` below `main` is yours.\n\
              #[embassy_executor::task]\n\
              async fn {b}_irq(mut pin: ExtiInput<'static, Async>) {{\n\
              \x20   loop {{\n\
              \x20       pin.{wait}().await;\n\
-             \x20       // {sing} {label} edge: your handler code here.\n\
+             {call}\
              \x20   }}\n\
              }}\n\n",
             sing = e.singleton,
-            label = e.edge.label().to_ascii_lowercase(),
+            phrase = e.edge.phrase(),
             b = e.binding,
             wait = exti_wait(e.edge),
+            call = edge_call(&hook, "pin.is_high()", true, "        "),
         ));
     }
     out
@@ -188,6 +214,29 @@ mod exti_tests {
         p.selected_function = PinFunction::GpioInput;
         p.irq = Some(edge);
         p
+    }
+
+    /// The task calls the user's hook - named after the pad, never its label
+    /// - and a pad refused its line has no task, so no hook.
+    #[test]
+    fn the_task_calls_the_hook_and_a_refused_pad_has_none() {
+        let a = armed("PA5", Edge::Both);
+        let mut b = armed("PB5", Edge::Rising);
+        b.custom_label = "btn".into();
+        let pins = [&a, &b];
+        let (plan, notes) = exti_plan(&pins, &vectors(&["EXTI9_5"]));
+        assert_eq!(plan.len(), 1, "{notes}");
+        let hooks = exti_hooks(&plan);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].name, "on_pa5_in_edge");
+        assert!(hooks[0].is_async);
+        let tasks = exti_tasks(&plan);
+        assert!(
+            tasks.contains("        on_pa5_in_edge(pin.is_high()).await;\n"),
+            "{tasks}"
+        );
+        assert!(tasks.contains("wakes on either edge"), "{tasks}");
+        assert!(!tasks.contains("code here"), "{tasks}");
     }
 
     /// An EXTI vector name states a RANGE, which is what makes `nvic::covered`

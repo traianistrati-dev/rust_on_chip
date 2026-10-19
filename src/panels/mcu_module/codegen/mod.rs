@@ -150,6 +150,9 @@ impl Mcu {
             .map(|b| b.edge_hooks(self))
             .unwrap_or_default();
         let code = common::ensure_edge_hooks(code, &hooks);
+        // An untouched seed follows the runtime (`fn` / `async fn`); an
+        // edited one stays, and a call it no longer fits says so when built.
+        let code = common::retarget_pristine_hooks(code, &hooks);
         // The devices the user grouped, gathered into one comment.
         let code = common::with_device_comment(code, self);
         // Strict-lints: exempt the generated entry fn (its init uses unwrap/as…).
@@ -178,6 +181,9 @@ impl Mcu {
             .map(|b| b.edge_hooks(self))
             .unwrap_or_default();
         let code = common::ensure_edge_hooks(code, &hooks);
+        // An untouched seed follows the runtime (`fn` / `async fn`); an
+        // edited one stays, and a call it no longer fits says so when built.
+        let code = common::retarget_pristine_hooks(code, &hooks);
         // Rebuilt with the block, so renaming a device in the panel renames it
         // here on the next save.
         let code = common::with_device_comment(code, self);

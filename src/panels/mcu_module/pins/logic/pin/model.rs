@@ -65,8 +65,10 @@ impl TaskPriority {
 /// Which edge of an input pin raises an interrupt.
 ///
 /// `None` on a pin (the default) means "read it by polling" — the common case,
-/// and why this is opt-in rather than implied by `GpioInput`. Only meaningful on
-/// the RTIC runtime, where each interrupt-enabled pin becomes a hardware task.
+/// and why this is opt-in rather than implied by `GpioInput`. An armed pin gets
+/// an interrupt handler (F1 Blocking/Native, ESP Blocking), a hardware task
+/// (RTIC) or an executor task (Async), and each calls the user's
+/// `on_<pad>_in_edge` hook below `main`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Edge {
     Rising,
@@ -107,6 +109,16 @@ impl Edge {
             Self::Rising => "Rising",
             Self::Falling => "Falling",
             Self::Both => "Both edges",
+        }
+    }
+
+    /// The edge as a phrase in a sentence of generated text: "wakes on
+    /// either edge" - not `label`, whose "Both edges" read "both edges edge".
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::Rising => "a rising edge",
+            Self::Falling => "a falling edge",
+            Self::Both => "either edge",
         }
     }
 }

@@ -17,8 +17,8 @@
 
 use super::common::AUTOGEN_BANNER;
 use super::common::{
-    ASYNC_USER_TAIL, GEN_BEGIN, GEN_END, USER_TAIL, mcu_id_marker_line, retarget_pristine_tail,
-    var_suffix,
+    ASYNC_USER_TAIL, EdgeHook, GEN_BEGIN, GEN_END, USER_TAIL, edge_call, edge_hook_name,
+    mcu_id_marker_line, retarget_pristine_tail, var_suffix,
 };
 use super::family::FamilyBackend;
 use crate::panels::mcu_module::mcu::Mcu;
@@ -3609,13 +3609,22 @@ fn async_gpio_lines(mcu: &Mcu) -> (String, String) {
                     Edge::Both => "Either edge",
                 };
                 let name = format!("gp{n}{sfx}");
-                tasks.push_str(&format!("/// {what} on GP{n}. The task owns the pin.\n"));
+                // The body is NOT here: this task is rebuilt on every
+                // regeneration, so it calls a hook seeded once below the tail
+                // (`common::ensure_edge_hooks`), which is the user's to fill.
+                let hook = edge_hook_name(&name);
+                tasks.push_str(&format!(
+                    "/// {what} on GP{n}. The task owns the pin;\n/// `{hook}` below `main` is yours.\n"
+                ));
                 tasks.push_str("#[embassy_executor::task]\n");
                 tasks.push_str(&format!(
                     "async fn {name}_irq(mut pin: Input<'static>) {{\n"
                 ));
                 tasks.push_str(&format!("    loop {{\n        pin.{wait}().await;\n"));
-                tasks.push_str("        // The edge arrived. Your code here.\n    }\n}\n\n");
+                tasks.push_str(&format!(
+                    "{}    }}\n}}\n\n",
+                    edge_call(&hook, "pin.is_high()", true, "        ")
+                ));
                 pins_out.push(format!(
                     "    let {name} = Input::new(p.PIN_{n}, Pull::Up);\n    _spawner.spawn({name}_irq({name}).unwrap());\n"
                 ));
@@ -3624,6 +3633,25 @@ fn async_gpio_lines(mcu: &Mcu) -> (String, String) {
         }
     }
     (tasks, super::common::blank_separated(pins_out))
+}
+
+/// The hooks the armed inputs' tasks call, in the order the tasks are
+/// emitted - the same pins, binding and name as [`async_gpio_lines`]. The
+/// binding carries no label (`gp15in`), so neither does the hook.
+fn async_edge_hooks(mcu: &Mcu) -> Vec<EdgeHook> {
+    mcu.iter_all_pins()
+        .filter(|p| !p.reserved && p.selected_function == PinFunction::GpioInput && p.irq.is_some())
+        .filter_map(|p| gpio_index(&p.name).map(|n| (n, p)))
+        .map(|(n, p)| {
+            let name = format!("gp{n}{}", var_suffix(&p.selected_function));
+            EdgeHook {
+                name: edge_hook_name(&name),
+                what: format!("GP{n}"),
+                caller: format!("{name}_irq"),
+                is_async: true,
+            }
+        })
+        .collect()
 }
 
 /// The buses, on embassy-rp.
@@ -4457,6 +4485,12 @@ impl FamilyBackend for AsyncRpBackend {
             async_section(mcu).trim_end_matches('\n'),
             retarget_pristine_tail(&existing[end..], true)
         )
+    }
+
+    /// One `async fn` per armed input, awaited from its task. Blocking
+    /// generates no handler (it says so), so it reports none.
+    fn edge_hooks(&self, mcu: &Mcu) -> Vec<EdgeHook> {
+        async_edge_hooks(mcu)
     }
 }
 

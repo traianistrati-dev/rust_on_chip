@@ -4779,7 +4779,7 @@ mod edge_hook {
             "{main}"
         );
         assert!(
-            main.contains("/// P0.14 (pad 5, BTN_A) - called from the `p0_14_in_irq` task"),
+            main.contains("/// `P0.14 (pad 5, BTN_A)` - called from the `p0_14_in_irq` task"),
             "{main}"
         );
     }
@@ -4861,7 +4861,7 @@ mod edge_hook {
         let mcu = armed();
         let fresh = mcu.fresh_main_rs();
         let seed = fresh
-            .find("\n/// P0.14 (pad 5, BTN_A) - called")
+            .find("\n/// `P0.14 (pad 5, BTN_A)` - called")
             .expect("seed");
         let old = fresh[..seed]
             .replacen(CALL, "        // The edge arrived. Your code here.\n", 1)

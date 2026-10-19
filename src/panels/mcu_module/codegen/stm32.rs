@@ -2545,19 +2545,41 @@ fn f1_irq_items(all_pins: &[&Pin]) -> String {
     for (vector, group) in super::rtic::by_vector(&armed) {
         if group.len() == 1 {
             out.push_str(&format!(
-                "/// {} (EXTI line {}).\n",
-                group[0].name, group[0].line
+                "/// {} (EXTI line {}). `{}` below `main` is yours, a plain `fn`.\n",
+                group[0].name, group[0].line, group[0].hook
             ));
         } else {
             out.push_str(&format!(
-                "/// {vector} is shared by {} lines — each pin is asked in turn.\n",
+                "/// `{vector}` is shared by {} lines — each pin is asked in turn, and\n\
+                 /// each pin's hook below `main` is yours, a plain `fn`.\n",
                 group.len()
             ));
         }
         out.push_str("#[interrupt]\n");
         out.push_str(&format!("fn {vector}() {{\n"));
+        // The body is NOT here: this handler is rebuilt on every regeneration,
+        // so it calls a hook seeded once below the tail. AFTER the critical
+        // section, with the level it read: the hook may take one itself, and
+        // the pin's `RefCell` is no longer borrowed by then. ONE local, a
+        // tuple when the vector is shared: one per pin would differ by a
+        // letter (`pa5`/`pb8`), which `clippy::similar_names` denies under
+        // Strict, and would start with the pin's name, which is how the IDE
+        // finds a pin's binding in the block.
+        let slot = |i: usize| {
+            if group.len() == 1 {
+                "fired".to_owned()
+            } else {
+                format!("fired.{i}")
+            }
+        };
+        let nones = vec!["None"; group.len()].join(", ");
+        out.push_str(&if group.len() == 1 {
+            "    let mut fired = None;\n".to_owned()
+        } else {
+            format!("    let mut fired = ({nones});\n")
+        });
         out.push_str("    cortex_m::interrupt::free(|cs| {\n");
-        for p in group {
+        for (i, &p) in group.iter().enumerate() {
             let up = p.binding.to_ascii_uppercase();
             out.push_str(&format!(
                 "        if let Some(pin) = {up}.borrow(cs).borrow_mut().as_mut() {{\n"
@@ -2569,14 +2591,21 @@ fn f1_irq_items(all_pins: &[&Pin]) -> String {
             out.push_str("                // handler re-enters the moment it returns.\n");
             out.push_str("                pin.clear_interrupt_pending_bit();\n");
             out.push_str(&format!(
-                "                // {} {} edge: your handler code here.\n",
-                p.name,
-                p.edge.label().to_ascii_lowercase()
+                "                {} = Some(pin.is_high());\n",
+                slot(i)
             ));
             out.push_str("            }\n");
             out.push_str("        }\n");
         }
-        out.push_str("    });\n}\n\n");
+        out.push_str("    });\n");
+        for (i, &p) in group.iter().enumerate() {
+            out.push_str(&format!(
+                "    if let Some(high) = {} {{\n{}    }}\n",
+                slot(i),
+                super::common::edge_call(&p.hook, "high", false, "        ")
+            ));
+        }
+        out.push_str("}\n\n");
     }
     out
 }

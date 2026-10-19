@@ -298,8 +298,15 @@ $ALL_CASES = @(
     # `#[init]` as a Local. The second wires NO pin - the "select pins"
     # skeleton, which used to drop every init. Cheap: same directory, deps built.
     @{ n = "F1 RTIC";                      t = "emit_f1_rtic_project";   e = @{};                       q = $true; fam = "f1" }
+    # Two armed pads on ONE vector (EXTI9_5): the task asks each and calls
+    # each pin's hook - plain `fn`s at the crate root, reached from `mod app`.
+    @{ n = "F1 RTIC, shared EXTI9_5";      t = "emit_f1_rtic_project";   e = @{ EIDE_F1_IRQ_SHARED = "1" }; q = $true; fam = "f1" }
     @{ n = "F1 RTIC, no pins";             t = "emit_f1_rtic_project";   e = @{ EIDE_F1_NOPINS = "1" }; q = $true; fam = "f1" }
     @{ n = "F1 Native";                    t = "emit_f1_native_project"; e = @{};                       q = $true; fam = "f1" }
+    # The bare-metal `#[interrupt]` with two pins on EXTI9_5: each pin's level
+    # read inside the critical section, its hook called after it.
+    @{ n = "F1 blocking, shared EXTI9_5";  t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_F1_IRQ_SHARED = "1" }; q = $true; fam = "f1" }
+    @{ n = "F1 Native, shared EXTI9_5";    t = "emit_f1_native_project"; e = @{ EIDE_F1_IRQ_SHARED = "1" }; q = $false; fam = "f1" }
     # The Configuration tab's flash store on an STM32: stm32f1xx-hal behind the
     # generated `F1Flash` adapter (Blocking, Native), embassy-stm32's `Flash` on
     # Async and on the other families, and memory.x's FLASH cut short by the
@@ -330,6 +337,10 @@ $ALL_CASES = @(
     # what checks that `InterruptExecutor<1>`, `sw_int.software_interrupt1` and
     # `Priority::Priority2` are things esp-rtos and esp-hal actually have.
     @{ n = "ESP32-C3 preemptive task";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IRQ = "rising"; EIDE_ESP_TASK_PRIO = "high" }; q = $true; fam = "esp" }
+    # The ONE `gpio_irq` handler calling its hook after the critical section,
+    # and a task on the shared executor awaiting its hook.
+    @{ n = "ESP32-C3 blocking, armed input"; t = "emit_esp32c3_project";     e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_ESP_IRQ = "falling" }; q = $true; fam = "esp" }
+    @{ n = "ESP32-C3 async, armed input";  t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_IRQ = "both" }; q = $false; fam = "esp" }
     @{ n = "ESP32-C3 input Pull::Up";      t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_ESP_PULL = "up" }; q = $true; fam = "esp" }
     @{ n = "ESP32-C3 async Pull::Down";    t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_ESP_PULL = "down" }; q = $true; fam = "esp" }
     # The harness wires ONE LEDC channel by default, so the two cases above only
@@ -641,7 +652,8 @@ $ALL_CASES = @(
 # read it, and a stale value there would pick the wrong runtime just as quietly.
 $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
-           "EIDE_F1_SWITCH", "EIDE_F1_WDG", "EIDE_F1_NOPINS", "ESP_ASYNC_RUNTIME",
+           "EIDE_F1_SWITCH", "EIDE_F1_WDG", "EIDE_F1_NOPINS", "EIDE_F1_IRQ",
+           "EIDE_F1_IRQ_SHARED", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",

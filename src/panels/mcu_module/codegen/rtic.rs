@@ -21,7 +21,10 @@
 //! produces ONE task that asks each of its pins `check_interrupt()` — two tasks
 //! bound to the same vector is a compile error from the RTIC macro.
 
-use super::common::{AUTOGEN_BANNER, GEN_BEGIN, GEN_END, pin_binding};
+use super::common::{
+    AUTOGEN_BANNER, EdgeHook, GEN_BEGIN, GEN_END, edge_call, edge_hook_name, hook_binding,
+    pin_binding,
+};
 use super::stm32::{Binding, GenParts, gen_parts};
 use crate::panels::mcu_module::clock::ClockConfig;
 use crate::panels::mcu_module::modules::{
@@ -190,6 +193,9 @@ pub struct IrqPin {
     /// EXTI line — the pin INDEX, not the port (PA5, PB5 and PC5 all use 5).
     pub line: u8,
     pub edge: Edge,
+    /// The user's hook the handler calls (`on_pb5_in_edge`): named after the
+    /// pad alone, so a label never renames it - see `common::hook_binding`.
+    pub hook: String,
 }
 
 /// NVIC vector for an EXTI line.
@@ -236,6 +242,7 @@ pub fn irq_pins(all_pins: &[&Pin]) -> Vec<IrqPin> {
                     &p.selected_function,
                     &p.custom_label,
                 ),
+                hook: edge_hook_name(&hook_binding(&p.name.to_ascii_lowercase())),
                 name: p.name.clone(),
                 line,
                 edge,
@@ -244,6 +251,22 @@ pub fn irq_pins(all_pins: &[&Pin]) -> Vec<IrqPin> {
         .collect();
     out.sort_by_key(|p| (p.line, p.name.clone()));
     out
+}
+
+/// The hooks the F1's interrupt handlers call, one per armed input, in the
+/// order they are called. The SAME list on Blocking, Native and RTIC - a
+/// plain `fn`, named after the vector that calls it - so a switch between them
+/// moves no seed.
+pub fn edge_hooks(all_pins: &[&Pin]) -> Vec<EdgeHook> {
+    irq_pins(all_pins)
+        .into_iter()
+        .map(|p| EdgeHook {
+            caller: exti_vector(p.line).to_owned(),
+            name: p.hook,
+            what: p.name,
+            is_async: false,
+        })
+        .collect()
 }
 
 /// Group the pins by the vector they land on, preserving line order.
@@ -292,15 +315,25 @@ fn tasks(pins: &[IrqPin]) -> String {
              \x20   fn {fname}(cx: {fname}::Context) {{\n",
             fname = vector.to_ascii_lowercase(),
         ));
+        // The body is NOT here: this task is rebuilt on every regeneration,
+        // so it calls a hook seeded once below the tail, reached through the
+        // app's `use super::*`. Cleared first, then called with the level.
         if group.len() == 1 {
             let p = group[0];
             out.push_str(&format!(
-                "        // {name} (EXTI line {line}).\n\
+                "        // {name} (EXTI line {line}). `{hook}` below is yours, a plain `fn`.\n\
                  \x20       cx.local.{b}.clear_interrupt_pending_bit();\n\
-                 \x20       // Your handler code here.\n",
+                 {call}",
                 name = p.name,
                 line = p.line,
                 b = p.binding,
+                hook = p.hook,
+                call = edge_call(
+                    &p.hook,
+                    &format!("cx.local.{}.is_high()", p.binding),
+                    false,
+                    "        "
+                ),
             ));
         } else {
             out.push_str(&format!(
@@ -310,12 +343,20 @@ fn tasks(pins: &[IrqPin]) -> String {
             for p in group {
                 out.push_str(&format!(
                     "        if cx.local.{b}.check_interrupt() {{\n\
+                     \x20           // {name} (EXTI line {line}). `{hook}` below is yours, a plain `fn`.\n\
                      \x20           cx.local.{b}.clear_interrupt_pending_bit();\n\
-                     \x20           // {name} (EXTI line {line}): your handler code here.\n\
+                     {call}\
                      \x20       }}\n",
                     b = p.binding,
                     name = p.name,
                     line = p.line,
+                    hook = p.hook,
+                    call = edge_call(
+                        &p.hook,
+                        &format!("cx.local.{}.is_high()", p.binding),
+                        false,
+                        "            "
+                    ),
                 ));
             }
         }
@@ -350,7 +391,29 @@ pub fn invariant_header(mcu_name: &str, mcu_id: &str) -> String {
     )
 }
 
-pub const RTIC_USER_TAIL: &str = "// Add helpers, `impl`s and `use`s for your tasks here.\n     // Task bodies live inside the `mod app` block above.\n";
+pub const RTIC_USER_TAIL: &str = "// Add helpers, `impl`s and `use`s for your tasks here. The tasks in\n// `mod app` are generated: an armed pin's task calls its hook below.\n";
+
+/// The tail RTIC projects were seeded with before the edge hooks: its second
+/// line ragged, and sending the task bodies into `mod app`, which every
+/// regeneration rebuilds. Still the IDE's while untouched, so it is swapped
+/// like the current one.
+pub const RTIC_USER_TAIL_V1: &str = "// Add helpers, `impl`s and `use`s for your tasks here.\n     // Task bodies live inside the `mod app` block above.\n";
+
+/// `after` (the text below the block) with an untouched RTIC seed of either
+/// version at its head swapped for `to`, and what follows it kept. `None`
+/// when no seed of ours is there.
+pub fn swap_rtic_tail(after: &str, to: &str) -> Option<String> {
+    let body = after.trim_start_matches('\n');
+    for seed in [RTIC_USER_TAIL, RTIC_USER_TAIL_V1] {
+        if body.trim() == seed.trim() {
+            return Some(to.to_owned());
+        }
+        if let Some(rest) = body.strip_prefix(seed) {
+            return Some(format!("{to}{rest}"));
+        }
+    }
+    None
+}
 
 /// Where a tail stops closing the entry fn the GEN section used to open: the
 /// byte just after the `}` that takes the brace depth below zero, or `None`
@@ -478,12 +541,18 @@ pub fn splice_rtic_section(
     };
     let after = existing[end_start + GEN_END.len()..].trim_start_matches('\n');
     let Some(cut) = entry_close(after) else {
+        // Already RTIC-shaped: an untouched seed of an older IDE becomes
+        // today's, whatever follows it (the hooks) stays.
+        let after = swap_rtic_tail(after, RTIC_USER_TAIL).unwrap_or_else(|| after.to_owned());
         return format!("{head}{new_section}\n{after}");
     };
     let rest = after[cut..].trim_start_matches('\n');
-    let seed_head = RTIC_USER_TAIL.lines().next().unwrap_or_default();
+    // Both versions' first line - today's starts with the older one.
+    let seed_head = RTIC_USER_TAIL_V1.lines().next().unwrap_or_default();
     let tail = if rest.trim().is_empty() {
         RTIC_USER_TAIL.to_owned()
+    } else if let Some(swapped) = swap_rtic_tail(rest, RTIC_USER_TAIL) {
+        swapped
     } else if rest.starts_with(seed_head) {
         rest.to_owned()
     } else {
@@ -899,7 +968,7 @@ mod tests {
             let clear = body
                 .find("clear_interrupt_pending_bit")
                 .unwrap_or(usize::MAX);
-            let handler = body.find("handler code here").unwrap_or(0);
+            let handler = body.find("_edge(").unwrap_or(0);
             assert!(
                 clear < handler,
                 "pending bit cleared after the handler:\n{body}"

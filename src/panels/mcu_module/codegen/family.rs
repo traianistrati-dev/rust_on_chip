@@ -82,10 +82,11 @@ pub trait FamilyBackend {
     }
 
     /// The hooks the generated handlers call, one per armed input, so `Mcu`
-    /// can seed each below the user tail (`common::ensure_edge_hooks`).
-    /// Default: none, for a backend whose handler still carries its body
-    /// inline between the markers - it reports nothing, and no hook it does
-    /// not call is ever seeded.
+    /// can seed each below the user tail (`common::ensure_edge_hooks`). Every
+    /// backend that generates a handler reports one per armed input it
+    /// handles; the default, none, is for a runtime that generates no handler
+    /// (nRF and RP Blocking say so in a comment) - and no hook it does not
+    /// call is ever seeded.
     fn edge_hooks(&self, _mcu: &Mcu) -> Vec<EdgeHook> {
         Vec::new()
     }
@@ -182,6 +183,12 @@ impl FamilyBackend for Stm32f1Backend {
         stm32::strip_obsolete_helpers(spliced)
     }
 
+    /// One plain `fn` per armed input, called from its EXTI vector's
+    /// `#[interrupt]` - the same list RTIC reports.
+    fn edge_hooks(&self, mcu: &Mcu) -> Vec<EdgeHook> {
+        rtic::edge_hooks(&pins_of(mcu))
+    }
+
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
         let all = pins_of(mcu);
         let (usart, spi, i2c) = resolve_bus_configs(mcu);
@@ -262,6 +269,11 @@ impl FamilyBackend for Esp32Backend {
 
     fn update_main_rs(&self, mcu: &Mcu, existing: &str) -> String {
         esp_update_main_rs(mcu, existing, EspRuntime::Blocking)
+    }
+
+    /// One plain `fn` per armed input, called from the ONE `gpio_irq`.
+    fn edge_hooks(&self, mcu: &Mcu) -> Vec<EdgeHook> {
+        codegen_esp::edge_hooks(&pins_of(mcu), EspRuntime::Blocking)
     }
 
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
@@ -608,6 +620,11 @@ impl FamilyBackend for AsyncEspBackend {
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
         esp_config_files(mcu, EspRuntime::Async)
     }
+
+    /// One `async fn` per armed input, awaited from its task.
+    fn edge_hooks(&self, mcu: &Mcu) -> Vec<EdgeHook> {
+        codegen_esp::edge_hooks(&pins_of(mcu), EspRuntime::Async)
+    }
 }
 
 /// Chosen by runtime rather than family, so — like [`ASYNC_EMBASSY_BACKEND`] —
@@ -796,6 +813,12 @@ impl FamilyBackend for AsyncEmbassyBackend {
         let section = async_section(mcu);
         let section = super::common::keep_manual_clock(existing, section, mcu.clock_manual);
         embassy_stm32::splice_section(existing, &section, &mcu.name, &mcu.id)
+    }
+
+    /// One `async fn` per armed input that got an EXTI line, awaited from its
+    /// task.
+    fn edge_hooks(&self, mcu: &Mcu) -> Vec<EdgeHook> {
+        embassy_stm32::exti_hooks(&async_periphs(mcu).exti)
     }
 
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
@@ -1024,6 +1047,11 @@ impl FamilyBackend for RticBackend {
 
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
         Stm32f1Backend.config_files(mcu)
+    }
+
+    /// The hardware tasks' hooks: the same plain `fn`s as Blocking's.
+    fn edge_hooks(&self, mcu: &Mcu) -> Vec<EdgeHook> {
+        rtic::edge_hooks(&pins_of(mcu))
     }
 }
 
@@ -6126,5 +6154,272 @@ mod config_template_switch_tests {
             checked > 50,
             "only {checked} edited files went through a switch"
         );
+    }
+}
+
+/// The hook every armed input's handler calls, on every runtime that has a
+/// handler: called once from the block, defined once below it, and carried
+/// through a runtime switch - untouched it follows the runtime; edited it
+/// stays, and the call stays the runtime's own.
+#[cfg(test)]
+mod edge_hook_switch_tests {
+    use crate::panels::mcu_module::builtins::builtin_definitions;
+    use crate::panels::mcu_module::codegen::{GEN_BEGIN, GEN_END};
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::pins::PinFunction;
+    use crate::panels::mcu_module::pins::logic::pin::Edge;
+
+    const F1_ID: &str = "stm32f103c8t6";
+    /// Two pads on one vector (`EXTI9_5`), so the handler asks each.
+    const F1: &[(&str, Edge)] = &[("PB5", Edge::Both), ("PB6", Edge::Rising)];
+    const F1_RUNTIMES: [Runtime; 4] = [
+        Runtime::Blocking,
+        Runtime::Native,
+        Runtime::Rtic,
+        Runtime::Async,
+    ];
+    const ESP: &[(&str, Edge)] = &[("GPIO4", Edge::Rising), ("GPIO5", Edge::Both)];
+    const BODY: &str = "    PRESSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);\n";
+
+    /// `pads` armed as inputs on the built-in `id`, at `rt`.
+    fn armed(id: &str, rt: Runtime, pads: &[(&str, Edge)]) -> Mcu {
+        let mut mcu = builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == id)
+            .expect(id)
+            .build_mcu();
+        mcu.runtime = rt;
+        mcu.pending_runtime = rt;
+        for p in mcu.iter_all_pins_mut() {
+            if let Some((_, edge)) = pads.iter().find(|(n, _)| p.name == *n) {
+                p.selected_function = PinFunction::GpioInput;
+                p.irq = Some(*edge);
+            }
+        }
+        mcu
+    }
+
+    fn block(main: &str) -> &str {
+        &main[main.find(GEN_BEGIN).expect("begin")..main.find(GEN_END).expect("end")]
+    }
+
+    /// The user's text: above the block and below it.
+    fn user(main: &str) -> String {
+        let begin = main.find(GEN_BEGIN).expect("begin");
+        let end = main.find(GEN_END).expect("end") + GEN_END.len();
+        format!("{}{}", &main[..begin], &main[end..])
+    }
+
+    /// Fill `hook`'s seed in, as the user would.
+    fn edit(main: &str, hook: &str) -> String {
+        let at = main
+            .find(&format!("{hook}(_high: bool) {{\n"))
+            .unwrap_or_else(|| panic!("no seed for {hook}:\n{main}"));
+        let edited = main[at..].replacen("    // Your code here.\n", BODY, 1);
+        format!("{}{edited}", &main[..at])
+    }
+
+    /// Every hook a backend reports is called exactly once from the block and
+    /// defined exactly once outside it, in the flavor its caller needs.
+    #[test]
+    fn every_reported_hook_is_called_once_and_seeded_once() {
+        let mut cases: Vec<Mcu> = F1_RUNTIMES.iter().map(|rt| armed(F1_ID, *rt, F1)).collect();
+        cases.push(armed("esp32c3", Runtime::Blocking, ESP));
+        cases.push(armed("esp32c3", Runtime::Async, ESP));
+        cases.push(armed(
+            "rp2040_pico",
+            Runtime::Async,
+            &[("GP15", Edge::Falling)],
+        ));
+        for mcu in &cases {
+            let hooks = mcu.backend().expect("backend").edge_hooks(mcu);
+            let label = format!("{} {:?}", mcu.id, mcu.runtime);
+            assert!(!hooks.is_empty(), "{label}: no hook reported");
+            let main = mcu.fresh_main_rs();
+            for h in &hooks {
+                assert_eq!(
+                    block(&main).matches(&format!("{}(", h.name)).count(),
+                    1,
+                    "{label}: {} called once:\n{main}",
+                    h.name
+                );
+                let kw = if h.is_async { "async fn" } else { "fn" };
+                assert_eq!(
+                    user(&main)
+                        .matches(&format!("\n{kw} {}(_high: bool) {{\n", h.name))
+                        .count(),
+                    1,
+                    "{label}: {} seeded once, as `{kw}`:\n{main}",
+                    h.name
+                );
+                assert!(
+                    !block(&main).contains("code here"),
+                    "{label}: nothing in the block invites an edit:\n{main}"
+                );
+            }
+        }
+    }
+
+    /// A still-untouched project, armed, switched between any two F1
+    /// runtimes, is exactly the project the new runtime writes fresh - the
+    /// seeds swap `fn` and `async fn` with it.
+    #[test]
+    fn every_f1_runtime_switch_with_armed_pins_rewrites_a_pristine_main_rs_whole() {
+        let mut wrong = Vec::new();
+        for from in F1_RUNTIMES {
+            for to in F1_RUNTIMES {
+                let switched =
+                    armed(F1_ID, to, F1).update_main_rs(&armed(F1_ID, from, F1).fresh_main_rs());
+                if switched != armed(F1_ID, to, F1).fresh_main_rs() {
+                    wrong.push(format!("{from:?} -> {to:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The same on the ESP, Blocking and Async both ways.
+    #[test]
+    fn an_esp_runtime_switch_with_armed_pins_rewrites_a_pristine_main_rs_whole() {
+        for (from, to) in [
+            (Runtime::Blocking, Runtime::Async),
+            (Runtime::Async, Runtime::Blocking),
+        ] {
+            let switched = armed("esp32c3", to, ESP)
+                .update_main_rs(&armed("esp32c3", from, ESP).fresh_main_rs());
+            assert_eq!(
+                switched,
+                armed("esp32c3", to, ESP).fresh_main_rs(),
+                "{from:?} -> {to:?}"
+            );
+        }
+    }
+
+    /// An edited hook goes through every F1 switch with its body, once, and
+    /// the call stays the runtime's own: a hook that no longer fits its caller
+    /// is the compiler's to report, never the block's to guess around. Its
+    /// untouched neighbour follows the runtime meanwhile.
+    #[test]
+    fn an_edited_hook_survives_every_f1_runtime_switch() {
+        for start in F1_RUNTIMES {
+            let mut main = edit(&armed(F1_ID, start, F1).fresh_main_rs(), "on_pb5_in_edge");
+            for to in F1_RUNTIMES.into_iter().chain([start]) {
+                main = armed(F1_ID, to, F1).update_main_rs(&main);
+                let at = format!("{start:?} -> {to:?}");
+                assert_eq!(main.matches(BODY).count(), 1, "{at}:\n{main}");
+                assert_eq!(
+                    main.matches("fn on_pb5_in_edge(").count(),
+                    1,
+                    "{at}:\n{main}"
+                );
+                assert_eq!(
+                    main.matches("fn on_pb6_in_edge(").count(),
+                    1,
+                    "{at}:\n{main}"
+                );
+                let b = block(&main);
+                let caller_async = to == Runtime::Async;
+                assert_eq!(b.matches("on_pb5_in_edge(").count(), 1, "{at}:\n{main}");
+                assert_eq!(
+                    b.contains("on_pb5_in_edge(pin.is_high()).await;"),
+                    caller_async,
+                    "{at}:\n{main}"
+                );
+                let kw = if caller_async { "async fn" } else { "fn" };
+                assert!(
+                    main.contains(&format!("\n{kw} on_pb6_in_edge(_high: bool) {{\n")),
+                    "{at}: the untouched seed follows:\n{main}"
+                );
+            }
+        }
+    }
+
+    /// A shared vector asks each pin inside ONE critical section, then calls
+    /// each pin's hook after it, in line order.
+    #[test]
+    fn a_shared_f1_vector_calls_each_hook_after_its_critical_section() {
+        for rt in [Runtime::Blocking, Runtime::Native] {
+            let main = armed(F1_ID, rt, F1).fresh_main_rs();
+            let b = block(&main);
+            assert_eq!(b.matches("fn EXTI9_5() {").count(), 1, "{main}");
+            assert_eq!(
+                b.matches("cortex_m::interrupt::free(|cs| {").count(),
+                1,
+                "{main}"
+            );
+            assert!(b.contains("    let mut fired = (None, None);\n"), "{main}");
+            assert!(b.contains("fired.0 = Some(pin.is_high());"), "{main}");
+            assert!(
+                b.contains(
+                    "    });\n    if let Some(high) = fired.0 {\n        #[deny(unused_must_use)]\n        on_pb5_in_edge(high);\n    }\n    if let Some(high) = fired.1 {\n        #[deny(unused_must_use)]\n        on_pb6_in_edge(high);\n    }\n}\n"
+                ),
+                "{rt:?}:\n{main}"
+            );
+        }
+    }
+
+    /// RTIC calls the hook in the task, after the bit is cleared; the Local
+    /// carries the pin's label, the hook does not.
+    #[test]
+    fn an_rtic_task_calls_the_hook_after_clearing() {
+        let mut mcu = armed(F1_ID, Runtime::Rtic, F1);
+        for p in mcu.iter_all_pins_mut() {
+            if p.name == "PB5" {
+                p.custom_label = "button".into();
+            }
+        }
+        let main = mcu.fresh_main_rs();
+        assert!(
+            block(&main).contains(
+                "            cx.local.pb5_in_button.clear_interrupt_pending_bit();\n            #[deny(unused_must_use)]\n            on_pb5_in_edge(cx.local.pb5_in_button.is_high());\n"
+            ),
+            "{main}"
+        );
+        assert_eq!(
+            main.matches("\nfn on_pb5_in_edge(_high: bool) {\n").count(),
+            1,
+            "{main}"
+        );
+    }
+
+    /// The Pico's hook stays through a switch to Blocking, which generates no
+    /// handler, and is called again on the way back - body intact, once.
+    #[test]
+    fn a_pico_hook_survives_blocking_and_is_called_again() {
+        let pads = &[("GP15", Edge::Falling)];
+        let main = edit(
+            &armed("rp2040_pico", Runtime::Async, pads).fresh_main_rs(),
+            "on_gp15in_edge",
+        );
+        let blocking = armed("rp2040_pico", Runtime::Blocking, pads).update_main_rs(&main);
+        assert!(!block(&blocking).contains("on_gp15in_edge("), "{blocking}");
+        assert_eq!(blocking.matches(BODY).count(), 1, "{blocking}");
+        let back = armed("rp2040_pico", Runtime::Async, pads).update_main_rs(&blocking);
+        assert!(
+            block(&back).contains("on_gp15in_edge(pin.is_high()).await;"),
+            "{back}"
+        );
+        assert_eq!(back.matches("fn on_gp15in_edge(").count(), 1, "{back}");
+        assert_eq!(back.matches(BODY).count(), 1, "{back}");
+    }
+
+    /// An RTIC project an older IDE wrote - its tail the ragged one that sent
+    /// task bodies into `mod app` - gets today's tail on the next
+    /// regeneration, hooks and all, and leaving RTIC still knows it as ours.
+    #[test]
+    fn an_old_rtic_tail_is_still_the_ides() {
+        use crate::panels::mcu_module::codegen::rtic::{RTIC_USER_TAIL, RTIC_USER_TAIL_V1};
+        let mcu = armed(F1_ID, Runtime::Rtic, F1);
+        let fresh = mcu.fresh_main_rs();
+        let old = fresh.replacen(RTIC_USER_TAIL, RTIC_USER_TAIL_V1, 1);
+        assert_ne!(old, fresh, "the fixture took");
+        assert_eq!(mcu.update_main_rs(&old), fresh);
+        for to in [Runtime::Blocking, Runtime::Native, Runtime::Async] {
+            assert_eq!(
+                armed(F1_ID, to, F1).update_main_rs(&old),
+                armed(F1_ID, to, F1).fresh_main_rs(),
+                "{to:?}"
+            );
+        }
     }
 }

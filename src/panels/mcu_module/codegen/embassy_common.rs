@@ -305,6 +305,30 @@ mod emit_for_manual_compile {
             .find(|p| p.is_file())
     }
 
+    /// `EIDE_F1_IRQ_SHARED=1` arms PB5 (either edge) and PB8 (rising): two
+    /// lines on ONE vector, `EXTI9_5`, so the handler - or the RTIC task - asks
+    /// each pin and calls each pin's hook. Both pads are free in every F1
+    /// wiring here; one that is not is a broken row, so it panics.
+    fn arm_shared_exti9_5(mcu: &mut crate::panels::mcu_module::mcu::Mcu) {
+        use crate::panels::mcu_module::pins::logic::pin::Edge;
+        if std::env::var_os("EIDE_F1_IRQ_SHARED").is_none() {
+            return;
+        }
+        for (name, edge) in [("PB5", Edge::Both), ("PB8", Edge::Rising)] {
+            let num = mcu
+                .iter_all_pins()
+                .find(|p| p.name == name)
+                .map(|p| p.number);
+            match num.and_then(|n| mcu.find_pin_mut(n)) {
+                Some(p) if p.selected_function == PinFunction::Unset => {
+                    p.selected_function = PinFunction::GpioInput;
+                    p.irq = Some(edge);
+                }
+                _ => panic!("{name} is not free to arm in this wiring"),
+            }
+        }
+    }
+
     /// Say something when a codegen matrix run is in progress.
     ///
     /// These harnesses REWRITE fixed directories under the temp dir, and the
@@ -1131,6 +1155,7 @@ mod emit_for_manual_compile {
                 None => println!("no pad free to arm"),
             }
         }
+        arm_shared_exti9_5(&mut mcu);
         mcu.reconcile_modules();
         // `EIDE_F1_DMA=tx|rx|both` picks which halves run on DMA. Each is a
         // DIFFERENT set of HAL types, so each needs its own compile - `TxDma`
@@ -1588,6 +1613,7 @@ mod emit_for_manual_compile {
                 }
             }
         }
+        arm_shared_exti9_5(&mut mcu);
         if std::env::var("EIDE_F1_WDG").as_deref() != Ok("0") {
             use crate::panels::mcu_module::watchdog::IwdgConfig;
             mcu.watchdog.iwdg = Some(IwdgConfig {
@@ -1702,6 +1728,7 @@ mod emit_for_manual_compile {
                 None => println!("no pad free to arm"),
             }
         }
+        arm_shared_exti9_5(&mut mcu);
         mcu.reconcile_modules();
         for m in &mut mcu.modules {
             if let ModuleConfig::Timer(c) = &mut m.config {

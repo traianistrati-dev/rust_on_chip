@@ -12,8 +12,8 @@
 pub mod common;
 pub mod dma_data;
 pub mod dma_map;
-pub mod embassy_async;
 pub mod embassy_common;
+pub mod embassy_stm32;
 pub mod family;
 pub mod flash_store_gen;
 pub mod iot_gen;
@@ -27,6 +27,7 @@ pub mod rcc_n6;
 pub mod rp;
 pub mod rtic;
 pub mod stm32;
+pub mod tmpl;
 pub mod watchdog_gen;
 pub mod wba;
 
@@ -1756,7 +1757,7 @@ mod tests {
     #[test]
     fn custom_inits_are_appended_by_every_backend_section() {
         use super::super::mock_mcu;
-        use super::{embassy_async, embassy_common};
+        use super::{embassy_common, embassy_stm32};
         use crate::panels::mcu_module::pins::logic::pin::Pin;
 
         let mut mcu = mock_mcu::create_stm32f103c8tx();
@@ -1778,7 +1779,7 @@ mod tests {
         assert!(!blocking.contains("Custom modules"), "{blocking}");
 
         // Async embassy.
-        let async_ = embassy_async::make_generated_section("X", &pins, "", "", "", line, &[]);
+        let async_ = embassy_stm32::make_generated_section("X", &pins, "", "", "", line, &[]);
         assert!(
             async_.contains(line),
             "embassy async:

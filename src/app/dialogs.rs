@@ -2469,7 +2469,7 @@ mod chip_gaps_tests {
     /// bundled chip - the runtime each definition ships with, and no peripheral
     /// wired. Emitters reached only by a configured bus on the Async runtime are
     /// NOT exercised here, and at least one such line exists today
-    /// (`embassy_async.rs`, the async USART DMA binding). Widening this to every
+    /// (`embassy_stm32/usart.rs`, the async USART DMA binding). Widening this to every
     /// runtime x wiring is what `scripts/verify-codegen.ps1` is for.
     #[test]
     fn no_generated_file_carries_a_joined_continuation() {

@@ -1,0 +1,36 @@
+//
+// nrf-hal refuses ANY watchdog that is already running, whatever its period.
+// So after every reflash of a project that has activated it, `init` returns
+// `Err`. Do not pet that one - you did not configure it: it resets the chip
+// once (RESETREAS then reads DOG), that reset clears it, and the next boot
+// configures this period.
+use {HAL}::pac::WDT;
+use {HAL}::wdt::{Inactive, Watchdog};
+
+/// Handle type, so it can be stored in a struct.
+pub type Handle = Watchdog<Inactive>;
+
+/// Configure the watchdog. It is NOT running yet - call
+/// `activate::<count::One>()` on it when your start-up is far enough along to
+/// keep petting it.
+///
+/// `Err` hands the peripheral back when a watchdog is ALREADY counting - see
+/// the note above.
+pub fn init(wdt: WDT) -> Result<Handle, WDT> {
+    let mut watchdog = Watchdog::try_new(wdt)?;
+    watchdog.set_lfosc_ticks(TIMEOUT_TICKS);
+    // Hold the count while a debugger halts the core, so a breakpoint does
+    // not become a reset.
+    watchdog.run_during_debug_halt(false);
+    Ok(watchdog)
+}
+
+// -- Using the watchdog --
+//
+//     use {HAL}::wdt::count;
+//     if let Ok(w) = watchdog {
+//         let mut parts = w.activate::<count::One>();  // from here on it resets the chip
+//         loop {
+//             parts.handles.0.pet();                   // at least once every period
+//         }
+//     }

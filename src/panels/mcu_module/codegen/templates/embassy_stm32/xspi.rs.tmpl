@@ -1,0 +1,40 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const PRESCALER: u8 = {PRESCALER}; // bus = kernel clock / (PRESCALER + 1)
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// {MODE} on XSPI{N}. The OCTOSPI's successor: the same block again, now up to
+// sixteen data lines, with two chip selects and two strobes to choose from.
+// This is the BLOCKING driver — a memory command is a round trip anyway.
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::xspi::enums::{MemorySize, MemoryType};
+use embassy_stm32::xspi::{{PINS}, Config, Xspi};
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.device_size = MemorySize::{SIZE};
+    config.memory_type = MemoryType::{MTYPE};
+    config.clock_prescaler = PRESCALER;
+    config
+}
+
+/// Initialise XSPI{N} in {MODE_SHORT}.
+pub fn init<'d>(
+    xspi: Peri<'d, peripherals::XSPI{N}>,
+{PARAMS}) -> Xspi<'d, peripherals::XSPI{N}, Blocking> {
+    Xspi::{CTOR}(xspi, {ARGS}, get_config())
+}
+
+// ── Using XSPI{N} ──
+// Commands go out as a `TransferConfig`, the same shape as the OCTOSPI's:
+//
+//     use embassy_stm32::xspi::TransferConfig;
+//
+//     let mut id = [0u8; 3];
+//     {HANDLE}.blocking_read(&mut id, TransferConfig {
+//         instruction: Some(0x9F), // read JEDEC id
+//         ..Default::default()
+//     }).ok();

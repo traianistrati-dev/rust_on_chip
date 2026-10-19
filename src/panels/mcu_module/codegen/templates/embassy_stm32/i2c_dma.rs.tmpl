@@ -1,0 +1,65 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const CLOCK_HZ: u32 = {CLK};
+{DEVICES}// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// `init` returns an ASYNC `embedded-hal-async` `I2c` (`.await`-able), backed by
+// DMA. The DMA channels are passed in from `main.rs`.
+//
+//     async fn app<I: embedded_hal_async::i2c::I2c>(i2c: &mut I) { /* … */ }
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
+use embassy_stm32::i2c::{
+    Config, ErrorInterruptHandler, EventInterruptHandler, I2c, Instance, RxDma, SclPin, SdaPin,
+    TxDma,
+};
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::time::Hertz;
+use embassy_stm32::{peripherals, Peri};
+
+// No `bind_interrupts!` here, unlike the non-DMA configs: `I2c::new` takes ONE
+// value that must bind the peripheral's two interrupts AND both DMA channels',
+// and the channels are only known in `main.rs`. So the whole `Irqs` lives there.
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.frequency = Hertz(CLOCK_HZ);
+{EXTRA_CFG}    config
+}
+
+/// Initialise I2C{N} as an async `embedded-hal-async` I2c value (DMA-backed).
+pub fn init<'d, TxD: TxDma<peripherals::I2C{N}>, RxD: RxDma<peripherals::I2C{N}>>(
+    i2c: Peri<'d, peripherals::I2C{N}>,
+    scl: Peri<'d, impl SclPin<peripherals::I2C{N}>>,
+    sda: Peri<'d, impl SdaPin<peripherals::I2C{N}>>,
+    tx_dma: Peri<'d, TxD>,
+    rx_dma: Peri<'d, RxD>,
+    irqs: impl Binding<
+            <peripherals::I2C{N} as Instance>::EventInterrupt,
+            EventInterruptHandler<peripherals::I2C{N}>,
+        > + Binding<
+            <peripherals::I2C{N} as Instance>::ErrorInterrupt,
+            ErrorInterruptHandler<peripherals::I2C{N}>,
+        > + Binding<TxD::Interrupt, DmaInterruptHandler<TxD>>
+        + Binding<RxD::Interrupt, DmaInterruptHandler<RxD>>
+        + 'd,
+) -> impl embedded_hal_async::i2c::I2c + 'd {
+    // Argument order matters and changed in embassy 0.6: the irq binding comes
+    // AFTER both DMA channels, not before them.
+    I2c::new(i2c, scl, sda, tx_dma, rx_dma, irqs, get_config())
+}
+
+// ── Using I2C{N} ──
+// Async-DMA init: the handle is an `embedded-hal-async` `I2c`.
+//
+//     use embedded_hal_async::i2c::I2c;
+//     // The address is the device's own, in its file beside this one:
+//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
+//
+//     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).await.ok();
+//
+//     let mut rx = [0u8; 2];
+//     {HANDLE}.read(DEVICE_ADDRESS, &mut rx).await.ok();
+//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).await.ok();
+

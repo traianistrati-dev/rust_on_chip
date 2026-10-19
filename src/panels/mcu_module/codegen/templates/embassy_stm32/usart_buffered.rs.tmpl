@@ -1,0 +1,90 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 7, 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+{EXTRA_CONSTS}// Byte capacity of the interrupt-driven TX/RX ring buffers.
+pub const BUF_LEN: usize = {BUF};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// `init` returns a value implementing the STANDARD `embedded-io-async` traits
+// (`Read` + `Write`), so your application code stays portable across chips/HALs:
+//
+//     async fn app<S: embedded_io_async::Read + embedded_io_async::Write>(s: &mut S) { /* … */ }
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::usart::{
+    BufferedInterruptHandler, BufferedUart, Config, DataBits, Instance, Parity, RxPin, StopBits,
+    TxPin,
+};
+{FLOW_USE}
+use embassy_stm32::{peripherals, Peri};
+use static_cell::StaticCell;
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.baudrate = BAUDRATE;
+    config.data_bits = match DATA_BITS {
+        7 => DataBits::DataBits7,
+        9 => DataBits::DataBits9,
+        _ => DataBits::DataBits8,
+    };
+    config.parity = match PARITY {
+        'O' => Parity::ParityOdd,
+        'E' => Parity::ParityEven,
+        _ => Parity::ParityNone,
+    };
+    config.stop_bits = match STOP_BITS {
+        2 => StopBits::STOP2,
+        _ => StopBits::STOP1,
+    };
+{EXTRA_CONFIG}    config
+}
+
+/// Initialise {PERI} as an async `embedded-io-async` Read + Write value.
+///
+/// No `bind_interrupts!` here: on some families several peripherals SHARE one
+/// NVIC vector (an STM32G0 routes USART3, USART4 and LPUART1 through
+/// `USART3_4_LPUART1`), and a vector may only be bound ONCE in the whole
+/// program. `main.rs` owns the single `Irqs` and passes it in.
+pub fn init<'d>(
+    usart: Peri<'d, peripherals::{PERI}>,
+{PIN_PARAMS}{FLOW_PARAMS}    irqs: impl Binding<
+        <peripherals::{PERI} as Instance>::Interrupt,
+        BufferedInterruptHandler<peripherals::{PERI}>,
+    > + 'd,
+) -> impl embedded_io_async::Read + embedded_io_async::Write + 'd {
+    static TX_BUF: StaticCell<[u8; BUF_LEN]> = StaticCell::new();
+    static RX_BUF: StaticCell<[u8; BUF_LEN]> = StaticCell::new();
+    let tx_buf = TX_BUF.init([0; BUF_LEN]);
+    let rx_buf = RX_BUF.init([0; BUF_LEN]);
+    {CTOR}.unwrap()
+}
+
+// ── Using {PERI} ──
+// The handle is an `embedded-io-async` Read + Write over embassy's BufferedUart.
+// In main.rs, inside the async fn after the init above:
+//
+//     use embedded_io_async::{Read, Write};
+//
+//     // Send — yields to the executor instead of spinning
+//     {HANDLE}.write_all(b"hello\r\n").await.ok();
+//     {HANDLE}.flush().await.ok();
+//
+//     // Receive exactly N bytes
+//     let mut buf = [0u8; 4];
+//     {HANDLE}.read_exact(&mut buf).await.ok();
+//
+//     // Or take whatever has arrived (returns as soon as there is >= 1 byte)
+//     let n = {HANDLE}.read(&mut buf).await.unwrap_or(0);
+//
+//     // Time out a read — the whole point of doing this on an executor:
+//     use embassy_time::{with_timeout, Duration};
+//     match with_timeout(Duration::from_millis(500), {HANDLE}.read(&mut buf)).await {
+//         Ok(Ok(n)) => { /* n bytes */ }
+//         Ok(Err(_)) => { /* UART error */ }
+//         Err(_) => { /* timed out */ }
+//     }
+

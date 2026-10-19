@@ -1,0 +1,32 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const PRESCALER: u8 = {PRESCALER}; // bus = kernel clock / (PRESCALER + 1)
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// {MODE} on HSPI{N}. The high-speed memory controller at the top of the U5 line.
+// The pads go up to IO15, but embassy's driver has exactly two constructors —
+// single and octal — so those are the two widths this file can be generated in.
+// This is the BLOCKING driver: a memory command is a round trip anyway.
+use embassy_stm32::hspi::enums::{MemorySize, MemoryType};
+use embassy_stm32::hspi::{{PINS}, Config, Hspi};
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.device_size = MemorySize::{SIZE};
+    config.memory_type = MemoryType::{MTYPE};
+    config.clock_prescaler = PRESCALER;
+    config
+}
+
+/// Initialise HSPI{N} in {MODE_SHORT}.
+pub fn init<'d>(
+    hspi: Peri<'d, peripherals::HSPI{N}>,
+{PARAMS}) -> Hspi<'d, peripherals::HSPI{N}, Blocking> {
+    Hspi::new_blocking_{CTOR}(hspi, {ARGS}, get_config())
+}
+
+{USAGE}

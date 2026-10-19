@@ -1,0 +1,35 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const DATA_TIMEOUT: u32 = {TIMEOUT}; // card bus clock periods
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// {PERI} at {WIDTH}-bit width — the width IS the wiring: one, four or eight data
+// lines, one constructor each.
+//
+// This chip carries the {VER} controller.{DMA_NOTE}
+{DMA_USE}use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::sdmmc::{{ITEMS}};
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.data_transfer_timeout = DATA_TIMEOUT;
+    config
+}
+
+/// Initialise {PERI} as a {WIDTH}-bit SD/eMMC host.
+pub fn init<'d{GENERIC}>(
+    sdmmc: Peri<'d, peripherals::{PERI}>,
+{PARAMS}) -> Sdmmc<'d> {
+    {CTOR}
+}
+
+// ── Using {PERI} ──
+// The handle talks to the card directly; it has to be initialised once the
+// card is in the socket:
+//
+//     {HANDLE}.init_card(embassy_stm32::time::mhz(25)).await.unwrap();
+//     let card = {HANDLE}.card().unwrap();
+//     defmt::info!("{} blocks", card.csd.block_count());

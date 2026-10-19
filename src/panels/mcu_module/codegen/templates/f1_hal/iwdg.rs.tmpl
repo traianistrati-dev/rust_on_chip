@@ -1,0 +1,36 @@
+// <<< GENERATED>>>
+// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
+// MILLISECONDS: stm32f1xx-hal takes `MilliSeconds`, not microseconds.
+const TIMEOUT_MS: u32 = {TIMEOUT_MS};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// The INDEPENDENT watchdog runs off the LSI (40 kHz on this family), so its
+// period does not move when you change the system clock. `new` only wraps the
+// peripheral: nothing resets the chip until `start()` is called.
+use stm32f1xx_hal::pac::IWDG;
+use stm32f1xx_hal::time::MilliSeconds;
+use stm32f1xx_hal::watchdog::IndependentWatchdog;
+
+/// Handle type, so it can be stored in a struct or an RTIC resource.
+pub type Handle = IndependentWatchdog;
+
+/// Wrap the IWDG. It is NOT running yet - call `start(period())` when your
+/// start-up is far enough along that you can keep feeding it.
+pub fn init(iwdg: IWDG) -> Handle {
+    IndependentWatchdog::new(iwdg)
+}
+
+/// The configured period, in the unit this HAL wants.
+pub fn period() -> MilliSeconds {
+    MilliSeconds::from_ticks(TIMEOUT_MS)
+}
+
+// -- Using the IWDG --
+//
+//     let mut wdg = pins::configs::iwdg::init(dp.IWDG);
+//     wdg.start(pins::configs::iwdg::period());  // starts biting here
+//     loop {
+//         wdg.feed();                            // at least every TIMEOUT_MS
+//     }

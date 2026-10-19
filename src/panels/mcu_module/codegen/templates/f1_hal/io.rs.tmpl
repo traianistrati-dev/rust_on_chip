@@ -1,0 +1,54 @@
+// <<< GENERATED>>>
+// Portable GPIO/Delay bridges — no per-chip config; this marker just frames the
+// regenerated region. Edit the bridges below freely.
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// Wrap a HAL pin/delay to make it a STANDARD `embedded-hal` 1.0 value, so your
+// driver/app code is portable across chips/HALs:
+//
+//     fn app<P: embedded_hal::digital::OutputPin>(led: &mut P) { /* … */ }
+#[derive(Debug)]
+pub struct IoError;
+impl embedded_hal::digital::Error for IoError {
+    fn kind(&self) -> embedded_hal::digital::ErrorKind {
+        embedded_hal::digital::ErrorKind::Other
+    }
+}
+
+/// A HAL output pin (embedded-hal 0.2) as an `embedded-hal` 1.0 pin.
+pub struct DigitalOut<P>(pub P);
+impl<P> embedded_hal::digital::ErrorType for DigitalOut<P> {
+    type Error = IoError;
+}
+impl<P: embedded_hal_0_2::digital::v2::OutputPin> embedded_hal::digital::OutputPin for DigitalOut<P> {
+    fn set_low(&mut self) -> Result<(), Self::Error> { self.0.set_low().map_err(|_| IoError) }
+    fn set_high(&mut self) -> Result<(), Self::Error> { self.0.set_high().map_err(|_| IoError) }
+}
+impl<P> embedded_hal::digital::StatefulOutputPin for DigitalOut<P>
+where
+    P: embedded_hal_0_2::digital::v2::OutputPin + embedded_hal_0_2::digital::v2::StatefulOutputPin,
+{
+    fn is_set_high(&mut self) -> Result<bool, Self::Error> { self.0.is_set_high().map_err(|_| IoError) }
+    fn is_set_low(&mut self) -> Result<bool, Self::Error> { self.0.is_set_low().map_err(|_| IoError) }
+}
+
+/// A HAL input pin (embedded-hal 0.2) as an `embedded-hal` 1.0 pin.
+pub struct DigitalIn<P>(pub P);
+impl<P> embedded_hal::digital::ErrorType for DigitalIn<P> {
+    type Error = IoError;
+}
+impl<P: embedded_hal_0_2::digital::v2::InputPin> embedded_hal::digital::InputPin for DigitalIn<P> {
+    fn is_high(&mut self) -> Result<bool, Self::Error> { self.0.is_high().map_err(|_| IoError) }
+    fn is_low(&mut self) -> Result<bool, Self::Error> { self.0.is_low().map_err(|_| IoError) }
+}
+
+/// A HAL blocking delay (embedded-hal 0.2) as an `embedded-hal` 1.0 `DelayNs`.
+/// Build one from the SysTick: `let mut d = pins::configs::io::Delay(cp.SYST.delay(&clocks));`
+#[allow(dead_code)]
+pub struct Delay<D>(pub D);
+impl<D: embedded_hal_0_2::blocking::delay::DelayUs<u32>> embedded_hal::delay::DelayNs for Delay<D> {
+    fn delay_ns(&mut self, ns: u32) { self.0.delay_us(ns.div_ceil(1000)); }
+    fn delay_us(&mut self, us: u32) { self.0.delay_us(us); }
+}

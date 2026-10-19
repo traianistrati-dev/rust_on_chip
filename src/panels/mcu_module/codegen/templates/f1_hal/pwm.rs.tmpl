@@ -1,0 +1,84 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const FREQUENCY_HZ: u32 = {HZ}; // one frequency for the whole timer
+// Duty per channel, in HUNDREDTHS of a percent — 750 is 7.5 %, which is what a
+// hobby servo wants and what whole percent cannot say.
+{DUTIES}
+
+// The wired pins, straight from the MCU Configurator's pin map. They live in
+// this block because re-wiring the timer has to update them; the `use` is here
+// too, so the aliases hold whatever you do to the `use` block below.
+use stm32f1xx_hal::gpio as hal_gpio;
+
+/// The pins TIM{N} drives, in `pwm_hz` order: {LIST}.
+///
+/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
+#[allow(dead_code)]
+pub type PwmPins = {PINS};
+
+/// Which pads the timer comes out on. NOT decoration: `pwm_hz` reads the remap
+/// REGISTER BIT from this type, so the wrong one drives the wrong pins.
+pub type PwmRemap = stm32f1xx_hal::timer::{REMAP};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+use stm32f1xx_hal::{
+    afio, pac,
+    prelude::*,
+    rcc::Clocks,
+    timer::{Ch, Channel, PwmHz, Timer},
+};
+
+/// The concrete type [`init`] hands back. The HAL keeps the channel markers AND
+/// the pins inside it, so this alias moves with the wiring — which is what lets
+/// it be a struct field or an RTIC `Local`.
+pub type Handle = PwmHz<pac::TIM{N}, PwmRemap, {CHS}, PwmPins>;
+
+/// Initialise TIM{N} {LIST} at `FREQUENCY_HZ`, each channel at its own duty,
+/// and enable them.
+pub fn init(tim: pac::TIM{N}, pins: PwmPins, afio: &mut afio::Parts, clocks: &Clocks) -> Handle {
+    let mut pwm =
+        Timer::new(tim, clocks).pwm_hz::<PwmRemap, _, _>(pins, &mut afio.mapr, FREQUENCY_HZ.Hz());
+    let max = pwm.get_max_duty();
+{SETS}    pwm
+}
+
+/// Set a channel's duty in the same units the `DUTY_*` constants above use —
+/// HUNDREDTHS of a percent, so `10_000` is 100 % and `750` is 7.5 %.
+///
+/// A trait rather than an inherent method because `Handle` is an alias for the
+/// HAL's own `PwmHz`, which this crate does not own.
+///
+/// One method per WIRED channel ({LIST}). The channel is part of the NAME
+/// rather than an argument on purpose: `set_duty` PANICS on a channel this
+/// timer has no pin for — `PINS::check_used` says "Unused channel" — and a duty
+/// setter should not be able to reach a panic. `set_duty_tim_{N}` drives
+/// {CH1ST} — the lowest channel you wired.
+pub trait DutyHandle {
+    /// {CH1ST}, the lowest channel wired to TIM{N}.
+    fn set_duty_tim_{N}(&mut self, value: u32);
+{DUTY_DECLS}}
+
+impl DutyHandle for Handle {
+    fn set_duty_tim_{N}(&mut self, value: u32) {
+        self.set_duty_tim_{N}_ch{CH1N}(value);
+    }
+{DUTY_IMPLS}}
+
+// ── Using TIM{N} ──
+// The duty is already set and the channels are already running. To change one
+// from your loop:
+//
+//     use pins::configs::pwm{N}::DutyHandle;
+//     {HANDLE}.set_duty_tim_{N}(2_500); // 25 %
+//
+// or through the HAL directly, which is what the trait does — except that the
+// channel is then yours to get right: {LIST} are wired, and any other panics.
+//
+//     use stm32f1xx_hal::timer::Channel;
+//
+//     let max = {HANDLE}.get_max_duty();
+//     {HANDLE}.set_duty(Channel::{CH1ST}, max / 2); // 50 %
+//
+//     // …and to stop driving a pad without tearing the timer down:
+//     {HANDLE}.disable(Channel::{CH1ST});

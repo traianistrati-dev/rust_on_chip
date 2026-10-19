@@ -1082,7 +1082,7 @@ impl FamilyBackend for RpBackend {
     /// Replace ONLY the marked block, keeping what the user wrote on either
     /// side of it.
     ///
-    /// Not `embassy_async::splice_section`: that one regenerates everything
+    /// Not `embassy_stm32::splice_section`: that one regenerates everything
     /// ABOVE the markers too, so a runtime switch can rewrite the imports. It is
     /// right for a backend with three runtimes and wrong for this one — reusing
     /// it here rebuilt the file with embassy-stm32's header on a Pico, and took

@@ -1,0 +1,62 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const SAMPLE_RATE_HZ: u32 = {RATE};
+pub const BUF_LEN: usize = {BUF};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// I2S{N} IS the SPI{N} block: the same silicon, told to speak audio instead. It
+// runs from a ring buffer the DMA owns for the whole program — there is no
+// blocking I2S in embassy, so `init` always takes a channel.
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
+use embassy_stm32::i2s::{ClockPolarity, Config, Format, I2S, Mode, Standard};
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::spi::{CkPin, I2sSdPin, {DMA_TRAIT}, WsPin{MCK_USE}};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::{peripherals, Peri};
+use static_cell::StaticCell;
+
+fn get_config() -> Config {
+    // `Config` is `#[non_exhaustive]`, so it is built by assignment rather than
+    // as a literal.
+    let mut config = Config::default();
+    config.frequency = Hertz(SAMPLE_RATE_HZ);
+    config.mode = Mode::{MODE};
+    config.standard = Standard::{STANDARD};
+    config.format = Format::{FORMAT};
+    config.clock_polarity = ClockPolarity::{POLARITY};
+    config.master_clock = {MASTER_CLOCK};
+    config
+}
+
+/// Initialise SPI{N} as I2S{N}, {DIRWORD}.
+pub fn init<'d, D: {DMA_TRAIT}<peripherals::SPI{N}>>(
+    spi: Peri<'d, peripherals::SPI{N}>,
+    sd: Peri<'d, impl I2sSdPin<peripherals::SPI{N}>>,
+    ws: Peri<'d, impl WsPin<peripherals::SPI{N}>>,
+    ck: Peri<'d, impl CkPin<peripherals::SPI{N}>>,
+{MCK_PARAM}    dma: Peri<'d, D>,
+    // Only `main.rs` knows WHICH channel this is, so the binding travels with
+    // it — same shape as the DMA-backed SPI next door.
+    irqs: impl Binding<D::Interrupt, DmaInterruptHandler<D>> + 'd,
+) -> I2S<'d, {WORD}> {
+    // `'static` so the DMA controller can own it for the program's lifetime.
+    static BUF: StaticCell<[{WORD}; BUF_LEN]> = StaticCell::new();
+    I2S::{CTOR}(
+        spi,
+        sd,
+        ws,
+        ck,
+{MCK_ARG}        dma,
+        BUF.init([0; BUF_LEN]),
+        irqs,
+        get_config(),
+    )
+}
+
+// ── Using I2S{N} ──
+// The handle streams through its ring buffer; `start()` opens the tap.
+//
+//     {HANDLE}.start();
+{USAGE}

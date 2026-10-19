@@ -1,0 +1,40 @@
+// <<< GENERATED>>>
+// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
+const TIMEOUT_US: u32 = {TIMEOUT};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// The watchdog counts the 1 us tick main.rs starts from the crystal, so its
+// period does not move with the Clock tab.
+//
+// {DRIVER}'s `start()` PANICS above {MAX} us. This turns that boot panic
+// into a build error:
+const _: () = assert!(
+    TIMEOUT_US >= 1 && TIMEOUT_US <= {MAX},
+    "watchdog period out of range: {DRIVER} start() panics above {MAX} us"
+);
+
+use {HAL}::Watchdog;
+use {HAL}::fugit::MicrosDurationU32;
+
+/// The configured period, as `start` takes it.
+pub fn period() -> MicrosDurationU32 {
+    MicrosDurationU32::from_ticks(TIMEOUT_US)
+}
+
+/// Configure the watchdog main.rs owns. It is NOT running yet - call
+/// `watchdog.start(pins::configs::watchdog::period())` when your start-up is
+/// far enough along to keep feeding it.
+pub fn init(watchdog: &mut Watchdog) {
+    // Hold the count while a debugger halts the core, so a breakpoint does
+    // not become a reset.
+    watchdog.pause_on_debug(true);
+}
+
+// -- Using the watchdog --
+//
+//     watchdog.start(pins::configs::watchdog::period());  // from here on it resets the chip
+//     loop {
+//         watchdog.feed();                                  // at least once every TIMEOUT_US
+//     }

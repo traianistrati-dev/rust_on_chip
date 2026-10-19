@@ -1,0 +1,30 @@
+// <<< GENERATED>>>
+// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
+const TIMEOUT_US: u32 = {TIMEOUT};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// The INDEPENDENT watchdog runs off the LSI, so its period does not move when
+// you change the system clock. `new` only configures it: nothing resets the
+// chip until `unleash()` is called.
+use embassy_stm32::peripherals::IWDG;
+use embassy_stm32::wdg::IndependentWatchdog;
+use embassy_stm32::Peri;
+
+/// Handle type, so it can be stored in a struct or an RTIC resource.
+pub type Handle = IndependentWatchdog<'static, IWDG>;
+
+/// Configure the IWDG. It is NOT running yet - call `unleash()` when your
+/// start-up is far enough along that you can keep petting it.
+pub fn init(iwdg: Peri<'static, IWDG>) -> Handle {
+    IndependentWatchdog::new(iwdg, TIMEOUT_US)
+}
+
+// -- Using the IWDG --
+//
+//     let mut wdg = pins::configs::iwdg::init(p.IWDG);
+//     wdg.unleash();                 // from here on it will reset the chip
+//     loop {
+//         wdg.pet();                 // at least once every TIMEOUT_US
+//     }

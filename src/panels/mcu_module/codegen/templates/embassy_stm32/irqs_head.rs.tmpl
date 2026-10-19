@@ -1,0 +1,4 @@
+use embassy_stm32::{bind_interrupts, peripherals};
+
+// Interrupt bindings for the DMA-backed peripherals below.
+bind_interrupts!(struct Irqs {

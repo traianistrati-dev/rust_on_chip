@@ -15,6 +15,7 @@
 
 use super::super::mcu::Runtime;
 use super::super::watchdog::{self, EspWdtConfig, WatchdogSettings};
+use super::tmpl;
 
 /// `src/pins/configs/iwdg.rs` — the STM32F1 on stm32f1xx-hal, i.e. on every
 /// runtime but Async.
@@ -22,114 +23,13 @@ use super::super::watchdog::{self, EspWdtConfig, WatchdogSettings};
 /// Three differences from [`IWDG_TMPL`], all visible at the call site: it takes
 /// the raw PAC peripheral, its period is in MILLISECONDS, and the reload method
 /// is `feed` rather than `pet`.
-const IWDG_TMPL_F1: &str = r#"// <<< GENERATED>>>
-// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
-// MILLISECONDS: stm32f1xx-hal takes `MilliSeconds`, not microseconds.
-const TIMEOUT_MS: u32 = {TIMEOUT_MS};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-//
-// The INDEPENDENT watchdog runs off the LSI (40 kHz on this family), so its
-// period does not move when you change the system clock. `new` only wraps the
-// peripheral: nothing resets the chip until `start()` is called.
-use stm32f1xx_hal::pac::IWDG;
-use stm32f1xx_hal::time::MilliSeconds;
-use stm32f1xx_hal::watchdog::IndependentWatchdog;
-
-/// Handle type, so it can be stored in a struct or an RTIC resource.
-pub type Handle = IndependentWatchdog;
-
-/// Wrap the IWDG. It is NOT running yet - call `start(period())` when your
-/// start-up is far enough along that you can keep feeding it.
-pub fn init(iwdg: IWDG) -> Handle {
-    IndependentWatchdog::new(iwdg)
-}
-
-/// The configured period, in the unit this HAL wants.
-pub fn period() -> MilliSeconds {
-    MilliSeconds::from_ticks(TIMEOUT_MS)
-}
-
-// -- Using the IWDG --
-//
-//     let mut wdg = pins::configs::iwdg::init(dp.IWDG);
-//     wdg.start(pins::configs::iwdg::period());  // starts biting here
-//     loop {
-//         wdg.feed();                            // at least every TIMEOUT_MS
-//     }
-"#;
+const IWDG_TMPL_F1: &str = include_str!("templates/f1_hal/iwdg.rs.tmpl");
 
 /// `src/pins/configs/iwdg.rs` — embassy families.
-const IWDG_TMPL: &str = r#"// <<< GENERATED>>>
-// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
-const TIMEOUT_US: u32 = {TIMEOUT};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-//
-// The INDEPENDENT watchdog runs off the LSI, so its period does not move when
-// you change the system clock. `new` only configures it: nothing resets the
-// chip until `unleash()` is called.
-use embassy_stm32::peripherals::IWDG;
-use embassy_stm32::wdg::IndependentWatchdog;
-use embassy_stm32::Peri;
-
-/// Handle type, so it can be stored in a struct or an RTIC resource.
-pub type Handle = IndependentWatchdog<'static, IWDG>;
-
-/// Configure the IWDG. It is NOT running yet - call `unleash()` when your
-/// start-up is far enough along that you can keep petting it.
-pub fn init(iwdg: Peri<'static, IWDG>) -> Handle {
-    IndependentWatchdog::new(iwdg, TIMEOUT_US)
-}
-
-// -- Using the IWDG --
-//
-//     let mut wdg = pins::configs::iwdg::init(p.IWDG);
-//     wdg.unleash();                 // from here on it will reset the chip
-//     loop {
-//         wdg.pet();                 // at least once every TIMEOUT_US
-//     }
-"#;
+const IWDG_TMPL: &str = include_str!("templates/embassy_stm32/iwdg.rs.tmpl");
 
 /// `src/pins/configs/wwdg.rs` — embassy families only (see `wwdg_supported`).
-const WWDG_TMPL: &str = r#"// <<< GENERATED>>>
-// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
-const TIMEOUT_US: u32 = {TIMEOUT};
-// The CLOSED window: petting during it resets the chip. 0 = no restriction.
-const WINDOW_US: u32 = {WINDOW};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-//
-// The WINDOW watchdog counts down from PCLK1, so its period moves with the
-// Clock tab - the values above were checked against the clock configured there.
-//
-// Two things to know before using it:
-//   * `new` STARTS it. There is no way to stop it short of a reset.
-//   * petting too EARLY resets the chip, exactly like petting too late. That is
-//     what the closed window means.
-use embassy_stm32::peripherals::WWDG;
-use embassy_stm32::wdg::WindowWatchdog;
-use embassy_stm32::Peri;
-
-/// Handle type, so it can be stored in a struct or an RTIC resource.
-pub type Handle = WindowWatchdog<'static, WWDG>;
-
-/// Configure AND START the window watchdog.
-pub fn init(wwdg: Peri<'static, WWDG>) -> Handle {
-    WindowWatchdog::new(wwdg, TIMEOUT_US, WINDOW_US)
-}
-
-// -- Using the WWDG --
-//
-//     let mut wdg = pins::configs::wwdg::init(p.WWDG);   // already running
-//     loop {
-//         // …work that takes at least WINDOW_US…
-//         wdg.pet();
-//     }
-"#;
+const WWDG_TMPL: &str = include_str!("templates/embassy_stm32/wwdg.rs.tmpl");
 
 /// `src/pins/configs/rwdt.rs` — the ESP's RTC watchdog.
 ///
@@ -139,44 +39,7 @@ pub fn init(wwdg: Peri<'static, WWDG>) -> Handle {
 /// with it the `LPWR` handle the rest of the low-power API needs — for the sake
 /// of a shorter type. Returning the `Rtc` costs one `.rwdt.` at each call and
 /// leaves sleep and the RTC clock reachable from the same binding.
-const RWDT_TMPL: &str = r#"// <<< GENERATED>>>
-// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
-const TIMEOUT_US: u64 = {TIMEOUT};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-//
-// The RTC watchdog lives in the RTC power domain and counts on the RTC SLOW
-// clock, an RC oscillator esp-hal calibrates at boot. So its period does not
-// move with the CPU clock - but it is not crystal-accurate either, and the same
-// code will not time out at exactly the same instant on two boards.
-//
-// `esp_hal::init()` DISABLES this watchdog on the way in, so nothing is armed
-// until you call `enable()`.
-use esp_hal::peripherals::LPWR;
-use esp_hal::rtc_cntl::{Rtc, RwdtStage};
-use esp_hal::time::Duration;
-
-/// Handle type, so it can be stored in a struct or a task's state.
-pub type Handle = Rtc<'static>;
-
-/// Configure the RTC watchdog. It is NOT running yet - call `rwdt.enable()`
-/// when your start-up is far enough along to keep feeding it.
-pub fn init(lpwr: LPWR<'static>) -> Handle {
-    let mut rtc = Rtc::new(lpwr);
-    rtc.rwdt
-        .set_timeout(RwdtStage::Stage0, Duration::from_micros(TIMEOUT_US));
-    rtc
-}
-
-// -- Using the RWDT --
-//
-//     let mut rtc = pins::configs::rwdt::init(peripherals.LPWR);
-//     rtc.rwdt.enable();             // from here on it will reset the chip
-//     loop {
-//         rtc.rwdt.feed();           // at least once every TIMEOUT_US
-//     }
-"#;
+const RWDT_TMPL: &str = include_str!("templates/esp_hal/rwdt.rs.tmpl");
 
 /// `src/pins/configs/mwdt{N}.rs` — a timer group's watchdog.
 ///
@@ -191,44 +54,7 @@ pub fn init(lpwr: LPWR<'static>) -> Handle {
 /// has already consumed the peripheral for the scheduler's timer. Taking the
 /// peripheral here would not compile there; taking nothing works on both, and
 /// the timer half and the watchdog half do not share a register.
-const MWDT_TMPL: &str = r#"// <<< GENERATED>>>
-// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
-const TIMEOUT_US: u64 = {TIMEOUT};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-//
-// Timer group {N}'s watchdog. It counts on the APB clock, but the period above
-// still means what it says: `set_timeout` reads the live clock and works out
-// the prescaler itself, so changing the Clock tab does not stretch it.
-//
-// `esp_hal::init()` DISABLES this watchdog on the way in, so nothing is armed
-// until you call `enable()`. Note that `enable()` also REWRITES the stage
-// actions - stage 0 resets the system, stages 1..3 off - so call it BEFORE any
-// `set_stage_action` of your own, not after.
-use esp_hal::peripherals::TIMG{N};
-use esp_hal::time::Duration;
-use esp_hal::timer::timg::{MwdtStage, Wdt};
-
-/// Handle type, so it can be stored in a struct or a task's state.
-pub type Handle = Wdt<TIMG{N}<'static>>;
-
-/// Configure timer group {N}'s watchdog. It is NOT running yet - call
-/// `enable()` when your start-up is far enough along to keep feeding it.
-pub fn init() -> Handle {
-    let mut wdt = Wdt::new();
-    wdt.set_timeout(MwdtStage::Stage0, Duration::from_micros(TIMEOUT_US));
-    wdt
-}
-
-// -- Using MWDT{N} --
-//
-//     let mut wdt = pins::configs::mwdt{N}::init();
-//     wdt.enable();                  // from here on it will reset the chip
-//     loop {
-//         wdt.feed();                // at least once every TIMEOUT_US
-//     }
-"#;
+const MWDT_TMPL: &str = include_str!("templates/esp_hal/mwdt.rs.tmpl");
 
 /// Does this chip have the second timer group? The ESP32-C2 does not.
 ///
@@ -265,11 +91,20 @@ fn esp_config_files(w: &WatchdogSettings, chip: &str) -> Vec<(String, String)> {
         .into_iter()
         .map(|(stem, c)| {
             let body = if stem == "rwdt" {
-                RWDT_TMPL.replace("{TIMEOUT}", &c.timeout_us.to_string())
+                tmpl::render(
+                    RWDT_TMPL,
+                    &[
+                        ("{TIMEOUT}", &c.timeout_us.to_string()),
+                    ],
+                )
             } else {
-                MWDT_TMPL
-                    .replace("{TIMEOUT}", &c.timeout_us.to_string())
-                    .replace("{N}", stem.trim_start_matches("mwdt"))
+                tmpl::render(
+                    MWDT_TMPL,
+                    &[
+                        ("{TIMEOUT}", &c.timeout_us.to_string()),
+                        ("{N}", stem.trim_start_matches("mwdt")),
+                    ],
+                )
             };
             (format!("{stem}.rs"), body)
         })
@@ -308,47 +143,7 @@ fn esp_init_lines(w: &WatchdogSettings, chip: &str) -> String {
 /// `panic!` inside `start()`, at boot. The assert moves it to the build, where
 /// the message can name the limit. It sits below the generated block, so a
 /// user who knows better can delete it.
-const RP_BLOCKING_TMPL: &str = r#"// <<< GENERATED>>>
-// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
-const TIMEOUT_US: u32 = {TIMEOUT};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-//
-// The watchdog counts the 1 us tick main.rs starts from the crystal, so its
-// period does not move with the Clock tab.
-//
-// {DRIVER}'s `start()` PANICS above {MAX} us. This turns that boot panic
-// into a build error:
-const _: () = assert!(
-    TIMEOUT_US >= 1 && TIMEOUT_US <= {MAX},
-    "watchdog period out of range: {DRIVER} start() panics above {MAX} us"
-);
-
-use {HAL}::Watchdog;
-use {HAL}::fugit::MicrosDurationU32;
-
-/// The configured period, as `start` takes it.
-pub fn period() -> MicrosDurationU32 {
-    MicrosDurationU32::from_ticks(TIMEOUT_US)
-}
-
-/// Configure the watchdog main.rs owns. It is NOT running yet - call
-/// `watchdog.start(pins::configs::watchdog::period())` when your start-up is
-/// far enough along to keep feeding it.
-pub fn init(watchdog: &mut Watchdog) {
-    // Hold the count while a debugger halts the core, so a breakpoint does
-    // not become a reset.
-    watchdog.pause_on_debug(true);
-}
-
-// -- Using the watchdog --
-//
-//     watchdog.start(pins::configs::watchdog::period());  // from here on it resets the chip
-//     loop {
-//         watchdog.feed();                                  // at least once every TIMEOUT_US
-//     }
-"#;
+const RP_BLOCKING_TMPL: &str = include_str!("templates/rp_hal/watchdog.rs.tmpl");
 
 /// `src/pins/configs/watchdog.rs` on an Async RP project (`embassy-rp`).
 ///
@@ -357,53 +152,7 @@ pub fn init(watchdog: &mut Watchdog) {
 /// embassy-rp's `feed` takes a duration and reloads the counter with IT, not
 /// with the one `start` set. A `feed()` with no argument does not exist there,
 /// so every call site needs the period - one constant keeps them equal.
-const RP_ASYNC_TMPL: &str = r#"// <<< GENERATED>>>
-// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
-const TIMEOUT_US: u64 = {TIMEOUT};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-//
-// embassy_rp::init() starts the 1 us tick the watchdog counts, from the
-// crystal, so its period does not move with the Clock tab.
-//
-// embassy-rp's `feed()` - which `start()` calls - PANICS above {MAX} us on
-// this chip. This turns that boot panic into a build error:
-const _: () = assert!(
-    TIMEOUT_US >= 1 && TIMEOUT_US <= {MAX},
-    "watchdog period out of range: embassy-rp panics above {MAX} us"
-);
-
-use embassy_rp::Peri;
-use embassy_rp::peripherals::WATCHDOG;
-use embassy_rp::watchdog::Watchdog;
-use embassy_time::Duration;
-
-/// Handle type, so it can be stored in a struct or a task's state.
-pub type Handle = Watchdog;
-
-/// The period `start` AND every `feed` take: embassy-rp's `feed` reloads the
-/// counter with the duration it is given, not with the one `start` set.
-pub const PERIOD: Duration = Duration::from_micros(TIMEOUT_US);
-
-/// Configure the watchdog. It is NOT running yet - call
-/// `watchdog.start(pins::configs::watchdog::PERIOD)` when your start-up is far
-/// enough along to keep feeding it.
-pub fn init(watchdog: Peri<'static, WATCHDOG>) -> Handle {
-    let mut wdt = Watchdog::new(watchdog);
-    // Hold the count while a debugger halts the core, so a breakpoint does
-    // not become a reset.
-    wdt.pause_on_debug(true);
-    wdt
-}
-
-// -- Using the watchdog --
-//
-//     watchdog.start(pins::configs::watchdog::PERIOD);    // from here on it resets the chip
-//     loop {
-//         watchdog.feed(pins::configs::watchdog::PERIOD); // at least once every TIMEOUT_US
-//     }
-"#;
+const RP_ASYNC_TMPL: &str = include_str!("templates/embassy_rp/watchdog.rs.tmpl");
 
 /// `8388607` -> `8_388_607`, for a limit that is read in generated code.
 fn grouped(n: u32) -> String {
@@ -432,23 +181,24 @@ pub fn rp_config_files(
         return Vec::new();
     };
     let (_, max) = watchdog::rp_range_us(family, is_async);
-    let tmpl = if is_async {
+    let template = if is_async {
         RP_ASYNC_TMPL
     } else {
         RP_BLOCKING_TMPL
     };
-    let body = tmpl
-        .replace("{TIMEOUT}", &c.timeout_us.to_string())
-        .replace("{MAX}", &grouped(max))
-        .replace("{DRIVER}", watchdog::rp_driver(family, is_async))
-        .replace(
-            "{HAL}",
-            if family == "rp2040" {
+    let body = tmpl::render(
+        template,
+        &[
+            ("{TIMEOUT}", &c.timeout_us.to_string()),
+            ("{MAX}", &grouped(max)),
+            ("{DRIVER}", watchdog::rp_driver(family, is_async)),
+            ("{HAL}", if family == "rp2040" {
                 "rp2040_hal"
             } else {
                 "rp235x_hal"
-            },
-        );
+            }),
+        ],
+    );
     vec![("watchdog.rs".to_owned(), body)]
 }
 
@@ -496,64 +246,13 @@ pub fn rp_init_lines(w: &WatchdogSettings, is_async: bool) -> String {
 /// takes, `TIMEOUT_US` is what a user's own timing should be derived from -
 /// the Async example sleeps half of it, where a fixed sleep bootlooped any
 /// period shorter than itself.
-const NRF_TMPL_HEAD: &str = r#"// <<< GENERATED>>>
-// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
-pub const TIMEOUT_US: u64 = {US};
-// The same period in ticks of the 32.768 kHz LFCLK, rounded up to a whole tick.
-pub const TIMEOUT_TICKS: u32 = {TICKS};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-//
-// The WDT counts the 32.768 kHz LFCLK, so its period does not move with the
-// HFCLK - but it is only as accurate as the LFCLK source the Clock tab picks.
-//
-// ONCE STARTED IT CANNOT BE STOPPED - not even by a soft reset, which is how a
-// debugger usually restarts after a reflash. So an image can boot with the
-// PREVIOUS image's watchdog still counting. What the HAL does then is below.
-"#;
+const NRF_TMPL_HEAD: &str = include_str!("templates/common/nrf_watchdog_head.rs.tmpl");
 
 /// `src/pins/configs/watchdog.rs` on a Blocking nRF project (`nrf52833-hal`).
 ///
 /// `init` configures and does NOT start: nrf-hal keeps the two apart, as
 /// `try_new` + `set_lfosc_ticks` and then `activate`.
-const NRF_BLOCKING_TMPL: &str = r#"//
-// nrf-hal refuses ANY watchdog that is already running, whatever its period.
-// So after every reflash of a project that has activated it, `init` returns
-// `Err`. Do not pet that one - you did not configure it: it resets the chip
-// once (RESETREAS then reads DOG), that reset clears it, and the next boot
-// configures this period.
-use {HAL}::pac::WDT;
-use {HAL}::wdt::{Inactive, Watchdog};
-
-/// Handle type, so it can be stored in a struct.
-pub type Handle = Watchdog<Inactive>;
-
-/// Configure the watchdog. It is NOT running yet - call
-/// `activate::<count::One>()` on it when your start-up is far enough along to
-/// keep petting it.
-///
-/// `Err` hands the peripheral back when a watchdog is ALREADY counting - see
-/// the note above.
-pub fn init(wdt: WDT) -> Result<Handle, WDT> {
-    let mut watchdog = Watchdog::try_new(wdt)?;
-    watchdog.set_lfosc_ticks(TIMEOUT_TICKS);
-    // Hold the count while a debugger halts the core, so a breakpoint does
-    // not become a reset.
-    watchdog.run_during_debug_halt(false);
-    Ok(watchdog)
-}
-
-// -- Using the watchdog --
-//
-//     use {HAL}::wdt::count;
-//     if let Ok(w) = watchdog {
-//         let mut parts = w.activate::<count::One>();  // from here on it resets the chip
-//         loop {
-//             parts.handles.0.pet();                   // at least once every period
-//         }
-//     }
-"#;
+const NRF_BLOCKING_TMPL: &str = include_str!("templates/nrf_hal/watchdog.rs.tmpl");
 
 /// `src/pins/configs/watchdog.rs` on an Async nRF project (`embassy-nrf`).
 ///
@@ -566,45 +265,7 @@ pub fn init(wdt: WDT) -> Result<Handle, WDT> {
 ///
 /// `Config` is `#[non_exhaustive]`, which is why it is built from `default()`
 /// and then assigned field by field rather than written as a literal.
-const NRF_ASYNC_TMPL: &str = r#"//
-// embassy-nrf ADOPTS a running watchdog whose configuration matches this one
-// exactly - period, debug-halt and sleep behaviour, number of handles - and
-// pets it: reflashing an unchanged project simply carries on. Anything else,
-// a changed period for one, is `Err`. Do not pet that one - you did not
-// configure it: it resets the chip once, that reset clears it, and the next
-// boot starts this period.
-use embassy_nrf::Peri;
-use embassy_nrf::peripherals::WDT;
-use embassy_nrf::wdt::{Config, HaltConfig, Watchdog, WatchdogHandle};
-
-/// Configure AND start the watchdog - on embassy-nrf they are one call, so
-/// main.rs does not make it: call this when your start-up is far enough along
-/// to keep petting the handle it returns.
-///
-/// `Err` hands the peripheral back when a watchdog is already counting with a
-/// different configuration - see the note above.
-pub fn start(
-    wdt: Peri<'static, WDT>,
-) -> Result<(Watchdog, [WatchdogHandle; 1]), Peri<'static, WDT>> {
-    let mut config = Config::default();
-    config.timeout_ticks = TIMEOUT_TICKS;
-    // Hold the count while a debugger halts the core, so a breakpoint does
-    // not become a reset. embassy-nrf's own default keeps it running.
-    config.action_during_debug_halt = HaltConfig::Pause;
-    Watchdog::try_new(wdt, config)
-}
-
-// -- Using the watchdog --
-//
-//     if let Ok((_wdt, [mut handle])) = pins::configs::watchdog::start(watchdog) {
-//         loop {
-//             handle.pet();                              // at least once every period
-//             // Half the period, from the period - never a fixed sleep, which
-//             // would outlast any period shorter than itself.
-//             embassy_time::Timer::after_micros(pins::configs::watchdog::TIMEOUT_US / 2).await;
-//         }
-//     }
-"#;
+const NRF_ASYNC_TMPL: &str = include_str!("templates/embassy_nrf/watchdog.rs.tmpl");
 
 /// The `pins/configs/watchdog.rs` an nRF project calls for, or none.
 ///
@@ -618,9 +279,13 @@ pub fn nrf_config_files(
     let Some(c) = w.nrf else {
         return Vec::new();
     };
-    let head = NRF_TMPL_HEAD
-        .replace("{US}", &c.timeout_us.to_string())
-        .replace("{TICKS}", &watchdog::nrf_ticks(c.timeout_us).to_string());
+    let head = tmpl::render(
+        NRF_TMPL_HEAD,
+        &[
+            ("{US}", &c.timeout_us.to_string()),
+            ("{TICKS}", &watchdog::nrf_ticks(c.timeout_us).to_string()),
+        ],
+    );
     // The application core of an nRF5340 has two watchdogs; its own is WDT0.
     let wdt = super::nrf::chip(family).map_or("WDT", |c| c.wdt());
     let embassy_tmpl = NRF_ASYNC_TMPL
@@ -640,7 +305,12 @@ pub fn nrf_config_files(
         )
     } else {
         // One HAL crate per chip, named after it (`nrf52833_hal`).
-        NRF_BLOCKING_TMPL.replace("{HAL}", &format!("{family}_hal"))
+        tmpl::render(
+            NRF_BLOCKING_TMPL,
+            &[
+                ("{HAL}", &format!("{family}_hal")),
+            ],
+        )
     };
     vec![("watchdog.rs".to_owned(), format!("{head}{body}"))]
 }
@@ -694,9 +364,19 @@ pub fn config_files(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Vec
         // both families, and only the generator knows what each HAL wants.
         // Truncating is right - rounding up could step past the range.
         let body = if f1_hal {
-            IWDG_TMPL_F1.replace("{TIMEOUT_MS}", &(i.timeout_us / 1_000).to_string())
+            tmpl::render(
+                IWDG_TMPL_F1,
+                &[
+                    ("{TIMEOUT_MS}", &(i.timeout_us / 1_000).to_string()),
+                ],
+            )
         } else {
-            IWDG_TMPL.replace("{TIMEOUT}", &i.timeout_us.to_string())
+            tmpl::render(
+                IWDG_TMPL,
+                &[
+                    ("{TIMEOUT}", &i.timeout_us.to_string()),
+                ],
+            )
         };
         out.push(("iwdg.rs".to_owned(), body));
     }
@@ -704,9 +384,13 @@ pub fn config_files(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Vec
         if super::super::watchdog::wwdg_supported(family, runtime) {
             out.push((
                 "wwdg.rs".to_owned(),
-                WWDG_TMPL
-                    .replace("{TIMEOUT}", &x.timeout_us.to_string())
-                    .replace("{WINDOW}", &x.window_us.to_string()),
+                tmpl::render(
+                    WWDG_TMPL,
+                    &[
+                        ("{TIMEOUT}", &x.timeout_us.to_string()),
+                        ("{WINDOW}", &x.window_us.to_string()),
+                    ],
+                ),
             ));
         }
     }

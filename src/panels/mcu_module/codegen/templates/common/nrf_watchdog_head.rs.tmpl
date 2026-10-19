@@ -1,0 +1,15 @@
+// <<< GENERATED>>>
+// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
+pub const TIMEOUT_US: u64 = {US};
+// The same period in ticks of the 32.768 kHz LFCLK, rounded up to a whole tick.
+pub const TIMEOUT_TICKS: u32 = {TICKS};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// The WDT counts the 32.768 kHz LFCLK, so its period does not move with the
+// HFCLK - but it is only as accurate as the LFCLK source the Clock tab picks.
+//
+// ONCE STARTED IT CANNOT BE STOPPED - not even by a soft reset, which is how a
+// debugger usually restarts after a reflash. So an image can boot with the
+// PREVIOUS image's watchdog still counting. What the HAL does then is below.

@@ -7,7 +7,7 @@ use super::module_docs::{self as docs, ConfigOut};
 use super::rotate::Rot;
 use crate::panels::mcu_module::codegen;
 use crate::panels::mcu_module::codegen::dma_map;
-use crate::panels::mcu_module::codegen::embassy_async::is_advanced_timer;
+use crate::panels::mcu_module::codegen::embassy_stm32::is_advanced_timer;
 use crate::panels::mcu_module::codegen::sanitize_label;
 use crate::panels::mcu_module::modules::model::BlockingDma;
 use crate::panels::mcu_module::modules::model::hz_label;

@@ -1856,7 +1856,7 @@ impl FamilyBackend for NrfBackend {
 
     /// Replace ONLY the marked block, keeping what the user wrote on either
     /// side of it. The same splice as the RP backend, for the same reason:
-    /// `embassy_async::splice_section` rewrites the header too. The one header
+    /// `embassy_stm32::splice_section` rewrites the header too. The one header
     /// line that names the runtime is refreshed.
     fn update_main_rs(&self, mcu: &Mcu, existing: &str) -> String {
         let (Some(begin), Some(end_start)) = (existing.find(GEN_BEGIN), existing.find(GEN_END))

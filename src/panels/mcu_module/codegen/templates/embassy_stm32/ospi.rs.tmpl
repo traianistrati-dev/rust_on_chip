@@ -1,0 +1,40 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const PRESCALER: u8 = {PRESCALER}; // bus = kernel clock / (PRESCALER + 1)
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// {MODE} on OCTOSPI{N}. QUADSPI's successor: the same idea with up to eight
+// data lines, and it speaks single, dual, quad and octal SPI from one block.
+// This is the BLOCKING driver — a flash command is a round trip anyway.
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::ospi::enums::{MemorySize, MemoryType};
+use embassy_stm32::ospi::{{PINS}, Config, Ospi};
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.device_size = MemorySize::{SIZE};
+    config.memory_type = MemoryType::{MTYPE};
+    config.clock_prescaler = PRESCALER;
+    config
+}
+
+/// Initialise OCTOSPI{N} in {MODE_SHORT}.
+pub fn init<'d>(
+    ospi: Peri<'d, peripherals::OCTOSPI{N}>,
+{PARAMS}) -> Ospi<'d, peripherals::OCTOSPI{N}, Blocking> {
+    Ospi::{CTOR}(ospi, {ARGS}, get_config())
+}
+
+// ── Using OCTOSPI{N} ──
+// Commands go out as a `TransferConfig`, the same shape as the QUADSPI's:
+//
+//     use embassy_stm32::ospi::TransferConfig;
+//
+//     let mut id = [0u8; 3];
+//     {HANDLE}.blocking_read(&mut id, TransferConfig {
+//         instruction: Some(0x9F), // read JEDEC id
+//         ..Default::default()
+//     }).ok();

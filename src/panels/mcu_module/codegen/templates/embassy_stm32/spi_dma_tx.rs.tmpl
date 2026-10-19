@@ -1,0 +1,48 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
+pub const CLOCK_HZ: u32 = {CLK};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// TRANSMIT ONLY: MISO is not wired, so this bus can send and cannot receive.
+// It takes one DMA channel instead of two — the other stays free for another
+// peripheral. Wire a MISO pin to get the full-duplex `SpiBus` back.
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
+use embassy_stm32::mode::Async;
+use embassy_stm32::spi::mode::Master;
+use embassy_stm32::spi::{Config, MosiPin, SckPin, Spi, TxDma};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.frequency = Hertz(CLOCK_HZ);
+{EXTRA_CFG}    config.mode = match SPI_MODE {
+        1 => embassy_stm32::spi::MODE_1,
+        2 => embassy_stm32::spi::MODE_2,
+        3 => embassy_stm32::spi::MODE_3,
+        _ => embassy_stm32::spi::MODE_0,
+    };
+    config
+}
+
+/// Initialise SPI{N} as a transmit-only, DMA-backed bus.
+pub fn init<'d, TxD: TxDma<peripherals::SPI{N}>>(
+    spi: Peri<'d, peripherals::SPI{N}>,
+    sck: Peri<'d, impl SckPin<peripherals::SPI{N}>>,
+    mosi: Peri<'d, impl MosiPin<peripherals::SPI{N}>>,
+    tx_dma: Peri<'d, TxD>,
+    irqs: impl Binding<TxD::Interrupt, DmaInterruptHandler<TxD>> + 'd,
+) -> Spi<'d, Async, Master> {
+    Spi::new_txonly(spi, sck, mosi, tx_dma, irqs, get_config())
+}
+
+// ── Using SPI{N} ──
+// Send only. `read` and `transfer` exist on this type but would panic here —
+// there is no RX channel behind them.
+//
+//     {HANDLE}.write(&[0x9Fu8, 0x00]).await.ok();
+

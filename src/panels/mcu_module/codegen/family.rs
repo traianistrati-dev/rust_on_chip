@@ -12,7 +12,7 @@
 //! here — they are pure data (a `.ron` definition).
 
 use super::common::{EdgeHook, USER_TAIL};
-use super::{embassy_async, embassy_common, rcc, rtic, stm32, wba};
+use super::{embassy_common, embassy_stm32, rcc, rtic, stm32, wba};
 use crate::panels::mcu_module::codegen_esp::{self, EspRuntime};
 use crate::panels::mcu_module::comparator;
 use crate::panels::mcu_module::mcu::{Mcu, Runtime};
@@ -760,7 +760,7 @@ impl FamilyBackend for StmEmbassyBackend {
 // `stm32f1` included: on Blocking, Native and RTIC the F1 is on stm32f1xx-hal,
 // and on Async it swaps that crate for the embassy-stm32 the others use (its
 // line is derived in `ProjectDef::for_async`), with its AFIO remap threaded
-// through the pin bounds (`embassy_async::with_afio_remap`).
+// through the pin bounds (`embassy_stm32::with_afio_remap`).
 struct AsyncEmbassyBackend;
 
 impl FamilyBackend for AsyncEmbassyBackend {
@@ -786,7 +786,7 @@ impl FamilyBackend for AsyncEmbassyBackend {
     fn fresh_main_rs(&self, mcu: &Mcu) -> String {
         format!(
             "{header}{section}\n{tail}",
-            header = embassy_async::invariant_header(&mcu.name, &mcu.id),
+            header = embassy_stm32::invariant_header(&mcu.name, &mcu.id),
             section = async_section(mcu),
             tail = super::common::ASYNC_USER_TAIL,
         )
@@ -795,7 +795,7 @@ impl FamilyBackend for AsyncEmbassyBackend {
     fn update_main_rs(&self, mcu: &Mcu, existing: &str) -> String {
         let section = async_section(mcu);
         let section = super::common::keep_manual_clock(existing, section, mcu.clock_manual);
-        embassy_async::splice_section(existing, &section, &mcu.name, &mcu.id)
+        embassy_stm32::splice_section(existing, &section, &mcu.name, &mcu.id)
     }
 
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
@@ -814,7 +814,7 @@ impl FamilyBackend for AsyncEmbassyBackend {
 }
 
 /// The async peripherals (USART/SPI/I2C) derived from `mcu`'s modules + pins.
-fn async_periphs(mcu: &Mcu) -> embassy_async::AsyncPeriphs {
+fn async_periphs(mcu: &Mcu) -> embassy_stm32::AsyncPeriphs {
     let all = pins_of(mcu);
     let usart = modules::usart_configs(&mcu.modules);
     let spi = modules::spi_configs(&mcu.modules);
@@ -838,15 +838,15 @@ fn async_periphs(mcu: &Mcu) -> embassy_async::AsyncPeriphs {
                 .map(|inp| (*n, inp, comparator::wired_pin(mcu, *n, "INM")))
         })
         .collect();
-    embassy_async::async_peripherals(
+    embassy_stm32::async_peripherals(
         &mcu.family,
-        embassy_async::ChipData {
+        embassy_stm32::ChipData {
             dma: mcu.dma.as_ref(),
             irq_vectors: &mcu.irq_vectors,
             usart_ip: mcu.usart_ip.as_deref(),
             sdmmc_ip: mcu.sdmmc_ip.as_deref(),
         },
-        embassy_async::CompInputs {
+        embassy_stm32::CompInputs {
             settings: &mcu.comp,
             instances: &comp_instances,
             pins: &comp_pins,
@@ -921,7 +921,7 @@ fn async_section(mcu: &Mcu) -> String {
         }
         None => periphs.init_calls.clone(),
     };
-    embassy_async::make_generated_section(
+    embassy_stm32::make_generated_section(
         &mcu.name,
         &gpio_pins,
         &clock,
@@ -1113,7 +1113,7 @@ pub fn async_details(family: &str) -> AsyncDetails {
     }
 }
 
-/// Each row is a claim about `embassy_async.rs` and `project_gen.rs`; the USART
+/// Each row is a claim about `embassy_stm32/` and `project_gen.rs`; the USART
 /// and DMA rows say what the module rows offer today (a Buffered | DMA
 /// transport, channels from the family's table with a per-module picker), not
 /// what they offered when the pane was first written.
@@ -4080,7 +4080,7 @@ mod tests {
         assert!(code.contains("async fn main(_spawner: Spawner)"));
         assert!(code.contains("use embassy_executor::Spawner;"));
         // Crate-level allow (the executor macro drops a fn-level one — see
-        // `embassy_async::invariant_header`).
+        // `embassy_stm32::invariant_header`).
         assert!(code.contains("#![allow(unused_variables, unused_mut)]"));
         assert!(
             !code.contains("fn main() -> !"),

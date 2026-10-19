@@ -1,0 +1,95 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 7, 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+{EXTRA_CONSTS}// Bytes the DMA controller can receive without the CPU touching them.
+pub const RX_DMA_BUF: usize = {BUF};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// `init` returns (TX, RX). Both implement the STANDARD `embedded-io-async`
+// traits, so your application code stays portable:
+//
+//     async fn send<W: embedded_io_async::Write>(w: &mut W) { /* … */ }
+//     async fn recv<R: embedded_io_async::Read>(r: &mut R) { /* … */ }
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::mode::Async;
+use embassy_stm32::usart::{
+    Config, DataBits, Instance, InterruptHandler, Parity, RingBufferedUartRx, RxDma, RxPin,
+    StopBits, TxDma, TxPin, Uart, UartTx,
+};
+{FLOW_USE}
+use embassy_stm32::{peripherals, Peri};
+use static_cell::StaticCell;
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.baudrate = BAUDRATE;
+    config.data_bits = match DATA_BITS {
+        7 => DataBits::DataBits7,
+        9 => DataBits::DataBits9,
+        _ => DataBits::DataBits8,
+    };
+    config.parity = match PARITY {
+        'O' => Parity::ParityOdd,
+        'E' => Parity::ParityEven,
+        _ => Parity::ParityNone,
+    };
+    config.stop_bits = match STOP_BITS {
+        2 => StopBits::STOP2,
+        _ => StopBits::STOP1,
+    };
+{EXTRA_CONFIG}    config
+}
+
+/// Initialise {PERI} on DMA, as (TX, RX).
+///
+/// No `bind_interrupts!` here: embassy takes ONE value that must bind this
+/// peripheral's interrupt AND both DMA channels', and only `main.rs` knows which
+/// channels those are — so the whole `Irqs` lives there.
+pub fn init<'d, TxD: TxDma<peripherals::{PERI}>, RxD: RxDma<peripherals::{PERI}>>(
+    usart: Peri<'d, peripherals::{PERI}>,
+{PIN_PARAMS}{FLOW_PARAMS}    tx_dma: Peri<'d, TxD>,
+    rx_dma: Peri<'d, RxD>,
+    irqs: impl Binding<
+            <peripherals::{PERI} as Instance>::Interrupt,
+            InterruptHandler<peripherals::{PERI}>,
+        > + Binding<TxD::Interrupt, DmaInterruptHandler<TxD>>
+        + Binding<RxD::Interrupt, DmaInterruptHandler<RxD>>
+        + 'd,
+) -> (UartTx<'d, Async>, RingBufferedUartRx<'d>) {
+    let uart = {CTOR}.unwrap();
+    let (tx, rx) = uart.split();
+    // `'static` so the DMA controller can own it for the program's lifetime.
+    static RX_BUF: StaticCell<[u8; RX_DMA_BUF]> = StaticCell::new();
+    (tx, rx.into_ring_buffered(RX_BUF.init([0; RX_DMA_BUF])))
+}
+
+// ── Using {PERI} ──
+// `init` gives you (tx, rx). Reception runs in the background from the moment
+// it returns, so a slow reader loses nothing as long as RX_DMA_BUF holds.
+//
+//     use embedded_io_async::{Read, Write};
+//
+//     let (mut tx, mut rx) = ({HANDLE}_tx, {HANDLE}_rx);
+//     tx.write_all(b"hello\r\n").await.ok();
+//
+//     let mut buf = [0u8; 32];
+//     let n = rx.read(&mut buf).await.unwrap(); // as much as has arrived
+//
+// ── Sending without the DMA ──
+// The same handle also writes straight from the CPU, which is often the better
+// trade for a short burst: a DMA write costs a descriptor setup and an
+// interrupt, and it yields to the executor, so a handful of bytes can leave
+// sooner this way.
+//
+//     {HANDLE}_tx.blocking_write(b"hi\r\n").ok();
+//
+// It does NOT free the channel: embassy takes both when it builds a
+// bidirectional UART, and this handle keeps its TX one either way. To spend one
+// channel instead of two, set the module's Data Direction to RX only (or TX
+// only) — that builds half a UART, and half a UART takes half the channels.

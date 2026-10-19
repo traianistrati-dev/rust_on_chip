@@ -1,0 +1,50 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
+pub const CLOCK_HZ: u32 = {CLK};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// `init` returns a STANDARD `embedded-hal` 1.0 `SpiBus<u8>` (BLOCKING). A blocking
+// bus in an async project is a common, valid pattern; for `.await`-able DMA SPI
+// switch this module to "Async-DMA" in the IDE.
+//
+//     fn app<S: embedded_hal::spi::SpiBus<u8>>(spi: &mut S) { /* … */ }
+use embassy_stm32::spi::{Config, MisoPin, MosiPin, SckPin, Spi, MODE_0, MODE_1, MODE_2, MODE_3};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.mode = match SPI_MODE {
+        1 => MODE_1,
+        2 => MODE_2,
+        3 => MODE_3,
+        _ => MODE_0,
+    };
+    config.frequency = Hertz(CLOCK_HZ);
+{EXTRA_CFG}    config
+}
+
+/// Initialise SPI{N} as a blocking `embedded-hal` 1.0 SpiBus value.
+pub fn init<'d>(
+    spi: Peri<'d, peripherals::SPI{N}>,
+    sck: Peri<'d, impl SckPin<peripherals::SPI{N}>>,
+    mosi: Peri<'d, impl MosiPin<peripherals::SPI{N}>>,
+    miso: Peri<'d, impl MisoPin<peripherals::SPI{N}>>,
+) -> impl embedded_hal::spi::SpiBus<u8> + 'd {
+    Spi::new_blocking(spi, sck, mosi, miso, get_config())
+}
+
+// ── Using SPI{N} ──
+// Blocking init inside an async project: the handle is an `embedded-hal` 1.0
+// `SpiBus` — no `.await`, the transfer busy-waits. Fine for short bursts;
+// switch the module to Async-DMA when a transfer is long enough to matter.
+//
+//     use embedded_hal::spi::SpiBus;
+//
+//     let mut buf = [0x9F, 0x00, 0x00];
+//     {HANDLE}.transfer_in_place(&mut buf).ok();
+//     {HANDLE}.flush().ok();
+

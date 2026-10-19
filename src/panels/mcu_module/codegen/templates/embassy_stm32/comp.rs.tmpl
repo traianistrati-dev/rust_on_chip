@@ -1,0 +1,56 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Configuration tab) - auto-updated; edit it there.
+use embassy_stm32::comp::{BlankingSource, Config, Hysteresis, InvertingInput, OutputPolarity};{POWER_USE}
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+{POWER_LINE}    config.hysteresis = Hysteresis::{HYST};
+    config.output_polarity = OutputPolarity::{POLARITY};
+    config.inverting_input = InvertingInput::{INM};
+    config.blanking_source = BlankingSource::{BLANK};
+    config
+}
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// `init` returns embassy's `Comp`, already enabled. The comparator then runs on
+// its own: no CPU involvement until you ask, either by polling `output_level()`
+// or by awaiting an edge.
+use embassy_stm32::comp::{Comp, InputPlusPin, Instance, InterruptHandler};{INM_USE}
+use embassy_stm32::gpio::Pin;
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::{peripherals, Peri};
+
+/// The concrete type [`init`] hands back, named so it can be a struct field.
+pub type Handle<'d> = Comp<'d, peripherals::COMP{N}>;
+
+/// Initialise COMP{N} and start it.
+pub fn init<'d>(
+    comp: Peri<'d, peripherals::COMP{N}>,
+    inp: Peri<'d, impl InputPlusPin<peripherals::COMP{N}> + Pin>,{INM_PARAM}
+    irqs: impl Binding<
+            <peripherals::COMP{N} as Instance>::Interrupt,
+            InterruptHandler<peripherals::COMP{N}>,
+        > + 'd,
+) -> Handle<'d> {
+    let mut comp = Comp::{CTOR}(comp, inp,{INM_ARG} irqs, get_config());
+    // embassy leaves a new comparator OFF; nothing would ever compare without
+    // this. Drop the line if you want to start it later yourself.
+    comp.enable();
+    comp
+}
+
+// -- Using COMP{N} --
+// In main.rs, after the init above:
+//
+//     // Read the current result - no waiting.
+//     let above = {HANDLE}.output_level();
+//
+//     // Or wait for the input to cross the threshold. WHICH edge you wait for
+//     // is chosen here, not in the config: embassy arms EXTI per call, so
+//     // there is no "trigger mode" field to set.
+//     {HANDLE}.wait_for_rising_edge().await;
+//     {HANDLE}.wait_for_falling_edge().await;
+//     {HANDLE}.wait_for_any_edge().await;
+

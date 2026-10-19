@@ -1,0 +1,141 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
+pub const CLOCK_KHZ: u32 = {KHZ};
+
+// The wired pins, straight from the MCU Configurator's pin map. They live in
+// this block because re-wiring the peripheral has to update them; the `use` is
+// here too, so the aliases hold whatever you do to the `use` block below.
+use stm32f1xx_hal::{gpio as hal_gpio, spi as hal_spi};
+
+/// The pins SPI{N} is wired to, in HAL order: (SCK, MISO, MOSI). A signal you
+/// left unwired is the HAL's `No…` placeholder.
+///
+/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
+#[allow(dead_code)]
+pub type SpiPins = ({PINS});
+
+/// Whether those are the peripheral's default pins or its remapped set — the
+/// HAL takes the remap register bit from this type.
+#[allow(dead_code)]
+pub type SpiRemap = {REMAP};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+use stm32f1xx_hal::{
+    pac,
+    prelude::*,
+    afio,
+    rcc::Clocks,
+    spi::{Mode, Phase, Polarity, Spi},
+};
+
+fn get_mode() -> Mode {
+    match SPI_MODE {
+        1 => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnSecondTransition },
+        2 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnFirstTransition },
+        3 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnSecondTransition },
+        _ => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnFirstTransition },
+    }
+}
+
+/// Bridges the HAL's blocking/nb SPI (embedded-hal 0.2) to the STANDARD
+/// `embedded-hal` 1.0 `SpiBus`, so driver/app code stays portable across HALs:
+///
+///     fn app<S: embedded_hal::spi::SpiBus>(spi: &mut S) { /* … */ }
+pub struct SpiBusIo<SPI>(pub SPI);
+
+#[derive(Debug)]
+pub struct IoError;
+impl embedded_hal::spi::Error for IoError {
+    fn kind(&self) -> embedded_hal::spi::ErrorKind {
+        embedded_hal::spi::ErrorKind::Other
+    }
+}
+impl<SPI> embedded_hal::spi::ErrorType for SpiBusIo<SPI> {
+    type Error = IoError;
+}
+impl<SPI> embedded_hal::spi::SpiBus<u8> for SpiBusIo<SPI>
+where
+    SPI: embedded_hal_0_2::blocking::spi::Write<u8>
+        + embedded_hal_0_2::blocking::spi::Transfer<u8>
+        + embedded_hal_0_2::spi::FullDuplex<u8>,
+{
+    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+        embedded_hal_0_2::blocking::spi::Write::write(&mut self.0, words).map_err(|_| IoError)
+    }
+    fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        for w in words.iter_mut() {
+            nb::block!(embedded_hal_0_2::spi::FullDuplex::send(&mut self.0, 0)).map_err(|_| IoError)?;
+            *w = nb::block!(embedded_hal_0_2::spi::FullDuplex::read(&mut self.0)).map_err(|_| IoError)?;
+        }
+        Ok(())
+    }
+    fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        embedded_hal_0_2::blocking::spi::Transfer::transfer(&mut self.0, words)
+            .map(|_| ())
+            .map_err(|_| IoError)
+    }
+    fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
+        // Clock max(read, write) bytes; pad the write with 0, ignore reads past `read`.
+        for i in 0..read.len().max(write.len()) {
+            let b = write.get(i).copied().unwrap_or(0);
+            nb::block!(embedded_hal_0_2::spi::FullDuplex::send(&mut self.0, b)).map_err(|_| IoError)?;
+            let r = nb::block!(embedded_hal_0_2::spi::FullDuplex::read(&mut self.0)).map_err(|_| IoError)?;
+            if let Some(slot) = read.get_mut(i) {
+                *slot = r;
+            }
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// The concrete type [`init`] hands back.
+///
+/// A NAMED type, not `impl Trait`: a struct field — an RTIC `Local` resource,
+/// say — has to name what it holds, and an opaque type cannot be named. The pins
+/// stay inside the HAL's `Spi<…>`, so `SpiPins`/`SpiRemap` from the GENERATED
+/// block above are part of it; re-wiring SPI{N} updates this alias with them.
+/// It is still an `embedded-hal` 1.0 `SpiBus` for every caller.
+pub type Handle = SpiBusIo<Spi<pac::SPI{N}, SpiRemap, SpiPins, u8>>;
+
+/// Initialise SPI{N} and expose it as an `embedded-hal` 1.0 `SpiBus`.
+pub fn init(
+    spi: pac::SPI{N},
+    pins: SpiPins,
+    {AFIO_PARAM}: &mut afio::Parts,
+    clocks: &Clocks,
+) -> Handle {
+    let bus = Spi::spi{N}(spi, pins, {AFIO_ARG}get_mode(), CLOCK_KHZ.kHz(), *clocks);
+    SpiBusIo(bus)
+}
+
+// ── Using SPI{N} ──
+// Portable init — the handle is an `embedded-hal` 1.0 `SpiBus`. In main.rs,
+// after the init above:
+//
+// NOTE: main.rs binds this handle as `let {HANDLE} = …` — add `mut`
+// there before calling anything below (bus methods take `&mut self`).
+//
+//     use embedded_hal::spi::SpiBus;
+//
+//     // Write only
+//     {HANDLE}.write(&[0x9F]).ok();
+//
+//     // Read only (clocks out zeros)
+//     let mut rx = [0u8; 3];
+//     {HANDLE}.read(&mut rx).ok();
+//
+//     // Full duplex, separate buffers
+//     {HANDLE}.transfer(&mut rx, &[0x9F, 0x00, 0x00]).ok();
+//
+//     // Full duplex in place: `buf` is sent, then overwritten by the reply
+//     let mut buf = [0x9F, 0x00, 0x00];
+//     {HANDLE}.transfer_in_place(&mut buf).ok();
+//     {HANDLE}.flush().ok();
+//
+//     // NSS/CS is a plain GPIO here — drive it low around a transaction.
+

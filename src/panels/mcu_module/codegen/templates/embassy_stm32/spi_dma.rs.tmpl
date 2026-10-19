@@ -1,0 +1,65 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
+pub const CLOCK_HZ: u32 = {CLK};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// `init` returns an ASYNC `embedded-hal-async` `SpiBus<u8>` (`.await`-able),
+// backed by DMA. The DMA channels are passed in from `main.rs`.
+//
+//     async fn app<S: embedded_hal_async::spi::SpiBus<u8>>(spi: &mut S) { /* … */ }
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::spi::{
+    Config, MisoPin, MosiPin, RxDma, SckPin, Spi, TxDma, MODE_0, MODE_1, MODE_2, MODE_3,
+};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.mode = match SPI_MODE {
+        1 => MODE_1,
+        2 => MODE_2,
+        3 => MODE_3,
+        _ => MODE_0,
+    };
+    config.frequency = Hertz(CLOCK_HZ);
+{EXTRA_CFG}    config
+}
+
+/// Initialise SPI{N} as an async `embedded-hal-async` SpiBus value (DMA-backed).
+pub fn init<'d, TxD: TxDma<peripherals::SPI{N}>, RxD: RxDma<peripherals::SPI{N}>>(
+    spi: Peri<'d, peripherals::SPI{N}>,
+    sck: Peri<'d, impl SckPin<peripherals::SPI{N}>>,
+    mosi: Peri<'d, impl MosiPin<peripherals::SPI{N}>>,
+    miso: Peri<'d, impl MisoPin<peripherals::SPI{N}>>,
+    tx_dma: Peri<'d, TxD>,
+    rx_dma: Peri<'d, RxD>,
+    // embassy 0.6 requires the DMA channels' interrupts to be bound, and only
+    // `main.rs` knows WHICH channels those are — hence the named type params
+    // above instead of `impl TxDma<..>`: the bound below has to name them.
+    irqs: impl Binding<TxD::Interrupt, DmaInterruptHandler<TxD>>
+        + Binding<RxD::Interrupt, DmaInterruptHandler<RxD>>
+        + 'd,
+) -> impl embedded_hal_async::spi::SpiBus<u8> + 'd {
+    Spi::new(spi, sck, mosi, miso, tx_dma, rx_dma, irqs, get_config())
+}
+
+// ── Using SPI{N} ──
+// Async-DMA init: the handle is an `embedded-hal-async` `SpiBus`, so a transfer
+// hands the bytes to DMA and yields until it finishes.
+//
+//     use embedded_hal_async::spi::SpiBus;
+//
+//     {HANDLE}.write(&[0x9F]).await.ok();
+//
+//     let mut rx = [0u8; 3];
+//     {HANDLE}.transfer(&mut rx, &[0x9F, 0x00, 0x00]).await.ok();
+//
+//     let mut buf = [0x9F, 0x00, 0x00];
+//     {HANDLE}.transfer_in_place(&mut buf).await.ok();
+//     {HANDLE}.flush().await.ok();
+

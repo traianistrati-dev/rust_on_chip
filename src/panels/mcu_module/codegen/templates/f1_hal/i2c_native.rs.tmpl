@@ -1,0 +1,74 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const CLOCK_KHZ: u32 = {KHZ}; // <=100 Standard, >100 Fast
+{DEVICES}
+
+// The wired pins, straight from the MCU Configurator's pin map. They live in
+// this block because re-wiring the peripheral has to update them; the `use` is
+// here too, so the alias holds whatever you do to the `use` block below.
+use stm32f1xx_hal::gpio as hal_gpio;
+
+/// The pins I2C{N} is wired to, in HAL order: (SCL, SDA).
+///
+/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
+#[allow(dead_code)]
+pub type I2cPins = ({PINS});
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+// NATIVE stm32f1xx-hal API — returns `BlockingI2c<…>`. Switch to the portable
+// `embedded-hal` 1.0 `I2c` API in the Virtual Module.
+use stm32f1xx_hal::{
+    pac,
+    prelude::*,
+    afio,
+    rcc::Clocks,
+    i2c::{self, BlockingI2c, Mode as I2cMode},
+};
+
+fn get_mode() -> I2cMode {
+    if CLOCK_KHZ <= 100 {
+        I2cMode::Standard { frequency: CLOCK_KHZ.kHz() }
+    } else {
+        I2cMode::Fast { frequency: CLOCK_KHZ.kHz(), duty_cycle: i2c::DutyCycle::Ratio2to1 }
+    }
+}
+
+/// The concrete type [`init`] hands back — the HAL's own `BlockingI2c`, with the
+/// pins it keeps in its type. Named so it can be a struct field (an RTIC `Local`
+/// resource, say); `I2cPins` comes from the GENERATED block above, so re-wiring
+/// I2C{N} updates this one with it.
+pub type Handle = BlockingI2c<pac::I2C{N}, I2cPins>;
+
+pub fn init(
+    i2c: pac::I2C{N},
+    pins: I2cPins,
+    {AFIO_PARAM}: &mut afio::Parts,
+    clocks: &Clocks,
+) -> Handle {
+    BlockingI2c::i2c{N}(i2c, pins, {AFIO_ARG}get_mode(), *clocks, 1000, 10, 1000, 1000)
+}
+
+// ── Using I2C{N} ──
+// Native init — the concrete `stm32f1xx-hal` BlockingI2c, whose traits are
+// `embedded-hal` 0.2. In main.rs, after the init above:
+//
+// NOTE: the Native path needs the 0.2 traits, which the IDE only adds to
+// Cargo.toml for PORTABLE modules. Add them yourself:
+//   embedded-hal-0-2 = { package = "embedded-hal", version = "0.2.7", features = ["unproven"] }
+// — or switch this module's Init API to Portable, where the handle is an
+// embedded-hal 1.0 bus and no extra dependency is needed.
+//
+// NOTE: main.rs binds this handle as `let {HANDLE} = …` — add `mut`
+// there before calling anything below (bus methods take `&mut self`).
+//
+//     use embedded_hal_0_2::blocking::i2c::{Read, Write, WriteRead};
+//     // The address is the device's own, in its file beside this one:
+//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
+//
+//     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();
+//
+//     let mut rx = [0u8; 2];
+//     {HANDLE}.read(DEVICE_ADDRESS, &mut rx).ok();
+//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).ok();
+

@@ -1,0 +1,65 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 7, 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+{EXTRA_CONSTS}// Bytes the DMA controller can receive without the CPU touching them.
+pub const RX_DMA_BUF: usize = {BUF};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// RECEIVE ONLY: the TX pad is free for something else. `init` returns a value
+// implementing `embedded_io_async::Read`.
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::usart::{
+    Config, DataBits, Instance, InterruptHandler, Parity, RingBufferedUartRx, RxDma, RxPin,
+    StopBits, UartRx,
+};
+use embassy_stm32::{peripherals, Peri};
+use static_cell::StaticCell;
+{FLOW_USE}
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.baudrate = BAUDRATE;
+    config.data_bits = match DATA_BITS {
+        7 => DataBits::DataBits7,
+        9 => DataBits::DataBits9,
+        _ => DataBits::DataBits8,
+    };
+    config.parity = match PARITY {
+        'O' => Parity::ParityOdd,
+        'E' => Parity::ParityEven,
+        _ => Parity::ParityNone,
+    };
+    config.stop_bits = match STOP_BITS {
+        2 => StopBits::STOP2,
+        _ => StopBits::STOP1,
+    };
+{EXTRA_CONFIG}    config
+}
+
+/// Initialise {PERI} as an RX-only DMA UART with a ring buffer.
+pub fn init<'d, RxD: RxDma<peripherals::{PERI}>>(
+    usart: Peri<'d, peripherals::{PERI}>,
+    rx: Peri<'d, impl RxPin<peripherals::{PERI}>>,
+{FLOW_PARAMS}    rx_dma: Peri<'d, RxD>,
+    irqs: impl Binding<
+            <peripherals::{PERI} as Instance>::Interrupt,
+            InterruptHandler<peripherals::{PERI}>,
+        > + Binding<RxD::Interrupt, DmaInterruptHandler<RxD>>
+        + 'd,
+) -> RingBufferedUartRx<'d> {
+    let rx = {CTOR}.unwrap();
+    // `'static` so the DMA controller can own it for the program's lifetime.
+    static RX_BUF: StaticCell<[u8; RX_DMA_BUF]> = StaticCell::new();
+    rx.into_ring_buffered(RX_BUF.init([0; RX_DMA_BUF]))
+}
+
+// ── Using {PERI} ──
+//     use embedded_io_async::Read;
+//     let mut buf = [0u8; 32];
+//     let n = {HANDLE}.read(&mut buf).await.unwrap();

@@ -1,0 +1,82 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
+pub const CLOCK_KHZ: u32 = {KHZ};
+
+// The wired pins, straight from the MCU Configurator's pin map. They live in
+// this block because re-wiring the peripheral has to update them; the `use` is
+// here too, so the aliases hold whatever you do to the `use` block below.
+use stm32f1xx_hal::{gpio as hal_gpio, spi as hal_spi};
+
+/// The pins SPI{N} is wired to, in HAL order: (SCK, MISO, MOSI). A signal you
+/// left unwired is the HAL's `No…` placeholder.
+///
+/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
+#[allow(dead_code)]
+pub type SpiPins = ({PINS});
+
+/// Whether those are the peripheral's default pins or its remapped set — the
+/// HAL takes the remap register bit from this type.
+#[allow(dead_code)]
+pub type SpiRemap = {REMAP};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+// NATIVE stm32f1xx-hal API — returns `Spi<…>`. Switch to the portable
+// `embedded-hal` 1.0 `SpiBus` API in the Virtual Module.
+use stm32f1xx_hal::{
+    pac,
+    prelude::*,
+    afio,
+    rcc::Clocks,
+    spi::{Mode, Phase, Polarity, Spi},
+};
+
+fn get_mode() -> Mode {
+    match SPI_MODE {
+        1 => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnSecondTransition },
+        2 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnFirstTransition },
+        3 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnSecondTransition },
+        _ => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnFirstTransition },
+    }
+}
+
+/// The concrete type [`init`] hands back — the HAL's own `Spi`, with the pins
+/// and the remap state it keeps in its type. Named so it can be a struct field
+/// (an RTIC `Local` resource, say); the two aliases come from the GENERATED
+/// block above, so re-wiring SPI{N} updates this one with them.
+pub type Handle = Spi<pac::SPI{N}, SpiRemap, SpiPins, u8>;
+
+pub fn init(
+    spi: pac::SPI{N},
+    pins: SpiPins,
+    {AFIO_PARAM}: &mut afio::Parts,
+    clocks: &Clocks,
+) -> Handle {
+    Spi::spi{N}(spi, pins, {AFIO_ARG}get_mode(), CLOCK_KHZ.kHz(), *clocks)
+}
+
+// ── Using SPI{N} ──
+// Native init — the concrete `stm32f1xx-hal` Spi, whose traits are
+// `embedded-hal` 0.2. In main.rs, after the init above:
+//
+// NOTE: the Native path needs the 0.2 traits, which the IDE only adds to
+// Cargo.toml for PORTABLE modules. Add them yourself:
+//   embedded-hal-0-2 = { package = "embedded-hal", version = "0.2.7", features = ["unproven"] }
+// — or switch this module's Init API to Portable, where the handle is an
+// embedded-hal 1.0 bus and no extra dependency is needed.
+//
+// NOTE: main.rs binds this handle as `let {HANDLE} = …` — add `mut`
+// there before calling anything below (bus methods take `&mut self`).
+//
+//     use embedded_hal_0_2::blocking::spi::{Transfer, Write};
+//
+//     // Write only
+//     {HANDLE}.write(&[0x9F]).ok();
+//
+//     // Full duplex in place: the buffer is sent, then holds the reply
+//     let mut buf = [0x9F, 0x00, 0x00];
+//     {HANDLE}.transfer(&mut buf).ok();
+//
+//     // NSS/CS is a plain GPIO here — drive it low around a transaction.
+

@@ -1,0 +1,56 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) - auto-updated; edit in the module.
+pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
+pub const CLOCK_KHZ: u32 = {KHZ};
+
+// The wired pins, straight from the MCU Configurator's pin map. They live in
+// this block because re-wiring the peripheral has to update them; the `use` is
+// here too, so the aliases hold whatever you do to the `use` block below.
+use stm32f1xx_hal::{gpio as hal_gpio, spi as hal_spi};
+
+/// The pins SPI{N} is wired to, in HAL order: (SCK, MISO, MOSI). A signal you
+/// left unwired is the HAL's `No...` placeholder.
+#[allow(dead_code)]
+pub type SpiPins = ({PINS});
+
+/// Whether those are the peripheral's default pins or its remapped set.
+#[allow(dead_code)]
+pub type SpiRemap = {REMAP};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+// DMA transport (chosen in the Virtual Module): {DMA_WHICH}. The channels are
+// NOT a choice on this chip: stm32f1xx-hal fixes SPI{N} to {RXCH} for RX and
+// {TXCH} for TX.
+use stm32f1xx_hal::{
+    afio,
+    dma::dma1,
+    pac,
+    prelude::*,
+    rcc::Clocks,
+    spi::{Mode, Phase, Polarity, Spi},
+};
+
+fn get_mode() -> Mode {
+    match SPI_MODE {
+        1 => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnSecondTransition },
+        2 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnFirstTransition },
+        3 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnSecondTransition },
+        _ => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnFirstTransition },
+    }
+}
+
+/// The DMA handle [`init`] hands back - its TYPE says which halves are on DMA.
+pub type Handle = {HANDLE_TY};
+
+pub fn init(
+    spi: pac::SPI{N},
+    pins: SpiPins,
+    {AFIO_PARAM}: &mut afio::Parts,
+    clocks: &Clocks,{RXCH_PARAM}{TXCH_PARAM}
+) -> Handle {
+    Spi::spi{N}(spi, pins, {AFIO_ARG}get_mode(), CLOCK_KHZ.kHz(), *clocks)
+        .{WITH}
+}
+
+{SPI_EXAMPLE}

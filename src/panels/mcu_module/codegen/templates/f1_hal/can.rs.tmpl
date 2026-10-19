@@ -1,0 +1,71 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+// Kept for the reader (and rewritten when you change the bit rate in the
+// module): `init` programs BTR, which is what the hardware actually takes.
+#[allow(dead_code)]
+pub const BITRATE: u32 = {BITRATE}; // bits/s
+// CAN_BTR register value, computed from BITRATE and the APB1 clock ({PCLK1} Hz).
+pub const BTR: u32 = {BTR};
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+// CAN on STM32F1 needs the `bxcan` + `nb` crates (auto-added to Cargo.toml when a
+// CAN module is present). Verify the bit timing / filters for your bus.
+use stm32f1xx_hal::{
+    pac,
+    afio,
+    can::Can,
+};
+
+/// The concrete type [`init`] hands back.
+///
+/// CAN already returned a named type; the alias exists so every config module
+/// spells its handle the same way, which is what the RTIC generator looks for.
+pub type Handle = bxcan::Can<Can<pac::CAN1>>;
+
+/// `usb` is not a typo: bxCAN and USB share the same 512 bytes of SRAM on this
+/// family, so `Can::new` takes the USB peripheral to prove nothing else holds
+/// it. The two cannot be used together, and on these pads (PA11/PA12) they
+/// cannot even be wired together.
+pub fn init<PINS>(
+    can: pac::CAN1,
+    usb: pac::USB,
+    pins: PINS,
+    afio: &mut afio::Parts,
+) -> Handle
+where
+    PINS: stm32f1xx_hal::can::Pins<Instance = pac::CAN1>,
+{
+    let hal_can = Can::new(can, usb);
+    hal_can.assign_pins(pins, &mut afio.mapr);
+
+    let mut bx = bxcan::Can::builder(hal_can)
+        .set_bit_timing(BTR)
+        .leave_disabled();
+
+    // Accept every frame by default — tighten the filter for your application.
+    // The FIFO here is the one `receive()` reads below.
+    bx.modify_filters()
+        .enable_bank(0, bxcan::Fifo::Fifo0, bxcan::filter::Mask32::accept_all());
+
+    nb::block!(bx.enable_non_blocking()).ok();
+    bx
+}
+
+// ── Using CAN1 ──
+// In main.rs, after the init above:
+//
+//     use bxcan::{Frame, StandardId};
+//
+//     // Send
+//     let id = StandardId::new(0x123).unwrap();
+//     let frame = Frame::new_data(id, [1u8, 2, 3, 4]);
+//     nb::block!({HANDLE}.transmit(&frame)).ok();
+//
+//     // Receive (nb: Err(WouldBlock) while the mailboxes are empty)
+//     if let Ok(rx) = {HANDLE}.receive() {
+//         if let Some(data) = rx.data() {
+//             let _payload = &data[..]; // the frame's bytes
+//         }
+//     }
+

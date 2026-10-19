@@ -1,0 +1,46 @@
+// <<< GENERATED>>>
+// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
+const TIMEOUT_US: u64 = {TIMEOUT};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// embassy_rp::init() starts the 1 us tick the watchdog counts, from the
+// crystal, so its period does not move with the Clock tab.
+//
+// embassy-rp's `feed()` - which `start()` calls - PANICS above {MAX} us on
+// this chip. This turns that boot panic into a build error:
+const _: () = assert!(
+    TIMEOUT_US >= 1 && TIMEOUT_US <= {MAX},
+    "watchdog period out of range: embassy-rp panics above {MAX} us"
+);
+
+use embassy_rp::Peri;
+use embassy_rp::peripherals::WATCHDOG;
+use embassy_rp::watchdog::Watchdog;
+use embassy_time::Duration;
+
+/// Handle type, so it can be stored in a struct or a task's state.
+pub type Handle = Watchdog;
+
+/// The period `start` AND every `feed` take: embassy-rp's `feed` reloads the
+/// counter with the duration it is given, not with the one `start` set.
+pub const PERIOD: Duration = Duration::from_micros(TIMEOUT_US);
+
+/// Configure the watchdog. It is NOT running yet - call
+/// `watchdog.start(pins::configs::watchdog::PERIOD)` when your start-up is far
+/// enough along to keep feeding it.
+pub fn init(watchdog: Peri<'static, WATCHDOG>) -> Handle {
+    let mut wdt = Watchdog::new(watchdog);
+    // Hold the count while a debugger halts the core, so a breakpoint does
+    // not become a reset.
+    wdt.pause_on_debug(true);
+    wdt
+}
+
+// -- Using the watchdog --
+//
+//     watchdog.start(pins::configs::watchdog::PERIOD);    // from here on it resets the chip
+//     loop {
+//         watchdog.feed(pins::configs::watchdog::PERIOD); // at least once every TIMEOUT_US
+//     }

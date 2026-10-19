@@ -10,6 +10,7 @@ use super::super::modules::{
 use super::super::pins::logic::pin::{GpioMode, Pin};
 use super::super::pins::logic::pin_function::PinFunction;
 use super::common::AUTOGEN_BANNER;
+use super::tmpl;
 use super::common::duty_percent_str;
 use super::common::{refit_header, retarget_pristine_tail, section_is_rtic, tail_leaving_rtic};
 use super::{GEN_BEGIN, GEN_END, USER_TAIL, mcu_id_marker_line, pin_binding, sanitize_label};
@@ -1416,61 +1417,7 @@ fn i2c_pin_tys(n: u8, all_pins: &[&Pin]) -> String {
 /// `DelayNs`), so driver/app code stays portable across HALs. Real-compile
 /// verified on thumbv7m. The leading GENERATED marker block is required by
 /// `sync_config_files` (there is no per-chip config here — it stays a comment).
-const GPIO_IO_FILE: &str = r#"// <<< GENERATED>>>
-// Portable GPIO/Delay bridges — no per-chip config; this marker just frames the
-// regenerated region. Edit the bridges below freely.
-// <<< GENERATED END >>>
-
-// Everything below is editable — your changes are preserved on regeneration.
-//
-// Wrap a HAL pin/delay to make it a STANDARD `embedded-hal` 1.0 value, so your
-// driver/app code is portable across chips/HALs:
-//
-//     fn app<P: embedded_hal::digital::OutputPin>(led: &mut P) { /* … */ }
-#[derive(Debug)]
-pub struct IoError;
-impl embedded_hal::digital::Error for IoError {
-    fn kind(&self) -> embedded_hal::digital::ErrorKind {
-        embedded_hal::digital::ErrorKind::Other
-    }
-}
-
-/// A HAL output pin (embedded-hal 0.2) as an `embedded-hal` 1.0 pin.
-pub struct DigitalOut<P>(pub P);
-impl<P> embedded_hal::digital::ErrorType for DigitalOut<P> {
-    type Error = IoError;
-}
-impl<P: embedded_hal_0_2::digital::v2::OutputPin> embedded_hal::digital::OutputPin for DigitalOut<P> {
-    fn set_low(&mut self) -> Result<(), Self::Error> { self.0.set_low().map_err(|_| IoError) }
-    fn set_high(&mut self) -> Result<(), Self::Error> { self.0.set_high().map_err(|_| IoError) }
-}
-impl<P> embedded_hal::digital::StatefulOutputPin for DigitalOut<P>
-where
-    P: embedded_hal_0_2::digital::v2::OutputPin + embedded_hal_0_2::digital::v2::StatefulOutputPin,
-{
-    fn is_set_high(&mut self) -> Result<bool, Self::Error> { self.0.is_set_high().map_err(|_| IoError) }
-    fn is_set_low(&mut self) -> Result<bool, Self::Error> { self.0.is_set_low().map_err(|_| IoError) }
-}
-
-/// A HAL input pin (embedded-hal 0.2) as an `embedded-hal` 1.0 pin.
-pub struct DigitalIn<P>(pub P);
-impl<P> embedded_hal::digital::ErrorType for DigitalIn<P> {
-    type Error = IoError;
-}
-impl<P: embedded_hal_0_2::digital::v2::InputPin> embedded_hal::digital::InputPin for DigitalIn<P> {
-    fn is_high(&mut self) -> Result<bool, Self::Error> { self.0.is_high().map_err(|_| IoError) }
-    fn is_low(&mut self) -> Result<bool, Self::Error> { self.0.is_low().map_err(|_| IoError) }
-}
-
-/// A HAL blocking delay (embedded-hal 0.2) as an `embedded-hal` 1.0 `DelayNs`.
-/// Build one from the SysTick: `let mut d = pins::configs::io::Delay(cp.SYST.delay(&clocks));`
-#[allow(dead_code)]
-pub struct Delay<D>(pub D);
-impl<D: embedded_hal_0_2::blocking::delay::DelayUs<u32>> embedded_hal::delay::DelayNs for Delay<D> {
-    fn delay_ns(&mut self, ns: u32) { self.0.delay_us(ns.div_ceil(1000)); }
-    fn delay_us(&mut self, us: u32) { self.0.delay_us(us); }
-}
-"#;
+const GPIO_IO_FILE: &str = include_str!("templates/f1_hal/io.rs.tmpl");
 
 /// APB1 (PCLK1) frequency in Hz from the clock config — needed for the CAN bit
 /// timing. Mirrors [`clock_setup_chain`]'s graph→typed→frequencies path.
@@ -1512,78 +1459,7 @@ fn can_btr(bitrate: u32, pclk1: u32) -> u32 {
     0
 }
 
-const CAN_TMPL: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
-// Kept for the reader (and rewritten when you change the bit rate in the
-// module): `init` programs BTR, which is what the hardware actually takes.
-#[allow(dead_code)]
-pub const BITRATE: u32 = {BITRATE}; // bits/s
-// CAN_BTR register value, computed from BITRATE and the APB1 clock ({PCLK1} Hz).
-pub const BTR: u32 = {BTR};
-// <<< GENERATED END >>>
-
-// Everything below is editable — your changes are preserved on regeneration.
-// CAN on STM32F1 needs the `bxcan` + `nb` crates (auto-added to Cargo.toml when a
-// CAN module is present). Verify the bit timing / filters for your bus.
-use stm32f1xx_hal::{
-    pac,
-    afio,
-    can::Can,
-};
-
-/// The concrete type [`init`] hands back.
-///
-/// CAN already returned a named type; the alias exists so every config module
-/// spells its handle the same way, which is what the RTIC generator looks for.
-pub type Handle = bxcan::Can<Can<pac::CAN1>>;
-
-/// `usb` is not a typo: bxCAN and USB share the same 512 bytes of SRAM on this
-/// family, so `Can::new` takes the USB peripheral to prove nothing else holds
-/// it. The two cannot be used together, and on these pads (PA11/PA12) they
-/// cannot even be wired together.
-pub fn init<PINS>(
-    can: pac::CAN1,
-    usb: pac::USB,
-    pins: PINS,
-    afio: &mut afio::Parts,
-) -> Handle
-where
-    PINS: stm32f1xx_hal::can::Pins<Instance = pac::CAN1>,
-{
-    let hal_can = Can::new(can, usb);
-    hal_can.assign_pins(pins, &mut afio.mapr);
-
-    let mut bx = bxcan::Can::builder(hal_can)
-        .set_bit_timing(BTR)
-        .leave_disabled();
-
-    // Accept every frame by default — tighten the filter for your application.
-    // The FIFO here is the one `receive()` reads below.
-    bx.modify_filters()
-        .enable_bank(0, bxcan::Fifo::Fifo0, bxcan::filter::Mask32::accept_all());
-
-    nb::block!(bx.enable_non_blocking()).ok();
-    bx
-}
-
-// ── Using CAN1 ──
-// In main.rs, after the init above:
-//
-//     use bxcan::{Frame, StandardId};
-//
-//     // Send
-//     let id = StandardId::new(0x123).unwrap();
-//     let frame = Frame::new_data(id, [1u8, 2, 3, 4]);
-//     nb::block!({HANDLE}.transmit(&frame)).ok();
-//
-//     // Receive (nb: Err(WouldBlock) while the mailboxes are empty)
-//     if let Ok(rx) = {HANDLE}.receive() {
-//         if let Some(data) = rx.data() {
-//             let _payload = &data[..]; // the frame's bytes
-//         }
-//     }
-
-"#;
+const CAN_TMPL: &str = include_str!("templates/f1_hal/can.rs.tmpl");
 
 fn can_config_file(cfg: Option<&CanModuleConfig>, pclk1: u32) -> String {
     let bitrate = cfg.map(|c| c.bitrate).unwrap_or(500_000);
@@ -1591,144 +1467,18 @@ fn can_config_file(cfg: Option<&CanModuleConfig>, pclk1: u32) -> String {
     let sfx = cfg
         .map(|c| module_label_sfx(&c.custom_label))
         .unwrap_or_default();
-    CAN_TMPL
-        .replace("{HANDLE}", &format!("_can{sfx}"))
-        .replace("{BITRATE}", &bitrate.to_string())
-        .replace("{PCLK1}", &pclk1.to_string())
-        .replace("{BTR}", &format!("0x{btr:08X}"))
+    tmpl::render(
+        CAN_TMPL,
+        &[
+            ("{HANDLE}", &format!("_can{sfx}")),
+            ("{BITRATE}", &bitrate.to_string()),
+            ("{PCLK1}", &pclk1.to_string()),
+            ("{BTR}", &format!("0x{btr:08X}")),
+        ],
+    )
 }
 
-const USART_TMPL: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
-pub const BAUDRATE: u32 = {BAUD};
-pub const DATA_BITS: u8 = {DATA}; // 8, 9
-pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
-pub const STOP_BITS: u8 = {STOP}; // 1, 2
-// <<< GENERATED END >>>
-
-// Everything below is editable — your changes are preserved on regeneration.
-//
-// `init` returns a value implementing the STANDARD `embedded-io` traits
-// (`Read` + `Write`), so your application code stays portable across chips/HALs:
-//
-//     fn app<S: embedded_io::Read + embedded_io::Write>(serial: &mut S) { /* … */ }
-//
-// stm32f1xx-hal 0.10 still speaks embedded-hal 0.2 (`nb`), so `SerialIo` below
-// bridges its split `Tx`/`Rx` to `embedded-io`.
-use stm32f1xx_hal::{
-    pac,
-    prelude::*,       // brings the embedded-hal 0.2 `nb` serial methods into scope
-    afio,
-    rcc::Clocks,
-    serial::{self, Config, Serial, StopBits},
-};
-
-fn get_config() -> serial::Config {
-    let mut config = Config::default().baudrate(BAUDRATE.bps());
-
-    if DATA_BITS == 8 {
-        config = config.wordlength_8bits();
-    } else if DATA_BITS == 9 {
-        config = config.wordlength_9bits();
-    }
-
-    if PARITY == 'N' {
-        config = config.parity_none();
-    } else if PARITY == 'O' {
-        config = config.parity_odd();
-    } else if PARITY == 'E' {
-        config = config.parity_even();
-    }
-
-    if STOP_BITS == 1 {
-        config = config.stopbits(StopBits::STOP1);
-    } else if STOP_BITS == 2 {
-        config = config.stopbits(StopBits::STOP2);
-    }
-
-    config
-}
-
-/// Bridges the HAL's `nb` serial (embedded-hal 0.2) to blocking `embedded-io`.
-pub struct SerialIo<TX, RX>(pub TX, pub RX);
-
-#[derive(Debug)]
-pub struct IoError;
-// embedded-io 0.7 requires `Error: core::error::Error`, which in turn wants
-// Display. Two tiny impls, and the bridge works on 0.6 and 0.7 alike.
-impl core::fmt::Display for IoError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("serial I/O error")
-    }
-}
-impl core::error::Error for IoError {}
-impl embedded_io::Error for IoError {
-    fn kind(&self) -> embedded_io::ErrorKind {
-        embedded_io::ErrorKind::Other
-    }
-}
-impl<TX, RX> embedded_io::ErrorType for SerialIo<TX, RX> {
-    type Error = IoError;
-}
-impl<TX: embedded_hal_0_2::serial::Write<u8>, RX> embedded_io::Write for SerialIo<TX, RX> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        for &b in buf {
-            nb::block!(self.0.write(b)).map_err(|_| IoError)?;
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        nb::block!(self.0.flush()).map_err(|_| IoError)
-    }
-}
-impl<TX, RX: embedded_hal_0_2::serial::Read<u8>> embedded_io::Read for SerialIo<TX, RX> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // `embedded-io::Read` blocks until at least one byte is available.
-        buf[0] = nb::block!(self.1.read()).map_err(|_| IoError)?;
-        Ok(1)
-    }
-}
-
-/// The concrete type [`init`] hands back.
-///
-/// A NAMED type, not `impl Trait`: a struct field has to name its type, and on
-/// the RTIC runtime this handle becomes a `Local` resource. Returning `impl
-/// Trait` made the peripheral unusable there — `#[init]` returned and dropped
-/// it. Still `embedded-io` Read + Write for every caller.
-pub type Handle = SerialIo<serial::Tx<pac::USART{N}>, serial::Rx<pac::USART{N}>>;
-
-/// Initialise USART{N} and expose it as an `embedded-io` Read + Write value.
-pub fn init(
-    usart: pac::USART{N},
-    pins: impl serial::Pins<pac::USART{N}>,
-    afio: &mut afio::Parts,
-    clocks: &Clocks,
-) -> Handle {
-    let (tx, rx) = Serial::new(usart, pins, &mut afio.mapr, get_config(), clocks).split();
-    SerialIo(tx, rx)
-}
-
-// ── Using USART{N} ──
-// Portable init — the handle is an `embedded-io` Read + Write, so this code
-// works unchanged on any HAL. In main.rs, after the init above:
-//
-//     use embedded_io::{Read, Write};
-//
-//     // Send
-//     {HANDLE}.write_all(b"hello\r\n").ok();
-//     {HANDLE}.flush().ok();
-//
-//     // Receive exactly N bytes (blocks until they arrive)
-//     let mut buf = [0u8; 4];
-//     {HANDLE}.read_exact(&mut buf).ok();
-//
-//     // Or take whatever is available right now
-//     let n = {HANDLE}.read(&mut buf).unwrap_or(0);
-
-"#;
+const USART_TMPL: &str = include_str!("templates/f1_hal/usart.rs.tmpl");
 
 fn usart_config_file(n: u8, cfg: Option<&UsartModuleConfig>) -> String {
     let baud = cfg.map(|c| c.baud_rate).unwrap_or(115_200);
@@ -1749,7 +1499,7 @@ fn usart_config_file(n: u8, cfg: Option<&UsartModuleConfig>) -> String {
         .map(|c| c.blocking_dma)
         .filter(|_| channels.is_some())
         .unwrap_or_default();
-    let tmpl = if dma.any() {
+    let template = if dma.any() {
         USART_TMPL_DMA
     } else {
         match cfg.map(|c| c.api_style).unwrap_or_default() {
@@ -1765,30 +1515,29 @@ fn usart_config_file(n: u8, cfg: Option<&UsartModuleConfig>) -> String {
         .unwrap_or_default();
     let tx = format!("_tx{n}{sfx}");
     let rx = format!("_rx{n}{sfx}");
-    tmpl.replace("{DMA_WHICH}", dma_which(dma))
-        .replace("{TX_TY}", &usart_half_ty(n, "Tx", dma.tx()))
-        .replace("{RX_TY}", &usart_half_ty(n, "Rx", dma.rx()))
-        .replace("{TXCH_PARAM}", &channel_param("tx_ch", txch, dma.tx()))
-        .replace("{RXCH_PARAM}", &channel_param("rx_ch", rxch, dma.rx()))
-        .replace(
-            "{TX_EXPR}",
-            if dma.tx() { "tx.with_dma(tx_ch)" } else { "tx" },
-        )
-        .replace(
-            "{RX_EXPR}",
-            if dma.rx() { "rx.with_dma(rx_ch)" } else { "rx" },
-        )
-        .replace("{USART_EXAMPLE}", &usart_example(n, dma, &tx, &rx))
-        .replace("{HANDLE}", &format!("_serial{n}{sfx}"))
-        .replace("{TXCH}", txch)
-        .replace("{RXCH}", rxch)
-        .replace("{TX}", &format!("_tx{n}{sfx}"))
-        .replace("{RX}", &format!("_rx{n}{sfx}"))
-        .replace("{N}", &n.to_string())
-        .replace("{BAUD}", &baud.to_string())
-        .replace("{DATA}", &data.to_string())
-        .replace("{PARITY}", &parity.to_string())
-        .replace("{STOP}", &stop.to_string())
+    tmpl::render(
+        template,
+        &[
+            ("{DMA_WHICH}", dma_which(dma)),
+            ("{TX_TY}", &usart_half_ty(n, "Tx", dma.tx())),
+            ("{RX_TY}", &usart_half_ty(n, "Rx", dma.rx())),
+            ("{TXCH_PARAM}", &channel_param("tx_ch", txch, dma.tx())),
+            ("{RXCH_PARAM}", &channel_param("rx_ch", rxch, dma.rx())),
+            ("{TX_EXPR}", if dma.tx() { "tx.with_dma(tx_ch)" } else { "tx" }),
+            ("{RX_EXPR}", if dma.rx() { "rx.with_dma(rx_ch)" } else { "rx" }),
+            ("{USART_EXAMPLE}", &usart_example(n, dma, &tx, &rx)),
+            ("{HANDLE}", &format!("_serial{n}{sfx}")),
+            ("{TXCH}", txch),
+            ("{RXCH}", rxch),
+            ("{TX}", &format!("_tx{n}{sfx}")),
+            ("{RX}", &format!("_rx{n}{sfx}")),
+            ("{N}", &n.to_string()),
+            ("{BAUD}", &baud.to_string()),
+            ("{DATA}", &data.to_string()),
+            ("{PARITY}", &parity.to_string()),
+            ("{STOP}", &stop.to_string()),
+        ],
+    )
 }
 
 /// One line of prose naming which halves are on DMA, for the file's header.
@@ -2109,350 +1858,18 @@ fn spi_dma_channels(n: u8) -> Option<(&'static str, &'static str)> {
 /// are `TxDma`/`RxDma`, whose transfer methods CONSUME the handle and hand it
 /// back from `wait()`. That is a different shape from both `embedded-io` and
 /// the `nb` halves, so it gets its own file and its own worked example.
-const USART_TMPL_DMA: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) - auto-updated; edit in the module.
-pub const BAUDRATE: u32 = {BAUD};
-pub const DATA_BITS: u8 = {DATA}; // 8, 9
-pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
-pub const STOP_BITS: u8 = {STOP}; // 1, 2
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-// DMA transport (chosen in the Virtual Module): {DMA_WHICH}. A half on DMA
-// moves bytes without the CPU polling for each one; a half left off is the
-// ordinary `nb` handle, which is often the better trade for short bursts - and
-// it leaves that channel free for another peripheral.
-//
-// The channels are NOT a choice on this chip: stm32f1xx-hal puts them in the
-// type, fixing USART{N} to {TXCH} for TX and {RXCH} for RX.
-use stm32f1xx_hal::{
-    afio,
-    dma::dma1,
-    pac,
-    prelude::*,
-    rcc::Clocks,
-    serial::{self, Config, Serial, StopBits},
-};
-
-/// The handles [`init`] hands back. Named so they can be struct fields.
-pub type TxHandle = {TX_TY};
-pub type RxHandle = {RX_TY};
-
-fn get_config() -> serial::Config {
-    let mut config = Config::default().baudrate(BAUDRATE.bps());
-    if DATA_BITS == 8 {
-        config = config.wordlength_8bits();
-    } else if DATA_BITS == 9 {
-        config = config.wordlength_9bits();
-    }
-    if PARITY == 'N' {
-        config = config.parity_none();
-    } else if PARITY == 'O' {
-        config = config.parity_odd();
-    } else if PARITY == 'E' {
-        config = config.parity_even();
-    }
-    if STOP_BITS == 1 {
-        config = config.stopbits(StopBits::STOP1);
-    } else if STOP_BITS == 2 {
-        config = config.stopbits(StopBits::STOP2);
-    }
-    config
-}
-
-pub fn init<PINS: serial::Pins<pac::USART{N}>>(
-    usart: pac::USART{N},
-    pins: PINS,
-    afio: &mut afio::Parts,
-    clocks: &Clocks,{TXCH_PARAM}{RXCH_PARAM}
-) -> (TxHandle, RxHandle) {
-    let (tx, rx) = Serial::new(usart, pins, &mut afio.mapr, get_config(), clocks).split();
-    ({TX_EXPR}, {RX_EXPR})
-}
-
-{USART_EXAMPLE}
-"#;
+const USART_TMPL_DMA: &str = include_str!("templates/f1_hal/usart_dma.rs.tmpl");
 
 /// Blocking `stm32f1xx-hal` SPI on DMA. Returns the combined RX+TX handle.
-const SPI_TMPL_DMA: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) - auto-updated; edit in the module.
-pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
-pub const CLOCK_KHZ: u32 = {KHZ};
-
-// The wired pins, straight from the MCU Configurator's pin map. They live in
-// this block because re-wiring the peripheral has to update them; the `use` is
-// here too, so the aliases hold whatever you do to the `use` block below.
-use stm32f1xx_hal::{gpio as hal_gpio, spi as hal_spi};
-
-/// The pins SPI{N} is wired to, in HAL order: (SCK, MISO, MOSI). A signal you
-/// left unwired is the HAL's `No...` placeholder.
-#[allow(dead_code)]
-pub type SpiPins = ({PINS});
-
-/// Whether those are the peripheral's default pins or its remapped set.
-#[allow(dead_code)]
-pub type SpiRemap = {REMAP};
-// <<< GENERATED END >>>
-
-// Everything below is editable - your changes are preserved on regeneration.
-// DMA transport (chosen in the Virtual Module): {DMA_WHICH}. The channels are
-// NOT a choice on this chip: stm32f1xx-hal fixes SPI{N} to {RXCH} for RX and
-// {TXCH} for TX.
-use stm32f1xx_hal::{
-    afio,
-    dma::dma1,
-    pac,
-    prelude::*,
-    rcc::Clocks,
-    spi::{Mode, Phase, Polarity, Spi},
-};
-
-fn get_mode() -> Mode {
-    match SPI_MODE {
-        1 => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnSecondTransition },
-        2 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnFirstTransition },
-        3 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnSecondTransition },
-        _ => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnFirstTransition },
-    }
-}
-
-/// The DMA handle [`init`] hands back - its TYPE says which halves are on DMA.
-pub type Handle = {HANDLE_TY};
-
-pub fn init(
-    spi: pac::SPI{N},
-    pins: SpiPins,
-    {AFIO_PARAM}: &mut afio::Parts,
-    clocks: &Clocks,{RXCH_PARAM}{TXCH_PARAM}
-) -> Handle {
-    Spi::spi{N}(spi, pins, {AFIO_ARG}get_mode(), CLOCK_KHZ.kHz(), *clocks)
-        .{WITH}
-}
-
-{SPI_EXAMPLE}
-"#;
+const SPI_TMPL_DMA: &str = include_str!("templates/f1_hal/spi_dma.rs.tmpl");
 
 /// Native `stm32f1xx-hal` USART init (no embedded-io bridge). Returns the split
 /// `(Tx, Rx)` halves — the idiomatic stm32f1xx-hal handles (TX for `writeln!`, RX
 /// for reading). Selected via `ApiStyle`; the `main.rs` binding destructures the
 /// tuple (`let (mut _txN, mut _rxN) = …`), unlike the single-value Portable form.
-const USART_TMPL_NATIVE: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
-pub const BAUDRATE: u32 = {BAUD};
-pub const DATA_BITS: u8 = {DATA}; // 8, 9
-pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
-pub const STOP_BITS: u8 = {STOP}; // 1, 2
-// <<< GENERATED END >>>
+const USART_TMPL_NATIVE: &str = include_str!("templates/f1_hal/usart_native.rs.tmpl");
 
-// Everything below is editable — your changes are preserved on regeneration.
-// NATIVE stm32f1xx-hal API (chosen in the Virtual Module). `init` returns the
-// split `(Tx, Rx)` handles — use `Tx` with `writeln!` / `Rx` with `.read()`.
-// Switch to the portable `embedded-io` API in the Virtual Module.
-use stm32f1xx_hal::{
-    pac,
-    prelude::*,
-    afio,
-    rcc::Clocks,
-    serial::{self, Config, Serial, StopBits},
-};
-
-fn get_config() -> serial::Config {
-    let mut config = Config::default().baudrate(BAUDRATE.bps());
-    if DATA_BITS == 8 {
-        config = config.wordlength_8bits();
-    } else if DATA_BITS == 9 {
-        config = config.wordlength_9bits();
-    }
-    if PARITY == 'N' {
-        config = config.parity_none();
-    } else if PARITY == 'O' {
-        config = config.parity_odd();
-    } else if PARITY == 'E' {
-        config = config.parity_even();
-    }
-    if STOP_BITS == 1 {
-        config = config.stopbits(StopBits::STOP1);
-    } else if STOP_BITS == 2 {
-        config = config.stopbits(StopBits::STOP2);
-    }
-    config
-}
-
-pub fn init<PINS: serial::Pins<pac::USART{N}>>(
-    usart: pac::USART{N},
-    pins: PINS,
-    afio: &mut afio::Parts,
-    clocks: &Clocks,
-) -> (serial::Tx<pac::USART{N}>, serial::Rx<pac::USART{N}>) {
-    Serial::new(usart, pins, &mut afio.mapr, get_config(), clocks).split()
-}
-
-// ── Using USART{N} ──
-// Native init — `init` returns the HAL's own split halves, which are `nb`
-// (non-blocking) based. In main.rs, after the init above:
-//
-//     use nb::block;
-//
-//     // Send one byte at a time
-//     for b in b"hello\r\n" {
-//         block!({TX}.write(*b)).ok();
-//     }
-//     block!({TX}.flush()).ok();
-//
-//     // Receive one byte, blocking until it arrives
-//     let byte = block!({RX}.read()).unwrap_or(0);
-//
-//     // Non-blocking poll: Err(nb::Error::WouldBlock) means "nothing yet"
-//     match {RX}.read() {
-//         Ok(b) => { /* got b */ }
-//         Err(nb::Error::WouldBlock) => { /* try again later */ }
-//         Err(_) => { /* framing / overrun error */ }
-//     }
-
-"#;
-
-const SPI_TMPL: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
-pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
-pub const CLOCK_KHZ: u32 = {KHZ};
-
-// The wired pins, straight from the MCU Configurator's pin map. They live in
-// this block because re-wiring the peripheral has to update them; the `use` is
-// here too, so the aliases hold whatever you do to the `use` block below.
-use stm32f1xx_hal::{gpio as hal_gpio, spi as hal_spi};
-
-/// The pins SPI{N} is wired to, in HAL order: (SCK, MISO, MOSI). A signal you
-/// left unwired is the HAL's `No…` placeholder.
-///
-/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
-#[allow(dead_code)]
-pub type SpiPins = ({PINS});
-
-/// Whether those are the peripheral's default pins or its remapped set — the
-/// HAL takes the remap register bit from this type.
-#[allow(dead_code)]
-pub type SpiRemap = {REMAP};
-// <<< GENERATED END >>>
-
-// Everything below is editable — your changes are preserved on regeneration.
-use stm32f1xx_hal::{
-    pac,
-    prelude::*,
-    afio,
-    rcc::Clocks,
-    spi::{Mode, Phase, Polarity, Spi},
-};
-
-fn get_mode() -> Mode {
-    match SPI_MODE {
-        1 => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnSecondTransition },
-        2 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnFirstTransition },
-        3 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnSecondTransition },
-        _ => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnFirstTransition },
-    }
-}
-
-/// Bridges the HAL's blocking/nb SPI (embedded-hal 0.2) to the STANDARD
-/// `embedded-hal` 1.0 `SpiBus`, so driver/app code stays portable across HALs:
-///
-///     fn app<S: embedded_hal::spi::SpiBus>(spi: &mut S) { /* … */ }
-pub struct SpiBusIo<SPI>(pub SPI);
-
-#[derive(Debug)]
-pub struct IoError;
-impl embedded_hal::spi::Error for IoError {
-    fn kind(&self) -> embedded_hal::spi::ErrorKind {
-        embedded_hal::spi::ErrorKind::Other
-    }
-}
-impl<SPI> embedded_hal::spi::ErrorType for SpiBusIo<SPI> {
-    type Error = IoError;
-}
-impl<SPI> embedded_hal::spi::SpiBus<u8> for SpiBusIo<SPI>
-where
-    SPI: embedded_hal_0_2::blocking::spi::Write<u8>
-        + embedded_hal_0_2::blocking::spi::Transfer<u8>
-        + embedded_hal_0_2::spi::FullDuplex<u8>,
-{
-    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-        embedded_hal_0_2::blocking::spi::Write::write(&mut self.0, words).map_err(|_| IoError)
-    }
-    fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-        for w in words.iter_mut() {
-            nb::block!(embedded_hal_0_2::spi::FullDuplex::send(&mut self.0, 0)).map_err(|_| IoError)?;
-            *w = nb::block!(embedded_hal_0_2::spi::FullDuplex::read(&mut self.0)).map_err(|_| IoError)?;
-        }
-        Ok(())
-    }
-    fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-        embedded_hal_0_2::blocking::spi::Transfer::transfer(&mut self.0, words)
-            .map(|_| ())
-            .map_err(|_| IoError)
-    }
-    fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
-        // Clock max(read, write) bytes; pad the write with 0, ignore reads past `read`.
-        for i in 0..read.len().max(write.len()) {
-            let b = write.get(i).copied().unwrap_or(0);
-            nb::block!(embedded_hal_0_2::spi::FullDuplex::send(&mut self.0, b)).map_err(|_| IoError)?;
-            let r = nb::block!(embedded_hal_0_2::spi::FullDuplex::read(&mut self.0)).map_err(|_| IoError)?;
-            if let Some(slot) = read.get_mut(i) {
-                *slot = r;
-            }
-        }
-        Ok(())
-    }
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-/// The concrete type [`init`] hands back.
-///
-/// A NAMED type, not `impl Trait`: a struct field — an RTIC `Local` resource,
-/// say — has to name what it holds, and an opaque type cannot be named. The pins
-/// stay inside the HAL's `Spi<…>`, so `SpiPins`/`SpiRemap` from the GENERATED
-/// block above are part of it; re-wiring SPI{N} updates this alias with them.
-/// It is still an `embedded-hal` 1.0 `SpiBus` for every caller.
-pub type Handle = SpiBusIo<Spi<pac::SPI{N}, SpiRemap, SpiPins, u8>>;
-
-/// Initialise SPI{N} and expose it as an `embedded-hal` 1.0 `SpiBus`.
-pub fn init(
-    spi: pac::SPI{N},
-    pins: SpiPins,
-    {AFIO_PARAM}: &mut afio::Parts,
-    clocks: &Clocks,
-) -> Handle {
-    let bus = Spi::spi{N}(spi, pins, {AFIO_ARG}get_mode(), CLOCK_KHZ.kHz(), *clocks);
-    SpiBusIo(bus)
-}
-
-// ── Using SPI{N} ──
-// Portable init — the handle is an `embedded-hal` 1.0 `SpiBus`. In main.rs,
-// after the init above:
-//
-// NOTE: main.rs binds this handle as `let {HANDLE} = …` — add `mut`
-// there before calling anything below (bus methods take `&mut self`).
-//
-//     use embedded_hal::spi::SpiBus;
-//
-//     // Write only
-//     {HANDLE}.write(&[0x9F]).ok();
-//
-//     // Read only (clocks out zeros)
-//     let mut rx = [0u8; 3];
-//     {HANDLE}.read(&mut rx).ok();
-//
-//     // Full duplex, separate buffers
-//     {HANDLE}.transfer(&mut rx, &[0x9F, 0x00, 0x00]).ok();
-//
-//     // Full duplex in place: `buf` is sent, then overwritten by the reply
-//     let mut buf = [0x9F, 0x00, 0x00];
-//     {HANDLE}.transfer_in_place(&mut buf).ok();
-//     {HANDLE}.flush().ok();
-//
-//     // NSS/CS is a plain GPIO here — drive it low around a transaction.
-
-"#;
+const SPI_TMPL: &str = include_str!("templates/f1_hal/spi.rs.tmpl");
 
 /// `has_miso` is what makes this a transmitter rather than a bus: with the pin
 /// unwired the HAL's `NoMiso` placeholder takes its slot in `SpiPins`, and the
@@ -2471,7 +1888,7 @@ fn spi_config_file(
         .filter(|_| channels.is_some())
         .map(|d| if has_miso { d } else { d.without_rx() })
         .unwrap_or_default();
-    let tmpl = if dma.any() {
+    let template = if dma.any() {
         SPI_TMPL_DMA
     } else {
         match cfg.map(|c| c.api_style).unwrap_or_default() {
@@ -2484,10 +1901,10 @@ fn spi_config_file(
     // `NoMiso` as a type-state placeholder, not as a narrower type), they just
     // return whatever the unconfigured pad happens to read. The DMA template
     // needs no such note — `without_rx` already left it with the send example.
-    let tmpl = if has_miso {
-        tmpl.to_owned()
+    let template = if has_miso {
+        template.to_owned()
     } else {
-        tmpl.replace(
+        template.replace(
             "// ── Using SPI{N} ──\n",
             "// ── Using SPI{N} ──\n\
              // MISO is not wired: this bus can only SEND. `read` / `transfer` still\n\
@@ -2501,25 +1918,27 @@ fn spi_config_file(
     let sfx = cfg
         .map(|c| module_label_sfx(&c.custom_label))
         .unwrap_or_default();
-    tmpl.replace("{HANDLE}", &format!("_spi{n}{sfx}"))
-        .replace("{N}", &n.to_string())
-        .replace("{MODE}", &mode.to_string())
-        .replace("{KHZ}", &khz.to_string())
-        .replace("{PINS}", pins)
-        .replace("{REMAP}", remap)
-        .replace("{AFIO_PARAM}", afio_param)
-        .replace("{AFIO_ARG}", afio_arg)
-        .replace("{RXCH}", rxch)
-        .replace("{TXCH}", txch)
-        .replace("{DMA_WHICH}", dma_which(dma))
-        .replace("{HANDLE_TY}", &spi_handle_ty(n, dma))
-        .replace("{RXCH_PARAM}", &channel_param("rx_ch", rxch, dma.rx()))
-        .replace("{TXCH_PARAM}", &channel_param("tx_ch", txch, dma.tx()))
-        .replace("{WITH}", spi_with(dma))
-        .replace(
-            "{SPI_EXAMPLE}",
-            &spi_example(n, dma, &format!("_spi{n}{sfx}")),
-        )
+    tmpl::render(
+        &template,
+        &[
+            ("{HANDLE}", &format!("_spi{n}{sfx}")),
+            ("{N}", &n.to_string()),
+            ("{MODE}", &mode.to_string()),
+            ("{KHZ}", &khz.to_string()),
+            ("{PINS}", pins),
+            ("{REMAP}", remap),
+            ("{AFIO_PARAM}", afio_param),
+            ("{AFIO_ARG}", afio_arg),
+            ("{RXCH}", rxch),
+            ("{TXCH}", txch),
+            ("{DMA_WHICH}", dma_which(dma)),
+            ("{HANDLE_TY}", &spi_handle_ty(n, dma)),
+            ("{RXCH_PARAM}", &channel_param("rx_ch", rxch, dma.rx())),
+            ("{TXCH_PARAM}", &channel_param("tx_ch", txch, dma.tx())),
+            ("{WITH}", spi_with(dma)),
+            ("{SPI_EXAMPLE}", &spi_example(n, dma, &format!("_spi{n}{sfx}"))),
+        ],
+    )
 }
 
 /// The channels wired on TIM`tim`, ascending. One place, because `gen_parts`
@@ -2642,109 +2061,29 @@ fn pwm_config_file(
     // `pwm_timers` only yields timers with a channel, so this fallback is for a
     // caller that does not exist yet — but indexing here would panic the IDE.
     let first = chans.first().map_or(1, |(c, _)| *c);
-    PWM_TMPL
-        .replace("{HANDLE}", &format!("_pwm{tim}{sfx}"))
-        .replace("{N}", &tim.to_string())
-        .replace("{HZ}", &hz.to_string())
-        .replace("{DUTIES}", duties.trim_end_matches('\n'))
-        .replace("{SETS}", &sets)
-        .replace("{PINS}", &pins_ty)
-        .replace("{CHS}", &ch_markers)
-        .replace("{REMAP}", remap)
-        .replace("{LIST}", &list)
-        .replace("{DUTY_DECLS}", &duty_decls)
-        .replace("{DUTY_IMPLS}", &duty_impls)
-        .replace("{CH1ST}", &format!("C{first}"))
-        .replace("{CH1N}", &first.to_string())
+    tmpl::render(
+        PWM_TMPL,
+        &[
+            ("{HANDLE}", &format!("_pwm{tim}{sfx}")),
+            ("{N}", &tim.to_string()),
+            ("{HZ}", &hz.to_string()),
+            ("{DUTIES}", duties.trim_end_matches('\n')),
+            ("{SETS}", &sets),
+            ("{PINS}", &pins_ty),
+            ("{CHS}", &ch_markers),
+            ("{REMAP}", remap),
+            ("{LIST}", &list),
+            ("{DUTY_DECLS}", &duty_decls),
+            ("{DUTY_IMPLS}", &duty_impls),
+            ("{CH1ST}", &format!("C{first}")),
+            ("{CH1N}", &first.to_string()),
+        ],
+    )
 }
 
 /// One `stm32f1xx-hal` timer in PWM mode. `pwm_hz` takes the pins BY VALUE and
 /// reads the pads off the remap type-state, so both live in the generated block.
-const PWM_TMPL: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
-pub const FREQUENCY_HZ: u32 = {HZ}; // one frequency for the whole timer
-// Duty per channel, in HUNDREDTHS of a percent — 750 is 7.5 %, which is what a
-// hobby servo wants and what whole percent cannot say.
-{DUTIES}
-
-// The wired pins, straight from the MCU Configurator's pin map. They live in
-// this block because re-wiring the timer has to update them; the `use` is here
-// too, so the aliases hold whatever you do to the `use` block below.
-use stm32f1xx_hal::gpio as hal_gpio;
-
-/// The pins TIM{N} drives, in `pwm_hz` order: {LIST}.
-///
-/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
-#[allow(dead_code)]
-pub type PwmPins = {PINS};
-
-/// Which pads the timer comes out on. NOT decoration: `pwm_hz` reads the remap
-/// REGISTER BIT from this type, so the wrong one drives the wrong pins.
-pub type PwmRemap = stm32f1xx_hal::timer::{REMAP};
-// <<< GENERATED END >>>
-
-// Everything below is editable — your changes are preserved on regeneration.
-use stm32f1xx_hal::{
-    afio, pac,
-    prelude::*,
-    rcc::Clocks,
-    timer::{Ch, Channel, PwmHz, Timer},
-};
-
-/// The concrete type [`init`] hands back. The HAL keeps the channel markers AND
-/// the pins inside it, so this alias moves with the wiring — which is what lets
-/// it be a struct field or an RTIC `Local`.
-pub type Handle = PwmHz<pac::TIM{N}, PwmRemap, {CHS}, PwmPins>;
-
-/// Initialise TIM{N} {LIST} at `FREQUENCY_HZ`, each channel at its own duty,
-/// and enable them.
-pub fn init(tim: pac::TIM{N}, pins: PwmPins, afio: &mut afio::Parts, clocks: &Clocks) -> Handle {
-    let mut pwm =
-        Timer::new(tim, clocks).pwm_hz::<PwmRemap, _, _>(pins, &mut afio.mapr, FREQUENCY_HZ.Hz());
-    let max = pwm.get_max_duty();
-{SETS}    pwm
-}
-
-/// Set a channel's duty in the same units the `DUTY_*` constants above use —
-/// HUNDREDTHS of a percent, so `10_000` is 100 % and `750` is 7.5 %.
-///
-/// A trait rather than an inherent method because `Handle` is an alias for the
-/// HAL's own `PwmHz`, which this crate does not own.
-///
-/// One method per WIRED channel ({LIST}). The channel is part of the NAME
-/// rather than an argument on purpose: `set_duty` PANICS on a channel this
-/// timer has no pin for — `PINS::check_used` says "Unused channel" — and a duty
-/// setter should not be able to reach a panic. `set_duty_tim_{N}` drives
-/// {CH1ST} — the lowest channel you wired.
-pub trait DutyHandle {
-    /// {CH1ST}, the lowest channel wired to TIM{N}.
-    fn set_duty_tim_{N}(&mut self, value: u32);
-{DUTY_DECLS}}
-
-impl DutyHandle for Handle {
-    fn set_duty_tim_{N}(&mut self, value: u32) {
-        self.set_duty_tim_{N}_ch{CH1N}(value);
-    }
-{DUTY_IMPLS}}
-
-// ── Using TIM{N} ──
-// The duty is already set and the channels are already running. To change one
-// from your loop:
-//
-//     use pins::configs::pwm{N}::DutyHandle;
-//     {HANDLE}.set_duty_tim_{N}(2_500); // 25 %
-//
-// or through the HAL directly, which is what the trait does — except that the
-// channel is then yours to get right: {LIST} are wired, and any other panics.
-//
-//     use stm32f1xx_hal::timer::Channel;
-//
-//     let max = {HANDLE}.get_max_duty();
-//     {HANDLE}.set_duty(Channel::{CH1ST}, max / 2); // 50 %
-//
-//     // …and to stop driving a pad without tearing the timer down:
-//     {HANDLE}.disable(Channel::{CH1ST});
-"#;
+const PWM_TMPL: &str = include_str!("templates/f1_hal/pwm.rs.tmpl");
 
 /// `({AFIO_PARAM}, {AFIO_ARG})` for a config template.
 ///
@@ -2762,226 +2101,13 @@ fn afio_subst(takes_mapr: bool) -> (&'static str, &'static str) {
 }
 
 /// Native `stm32f1xx-hal` SPI init (no eh-1.0 bridge). Returns `Spi<…>`.
-const SPI_TMPL_NATIVE: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
-pub const SPI_MODE: u8 = {MODE}; // 0..=3 (CPOL/CPHA)
-pub const CLOCK_KHZ: u32 = {KHZ};
+const SPI_TMPL_NATIVE: &str = include_str!("templates/f1_hal/spi_native.rs.tmpl");
 
-// The wired pins, straight from the MCU Configurator's pin map. They live in
-// this block because re-wiring the peripheral has to update them; the `use` is
-// here too, so the aliases hold whatever you do to the `use` block below.
-use stm32f1xx_hal::{gpio as hal_gpio, spi as hal_spi};
-
-/// The pins SPI{N} is wired to, in HAL order: (SCK, MISO, MOSI). A signal you
-/// left unwired is the HAL's `No…` placeholder.
-///
-/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
-#[allow(dead_code)]
-pub type SpiPins = ({PINS});
-
-/// Whether those are the peripheral's default pins or its remapped set — the
-/// HAL takes the remap register bit from this type.
-#[allow(dead_code)]
-pub type SpiRemap = {REMAP};
-// <<< GENERATED END >>>
-
-// Everything below is editable — your changes are preserved on regeneration.
-// NATIVE stm32f1xx-hal API — returns `Spi<…>`. Switch to the portable
-// `embedded-hal` 1.0 `SpiBus` API in the Virtual Module.
-use stm32f1xx_hal::{
-    pac,
-    prelude::*,
-    afio,
-    rcc::Clocks,
-    spi::{Mode, Phase, Polarity, Spi},
-};
-
-fn get_mode() -> Mode {
-    match SPI_MODE {
-        1 => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnSecondTransition },
-        2 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnFirstTransition },
-        3 => Mode { polarity: Polarity::IdleHigh, phase: Phase::CaptureOnSecondTransition },
-        _ => Mode { polarity: Polarity::IdleLow, phase: Phase::CaptureOnFirstTransition },
-    }
-}
-
-/// The concrete type [`init`] hands back — the HAL's own `Spi`, with the pins
-/// and the remap state it keeps in its type. Named so it can be a struct field
-/// (an RTIC `Local` resource, say); the two aliases come from the GENERATED
-/// block above, so re-wiring SPI{N} updates this one with them.
-pub type Handle = Spi<pac::SPI{N}, SpiRemap, SpiPins, u8>;
-
-pub fn init(
-    spi: pac::SPI{N},
-    pins: SpiPins,
-    {AFIO_PARAM}: &mut afio::Parts,
-    clocks: &Clocks,
-) -> Handle {
-    Spi::spi{N}(spi, pins, {AFIO_ARG}get_mode(), CLOCK_KHZ.kHz(), *clocks)
-}
-
-// ── Using SPI{N} ──
-// Native init — the concrete `stm32f1xx-hal` Spi, whose traits are
-// `embedded-hal` 0.2. In main.rs, after the init above:
-//
-// NOTE: the Native path needs the 0.2 traits, which the IDE only adds to
-// Cargo.toml for PORTABLE modules. Add them yourself:
-//   embedded-hal-0-2 = { package = "embedded-hal", version = "0.2.7", features = ["unproven"] }
-// — or switch this module's Init API to Portable, where the handle is an
-// embedded-hal 1.0 bus and no extra dependency is needed.
-//
-// NOTE: main.rs binds this handle as `let {HANDLE} = …` — add `mut`
-// there before calling anything below (bus methods take `&mut self`).
-//
-//     use embedded_hal_0_2::blocking::spi::{Transfer, Write};
-//
-//     // Write only
-//     {HANDLE}.write(&[0x9F]).ok();
-//
-//     // Full duplex in place: the buffer is sent, then holds the reply
-//     let mut buf = [0x9F, 0x00, 0x00];
-//     {HANDLE}.transfer(&mut buf).ok();
-//
-//     // NSS/CS is a plain GPIO here — drive it low around a transaction.
-
-"#;
-
-const I2C_TMPL: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
-pub const CLOCK_KHZ: u32 = {KHZ}; // <=100 Standard, >100 Fast
-{DEVICES}
-
-// The wired pins, straight from the MCU Configurator's pin map. They live in
-// this block because re-wiring the peripheral has to update them; the `use` is
-// here too, so the alias holds whatever you do to the `use` block below.
-use stm32f1xx_hal::gpio as hal_gpio;
-
-/// The pins I2C{N} is wired to, in HAL order: (SCL, SDA).
-///
-/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
-#[allow(dead_code)]
-pub type I2cPins = ({PINS});
-// <<< GENERATED END >>>
-
-// Everything below is editable — your changes are preserved on regeneration.
-use stm32f1xx_hal::{
-    pac,
-    prelude::*,
-    afio,
-    rcc::Clocks,
-    i2c::{self, BlockingI2c, Mode as I2cMode},
-};
-
-fn get_mode() -> I2cMode {
-    if CLOCK_KHZ <= 100 {
-        I2cMode::Standard { frequency: CLOCK_KHZ.kHz() }
-    } else {
-        I2cMode::Fast { frequency: CLOCK_KHZ.kHz(), duty_cycle: i2c::DutyCycle::Ratio2to1 }
-    }
-}
-
-/// Bridges the HAL's blocking I2C (embedded-hal 0.2) to the STANDARD
-/// `embedded-hal` 1.0 `I2c`, so driver/app code stays portable across HALs:
-///
-///     fn app<I: embedded_hal::i2c::I2c>(i2c: &mut I) { /* … */ }
-pub struct I2cIo<I2C>(pub I2C);
-
-#[derive(Debug)]
-pub struct IoError;
-impl embedded_hal::i2c::Error for IoError {
-    fn kind(&self) -> embedded_hal::i2c::ErrorKind {
-        embedded_hal::i2c::ErrorKind::Other
-    }
-}
-impl<I2C> embedded_hal::i2c::ErrorType for I2cIo<I2C> {
-    type Error = IoError;
-}
-impl<I2C> embedded_hal::i2c::I2c<embedded_hal::i2c::SevenBitAddress> for I2cIo<I2C>
-where
-    I2C: embedded_hal_0_2::blocking::i2c::Read
-        + embedded_hal_0_2::blocking::i2c::Write
-        + embedded_hal_0_2::blocking::i2c::WriteRead,
-{
-    fn transaction(
-        &mut self,
-        addr: u8,
-        ops: &mut [embedded_hal::i2c::Operation<'_>],
-    ) -> Result<(), Self::Error> {
-        use embedded_hal::i2c::Operation;
-        // Optimise the common `[Write, Read]` (register read) into one
-        // repeated-start `write_read`; single ops map directly. Other multi-op
-        // sequences fall back to per-op (each with its own START/STOP).
-        match ops {
-            [Operation::Write(w), Operation::Read(r)] => {
-                embedded_hal_0_2::blocking::i2c::WriteRead::write_read(&mut self.0, addr, w, r)
-                    .map_err(|_| IoError)
-            }
-            _ => {
-                for op in ops.iter_mut() {
-                    match op {
-                        Operation::Read(r) => {
-                            embedded_hal_0_2::blocking::i2c::Read::read(&mut self.0, addr, r)
-                                .map_err(|_| IoError)?
-                        }
-                        Operation::Write(w) => {
-                            embedded_hal_0_2::blocking::i2c::Write::write(&mut self.0, addr, w)
-                                .map_err(|_| IoError)?
-                        }
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-/// The concrete type [`init`] hands back.
-///
-/// A NAMED type, not `impl Trait`: a struct field — an RTIC `Local` resource,
-/// say — has to name what it holds, and an opaque type cannot be named. The pins
-/// stay inside the HAL's `BlockingI2c<…>`, so `I2cPins` from the GENERATED block
-/// above is part of it; re-wiring I2C{N} updates this alias with it. It is still
-/// an `embedded-hal` 1.0 `I2c` for every caller.
-pub type Handle = I2cIo<BlockingI2c<pac::I2C{N}, I2cPins>>;
-
-/// Initialise I2C{N} and expose it as an `embedded-hal` 1.0 `I2c`.
-pub fn init(
-    i2c: pac::I2C{N},
-    pins: I2cPins,
-    {AFIO_PARAM}: &mut afio::Parts,
-    clocks: &Clocks,
-) -> Handle {
-    let bus = BlockingI2c::i2c{N}(i2c, pins, {AFIO_ARG}get_mode(), *clocks, 1000, 10, 1000, 1000);
-    I2cIo(bus)
-}
-
-// ── Using I2C{N} ──
-// Portable init — the handle is an `embedded-hal` 1.0 `I2c`. In main.rs,
-// after the init above:
-//
-// NOTE: main.rs binds this handle as `let {HANDLE} = …` — add `mut`
-// there before calling anything below (bus methods take `&mut self`).
-//
-//     use embedded_hal::i2c::I2c;
-//     // The address is the device's own, in its file beside this one:
-//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
-//
-//     // Write to a register
-//     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();
-//
-//     // Read bytes
-//     let mut rx = [0u8; 2];
-//     {HANDLE}.read(DEVICE_ADDRESS, &mut rx).ok();
-//
-//     // Register read: write the address, then read WITHOUT releasing the bus
-//     // (repeated START) — what most sensors expect.
-//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).ok();
-
-"#;
+const I2C_TMPL: &str = include_str!("templates/f1_hal/i2c.rs.tmpl");
 
 fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>, pins: &str) -> String {
     let khz = cfg.map(|c| c.clock_hz).unwrap_or(100_000) / 1_000;
-    let tmpl = match cfg.map(|c| c.api_style).unwrap_or_default() {
+    let template = match cfg.map(|c| c.api_style).unwrap_or_default() {
         ApiStyle::Portable => I2C_TMPL,
         ApiStyle::Native => I2C_TMPL_NATIVE,
     };
@@ -2990,91 +2116,22 @@ fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>, pins: &str) -> String {
     let sfx = cfg
         .map(|c| module_label_sfx(&c.custom_label))
         .unwrap_or_default();
-    tmpl.replace("{HANDLE}", &format!("_i2c{n}{sfx}"))
-        .replace("{N}", &n.to_string())
-        .replace("{KHZ}", &khz.to_string())
-        .replace("{PINS}", pins)
-        .replace("{AFIO_PARAM}", afio_param)
-        .replace("{AFIO_ARG}", afio_arg)
-        .replace("{DEVICES}", &super::common::i2c_device_mods(cfg))
+    tmpl::render(
+        template,
+        &[
+            ("{HANDLE}", &format!("_i2c{n}{sfx}")),
+            ("{N}", &n.to_string()),
+            ("{KHZ}", &khz.to_string()),
+            ("{PINS}", pins),
+            ("{AFIO_PARAM}", afio_param),
+            ("{AFIO_ARG}", afio_arg),
+            ("{DEVICES}", &super::common::i2c_device_mods(cfg)),
+        ],
+    )
 }
 
 /// Native `stm32f1xx-hal` I2C init (no eh-1.0 bridge). Returns `BlockingI2c<…>`.
-const I2C_TMPL_NATIVE: &str = r#"// <<< GENERATED>>>
-// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
-pub const CLOCK_KHZ: u32 = {KHZ}; // <=100 Standard, >100 Fast
-{DEVICES}
-
-// The wired pins, straight from the MCU Configurator's pin map. They live in
-// this block because re-wiring the peripheral has to update them; the `use` is
-// here too, so the alias holds whatever you do to the `use` block below.
-use stm32f1xx_hal::gpio as hal_gpio;
-
-/// The pins I2C{N} is wired to, in HAL order: (SCL, SDA).
-///
-/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
-#[allow(dead_code)]
-pub type I2cPins = ({PINS});
-// <<< GENERATED END >>>
-
-// Everything below is editable — your changes are preserved on regeneration.
-// NATIVE stm32f1xx-hal API — returns `BlockingI2c<…>`. Switch to the portable
-// `embedded-hal` 1.0 `I2c` API in the Virtual Module.
-use stm32f1xx_hal::{
-    pac,
-    prelude::*,
-    afio,
-    rcc::Clocks,
-    i2c::{self, BlockingI2c, Mode as I2cMode},
-};
-
-fn get_mode() -> I2cMode {
-    if CLOCK_KHZ <= 100 {
-        I2cMode::Standard { frequency: CLOCK_KHZ.kHz() }
-    } else {
-        I2cMode::Fast { frequency: CLOCK_KHZ.kHz(), duty_cycle: i2c::DutyCycle::Ratio2to1 }
-    }
-}
-
-/// The concrete type [`init`] hands back — the HAL's own `BlockingI2c`, with the
-/// pins it keeps in its type. Named so it can be a struct field (an RTIC `Local`
-/// resource, say); `I2cPins` comes from the GENERATED block above, so re-wiring
-/// I2C{N} updates this one with it.
-pub type Handle = BlockingI2c<pac::I2C{N}, I2cPins>;
-
-pub fn init(
-    i2c: pac::I2C{N},
-    pins: I2cPins,
-    {AFIO_PARAM}: &mut afio::Parts,
-    clocks: &Clocks,
-) -> Handle {
-    BlockingI2c::i2c{N}(i2c, pins, {AFIO_ARG}get_mode(), *clocks, 1000, 10, 1000, 1000)
-}
-
-// ── Using I2C{N} ──
-// Native init — the concrete `stm32f1xx-hal` BlockingI2c, whose traits are
-// `embedded-hal` 0.2. In main.rs, after the init above:
-//
-// NOTE: the Native path needs the 0.2 traits, which the IDE only adds to
-// Cargo.toml for PORTABLE modules. Add them yourself:
-//   embedded-hal-0-2 = { package = "embedded-hal", version = "0.2.7", features = ["unproven"] }
-// — or switch this module's Init API to Portable, where the handle is an
-// embedded-hal 1.0 bus and no extra dependency is needed.
-//
-// NOTE: main.rs binds this handle as `let {HANDLE} = …` — add `mut`
-// there before calling anything below (bus methods take `&mut self`).
-//
-//     use embedded_hal_0_2::blocking::i2c::{Read, Write, WriteRead};
-//     // The address is the device's own, in its file beside this one:
-//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
-//
-//     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();
-//
-//     let mut rx = [0u8; 2];
-//     {HANDLE}.read(DEVICE_ADDRESS, &mut rx).ok();
-//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).ok();
-
-"#;
+const I2C_TMPL_NATIVE: &str = include_str!("templates/f1_hal/i2c_native.rs.tmpl");
 
 /// The section header older versions inserted before the appended helpers.
 const HELPERS_HEADER: &str = "── Peripheral init helpers";

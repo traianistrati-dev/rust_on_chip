@@ -1,0 +1,37 @@
+// <<< GENERATED>>>
+// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
+const TIMEOUT_US: u64 = {TIMEOUT};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// Timer group {N}'s watchdog. It counts on the APB clock, but the period above
+// still means what it says: `set_timeout` reads the live clock and works out
+// the prescaler itself, so changing the Clock tab does not stretch it.
+//
+// `esp_hal::init()` DISABLES this watchdog on the way in, so nothing is armed
+// until you call `enable()`. Note that `enable()` also REWRITES the stage
+// actions - stage 0 resets the system, stages 1..3 off - so call it BEFORE any
+// `set_stage_action` of your own, not after.
+use esp_hal::peripherals::TIMG{N};
+use esp_hal::time::Duration;
+use esp_hal::timer::timg::{MwdtStage, Wdt};
+
+/// Handle type, so it can be stored in a struct or a task's state.
+pub type Handle = Wdt<TIMG{N}<'static>>;
+
+/// Configure timer group {N}'s watchdog. It is NOT running yet - call
+/// `enable()` when your start-up is far enough along to keep feeding it.
+pub fn init() -> Handle {
+    let mut wdt = Wdt::new();
+    wdt.set_timeout(MwdtStage::Stage0, Duration::from_micros(TIMEOUT_US));
+    wdt
+}
+
+// -- Using MWDT{N} --
+//
+//     let mut wdt = pins::configs::mwdt{N}::init();
+//     wdt.enable();                  // from here on it will reset the chip
+//     loop {
+//         wdt.feed();                // at least once every TIMEOUT_US
+//     }

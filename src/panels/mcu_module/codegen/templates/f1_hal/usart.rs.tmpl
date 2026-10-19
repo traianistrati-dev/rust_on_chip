@@ -1,0 +1,130 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// `init` returns a value implementing the STANDARD `embedded-io` traits
+// (`Read` + `Write`), so your application code stays portable across chips/HALs:
+//
+//     fn app<S: embedded_io::Read + embedded_io::Write>(serial: &mut S) { /* … */ }
+//
+// stm32f1xx-hal 0.10 still speaks embedded-hal 0.2 (`nb`), so `SerialIo` below
+// bridges its split `Tx`/`Rx` to `embedded-io`.
+use stm32f1xx_hal::{
+    pac,
+    prelude::*,       // brings the embedded-hal 0.2 `nb` serial methods into scope
+    afio,
+    rcc::Clocks,
+    serial::{self, Config, Serial, StopBits},
+};
+
+fn get_config() -> serial::Config {
+    let mut config = Config::default().baudrate(BAUDRATE.bps());
+
+    if DATA_BITS == 8 {
+        config = config.wordlength_8bits();
+    } else if DATA_BITS == 9 {
+        config = config.wordlength_9bits();
+    }
+
+    if PARITY == 'N' {
+        config = config.parity_none();
+    } else if PARITY == 'O' {
+        config = config.parity_odd();
+    } else if PARITY == 'E' {
+        config = config.parity_even();
+    }
+
+    if STOP_BITS == 1 {
+        config = config.stopbits(StopBits::STOP1);
+    } else if STOP_BITS == 2 {
+        config = config.stopbits(StopBits::STOP2);
+    }
+
+    config
+}
+
+/// Bridges the HAL's `nb` serial (embedded-hal 0.2) to blocking `embedded-io`.
+pub struct SerialIo<TX, RX>(pub TX, pub RX);
+
+#[derive(Debug)]
+pub struct IoError;
+// embedded-io 0.7 requires `Error: core::error::Error`, which in turn wants
+// Display. Two tiny impls, and the bridge works on 0.6 and 0.7 alike.
+impl core::fmt::Display for IoError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("serial I/O error")
+    }
+}
+impl core::error::Error for IoError {}
+impl embedded_io::Error for IoError {
+    fn kind(&self) -> embedded_io::ErrorKind {
+        embedded_io::ErrorKind::Other
+    }
+}
+impl<TX, RX> embedded_io::ErrorType for SerialIo<TX, RX> {
+    type Error = IoError;
+}
+impl<TX: embedded_hal_0_2::serial::Write<u8>, RX> embedded_io::Write for SerialIo<TX, RX> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        for &b in buf {
+            nb::block!(self.0.write(b)).map_err(|_| IoError)?;
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        nb::block!(self.0.flush()).map_err(|_| IoError)
+    }
+}
+impl<TX, RX: embedded_hal_0_2::serial::Read<u8>> embedded_io::Read for SerialIo<TX, RX> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // `embedded-io::Read` blocks until at least one byte is available.
+        buf[0] = nb::block!(self.1.read()).map_err(|_| IoError)?;
+        Ok(1)
+    }
+}
+
+/// The concrete type [`init`] hands back.
+///
+/// A NAMED type, not `impl Trait`: a struct field has to name its type, and on
+/// the RTIC runtime this handle becomes a `Local` resource. Returning `impl
+/// Trait` made the peripheral unusable there — `#[init]` returned and dropped
+/// it. Still `embedded-io` Read + Write for every caller.
+pub type Handle = SerialIo<serial::Tx<pac::USART{N}>, serial::Rx<pac::USART{N}>>;
+
+/// Initialise USART{N} and expose it as an `embedded-io` Read + Write value.
+pub fn init(
+    usart: pac::USART{N},
+    pins: impl serial::Pins<pac::USART{N}>,
+    afio: &mut afio::Parts,
+    clocks: &Clocks,
+) -> Handle {
+    let (tx, rx) = Serial::new(usart, pins, &mut afio.mapr, get_config(), clocks).split();
+    SerialIo(tx, rx)
+}
+
+// ── Using USART{N} ──
+// Portable init — the handle is an `embedded-io` Read + Write, so this code
+// works unchanged on any HAL. In main.rs, after the init above:
+//
+//     use embedded_io::{Read, Write};
+//
+//     // Send
+//     {HANDLE}.write_all(b"hello\r\n").ok();
+//     {HANDLE}.flush().ok();
+//
+//     // Receive exactly N bytes (blocks until they arrive)
+//     let mut buf = [0u8; 4];
+//     {HANDLE}.read_exact(&mut buf).ok();
+//
+//     // Or take whatever is available right now
+//     let n = {HANDLE}.read(&mut buf).unwrap_or(0);
+

@@ -1,0 +1,38 @@
+//
+// embassy-nrf ADOPTS a running watchdog whose configuration matches this one
+// exactly - period, debug-halt and sleep behaviour, number of handles - and
+// pets it: reflashing an unchanged project simply carries on. Anything else,
+// a changed period for one, is `Err`. Do not pet that one - you did not
+// configure it: it resets the chip once, that reset clears it, and the next
+// boot starts this period.
+use embassy_nrf::Peri;
+use embassy_nrf::peripherals::WDT;
+use embassy_nrf::wdt::{Config, HaltConfig, Watchdog, WatchdogHandle};
+
+/// Configure AND start the watchdog - on embassy-nrf they are one call, so
+/// main.rs does not make it: call this when your start-up is far enough along
+/// to keep petting the handle it returns.
+///
+/// `Err` hands the peripheral back when a watchdog is already counting with a
+/// different configuration - see the note above.
+pub fn start(
+    wdt: Peri<'static, WDT>,
+) -> Result<(Watchdog, [WatchdogHandle; 1]), Peri<'static, WDT>> {
+    let mut config = Config::default();
+    config.timeout_ticks = TIMEOUT_TICKS;
+    // Hold the count while a debugger halts the core, so a breakpoint does
+    // not become a reset. embassy-nrf's own default keeps it running.
+    config.action_during_debug_halt = HaltConfig::Pause;
+    Watchdog::try_new(wdt, config)
+}
+
+// -- Using the watchdog --
+//
+//     if let Ok((_wdt, [mut handle])) = pins::configs::watchdog::start(watchdog) {
+//         loop {
+//             handle.pet();                              // at least once every period
+//             // Half the period, from the period - never a fixed sleep, which
+//             // would outlast any period shorter than itself.
+//             embassy_time::Timer::after_micros(pins::configs::watchdog::TIMEOUT_US / 2).await;
+//         }
+//     }

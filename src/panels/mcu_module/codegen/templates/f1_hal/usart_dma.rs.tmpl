@@ -1,0 +1,62 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) - auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+// DMA transport (chosen in the Virtual Module): {DMA_WHICH}. A half on DMA
+// moves bytes without the CPU polling for each one; a half left off is the
+// ordinary `nb` handle, which is often the better trade for short bursts - and
+// it leaves that channel free for another peripheral.
+//
+// The channels are NOT a choice on this chip: stm32f1xx-hal puts them in the
+// type, fixing USART{N} to {TXCH} for TX and {RXCH} for RX.
+use stm32f1xx_hal::{
+    afio,
+    dma::dma1,
+    pac,
+    prelude::*,
+    rcc::Clocks,
+    serial::{self, Config, Serial, StopBits},
+};
+
+/// The handles [`init`] hands back. Named so they can be struct fields.
+pub type TxHandle = {TX_TY};
+pub type RxHandle = {RX_TY};
+
+fn get_config() -> serial::Config {
+    let mut config = Config::default().baudrate(BAUDRATE.bps());
+    if DATA_BITS == 8 {
+        config = config.wordlength_8bits();
+    } else if DATA_BITS == 9 {
+        config = config.wordlength_9bits();
+    }
+    if PARITY == 'N' {
+        config = config.parity_none();
+    } else if PARITY == 'O' {
+        config = config.parity_odd();
+    } else if PARITY == 'E' {
+        config = config.parity_even();
+    }
+    if STOP_BITS == 1 {
+        config = config.stopbits(StopBits::STOP1);
+    } else if STOP_BITS == 2 {
+        config = config.stopbits(StopBits::STOP2);
+    }
+    config
+}
+
+pub fn init<PINS: serial::Pins<pac::USART{N}>>(
+    usart: pac::USART{N},
+    pins: PINS,
+    afio: &mut afio::Parts,
+    clocks: &Clocks,{TXCH_PARAM}{RXCH_PARAM}
+) -> (TxHandle, RxHandle) {
+    let (tx, rx) = Serial::new(usart, pins, &mut afio.mapr, get_config(), clocks).split();
+    ({TX_EXPR}, {RX_EXPR})
+}
+
+{USART_EXAMPLE}

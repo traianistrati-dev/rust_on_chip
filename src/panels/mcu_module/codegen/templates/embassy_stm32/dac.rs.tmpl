@@ -1,0 +1,25 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+{START_CONSTS}// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// The analog mirror of a GPIO output: write a number, the pin holds the
+// matching voltage. `new_blocking` writes the data register directly — no DMA
+// and no interrupt, which is the whole peripheral for a set-point or a bias.
+// Waveform streaming is the other API, and it needs a timer trigger.
+{USE}
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::{peripherals, Peri};
+
+/// Initialise DAC{N}. The channel(s) are enabled and driving before this
+/// returns, at the value(s) above.
+pub fn init<'d>(
+    dac: Peri<'d, peripherals::DAC{N}>,
+{PARAMS}) -> {RET} {
+    let mut dac = {CTOR};
+{SETS}    dac
+}
+
+// ── Using DAC{N} ──
+{USAGE}

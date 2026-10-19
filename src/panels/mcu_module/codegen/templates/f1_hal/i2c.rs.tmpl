@@ -1,0 +1,131 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const CLOCK_KHZ: u32 = {KHZ}; // <=100 Standard, >100 Fast
+{DEVICES}
+
+// The wired pins, straight from the MCU Configurator's pin map. They live in
+// this block because re-wiring the peripheral has to update them; the `use` is
+// here too, so the alias holds whatever you do to the `use` block below.
+use stm32f1xx_hal::gpio as hal_gpio;
+
+/// The pins I2C{N} is wired to, in HAL order: (SCL, SDA).
+///
+/// `allow(dead_code)`: `init` below is yours to edit and may stop naming it.
+#[allow(dead_code)]
+pub type I2cPins = ({PINS});
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+use stm32f1xx_hal::{
+    pac,
+    prelude::*,
+    afio,
+    rcc::Clocks,
+    i2c::{self, BlockingI2c, Mode as I2cMode},
+};
+
+fn get_mode() -> I2cMode {
+    if CLOCK_KHZ <= 100 {
+        I2cMode::Standard { frequency: CLOCK_KHZ.kHz() }
+    } else {
+        I2cMode::Fast { frequency: CLOCK_KHZ.kHz(), duty_cycle: i2c::DutyCycle::Ratio2to1 }
+    }
+}
+
+/// Bridges the HAL's blocking I2C (embedded-hal 0.2) to the STANDARD
+/// `embedded-hal` 1.0 `I2c`, so driver/app code stays portable across HALs:
+///
+///     fn app<I: embedded_hal::i2c::I2c>(i2c: &mut I) { /* … */ }
+pub struct I2cIo<I2C>(pub I2C);
+
+#[derive(Debug)]
+pub struct IoError;
+impl embedded_hal::i2c::Error for IoError {
+    fn kind(&self) -> embedded_hal::i2c::ErrorKind {
+        embedded_hal::i2c::ErrorKind::Other
+    }
+}
+impl<I2C> embedded_hal::i2c::ErrorType for I2cIo<I2C> {
+    type Error = IoError;
+}
+impl<I2C> embedded_hal::i2c::I2c<embedded_hal::i2c::SevenBitAddress> for I2cIo<I2C>
+where
+    I2C: embedded_hal_0_2::blocking::i2c::Read
+        + embedded_hal_0_2::blocking::i2c::Write
+        + embedded_hal_0_2::blocking::i2c::WriteRead,
+{
+    fn transaction(
+        &mut self,
+        addr: u8,
+        ops: &mut [embedded_hal::i2c::Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        use embedded_hal::i2c::Operation;
+        // Optimise the common `[Write, Read]` (register read) into one
+        // repeated-start `write_read`; single ops map directly. Other multi-op
+        // sequences fall back to per-op (each with its own START/STOP).
+        match ops {
+            [Operation::Write(w), Operation::Read(r)] => {
+                embedded_hal_0_2::blocking::i2c::WriteRead::write_read(&mut self.0, addr, w, r)
+                    .map_err(|_| IoError)
+            }
+            _ => {
+                for op in ops.iter_mut() {
+                    match op {
+                        Operation::Read(r) => {
+                            embedded_hal_0_2::blocking::i2c::Read::read(&mut self.0, addr, r)
+                                .map_err(|_| IoError)?
+                        }
+                        Operation::Write(w) => {
+                            embedded_hal_0_2::blocking::i2c::Write::write(&mut self.0, addr, w)
+                                .map_err(|_| IoError)?
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The concrete type [`init`] hands back.
+///
+/// A NAMED type, not `impl Trait`: a struct field — an RTIC `Local` resource,
+/// say — has to name what it holds, and an opaque type cannot be named. The pins
+/// stay inside the HAL's `BlockingI2c<…>`, so `I2cPins` from the GENERATED block
+/// above is part of it; re-wiring I2C{N} updates this alias with it. It is still
+/// an `embedded-hal` 1.0 `I2c` for every caller.
+pub type Handle = I2cIo<BlockingI2c<pac::I2C{N}, I2cPins>>;
+
+/// Initialise I2C{N} and expose it as an `embedded-hal` 1.0 `I2c`.
+pub fn init(
+    i2c: pac::I2C{N},
+    pins: I2cPins,
+    {AFIO_PARAM}: &mut afio::Parts,
+    clocks: &Clocks,
+) -> Handle {
+    let bus = BlockingI2c::i2c{N}(i2c, pins, {AFIO_ARG}get_mode(), *clocks, 1000, 10, 1000, 1000);
+    I2cIo(bus)
+}
+
+// ── Using I2C{N} ──
+// Portable init — the handle is an `embedded-hal` 1.0 `I2c`. In main.rs,
+// after the init above:
+//
+// NOTE: main.rs binds this handle as `let {HANDLE} = …` — add `mut`
+// there before calling anything below (bus methods take `&mut self`).
+//
+//     use embedded_hal::i2c::I2c;
+//     // The address is the device's own, in its file beside this one:
+//     use pins::configs::i2c{N}::device1_<name>::DEVICE_ADDRESS;
+//
+//     // Write to a register
+//     {HANDLE}.write(DEVICE_ADDRESS, &[0x10, 0x42]).ok();
+//
+//     // Read bytes
+//     let mut rx = [0u8; 2];
+//     {HANDLE}.read(DEVICE_ADDRESS, &mut rx).ok();
+//
+//     // Register read: write the address, then read WITHOUT releasing the bus
+//     // (repeated START) — what most sensors expect.
+//     {HANDLE}.write_read(DEVICE_ADDRESS, &[0x10], &mut rx).ok();
+

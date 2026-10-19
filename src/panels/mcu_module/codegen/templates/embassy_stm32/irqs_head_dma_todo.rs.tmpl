@@ -1,0 +1,8 @@
+use embassy_stm32::{bind_interrupts, peripherals};
+
+// Interrupt bindings for the DMA-backed peripherals below.
+// TODO(async DMA): add one line per DMA channel you pass to an `init`, e.g.
+//     DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH3>;
+// The INTERRUPT name (left) and the CHANNEL name (right) differ on most
+// families - check your chip's `embassy_stm32::interrupt` list.
+bind_interrupts!(struct Irqs {

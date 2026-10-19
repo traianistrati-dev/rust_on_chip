@@ -1,0 +1,29 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const FREQ_HZ: u32 = {FREQ};
+{DUTY_CONSTS}// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+{INTRO}
+{GPIO_USE}
+use embassy_stm32::time::Hertz;
+{LOW_LEVEL_USE}
+{DRIVER_USE}
+{TIMER_USE}
+use embassy_stm32::{peripherals, Peri};
+{BREAK_STRUCT}
+/// Initialise TIM{N} as PWM on the wired pad(s), enabled at the configured duty.
+pub fn init<'d>(
+    tim: Peri<'d, peripherals::TIM{N}>,
+{PARAMS}) -> {RET} {
+{PRELUDE}    let mut pwm = {DRIVER}::new(
+        tim,
+{CH_ARGS}        Hertz(FREQ_HZ),
+        CountingMode::{COUNTING},
+    );
+{ENABLES}    {RET_EXPR}
+}
+{DUTY_TRAIT}
+// ── Using TIM{N} ──
+{USAGE}

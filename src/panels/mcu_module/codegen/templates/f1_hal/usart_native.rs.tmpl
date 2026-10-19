@@ -1,0 +1,73 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+// NATIVE stm32f1xx-hal API (chosen in the Virtual Module). `init` returns the
+// split `(Tx, Rx)` handles — use `Tx` with `writeln!` / `Rx` with `.read()`.
+// Switch to the portable `embedded-io` API in the Virtual Module.
+use stm32f1xx_hal::{
+    pac,
+    prelude::*,
+    afio,
+    rcc::Clocks,
+    serial::{self, Config, Serial, StopBits},
+};
+
+fn get_config() -> serial::Config {
+    let mut config = Config::default().baudrate(BAUDRATE.bps());
+    if DATA_BITS == 8 {
+        config = config.wordlength_8bits();
+    } else if DATA_BITS == 9 {
+        config = config.wordlength_9bits();
+    }
+    if PARITY == 'N' {
+        config = config.parity_none();
+    } else if PARITY == 'O' {
+        config = config.parity_odd();
+    } else if PARITY == 'E' {
+        config = config.parity_even();
+    }
+    if STOP_BITS == 1 {
+        config = config.stopbits(StopBits::STOP1);
+    } else if STOP_BITS == 2 {
+        config = config.stopbits(StopBits::STOP2);
+    }
+    config
+}
+
+pub fn init<PINS: serial::Pins<pac::USART{N}>>(
+    usart: pac::USART{N},
+    pins: PINS,
+    afio: &mut afio::Parts,
+    clocks: &Clocks,
+) -> (serial::Tx<pac::USART{N}>, serial::Rx<pac::USART{N}>) {
+    Serial::new(usart, pins, &mut afio.mapr, get_config(), clocks).split()
+}
+
+// ── Using USART{N} ──
+// Native init — `init` returns the HAL's own split halves, which are `nb`
+// (non-blocking) based. In main.rs, after the init above:
+//
+//     use nb::block;
+//
+//     // Send one byte at a time
+//     for b in b"hello\r\n" {
+//         block!({TX}.write(*b)).ok();
+//     }
+//     block!({TX}.flush()).ok();
+//
+//     // Receive one byte, blocking until it arrives
+//     let byte = block!({RX}.read()).unwrap_or(0);
+//
+//     // Non-blocking poll: Err(nb::Error::WouldBlock) means "nothing yet"
+//     match {RX}.read() {
+//         Ok(b) => { /* got b */ }
+//         Err(nb::Error::WouldBlock) => { /* try again later */ }
+//         Err(_) => { /* framing / overrun error */ }
+//     }
+

@@ -1,0 +1,47 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const PRESCALER: u8 = {PRESCALER}; // bus = kernel clock / (PRESCALER + 1)
+// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// External flash on {SHAPE}. Four data lines instead of one, so a read runs
+// about four times faster than over plain SPI. This is the BLOCKING driver: it
+// waits for each command, which is what a flash command is anyway.
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::qspi::enums::{AddressSize, MemorySize};
+use embassy_stm32::qspi::{{PINS}, Config, Qspi};
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.memory_size = MemorySize::{SIZE};
+    config.address_size = AddressSize::{ADDR};
+    config.prescaler = PRESCALER;
+    config.dual_flash = {DUAL};
+    config
+}
+
+/// Initialise the QUADSPI over {SHAPE}.
+pub fn init<'d>(
+    qspi: Peri<'d, peripherals::QUADSPI>,
+{PARAMS}) -> Qspi<'d, peripherals::QUADSPI, Blocking> {
+    Qspi::{CTOR}(qspi, {ARGS}, get_config())
+}
+
+// ── Using the QUADSPI ──
+// Commands go out as a `TransferConfig`; the driver waits for each one.
+//
+//     use embassy_stm32::qspi::TransferConfig;
+//     use embassy_stm32::qspi::enums::{QspiWidth, DummyCycles};
+//
+//     let mut id = [0u8; 3];
+//     {HANDLE}.blocking_read(
+//         &mut id,
+//         TransferConfig {
+//             iwidth: QspiWidth::SING,
+//             instruction: Some(0x9F), // read JEDEC id
+//             dummy: DummyCycles::_0,
+//             ..Default::default()
+//         },
+//     );

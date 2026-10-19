@@ -1,0 +1,24 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+{CONSTS}// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// SAI{N} carries TWO independent sub-blocks. `split_subblocks` hands them out
+// once, here, which is why one config module covers the whole unit even though
+// each sub-block gets its own driver, its own direction and its own DMA.
+use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::sai::{{ITEMS}};
+use embassy_stm32::{peripherals, Peri};
+use static_cell::StaticCell;
+
+{CONFIGS}/// Initialise the wired sub-block(s) of SAI{N}.
+pub fn init<'d, {GENERICS}>(
+    sai: Peri<'d, peripherals::SAI{N}>,
+{PARAMS}    // One binding value covers every channel, so it travels with them —
+    // same shape as the DMA-backed SPI and I2S next door.
+    irqs: impl {BOUNDS} + 'd,
+) -> {RET} {
+{SPLIT}    // `'static` so the DMA controller can own them for the program's lifetime.
+{STATICS}{BODY}}

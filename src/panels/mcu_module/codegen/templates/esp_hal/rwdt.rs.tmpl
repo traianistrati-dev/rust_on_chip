@@ -1,0 +1,37 @@
+// <<< GENERATED>>>
+// Watchdog config (from the Configuration tab) - auto-updated; edit it there.
+const TIMEOUT_US: u64 = {TIMEOUT};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// The RTC watchdog lives in the RTC power domain and counts on the RTC SLOW
+// clock, an RC oscillator esp-hal calibrates at boot. So its period does not
+// move with the CPU clock - but it is not crystal-accurate either, and the same
+// code will not time out at exactly the same instant on two boards.
+//
+// `esp_hal::init()` DISABLES this watchdog on the way in, so nothing is armed
+// until you call `enable()`.
+use esp_hal::peripherals::LPWR;
+use esp_hal::rtc_cntl::{Rtc, RwdtStage};
+use esp_hal::time::Duration;
+
+/// Handle type, so it can be stored in a struct or a task's state.
+pub type Handle = Rtc<'static>;
+
+/// Configure the RTC watchdog. It is NOT running yet - call `rwdt.enable()`
+/// when your start-up is far enough along to keep feeding it.
+pub fn init(lpwr: LPWR<'static>) -> Handle {
+    let mut rtc = Rtc::new(lpwr);
+    rtc.rwdt
+        .set_timeout(RwdtStage::Stage0, Duration::from_micros(TIMEOUT_US));
+    rtc
+}
+
+// -- Using the RWDT --
+//
+//     let mut rtc = pins::configs::rwdt::init(peripherals.LPWR);
+//     rtc.rwdt.enable();             // from here on it will reset the chip
+//     loop {
+//         rtc.rwdt.feed();           // at least once every TIMEOUT_US
+//     }

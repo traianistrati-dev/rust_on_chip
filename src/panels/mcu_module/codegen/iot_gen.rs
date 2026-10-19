@@ -399,30 +399,6 @@ fn lf(s: &str) -> String {
     s.replace("\r\n", "\n")
 }
 
-/// Is `name` one of the IoT tab's files? None of them changes with the
-/// runtime - they exist only on Async - so a Runtime Apply's forced rewrite
-/// must pass them by, as it does the flash store's: it would only wipe what
-/// the user wrote below the markers.
-pub fn runtime_free(name: &str) -> bool {
-    matches!(
-        name,
-        NET | WIFI
-            | MQTT
-            | MQTT_LINK
-            | MQTT_CA
-            | SNTP
-            | ESPNOW
-            | BLE
-            | BLE_MESH
-            | THREAD
-            | SECRETS
-            | PANIC
-            | TLS
-            | HTTP
-            | HTTP_CA
-    )
-}
-
 /// The Wi-Fi station's secrets, in the order they are written: the network,
 /// and the broker's login (written with the station, MQTT or not).
 pub const WIFI_SECRETS: [&str; 4] = [
@@ -1525,7 +1501,12 @@ fn is_pristine(name: &str, content: &str) -> bool {
     let Some(tail) = tail_of(content) else {
         return false;
     };
-    TAILS.iter().any(|(n, t)| *n == name && lf(t) == tail)
+    // Text above the block is the user's: no IoT template has any, and the
+    // file goes with the link only when nothing in it is theirs.
+    if crate::project_tree::templates::editable(content).is_none_or(|(head, _)| !head.is_empty()) {
+        return false;
+    }
+    TAILS.iter().any(|(n, t)| *n == name && same_tail(t, &tail))
 }
 
 /// What replaces `existing` when it still holds an older IDE's template, or
@@ -1546,16 +1527,26 @@ fn is_pristine(name: &str, content: &str) -> bool {
 pub fn upgraded(name: &str, existing: &str, body: &str) -> Option<String> {
     let tail = tail_of(existing)?;
     let foreign = tail_of(body).is_some_and(|want| want != tail)
-        && TAILS.iter().any(|(n, t)| *n == name && lf(t) == tail);
+        && TAILS.iter().any(|(n, t)| *n == name && same_tail(t, &tail));
     if foreign
         || LEGACY_TAILS
             .iter()
-            .any(|(n, t)| *n == name && lf(t) == tail)
+            .any(|(n, t)| *n == name && same_tail(t, &tail))
     {
         let text = lf(existing);
-        let head = text.find(GEN_BEGIN_CFG).map_or("", |i| &text[..i]);
+        // The block as the splice finds it: a marker MENTIONED in the user's
+        // text above it is not where their text ends.
+        let head = crate::project_tree::templates::block(&text).map_or("", |(b, _)| &text[..b]);
         return Some(format!("{head}{body}"));
     }
+    migrated(name, existing)
+}
+
+/// The half of [`upgraded`] that keeps the user's edits: an edited phase-1
+/// ESP `wifi.rs` moved to the `init` main.rs calls. It never writes a
+/// template over the file, so a template the user turned down does not stop
+/// it.
+pub fn migrated(name: &str, existing: &str) -> Option<String> {
     if name == WIFI {
         return migrate_wifi_esp_v1(existing);
     }
@@ -1617,7 +1608,7 @@ pub fn mqtt_files_left(
         return Some(
             "src/pins/configs/mqtt.rs is from before TLS and talks to its socket itself, so TLS never \
              reaches it - and you edited it, so the IDE left it. Move your changes into the current \
-             template (delete the file to get it).",
+             template (Reset to template in its right-click menu, your version copied first - or delete the file).",
         );
     }
     let link = link?;
@@ -1629,7 +1620,7 @@ pub fn mqtt_files_left(
         return Some(
             "src/pins/configs/mqtt_link.rs is from before tls.rs (the TLS that MQTT and HTTP now \
              share), and you edited it, so the IDE left it: it no longer compiles. Move your \
-             changes into the current template (delete the file to get it).",
+             changes into the current template (Reset to template in its right-click menu, your version copied first - or delete the file).",
         );
     }
     let has_tls = own_tls || tail.contains("super::tls::");
@@ -1643,8 +1634,8 @@ pub fn mqtt_files_left(
     if has_tls != tls || (tls && other_radio) {
         return Some(
             "src/pins/configs/mqtt_link.rs was written for another TLS setting or radio, and you \
-             edited it, so the IDE left it: it does not fit this project. Delete it to get the \
-             current one.",
+             edited it, so the IDE left it: it does not fit this project. Reset to template in its \
+             right-click menu takes the current one, your version copied first - or delete the file.",
         );
     }
     None
@@ -1681,7 +1672,7 @@ pub fn client_link_left(link: Option<&str>, client: bool) -> Option<&'static str
         .then_some(
             "src/pins/configs/mqtt_link.rs is from before the client certificate, and you edited it, \
              so the IDE left it: it cannot send the certificate. Move your changes into the current \
-             template (delete the file to get it).",
+             template (Reset to template in its right-click menu, your version copied first - or delete the file).",
         )
 }
 
@@ -1697,7 +1688,7 @@ pub fn entropy_link_left(link: Option<&str>, trng: bool) -> Option<&'static str>
     .then_some(
         "src/pins/configs/mqtt_link.rs is from before the Pico 2 W's TRNG, and you edited it, \
          so the IDE left it: its keys still come from the ring oscillator alone. Move your \
-         changes into the current template (delete the file to get it).",
+         changes into the current template (Reset to template in its right-click menu, your version copied first - or delete the file).",
     )
 }
 
@@ -1734,12 +1725,26 @@ pub fn foreign_radio_file(name: &str, content: &str, platform: Platform) -> bool
     }
 }
 
-/// The editable half of a generated file, as written: what follows the end
-/// marker's own newline, line endings normalised.
+/// The editable half of a generated file: what follows the end marker, line
+/// endings normalised and the blank lines above it dropped - a splice puts
+/// one there whatever the template had, so a file synced once would never
+/// equal a template that starts right below its marker (`thread_nrf_v1`).
 fn tail_of(content: &str) -> Option<String> {
-    let (_, tail) = content.split_once(GEN_END_CFG)?;
-    let tail = tail.replace("\r\n", "\n");
-    Some(tail.strip_prefix('\n').unwrap_or(&tail).to_owned())
+    // The END that closes the block, as the splice finds it - not one the
+    // user mentioned above it. No block, no tail: a file whose BEGIN went is
+    // the user's, as `decide` has it, and nothing may cut it at its END.
+    let (_, end) = crate::project_tree::templates::block(content)?;
+    Some(
+        content[end..]
+            .replace("\r\n", "\n")
+            .trim_start_matches('\n')
+            .to_owned(),
+    )
+}
+
+/// Is `tail` (from [`tail_of`]) the template tail `template`?
+fn same_tail(template: &str, tail: &str) -> bool {
+    lf(template).trim_start_matches('\n') == tail
 }
 
 /// The `pins/configs/` paths the tree must keep although `files` no longer
@@ -2624,7 +2629,7 @@ mod tests {
                 assert_eq!(tls.contains("super::sntp::now_unix()"), sntp, "{id}");
                 assert!(!link.contains("super::sntp"), "the clock is tls.rs's");
                 assert!(is_pristine(MQTT_LINK, &link) && is_pristine(TLS, &tls));
-                assert!(runtime_free(TLS) && !write_once(TLS));
+                assert!(!write_once(TLS));
                 let mq = get(MQTT).unwrap();
                 assert!(mq.contains("pub const BROKER_PORT: u16 = 8886;"), "{mq}");
                 assert_eq!(
@@ -2639,7 +2644,7 @@ mod tests {
                     "{ca}"
                 );
                 assert!(ca.contains("-----END CERTIFICATE-----\";"), "{ca}");
-                assert!(write_once(MQTT_CA) && is_pristine(MQTT_CA, &ca) && runtime_free(MQTT_CA));
+                assert!(write_once(MQTT_CA) && is_pristine(MQTT_CA, &ca));
                 assert!(!is_pristine(MQTT_CA, &ca.replace("MIIFazCC", "MIIFazCD")));
                 // The SOCKETS count is the plain one: TLS runs on MQTT's socket.
                 let mut same = mcu(id, Runtime::Async, true);
@@ -3087,6 +3092,28 @@ mod tests {
         assert!(!phase_one_wifi_left(&up));
         // Migrated twice is migrated once.
         assert_eq!(upgraded(WIFI, &up, &body), None);
+        // The move keeps the edits, so a template the user turned down does
+        // not hold it back: the sync still runs it.
+        {
+            use crate::project_tree::logic::ProjectTreeState;
+            let path = format!("src/pins/configs/{WIFI}");
+            let mut tree = ProjectTreeState::new();
+            tree.user_src_files.push((path.clone(), old.clone()));
+            let mut stamp = crate::project_tree::templates::written(&old);
+            stamp
+                .declined
+                .insert(crate::project_tree::templates::written(&body).seen.unwrap());
+            tree.templates.files.insert(path.clone(), stamp);
+            tree.sync_config_files(&[(WIFI.to_owned(), body.clone())], &[], &mut None);
+            let now = &tree
+                .user_src_files
+                .iter()
+                .find(|(p, _)| *p == path)
+                .unwrap()
+                .1;
+            assert!(!phase_one_wifi_left(now), "{now}");
+            assert!(now.contains("pub const RETRY_S: u64 = 10;"), "{now}");
+        }
 
         let mangled = old.replace(
             "    let (controller, interfaces) = esp_radio::wifi::new(wifi, Default::default()).unwrap();\n",
@@ -3094,21 +3121,6 @@ mod tests {
         );
         assert_eq!(upgraded(WIFI, &mangled, &body), None);
         assert!(phase_one_wifi_left(&mangled), "the tab tells the user");
-    }
-
-    /// The IoT files never change with the runtime, so a Runtime Apply's
-    /// forced rewrite must leave them to the user.
-    #[test]
-    fn every_iot_file_is_runtime_free() {
-        let mut m = mcu("esp32c3", Runtime::Async, true);
-        m.iot.sntp = Some(SntpConfig::default());
-        m.iot.esp_now = Some(EspNowConfig::default());
-        for (name, _) in config_files_for(&m) {
-            assert!(runtime_free(&name), "{name}");
-        }
-        for (name, _) in config_files_for(&thread_mcu("nrf52840_dk")) {
-            assert!(runtime_free(&name), "{name}");
-        }
     }
 
     /// The peer list holds 20 entries, the broadcast address among them.
@@ -3510,7 +3522,6 @@ mod tests {
         // With no dataset the handle is kept, not dropped under `ot_task`.
         assert!(thread.contains("core::mem::forget(ot);"), "{thread}");
         assert!(is_pristine(THREAD, thread) && is_pristine(SECRETS, secrets));
-        assert!(runtime_free(THREAD));
     }
 
     /// Thread on an ESP: `thread::start` with the 802.15.4 peripheral, last in
@@ -3590,6 +3601,18 @@ mod tests {
         );
         let up = upgraded(THREAD, &v1, &nrf).expect("phase 4's template is moved");
         assert!(up.contains("core::mem::forget(ot);"), "{up}");
+        // ...also after a splice, which leaves a blank line below the block
+        // that v1 never had.
+        let spliced = v1.replace(&format!("{GEN_END_CFG}\n"), &format!("{GEN_END_CFG}\n\n"));
+        assert_eq!(upgraded(THREAD, &spliced, &nrf), Some(up.clone()));
+        assert!(is_pristine(THREAD, &spliced));
+        // ...and the user's text above it, which mentions the markers, rides
+        // along whole - the block is where the splice finds it.
+        let head = format!(
+            "// keep {GEN_BEGIN_CFG} .. {GEN_END_CFG} as the IDE wrote it\nuse crate::mine;\n\n"
+        );
+        let up = upgraded(THREAD, &format!("{head}{spliced}"), &nrf).expect("still v1 below");
+        assert_eq!(up, format!("{head}{nrf}"));
         assert!(
             is_pristine(THREAD, &v1),
             "an untouched v1 may go with the switch"
@@ -3597,6 +3620,42 @@ mod tests {
         let edited = format!("{esp}\n// mine\n");
         assert_eq!(upgraded(THREAD, &edited, &nrf), None);
         assert!(foreign_radio_file(THREAD, &edited, Platform::Nrf));
+    }
+
+    /// "Keep my version" holds for an IoT file too: undone to the template
+    /// it was built on, a thread.rs is not moved onto the other radio's one
+    /// the user turned down - not by `upgraded`, not by the decision.
+    #[test]
+    fn a_declined_radio_template_is_not_reached_by_an_upgrade() {
+        use crate::project_tree::logic::ProjectTreeState;
+        let t = ThreadConfig::default();
+        let nrf = thread_file(&t, Platform::Nrf);
+        let esp = thread_file(&t, Platform::Esp);
+        let path = format!("src/pins/configs/{THREAD}");
+        fn file(tree: &mut ProjectTreeState) -> &mut String {
+            let path = format!("src/pins/configs/{THREAD}");
+            &mut tree
+                .user_src_files
+                .iter_mut()
+                .find(|(p, _)| *p == path)
+                .expect("thread.rs")
+                .1
+        }
+        let mut tree = ProjectTreeState::new();
+        tree.sync_config_files(&[(THREAD.to_owned(), nrf.clone())], &[], &mut None);
+        file(&mut tree).push_str("// mine\n");
+        let report = tree.sync_config_files(&[(THREAD.to_owned(), esp.clone())], &[], &mut None);
+        assert_eq!(report.kept.len(), 1, "the ESP template is offered");
+        // Keep my version.
+        let stamp = tree.templates.files.get_mut(&path).unwrap();
+        let offered = stamp.offered.take().unwrap();
+        stamp.declined.insert(offered);
+        // The edit undone: the untouched nRF file, which `upgraded` alone
+        // would move to the ESP template.
+        *file(&mut tree) = nrf.clone();
+        assert!(upgraded(THREAD, &nrf, &esp).is_some());
+        tree.sync_config_files(&[(THREAD.to_owned(), esp.clone())], &[], &mut None);
+        assert_eq!(tail_of(file(&mut tree)), tail_of(&nrf));
     }
 
     /// A crystal the Clock tab already chose is not "overridden"; the 52833
@@ -4303,7 +4362,7 @@ mod tests {
         assert!(http.contains("Err(HttpError::NoTls)") && http.contains("pub struct LinkBuffers;"));
         assert!(http.contains("pub const USER_AGENT: &str = \"RustOnChip\";"));
         assert!(http.contains("pub const BODY_MAX: usize = 2048;") && http.contains("pub const TIMEOUT_S: u64 = 30;"));
-        assert!(is_pristine(HTTP, &http) && runtime_free(HTTP) && !write_once(HTTP));
+        assert!(is_pristine(HTTP, &http) && !write_once(HTTP));
         assert!(file_of(&plain, TLS).is_none() && file_of(&plain, HTTP_CA).is_none());
         let net = file_of(&plain, NET).unwrap();
         assert!(net.contains("HTTP one") && net.contains("pub const SOCKETS: usize = 5;"), "{net}");
@@ -4668,7 +4727,6 @@ mod tests {
             spliced.replace("1_000;", "500;"),
         )];
         assert_eq!(kept_paths(&[], &edited), ["src/pins/configs/panic.rs"]);
-        assert!(runtime_free(PANIC));
     }
 }
 

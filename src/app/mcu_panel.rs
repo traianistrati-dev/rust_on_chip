@@ -3336,7 +3336,7 @@ impl AppIde {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(format!(
-                            "{}  Edits inside a config file may be lost if its template changes (e.g. blocking -> async).",
+                            "{}  A config file you edited keeps your edits: its new template is saved beside it, and Reset to template is in its right-click menu.",
                             ph::WARNING,
                         ))
                         .size(11.0)

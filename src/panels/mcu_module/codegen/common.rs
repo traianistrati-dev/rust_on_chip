@@ -852,6 +852,14 @@ mod device_address_tests {
             format!("{unminted}\n// device-id: i2c1/9\npub const DEVICE_ADDRESS: u8 = 0x11;\n");
         assert_eq!(super::device_file_id(&fake), None);
         assert_eq!(super::device_file_address(&fake), Some(0x68));
+        // Read off the block the splice finds: a comment naming the markers
+        // above it does not hide the address, so a rename still pairs it.
+        let noted = format!(
+            "// keep {} .. {} as the IDE wrote it\n{unminted}",
+            super::CFG_GEN_BEGIN,
+            super::CFG_GEN_END
+        );
+        assert_eq!(super::device_file_address(&noted), Some(0x68));
 
         assert_eq!(
             super::parse_device_file_name("device3_imu.rs"),
@@ -1167,12 +1175,11 @@ pub fn parse_device_file_name(file: &str) -> Option<(usize, &str)> {
     Some((k, slug))
 }
 
-/// The inside of a config file's FIRST generated block - the rule
-/// `sync_config_files` splices by.
+/// The inside of a config file's generated block, found by the rule
+/// `sync_config_files` splices by (`templates::block`).
 fn first_cfg_gen_block(body: &str) -> Option<&str> {
-    let begin = body.find(CFG_GEN_BEGIN)? + CFG_GEN_BEGIN.len();
-    let end = begin + body[begin..].find(CFG_GEN_END)?;
-    Some(&body[begin..end])
+    let (begin, end) = crate::project_tree::templates::block(body)?;
+    Some(&body[begin + CFG_GEN_BEGIN.len()..end - CFG_GEN_END.len()])
 }
 
 /// The address a device file's generated block carries.

@@ -1,7 +1,9 @@
 //! Project tree logic — file operations, directory scanning, filesystem watching.
 
+use super::templates::{self, Decision, Mark, TemplateRecord};
 use crate::panels::mcu_module::codegen::common as codegen;
 use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// State for the project tree (files and folders in src/).
@@ -25,6 +27,15 @@ pub struct ProjectTreeState {
     /// Not declared in `configs/mod.rs`, so it is never compiled, the same as
     /// a Custom module's older revisions.
     pub kept_config_files: Vec<String>,
+    /// What the IDE last wrote into each config file - see
+    /// [`super::templates`]. Loaded with the project, saved with it.
+    pub templates: TemplateRecord,
+    /// Per config file: its template now, and whether one is offered beside
+    /// it. Rebuilt by every config sync; what the tree's menu and badge read.
+    pub template_marks: BTreeMap<String, Mark>,
+    /// Config files the user asked to Reset to their template: the next sync
+    /// writes the template over them, edited or not.
+    pub reset_requested: BTreeSet<String>,
 }
 
 /// What [`ProjectTreeState::sync_config_files`] did besides splicing - what
@@ -47,6 +58,15 @@ pub struct ConfigSync {
     /// that no device claimed: dropped, so the user has to hear where a copy
     /// is - nothing will ever generate its flat name again.
     pub unplaced: Vec<(String, String)>,
+    /// Files whose editable text followed a changed template: the IDE's own
+    /// text, so nothing of the user's went with it.
+    pub replaced: Vec<String>,
+    /// `(path, new template)` of each EDITED file whose template changed this
+    /// sync: its edits stay, the template is offered beside it.
+    pub kept: Vec<(String, String)>,
+    /// `(path, template)` of every file with an offer pending, this sync's and
+    /// earlier ones - the copies kept beside them.
+    pub offered: Vec<(String, String)>,
 }
 
 impl ConfigSync {
@@ -117,6 +137,9 @@ impl ProjectTreeState {
             user_src_folders: Vec::new(),
             config_graveyard: Vec::new(),
             kept_config_files: Vec::new(),
+            templates: TemplateRecord::default(),
+            template_marks: BTreeMap::new(),
+            reset_requested: BTreeSet::new(),
         }
     }
 
@@ -179,6 +202,9 @@ impl ProjectTreeState {
             user_src_folders: folders,
             config_graveyard: Vec::new(),
             kept_config_files: Vec::new(),
+            templates: TemplateRecord::load(root),
+            template_marks: BTreeMap::new(),
+            reset_requested: BTreeSet::new(),
         }
     }
 
@@ -508,33 +534,13 @@ impl ProjectTreeState {
             generated_section.trim()
         );
 
+        // The block found as every config file's is: a marker mentioned in
+        // the user's text around it is not where it starts or ends.
         if let Some((_, mod_content)) = self.user_src_files.iter_mut().find(|(p, _)| p == MOD_PATH)
         {
-            let existing = mod_content.as_str();
-            if let (Some(begin_pos), Some(end_pos)) = (
-                existing.find("// <<< GENERATED>>>"),
-                existing.find("// <<< GENERATED END >>>"),
-            ) {
-                let before = &existing[..begin_pos].trim_end();
-                let after = &existing[end_pos + "// <<< GENERATED END >>>".len()..].trim_start();
-                if before.is_empty() && after.is_empty() {
-                    *mod_content = generated_with_markers;
-                } else if before.is_empty() {
-                    *mod_content = format!("{}\n\n{}", generated_with_markers.trim(), after);
-                } else if after.is_empty() {
-                    *mod_content = format!("{}\n\n{}", before, generated_with_markers.trim());
-                } else {
-                    *mod_content = format!(
-                        "{}\n\n{}\n\n{}",
-                        before,
-                        generated_with_markers.trim(),
-                        after
-                    );
-                }
-            } else if !existing.trim().is_empty() {
-                *mod_content = format!("{}\n\n{}", generated_with_markers.trim(), existing);
-            } else {
-                *mod_content = generated_with_markers;
+            let updated = splice_pin_file(mod_content, &generated_with_markers);
+            if *mod_content != updated {
+                *mod_content = updated;
             }
         }
     }
@@ -547,15 +553,14 @@ impl ProjectTreeState {
     /// with `pub mod <periph>;`. When `files` is empty the whole subtree is
     /// dropped. Call this BEFORE `sync_pin_files` so the latter can add
     /// `pub mod configs;` to `pins/mod.rs`.
-    /// `force` = rewrite each existing config file in FULL (the whole template,
-    /// not just the constants block). Used on a Runtime / Init-API Apply, where
-    /// the `init()` template itself changes (blocking ⇄ async ⇄ native) and a
-    /// constants-only splice would leave the old implementation in place. A
-    /// normal (baud/param) change passes `false` so user edits below the markers
-    /// survive.
     ///
-    /// A Custom module's file is the exception to both: it is written only when
-    /// it does not exist yet, and never touched again — not spliced, not forced.
+    /// The text around the block follows a changed template - a Runtime or
+    /// Init-API Apply, a re-wired pad, a newer IDE - only while it is still
+    /// the IDE's own; an edited file keeps it, and the template is offered
+    /// beside it. See [`super::templates`].
+    ///
+    /// A Custom module's file is the exception: it is written only when it
+    /// does not exist yet, and never touched again - not spliced, not replaced.
     /// Every Update produces a new revision file, so a pin change still reaches
     /// the code, while whatever the user wrote into an existing one stays.
     ///
@@ -564,8 +569,7 @@ impl ProjectTreeState {
     /// folder's own `mod.rs` declares what is inside it. Such a folder is an I2C
     /// bus, and its device files MOVE when a device is renamed or renumbered -
     /// see [`Self::carry_bus_folders`] - instead of being pruned and written
-    /// anew; they are never rewritten whole by `force` either, their template
-    /// has nothing a Runtime changes.
+    /// anew.
     ///
     /// Nothing pruned is lost for the session: it goes to
     /// [`Self::config_graveyard`] and comes back if its file is generated again.
@@ -576,7 +580,6 @@ impl ProjectTreeState {
     pub fn sync_config_files(
         &mut self,
         files: &[(String, String)],
-        force: bool,
         // Stems whose OLDER files must survive the prune below — a Custom module
         // writes each Update to a new `custom_<name>_<n>.rs`, and the previous
         // revisions are kept on disk (they are not in `configs/mod.rs`, so they
@@ -592,6 +595,7 @@ impl ProjectTreeState {
         let mut report = ConfigSync::default();
         // Files nothing generates any more that stay anyway (see the field).
         let kept = self.kept_config_files.clone();
+        self.template_marks.clear();
 
         if files.is_empty() {
             // No configured peripherals → drop the entire configs/ subtree,
@@ -655,6 +659,21 @@ impl ProjectTreeState {
         //    name changed - BEFORE the prune below, which would take the
         //    user's code with it.
         self.carry_bus_folders(files, selected, &mut report);
+        // A stamp goes where its file went. A renumber hands a path to ANOTHER
+        // device, and judged by the stamp of the one that left, an untouched
+        // file would be offered its own template instead of following it.
+        // Taken out first, then put back: a swap moves both ways at once.
+        let carried: Vec<(String, Option<templates::Stamp>)> = report
+            .moved
+            .iter()
+            .map(|(old, new)| (new.clone(), self.templates.files.remove(old)))
+            .collect();
+        for (new, stamp) in carried {
+            match stamp {
+                Some(stamp) => self.templates.files.insert(new, stamp),
+                None => self.templates.files.remove(&new),
+            };
+        }
 
         //    Then drop config files no longer configured. A Custom module's
         //    revisions are flat names, never nested.
@@ -687,18 +706,9 @@ impl ProjectTreeState {
             {
                 continue;
             }
-            // A device file's template holds nothing a Runtime changes, and
-            // everything below its markers is the user's. The flash store's
-            // likewise: one template serves every runtime, and its `Data` is
-            // the user's - a Runtime Apply must not wipe it.
             let is_device = name
                 .split_once('/')
                 .is_some_and(|(_, file)| codegen::parse_device_file_name(file).is_some());
-            // The IoT tab's files likewise: they exist only on Async and no
-            // Runtime changes them.
-            let runtime_free = is_device
-                || name == crate::panels::mcu_module::codegen::flash_store_gen::FILE
-                || crate::panels::mcu_module::codegen::iot_gen::runtime_free(name);
             // Generated again after being pruned this session: back with the
             // user's code, and spliced (or forced) below like any file. Not a
             // device file: step 3 already chose ITS old content by device,
@@ -726,39 +736,75 @@ impl ProjectTreeState {
                 }
                 continue;
             }
-            if let Some((_, content)) = self
+            let stamp = if let Some((_, content)) = self
                 .user_src_files
                 .iter_mut()
                 .find(|(p, _)| p == &file_path)
             {
-                if force && !runtime_free {
-                    // Template swapped (runtime / api style) → replace the whole
-                    // file; the editable region carries the init that must change.
-                    if *content != *body {
-                        *content = body.clone();
-                    }
+                // An IoT template an older IDE wrote: the current one, or the
+                // user's edited file moved to the signature main.rs now calls -
+                // then it is decided like any file. Never onto a template the
+                // user turned down ("Keep my version" holds here too); the
+                // move that keeps their edits still runs.
+                use crate::panels::mcu_module::codegen::iot_gen;
+                let declined = self
+                    .templates
+                    .files
+                    .get(&file_path)
+                    .is_some_and(|s| templates::declines(s, body));
+                let up = if declined {
+                    iot_gen::migrated(name, content)
                 } else {
-                    // An IoT template an older IDE wrote: the current one, or
-                    // the user's edited file moved to the signature main.rs
-                    // now calls - then the block is spliced as for any file.
-                    if let Some(up) =
-                        crate::panels::mcu_module::codegen::iot_gen::upgraded(name, content, body)
-                    {
-                        *content = up;
+                    iot_gen::upgraded(name, content, body)
+                };
+                if let Some(up) = up {
+                    *content = up;
+                }
+                let reset = self.reset_requested.remove(&file_path);
+                let (decision, stamp) =
+                    templates::decide(self.templates.files.get(&file_path), content, body, reset);
+                match decision {
+                    Decision::Template {
+                        replaced,
+                        keep_head,
+                    } => {
+                        // The body verbatim: a pristine file stays byte-equal
+                        // to a fresh one through any number of syncs.
+                        let text = templates::template_text(content, body, keep_head);
+                        if *content != text {
+                            *content = text;
+                        }
+                        if replaced {
+                            report.replaced.push(file_path.clone());
+                        }
                     }
-                    if let Some(block) = extract_gen_block(body) {
-                        let existing = content.clone();
-                        let updated = splice_pin_file(&existing, &block);
-                        if *content != updated {
-                            *content = updated;
+                    Decision::Keep { offer } => {
+                        if let Some(block) = extract_gen_block(body) {
+                            let existing = content.clone();
+                            let updated = splice_pin_file(&existing, &block);
+                            if *content != updated {
+                                *content = updated;
+                            }
+                        }
+                        if offer {
+                            report.kept.push((file_path.clone(), body.clone()));
                         }
                     }
                 }
+                stamp
             } else {
                 // New file: write the full generated content (consts + editable
                 // remainder).
-                self.user_src_files.push((file_path, body.clone()));
+                self.user_src_files.push((file_path.clone(), body.clone()));
+                templates::written(body)
+            };
+            if stamp.offered.is_some() {
+                report.offered.push((file_path.clone(), body.clone()));
             }
+            if let Some(mark) = Mark::of(body, stamp.offered.is_some()) {
+                self.template_marks.insert(file_path.clone(), mark);
+            }
+            self.templates.files.insert(file_path, stamp);
         }
 
         // A folder the prune emptied goes too - after step 4, which is what
@@ -1167,20 +1213,15 @@ fn match_devices(olds: &[&DevSig], targets: &[DevSig]) -> Vec<(usize, usize)> {
 /// (markers included), or `None` when absent. Used to splice just the constants
 /// block of a config file, leaving the editable remainder untouched.
 fn extract_gen_block(content: &str) -> Option<String> {
-    const GEN_BEGIN: &str = "// <<< GENERATED>>>";
-    const GEN_END: &str = "// <<< GENERATED END >>>";
-    let begin = content.find(GEN_BEGIN)?;
-    let end = content.find(GEN_END)? + GEN_END.len();
+    // Markers on lines of their own, and the END that closes THIS block: a
+    // marker mentioned in a comment must not split the file anywhere else.
+    let (begin, end) = templates::block(content)?;
     Some(content[begin..end].to_string())
 }
 
 fn splice_pin_file(existing: &str, new_generated: &str) -> String {
-    const GEN_BEGIN: &str = "// <<< GENERATED>>>";
-    const GEN_END: &str = "// <<< GENERATED END >>>";
-
-    if let (Some(begin_pos), Some(end_pos)) = (existing.find(GEN_BEGIN), existing.find(GEN_END)) {
+    if let Some((begin_pos, after_end)) = templates::block(existing) {
         let before = &existing[..begin_pos].trim_end();
-        let after_end = end_pos + GEN_END.len();
         let after = &existing[after_end..].trim_start();
 
         // Rebuild with new generated section
@@ -1644,6 +1685,34 @@ mod tests {
         assert_file_exists(&state, "src/pins/mod.rs");
     }
 
+    /// pins/mod.rs is spliced as every config file is: an END marker the
+    /// user mentioned above the block does not add a block per sync.
+    #[test]
+    fn a_marker_mentioned_in_pins_mod_rs_adds_no_block() {
+        let mut state = ProjectTreeState::new();
+        let mine = "// mine go after // <<< GENERATED END >>>\n// <<< GENERATED>>>\npub mod configs;\n// <<< GENERATED END >>>\n\npub mod mine;\n";
+        state
+            .user_src_files
+            .push(("src/pins/mod.rs".to_string(), mine.to_string()));
+        state
+            .user_src_files
+            .push(("src/pins/configs/mod.rs".to_string(), String::new()));
+        for _ in 0..3 {
+            state.sync_pin_files(&[]);
+        }
+        let now = &state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == "src/pins/mod.rs")
+            .unwrap()
+            .1;
+        assert_eq!(now.matches("pub mod configs;").count(), 1, "{now}");
+        assert!(
+            now.contains("// mine go after") && now.contains("pub mod mine;"),
+            "{now}"
+        );
+    }
+
     #[test]
     fn test_sync_preserves_custom_code() {
         let mut state = ProjectTreeState::new();
@@ -1799,7 +1868,6 @@ mod tests {
                 ("usart1.rs".to_string(), body.to_string()),
                 ("custom_led_2.rs".to_string(), body.to_string()),
             ],
-            false,
             &["custom_led".to_string()],
             &mut None,
         );
@@ -1815,9 +1883,9 @@ mod tests {
         assert!(!mod_rs.contains("pub use usart1::*;"), "{mod_rs}");
     }
 
-    /// A Custom module's file is written once and then left alone: neither a
-    /// normal regeneration nor a forced one (Runtime Apply) may touch it. The
-    /// reported case — a field added to the struct gone after every IDE start.
+    /// A Custom module's file is written once and then left alone, however
+    /// often it is regenerated. The reported case — a field added to the
+    /// struct gone after every IDE start.
     #[test]
     fn an_existing_custom_module_file_is_never_rewritten() {
         let mut state = ProjectTreeState::new();
@@ -1826,7 +1894,6 @@ mod tests {
         let generated = "pub struct Encoder<A> {\n    pub a: A,\n}\n";
         state.sync_config_files(
             &[("custom_menu_nav.rs".to_string(), generated.to_string())],
-            false,
             &keep,
             &mut None,
         );
@@ -1838,10 +1905,9 @@ mod tests {
             .expect("written on first sync")
             .1 = edited.to_string();
 
-        for force in [false, true] {
+        for round in 1..=2 {
             state.sync_config_files(
                 &[("custom_menu_nav.rs".to_string(), generated.to_string())],
-                force,
                 &keep,
                 &mut None,
             );
@@ -1851,13 +1917,12 @@ mod tests {
                 .find(|(p, _)| p == path)
                 .unwrap()
                 .1;
-            assert_eq!(body, edited, "force = {force}");
+            assert_eq!(body, edited, "sync {round}");
         }
 
         // An Update is a new revision file: written, and the old one kept.
         state.sync_config_files(
             &[("custom_menu_nav_1.rs".to_string(), generated.to_string())],
-            false,
             &keep,
             &mut None,
         );
@@ -1887,12 +1952,7 @@ mod tests {
         let mut state = ProjectTreeState::new();
         let path = "src/pins/configs/usart1.rs";
         let v1 = "// <<< GENERATED>>>\nconst BAUDRATE: u32 = 115200;\n// <<< GENERATED END >>>\n\nuse foo;\npub fn init() { /* orig */ }\n";
-        state.sync_config_files(
-            &[("usart1.rs".to_string(), v1.to_string())],
-            false,
-            &[],
-            &mut None,
-        );
+        state.sync_config_files(&[("usart1.rs".to_string(), v1.to_string())], &[], &mut None);
         assert!(state.user_src_files.iter().any(|(p, _)| p == path));
 
         // User edits the EDITABLE part (below the markers).
@@ -1907,12 +1967,7 @@ mod tests {
 
         // Regenerate with a new baud rate (only the constants block changes).
         let v2 = "// <<< GENERATED>>>\nconst BAUDRATE: u32 = 9600;\n// <<< GENERATED END >>>\n\nuse foo;\npub fn init() { /* orig */ }\n";
-        state.sync_config_files(
-            &[("usart1.rs".to_string(), v2.to_string())],
-            false,
-            &[],
-            &mut None,
-        );
+        state.sync_config_files(&[("usart1.rs".to_string(), v2.to_string())], &[], &mut None);
 
         let body = &state
             .user_src_files
@@ -1931,31 +1986,31 @@ mod tests {
         );
     }
 
-    /// A Runtime / Init-API Apply passes `force = true`: the WHOLE config file is
-    /// replaced (the editable `init()` template changes blocking → native/async),
-    /// so a constants-only splice would leave stale code — the bug behind "MCU
-    /// System code doesn't update on change".
+    /// A file still holding the IDE's text follows a changed template whole -
+    /// a Runtime / Init-API Apply swaps the `init` below the markers (blocking
+    /// -> native / async), and a constants-only splice would leave the old one:
+    /// the bug behind "MCU System code doesn't update on change".
     #[test]
-    fn config_file_force_rewrites_the_whole_template() {
+    fn a_pristine_config_file_follows_a_changed_template() {
         let mut state = ProjectTreeState::new();
         let path = "src/pins/configs/usart1.rs";
         // Blocking (portable) template — its init lives BELOW the markers.
         let portable = "// <<< GENERATED>>>\nconst BAUDRATE: u32 = 115200;\n// <<< GENERATED END >>>\n\nuse portable;\npub fn init() -> SerialIo { /* portable */ }\n";
         state.sync_config_files(
             &[("usart1.rs".to_string(), portable.to_string())],
-            false,
             &[],
             &mut None,
         );
 
         // Apply switches the runtime → a completely different (native) template.
         let native = "// <<< GENERATED>>>\nconst BAUDRATE: u32 = 115200;\n// <<< GENERATED END >>>\n\nuse native;\npub fn init() -> (Tx, Rx) { /* native */ }\n";
-        state.sync_config_files(
+        let report = state.sync_config_files(
             &[("usart1.rs".to_string(), native.to_string())],
-            true,
             &[],
             &mut None,
         );
+        assert_eq!(report.replaced, [path]);
+        assert!(report.kept.is_empty());
 
         let body = &state
             .user_src_files
@@ -1965,6 +2020,274 @@ mod tests {
             .1;
         assert!(body.contains("(Tx, Rx)"), "new template applied:\n{body}");
         assert!(!body.contains("SerialIo"), "old template gone:\n{body}");
+    }
+
+    const V1: &str = "// <<< GENERATED>>>\npub const BAUD: u32 = 9600;\n// <<< GENERATED END >>>\n\nuse portable;\npub fn init() -> SerialIo { todo!() }\n";
+    const V2: &str = "// <<< GENERATED>>>\npub const BAUD: u32 = 9600;\n// <<< GENERATED END >>>\n\nuse native;\npub fn init() -> (Tx, Rx) { todo!() }\n";
+    const USART: &str = "src/pins/configs/usart1.rs";
+
+    fn usart(state: &mut ProjectTreeState, body: &str) -> ConfigSync {
+        state.sync_config_files(
+            &[("usart1.rs".to_string(), body.to_string())],
+            &[],
+            &mut None,
+        )
+    }
+
+    fn usart_text(state: &ProjectTreeState) -> &str {
+        state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == USART)
+            .map(|(_, c)| c.as_str())
+            .expect("usart1.rs")
+    }
+
+    fn edit_usart(state: &mut ProjectTreeState, f: impl Fn(&str) -> String) {
+        let c = &mut state
+            .user_src_files
+            .iter_mut()
+            .find(|(p, _)| p == USART)
+            .expect("usart1.rs")
+            .1;
+        *c = f(c);
+    }
+
+    /// An EDITED file keeps its text when its template changes: only the block
+    /// is spliced, and the new template is offered - once, however often the
+    /// sync runs - for the app to put beside it.
+    #[test]
+    fn an_edited_config_file_keeps_its_text_and_is_offered_the_template() {
+        let mut state = ProjectTreeState::new();
+        usart(&mut state, V1);
+        edit_usart(&mut state, |c| c.replace("todo!()", "my_serial()"));
+        let report = usart(&mut state, &V2.replace("9600", "115200"));
+        let now = usart_text(&state);
+        assert!(
+            now.contains("my_serial()") && now.contains("SerialIo"),
+            "{now}"
+        );
+        assert!(
+            now.contains("BAUD: u32 = 115200;"),
+            "the block is spliced:\n{now}"
+        );
+        assert!(report.replaced.is_empty());
+        assert_eq!(
+            report.kept,
+            [(USART.to_string(), V2.replace("9600", "115200"))]
+        );
+        assert_eq!(report.offered.len(), 1);
+        assert!(state.template_marks[USART].offered);
+        // Again: still offered, not offered anew.
+        let again = usart(&mut state, &V2.replace("9600", "115200"));
+        assert!(again.kept.is_empty());
+        assert_eq!(again.offered.len(), 1);
+    }
+
+    /// An Apply that leaves a file's template as it was no longer touches its
+    /// edits - the compromise the old "rewrite every file" Apply made.
+    #[test]
+    fn an_edit_survives_a_template_that_did_not_change() {
+        let mut state = ProjectTreeState::new();
+        usart(&mut state, V1);
+        edit_usart(&mut state, |c| format!("{c}// MINE\n"));
+        let report = usart(&mut state, V1);
+        assert!(usart_text(&state).contains("// MINE"));
+        assert!(report.kept.is_empty() && report.replaced.is_empty());
+        assert!(!state.template_marks[USART].offered);
+    }
+
+    /// A file the record does not know - a project from before it - is the
+    /// IDE's only while it equals the template; otherwise it is the user's,
+    /// quietly, until its template changes.
+    #[test]
+    fn a_file_without_a_record_counts_as_edited_unless_it_is_the_template() {
+        let mut state = ProjectTreeState::new();
+        state
+            .user_src_files
+            .push((USART.to_string(), V1.to_string()));
+        usart(&mut state, V1);
+        assert_eq!(usart(&mut state, V2).replaced, [USART]);
+
+        let mut legacy = ProjectTreeState::new();
+        let theirs = V1.replace("todo!()", "theirs()");
+        legacy
+            .user_src_files
+            .push((USART.to_string(), theirs.clone()));
+        let first = usart(&mut legacy, V1);
+        assert!(
+            first.kept.is_empty() && first.replaced.is_empty(),
+            "quiet on a first look"
+        );
+        assert_eq!(usart_text(&legacy), theirs);
+        let then = usart(&mut legacy, V2);
+        assert_eq!(then.kept.len(), 1, "offered once the template changes");
+        assert!(usart_text(&legacy).contains("theirs()"));
+    }
+
+    /// A GENERATED marker mentioned above the block - in a comment about it -
+    /// neither duplicates the block nor loses the text around it.
+    #[test]
+    fn a_marker_mentioned_above_the_block_splits_nothing() {
+        let mut state = ProjectTreeState::new();
+        usart(&mut state, V1);
+        edit_usart(&mut state, |c| {
+            format!(
+                "// the block below ends at `// <<< GENERATED END >>>`\nuse my::thing;\n\n{c}// MINE\n"
+            )
+        });
+        let newer = V1.replace("9600", "115200");
+        for _ in 0..3 {
+            usart(&mut state, &newer);
+        }
+        let now = usart_text(&state);
+        assert_eq!(now.matches("// <<< GENERATED>>>").count(), 1, "{now}");
+        assert!(
+            now.contains("use my::thing;") && now.contains("// MINE") && now.contains("115200"),
+            "{now}"
+        );
+    }
+
+    /// An edited file an outside editor saved with a BOM, or with a note on
+    /// a marker's line: one block, spliced in place - not a second one put
+    /// above the first, which would define every constant twice.
+    #[test]
+    fn a_bom_or_a_note_on_a_marker_line_still_splices_one_block() {
+        let notes: [fn(&str) -> String; 2] = [
+            |c| format!("\u{feff}{c}// MINE\n"),
+            |c| {
+                c.replace(
+                    "// <<< GENERATED END >>>",
+                    "// <<< GENERATED END >>> // do not touch",
+                ) + "// MINE\n"
+            },
+        ];
+        for note in notes {
+            let mut state = ProjectTreeState::new();
+            usart(&mut state, V1);
+            edit_usart(&mut state, note);
+            let newer = V1.replace("9600", "115200");
+            for _ in 0..3 {
+                usart(&mut state, &newer);
+            }
+            let now = usart_text(&state);
+            assert_eq!(now.matches("pub const BAUD").count(), 1, "{now}");
+            assert!(now.contains("115200") && now.contains("// MINE"), "{now}");
+        }
+    }
+
+    /// A pristine file stays byte-equal to the template through any number of
+    /// syncs - including the shapes a splice used to change: a tail that
+    /// follows the block after ONE newline, and a file that IS the block.
+    #[test]
+    fn a_second_sync_leaves_a_pristine_file_alone() {
+        let one_newline =
+            "// <<< GENERATED>>>\npub const X: u8 = 1;\n// <<< GENERATED END >>>\npub fn f() {}\n";
+        let block_only = "// <<< GENERATED>>>\npub fn adapter() {}\n// <<< GENERATED END >>>\n";
+        for body in [one_newline, block_only, V1] {
+            let mut state = ProjectTreeState::new();
+            usart(&mut state, body);
+            usart(&mut state, body);
+            usart(&mut state, body);
+            assert_eq!(usart_text(&state), body);
+        }
+    }
+
+    /// A template with text above its block (ESP's `use` lines, which follow
+    /// the runtime): an untouched head follows it, an edited one keeps the file.
+    #[test]
+    fn a_template_head_counts_as_the_ides_text() {
+        let blocking = format!("use esp_hal::Blocking;\n{V1}");
+        let asynch = format!("use esp_hal::{{Async, Blocking}};\n{V1}");
+        let mut state = ProjectTreeState::new();
+        usart(&mut state, &blocking);
+        usart(&mut state, &asynch);
+        assert_eq!(usart_text(&state), asynch);
+
+        edit_usart(&mut state, |c| {
+            c.replace(
+                "use esp_hal::{Async, Blocking};",
+                "use esp_hal::{Async, Blocking, mine};",
+            )
+        });
+        let report = usart(&mut state, &blocking);
+        assert!(usart_text(&state).contains("mine"));
+        assert_eq!(report.kept.len(), 1);
+    }
+
+    /// A head the user typed above a template that has none is theirs: kept
+    /// when the file follows its template.
+    #[test]
+    fn a_user_head_rides_along_with_the_template() {
+        let mut state = ProjectTreeState::new();
+        usart(&mut state, V1);
+        edit_usart(&mut state, |c| format!("use my::thing;\n\n{c}"));
+        let report = usart(&mut state, V2);
+        assert_eq!(report.replaced, [USART]);
+        assert_eq!(usart_text(&state), format!("use my::thing;\n\n{V2}"));
+    }
+
+    /// Reset to template: the next sync writes the template over the edited
+    /// file it names, and over nothing else.
+    #[test]
+    fn a_reset_takes_the_template_for_that_file_only() {
+        let mut state = ProjectTreeState::new();
+        let other = "// <<< GENERATED>>>\n// <<< GENERATED END >>>\n\npub fn spi() {}\n";
+        let files = |usart: &str| {
+            vec![
+                ("usart1.rs".to_string(), usart.to_string()),
+                ("spi1.rs".to_string(), other.to_string()),
+            ]
+        };
+        state.sync_config_files(&files(V1), &[], &mut None);
+        edit_usart(&mut state, |c| format!("{c}// MINE\n"));
+        for (p, c) in &mut state.user_src_files {
+            if p.ends_with("spi1.rs") {
+                c.push_str("// MINE TOO\n");
+            }
+        }
+        state.sync_config_files(&files(V2), &[], &mut None);
+        assert!(state.template_marks[USART].offered);
+        state.reset_requested.insert(USART.to_string());
+        let report = state.sync_config_files(&files(V2), &[], &mut None);
+        assert_eq!(report.replaced, [USART]);
+        assert_eq!(usart_text(&state), V2);
+        assert!(!state.template_marks[USART].offered);
+        assert!(state.reset_requested.is_empty());
+        let spi = state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p.ends_with("spi1.rs"))
+            .unwrap();
+        assert!(spi.1.contains("// MINE TOO"));
+    }
+
+    /// The record round-trips through a Save and an Open: a file the user
+    /// edited is still known as edited after the project is reopened.
+    #[test]
+    fn the_record_survives_save_and_open() {
+        let dir = std::env::temp_dir().join(format!("eide_tmpl_open_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = ProjectTreeState::new();
+        usart(&mut state, V1);
+        edit_usart(&mut state, |c| format!("{c}// MINE\n"));
+        usart(&mut state, V1);
+        for (path, content) in &state.user_src_files {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, content).unwrap();
+        }
+        let present = |p: &str| state.user_src_files.iter().any(|(f, _)| f == p);
+        templates::save(&dir, &state.templates.kept(present)).unwrap();
+        let mut reopened = ProjectTreeState::load_from_dir(&dir);
+        assert_eq!(
+            reopened.templates.files[USART],
+            state.templates.files[USART]
+        );
+        let report = usart(&mut reopened, V2);
+        assert_eq!(report.kept.len(), 1, "still the user's after an open");
+        assert!(usart_text(&reopened).contains("// MINE"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A config module may be a FOLDER: `configs/mod.rs` declares it once, by
@@ -1983,7 +2306,7 @@ mod tests {
         .iter()
         .map(|n| (n.to_string(), body.to_string()))
         .collect();
-        state.sync_config_files(&files, false, &[], &mut None);
+        state.sync_config_files(&files, &[], &mut None);
         let mod_rs = &state
             .user_src_files
             .iter()
@@ -2005,7 +2328,7 @@ mod tests {
         assert_folder_exists(&state, "src/pins/configs/i2c1");
 
         // The bus goes: its whole folder goes, and so does the folder entry.
-        state.sync_config_files(&files[..1], false, &[], &mut None);
+        state.sync_config_files(&files[..1], &[], &mut None);
         assert_file_not_exists(&state, "src/pins/configs/i2c1/mod.rs");
         assert_file_not_exists(&state, "src/pins/configs/i2c1/device1.rs");
         assert!(
@@ -2018,8 +2341,8 @@ mod tests {
         );
 
         // Nothing configured at all: the subtree goes, subfolders included.
-        state.sync_config_files(&files, false, &[], &mut None);
-        state.sync_config_files(&[], false, &[], &mut None);
+        state.sync_config_files(&files, &[], &mut None);
+        state.sync_config_files(&[], &[], &mut None);
         assert!(
             !state
                 .user_src_folders
@@ -2049,14 +2372,14 @@ mod tests {
         state
             .user_src_files
             .push(("src/app/logic.rs".into(), "fn a() {}".into()));
-        state.sync_config_files(&both, false, &[], &mut None);
+        state.sync_config_files(&both, &[], &mut None);
         let at = |s: &ProjectTreeState, p: &str| s.user_src_files.iter().position(|(q, _)| q == p);
         let usart = at(&state, "src/pins/configs/usart1.rs").unwrap();
         let spi = at(&state, "src/pins/configs/spi1.rs").unwrap();
         assert!(spi < usart, "the fixture needs spi1 in front of usart1");
 
         let mut selected = Some(usart);
-        state.sync_config_files(&both[1..], false, &[], &mut selected);
+        state.sync_config_files(&both[1..], &[], &mut selected);
         assert_eq!(
             selected,
             at(&state, "src/pins/configs/usart1.rs"),
@@ -2066,14 +2389,13 @@ mod tests {
         let mut selected = at(&state, "src/pins/configs/usart1.rs");
         state.sync_config_files(
             &[("spi1.rs".to_string(), body.to_string())],
-            false,
             &[],
             &mut selected,
         );
         assert_eq!(selected, None, "its own file was pruned");
 
         let mut selected = at(&state, "src/app/logic.rs");
-        state.sync_config_files(&[], false, &[], &mut selected);
+        state.sync_config_files(&[], &[], &mut selected);
         assert_eq!(
             selected,
             at(&state, "src/app/logic.rs"),
@@ -2107,7 +2429,7 @@ mod tests {
     }
 
     fn sync(state: &mut ProjectTreeState, files: &[(String, String)]) -> ConfigSync {
-        state.sync_config_files(files, false, &[], &mut None)
+        state.sync_config_files(files, &[], &mut None)
     }
 
     fn text<'a>(state: &'a ProjectTreeState, path: &str) -> Option<&'a str> {
@@ -2205,12 +2527,7 @@ mod tests {
             .user_src_files
             .iter()
             .position(|(p, _)| *p == dev("device3"));
-        let r = st.sync_config_files(
-            &bus_files(&[("", 0, 2), ("", 0, 3)]),
-            false,
-            &[],
-            &mut selected,
-        );
+        let r = st.sync_config_files(&bus_files(&[("", 0, 2), ("", 0, 3)]), &[], &mut selected);
         assert_eq!(device_files(&st), vec![dev("device1"), dev("device2")]);
         let one = text(&st, &dev("device1")).unwrap();
         let two = text(&st, &dev("device2")).unwrap();
@@ -2305,7 +2622,6 @@ mod tests {
         let mut selected = at;
         let r = st.sync_config_files(
             &bus_files(&[("oled", 0x3C, 0), ("imu", 0x68, 0)]),
-            false,
             &[],
             &mut selected,
         );
@@ -2403,23 +2719,72 @@ mod tests {
         assert!(r.conflicts[0].1.contains("/* OLD */"));
     }
 
-    /// A Runtime Apply rewrites a bus's `mod.rs` whole - its `init` is what
-    /// changed - but a device file only gets its generated block: nothing in
-    /// it depends on the Runtime, and the rest is the user's.
+    /// A device renamed moves its file, and the stamp moves with it: an
+    /// untouched file then follows a template that changed in the same sync
+    /// (one naming the device below its markers) instead of being taken for
+    /// the user's - nothing stamped the new path before.
     #[test]
-    fn force_leaves_the_device_files_alone() {
+    fn an_untouched_device_file_follows_its_rename() {
+        // Device tails that name their device, as a future template may.
+        let named = |files: Vec<(String, String)>| -> Vec<(String, String)> {
+            files
+                .into_iter()
+                .map(|(name, body)| {
+                    let body = if name.contains("/device") {
+                        format!("{body}// for {name}\n")
+                    } else {
+                        body
+                    };
+                    (name, body)
+                })
+                .collect()
+        };
         let mut st = ProjectTreeState::new();
-        let files = bus_files(&[("oled", 0x3C, 1)]);
+        sync(&mut st, &named(bus_files(&[("oled", 0x3C, 1)])));
+        let after = named(bus_files(&[("screen", 0x3C, 1)]));
+        let report = sync(&mut st, &after);
+        assert_eq!(report.moved.len(), 1, "{:?}", report.moved);
+        assert!(report.kept.is_empty(), "{:?}", report.kept);
+        for (name, body) in &after {
+            let path = format!("src/pins/configs/{name}");
+            assert_eq!(text(&st, &path), Some(body.as_str()), "{path}");
+        }
+    }
+
+    /// A bus's `mod.rs` and its device files follow the same rule as every
+    /// config file: edited, they keep their text and are offered a changed
+    /// template; untouched, they follow it.
+    #[test]
+    fn an_edited_bus_keeps_its_init_and_an_untouched_device_follows() {
+        let mut st = ProjectTreeState::new();
+        let files = bus_files(&[("oled", 0x3C, 1), ("imu", 0x68, 2)]);
         sync(&mut st, &files);
         write_below(&mut st, &dev("device1_oled"), "// MINE");
         write_below(&mut st, &format!("{BUS}/mod.rs"), "// OLD-INIT");
-        st.sync_config_files(&files, true, &[], &mut None);
+        let report = sync(&mut st, &files);
+        assert!(report.kept.is_empty());
         assert!(text(&st, &dev("device1_oled")).unwrap().contains("// MINE"));
         assert!(
-            !text(&st, &format!("{BUS}/mod.rs"))
+            text(&st, &format!("{BUS}/mod.rs"))
                 .unwrap()
                 .contains("OLD-INIT")
         );
+
+        // Every template changes below its markers: the two edited files are
+        // offered theirs, the untouched device follows.
+        let newer: Vec<(String, String)> = files
+            .iter()
+            .map(|(n, b)| (n.clone(), format!("{b}// newer template\n")))
+            .collect();
+        let report = sync(&mut st, &newer);
+        let mut kept: Vec<&str> = report.kept.iter().map(|(p, _)| p.as_str()).collect();
+        kept.sort_unstable();
+        let bus_mod = format!("{BUS}/mod.rs");
+        assert_eq!(kept, [dev("device1_oled").as_str(), bus_mod.as_str()]);
+        assert!(text(&st, &bus_mod).unwrap().contains("OLD-INIT"));
+        let imu = newer.iter().find(|(n, _)| n.contains("imu")).unwrap();
+        assert_eq!(text(&st, &dev("device2_imu")), Some(imu.1.as_str()));
+        assert_eq!(report.replaced, [dev("device2_imu")]);
     }
 
     /// A bus that leaves the generated files - a pad cleared, a Runtime with
@@ -2754,23 +3119,23 @@ mod flash_store_sync_tests {
     fn an_edited_store_file_outlives_the_toggle_and_a_pristine_one_does_not() {
         let path = store_gen::tree_path();
         let mut tree = ProjectTreeState::new();
-        tree.sync_config_files(&store_files(), false, &[], &mut None);
+        tree.sync_config_files(&store_files(), &[], &mut None);
         assert!(content(&tree, &path).is_some());
 
         // Off, untouched: pruned like any config file.
         tree.kept_config_files = store_gen::kept_paths(&[], &tree.user_src_files);
-        tree.sync_config_files(&[], false, &[], &mut None);
+        tree.sync_config_files(&[], &[], &mut None);
         assert!(content(&tree, &path).is_none());
 
         // On again, the user's own field, then off: it stays, undeclared.
-        tree.sync_config_files(&store_files(), false, &[], &mut None);
+        tree.sync_config_files(&store_files(), &[], &mut None);
         for (p, c) in &mut tree.user_src_files {
             if *p == path {
                 *c = c.replace("pub counter: u32,", "pub counter: u32,\n    pub level: u8,");
             }
         }
         tree.kept_config_files = store_gen::kept_paths(&[], &tree.user_src_files);
-        tree.sync_config_files(&[], false, &[], &mut None);
+        tree.sync_config_files(&[], &[], &mut None);
         assert!(content(&tree, &path).is_some_and(|c| c.contains("pub level: u8,")));
         assert!(content(&tree, "src/pins/configs/mod.rs").is_none());
         // ...and `pins/mod.rs` must not declare a `configs` with no mod.rs
@@ -2785,7 +3150,7 @@ mod flash_store_sync_tests {
             "// <<< GENERATED>>>\npub const X: u32 = 1;\n// <<< GENERATED END >>>\n".to_owned(),
         )];
         tree.kept_config_files = store_gen::kept_paths(&other, &tree.user_src_files);
-        tree.sync_config_files(&other, false, &[], &mut None);
+        tree.sync_config_files(&other, &[], &mut None);
         assert!(content(&tree, &path).is_some());
         let m = content(&tree, "src/pins/configs/mod.rs").expect("mod.rs");
         assert!(
@@ -2797,20 +3162,19 @@ mod flash_store_sync_tests {
         assert!(pins.contains("pub mod configs;"), "{pins}");
     }
 
-    /// A Runtime Apply rewrites config files whole - but not this one: one
-    /// template serves every runtime, and the user's `Data` is below its
-    /// markers.
+    /// The user's `Data`, below the store file's markers, survives every
+    /// regeneration: one template serves every runtime.
     #[test]
-    fn a_forced_rewrite_spares_the_store_file() {
+    fn a_regeneration_spares_the_store_file() {
         let path = store_gen::tree_path();
         let mut tree = ProjectTreeState::new();
-        tree.sync_config_files(&store_files(), false, &[], &mut None);
+        tree.sync_config_files(&store_files(), &[], &mut None);
         for (p, c) in &mut tree.user_src_files {
             if *p == path {
                 c.push_str("\n// MINE\n");
             }
         }
-        tree.sync_config_files(&store_files(), true, &[], &mut None);
+        tree.sync_config_files(&store_files(), &[], &mut None);
         assert!(content(&tree, &path).is_some_and(|c| c.contains("// MINE")));
     }
 }
@@ -2831,37 +3195,45 @@ mod iot_secrets_sync_tests {
             .map(|(_, c)| c.clone())
     }
 
-    /// A Runtime Apply forces every config file to its template - except the
-    /// IoT ones, which no runtime changes: the user's code in espnow.rs stays.
+    /// The user's code in espnow.rs stays through a regeneration that changes
+    /// its template, as in every edited config file.
     #[test]
-    fn a_runtime_apply_leaves_the_iot_files_to_the_user() {
+    fn a_changed_template_leaves_an_edited_iot_file_to_the_user() {
         let path = "src/pins/configs/espnow.rs";
         let body = "// <<< GENERATED>>>\npub const CHANNEL: u8 = 1;\n// <<< GENERATED END >>>\n\nfn template() {}\n";
         let files = vec![(iot_gen::ESPNOW.to_owned(), body.to_owned())];
         let mut tree = ProjectTreeState::new();
-        tree.sync_config_files(&files, false, &[], &mut None);
+        tree.sync_config_files(&files, &[], &mut None);
         for (p, c) in &mut tree.user_src_files {
             if p == path {
                 c.push_str("fn mine() {}\n");
             }
         }
-        tree.sync_config_files(&files, true, &[], &mut None);
+        let newer = vec![(
+            iot_gen::ESPNOW.to_owned(),
+            body.replace("fn template() {}", "fn template_v2() {}"),
+        )];
+        let report = tree.sync_config_files(&newer, &[], &mut None);
+        assert_eq!(report.kept.len(), 1);
         let kept = tree
             .user_src_files
             .iter()
             .find(|(p, _)| p == path)
             .map(|(_, c)| c.clone())
             .unwrap();
-        assert!(kept.contains("fn mine() {}"), "{kept}");
+        assert!(
+            kept.contains("fn mine() {}") && kept.contains("fn template() {}"),
+            "{kept}"
+        );
     }
 
     /// Thread switched on in a project whose `secrets.rs` the station wrote:
-    /// the file gets THREAD_DATASET's empty line and keeps every value - on a
-    /// plain sync and on a forced one.
+    /// the file gets THREAD_DATASET's empty line and keeps every value, sync
+    /// after sync.
     #[test]
     fn a_later_link_adds_its_secret_line_only() {
         let mut tree = ProjectTreeState::new();
-        tree.sync_config_files(&files(), false, &[], &mut None);
+        tree.sync_config_files(&files(), &[], &mut None);
         let mine = iot_gen::write_secret(&secrets(&tree).unwrap(), "WIFI_PASSWORD", "hunter2");
         for (p, c) in &mut tree.user_src_files {
             if p == iot_gen::SECRETS_PATH {
@@ -2872,8 +3244,8 @@ mod iot_secrets_sync_tests {
             iot_gen::SECRETS.to_owned(),
             iot_gen::secrets_body_for(true, true),
         )];
-        for force in [false, true] {
-            tree.sync_config_files(&both, force, &[], &mut None);
+        for _ in 1..=2 {
+            tree.sync_config_files(&both, &[], &mut None);
             let now = secrets(&tree).unwrap();
             assert!(now.starts_with(&mine), "{now}");
             assert_eq!(
@@ -2889,12 +3261,12 @@ mod iot_secrets_sync_tests {
         }
     }
 
-    /// The password typed into `secrets.rs` survives every regeneration, a
-    /// forced one (a Runtime Apply) included, and switching the tab off.
+    /// The password typed into `secrets.rs` survives every regeneration, and
+    /// switching the tab off.
     #[test]
     fn the_secrets_file_is_never_rewritten() {
         let mut tree = ProjectTreeState::new();
-        tree.sync_config_files(&files(), false, &[], &mut None);
+        tree.sync_config_files(&files(), &[], &mut None);
         let body = secrets(&tree).expect("written when missing");
         let mine = iot_gen::write_secret(&body, "WIFI_PASSWORD", "hunter2");
         for (p, c) in &mut tree.user_src_files {
@@ -2902,14 +3274,14 @@ mod iot_secrets_sync_tests {
                 *c = mine.clone();
             }
         }
-        tree.sync_config_files(&files(), false, &[], &mut None);
+        tree.sync_config_files(&files(), &[], &mut None);
         assert_eq!(secrets(&tree).as_deref(), Some(mine.as_str()), "spliced");
-        tree.sync_config_files(&files(), true, &[], &mut None);
-        assert_eq!(secrets(&tree).as_deref(), Some(mine.as_str()), "forced");
+        tree.sync_config_files(&files(), &[], &mut None);
+        assert_eq!(secrets(&tree).as_deref(), Some(mine.as_str()), "again");
 
         // Off: kept, because there is a password in it.
         tree.kept_config_files = iot_gen::kept_paths(&[], &tree.user_src_files);
-        tree.sync_config_files(&[], false, &[], &mut None);
+        tree.sync_config_files(&[], &[], &mut None);
         assert_eq!(secrets(&tree).as_deref(), Some(mine.as_str()), "kept");
     }
 }

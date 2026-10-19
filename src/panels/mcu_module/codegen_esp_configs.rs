@@ -54,10 +54,10 @@ const GEN_END: &str = "// <<< GENERATED END >>>";
 ///
 /// The example is COMMENTED on purpose: it names a handle (`_uart0`) that only
 /// exists in `main.rs`, so as code it would not compile here — it is there to be
-/// read and copied into the loop. It also tracks the runtime: a Runtime /
-/// Init-API Apply rewrites config files wholesale (`sync_config_files(force)`),
-/// so switching Blocking ⇄ Async replaces the example along with the `init` it
-/// describes.
+/// read and copied into the loop. It also tracks the runtime: a file still
+/// holding the IDE's text follows its changed template whole (see
+/// `project_tree::templates`), so switching Blocking ⇄ Async replaces the
+/// example along with the `init` it describes.
 fn file(uses: &str, consts: &str, body: &str, example: &str) -> String {
     format!(
         "{uses}\n\

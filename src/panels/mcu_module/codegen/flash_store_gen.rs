@@ -776,17 +776,21 @@ pub fn kept_paths(files: &[(String, String)], tree: &[(String, String)]) -> Vec<
 /// Then switching the store off may let it go; otherwise it holds the user's
 /// `Data` and is kept (see `ProjectTreeState::kept_config_files`).
 pub fn is_pristine(content: &str) -> bool {
-    let tail = |s: &str| {
-        s.split_once(GEN_END_CFG)
-            .map(|(_, t)| t.replace("\r\n", "\n"))
-    };
-    let Some(mine) = tail(content) else {
+    use crate::project_tree::templates::editable;
+    // Measured as the sync measures it. Text above the block is the user's -
+    // no template has any - and keeps the file too.
+    let Some((head, mine)) = editable(content) else {
         return false;
     };
-    TEMPLATES.iter().any(|t| tail(t).is_some_and(|t| t == mine))
+    head.is_empty()
+        && TEMPLATES
+            .iter()
+            .any(|t| editable(t).is_some_and(|(_, t)| t == mine))
 }
 
-/// The end marker of a config file's GENERATED block (not `main.rs`'s).
+/// The end marker of a config file's GENERATED block (not `main.rs`'s), for
+/// the tests: the code finds the block with `templates::block`.
+#[cfg(test)]
 const GEN_END_CFG: &str = "// <<< GENERATED END >>>";
 
 /// The generated-block lines in `main.rs` for `mcu`'s store - see

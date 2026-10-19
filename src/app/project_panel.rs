@@ -58,6 +58,8 @@ pub(super) struct ProjectPanelSignals {
     pub move_to_folder: Option<String>,
     /// "Publish…" was picked on a library; the app opens the publish dialog.
     pub publish_lib: Option<String>,
+    /// "Reset to template" / "Keep my version" was picked on a config file.
+    pub template_action: Option<crate::project_tree::gui::TemplateAction>,
 }
 
 impl AppIde {
@@ -199,6 +201,7 @@ impl AppIde {
         let mut goto_error: Option<crate::app::ProjectFileId> = None;
         let mut rename_request: Option<crate::project_tree::gui::RenameRequest> = None;
         let mut move_to_folder: Option<String> = None;
+        let mut template_action = None;
         let mut publish_lib: Option<String> = None;
 
         // Collapsed: the panel is not built at all, so the editor and the MCU
@@ -423,6 +426,10 @@ impl AppIde {
                             } else {
                                 crate::workspace::dir()
                             };
+                            let mut template_rows = crate::project_tree::gui::TemplateRows {
+                                marks: &self.project_tree.template_marks,
+                                action: None,
+                            };
                             show_project_tree_panel(
                                 ui,
                                 &project.pkg_name,
@@ -461,7 +468,9 @@ impl AppIde {
                                 &mut goto_error,
                                 &mut move_to_folder,
                                 &mut rename_request,
+                                &mut template_rows,
                             );
+                            template_action = template_rows.action;
                         }
                         _ => {
                             ui.add_space(12.0);
@@ -498,6 +507,7 @@ impl AppIde {
             goto_error,
             rename_request,
             move_to_folder,
+            template_action,
             publish_lib,
         }
     }

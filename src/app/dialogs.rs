@@ -309,7 +309,7 @@ impl AppIde {
             return;
         };
         let short = &sha[..sha.len().min(7)];
-        let unsaved = self.git.state.lock().unwrap().unsaved.clone();
+        let unsaved = self.git_unsaved();
         let mut keep = true;
         let mut confirmed = false;
 
@@ -411,7 +411,7 @@ impl AppIde {
         let Some(branch) = self.git_switch_confirm.clone() else {
             return;
         };
-        let unsaved = self.git.state.lock().unwrap().unsaved.clone();
+        let unsaved = self.git_unsaved();
         let mut keep = true;
         let mut confirmed = false;
 
@@ -1398,7 +1398,13 @@ impl AppIde {
                         // project's first regeneration would bring them back,
                         // their code below the markers included.
                         self.project_tree.config_graveyard.clear();
+                        // And what the previous project's record knew: a new
+                        // project's files are the IDE's own.
+                        self.project_tree.templates = Default::default();
+                        self.project_tree.template_marks.clear();
+                        self.project_tree.reset_requested.clear();
                         self.config_moves = Default::default();
+                        self.config_templates = Default::default();
                         // Fresh config files (Cargo.toml, memory.x, …) for the
                         // selected chip — a clean slate for the new project.
                         self.reset_config_files();

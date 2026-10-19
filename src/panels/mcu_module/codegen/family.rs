@@ -3080,7 +3080,7 @@ mod tests {
             // rename made through the panel's own write path.
             let mut tree = ProjectTreeState::new();
             let sync = |tree: &mut ProjectTreeState, mcu: &Mcu| {
-                tree.sync_config_files(&mcu.config_files(), false, &[], &mut None);
+                tree.sync_config_files(&mcu.config_files(), &[], &mut None);
                 tree.sync_pin_files(&mcu.all_pin_functions());
             };
             sync(&mut tree, &mcu);
@@ -5913,5 +5913,218 @@ mod esp_gpio_mode_tests {
                 "{id} offers a GPIO mode on a USART pad"
             );
         }
+    }
+}
+
+/// A Runtime Apply in a real project, end to end through the generators and
+/// the tree: the files decide for themselves whether they follow their
+/// template (`project_tree::templates`), so an untouched project switched
+/// must land on the project a fresh one would be, and an edited one must keep
+/// every edit - with exactly the files whose template changed offered theirs.
+#[cfg(test)]
+mod config_template_switch_tests {
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::mcu::Mcu;
+    use crate::panels::mcu_module::mcu::model::Runtime;
+    use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+    use crate::project_tree::logic::{ConfigSync, ProjectTreeState};
+    use crate::project_tree::templates;
+
+    fn pwm(timer: u8, channel: u8) -> PinFunction {
+        PinFunction::TimerPwm { timer, channel }
+    }
+
+    /// `(chip, wiring, the runtimes it switches between)`.
+    fn cases() -> Vec<(&'static str, Vec<(&'static str, PinFunction)>, Vec<Runtime>)> {
+        vec![
+            (
+                "stm32f103c8t6",
+                vec![
+                    ("PA9", PinFunction::UsartTx(1)),
+                    ("PA10", PinFunction::UsartRx(1)),
+                    ("PA5", PinFunction::SpiSck(1)),
+                    ("PA6", PinFunction::SpiMiso(1)),
+                    ("PA7", PinFunction::SpiMosi(1)),
+                    ("PB6", PinFunction::I2cScl(1)),
+                    ("PB7", PinFunction::I2cSda(1)),
+                    ("PA2", pwm(2, 3)),
+                    ("PC13", PinFunction::GpioOutput),
+                ],
+                vec![
+                    Runtime::Blocking,
+                    Runtime::Native,
+                    Runtime::Async,
+                    Runtime::Rtic,
+                ],
+            ),
+            (
+                "esp32c3",
+                vec![
+                    ("GPIO21", PinFunction::UsartTx(0)),
+                    ("GPIO20", PinFunction::UsartRx(0)),
+                    ("GPIO8", PinFunction::I2cScl(0)),
+                    ("GPIO9", PinFunction::I2cSda(0)),
+                    ("GPIO2", PinFunction::GpioOutput),
+                ],
+                vec![Runtime::Blocking, Runtime::Async],
+            ),
+            (
+                "rp2040_pico",
+                vec![
+                    ("GP0", PinFunction::UsartTx(0)),
+                    ("GP1", PinFunction::UsartRx(0)),
+                    ("GP2", pwm(1, 1)),
+                ],
+                vec![Runtime::Blocking, Runtime::Async],
+            ),
+            (
+                "nrf52833_microbit_v2",
+                vec![
+                    ("P0.06", PinFunction::UsartTx(0)),
+                    ("P1.08", PinFunction::UsartRx(0)),
+                    ("P0.08", PinFunction::I2cScl(0)),
+                    ("P0.16", PinFunction::I2cSda(0)),
+                    ("P0.00", pwm(0, 0)),
+                ],
+                vec![Runtime::Blocking, Runtime::Async],
+            ),
+        ]
+    }
+
+    fn wired(id: &str, wiring: &[(&str, PinFunction)], runtime: Runtime) -> Mcu {
+        let mut mcu = builtin_for(id)
+            .unwrap_or_else(|| panic!("built-in {id}"))
+            .build_mcu();
+        mcu.runtime = runtime;
+        mcu.pending_runtime = runtime;
+        for (name, func) in wiring {
+            // A board names its pads after the chip pin, then its own label
+            // (`P0.06 (RING1)`): the pin, not a longer one (`P0.0` vs `P0.06`).
+            let num = mcu
+                .iter_all_pins()
+                .find(|p| {
+                    p.name.strip_prefix(*name).is_some_and(|rest| {
+                        !rest.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+                    })
+                })
+                .map(|p| p.number)
+                .unwrap_or_else(|| panic!("{id}: no pad {name}"));
+            if let Some(p) = mcu.find_pin_mut(num) {
+                p.selected_function = func.clone();
+            }
+        }
+        if id.starts_with("stm32") {
+            use crate::panels::mcu_module::watchdog::IwdgConfig;
+            mcu.watchdog.iwdg = Some(IwdgConfig {
+                timeout_us: 2_000_000,
+            });
+        }
+        mcu.reconcile_modules();
+        mcu
+    }
+
+    /// The two calls the app makes on every regeneration.
+    fn sync(tree: &mut ProjectTreeState, mcu: &Mcu) -> ConfigSync {
+        let report =
+            tree.sync_config_files(&mcu.config_files(), &mcu.custom_keep_prefixes(), &mut None);
+        tree.sync_pin_files(&mcu.all_pin_functions());
+        report
+    }
+
+    /// The Apply button: the runtime committed, the next regeneration flagged.
+    fn switch(mcu: &mut Mcu, to: Runtime) {
+        mcu.pending_runtime = to;
+        mcu.apply_pending_style();
+    }
+
+    fn sorted(mut files: Vec<(String, String)>) -> Vec<(String, String)> {
+        files.sort();
+        files
+    }
+
+    fn pairs() -> Vec<(
+        &'static str,
+        Vec<(&'static str, PinFunction)>,
+        Runtime,
+        Runtime,
+    )> {
+        let mut out = Vec::new();
+        for (id, wiring, runtimes) in cases() {
+            for &from in &runtimes {
+                for &to in &runtimes {
+                    if from != to {
+                        out.push((id, wiring.clone(), from, to));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_pristine_project_switched_is_a_fresh_project() {
+        let mut wrong = Vec::new();
+        for (id, wiring, from, to) in pairs() {
+            let mut mcu = wired(id, &wiring, from);
+            let mut tree = ProjectTreeState::new();
+            sync(&mut tree, &mcu);
+            switch(&mut mcu, to);
+            let report = sync(&mut tree, &mcu);
+            assert!(
+                report.kept.is_empty(),
+                "{id} {from:?} -> {to:?}: {:?}",
+                report.kept
+            );
+            if sorted(tree.user_src_files.clone())
+                != sorted(wired(id, &wiring, to).pin_tree_files())
+            {
+                wrong.push(format!("{id} {from:?} -> {to:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn an_edited_project_switched_keeps_every_edit() {
+        let mut checked = 0;
+        for (id, wiring, from, to) in pairs() {
+            let mut mcu = wired(id, &wiring, from);
+            let mut tree = ProjectTreeState::new();
+            sync(&mut tree, &mcu);
+            let before: Vec<(String, String)> = tree.user_src_files.clone();
+            for (path, content) in &mut tree.user_src_files {
+                if path.starts_with("src/pins/configs/") && templates::editable(content).is_some() {
+                    content.push_str(&format!("// MINE {path}\n"));
+                }
+            }
+            switch(&mut mcu, to);
+            let report = sync(&mut tree, &mcu);
+            let fresh = wired(id, &wiring, to).pin_tree_files();
+            for (path, content) in &tree.user_src_files {
+                let Some((_, was)) = before.iter().find(|(p, _)| p == path) else {
+                    continue;
+                };
+                if templates::editable(was).is_none() || !path.starts_with("src/pins/configs/") {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    content.contains(&format!("// MINE {path}")),
+                    "{id} {from:?} -> {to:?}: {path} lost the edit:\n{content}"
+                );
+                // Offered exactly when the template moved under the edit.
+                let now = fresh
+                    .iter()
+                    .find(|(p, _)| p == path)
+                    .map(|(_, b)| b.as_str());
+                let moved = now.is_some_and(|b| templates::editable(b) != templates::editable(was));
+                let offered = report.kept.iter().any(|(p, _)| p == path);
+                assert_eq!(offered, moved, "{id} {from:?} -> {to:?}: {path}");
+            }
+        }
+        assert!(
+            checked > 50,
+            "only {checked} edited files went through a switch"
+        );
     }
 }

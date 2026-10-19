@@ -469,7 +469,7 @@ impl AppIde {
         // which discards unsaved editor edits — confirm first if any exist,
         // otherwise switch straight away.
         if let Some(b) = git_switch_branch {
-            let has_unsaved = !self.git.state.lock().unwrap().unsaved.is_empty();
+            let has_unsaved = !self.git_unsaved().is_empty();
             if has_unsaved {
                 self.git_switch_confirm = Some(b);
             } else {

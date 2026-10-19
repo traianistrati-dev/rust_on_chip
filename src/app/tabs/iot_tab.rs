@@ -407,7 +407,7 @@ impl AppIde {
                         "the WIFI peripheral), and you edited it too far for the IDE to move it. ",
                         "main.rs creates the radio now: make `init` take ",
                         "(spawner, controller: WifiController<'static>, station: Interface<'static>), ",
-                        "or delete the file to get the current template."
+                        "or use Reset to template in its right-click menu (or delete the file)."
                     )));
                 }
                 if let Some(t) = &thread_target_off {
@@ -425,7 +425,7 @@ impl AppIde {
                     ui.label(warn(format!(
                         "src/pins/configs/{name} was written for the radio of the chip before, and \
                          you edited it, so the IDE left it: it does not fit this chip's main.rs. \
-                         Move your code into the current template - delete the file to get it."
+                         Move your code into the current template - Reset to template in its right-click menu, your version copied first - or delete the file."
                     )));
                 }
                 for text in &radio_clashes {
@@ -2526,7 +2526,7 @@ fn mqtt_shadow_section(ui: &mut egui::Ui, m: &mut MqttConfig, tls: &TlsFacts) {
         }
         if tls.no_mqtt_shadow {
             ui.label(warn(
-                "src/pins/configs/mqtt.rs is from before the Device Shadow, and you edited it, so the IDE left it: its shadow_* calls are missing. Move your changes into the current template (delete the file to get it).",
+                "src/pins/configs/mqtt.rs is from before the Device Shadow, and you edited it, so the IDE left it: its shadow_* calls are missing. Move your changes into the current template (Reset to template in its right-click menu, your version copied first - or delete the file).",
             ));
         }
         if tls.http_shadow {
@@ -3024,7 +3024,7 @@ fn aws_https_section(
     }
     if f.no_aws_publish {
         ui.label(warn(
-            "src/pins/configs/http.rs is from before aws_publish(), and you edited it, so the IDE left it: the line below would not build. Move your changes into the current template (delete the file to get it).",
+            "src/pins/configs/http.rs is from before aws_publish(), and you edited it, so the IDE left it: the line below would not build. Move your changes into the current template (Reset to template in its right-click menu, your version copied first - or delete the file).",
         ));
     }
     let named = if thing.is_empty() { "my-thing" } else { thing.as_str() };
@@ -3041,7 +3041,7 @@ fn aws_https_section(
     });
     if h.aws_retain && f.no_aws_message && !f.no_aws_publish {
         ui.label(warn(
-            "src/pins/configs/http.rs is from before AwsMessage and aws_publish_with(), and you edited it, so the IDE left it: aws_publish() works, the retained line below would not build. Move your changes into the current template (delete the file to get it).",
+            "src/pins/configs/http.rs is from before AwsMessage and aws_publish_with(), and you edited it, so the IDE left it: aws_publish() works, the retained line below would not build. Move your changes into the current template (Reset to template in its right-click menu, your version copied first - or delete the file).",
         ));
     }
     if h.aws_retain {
@@ -3061,7 +3061,7 @@ fn aws_https_section(
     });
     if h.aws_shadow && f.no_shadow && !f.no_aws_publish {
         ui.label(warn(
-            "src/pins/configs/http.rs is from before the Device Shadow, and you edited it, so the IDE left it: aws_publish() works, the shadow lines below would not build. Move your changes into the current template (delete the file to get it).",
+            "src/pins/configs/http.rs is from before the Device Shadow, and you edited it, so the IDE left it: aws_publish() works, the shadow lines below would not build. Move your changes into the current template (Reset to template in its right-click menu, your version copied first - or delete the file).",
         ));
     }
     if h.aws_shadow {

@@ -752,6 +752,7 @@ mod apply_tests {
             user_src_folders: folders.iter().map(|f| (*f).to_owned()).collect(),
             config_graveyard: Vec::new(),
             kept_config_files: Vec::new(),
+            ..ProjectTreeState::new()
         }
     }
 

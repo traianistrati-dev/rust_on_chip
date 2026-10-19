@@ -383,7 +383,7 @@ impl AppIde {
         let mut arm_confirm = false;
 
         // Read before the window borrows `self`. Cheap, unlike
-        // `unsaved_files()`, which takes a disk snapshot and so stays where it
+        // `unsaved_source_files()`, which takes a disk snapshot and so stays where it
         // is - inside `start_cargo_publish`, checked once per click.
         //
         // And read BEFORE the retry below clears `save_pending`, deliberately.
@@ -1133,7 +1133,7 @@ impl AppIde {
         // BOTH runs, not just the upload: a rehearsal of text that never
         // reached the folder is a rehearsal of a different crate, and it
         // reports "dry run passed" for it.
-        if !self.unsaved_files().is_empty() {
+        if !self.unsaved_source_files().is_empty() {
             if let Some(d) = &mut self.publish_dialog {
                 d.error = Some(
                     "Save the project first (Ctrl+S) - cargo reads the folder on disk, not the \

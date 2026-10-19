@@ -36,6 +36,7 @@ impl AppIde {
         // that should be now - not in the middle of the user's first edit.
         self.mcu_state_hash = 0;
         self.config_moves = Default::default();
+        self.config_templates = Default::default();
         // Timing regions point into the files just replaced, and the last run
         // measured them.
         self.timing.forget();
@@ -1419,6 +1420,44 @@ impl AppIde {
     /// (configured a pin, added a module or a source file). Otherwise a
     /// pristine start-up state would nag on every exit.
     pub(super) fn unsaved_files(&self) -> Vec<String> {
+        let mut out = self.unsaved_source_files();
+        if self.template_record_unsaved() {
+            out.push(crate::project_tree::templates::RECORD.to_owned());
+        }
+        out
+    }
+
+    /// Is the record of the config templates ahead of the one on disk? An
+    /// offer made or taken, a template turned down, a file adopted on open: a
+    /// change the next Save writes into the record, though no file's text
+    /// moved. Reads the record from disk.
+    pub(super) fn template_record_unsaved(&self) -> bool {
+        use crate::project_tree::templates;
+        let Some(dir) = &self.project_dir else {
+            return false;
+        };
+        let in_tree = |p: &str| self.project_tree.user_src_files.iter().any(|(f, _)| f == p);
+        let memory = self.project_tree.templates.kept(in_tree);
+        !templates::record_changes(&memory, &templates::TemplateRecord::load(dir)).is_empty()
+    }
+
+    /// The Git tab's unsaved files - its worker diffs the buffers - and the
+    /// template record, which no buffer holds: a branch switch or a restore
+    /// reloads it from disk as it does the files.
+    pub(super) fn git_unsaved(&self) -> Vec<String> {
+        let mut out = self.git.state.lock().unwrap().unsaved.clone();
+        let record = crate::project_tree::templates::RECORD;
+        if !out.iter().any(|p| p == record) && self.template_record_unsaved() {
+            out.push(record.to_owned());
+        }
+        out
+    }
+
+    /// [`Self::unsaved_files`] without the IDE's record of its config
+    /// templates: what cargo and rust-analyzer would read stale. Neither reads
+    /// the record, so a change to it alone must not hold back a rename's
+    /// reference edits or a publish.
+    pub(super) fn unsaved_source_files(&self) -> Vec<String> {
         let snapshot = self.git_disk_snapshot();
         match &self.project_dir {
             Some(dir) => crate::git::unsaved_changes(

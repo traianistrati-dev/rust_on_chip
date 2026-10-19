@@ -33,6 +33,7 @@ mod clock_import_dialog;
 mod clone_project_dialog;
 mod close_guard;
 mod config_moves;
+mod config_templates;
 mod datasheet_import_dialog;
 mod device_groups;
 mod dialogs;
@@ -1675,6 +1676,10 @@ pub struct AppIde {
     /// (UI stays responsive; the header shows a "Saving…" spinner).
     #[allow(clippy::type_complexity)]
     save_in_progress: Option<Arc<Mutex<Option<Result<String, String>>>>>,
+    /// Why the last Save could not write `.rustonchip/templates.ron`, set by
+    /// its worker. The files themselves are saved, so the Save succeeds - but
+    /// the project still counts as unsaved, and the status line says why.
+    save_record_error: Arc<Mutex<Option<String>>>,
     /// Increments on every user Save. All the actions one Ctrl+S produces
     /// (project write → LSP flush → wall clock) carry this id, so the Activity
     /// tab shows ONE group per save instead of one per action.
@@ -2227,6 +2232,8 @@ pub struct AppIde {
     /// the workspace write, rust-analyzer's closes, the notice (see
     /// `config_moves`).
     config_moves: config_moves::ConfigMoves,
+    /// Edited config files kept on their old template - see `config_templates`.
+    config_templates: config_templates::ConfigTemplates,
 
     /// A `--project` argument that could not be used (missing folder, no
     /// `Cargo.toml`). Shown as a banner and dismissible: a bad argument must
@@ -2481,6 +2488,7 @@ impl AppIde {
             save_wall: None,
             export_msg: String::new(),
             save_in_progress: None,
+            save_record_error: Arc::new(Mutex::new(None)),
             save_session: 0,
             save_dest: None,
             egui_ctx: cc.egui_ctx.clone(),
@@ -2600,6 +2608,9 @@ impl AppIde {
                 ),
                 config_graveyard: Vec::new(),
                 kept_config_files: Vec::new(),
+                // The record comes with the project: the startup restore goes
+                // through `load_project_from_dir`, which reads it.
+                ..ProjectTreeState::new()
             },
             new_src_name: None,
             new_src_folder_name: None,
@@ -2675,6 +2686,7 @@ impl AppIde {
             startup_picker: None,
             workspace_write_requested: false,
             config_moves: Default::default(),
+            config_templates: Default::default(),
             cli_project_error: cli_error,
             // Empty, not the startup title: the first frame then always pushes
             // one title, so what the window shows can't drift from what this
@@ -3748,16 +3760,15 @@ impl AppIde {
                 ProjectFileId::UserFile(i) => Some(i),
                 _ => None,
             };
-            let report = self.project_tree.sync_config_files(
-                &config_files,
-                force_configs,
-                &keep,
-                &mut selected,
-            );
+            let report = self
+                .project_tree
+                .sync_config_files(&config_files, &keep, &mut selected);
             if let ProjectFileId::UserFile(_) = self.selected_file {
                 self.selected_file =
                     selected.map_or(ProjectFileId::MainRs, ProjectFileId::UserFile);
             }
+            // After an Apply a kept file gets a window; otherwise a status line.
+            self.follow_template_sync(&report, force_configs);
             self.follow_config_sync(report);
             self.project_tree.sync_pin_files(&all_pins);
             if force_configs {
@@ -4644,10 +4655,39 @@ impl AppIde {
                 self.export_msg = format!("{}  {name}", egui_phosphor::regular::CHECK_CIRCLE);
                 self.export_status_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                let record_failed = self.save_record_error.lock().unwrap().take();
+                let saved_name = name.clone();
                 self.project_name = Some(name);
                 // A new project now has a home — later saves go here.
                 let had_dir = self.project_dir.clone();
                 self.project_dir = self.save_dest.take();
+                // The templates offered beside edited config files, as they
+                // are NOW - into a first Save's new folder too. Before a
+                // close or an open below can replace the project.
+                self.reconcile_config_templates();
+                // Saved, all but the record. When it still holds a change the
+                // prompts count (`unsaved_files`), the project stays "unsaved"
+                // until it can be written, and this is the only place that
+                // says why; a difference in bookkeeping alone costs nothing.
+                let record_pending = record_failed.is_some() && self.template_record_unsaved();
+                if let Some(e) = &record_failed {
+                    let record = crate::project_tree::templates::RECORD;
+                    self.export_msg = if record_pending {
+                        format!(
+                            "{}  {saved_name} saved, but {record} could not be written ({e}) - the project still counts as unsaved",
+                            egui_phosphor::regular::WARNING
+                        )
+                    } else {
+                        format!(
+                            "{}  {saved_name} saved ({record} could not be refreshed: {e})",
+                            egui_phosphor::regular::WARNING
+                        )
+                    };
+                    self.export_status_until = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(if record_pending { 12 } else { 6 }),
+                    );
+                }
                 // First save into a folder → claim it. Re-claiming on every
                 // save would be wasted work (and would briefly release a
                 // folder we already hold), so only when it changed.
@@ -4668,6 +4708,23 @@ impl AppIde {
                     }
                     // …and where a "New chip" becomes a chip of its system.
                     self.board_register_saved_chip();
+                }
+                // The record is the one thing not on disk: hold the close /
+                // open / new the prompt put on hold, as a failed save does, so
+                // the user reads why and can still discard deliberately.
+                // Only when the record still holds a change the prompt counts
+                // (`unsaved_files`): one that differs in bookkeeping alone
+                // would leave the prompt nothing to hold for.
+                if record_pending {
+                    // The project stays open with its files written: the
+                    // flush held back in case it was about to be closed or
+                    // replaced is owed now, as for a cancelled picker.
+                    if self.close.after_save || self.open_after_save || self.new_after_save {
+                        self.lsp_flush_requested = true;
+                    }
+                    self.close.after_save = false;
+                    self.open_after_save = false;
+                    self.new_after_save = false;
                 }
                 // "Save and close": the files are on disk now, so finish
                 // the close the prompt put on hold.
@@ -5272,6 +5329,9 @@ impl eframe::App for AppIde {
                     Some(publish_dialog::PublishDialog::new(dir, &manifest, targets));
             }
         }
+        if let Some(action) = signals.template_action {
+            self.apply_template_action(action);
+        }
         if let Some(path) = signals.move_to_folder {
             self.move_file_dialog = Some(move_file_dialog::MoveFileDialog::new(path));
         }
@@ -5549,6 +5609,13 @@ impl eframe::App for AppIde {
                 let t_prelude = std::time::Instant::now();
                 let files = self.current_project_files();
                 let user_files = self.project_tree.user_src_files.clone();
+                // What the IDE last wrote into each config file still in the
+                // project. The copies beside them follow on the UI thread, in
+                // `apply_finished_save`.
+                let template_record = self
+                    .project_tree
+                    .templates
+                    .kept(|p| user_files.iter().any(|(f, _)| f == p));
                 let mcu_cfg = self.mcu_config_text();
                 let structure_cfg = self.structure_config_text();
                 let prelude = t_prelude.elapsed();
@@ -5557,6 +5624,8 @@ impl eframe::App for AppIde {
                 let ctx = self.egui_ctx.clone();
                 let dest_thread = dest.clone();
                 let activity = Arc::clone(&self.activity);
+                let record_error = Arc::clone(&self.save_record_error);
+                *record_error.lock().unwrap() = None;
                 std::thread::spawn(move || {
                     // Reports a failure if this thread dies before setting the
                     // result — otherwise the UI hangs on "Saving…".
@@ -5572,6 +5641,16 @@ impl eframe::App for AppIde {
                                 &mcu_cfg,
                                 &structure_cfg,
                             )
+                        })
+                        .map(|()| {
+                            // After the files it describes. A failure here
+                            // costs only care: an unknown file counts as
+                            // edited at the next open, never overwritten.
+                            if let Err(e) =
+                                crate::project_tree::templates::save(&dest_thread, &template_record)
+                            {
+                                *record_error.lock().unwrap() = Some(e.to_string());
+                            }
                         })
                         .map(|()| {
                             dest_thread
@@ -5652,6 +5731,7 @@ impl eframe::App for AppIde {
         self.show_library_action_dialog(ui);
         self.show_workspace_add_error_dialog(ui);
         self.show_config_moves_notice(ui);
+        self.show_config_templates_notice(ui);
         self.show_exit_prompt(ui);
         self.show_open_project_prompt(ui, &mut save_project_needed);
         self.show_new_project_prompt(ui);

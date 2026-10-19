@@ -4,6 +4,7 @@ use crate::app::ProjectFileId;
 use crate::panels::mcu_module::mcu_catalog::ToolchainKind;
 use crate::project_tree::clipboard;
 use crate::project_tree::logic::SRC_ROOT;
+use crate::project_tree::templates;
 use crate::{build, lsp};
 use eframe::egui;
 use egui_phosphor::regular as ph;
@@ -34,6 +35,23 @@ pub struct RenameRequest {
     pub old_path: String,
     /// Project-root-relative, same folder as `old_path`.
     pub new_path: String,
+}
+
+/// The config files the tree can give their template back to - see
+/// [`templates`]: the marks the last sync left, and what a row's menu asked
+/// for, for the app to act on.
+pub struct TemplateRows<'a> {
+    pub marks: &'a BTreeMap<String, templates::Mark>,
+    pub action: Option<TemplateAction>,
+}
+
+/// A config file's template, picked from its row menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TemplateAction {
+    /// Write the template over the file - a copy of the file is kept first.
+    Reset(String),
+    /// Keep the user's version and drop the template offered beside it.
+    Keep(String),
 }
 
 /// The last path segment of a `src/`-relative path (the bare file/folder name).
@@ -1087,6 +1105,8 @@ pub fn show_project_tree(
     move_to_folder: &mut Option<String>,
     // A validated file rename for the app to perform (see `RenameRequest`).
     rename_request: &mut Option<RenameRequest>,
+    // Config files' templates: what the rows show, and a Reset / Keep picked.
+    templates: &mut TemplateRows<'_>,
 ) {
     // Diagnostic status of the user files (cargo + rust-analyzer), so
     // `user_file_row` can flag them: `true` = has ERRORS (red icon), `false` =
@@ -1304,6 +1324,7 @@ pub fn show_project_tree(
                     &mut move_request,
                     extract_folder,
                     &file_diags,
+                    templates,
                 );
             });
 
@@ -1675,6 +1696,7 @@ pub fn show_project_tree(
                         &mut move_request,
                         extract_folder,
                         &file_diags,
+                        templates,
                     );
                 });
                 state.store(ui.ctx());
@@ -1874,6 +1896,7 @@ pub fn show_project_tree(
                             &mut move_request,
                             extract_folder,
                             &file_diags,
+                            templates,
                         );
                     });
                     state.store(ui.ctx());
@@ -2159,6 +2182,7 @@ fn render_tree_node(
     extract_folder: &mut Option<String>,
     // User-file diagnostic status: `true` = errors, `false` = warnings-only.
     file_diags: &std::collections::HashMap<String, bool>,
+    templates: &mut TemplateRows<'_>,
 ) {
     let default_tree_folder_color = egui::Color32::from_rgb(100, 105, 115);
     // While any inline edit is active (new file/folder input or a rename), don't
@@ -2181,6 +2205,7 @@ fn render_tree_node(
                     .unwrap_or(&full_path)
                     .to_string();
                 let can_duplicate = generated_file_reason(&full_path).is_none();
+                let content = &user_src_files[*idx].1;
                 user_file_row(
                     ui,
                     indent,
@@ -2200,6 +2225,8 @@ fn render_tree_node(
                     &full_path,
                     project_dir,
                     file_diags.get(&full_path).copied(),
+                    content,
+                    templates,
                 );
             }
             TreeNode::Folder(children) => {
@@ -2354,6 +2381,7 @@ fn render_tree_node(
                             move_request,
                             extract_folder,
                             file_diags,
+                            templates,
                         );
                     });
 
@@ -2673,7 +2701,12 @@ fn user_file_row(
     // Diagnostic badge at the row's end: `Some(true)` = errors (red), `Some(false)`
     // = warnings only (amber), `None` = clean.
     diag: Option<bool>,
+    // The file's text, for "would a Reset change it?" - asked only while its
+    // menu is open.
+    content: &str,
+    templates: &mut TemplateRows<'_>,
 ) {
+    let mark = templates.marks.get(rel_path).copied();
     let hi = egui::Color32::from_rgb(100, 180, 255);
     let normal = egui::Color32::from_rgb(200, 205, 215);
     let id = ProjectFileId::UserFile(idx);
@@ -2745,6 +2778,16 @@ fn user_file_row(
             }
             None => {}
         }
+        if mark.is_some_and(|m| m.offered) {
+            ui.label(
+                egui::RichText::new(ph::GIT_DIFF)
+                    .size(10.0)
+                    .color(egui::Color32::from_rgb(220, 180, 60)),
+            )
+            .on_hover_text(
+                "A newer template waits beside this file: you had edited it, so the IDE kept your version. Right-click: Reset to template, or Keep my version.",
+            );
+        }
         // Holding the primary button on the row (pre-arm) — reported to the
         // caller so the cursor can show "grab" while the 0.4s hold elapses.
         let held =
@@ -2791,6 +2834,43 @@ fn user_file_row(
             {
                 *move_to_folder = Some(rel_path.to_owned());
                 ui.close();
+            }
+            if let Some(mark) = mark {
+                ui.separator();
+                // A Reset keeps a copy of the file beside it: no folder, no copy.
+                let differs = project_dir.is_some() && mark.differs(content);
+                let reset = ui
+                    .add_enabled(
+                        differs,
+                        egui::Button::new(menu_label(
+                            ph::ARROW_COUNTER_CLOCKWISE,
+                            "Reset to template",
+                            ICON_EDIT,
+                        )),
+                    )
+                    .on_hover_text(if mark.offered {
+                        "Write the newer template over this file. Your version is copied to .rustonchip/templates/ first."
+                    } else {
+                        "Throw away your edits outside the GENERATED block and write the template back. Your version is copied to .rustonchip/templates/ first."
+                    })
+                    .on_disabled_hover_text(if project_dir.is_none() {
+                        "Save the project first: a Reset keeps a copy of your version beside it"
+                    } else {
+                        "This file is its template, as it is"
+                    });
+                if reset.clicked() {
+                    templates.action = Some(TemplateAction::Reset(rel_path.to_owned()));
+                    ui.close();
+                }
+                if mark.offered
+                    && ui
+                        .button(menu_label(ph::CHECK, "Keep my version", ICON_EDIT))
+                        .on_hover_text("Keep your edits and turn this template down: it is not offered again, and its copy beside the file goes")
+                        .clicked()
+                {
+                    templates.action = Some(TemplateAction::Keep(rel_path.to_owned()));
+                    ui.close();
+                }
             }
             ui.separator();
             if ui

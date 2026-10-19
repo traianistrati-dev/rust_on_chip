@@ -125,7 +125,7 @@ fn reference_update_blocker(app: &AppIde, req: &RenameRequest) -> Option<String>
     // only ever sees a Project Save. Applying them to buffers that have moved
     // on would splice at stale offsets, so the rename degrades to a plain move
     // instead of corrupting files.
-    if !app.unsaved_files().is_empty() {
+    if !app.unsaved_source_files().is_empty() {
         return Some("save the project first so rust-analyzer sees the current text".to_owned());
     }
     None

@@ -262,7 +262,6 @@ impl Mcu {
         let mut tree = crate::project_tree::logic::ProjectTreeState::new();
         tree.sync_config_files(
             &self.config_files(),
-            false,
             &self.custom_keep_prefixes(),
             &mut None,
         );

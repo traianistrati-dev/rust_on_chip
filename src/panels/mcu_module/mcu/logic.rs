@@ -1787,8 +1787,8 @@ impl Mcu {
         }
         self.pending_module_styles = pending;
         self.pending_apply_confirm = false;
-        // The runtime / api-style just changed → the config templates (whole
-        // `init()`, not just the consts) must be regenerated in full next frame.
+        // The runtime / api-style just changed: the next regeneration is the
+        // one that tells the user which edited config files kept their text.
         self.config_regen_forced = true;
     }
 

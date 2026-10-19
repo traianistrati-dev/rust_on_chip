@@ -91,12 +91,7 @@ fn esp_config_files(w: &WatchdogSettings, chip: &str) -> Vec<(String, String)> {
         .into_iter()
         .map(|(stem, c)| {
             let body = if stem == "rwdt" {
-                tmpl::render(
-                    RWDT_TMPL,
-                    &[
-                        ("{TIMEOUT}", &c.timeout_us.to_string()),
-                    ],
-                )
+                tmpl::render(RWDT_TMPL, &[("{TIMEOUT}", &c.timeout_us.to_string())])
             } else {
                 tmpl::render(
                     MWDT_TMPL,
@@ -192,11 +187,14 @@ pub fn rp_config_files(
             ("{TIMEOUT}", &c.timeout_us.to_string()),
             ("{MAX}", &grouped(max)),
             ("{DRIVER}", watchdog::rp_driver(family, is_async)),
-            ("{HAL}", if family == "rp2040" {
-                "rp2040_hal"
-            } else {
-                "rp235x_hal"
-            }),
+            (
+                "{HAL}",
+                if family == "rp2040" {
+                    "rp2040_hal"
+                } else {
+                    "rp235x_hal"
+                },
+            ),
         ],
     );
     vec![("watchdog.rs".to_owned(), body)]
@@ -305,12 +303,7 @@ pub fn nrf_config_files(
         )
     } else {
         // One HAL crate per chip, named after it (`nrf52833_hal`).
-        tmpl::render(
-            NRF_BLOCKING_TMPL,
-            &[
-                ("{HAL}", &format!("{family}_hal")),
-            ],
-        )
+        tmpl::render(NRF_BLOCKING_TMPL, &[("{HAL}", &format!("{family}_hal"))])
     };
     vec![("watchdog.rs".to_owned(), format!("{head}{body}"))]
 }
@@ -366,17 +359,10 @@ pub fn config_files(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Vec
         let body = if f1_hal {
             tmpl::render(
                 IWDG_TMPL_F1,
-                &[
-                    ("{TIMEOUT_MS}", &(i.timeout_us / 1_000).to_string()),
-                ],
+                &[("{TIMEOUT_MS}", &(i.timeout_us / 1_000).to_string())],
             )
         } else {
-            tmpl::render(
-                IWDG_TMPL,
-                &[
-                    ("{TIMEOUT}", &i.timeout_us.to_string()),
-                ],
-            )
+            tmpl::render(IWDG_TMPL, &[("{TIMEOUT}", &i.timeout_us.to_string())])
         };
         out.push(("iwdg.rs".to_owned(), body));
     }

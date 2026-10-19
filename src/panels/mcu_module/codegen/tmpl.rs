@@ -99,7 +99,10 @@ mod tests {
     fn render_substitutes_in_order() {
         // The example names the handle; the handle is filled after it.
         let t = "{EXAMPLE}\nlet {HANDLE} = init();\n";
-        let out = render(t, &[("{EXAMPLE}", "// use {HANDLE}"), ("{HANDLE}", "_serial1")]);
+        let out = render(
+            t,
+            &[("{EXAMPLE}", "// use {HANDLE}"), ("{HANDLE}", "_serial1")],
+        );
         assert_eq!(out, "// use _serial1\nlet _serial1 = init();\n");
     }
 
@@ -123,10 +126,81 @@ mod tests {
 
     #[test]
     fn rust_braces_are_not_tokens() {
-        for t in ["{}", "{:?}", "{ x }", "{n}", "{X:?}", "{0}", "Config { N }", "{_A}", "{}}"] {
+        for t in [
+            "{}",
+            "{:?}",
+            "{ x }",
+            "{n}",
+            "{X:?}",
+            "{0}",
+            "Config { N }",
+            "{_A}",
+            "{}}",
+        ] {
             assert_eq!(leftover(t), None, "{t}");
         }
         assert_eq!(leftover("x {DMA_TX} y"), Some("{DMA_TX}"));
         assert_eq!(fill("{ x } {} {:?}", &[]), "{ x } {} {:?}");
+    }
+
+    /// Every file under `templates/` is one a generator includes, named
+    /// `<unit>[_<variant>].rs.tmpl` in a known stack directory, and LF: a CR
+    /// would reach the user's project byte for byte, and a file nothing
+    /// includes is an edit that changes nothing.
+    #[test]
+    fn every_template_is_included_named_and_lf() {
+        use std::path::{Path, PathBuf};
+        const STACKS: [&str; 8] = [
+            "common",
+            "embassy_nrf",
+            "embassy_rp",
+            "embassy_stm32",
+            "esp_hal",
+            "f1_hal",
+            "nrf_hal",
+            "rp_hal",
+        ];
+        fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("readable dir") {
+                let p = e.expect("dir entry").path();
+                if p.is_dir() {
+                    files(&p, out);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        let codegen = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/panels/mcu_module/codegen");
+        let mut all = Vec::new();
+        files(&codegen, &mut all);
+        let sources: String = all
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .map(|p| std::fs::read_to_string(p).expect("source"))
+            .collect();
+        let templates: Vec<&PathBuf> = all
+            .iter()
+            .filter(|p| p.starts_with(codegen.join("templates")))
+            .collect();
+        assert!(templates.len() >= 40, "only {} templates found", templates.len());
+        for p in templates {
+            let rel = p
+                .strip_prefix(codegen.join("templates"))
+                .expect("under templates/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let (stack, name) = rel.split_once('/').expect("<stack>/<file>");
+            assert!(STACKS.contains(&stack), "{rel}: unknown stack directory");
+            assert!(
+                name.ends_with(".rs.tmpl") && !name.contains('/'),
+                "{rel}: not <unit>[_<variant>].rs.tmpl"
+            );
+            assert!(
+                sources.contains(&format!("templates/{rel}\")")),
+                "{rel}: no generator includes it"
+            );
+            let bytes = std::fs::read(p).expect("template");
+            assert!(!bytes.contains(&b'\r'), "{rel}: CR in a template");
+        }
     }
 }

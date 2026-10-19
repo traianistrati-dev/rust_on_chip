@@ -13,7 +13,8 @@ use super::*;
 /// GENERIC over the pin types (`impl RxPin/TxPin`) so the file is the same for
 /// every chip — only the instance number differs; the concrete pins are chosen at
 /// the call site in `main.rs`. Real-compile verified on STM32F411RE.
-pub(super) const ASYNC_USART_TMPL: &str = include_str!("../templates/embassy_stm32/usart_buffered.rs.tmpl");
+pub(super) const ASYNC_USART_TMPL: &str =
+    include_str!("../templates/embassy_stm32/usart_buffered.rs.tmpl");
 
 /// The USART peripheral instances that have BOTH a TX and an RX pin configured —
 /// the ones an async `BufferedUart` (bidirectional) can be built for. Returns
@@ -113,7 +114,12 @@ pub fn serial_handle(peri: &str, n: u8, sfx: &str) -> String {
 /// an STM32F103RC has `p.UART4`, and `p.USART4` is E0609. Read from the vector
 /// list where the chip carries one (a G0's `USART3_4_LPUART1` keeps USART4 a
 /// USART); without one, only the F1's UART4/5 are known to be UARTs.
-pub(super) fn serial_word(word: &'static str, family: &str, irqs: &[String], n: u8) -> &'static str {
+pub(super) fn serial_word(
+    word: &'static str,
+    family: &str,
+    irqs: &[String],
+    n: u8,
+) -> &'static str {
     if word != "USART" {
         return word;
     }
@@ -150,7 +156,8 @@ pub(super) fn serial_irq(irqs: &[String], peri: &str, n: u8) -> String {
 ///
 /// Concrete embassy types, not `impl Trait`: a tuple return cannot carry
 /// `impl Trait`, and both types implement the standard traits anyway.
-pub(super) const ASYNC_USART_TMPL_DMA: &str = include_str!("../templates/embassy_stm32/usart_dma.rs.tmpl");
+pub(super) const ASYNC_USART_TMPL_DMA: &str =
+    include_str!("../templates/embassy_stm32/usart_dma.rs.tmpl");
 
 /// `configs/usart{n}.rs` — or `configs/lpuart{n}.rs`, which is the same file
 /// with a different peripheral: embassy drives an LPUART through the very same
@@ -161,12 +168,14 @@ pub(super) const ASYNC_USART_TMPL_DMA: &str = include_str!("../templates/embassy
 /// A separate template rather than a flag on the full-duplex one because the
 /// return type is the point — half a UART is a different value, not the same
 /// value with a `None` in it.
-pub(super) const ASYNC_USART_TMPL_DMA_TX: &str = include_str!("../templates/embassy_stm32/usart_dma_tx.rs.tmpl");
+pub(super) const ASYNC_USART_TMPL_DMA_TX: &str =
+    include_str!("../templates/embassy_stm32/usart_dma_tx.rs.tmpl");
 
 /// `configs/{PERI}.rs` for a **RX-only** DMA UART. The receiver is ring-buffered
 /// for the same reason the full-duplex one is: a bare `UartRx` has no
 /// `embedded_io_async::Read`, and reception must not stop between reads.
-pub(super) const ASYNC_USART_TMPL_DMA_RX: &str = include_str!("../templates/embassy_stm32/usart_dma_rx.rs.tmpl");
+pub(super) const ASYNC_USART_TMPL_DMA_RX: &str =
+    include_str!("../templates/embassy_stm32/usart_dma_rx.rs.tmpl");
 
 /// The extra pin parameters, the `use` they need and the constructor call for
 /// one `(transport, direction, flow)` combination.
@@ -314,7 +323,10 @@ pub(super) struct SerialShape {
 /// under `#[cfg(any(usart_v3, usart_v4))]`, so on an older USART the assignment
 /// would not compile. Codegen re-checks it rather than trusting the UI — a
 /// project file can outlive the chip it was written for.
-pub(super) fn serial_line_extras(cfg: Option<&UsartModuleConfig>, supported: bool) -> (String, String) {
+pub(super) fn serial_line_extras(
+    cfg: Option<&UsartModuleConfig>,
+    supported: bool,
+) -> (String, String) {
     let (mut consts, mut body) = (String::new(), String::new());
     if !supported {
         return (consts, body);

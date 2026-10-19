@@ -6,7 +6,8 @@ use super::*;
 pub(super) const IRQS_HEAD: &str = include_str!("../templates/embassy_stm32/irqs_head.rs.tmpl");
 
 /// The same head while some `init` still waits for its DMA channels.
-pub(super) const IRQS_HEAD_DMA_TODO: &str = include_str!("../templates/embassy_stm32/irqs_head_dma_todo.rs.tmpl");
+pub(super) const IRQS_HEAD_DMA_TODO: &str =
+    include_str!("../templates/embassy_stm32/irqs_head_dma_todo.rs.tmpl");
 
 /// The `bind_interrupts!` block `main.rs` needs when any bus runs on DMA.
 ///

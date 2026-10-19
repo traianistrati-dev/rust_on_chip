@@ -10,9 +10,9 @@ use super::super::modules::{
 use super::super::pins::logic::pin::{GpioMode, Pin};
 use super::super::pins::logic::pin_function::PinFunction;
 use super::common::AUTOGEN_BANNER;
-use super::tmpl;
 use super::common::duty_percent_str;
 use super::common::{refit_header, retarget_pristine_tail, section_is_rtic, tail_leaving_rtic};
+use super::tmpl;
 use super::{GEN_BEGIN, GEN_END, USER_TAIL, mcu_id_marker_line, pin_binding, sanitize_label};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1523,8 +1523,14 @@ fn usart_config_file(n: u8, cfg: Option<&UsartModuleConfig>) -> String {
             ("{RX_TY}", &usart_half_ty(n, "Rx", dma.rx())),
             ("{TXCH_PARAM}", &channel_param("tx_ch", txch, dma.tx())),
             ("{RXCH_PARAM}", &channel_param("rx_ch", rxch, dma.rx())),
-            ("{TX_EXPR}", if dma.tx() { "tx.with_dma(tx_ch)" } else { "tx" }),
-            ("{RX_EXPR}", if dma.rx() { "rx.with_dma(rx_ch)" } else { "rx" }),
+            (
+                "{TX_EXPR}",
+                if dma.tx() { "tx.with_dma(tx_ch)" } else { "tx" },
+            ),
+            (
+                "{RX_EXPR}",
+                if dma.rx() { "rx.with_dma(rx_ch)" } else { "rx" },
+            ),
             ("{USART_EXAMPLE}", &usart_example(n, dma, &tx, &rx)),
             ("{HANDLE}", &format!("_serial{n}{sfx}")),
             ("{TXCH}", txch),
@@ -1936,7 +1942,10 @@ fn spi_config_file(
             ("{RXCH_PARAM}", &channel_param("rx_ch", rxch, dma.rx())),
             ("{TXCH_PARAM}", &channel_param("tx_ch", txch, dma.tx())),
             ("{WITH}", spi_with(dma)),
-            ("{SPI_EXAMPLE}", &spi_example(n, dma, &format!("_spi{n}{sfx}"))),
+            (
+                "{SPI_EXAMPLE}",
+                &spi_example(n, dma, &format!("_spi{n}{sfx}")),
+            ),
         ],
     )
 }

@@ -32,7 +32,11 @@ pub(super) const COMP_TMPL: &str = include_str!("../templates/embassy_stm32/comp
 /// exists on both generations, but `configure_raw` computes it under
 /// `#[cfg(comp_u5)]` alone — assigning it in a G4 project would put a line in
 /// the user's file that changes nothing, which is worse than leaving it out.
-pub(super) fn comp_config_file(n: u8, cfg: &comparator::CompConfig, g: comparator::Generation) -> String {
+pub(super) fn comp_config_file(
+    n: u8,
+    cfg: &comparator::CompConfig,
+    g: comparator::Generation,
+) -> String {
     let (ctor, inm_param, inm_arg) = if cfg.inverting_input.needs_pin() {
         (
             "new_with_input_minus_pin",
@@ -76,15 +80,17 @@ use embassy_stm32::comp::PowerMode;",
             ("{INM}", cfg.inverting_input.token()),
             ("{BLANK}", cfg.blanking_source.token()),
             ("{CTOR}", ctor),
-            ("{INM_USE}", // Only the pin form names that trait; importing it always is an
-            // `unused_imports` warning in the USER's project, which is worse
-            // than in ours - they cannot fix it without editing generated code.
-            if cfg.inverting_input.needs_pin() {
-                "
+            (
+                "{INM_USE}", // Only the pin form names that trait; importing it always is an
+                // `unused_imports` warning in the USER's project, which is worse
+                // than in ours - they cannot fix it without editing generated code.
+                if cfg.inverting_input.needs_pin() {
+                    "
 use embassy_stm32::comp::InputMinusPin;"
-            } else {
-                ""
-            }),
+                } else {
+                    ""
+                },
+            ),
             ("{INM_PARAM}", &inm_param),
             ("{INM_ARG}", &inm_arg),
         ],

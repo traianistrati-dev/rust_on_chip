@@ -85,11 +85,14 @@ pub fn i2s_config_file(n: u8, cfg: &I2sModuleConfig, w: &I2sWiring, handle: &str
             ("{BUF}", &cfg.buffer_len.to_string()),
             ("{DMA_TRAIT}", if tx { "TxDma" } else { "RxDma" }),
             ("{MCK_USE}", if has_mck { ", MckPin" } else { "" }),
-            ("{MCK_PARAM}", if has_mck {
-                "    mck: Peri<'d, impl MckPin<peripherals::SPI{N}>>,\n"
-            } else {
-                ""
-            }),
+            (
+                "{MCK_PARAM}",
+                if has_mck {
+                    "    mck: Peri<'d, impl MckPin<peripherals::SPI{N}>>,\n"
+                } else {
+                    ""
+                },
+            ),
             ("{MCK_ARG}", if has_mck { "        mck,\n" } else { "" }),
             ("{MODE}", cfg.mode.embassy()),
             ("{STANDARD}", cfg.standard.embassy()),

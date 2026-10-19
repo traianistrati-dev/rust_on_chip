@@ -38,11 +38,13 @@ pub(super) fn spi_wires(pins: &[&Pin]) -> Vec<(u8, String, String, Option<String
 
 /// Blocking SPI (`Spi::new_blocking`) exposed as the STANDARD blocking
 /// `embedded-hal` 1.0 `SpiBus<u8>`. No DMA — compiles out of the box.
-pub(super) const ASYNC_SPI_TMPL_BLOCKING: &str = include_str!("../templates/embassy_stm32/spi_blocking.rs.tmpl");
+pub(super) const ASYNC_SPI_TMPL_BLOCKING: &str =
+    include_str!("../templates/embassy_stm32/spi_blocking.rs.tmpl");
 
 /// Async DMA SPI (`Spi::new`) exposed as `embedded-hal-async` `SpiBus<u8>`
 /// (`.await`-able). Needs two DMA channels, passed by `main.rs`.
-pub(super) const ASYNC_SPI_TMPL_DMA: &str = include_str!("../templates/embassy_stm32/spi_dma.rs.tmpl");
+pub(super) const ASYNC_SPI_TMPL_DMA: &str =
+    include_str!("../templates/embassy_stm32/spi_dma.rs.tmpl");
 
 /// Render the SPI config file for instance `n`, picking the blocking or
 /// async-DMA template from the module's [`AsyncBusMode`].
@@ -92,10 +94,12 @@ pub fn spi_config_file(n: u8, cfg: Option<&SpiModuleConfig>, tx_only: bool) -> S
 /// without an RX channel those panic inside embassy (`rx_dma.unwrap()`).
 /// Handing back a trait that cannot keep half its contract would be worse than
 /// handing back a narrower type.
-pub(super) const ASYNC_SPI_TMPL_DMA_TX: &str = include_str!("../templates/embassy_stm32/spi_dma_tx.rs.tmpl");
+pub(super) const ASYNC_SPI_TMPL_DMA_TX: &str =
+    include_str!("../templates/embassy_stm32/spi_dma_tx.rs.tmpl");
 
 /// The same shape without DMA: `new_blocking_txonly`, no channels at all.
-pub(super) const ASYNC_SPI_TMPL_BLOCKING_TX: &str = include_str!("../templates/embassy_stm32/spi_blocking_tx.rs.tmpl");
+pub(super) const ASYNC_SPI_TMPL_BLOCKING_TX: &str =
+    include_str!("../templates/embassy_stm32/spi_blocking_tx.rs.tmpl");
 
 #[cfg(test)]
 mod spi_txonly_tests {

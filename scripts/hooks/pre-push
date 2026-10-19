@@ -136,10 +136,24 @@ else
             # watchdog_gen.rs is NOT here: it writes the nRF, RP and ESP
             # watchdogs too, so like family.rs it is shared and runs the
             # quick set.
-            # embassy_async.rs is the Async backend of EVERY STM32, the F1 and
+            # embassy_stm32/ is the Async backend of EVERY STM32, the F1 and
             # the imported chips included - their harnesses run through it.
-            src/panels/mcu_module/codegen/embassy_async.rs)
+            # Its templates, and the embassy watchdogs', go the same way.
+            src/panels/mcu_module/codegen/embassy_stm32/*|            src/panels/mcu_module/codegen/templates/embassy_stm32/*)
                 fams="$fams embassy f1 import" ;;
+            # The stm32f1xx-hal templates: stm32.rs's and the F1 IWDG, which
+            # the embassy harness's F1 project carries too.
+            src/panels/mcu_module/codegen/templates/f1_hal/*)
+                fams="$fams f1 embassy" ;;
+            src/panels/mcu_module/codegen/templates/esp_hal/*)
+                fams="$fams esp" ;;
+            src/panels/mcu_module/codegen/templates/rp_hal/*|            src/panels/mcu_module/codegen/templates/embassy_rp/*)
+                fams="$fams rp" ;;
+            # `common/` is shared by definition; only the nRF watchdog's head
+            # is known to belong to one family. Anything else there runs the
+            # quick set through the catch-all below.
+            src/panels/mcu_module/codegen/templates/nrf_hal/*|            src/panels/mcu_module/codegen/templates/embassy_nrf/*|            src/panels/mcu_module/codegen/templates/common/nrf_*)
+                fams="$fams nrf" ;;
             src/panels/mcu_module/codegen/wba.rs)
                 fams="$fams embassy" ;;
             src/panels/mcu_module/codegen/rcc_n6.rs)

@@ -183,7 +183,7 @@ pub fn sai_config_file(n: u8, cfg: &SaiModuleConfig, blocks: &[(u8, SaiBlockWiri
             ("{CONFIGS}", &configs),
             ("{GENERICS}", &generics.join(", ")),
             ("{PARAMS}", &params),
-            ("{BOUNDS}", &(bounds.join(" + ")).to_string()),
+            ("{BOUNDS}", &bounds.join(" + ")),
             ("{RET}", &ret),
             ("{SPLIT}", &split),
             ("{STATICS}", &statics),

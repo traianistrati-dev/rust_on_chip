@@ -32,12 +32,14 @@ pub(super) fn i2c_wires(pins: &[&Pin]) -> Vec<(u8, String, String)> {
 
 /// Blocking I2C (`I2c::new_blocking`) exposed as the STANDARD blocking
 /// `embedded-hal` 1.0 `I2c`. No DMA/interrupts — compiles out of the box.
-pub(super) const ASYNC_I2C_TMPL_BLOCKING: &str = include_str!("../templates/embassy_stm32/i2c_blocking.rs.tmpl");
+pub(super) const ASYNC_I2C_TMPL_BLOCKING: &str =
+    include_str!("../templates/embassy_stm32/i2c_blocking.rs.tmpl");
 
 /// Async DMA I2C (`I2c::new`) exposed as `embedded-hal-async` `I2c`
 /// (`.await`-able). Needs an interrupt binding (event + error) and two DMA
 /// channels (passed by `main.rs`).
-pub(super) const ASYNC_I2C_TMPL_DMA: &str = include_str!("../templates/embassy_stm32/i2c_dma.rs.tmpl");
+pub(super) const ASYNC_I2C_TMPL_DMA: &str =
+    include_str!("../templates/embassy_stm32/i2c_dma.rs.tmpl");
 
 /// Render the I2C config file for instance `n`, picking the blocking or
 /// async-DMA template from the module's [`AsyncBusMode`].

@@ -120,17 +120,20 @@ pub fn xspi_config_file(n: u8, cfg: &XspiModuleConfig, dqs: usize) -> String {
     tmpl::fill(
         XSPI_TMPL,
         &[
-            ("{PRESCALER}", &(cfg.prescaler).to_string()),
-            ("{MODE}", &(cfg.mode.label()).to_string()),
+            ("{PRESCALER}", &cfg.prescaler.to_string()),
+            ("{MODE}", &cfg.mode.label().to_string()),
             ("{N}", &n.to_string()),
             ("{PINS}", &pin_items.join(", ")),
-            ("{SIZE}", &(cfg.size_embassy()).to_string()),
-            ("{MTYPE}", &(cfg.memory_type.embassy()).to_string()),
-            ("{MODE_SHORT}", &(cfg.mode.label().to_lowercase()).to_string()),
+            ("{SIZE}", &cfg.size_embassy().to_string()),
+            ("{MTYPE}", &cfg.memory_type.embassy().to_string()),
+            ("{MODE_SHORT}", &cfg.mode.label().to_lowercase()),
             ("{PARAMS}", &params),
             ("{CTOR}", &ctor),
             ("{ARGS}", &args.join(", ")),
-            ("{HANDLE}", &format!("_xspi{n}{}", label_sfx(&cfg.custom_label))),
+            (
+                "{HANDLE}",
+                &format!("_xspi{n}{}", label_sfx(&cfg.custom_label)),
+            ),
         ],
     )
 }

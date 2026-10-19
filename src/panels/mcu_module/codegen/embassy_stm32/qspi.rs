@@ -128,11 +128,11 @@ pub fn qspi_config_file(cfg: &QspiModuleConfig, b1: bool, b2: bool, handle: &str
     tmpl::fill(
         QSPI_TMPL,
         &[
-            ("{PRESCALER}", &(cfg.prescaler).to_string()),
+            ("{PRESCALER}", &cfg.prescaler.to_string()),
             ("{SHAPE}", &shape),
             ("{PINS}", &pin_items.join(", ")),
-            ("{SIZE}", &(cfg.memory_size_embassy()).to_string()),
-            ("{ADDR}", &(cfg.address_size.embassy()).to_string()),
+            ("{SIZE}", &cfg.memory_size_embassy().to_string()),
+            ("{ADDR}", &cfg.address_size.embassy().to_string()),
             ("{DUAL}", &dual.to_string()),
             ("{PARAMS}", &params),
             ("{CTOR}", &ctor),

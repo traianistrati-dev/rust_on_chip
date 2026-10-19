@@ -144,32 +144,44 @@ pub fn sdmmc_config_file(
     tmpl::fill(
         SDMMC_TMPL,
         &[
-            ("{TIMEOUT}", &(cfg.data_timeout).to_string()),
+            ("{TIMEOUT}", &cfg.data_timeout.to_string()),
             ("{PERI}", &peri),
             ("{WIDTH}", &width.to_string()),
-            ("{VER}", &(if v1 { "older (v1)" } else { "newer (v2)" }).to_string()),
-            ("{DMA_NOTE}", &(if v1 {
-            " It is fed a DMA channel, and binds
+            ("{VER}", if v1 { "older (v1)" } else { "newer (v2)" }),
+            (
+                "{DMA_NOTE}",
+                if v1 {
+                    " It is fed a DMA channel, and binds
 // that channel's interrupt as well as its own."
-        } else {
-            " It has its own DMA controller
+                } else {
+                    " It has its own DMA controller
 // inside, so it takes no channel."
-        }).to_string()),
-            ("{DMA_USE}", &(if v1 {
-            "use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
+                },
+            ),
+            (
+                "{DMA_USE}",
+                if v1 {
+                    "use embassy_stm32::dma::InterruptHandler as DmaInterruptHandler;
 "
-        } else {
-            ""
-        }).to_string()),
+                } else {
+                    ""
+                },
+            ),
             ("{ITEMS}", &sd_items.join(", ")),
-            ("{GENERIC}", &(if v1 {
-            format!(", D: SdmmcDma<peripherals::{peri}>")
-        } else {
-            String::new()
-        }).to_string()),
+            (
+                "{GENERIC}",
+                &(if v1 {
+                    format!(", D: SdmmcDma<peripherals::{peri}>")
+                } else {
+                    String::new()
+                }),
+            ),
             ("{PARAMS}", &params),
             ("{CTOR}", &ctor),
-            ("{HANDLE}", &format!("_sd{n}{}", label_sfx(&cfg.custom_label))),
+            (
+                "{HANDLE}",
+                &format!("_sd{n}{}", label_sfx(&cfg.custom_label)),
+            ),
         ],
     )
 }

@@ -454,10 +454,16 @@ mod tests {
     fn the_configured_durations_reach_the_generated_file() {
         let files = config_files(&both(), "stm32f4", Runtime::Blocking);
         let iwdg = &files.iter().find(|(n, _)| n == "iwdg.rs").unwrap().1;
-        assert!(iwdg.contains("const TIMEOUT_US: u32 = 32768000;"), "{iwdg}");
+        assert!(
+            iwdg.contains("pub const TIMEOUT_US: u32 = 32768000;"),
+            "{iwdg}"
+        );
         let wwdg = &files.iter().find(|(n, _)| n == "wwdg.rs").unwrap().1;
-        assert!(wwdg.contains("const TIMEOUT_US: u32 = 41472;"), "{wwdg}");
-        assert!(wwdg.contains("const WINDOW_US: u32 = 1000;"), "{wwdg}");
+        assert!(
+            wwdg.contains("pub const TIMEOUT_US: u32 = 41472;"),
+            "{wwdg}"
+        );
+        assert!(wwdg.contains("pub const WINDOW_US: u32 = 1000;"), "{wwdg}");
     }
 
     #[test]
@@ -486,13 +492,13 @@ mod tests {
             ..Default::default()
         };
         let f1 = &config_files(&w, "stm32f1", Runtime::Blocking)[0].1;
-        assert!(f1.contains("const TIMEOUT_MS: u32 = 26214;"), "{f1}");
+        assert!(f1.contains("pub const TIMEOUT_MS: u32 = 26214;"), "{f1}");
         assert!(f1.contains("stm32f1xx_hal::watchdog"), "{f1}");
         assert!(!f1.contains("embassy"), "{f1}");
         assert!(init_lines(&w, "stm32f1", Runtime::Blocking).contains("init(dp.IWDG)"));
 
         let f4 = &config_files(&w, "stm32f4", Runtime::Blocking)[0].1;
-        assert!(f4.contains("const TIMEOUT_US: u32 = 26214000;"), "{f4}");
+        assert!(f4.contains("pub const TIMEOUT_US: u32 = 26214000;"), "{f4}");
         assert!(init_lines(&w, "stm32f4", Runtime::Blocking).contains("init(p.IWDG)"));
     }
 
@@ -520,7 +526,10 @@ mod tests {
         assert_eq!(names, ["rwdt.rs", "mwdt0.rs", "mwdt1.rs"]);
 
         let rwdt = &files[0].1;
-        assert!(rwdt.contains("const TIMEOUT_US: u64 = 2000000;"), "{rwdt}");
+        assert!(
+            rwdt.contains("pub const TIMEOUT_US: u64 = 2000000;"),
+            "{rwdt}"
+        );
         assert!(rwdt.contains("Rtc::new(lpwr)"), "{rwdt}");
         assert!(rwdt.contains("RwdtStage::Stage0"), "{rwdt}");
         // Never the STM32 vocabulary.
@@ -531,7 +540,10 @@ mod tests {
         // type, the module path and the example, so one missed substitution
         // would compile against the wrong peripheral.
         let mwdt1 = &files[2].1;
-        assert!(mwdt1.contains("const TIMEOUT_US: u64 = 500000;"), "{mwdt1}");
+        assert!(
+            mwdt1.contains("pub const TIMEOUT_US: u64 = 500000;"),
+            "{mwdt1}"
+        );
         assert!(mwdt1.contains("Wdt<TIMG1<'static>>"), "{mwdt1}");
         assert!(mwdt1.contains("peripherals::TIMG1"), "{mwdt1}");
         assert!(!mwdt1.contains("TIMG0"), "{mwdt1}");

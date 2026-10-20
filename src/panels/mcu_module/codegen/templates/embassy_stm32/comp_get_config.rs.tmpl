@@ -1,0 +1,18 @@
+/// The `Config` the numbers above describe. Yours to edit: the Configuration
+/// tab rewrites only the numbers.
+fn get_config() -> embassy_stm32::comp::Config {
+    use embassy_stm32::comp::{BlankingSource, Config, Hysteresis, InvertingInput, OutputPolarity};
+{POWER_USE}    let mut config = Config::default();
+{POWER_MATCH}    config.hysteresis = match HYSTERESIS {
+{HYST_ARMS}    };
+    config.output_polarity = if INVERTED {
+        OutputPolarity::Inverted
+    } else {
+        OutputPolarity::NotInverted
+    };
+    config.inverting_input = match INVERTING_INPUT {
+{INM_ARMS}    };
+    config.blanking_source = match BLANKING_SOURCE {
+{BLANK_ARMS}    };
+    config
+}

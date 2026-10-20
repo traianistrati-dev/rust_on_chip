@@ -316,8 +316,11 @@ pub(super) struct SerialShape {
 }
 
 /// The line-level extras (`swap_rx_tx`, `invert_tx`, `invert_rx`) as a pair of
-/// `(consts, assignments)` — EMPTY unless the user turned one on, so a project
-/// that uses none generates exactly what it did before these existed.
+/// `(consts, assignments)` — all three, `true` or `false`, wherever the chip
+/// has them. Named only while switched on, a constant vanished from the block
+/// the moment the box was cleared, and an edited file whose `get_config` still
+/// assigned it stopped compiling; a block whose names never move cannot do
+/// that (the rule in `peripheral-config-files`).
 ///
 /// `supported` is the chip gate: embassy declares these `Config` fields only
 /// under `#[cfg(any(usart_v3, usart_v4))]`, so on an older USART the assignment
@@ -340,18 +343,48 @@ pub(super) fn serial_line_extras(
         (cfg.is_some_and(|c| c.invert_tx), "INVERT_TX", "invert_tx"),
         (cfg.is_some_and(|c| c.invert_rx), "INVERT_RX", "invert_rx"),
     ] {
-        if on {
-            consts.push_str(&format!(
-                "pub const {konst}: bool = true;
-"
-            ));
-            body.push_str(&format!(
-                "    config.{field} = {konst};
-"
-            ));
+        consts.push_str(&format!("pub const {konst}: bool = {on};\n"));
+        body.push_str(&format!("    config.{field} = {konst};\n"));
+    }
+    consts.insert_str(
+        0,
+        "// Line options: TX and RX pads swapped, TX inverted, RX inverted.\n",
+    );
+    (consts, body)
+}
+
+/// USART1 on a chip with the line options (`usart_v4`), swap on or off: for
+/// the sync tests in `project_tree`.
+#[cfg(test)]
+pub fn usart_file_for_tests(swap: bool) -> String {
+    let cfg = UsartModuleConfig {
+        swap_rx_tx: swap,
+        ..UsartModuleConfig::new(1)
+    };
+    serial_config_file("USART", 1, Some(&cfg), "USART1", true)
+}
+
+/// `body` as the IDE wrote it before 1B.4: an option named - in the block and
+/// in `get_config` - only while it was on.
+#[cfg(test)]
+pub fn legacy_usart_file(body: &str) -> String {
+    let mut out = body.replace(
+        "// Line options: TX and RX pads swapped, TX inverted, RX inverted.\n",
+        "",
+    );
+    for (konst, field) in [
+        ("SWAP_RX_TX", "swap_rx_tx"),
+        ("INVERT_TX", "invert_tx"),
+        ("INVERT_RX", "invert_rx"),
+    ] {
+        let off = format!("pub const {konst}: bool = false;\n");
+        if out.contains(&off) {
+            out = out
+                .replace(&off, "")
+                .replace(&format!("    config.{field} = {konst};\n"), "");
         }
     }
-    (consts, body)
+    out
 }
 
 pub fn serial_config_file(
@@ -1401,14 +1434,27 @@ mod flow_and_direction_tests {
         assert_eq!(out.dma_uses.len(), 2, "{:?}", out.dma_uses);
     }
 
-    /// Swap / invert reach `get_config`, as consts, and ONLY when switched on —
-    /// so a project that uses none generates exactly what it did before.
+    /// Swap / invert reach `get_config` as consts, all three always, where the
+    /// chip has them - so clearing a box changes a value, never a name.
     #[test]
-    fn line_extras_are_opt_in_and_chip_gated() {
+    fn line_extras_are_always_named_where_the_chip_has_them() {
         let plain = run(&full_duplex(), UsartModuleConfig::new(1));
         let body = &plain.config_files[0].1;
-        assert!(!body.contains("swap_rx_tx"), "{body}");
-        assert!(!body.contains("invert"), "{body}");
+        for want in [
+            "pub const SWAP_RX_TX: bool = false;",
+            "pub const INVERT_TX: bool = false;",
+            "pub const INVERT_RX: bool = false;",
+            "    config.swap_rx_tx = SWAP_RX_TX;",
+            "    config.invert_tx = INVERT_TX;",
+            "    config.invert_rx = INVERT_RX;",
+        ] {
+            assert!(body.contains(want), "{want}:\n{body}");
+        }
+        let end = body.find("// <<< GENERATED END >>>").unwrap();
+        assert!(
+            body[..end].contains("SWAP_RX_TX"),
+            "the names are in the block"
+        );
 
         let cfg = UsartModuleConfig {
             swap_rx_tx: true,
@@ -1426,8 +1472,15 @@ mod flow_and_direction_tests {
             "{body}"
         );
         assert!(body.contains("    config.invert_rx = INVERT_RX;"), "{body}");
+        assert!(body.contains("pub const INVERT_RX: bool = true;"), "{body}");
         // Only what was asked for: TX inversion was left off.
-        assert!(!body.contains("invert_tx"), "{body}");
+        assert!(
+            body.contains("pub const INVERT_TX: bool = false;"),
+            "{body}"
+        );
+        // The editable half is the plain project's: a box changes a number.
+        let tail = |b: &str| b[b.find("// <<< GENERATED END >>>").unwrap()..].to_owned();
+        assert_eq!(tail(body), tail(&plain.config_files[0].1));
 
         // Same config on an OLD USART: the fields do not exist there, so nothing
         // is emitted even though the module still carries the choice.

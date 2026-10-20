@@ -761,7 +761,7 @@ impl ProjectTreeState {
                     *content = up;
                 }
                 let reset = self.reset_requested.remove(&file_path);
-                let (decision, stamp) =
+                let (decision, mut stamp) =
                     templates::decide(self.templates.files.get(&file_path), content, body, reset);
                 match decision {
                     Decision::Template {
@@ -778,10 +778,31 @@ impl ProjectTreeState {
                             report.replaced.push(file_path.clone());
                         }
                     }
-                    Decision::Keep { offer } => {
+                    Decision::Keep { mut offer } => {
                         if let Some(block) = extract_gen_block(body) {
                             let existing = content.clone();
-                            let updated = splice_pin_file(&existing, &block);
+                            let mut updated = splice_pin_file(&existing, &block);
+                            // A file from before its template took something out of
+                            // the block - comp's `get_config` and imports, the USART
+                            // line options - brought up to it, or the user's code
+                            // stops compiling / a box stops working.
+                            if let Some(up) =
+                                codegen::upgraded_config(name, &existing, &updated, body)
+                            {
+                                updated = up;
+                                // An older untouched file IS the template now: the
+                                // IDE's again, with nothing left to offer.
+                                if let (
+                                    Decision::Template {
+                                        replaced: false, ..
+                                    },
+                                    fresh,
+                                ) = templates::decide(Some(&stamp), &updated, body, false)
+                                {
+                                    stamp = fresh;
+                                    offer = false;
+                                }
+                            }
                             if *content != updated {
                                 *content = updated;
                             }
@@ -1942,6 +1963,145 @@ mod tests {
             old, edited,
             "the previous revision stays as the user left it"
         );
+    }
+
+    /// A comparator file from before `get_config` left its block, as the IDE
+    /// wrote it then (no record yet): one sync and it IS the new template,
+    /// byte for byte and offered nothing; the next sync leaves it alone.
+    #[test]
+    fn an_older_comp_file_lands_on_the_new_template() {
+        use crate::panels::mcu_module::codegen::embassy_stm32::comp_file_for_tests as comp;
+        let path = "src/pins/configs/comp1.rs";
+        let body = comp();
+        let legacy = legacy_comp(&body);
+        let mut state = ProjectTreeState::new();
+        state.user_src_files.push((path.to_owned(), legacy));
+        let files = [("comp1.rs".to_string(), body.clone())];
+        let report = state.sync_config_files(&files, &[], &mut None);
+        let text = &state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap()
+            .1;
+        assert_eq!(text, &body);
+        assert!(
+            report.kept.is_empty() && report.offered.is_empty(),
+            "{report:?}"
+        );
+        assert!(!state.templates.offered(path));
+        state.sync_config_files(&files, &[], &mut None);
+        let again = &state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap()
+            .1;
+        assert_eq!(again, &body);
+    }
+
+    /// The same file with a line of the user's in `init`: it keeps the line,
+    /// gains `get_config` exactly once, and compiles against the new block.
+    #[test]
+    fn an_edited_comp_file_gains_get_config_and_keeps_its_lines() {
+        use crate::panels::mcu_module::codegen::embassy_stm32::comp_file_for_tests as comp;
+        let path = "src/pins/configs/comp1.rs";
+        let body = comp();
+        let legacy = legacy_comp(&body).replace(
+            "    comp.enable();\n",
+            "    comp.enable();\n    led_on(); // mine\n",
+        );
+        let mut state = ProjectTreeState::new();
+        state.user_src_files.push((path.to_owned(), legacy));
+        state.sync_config_files(&[("comp1.rs".to_string(), body.clone())], &[], &mut None);
+        let text = &state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap()
+            .1;
+        assert!(text.contains("    led_on(); // mine\n"), "{text}");
+        assert_eq!(text.matches("fn get_config(").count(), 1, "{text}");
+        assert!(text.contains("pub const HYSTERESIS: u8 = "), "{text}");
+        let end = text.find("// <<< GENERATED END >>>").unwrap();
+        assert!(
+            text[end..].contains("fn get_config("),
+            "below the block:\n{text}"
+        );
+    }
+
+    /// `body` as the IDE wrote it before 1B.4 (see `legacy_comp_file`).
+    fn legacy_comp(body: &str) -> String {
+        crate::panels::mcu_module::codegen::embassy_stm32::legacy_comp_file(body)
+    }
+
+    /// An edited older comp file whose code names what the old block
+    /// imported gets those names back, once, below its own `use`.
+    #[test]
+    fn an_edited_comp_file_keeps_the_names_the_old_block_imported() {
+        use crate::panels::mcu_module::codegen::embassy_stm32::comp_file_for_tests as comp;
+        let path = "src/pins/configs/comp1.rs";
+        let body = comp();
+        let legacy = legacy_comp(&body).replace(
+            "    comp.enable();\n",
+            "    comp.enable();\n    comp.set_blanking_source(BlankingSource::Blank1);\n",
+        );
+        let mut state = ProjectTreeState::new();
+        state.user_src_files.push((path.to_owned(), legacy));
+        let files = [("comp1.rs".to_string(), body.clone())];
+        state.sync_config_files(&files, &[], &mut None);
+        let text = state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            text.matches("use embassy_stm32::comp::{BlankingSource};\n")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains("InterruptHandler};\nuse embassy_stm32::comp::{BlankingSource};\n"),
+            "{text}"
+        );
+        state.sync_config_files(&files, &[], &mut None);
+        let again = &state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap()
+            .1;
+        assert_eq!(again, &text, "a second sync changes nothing");
+    }
+
+    /// A USART file from before the line options were always named, untouched
+    /// and with no record: one sync and it is the template, offered nothing.
+    #[test]
+    fn an_older_usart_file_lands_on_the_new_template() {
+        use crate::panels::mcu_module::codegen::embassy_stm32::{
+            legacy_usart_file, usart_file_for_tests,
+        };
+        let path = "src/pins/configs/usart1.rs";
+        for swap in [false, true] {
+            let body = usart_file_for_tests(swap);
+            let mut state = ProjectTreeState::new();
+            state
+                .user_src_files
+                .push((path.to_owned(), legacy_usart_file(&body)));
+            let files = [("usart1.rs".to_string(), body.clone())];
+            let report = state.sync_config_files(&files, &[], &mut None);
+            let text = &state
+                .user_src_files
+                .iter()
+                .find(|(p, _)| p == path)
+                .unwrap()
+                .1;
+            assert_eq!(text, &body, "swap {swap}");
+            assert!(report.offered.is_empty(), "{report:?}");
+        }
     }
 
     /// A config file's constants (inside the GENERATED block) regenerate on a

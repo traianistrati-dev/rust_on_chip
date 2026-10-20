@@ -2484,8 +2484,9 @@ mod public_constants {
         for (n, line) in body.lines().enumerate() {
             let t = line.trim_start();
             // `const fn` is a function, not a constant, and the ones generated
-            // here are helpers living in the reader's own editable zone.
-            if t.starts_with("const ") && !t.starts_with("const fn ") {
+            // here are helpers living in the reader's own editable zone. Nor is
+            // `const _`: a compile-time assertion with no name to read.
+            if t.starts_with("const ") && !t.starts_with("const fn ") && !t.starts_with("const _") {
                 panic!("{what}:{}: generated constant is private:\n{line}", n + 1);
             }
         }
@@ -2533,19 +2534,46 @@ mod public_constants {
         mcu.reconcile_modules();
     }
 
-    /// Every built-in chip, on every runtime, main.rs and every config file.
+    /// Every built-in chip, on every runtime, main.rs and every config file -
+    /// with every watchdog switched on, so their files are among them: their
+    /// constants were the last private ones, unseen while the guard built
+    /// projects with the watchdogs off.
     #[test]
     fn no_generated_constant_is_private() {
+        use crate::panels::mcu_module::watchdog::{
+            EspWdtConfig, IwdgConfig, NrfWdtConfig, RpWdtConfig, WatchdogSettings, WwdgConfig,
+        };
         let mut files = 0;
+        let mut watchdogs = std::collections::BTreeSet::new();
         for def in builtins::builtin_definitions() {
             for runtime in [Runtime::Blocking, Runtime::Async] {
                 let mut mcu = def.build_mcu();
                 mcu.runtime = runtime;
                 wire_two_buses(&mut mcu);
+                mcu.watchdog = WatchdogSettings {
+                    iwdg: Some(IwdgConfig {
+                        timeout_us: 1_000_000,
+                    }),
+                    wwdg: Some(WwdgConfig {
+                        timeout_us: 20_000,
+                        window_us: 0,
+                    }),
+                    rwdt: Some(EspWdtConfig::default_for()),
+                    mwdt0: Some(EspWdtConfig::default_for()),
+                    mwdt1: Some(EspWdtConfig::default_for()),
+                    rp: Some(RpWdtConfig::default_for()),
+                    nrf: Some(NrfWdtConfig::default_for()),
+                };
                 assert_all_public(&format!("{} main.rs", def.id), &mcu.fresh_main_rs());
                 for (name, body) in mcu.config_files() {
                     assert_all_public(&format!("{} {name}", def.id), &body);
                     files += 1;
+                    if ["iwdg", "wwdg", "rwdt", "mwdt0", "mwdt1", "watchdog"]
+                        .iter()
+                        .any(|w| name == format!("{w}.rs"))
+                    {
+                        watchdogs.insert(name);
+                    }
                 }
             }
         }
@@ -2553,6 +2581,18 @@ mod public_constants {
             files >= 2,
             "no bus config file was generated, so the richest source of \
              constants went unchecked"
+        );
+        // Every kind of watchdog file reached the check, or it checked nothing.
+        assert_eq!(
+            watchdogs.into_iter().collect::<Vec<_>>(),
+            [
+                "iwdg.rs",
+                "mwdt0.rs",
+                "mwdt1.rs",
+                "rwdt.rs",
+                "watchdog.rs",
+                "wwdg.rs"
+            ]
         );
     }
 }

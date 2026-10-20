@@ -1,16 +1,15 @@
 // <<< GENERATED>>>
 // Peripheral config (from the Configuration tab) - auto-updated; edit it there.
-use embassy_stm32::comp::{BlankingSource, Config, Hysteresis, InvertingInput, OutputPolarity};{POWER_USE}
-
-fn get_config() -> Config {
-    let mut config = Config::default();
-{POWER_LINE}    config.hysteresis = Hysteresis::{HYST};
-    config.output_polarity = OutputPolarity::{POLARITY};
-    config.inverting_input = InvertingInput::{INM};
-    config.blanking_source = BlankingSource::{BLANK};
-    config
-}
-// <<< GENERATED END >>>
+// Plain numbers: `get_config()` below turns them into embassy's settings.
+// Hysteresis: {HYST_LEGEND}.
+pub const HYSTERESIS: u8 = {HYST_N};
+// Output inverted.
+pub const INVERTED: bool = {INVERTED};
+// Inverting input [-]: {INM_LEGEND}.
+pub const INVERTING_INPUT: u8 = {INM_N};
+// Blanking: {BLANK_LEGEND}.
+pub const BLANKING_SOURCE: u8 = {BLANK_N};
+{POWER_CONST}// <<< GENERATED END >>>
 
 // Everything below is editable - your changes are preserved on regeneration.
 //
@@ -25,6 +24,7 @@ use embassy_stm32::{peripherals, Peri};
 /// The concrete type [`init`] hands back, named so it can be a struct field.
 pub type Handle<'d> = Comp<'d, peripherals::COMP{N}>;
 
+{GET_CONFIG}
 /// Initialise COMP{N} and start it.
 pub fn init<'d>(
     comp: Peri<'d, peripherals::COMP{N}>,
@@ -53,4 +53,3 @@ pub fn init<'d>(
 //     {HANDLE}.wait_for_rising_edge().await;
 //     {HANDLE}.wait_for_falling_edge().await;
 //     {HANDLE}.wait_for_any_edge().await;
-

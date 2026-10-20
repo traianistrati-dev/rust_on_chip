@@ -978,7 +978,48 @@ mod emit_for_manual_compile {
             "config files: {:?}",
             configs.iter().map(|(n, _)| n).collect::<Vec<_>>()
         );
-        let user: Vec<(String, String)> = mcu.pin_tree_files();
+        // `EIDE_COMP_UPGRADE=edited`: COMP{a} as an older IDE wrote it, with
+        // lines of the user's naming what its block imported, upgraded by the
+        // app's own sync - so what an upgrade leaves behind is what compiles.
+        let user: Vec<(String, String)> = if std::env::var("EIDE_COMP_UPGRADE").as_deref()
+            == Ok("edited")
+        {
+            let name = format!("comp{a}.rs");
+            let body = &configs
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("the comp file")
+                .1;
+            let legacy = crate::panels::mcu_module::codegen::embassy_stm32::legacy_comp_file(body)
+                .replace(
+                    "    comp.enable();\n",
+                    concat!(
+                        "    comp.enable();\n",
+                        "    comp.set_blanking_source(BlankingSource::Blank1);\n",
+                        "    let _c: Config = get_config();\n",
+                    ),
+                );
+            let mut tree = crate::project_tree::logic::ProjectTreeState::new();
+            tree.user_src_files
+                .push((format!("src/pins/configs/{name}"), legacy));
+            tree.sync_config_files(&configs, &mcu.custom_keep_prefixes(), &mut None);
+            tree.sync_pin_files(&mcu.all_pin_functions());
+            let text = &tree
+                .user_src_files
+                .iter()
+                .find(|(p, _)| p.ends_with(&name))
+                .expect("upgraded")
+                .1;
+            assert!(
+                text.contains("use embassy_stm32::comp::{BlankingSource, Config};")
+                    && text.contains("fn get_config("),
+                "{text}"
+            );
+            println!("upgraded {name}");
+            tree.user_src_files
+        } else {
+            mcu.pin_tree_files()
+        };
         let dir = std::env::temp_dir().join("eide_comp_check");
         project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")

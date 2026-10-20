@@ -1818,6 +1818,367 @@ pub fn ensure_edge_hooks(mut file: String, hooks: &[EdgeHook]) -> String {
     file
 }
 
+// ── Config files from before their template changed ────────────────────────
+
+/// An item a config file's GENERATED block used to hold and its template now
+/// keeps below the block: `ident`, in the files `file` accepts, put back in
+/// front of the line that starts with `before`.
+struct MovedItem {
+    file: fn(&str) -> bool,
+    ident: &'static str,
+    before: &'static str,
+}
+
+/// `comp{N}.rs`'s `get_config`: in the block until it became plain numbers
+/// (see `embassy_stm32::comp`).
+const MOVED_ITEMS: [MovedItem; 1] = [MovedItem {
+    file: is_comp_file,
+    ident: "get_config",
+    before: "/// Initialise COMP",
+}];
+
+/// The `use` that old comp block had - for the code below it as much as for
+/// `get_config`: `Config { .. }`, `comp.set_blanking_source(BlankingSource::Blank1)`.
+const COMP_BLOCK_USE: &str = "embassy_stm32::comp";
+const COMP_BLOCK_NAMES: [&str; 6] = [
+    "BlankingSource",
+    "Config",
+    "Hysteresis",
+    "InvertingInput",
+    "OutputPolarity",
+    "PowerMode",
+];
+
+/// The USART line options a block names - always since 1B.4, before only
+/// while switched on - each with the line `get_config` sets it by.
+const LINE_EXTRAS: [(&str, &str); 3] = [
+    ("SWAP_RX_TX", "    config.swap_rx_tx = SWAP_RX_TX;\n"),
+    ("INVERT_TX", "    config.invert_tx = INVERT_TX;\n"),
+    ("INVERT_RX", "    config.invert_rx = INVERT_RX;\n"),
+];
+
+/// `comp1.rs`, `comp12.rs` - a comparator's config file.
+fn is_comp_file(name: &str) -> bool {
+    name.strip_prefix("comp")
+        .and_then(|r| r.strip_suffix(".rs"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `spliced` - `existing` with its block just replaced by `body`'s - brought
+/// up to the template wherever the OLD block shows the file predates a change
+/// that took something out of the block:
+/// - comp, whose block held `get_config` and its `use`: `get_config` back
+///   below the block while the code there still calls it, and the names that
+///   `use` gave the code there;
+/// - USART, whose block named an option only while it was on: `get_config`'s
+///   line for each option it did not name, unless the code sets that field
+///   itself - or the option's box would do nothing.
+///
+/// An older untouched file comes out as the template byte for byte; one
+/// this version wrote is never touched - its old block already has the new
+/// shape. `None` when nothing changed. LF text out, as `iot_gen::upgraded`.
+pub fn upgraded_config(name: &str, existing: &str, spliced: &str, body: &str) -> Option<String> {
+    let (begin, end) = crate::project_tree::templates::block(existing)?;
+    let old = code_only(&existing[begin..end]);
+    let lf = spliced.replace("\r\n", "\n");
+    let mut out = lf.clone();
+    if is_comp_file(name) && old.contains(&format!("use {COMP_BLOCK_USE}::")) {
+        // The names the old block's `use` bound - a G4 one never had
+        // `PowerMode` - and before `get_config` goes in: its body names them.
+        let names: Vec<&str> = COMP_BLOCK_NAMES
+            .iter()
+            .copied()
+            .filter(|n| binds_name(&old, n))
+            .collect();
+        restore_imports(&mut out, COMP_BLOCK_USE, &names);
+    }
+    for item in MOVED_ITEMS
+        .iter()
+        .filter(|m| (m.file)(name) && defines_fn(&old, m.ident))
+    {
+        put_back(&mut out, item, body);
+    }
+    add_line_extras(&mut out, &old, body);
+    (out != lf).then_some(out)
+}
+
+/// `item` from `body` below `out`'s block, while the code there calls it and
+/// neither defines nor imports one of its own: in front of its anchor line,
+/// where the template has it, or at the end when the anchor is gone, doubled
+/// or only in a comment.
+fn put_back(out: &mut String, item: &MovedItem, body: &str) {
+    let Some((_, after)) = crate::project_tree::templates::block(out) else {
+        return;
+    };
+    let code = code_only(&out[after..]);
+    // At the top level: a method `get_config` in an `impl`, or one in a nested
+    // module, is not the free function `init` calls.
+    if !has_ident(&code, item.ident)
+        || defines_item(&code, item.ident)
+        || binds_name(&code, item.ident)
+    {
+        return;
+    }
+    let Some(text) = item_text(body, item.ident) else {
+        return;
+    };
+    let tail = &out[after..];
+    // A line that starts with the anchor, in code: `code_only` swallows a
+    // marker put there when it is inside a comment or a literal.
+    let anchors: Vec<usize> = tail
+        .match_indices(item.before)
+        .map(|(i, _)| i)
+        .filter(|&i| i == 0 || tail[..i].ends_with('\n'))
+        .filter(|&i| code_only(&format!("{}\u{1}", &tail[..i])).ends_with('\u{1}'))
+        .collect();
+    match anchors.as_slice() {
+        [i] => out.insert_str(after + i, &format!("{text}\n")),
+        _ => {
+            let end = out.trim_end().len();
+            out.truncate(end);
+            out.push_str(&format!("\n\n{text}"));
+        }
+    }
+}
+
+/// One `use {path}::{..};` below `out`'s block for each of `names` the
+/// user's code - above the block or below it - names as a path's first
+/// segment (`Config { .. }`, `BlankingSource::Blank1`, `super::Config` from a
+/// module inside; not `comp::Config`) and neither imports nor defines: what
+/// the old block gave it. At the top level only - a `use` inside a `fn` or a
+/// `mod tests` is another scope: after the code's own `use {path}::` (its
+/// LAST line, a tree can span several, and where code resumes), else above
+/// its first `use` and that `use`'s attributes, else right below the block.
+fn restore_imports(out: &mut String, path: &str, names: &[&str]) {
+    let Some((begin, after)) = crate::project_tree::templates::block(out) else {
+        return;
+    };
+    let around = code_only(&format!("{}\n{}", &out[..begin], &out[after..]));
+    let missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| names_head(&around, n) && !binds_name(&around, n) && !defines_item(&around, n))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let line = format!("use {path}::{{{}}};\n", missing.join(", "));
+    // By line: `code_only` keeps every line break, so a line of the code is
+    // that line of the file.
+    let tail = out[after..].to_owned();
+    let raw: Vec<&str> = tail.split_inclusive('\n').collect();
+    let code = code_only(&tail);
+    let lines: Vec<&str> = code.split('\n').collect();
+    let depth = brace_depths(&code);
+    let offset = |k: usize| {
+        raw[..k.min(raw.len())]
+            .iter()
+            .map(|l| l.len())
+            .sum::<usize>()
+    };
+    // A line whose start is code, not the inside of a comment or a literal.
+    let in_code = |k: usize| {
+        k >= raw.len() || code_only(&format!("{}\u{1}", &tail[..offset(k)])).ends_with('\u{1}')
+    };
+    let top_use = |prefix: &str| {
+        (0..lines.len()).find(|&k| depth[k].0 == 0 && lines[k].trim_start().starts_with(prefix))
+    };
+    let own = format!("use {path}::");
+    let at = if let Some(k) = top_use(&own) {
+        let last = (k..lines.len())
+            .find(|&m| lines[m].contains(';'))
+            .unwrap_or(k);
+        let next = (last + 1..=raw.len())
+            .find(|&m| in_code(m))
+            .unwrap_or(raw.len());
+        offset(next)
+    } else if let Some(mut k) = top_use("use ") {
+        while k > 0 && depth[k - 1].0 == 0 && lines[k - 1].trim_start().starts_with("#[") {
+            k -= 1;
+        }
+        offset(k)
+    } else {
+        out.insert_str(after, &format!("\n{}", line.trim_end()));
+        return;
+    };
+    out.insert_str(after + at, &line);
+}
+
+/// For each line of `code` (see [`code_only`]), its brace depth where it
+/// starts and where it ends - 0 is the top level, outside every `fn`, `impl`
+/// and `mod` body.
+fn brace_depths(code: &str) -> Vec<(usize, usize)> {
+    let mut depth = 0usize;
+    code.split('\n')
+        .map(|line| {
+            let start = depth;
+            for c in line.chars() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            (start, depth)
+        })
+        .collect()
+}
+
+/// Whether `code` names `name` as a path's FIRST segment - or after `self::`
+/// / `super::`, which reach a module's own imports - not after another path's
+/// `::`, not a field after `.`, not inside another crate's `use` tree.
+fn names_head(code: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(name).any(|(at, _)| {
+        let before = &code[..at];
+        let trimmed = before.trim_end();
+        let head = trimmed.strip_suffix("::").is_none_or(|p| {
+            matches!(
+                p.trim_end().rsplit(|c: char| !is_ident(c)).next(),
+                Some("self" | "super")
+            )
+        });
+        !before.chars().next_back().is_some_and(is_ident)
+            && !code[at + name.len()..].chars().next().is_some_and(is_ident)
+            && head
+            && !trimmed.ends_with('.')
+            && use_tree_root(before).is_none_or(|r| matches!(r, "self" | "super"))
+    })
+}
+
+/// Whether `code` defines an item `name` at its top level - a `struct`,
+/// `enum`, `type`, `trait`, `union`, `const`, `static` or `fn`.
+fn defines_item(code: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    top_level_items(code).iter().any(|item| {
+        let t = bare_item(item);
+        [
+            "struct ",
+            "enum ",
+            "type ",
+            "trait ",
+            "union ",
+            "const ",
+            "static ",
+            "fn ",
+            "const fn ",
+            "async fn ",
+            "unsafe fn ",
+        ]
+        .iter()
+        .any(|kw| {
+            t.strip_prefix(kw)
+                .is_some_and(|r| r.trim_start().split(|c: char| !is_ident(c)).next() == Some(name))
+        })
+    })
+}
+
+/// `get_config`'s line for each option in [`LINE_EXTRAS`] that `body` sets
+/// and the `old` block did not name - so the file predates it - unless the
+/// code below the block sets that field itself; in the body's order, in front
+/// of `get_config`'s closing `config`. The free `get_config` only - at the
+/// top level, in code - and only when it ends as the template's does, with
+/// `config` on the line before its closing `}`: anything else is left alone.
+fn add_line_extras(out: &mut String, old: &str, body: &str) {
+    let Some((_, after)) = crate::project_tree::templates::block(out) else {
+        return;
+    };
+    let tail = out[after..].to_owned();
+    let code = code_only(&tail);
+    let missing: Vec<&str> = LINE_EXTRAS
+        .iter()
+        .filter(|(konst, line)| {
+            let field = line.trim().split(" = ").next().unwrap_or_default();
+            body.contains(line)
+                && !old.contains(&format!("pub const {konst}:"))
+                && !code.contains(field)
+        })
+        .map(|(_, line)| *line)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let raw: Vec<&str> = tail.split_inclusive('\n').collect();
+    let lines: Vec<&str> = code.split('\n').collect();
+    let depth = brace_depths(&code);
+    // The line of `config` just above the `}` that closes `get_config`.
+    let Some(config) = (0..lines.len())
+        .filter(|&k| depth[k].0 == 0)
+        .find_map(|k| {
+            let at = lines[k].find("fn get_config(")?;
+            if !matches!(
+                lines[k][..at].trim(),
+                "" | "pub" | "pub(crate)" | "pub(super)"
+            ) {
+                return None;
+            }
+            let close = (k + 1..lines.len()).find(|&m| depth[m].1 == 0)?;
+            (lines[close].trim_start().starts_with('}') && lines[close - 1] == "    config")
+                .then_some(close - 1)
+        })
+        .filter(|&k| k < raw.len())
+    else {
+        return;
+    };
+    // The run of option lines just above it, rebuilt in the body's order.
+    let mut start = config;
+    while start > 0 && LINE_EXTRAS.iter().any(|(_, l)| raw[start - 1] == *l) {
+        start -= 1;
+    }
+    let run = raw[start..config].concat();
+    let rebuilt: String = LINE_EXTRAS
+        .iter()
+        .map(|(_, l)| *l)
+        .filter(|l| run.contains(l) || missing.contains(l))
+        .collect();
+    let line_at = |k: usize| raw[..k].iter().map(|l| l.len()).sum::<usize>();
+    out.replace_range(after + line_at(start)..after + line_at(config), &rebuilt);
+}
+
+/// Whether `code` (see [`code_only`]) defines a function `ident` - `fn`,
+/// `pub fn`, `pub(crate) fn`, `const fn`, `async fn` and the like.
+fn defines_fn(code: &str, ident: &str) -> bool {
+    code.lines().any(|line| {
+        let mut t = line.trim_start();
+        for q in [
+            "pub(crate) ",
+            "pub(super) ",
+            "pub ",
+            "const ",
+            "async ",
+            "unsafe ",
+        ] {
+            t = t.strip_prefix(q).unwrap_or(t);
+        }
+        t.strip_prefix("fn ")
+            .and_then(|r| r.trim_start().strip_prefix(ident))
+            .is_some_and(|r| r.trim_start().starts_with(['(', '<']))
+    })
+}
+
+/// The function `ident` below `body`'s block, with the `///` lines above it,
+/// through its closing `}` at the start of a line.
+fn item_text(body: &str, ident: &str) -> Option<String> {
+    let (_, after) = crate::project_tree::templates::block(body)?;
+    let tail = &body[after..];
+    let head = format!("fn {ident}(");
+    let at = tail
+        .match_indices(&head)
+        .map(|(i, _)| i)
+        .find(|&i| i == 0 || tail[..i].ends_with('\n'))?;
+    let close = tail[at..].find("\n}\n").map(|i| at + i + 3)?;
+    // The doc lines just above it.
+    let mut start = at;
+    while let Some(prev) = tail[..start].strip_suffix('\n') {
+        let line_start = prev.rfind('\n').map_or(0, |i| i + 1);
+        if !prev[line_start..].trim_start().starts_with("///") {
+            break;
+        }
+        start = line_start;
+    }
+    Some(tail[start..close].to_owned())
+}
+
 /// Whether `ident` occurs in `text` as a whole identifier - not as the tail of
 /// `on_p0_14_in_edge_old`, nor the head of `on_p0_14_in_edge2`.
 fn has_ident(text: &str, ident: &str) -> bool {
@@ -3526,5 +3887,320 @@ mod names_module_tests {
             "use stm32f1xx_hal::{timer::Timer};\nfn f() { adc::x(); }\n",
             "adc"
         ));
+    }
+}
+
+#[cfg(test)]
+mod config_upgrade_tests {
+    use super::upgraded_config;
+
+    // ── comp ──
+    const OLD: &str = "// <<< GENERATED>>>\nuse embassy_stm32::comp::{BlankingSource, Config};\n\nfn get_config() -> Config {\n    Config::default()\n}\n// <<< GENERATED END >>>\n\n";
+    const NEW: &str =
+        "// <<< GENERATED>>>\npub const HYSTERESIS: u8 = 3;\n// <<< GENERATED END >>>\n\n";
+    const USES: &str = "use embassy_stm32::comp::{Comp};\n\n";
+    const FN: &str = "/// The `Config` the numbers above describe.\nfn get_config() -> embassy_stm32::comp::Config {\n    use embassy_stm32::comp::Config;\n    Config::default()\n}\n";
+    const INIT: &str = "/// Initialise COMP1 and start it.\npub fn init() -> Handle {\n    Comp::new(get_config())\n}\n";
+
+    fn body() -> String {
+        format!("{NEW}{USES}{FN}\n{INIT}")
+    }
+
+    /// `tail` below the old block, spliced as the sync does, and upgraded.
+    fn up(tail: &str) -> Option<String> {
+        upgraded_config(
+            "comp1.rs",
+            &format!("{OLD}{tail}"),
+            &format!("{NEW}{tail}"),
+            &body(),
+        )
+    }
+
+    /// An older untouched file: `get_config` back in front of the anchor -
+    /// the template itself - and a file of the new shape is left alone.
+    #[test]
+    fn an_older_comp_file_gets_get_config_back_where_the_template_has_it() {
+        assert_eq!(up(&format!("{USES}{INIT}")), Some(body()));
+        assert_eq!(upgraded_config("comp1.rs", &body(), &body(), &body()), None);
+        // CRLF on disk comes out LF.
+        let old = format!("{OLD}{USES}{INIT}").replace('\n', "\r\n");
+        let spliced = format!("{NEW}{USES}{INIT}").replace('\n', "\r\n");
+        assert_eq!(
+            upgraded_config("comp1.rs", &old, &spliced, &body()),
+            Some(body())
+        );
+    }
+
+    /// The user's own `get_config`, one brought in, no call left, or a file
+    /// this version wrote with `get_config` deleted: nothing is added. Nor in
+    /// a file that is not a comparator's.
+    #[test]
+    fn a_tail_that_owns_or_drops_get_config_is_left_alone() {
+        for tail in [
+            format!("{USES}pub(crate) fn get_config() -> Mine {{ mine() }}\n\n{INIT}"),
+            format!("use crate::cfg::get_config;\n\n{INIT}"),
+            format!("{USES}pub fn init() -> Handle {{\n    Comp::new(Mine)\n}}\n"),
+            format!("{USES}// get_config() went away\npub fn init() {{}}\n"),
+        ] {
+            assert_eq!(up(&tail), None, "{tail}");
+        }
+        let new_shape = format!("{NEW}{USES}{INIT}");
+        assert_eq!(
+            upgraded_config("comp1.rs", &new_shape, &new_shape, &body()),
+            None
+        );
+        let (old, spliced) = (format!("{OLD}{USES}{INIT}"), format!("{NEW}{USES}{INIT}"));
+        assert_eq!(upgraded_config("usart1.rs", &old, &spliced, &body()), None);
+        assert_eq!(upgraded_config("compx.rs", &old, &spliced, &body()), None);
+    }
+
+    /// Code the user wrote below the old block that named what the block
+    /// imported gets those names back - only those it names first in a path,
+    /// and not one it imports or defines itself; once.
+    #[test]
+    fn the_names_the_old_block_imported_come_back_for_the_code_that_uses_them() {
+        let init = "/// Initialise COMP1 and start it.\npub fn init() -> Handle {\n    let c: Config = get_config();\n    let mut comp = Comp::new(c);\n    comp.set_blanking_source(BlankingSource::Blank1);\n    let _p = embassy_stm32::comp::OutputPolarity::Inverted;\n    comp\n}\n";
+        let out = up(&format!("{USES}{init}")).expect("upgraded");
+        assert!(
+            out.contains(
+                "use embassy_stm32::comp::{Comp};\nuse embassy_stm32::comp::{BlankingSource, Config};\n"
+            ),
+            "{out}"
+        );
+        assert_eq!(out.matches("fn get_config(").count(), 1, "{out}");
+        assert_eq!(upgraded_config("comp1.rs", &out, &out, &body()), None);
+        // One the user imports, or defines, is theirs.
+        let own = format!("use embassy_stm32::comp::BlankingSource;\nstruct Config;\n{USES}{init}");
+        let out = up(&own).expect("upgraded");
+        assert!(!out.contains("{BlankingSource"), "{out}");
+        assert!(!out.contains("comp::{Config}"), "{out}");
+    }
+
+    /// The anchor edited away, doubled, or only inside a comment: the
+    /// function goes at the end, once.
+    #[test]
+    fn without_its_anchor_in_code_the_item_goes_at_the_end() {
+        let bare = format!("{USES}pub fn init() -> Handle {{\n    Comp::new(get_config())\n}}\n");
+        let out = up(&bare).expect("moved");
+        assert!(out.ends_with(&format!("}}\n\n{FN}")), "{out}");
+        assert_eq!(upgraded_config("comp1.rs", &out, &out, &body()), None);
+        let doubled = format!("{USES}{INIT}\n{INIT}");
+        assert!(up(&doubled).expect("moved").ends_with(FN));
+        let commented = format!(
+            "{USES}/*\n/// Initialise COMP1 and start it.\n*/\npub fn init() -> Handle {{\n    Comp::new(get_config())\n}}\n"
+        );
+        let out = up(&commented).expect("moved");
+        assert!(out.ends_with(FN), "{out}");
+        assert!(
+            out.contains("/*\n/// Initialise COMP1 and start it.\n*/\npub fn"),
+            "{out}"
+        );
+    }
+
+    /// Each case the second review found: a `use` tree over several lines, a
+    /// method named `get_config`, a name the old block did not import, a name
+    /// reached through `super::`, and a `use` line inside a comment.
+    #[test]
+    fn the_upgrade_finds_its_places_in_the_code() {
+        let names = "pub fn init() -> Handle {\n    let mut comp = Comp::new(get_config());\n    comp.set_blanking_source(BlankingSource::Blank1);\n    comp\n}\n";
+        let wrapped =
+            format!("use embassy_stm32::comp::{{\n    Comp, InputPlusPin,\n}};\n\n{names}");
+        let out = up(&wrapped).expect("upgraded");
+        assert!(
+            out.contains(
+                "    Comp, InputPlusPin,\n};\nuse embassy_stm32::comp::{BlankingSource};\n"
+            ),
+            "after the tree's last line:\n{out}"
+        );
+        let method = format!(
+            "{USES}pub struct W(u8);\nimpl W {{\n    pub fn get_config(&self) -> u8 {{\n        self.0\n    }}\n}}\n\n{INIT}"
+        );
+        let out = up(&method).expect("upgraded");
+        assert_eq!(
+            out.matches("fn get_config(").count(),
+            2,
+            "the free one too:\n{out}"
+        );
+        let power = format!("{USES}{INIT}\nfn p() {{\n    let _ = PowerMode::HighSpeed;\n}}\n");
+        assert!(!up(&power).expect("upgraded").contains("PowerMode}"));
+        let nested = format!(
+            "{USES}mod helpers {{\n    pub fn c() -> super::Config {{\n        super::Config::default()\n    }}\n}}\n\n{INIT}"
+        );
+        let out = up(&nested).expect("upgraded");
+        assert!(
+            out.contains("use embassy_stm32::comp::{Config};\n"),
+            "{out}"
+        );
+        let commented = format!("/*\nuse embassy_stm32::comp::{{Old}};\n*/\n{USES}{names}");
+        let out = up(&commented).expect("upgraded");
+        assert!(
+            out.contains(
+                "*/\nuse embassy_stm32::comp::{Comp};\nuse embassy_stm32::comp::{BlankingSource};\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// The third round's cases: a `use` inside `mod tests` or a `fn` is
+    /// another scope; the user's attribute stays on their `use`; a comment
+    /// opened after the `;` is not where the import goes; a braced
+    /// `use super::{Config}` reaches the name too.
+    #[test]
+    fn the_upgrade_works_at_the_top_level_only() {
+        let init =
+            "pub fn init() -> Handle {\n    let c: Config = get_config();\n    Comp::new(c)\n}\n";
+        let tests = "\n#[cfg(test)]\nmod tests {\n    use embassy_stm32::comp::Comp;\n}\n";
+        let scoped =
+            format!("use embassy_stm32::{{comp::{{Comp}}, peripherals}};\n\n{init}{tests}");
+        let out = up(&scoped).expect("upgraded");
+        assert!(
+            out.contains("use embassy_stm32::comp::{Config};\nuse embassy_stm32::{comp::{Comp}, peripherals};"),
+            "above the first top-level use:\n{out}"
+        );
+        assert!(
+            out.contains("mod tests {\n    use embassy_stm32::comp::Comp;\n}"),
+            "{out}"
+        );
+        let attr = format!(
+            "#[allow(unused_imports)]\nuse embassy_stm32::{{comp::Comp, peripherals}};\n\n{init}"
+        );
+        let out = up(&attr).expect("upgraded");
+        assert!(
+            out.contains(
+                "use embassy_stm32::comp::{Config};\n#[allow(unused_imports)]\nuse embassy_stm32::{"
+            ),
+            "{out}"
+        );
+        let comment = format!(
+            "use embassy_stm32::comp::{{Comp}}; /* the comparator\n   and its pins */\n\n{init}"
+        );
+        let out = up(&comment).expect("upgraded");
+        assert!(
+            out.contains("and its pins */\nuse embassy_stm32::comp::{Config};\n"),
+            "{out}"
+        );
+        let braced = format!("{USES}mod reexport {{\n    pub use super::{{Config}};\n}}\n\n{INIT}");
+        assert!(
+            up(&braced)
+                .expect("upgraded")
+                .contains("use embassy_stm32::comp::{Config};\n")
+        );
+    }
+
+    // ── USART ──
+    const ALL: [&str; 3] = [
+        "    config.swap_rx_tx = SWAP_RX_TX;\n",
+        "    config.invert_tx = INVERT_TX;\n",
+        "    config.invert_rx = INVERT_RX;\n",
+    ];
+
+    fn u_block(named: &[&str]) -> String {
+        let consts: String = named
+            .iter()
+            .map(|k| format!("pub const {k}: bool = true;\n"))
+            .collect();
+        format!(
+            "// <<< GENERATED>>>\npub const BAUDRATE: u32 = 9600;\n{consts}// <<< GENERATED END >>>\n\n"
+        )
+    }
+
+    fn u_tail(lines: &str) -> String {
+        format!(
+            "use x;\n\nfn get_config() -> Config {{\n    let mut config = Config::default();\n    config.baudrate = BAUDRATE;\n{lines}    config\n}}\n"
+        )
+    }
+
+    fn u_body() -> String {
+        format!(
+            "{}{}",
+            u_block(&["SWAP_RX_TX", "INVERT_TX", "INVERT_RX"]),
+            u_tail(&ALL.concat())
+        )
+    }
+
+    /// `tail` under a block that named `named`, upgraded against the body.
+    fn u_up(named: &[&str], tail: &str) -> Option<String> {
+        upgraded_config(
+            "usart1.rs",
+            &format!("{}{tail}", u_block(named)),
+            &format!(
+                "{}{tail}",
+                u_block(&["SWAP_RX_TX", "INVERT_TX", "INVERT_RX"])
+            ),
+            &u_body(),
+        )
+    }
+
+    /// An older file has the line of each option that was on: the others come
+    /// in, in the body's order - the template, whichever were on.
+    #[test]
+    fn an_older_usart_file_gains_the_lines_of_the_options_it_did_not_name() {
+        assert_eq!(u_up(&[], &u_tail("")), Some(u_body()));
+        assert_eq!(u_up(&["SWAP_RX_TX"], &u_tail(ALL[0])), Some(u_body()));
+        assert_eq!(u_up(&["INVERT_RX"], &u_tail(ALL[2])), Some(u_body()));
+        assert_eq!(
+            upgraded_config("usart1.rs", &u_body(), &u_body(), &u_body()),
+            None
+        );
+    }
+
+    /// A field the user sets, a file of the new shape with a line deleted,
+    /// or no `get_config` to put a line in: the user's, as it stands.
+    #[test]
+    fn a_usart_file_that_sets_the_field_itself_keeps_it() {
+        let own = u_tail("    config.invert_tx = true;\n");
+        let out = u_up(&[], &own).expect("upgraded");
+        assert_eq!(out.matches("invert_tx").count(), 1, "{out}");
+        assert!(out.contains(ALL[0]) && out.contains(ALL[2]), "{out}");
+        let deleted = u_tail(&format!("{}{}", ALL[0], ALL[2]));
+        assert_eq!(
+            u_up(&["SWAP_RX_TX", "INVERT_TX", "INVERT_RX"], &deleted),
+            None
+        );
+        assert_eq!(u_up(&[], "use x;\n\npub fn init() {}\n"), None);
+        // `pub fn get_config` is the same function.
+        let public = u_tail("").replace("\nfn get_config", "\npub fn get_config");
+        assert_eq!(
+            u_up(&[], &public),
+            Some(u_body().replace("\nfn get_config", "\npub fn get_config"))
+        );
+        // A `get_config` that ends otherwise: the lines never go into the
+        // next function's `config`.
+        let other = "use x;\n\nfn get_config() -> Config {\n    return Config::default();\n}\n\nfn other() -> Config {\n    let config = Config::default();\n    config\n}\n";
+        assert_eq!(u_up(&[], other), None);
+        // Nor when its `}` carries a comment, or it is a one-liner.
+        let noted = "use x;\n\nfn get_config() -> Config {\n    return Config::default();\n} // done\n\nfn other() -> Config {\n    let config = Config::default();\n    config\n}\n";
+        assert_eq!(u_up(&[], noted), None);
+        let one = "use x;\n\nfn get_config() -> Config { Config::default() }\n\nfn other() -> Config {\n    let config = Config::default();\n    config\n}\n";
+        assert_eq!(u_up(&[], one), None);
+    }
+
+    /// A method or a nested `get_config` before the free one, or a copy in a
+    /// comment, does not hide the free one: the lines go there.
+    #[test]
+    fn the_usart_lines_go_into_the_free_get_config() {
+        let method = format!(
+            "use x;\n\npub struct S(u32);\nimpl S {{\n    pub fn get_config(&self) -> u32 {{\n        let config = self.0;\n        config\n    }}\n}}\n\n{}",
+            &u_tail("")["use x;\n\n".len()..]
+        );
+        let out = u_up(&[], &method).expect("upgraded");
+        assert!(
+            out.ends_with(&format!("{}    config\n}}\n", ALL.concat())),
+            "{out}"
+        );
+        assert!(
+            out.contains("        let config = self.0;\n        config\n    }"),
+            "{out}"
+        );
+        let commented = format!(
+            "use x;\n\n/*\nfn get_config() -> Config {{\n    config\n}}\n*/\n{}",
+            &u_tail("")["use x;\n\n".len()..]
+        );
+        let out = u_up(&[], &commented).expect("upgraded");
+        assert!(out.contains("*/\nfn get_config"), "{out}");
+        assert!(
+            out.ends_with(&format!("{}    config\n}}\n", ALL.concat())),
+            "{out}"
+        );
     }
 }

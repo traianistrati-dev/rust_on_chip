@@ -631,6 +631,8 @@ $ALL_CASES = @(
     # machine without the database is a normal machine.
     @{ n = "imported chip, async DMA";     t = "emit_imported_dma_project";  e = @{}; q = $true; p = $CUBE_DB; fam = "import" }
     @{ n = "imported chip, comparators";   t = "emit_comp_project";          e = @{}; q = $true; p = $CUBE_DB; fam = "import" }
+    # An older comp file with the user's lines, upgraded by the app's sync.
+    @{ n = "imported chip, comp upgraded";  t = "emit_comp_project";          e = @{ EIDE_COMP_UPGRADE = "edited" }; q = $false; p = $CUBE_DB; fam = "import" }
 
     # STM32N6 — the first family whose clock block does not come from the
     # descriptor model. Cortex-M55 on a v8-M Main triple, a chip feature derived
@@ -658,7 +660,7 @@ $ALL_CASES = @(
 $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
            "EIDE_F1_SWITCH", "EIDE_F1_WDG", "EIDE_F1_NOPINS", "EIDE_F1_IRQ",
-           "EIDE_F1_IRQ_SHARED", "EIDE_F1_ADC", "ESP_ASYNC_RUNTIME",
+           "EIDE_F1_IRQ_SHARED", "EIDE_F1_ADC", "EIDE_COMP_UPGRADE", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",

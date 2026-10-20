@@ -5823,7 +5823,10 @@ mod watchdog_rp {
             .iter()
             .find(|(n, _)| n == "watchdog.rs")
             .expect("watchdog.rs");
-        assert!(body.contains("const TIMEOUT_US: u32 = 500000;"), "{body}");
+        assert!(
+            body.contains("pub const TIMEOUT_US: u32 = 500000;"),
+            "{body}"
+        );
         assert!(body.contains("use rp235x_hal::Watchdog;"), "{body}");
         // rp235x-hal's ceiling - the RP2040's, kept - not the counter's.
         assert!(body.contains("TIMEOUT_US <= 8_388_607"), "{body}");

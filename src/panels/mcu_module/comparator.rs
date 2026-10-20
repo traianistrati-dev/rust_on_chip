@@ -356,6 +356,51 @@ impl BlankingSource {
     }
 }
 
+// ── The numbers `comp{N}.rs` stores ─────────────────────────────────────────
+//
+// A comparator's GENERATED block holds plain numbers, and `get_config()` below
+// it maps them back to embassy's enums. Each number is a POSITION in the lists
+// above, so their order is part of every user's `comp{N}.rs` now: never
+// reorder `ALL` or `options()`, only append.
+
+impl InvertingInput {
+    /// This choice's number in `comp{N}.rs`: its place in [`Self::ALL`].
+    pub fn index(self) -> u8 {
+        position(&Self::ALL, self)
+    }
+}
+
+impl PowerMode {
+    /// This mode's number in `comp{N}.rs`: its place in [`Self::ALL`].
+    pub fn index(self) -> u8 {
+        position(&Self::ALL, self)
+    }
+}
+
+impl Hysteresis {
+    /// This level's number in `comp{N}.rs` on generation `g`: its place in
+    /// [`Self::options`] - 0, none, for a level `g` cannot express, which is
+    /// what the card falls back to as well.
+    pub fn index(self, g: Generation) -> u8 {
+        position(Self::options(g), self)
+    }
+}
+
+impl BlankingSource {
+    /// This source's number in `comp{N}.rs`: its place in [`Self::ALL`].
+    pub fn index(self) -> u8 {
+        position(&Self::ALL, self)
+    }
+}
+
+/// Where `v` stands in `list`, 0 when it is not there.
+fn position<T: PartialEq>(list: &[T], v: T) -> u8 {
+    list.iter()
+        .position(|x| *x == v)
+        .and_then(|i| u8::try_from(i).ok())
+        .unwrap_or(0)
+}
+
 /// One comparator's settings. Present in [`Mcu::comp`] only when the user
 /// switched that instance on, so the map's keys ARE the enabled instances.
 ///

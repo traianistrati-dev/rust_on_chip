@@ -1347,10 +1347,11 @@ mod tests {
         assert_contains_substring(&code, ".use_hse(8.MHz())");
         assert_contains_substring(&code, ".sysclk(72.MHz())");
         assert_contains_substring(&code, ".pclk1(36.MHz())");
-        // …and omit knobs that match the HAL defaults (ahb/1, apb2/1, adc/6).
+        // …and omit knobs that match the HAL defaults (ahb/1, apb2/1). The
+        // ADC's is /8, so the tab's /6 has to be asked for.
         assert_not_contains_substring(&code, ".hclk(");
         assert_not_contains_substring(&code, ".pclk2(");
-        assert_not_contains_substring(&code, ".adcclk(");
+        assert_contains_substring(&code, ".adcclk(12.MHz())");
     }
 
     /// An imported `ClockConfig::Graph` drives the generated `rcc.cfgr` chain —

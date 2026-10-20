@@ -124,9 +124,9 @@ fn freq_lit(hz: u32) -> String {
 
 /// Build the `rcc.cfgr … .freeze(&mut flash.acr)` chain from the clock config.
 ///
-/// Only knobs that deviate from the HAL's natural defaults are emitted, so the
-/// default 72 MHz config produces exactly the original
-/// `use_hse(8).sysclk(72).pclk1(36)` chain (no spurious diffs).
+/// Only knobs that deviate from the HAL's natural defaults are emitted. The
+/// ADC prescaler is one of them at the Clock tab's default /6: the HAL's own,
+/// without `.adcclk()`, is /8.
 pub fn clock_setup_chain(clock: &ClockConfig) -> String {
     let a = cfgr_args(&typed_f1_clock(clock));
     // Newline + 17 spaces → lines up the `.method()` calls under `rcc.cfgr`.
@@ -188,7 +188,11 @@ fn cfgr_args(c: &Stm32f1Clock) -> CfgrArgs {
         pclk1: f.pclk1,
         hclk: (c.ahb_pre != 1).then_some(f.hclk),
         pclk2: (c.apb2_pre != 1).then_some(f.pclk2),
-        adcclk: (c.adc_pre != 6).then_some(f.adcclk),
+        // The HAL's prescaler without `.adcclk()` is /8 (rcc.rs, `AdcPre::Div8`),
+        // NOT the /6 the Clock tab starts on: left out at /6, the tab drew a
+        // 12 MHz ADC clock and the chip ran it at 9. Asked for, the HAL picks
+        // the prescaler from `pclk2 / adcclk`, which gives back the tab's.
+        adcclk: (c.adc_pre != 8).then_some(f.adcclk),
     }
 }
 
@@ -215,16 +219,22 @@ pub fn f1_hal_pclks(clock: &ClockConfig) -> Option<(u32, u32)> {
 
 /// The HCLK - the CPU clock - the same chain gives, by the same derivation.
 pub fn f1_hal_hclk(clock: &ClockConfig) -> Option<u32> {
-    hal_clocks(&cfgr_args(&typed_f1_clock(clock))).map(|(hclk, _, _)| hclk)
+    hal_clocks(&cfgr_args(&typed_f1_clock(clock))).map(|(hclk, ..)| hclk)
+}
+
+/// The ADC clock the same chain gives, by the same derivation: what each
+/// conversion is timed in.
+pub fn f1_hal_adcclk(clock: &ClockConfig) -> Option<u32> {
+    hal_clocks(&cfgr_args(&typed_f1_clock(clock))).map(|(.., adcclk)| adcclk)
 }
 
 fn hal_pclks(a: &CfgrArgs) -> Option<(u32, u32)> {
-    hal_clocks(a).map(|(_, p1, p2)| (p1, p2))
+    hal_clocks(a).map(|(_, p1, p2, _)| (p1, p2))
 }
 
-/// `(HCLK, PCLK1, PCLK2)` as stm32f1xx-hal's `freeze` derives them, `None`
-/// where it would assert.
-fn hal_clocks(a: &CfgrArgs) -> Option<(u32, u32, u32)> {
+/// `(HCLK, PCLK1, PCLK2, ADCCLK)` as stm32f1xx-hal's `freeze` derives them,
+/// `None` where it would assert.
+fn hal_clocks(a: &CfgrArgs) -> Option<(u32, u32, u32, u32)> {
     const HSI: u32 = 8_000_000;
     let pllsrc = a.hse.unwrap_or(HSI / 2);
     let sysclk = match a.sysclk / pllsrc {
@@ -282,7 +292,7 @@ fn hal_clocks(a: &CfgrArgs) -> Option<(u32, u32, u32)> {
         && pclk1 <= 36_000_000
         && pclk2 <= 72_000_000
         && adcclk <= 14_000_000;
-    ok.then_some((hclk, pclk1, pclk2))
+    ok.then_some((hclk, pclk1, pclk2, adcclk))
 }
 
 // ── Generated section builder ─────────────────────────────────────────────────
@@ -3752,11 +3762,39 @@ mod stale_io_mode_tests {
 
 #[cfg(test)]
 mod hal_clock_tests {
-    use super::{CfgrArgs, cfgr_args, hal_pclks};
+    use super::{CfgrArgs, cfgr_args, hal_clocks, hal_pclks};
     use crate::panels::mcu_module::clock::model::{PllSrc, Stm32f1Clock, SysclkSrc};
 
     fn pclks(c: Stm32f1Clock) -> Option<(u32, u32)> {
         hal_pclks(&cfgr_args(&c))
+    }
+
+    /// The ADC clock the HAL runs is the one the tab draws, at every
+    /// prescaler. At the tab's default /6 that takes asking: the HAL's own
+    /// default, with no `.adcclk()`, is /8 - 9 MHz where the tab said 12.
+    #[test]
+    fn the_adc_clock_is_the_tabs_at_every_prescaler() {
+        for (pre, hz) in [
+            (2, 36_000_000),
+            (4, 18_000_000),
+            (6, 12_000_000),
+            (8, 9_000_000),
+        ] {
+            let c = Stm32f1Clock {
+                adc_pre: pre,
+                ..Stm32f1Clock::default()
+            };
+            let args = cfgr_args(&c);
+            assert_eq!(
+                args.adcclk.is_some(),
+                pre != 8,
+                "/{pre}: asked only off the HAL's /8"
+            );
+            // 36 and 18 MHz are past the 14 MHz ceiling: the HAL asserts, and
+            // the mirror says so with `None`.
+            let want = (hz <= 14_000_000).then_some(hz);
+            assert_eq!(hal_clocks(&args).map(|(.., adc)| adc), want, "/{pre}");
+        }
     }
 
     /// The Blue Pill default comes out as the Clock tab draws it.

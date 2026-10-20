@@ -2549,15 +2549,13 @@ fn pcnt_file(
          {}",
         c.low_limit,
         c.high_limit,
-        if c.filter > 0 {
-            format!(
-                "// Pulses shorter than this many APB clocks are ignored.\n\
-                 pub const FILTER: u16 = {};\n",
-                c.filter,
-            )
-        } else {
-            String::new()
-        },
+        // Named with the filter off too: a box on the card changes a value,
+        // never a name the code below the block may use.
+        format!(
+            "// Pulses shorter than this many APB clocks are ignored; 0 = no filter.\n\
+             pub const FILTER: u16 = {};\n",
+            c.filter,
+        ),
     );
 
     // One edge parameter per wired channel, each followed by its control pad
@@ -2577,9 +2575,10 @@ fn pcnt_file(
         "\x20   unit.set_low_limit(Some(LOW_LIMIT)).unwrap();\n\
          \x20   unit.set_high_limit(Some(HIGH_LIMIT)).unwrap();\n",
     );
-    if c.filter > 0 {
-        steps.push_str("\x20   unit.set_filter(Some(FILTER)).unwrap();\n");
-    }
+    // `None` switches the filter off - `Some(0)` would switch it on with
+    // nothing to filter. `!= 0`, not `> 0`: Clippy denies a `> 0` on a `u16`
+    // constant that is 0 (`absurd_extreme_comparisons`).
+    steps.push_str("\x20   unit.set_filter((FILTER != 0).then_some(FILTER)).unwrap();\n");
     steps.push_str("\x20   unit.clear();\n");
 
     for (ch, has_ctrl) in chans {
@@ -2706,13 +2705,14 @@ fn rmt_file(n: u8, cfg: Option<&RmtModuleConfig>, rt: EspRuntime, source_hz: u32
             cfg.map_or(10_000, |c| c.idle_threshold),
         ));
     }
-    if carrier {
-        consts.push_str(&format!(
-            "// Carrier {carrier_hz} Hz at 50%: source / CLK_DIVIDER / carrier, split in two.\n\
-             pub const CARRIER_HIGH: u16 = {high};\n\
-             pub const CARRIER_LOW: u16 = {low};\n",
-        ));
-    }
+    // Named with the carrier off too: a box on the card changes a value,
+    // never a name the code below the block may use.
+    consts.push_str(&format!(
+        "// Carrier {carrier_hz} Hz at 50%: source / CLK_DIVIDER / carrier, split in two.\n\
+         pub const CARRIER: bool = {carrier};\n\
+         pub const CARRIER_HIGH: u16 = {high};\n\
+         pub const CARRIER_LOW: u16 = {low};\n",
+    ));
 
     let (ty, creator, ctor, pad_bound, pad_use) = if tx {
         (
@@ -2745,15 +2745,12 @@ fn rmt_file(n: u8, cfg: Option<&RmtModuleConfig>, rt: EspRuntime, source_hz: u32
     } else {
         chain.push_str("\x20       .with_idle_threshold(IDLE_THRESHOLD)\n");
     }
-    chain.push_str(&if carrier {
-        "\x20       .with_carrier_modulation(true)\n\
+    chain.push_str(
+        "\x20       .with_carrier_modulation(CARRIER)\n\
          \x20       .with_carrier_high(CARRIER_HIGH)\n\
          \x20       .with_carrier_low(CARRIER_LOW)\n\
-         \x20       .with_carrier_level(Level::High)\n"
-            .to_owned()
-    } else {
-        "\x20       .with_carrier_modulation(false)\n".to_owned()
-    });
+         \x20       .with_carrier_level(Level::High)\n",
+    );
 
     // The `;` belongs to the last builder call, not to a line of its own.
     let chain = chain.trim_end_matches('\n');
@@ -2844,20 +2841,249 @@ fn rmt_file(n: u8, cfg: Option<&RmtModuleConfig>, rt: EspRuntime, source_hz: u32
              use esp_hal::gpio::interconnect::{pad_use};\n\
              use esp_hal::rmt::{{Channel, {ty}, {cfg_ty}, {creator}}};\n",
             mode_import(rt),
-            // `Level` names the idle output and the carrier level, and a
-            // receive channel with no carrier uses neither — importing it
-            // there is an unused-import warning in the user's project.
-            level_use = if tx || carrier {
-                "use esp_hal::gpio::Level;
-"
-            } else {
-                ""
-            },
+            // `Level` names the carrier level, on every channel now that the
+            // carrier lines are always there.
+            level_use = "use esp_hal::gpio::Level;\n",
         ),
         &consts,
         &body,
         &example,
     )
+}
+
+#[cfg(test)]
+mod always_named_tests {
+    use super::*;
+    use crate::project_tree::logic::ProjectTreeState;
+
+    const FILTER_LINE: &str = "    unit.set_filter((FILTER != 0).then_some(FILTER)).unwrap();\n";
+    const CHAIN: &str = "        .with_carrier_modulation(CARRIER)\n        .with_carrier_high(CARRIER_HIGH)\n        .with_carrier_low(CARRIER_LOW)\n        .with_carrier_level(Level::High);\n";
+
+    fn pcnt(filter: u16) -> String {
+        let mut c = PcntModuleConfig::new(0);
+        c.filter = filter;
+        pcnt_file(0, &[(0, false)], Some(&c), EspRuntime::Blocking)
+    }
+
+    fn rmt(tx: bool, carrier: bool, rt: EspRuntime) -> String {
+        let mut c = RmtModuleConfig::new(0);
+        if !tx {
+            c.direction = crate::panels::mcu_module::modules::RmtDirection::Receive;
+        }
+        c.carrier = carrier;
+        rmt_file(0, Some(&c), rt, 80_000_000)
+    }
+
+    fn below(f: &str) -> &str {
+        &f[f.find(GEN_END).expect("the block")..]
+    }
+
+    /// The filter and the carrier are named whatever the box says, and the
+    /// code below the block reads them: switching one never touches it.
+    #[test]
+    fn the_filter_and_the_carrier_are_always_named() {
+        let (off, on) = (pcnt(0), pcnt(100));
+        assert!(off.contains("pub const FILTER: u16 = 0;"), "{off}");
+        assert!(on.contains("pub const FILTER: u16 = 100;"), "{on}");
+        assert!(off.contains(FILTER_LINE), "{off}");
+        assert_eq!(below(&off), below(&on));
+        for tx in [true, false] {
+            for rt in [EspRuntime::Blocking, EspRuntime::Async] {
+                let (off, on) = (rmt(tx, false, rt), rmt(tx, true, rt));
+                assert!(off.contains("pub const CARRIER: bool = false;"), "{off}");
+                assert!(on.contains("pub const CARRIER: bool = true;"), "{on}");
+                assert!(off.contains("pub const CARRIER_HIGH: u16 = "), "{off}");
+                assert!(off.contains("use esp_hal::gpio::Level;\n"), "{off}");
+                assert!(off.contains(CHAIN), "{off}");
+                assert_eq!(below(&off), below(&on), "tx {tx}");
+                assert_eq!(
+                    &off[..off.find(GEN_BEGIN).unwrap()],
+                    &on[..on.find(GEN_BEGIN).unwrap()]
+                );
+            }
+        }
+    }
+
+    /// `body` as the IDE wrote it before the names were always there: the
+    /// filter / the carrier named only while on.
+    fn legacy(body: &str) -> String {
+        let block = body.find(GEN_END).unwrap();
+        let (head, tail) = body.split_at(block);
+        let (mut head, mut tail) = (head.to_owned(), tail.to_owned());
+        let new_comment =
+            "// Pulses shorter than this many APB clocks are ignored; 0 = no filter.\n";
+        if head.contains("pub const FILTER: u16 = 0;") {
+            head = head.replace(&format!("{new_comment}pub const FILTER: u16 = 0;\n"), "");
+            tail = tail.replace(FILTER_LINE, "");
+        } else if head.contains("pub const FILTER: u16 = ") {
+            head = head.replace(
+                new_comment,
+                "// Pulses shorter than this many APB clocks are ignored.\n",
+            );
+            tail = tail.replace(FILTER_LINE, "    unit.set_filter(Some(FILTER)).unwrap();\n");
+        }
+        if head.contains("pub const CARRIER: bool = true;") {
+            head = head.replace("pub const CARRIER: bool = true;\n", "");
+            tail = tail.replace(
+                "        .with_carrier_modulation(CARRIER)\n",
+                "        .with_carrier_modulation(true)\n",
+            );
+        }
+        if head.contains("pub const CARRIER: bool = false;") {
+            head = head
+                .lines()
+                .filter(|l| !l.starts_with("// Carrier ") && !l.starts_with("pub const CARRIER"))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            tail = tail.replace(CHAIN, "        .with_carrier_modulation(false);\n");
+            if !body.contains("pub const IDLE_HIGH") {
+                // A receive channel with no carrier did not import `Level`.
+                head = head.replacen("use esp_hal::gpio::Level;\n", "", 1);
+            }
+        }
+        format!("{head}{tail}")
+    }
+
+    /// The `use` lines of `uses`, the block of `block` and what is below the
+    /// block of `tail`: a file an older IDE wrote with one setting and then
+    /// spliced only the block of after the box was toggled.
+    fn mix(uses: &str, block: &str, tail: &str) -> String {
+        let cut = |f: &str| {
+            let (b, e) = (f.find(GEN_BEGIN).unwrap(), f.find(GEN_END).unwrap());
+            (f[..b].to_owned(), f[b..e].to_owned(), f[e..].to_owned())
+        };
+        format!("{}{}{}", cut(uses).0, cut(block).1, cut(tail).2)
+    }
+
+    fn sync(name: &str, existing: String, body: &str) -> (String, bool) {
+        let path = format!("src/pins/configs/{name}");
+        let mut state = ProjectTreeState::new();
+        state.user_src_files.push((path.clone(), existing));
+        let files = [(name.to_owned(), body.to_owned())];
+        let report = state.sync_config_files(&files, &[], &mut None);
+        let text = state
+            .user_src_files
+            .iter()
+            .find(|(p, _)| *p == path)
+            .expect("the file")
+            .1
+            .clone();
+        (text, report.offered.is_empty() && report.kept.is_empty())
+    }
+
+    /// An older file, untouched and with no record: one sync and it is the
+    /// current template, offered nothing - the filter off and on, the carrier
+    /// on, the carrier off on a channel that sends and on one that receives
+    /// (which needs `Level` now).
+    #[test]
+    fn an_older_pcnt_or_rmt_file_lands_on_the_new_template() {
+        for (name, body) in [
+            ("pcnt0.rs", pcnt(0)),
+            ("pcnt0.rs", pcnt(100)),
+            ("rmt0.rs", rmt(true, true, EspRuntime::Async)),
+            ("rmt0.rs", rmt(true, false, EspRuntime::Blocking)),
+            ("rmt0.rs", rmt(false, false, EspRuntime::Async)),
+        ] {
+            let old = legacy(&body);
+            assert_ne!(old, body, "{name}: the fixture took");
+            let (text, quiet) = sync(name, old, &body);
+            assert_eq!(text, body, "{name}");
+            assert!(quiet, "{name}: nothing offered");
+        }
+    }
+
+    /// A box toggled in an older IDE after the file was written: its block
+    /// says one thing, the code below it the other. Upgraded either way, so
+    /// the box does what it says - the carrier off really off, the filter on
+    /// really on.
+    #[test]
+    fn a_box_toggled_after_the_file_was_written_works() {
+        for rt in [EspRuntime::Blocking, EspRuntime::Async] {
+            // Written with the carrier off, then switched on.
+            let (off, on) = (
+                legacy(&rmt(false, false, rt)),
+                legacy(&rmt(false, true, rt)),
+            );
+            let body = rmt(false, true, rt);
+            let (text, quiet) = sync("rmt0.rs", mix(&off, &on, &off), &body);
+            assert_eq!(text, body, "off -> on");
+            assert!(quiet);
+            // Written with it on, then switched off.
+            let body = rmt(false, false, rt);
+            let (text, quiet) = sync("rmt0.rs", mix(&on, &off, &on), &body);
+            assert_eq!(text, body, "on -> off");
+            assert!(quiet);
+        }
+        // Written with the filter off, then switched on.
+        let body = pcnt(100);
+        let existing = mix(&legacy(&pcnt(0)), &legacy(&body), &legacy(&pcnt(0)));
+        let (text, quiet) = sync("pcnt0.rs", existing, &body);
+        assert_eq!(text, body, "filter off -> on");
+        assert!(quiet);
+    }
+
+    /// An older file the user edited keeps their lines and gains the current
+    /// ones - the box then works. What they wrote themselves stays theirs: a
+    /// filter they set, a `Level` they import below the block, a commented-out
+    /// copy of the builder.
+    #[test]
+    fn an_edited_older_file_keeps_its_lines_and_gains_the_names() {
+        let body = rmt(false, false, EspRuntime::Blocking);
+        let mine = legacy(&body).replace(
+            "    channel.configure_rx(&config)",
+            "    let _mine = 1; // mine\n    channel.configure_rx(&config)",
+        );
+        let (text, _) = sync("rmt0.rs", mine, &body);
+        assert!(text.contains("    let _mine = 1; // mine\n"), "{text}");
+        assert!(text.contains(CHAIN), "{text}");
+        assert!(text.contains("use esp_hal::gpio::Level;\n"), "{text}");
+        let (again, _) = sync("rmt0.rs", text.clone(), &body);
+        assert_eq!(again, text, "a second sync changes nothing");
+
+        // `Level` imported below the block, and a builder copy in a comment.
+        let own = format!(
+            "{}\nuse esp_hal::gpio::Level;\n\n//        .with_carrier_modulation(false);\npub fn idle() -> Level {{\n    Level::Low\n}}\n",
+            legacy(&body)
+        );
+        let (text, _) = sync("rmt0.rs", own, &body);
+        assert_eq!(
+            text.matches("use esp_hal::gpio::Level;").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains("\n//        .with_carrier_modulation(false);\npub fn idle"),
+            "{text}"
+        );
+        assert!(
+            text.contains(CHAIN),
+            "the real builder is upgraded:\n{text}"
+        );
+
+        // A carrier the user switched on by hand, box off: theirs.
+        let tx = rmt(true, false, EspRuntime::Blocking);
+        let by_hand = legacy(&tx).replace(
+            "        .with_carrier_modulation(false);\n",
+            "        .with_carrier_modulation(true)\n        .with_carrier_high(702)\n        .with_carrier_low(1404)\n        .with_carrier_level(Level::High);\n",
+        );
+        let (text, _) = sync("rmt0.rs", by_hand, &tx);
+        assert!(
+            text.contains(
+                "        .with_carrier_modulation(true)\n        .with_carrier_high(702)"
+            ),
+            "{text}"
+        );
+
+        // A filter the user sets: not overridden.
+        let pbody = pcnt(0);
+        let set = legacy(&pbody).replace(
+            "    unit.set_low_limit(",
+            "    unit.set_filter(Some(500)).unwrap();\n    unit.set_low_limit(",
+        );
+        let (text, _) = sync("pcnt0.rs", set, &pbody);
+        assert_eq!(text.matches("set_filter").count(), 1, "{text}");
+        assert!(text.contains("set_filter(Some(500))"), "{text}");
+    }
 }
 
 // ── I2C ──────────────────────────────────────────────────────────────────────

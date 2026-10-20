@@ -1872,7 +1872,10 @@ fn is_comp_file(name: &str) -> bool {
 ///   `use` gave the code there;
 /// - USART, whose block named an option only while it was on: `get_config`'s
 ///   line for each option it did not name, unless the code sets that field
-///   itself - or the option's box would do nothing.
+///   itself - or the option's box would do nothing;
+/// - ESP PCNT and RMT, whose block named the filter / the carrier only while
+///   it was on: the line the IDE wrote for it then becomes today's, with the
+///   `use` today's needs.
 ///
 /// An older untouched file comes out as the template byte for byte; one
 /// this version wrote is never touched - its old block already has the new
@@ -1899,6 +1902,7 @@ pub fn upgraded_config(name: &str, existing: &str, spliced: &str, body: &str) ->
         put_back(&mut out, item, body);
     }
     add_line_extras(&mut out, &old, body);
+    rewrite_always_named(&mut out, &existing[begin..end], body);
     (out != lf).then_some(out)
 }
 
@@ -2133,6 +2137,117 @@ fn add_line_extras(out: &mut String, old: &str, body: &str) {
         .collect();
     let line_at = |k: usize| raw[..k].iter().map(|l| l.len()).sum::<usize>();
     out.replace_range(after + line_at(start)..after + line_at(config), &rebuilt);
+}
+
+/// A text an older ESP template wrote below the block, while its block named
+/// a setting only when it was on, and what today's writes instead.
+struct AlwaysNamed {
+    /// Whether the OLD block, as written - comments too - lacks a mark only
+    /// this version writes there: an older IDE spliced the block on its own
+    /// when a box was toggled, so its block can say "on" over a tail written
+    /// "off", or the other way round, and both are older.
+    older: fn(&str) -> bool,
+    /// Code below the block that already does it: then it is the user's own.
+    unless: Option<&'static str>,
+    /// A name the code below the block must use for `was` to be the IDE's -
+    /// without it the line is the user's, whatever it says.
+    needs: Option<&'static str>,
+    was: &'static str,
+    now: &'static str,
+    /// A name `now` uses, the `use` that brings it, and the head line it
+    /// goes above.
+    import: Option<(&'static str, &'static str, &'static str)>,
+}
+
+const ALWAYS_NAMED: [AlwaysNamed; 4] = [
+    // PCNT, filter off when the file was written: no line at all.
+    AlwaysNamed {
+        older: |old| !old.contains("0 = no filter"),
+        unless: Some("set_filter("),
+        needs: None,
+        was: "    unit.set_high_limit(Some(HIGH_LIMIT)).unwrap();\n    unit.clear();\n",
+        now: "    unit.set_high_limit(Some(HIGH_LIMIT)).unwrap();\n    unit.set_filter((FILTER != 0).then_some(FILTER)).unwrap();\n    unit.clear();\n",
+        import: None,
+    },
+    // PCNT, filter on: the same, but `Some(0)` would switch it on.
+    AlwaysNamed {
+        older: |_| true,
+        unless: None,
+        needs: None,
+        was: "    unit.set_filter(Some(FILTER)).unwrap();\n",
+        now: "    unit.set_filter((FILTER != 0).then_some(FILTER)).unwrap();\n",
+        import: None,
+    },
+    // RMT, carrier on when the file was written: the IDE's chain reads
+    // `CARRIER_HIGH` - a `(true)` with the user's own numbers is theirs.
+    AlwaysNamed {
+        older: |old| !old.contains("pub const CARRIER:"),
+        unless: None,
+        needs: Some("CARRIER_HIGH"),
+        was: "        .with_carrier_modulation(true)\n",
+        now: "        .with_carrier_modulation(CARRIER)\n",
+        import: None,
+    },
+    // RMT, carrier off when the file was written: the call is the builder's
+    // last.
+    AlwaysNamed {
+        older: |old| !old.contains("pub const CARRIER:"),
+        unless: None,
+        needs: None,
+        was: "        .with_carrier_modulation(false);\n",
+        now: "        .with_carrier_modulation(CARRIER)\n        .with_carrier_high(CARRIER_HIGH)\n        .with_carrier_low(CARRIER_LOW)\n        .with_carrier_level(Level::High);\n",
+        import: Some((
+            "Level",
+            "use esp_hal::gpio::Level;\n",
+            "use esp_hal::gpio::interconnect::",
+        )),
+    },
+];
+
+/// Each [`ALWAYS_NAMED`] old text below `out`'s block replaced by today's,
+/// where the OLD block (raw, see [`AlwaysNamed::older`]) shows the file is
+/// older and `body` writes today's - the IDE's own text, matched exactly and
+/// only where it starts a line of code, so a line the user changed, or
+/// commented out, is theirs.
+fn rewrite_always_named(out: &mut String, old: &str, body: &str) {
+    for rule in &ALWAYS_NAMED {
+        if !(rule.older)(old) || !body.contains(rule.now) {
+            continue;
+        }
+        let Some((begin, after)) = crate::project_tree::templates::block(out) else {
+            return;
+        };
+        let tail = out[after..].to_owned();
+        let code = code_only(&tail);
+        if rule.unless.is_some_and(|u| code.contains(u))
+            || rule.needs.is_some_and(|n| !has_ident(&code, n))
+        {
+            continue;
+        }
+        let at: Vec<usize> = tail
+            .match_indices(rule.was)
+            .map(|(i, _)| i)
+            .filter(|&i| i == 0 || tail[..i].ends_with('\n'))
+            .filter(|&i| code_only(&format!("{}\u{1}", &tail[..i])).ends_with('\u{1}'))
+            .collect();
+        if at.is_empty() {
+            continue;
+        }
+        for &i in at.iter().rev() {
+            out.replace_range(after + i..after + i + rule.was.len(), rule.now);
+        }
+        if let Some((name, line, before)) = rule.import {
+            let around = code_only(&format!("{}\n{}", &out[..begin], &out[after..]));
+            if !binds_name(&around, name) && !defines_item(&around, name) {
+                let at = out[..begin]
+                    .match_indices(before)
+                    .map(|(i, _)| i)
+                    .find(|&i| i == 0 || out[..i].ends_with('\n'))
+                    .unwrap_or(begin);
+                out.insert_str(at, line);
+            }
+        }
+    }
 }
 
 /// Whether `code` (see [`code_only`]) defines a function `ident` - `fn`,

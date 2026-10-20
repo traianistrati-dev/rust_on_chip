@@ -269,6 +269,9 @@ $CUBE_DB = if ($env:EIDE_CUBE_DB) { $env:EIDE_CUBE_DB }
 # rows whose risk IS the layout carry it.
 $ALL_CASES = @(
     @{ n = "F1 blocking, full wiring";     t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off" };  q = $true; fam = "f1" }
+    # adc1.rs at a non-default sample time, its example pasted below the block,
+    # and an older project's `adc::SampleTime` line - which keeps the import.
+    @{ n = "F1 blocking, ADC example";     t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_F1_ADC = "example" }; q = $true; fam = "f1" }
     @{ n = "F1 blocking, DMA tx";          t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "tx" };   q = $false; fam = "f1" }
     @{ n = "F1 blocking, DMA rx";          t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "rx" };   q = $false; fam = "f1" }
     @{ n = "F1 blocking, DMA both";        t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "both" }; q = $true; fam = "f1" }
@@ -302,6 +305,8 @@ $ALL_CASES = @(
     # each pin's hook - plain `fn`s at the crate root, reached from `mod app`.
     @{ n = "F1 RTIC, shared EXTI9_5";      t = "emit_f1_rtic_project";   e = @{ EIDE_F1_IRQ_SHARED = "1" }; q = $true; fam = "f1" }
     @{ n = "F1 RTIC, no pins";             t = "emit_f1_rtic_project";   e = @{ EIDE_F1_NOPINS = "1" }; q = $true; fam = "f1" }
+    # A helper below the block naming `adc::`: the crate-root import kept for it.
+    @{ n = "F1 RTIC, ADC example";         t = "emit_f1_rtic_project";   e = @{ EIDE_F1_ADC = "example" }; q = $false; fam = "f1" }
     @{ n = "F1 Native";                    t = "emit_f1_native_project"; e = @{};                       q = $true; fam = "f1" }
     # The bare-metal `#[interrupt]` with two pins on EXTI9_5: each pin's level
     # read inside the critical section, its hook called after it.
@@ -653,7 +658,7 @@ $ALL_CASES = @(
 $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
            "EIDE_F1_SWITCH", "EIDE_F1_WDG", "EIDE_F1_NOPINS", "EIDE_F1_IRQ",
-           "EIDE_F1_IRQ_SHARED", "ESP_ASYNC_RUNTIME",
+           "EIDE_F1_IRQ_SHARED", "EIDE_F1_ADC", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",

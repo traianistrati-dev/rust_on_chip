@@ -154,8 +154,8 @@ impl FamilyBackend for Stm32f1Backend {
             header = stm32::invariant_header(&mcu.name, &mcu.id),
             tail = USER_TAIL,
         );
-        // Nothing lives after `fn main` any more: USART/SPI/I2C init are in
-        // `src/pins/configs/` and the ADC is one line inside the GEN block.
+        // Nothing lives after `fn main` any more: every peripheral's init, the
+        // ADC's included, is in `src/pins/configs/`.
         stm32::strip_obsolete_helpers(base)
     }
 
@@ -179,8 +179,12 @@ impl FamilyBackend for Stm32f1Backend {
             &mcu.watchdog_and_custom_inits(),
         );
         let spliced = stm32::splice_section(existing, &new_section, &mcu.name, &mcu.id);
-        // Clean up the init helpers older versions appended after `fn main`.
-        stm32::strip_obsolete_helpers(spliced)
+        // Clean up the init helpers older versions appended after `fn main`,
+        // and keep `adc` imported while the user's code names it.
+        stm32::adc_import_alias(
+            stm32::strip_obsolete_helpers(spliced),
+            stm32::wires_adc(&all),
+        )
     }
 
     /// One plain `fn` per armed input, called from its EXTI vector's
@@ -202,6 +206,7 @@ impl FamilyBackend for Stm32f1Backend {
             &modules::timer_configs(&mcu.modules),
             &mcu.clock,
             mcu.gpio_native(),
+            &mcu.adc,
         );
         // Pin-less, from the Configuration tab rather than the pins. The F1
         // gets only the IWDG - `stm32f1xx-hal` has no window watchdog - and
@@ -1042,11 +1047,21 @@ impl FamilyBackend for RticBackend {
             mcu.gpio_native(),
             &mcu.watchdog_and_custom_inits(),
         );
-        rtic::splice_rtic_section(existing, &section, &mcu.name, &mcu.id)
+        // The block imported `adc` here too, at the crate root the tail's
+        // helpers share: kept while they name it.
+        stm32::adc_import_alias(
+            rtic::splice_rtic_section(existing, &section, &mcu.name, &mcu.id),
+            stm32::wires_adc(&all),
+        )
     }
 
+    /// Blocking's files, their examples naming the handles as RTIC binds them.
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
-        Stm32f1Backend.config_files(mcu)
+        Stm32f1Backend
+            .config_files(mcu)
+            .into_iter()
+            .map(|(name, body)| (name, rtic::example_handles(&body)))
+            .collect()
     }
 
     /// The hardware tasks' hooks: the same plain `fn`s as Blocking's.
@@ -2737,33 +2752,81 @@ mod tests {
     #[test]
     fn config_examples_name_handles_that_main_rs_really_binds() {
         use crate::panels::mcu_module::mcu::Runtime;
+        use crate::panels::mcu_module::modules::model::SpiRole;
         use crate::panels::mcu_module::modules::{ApiStyle, ModuleConfig, ModuleKind};
         use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
 
-        // Pull `_serial1_label`-shaped identifiers out of the comment block.
-        let handles_in = |file: &str| -> Vec<String> {
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        // The handles a file's example USES, out of its comment lines:
+        // `_serial1_label`-shaped - `serial1_label` under RTIC, which binds
+        // them without the underscore - where a method is called on one
+        // (`_i2c1.write(…)`, not prose, not `adc1.rs`) or one is taken apart
+        // (`let (spi, rx, tx) = _spi2;`).
+        let handles_in = |file: &str, rtic: bool| -> Vec<String> {
             let mut out = Vec::new();
             for line in file.lines().filter(|l| l.trim_start().starts_with("//")) {
                 let mut rest = line;
-                while let Some(i) = rest.find('_') {
-                    let tail = &rest[i..];
-                    let ident: String = tail
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    let is_handle = ["_serial", "_spi", "_i2c", "_can", "_tx", "_rx", "_uart"]
-                        .iter()
-                        .any(|p| ident.starts_with(p));
-                    // Only when it is CALLED — `_i2c1.write(…)`, not prose.
-                    if is_handle && tail[ident.len()..].starts_with('.') {
-                        out.push(ident.clone());
+                let mut prev: Option<char> = None;
+                while let Some(c) = rest.chars().next() {
+                    let len = rest.find(|c: char| !is_ident(c)).unwrap_or(rest.len());
+                    if len == 0 || prev.is_some_and(is_ident) {
+                        prev = Some(c);
+                        rest = &rest[c.len_utf8()..];
+                        continue;
                     }
-                    rest = &tail[ident.len().max(1)..];
+                    let ident = &rest[..len];
+                    let before = &line[..line.len() - rest.len()];
+                    // Every `_`-handle; under RTIC also the ones it promotes,
+                    // which lose the underscore - an RTIC example still
+                    // naming `_serial1` is then checked, and fails.
+                    let (stem, stems): (&str, &[&str]) = match ident.strip_prefix('_') {
+                        Some(s) => (
+                            s,
+                            &[
+                                "serial", "usart", "uart", "spi", "i2c", "i2s", "can", "tx", "rx",
+                                "adc",
+                            ],
+                        ),
+                        None if rtic => (ident, &["serial", "spi", "i2c", "can", "adc"]),
+                        None => ("", &[]),
+                    };
+                    let is_handle = stems.iter().any(|p| stem.starts_with(p));
+                    let after = &rest[len..];
+                    let called = after.strip_prefix('.').is_some_and(|m| {
+                        let n = m.find(|c: char| !is_ident(c)).unwrap_or(m.len());
+                        n > 0 && m[n..].starts_with('(')
+                    });
+                    let taken_apart =
+                        before.trim_end().ends_with('=') && after.trim_start().starts_with(';');
+                    if is_handle && (called || taken_apart) {
+                        out.push(ident.to_owned());
+                    }
+                    prev = ident.chars().next_back();
+                    rest = after;
                 }
             }
             out.sort();
             out.dedup();
             out
+        };
+        // `h` as a whole identifier: `_adc1` inside `pa0_adc1_in0` is not it.
+        let binds = |main_rs: &str, h: &str| {
+            main_rs.match_indices(h).any(|(at, _)| {
+                !main_rs[..at].chars().next_back().is_some_and(is_ident)
+                    && !main_rs[at + h.len()..].chars().next().is_some_and(is_ident)
+            })
+        };
+        // A bus's own file - `usart1.rs`, `i2c1/mod.rs` - whose example has
+        // to show its handle in use, so none is passed by a pattern that
+        // cannot see it.
+        let bus_file = |name: &str| {
+            let stem = name.trim_end_matches(".rs").trim_end_matches("/mod");
+            ["usart", "uart", "spi", "i2c", "i2s", "adc"]
+                .iter()
+                .any(|p| {
+                    stem.strip_prefix(p)
+                        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                })
         };
 
         let stm32 = |family: &str, id: &str| {
@@ -2772,6 +2835,13 @@ mod tests {
             def.family = family.into();
             def.id = id.into();
             def.build_mcu()
+        };
+        // The built-in C3, as the app builds it: the mock has no GDMA channel,
+        // and an I2S without one is skipped in main.rs - nothing to bind.
+        let c3 = || {
+            crate::panels::mcu_module::builtins::builtin_for("esp32c3")
+                .expect("built-in C3")
+                .build_mcu()
         };
 
         // (label, mcu, runtime, per-module api style)
@@ -2789,34 +2859,40 @@ mod tests {
                 Some(ApiStyle::Native),
             ),
             (
+                "stm32f1 rtic",
+                stm32("stm32f1", "stm32f103c8t6"),
+                Runtime::Rtic,
+                None,
+            ),
+            (
                 "stm32f4 async",
                 stm32("stm32f4", "stm32f411re"),
                 Runtime::Async,
                 None,
             ),
-            (
-                "esp blocking",
-                crate::panels::mcu_module::mock_esp32c3::create_esp32c3(),
-                Runtime::Blocking,
-                None,
-            ),
-            (
-                "esp async",
-                crate::panels::mcu_module::mock_esp32c3::create_esp32c3(),
-                Runtime::Async,
-                None,
-            ),
+            ("esp blocking", c3(), Runtime::Blocking, None),
+            ("esp async", c3(), Runtime::Async, None),
+            ("esp blocking, spi slave", c3(), Runtime::Blocking, None),
+            ("esp async, spi slave", c3(), Runtime::Async, None),
         ];
 
         for (what, mut mcu, runtime, style) in cases {
             mcu.runtime = runtime;
-            // Wire a USART, an SPI and an I2C the way the user would, and give
-            // one of them a label — the case that made `{HANDLE}` necessary.
-            for kind in [
+            mcu.pending_runtime = runtime;
+            let esp = what.starts_with("esp");
+            let slave = what.ends_with("spi slave");
+            // Wire a USART, an SPI and an I2C the way the user would - and on
+            // the ESP an I2S - each with a label: the case that made
+            // `{HANDLE}` necessary.
+            let mut kinds = vec![
                 ModuleKind::GenericInterfaceUsart,
                 ModuleKind::GenericInterfaceSpi,
                 ModuleKind::GenericInterfaceI2c,
-            ] {
+            ];
+            if esp {
+                kinds.push(ModuleKind::GenericInterfaceI2s);
+            }
+            for kind in kinds {
                 mcu.add_module(kind);
             }
             for md in &mut mcu.modules {
@@ -2828,23 +2904,57 @@ mod tests {
                         }
                     }
                     ModuleConfig::Spi(c) => {
+                        c.custom_label = "flash".into();
+                        if slave {
+                            c.role = SpiRole::Slave;
+                        }
                         if let Some(s) = style {
                             c.api_style = s;
                         }
                     }
                     ModuleConfig::I2c(c) => {
+                        c.custom_label = "imu".into();
                         if let Some(s) = style {
                             c.api_style = s;
                         }
                     }
+                    ModuleConfig::I2s(c) => c.custom_label = "mic".into(),
                     _ => {}
                 }
             }
-            let _ = PinFunction::Unset; // (kept in scope for the import above)
+            // And an ADC pad, where the chip has one: `adc1.rs`'s example
+            // names `_adc1` (STM32F1).
+            let adc = mcu
+                .iter_all_pins()
+                .filter(|p| !p.reserved && p.selected_function == PinFunction::Unset)
+                .find_map(|p| {
+                    p.available_functions
+                        .iter()
+                        .find(|f| matches!(f, PinFunction::AdcChannel { .. }))
+                        .map(|f| (p.number, f.clone()))
+                });
+            if let Some((n, f)) = adc
+                && let Some(p) = mcu.find_pin_mut(n)
+            {
+                p.selected_function = f;
+            }
 
             let main_rs = mcu.fresh_main_rs();
             let files = mcu.config_files();
             assert!(!files.is_empty(), "{what}: wired buses produce configs");
+            let rtic = matches!(runtime, Runtime::Rtic);
+            let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+            if what.starts_with("stm32f1") {
+                let adc1 = files.iter().find(|(n, _)| n == "adc1.rs").expect("adc1.rs");
+                let want = if rtic { "adc1" } else { "_adc1" };
+                assert_eq!(handles_in(&adc1.1, rtic), [want], "{what}");
+            }
+            if esp {
+                assert!(
+                    names.iter().any(|n| n.starts_with("i2s")),
+                    "{what}: {names:?}"
+                );
+            }
 
             for (name, body) in &files {
                 assert!(
@@ -2855,9 +2965,14 @@ mod tests {
                         && !body.contains("{DEVICES}"),
                     "{what}/{name}: unsubstituted placeholder:\n{body}"
                 );
-                for h in handles_in(body) {
+                let handles = handles_in(body, rtic);
+                assert!(
+                    !bus_file(name) || !handles.is_empty(),
+                    "{what}/{name}: its example shows no handle in use:\n{body}"
+                );
+                for h in handles {
                     assert!(
-                        main_rs.contains(&h),
+                        binds(&main_rs, &h),
                         "{what}/{name}: the example calls `{h}`, which main.rs never binds.\n\
                          main.rs:\n{main_rs}"
                     );

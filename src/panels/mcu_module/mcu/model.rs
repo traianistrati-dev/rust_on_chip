@@ -482,6 +482,12 @@ pub struct Mcu {
     /// `mcu.config` `@comp`; feeds `calculate_mcu_state_hash` because it is
     /// codegen input.
     pub comp: crate::panels::mcu_module::comparator::CompSettings,
+    /// ADC settings from the Configuration tab, keyed by instance - only the
+    /// ones that differ from the HAL's default. The pads are wired on the Pins
+    /// canvas; the sample time is a register with no pin. Persisted in
+    /// `mcu.config` `@adc`; feeds `calculate_mcu_state_hash` because it is
+    /// codegen input (`pins/configs/adc1.rs`).
+    pub adc: crate::panels::mcu_module::adc::AdcSettings,
     /// The flash store from the Configuration tab: `Some` while it is switched
     /// on. Pin-less like the watchdogs. Persisted in `mcu.config`
     /// `@flashstore`; feeds `calculate_mcu_state_hash` because it is codegen

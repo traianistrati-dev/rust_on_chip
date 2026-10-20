@@ -1,3 +1,4 @@
+pub mod adc;
 pub mod aws_iot;
 #[cfg(test)]
 pub(crate) mod board_notes;

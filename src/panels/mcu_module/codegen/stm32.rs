@@ -317,24 +317,9 @@ pub(super) struct GenParts {
     /// Per-pin `let` bindings, grouped by port.
     pub pin_section: String,
     /// Peripheral init calls (`pins::configs::usart1::init(...)`, ADC, CAN...).
+    /// Every peripheral is built by its config module now, the ADC included,
+    /// so RTIC promotes each through its `Handle` (`rtic::BUS_HANDLES`).
     pub fn_calls: String,
-    /// `(binding, concrete type, written through during init)` for the
-    /// peripherals that have NO config module to name a `Handle` for them.
-    ///
-    /// Just the ADC now: the PWM timers moved into `pins/configs/pwm{N}.rs`
-    /// and got a `Handle` alias with the rest, so they promote through
-    /// `BUS_HANDLES` like every other peripheral.
-    ///
-    /// The third field decides whether the promoted binding keeps its `mut`.
-    ///
-    /// The bare-metal path ignores this: `fn main` runs forever, so a value it
-    /// keeps is a value that lives. RTIC's `#[init]` RETURNS, and everything it
-    /// did not hand to the framework is dropped right there — which is what
-    /// `rtic::promote_bus_handles` fixes for the buses, using the `Handle`
-    /// alias their config modules expose. These two have no such module, so the
-    /// type is spelled out here, where the timer, the remap and the pin types
-    /// are all already known.
-    pub inline_handles: Vec<(String, String, bool)>,
     /// Module-level items for the bare-metal EXTI path: the statics that park
     /// each armed input, and one `#[interrupt]` per vector. Empty on the RTIC
     /// path, which turns the same pins into tasks instead.
@@ -432,9 +417,12 @@ pub(super) fn gen_parts(
             PinFunction::I2cScl(_) | PinFunction::I2cSda(_)
         )
     });
+    // The ADC pads, and the ones ADC1 reads: the latter build ADC1 - through
+    // `pins/configs/adc1.rs`, which `config_files` writes for exactly them.
     let has_adc = configured
         .iter()
         .any(|(p, _)| matches!(p.selected_function, PinFunction::AdcChannel { .. }));
+    let has_adc1 = !adc1_pads(all_pins).is_empty();
     let has_timer = configured
         .iter()
         .any(|(p, _)| matches!(p.selected_function, PinFunction::TimerPwm { .. }));
@@ -497,9 +485,6 @@ pub(super) fn gen_parts(
     }
     if has_i2c {
         //  use_items.push("i2c::{self, BlockingI2c, Mode as I2cMode}".into());
-    }
-    if has_adc {
-        use_items.push("adc".into());
     }
     if has_usb {
         use_items.push("usb::{Peripheral, UsbBus}".into());
@@ -618,14 +603,12 @@ pub(super) fn gen_parts(
     }
 
     // Peripheral helper functions (init_usartN, init_spiN, init_i2cN) are NOT
-    // emitted here: USART/SPI/I2C init lives in `src/pins/configs/` and the ADC
-    // is constructed inline below (one plain `Adc::adc1` line — no helper fn).
+    // emitted here: every init, the ADC's included, lives in
+    // `src/pins/configs/`, and main.rs calls it.
 
     // ── Peripheral init calls (inside fn main) ───────────────────────────────
     let mut fn_calls = String::new();
     let mut any_call = false;
-    // See `GenParts::inline_handles`.
-    let mut inline_handles: Vec<(String, String, bool)> = Vec::new();
 
     macro_rules! header {
         () => {
@@ -834,19 +817,30 @@ pub(super) fn gen_parts(
 
     if has_adc {
         header!();
-        // Plain one-liner — `Adc::adc1` takes `Clocks` BY VALUE (Clocks is Copy).
-        fn_calls.push_str("    let mut _adc1 = adc::Adc::adc1(dp.ADC1, clocks);\n");
-        // The ADC is only MOVED in init - the read the block shows is the
-        // reader's to write, so no `mut` survives the promotion.
-        inline_handles.push(("_adc1".into(), "adc::Adc<pac::ADC1>".into(), false));
+        // Built in `pins/configs/adc1.rs`, which sets the Configuration tab's
+        // sample time; `read` is the reader's to write, one per pad below.
+        if has_adc1 {
+            fn_calls.push_str("    let mut _adc1 = pins::configs::adc1::init(dp.ADC1, &clocks);\n");
+        }
         for (p, meta) in configured
             .iter()
             .filter(|(p, _)| matches!(p.selected_function, PinFunction::AdcChannel { .. }))
         {
-            fn_calls.push_str(&format!(
-                "    // let val: u16 = _adc1.read(&mut {}).unwrap();\n",
-                binding_of(p, meta)
-            ));
+            if adc1_channel(meta.port, meta.pin_num).is_some() {
+                fn_calls.push_str(&format!(
+                    "    // let val: u16 = _adc1.read(&mut {}).unwrap();\n",
+                    binding_of(p, meta)
+                ));
+            } else {
+                // An ADC3-only pad (PF6..PF10, high-density parts): ADC1 cannot
+                // read it, and stm32f1xx-hal builds ADC3 only with a feature
+                // this project's manifest does not have. Said, not dropped.
+                fn_calls.push_str(&format!(
+                    "    // {} ({}) is NOT read: stm32f1xx-hal reads this pad only through ADC3,\n    // which this project does not build.\n",
+                    p.name,
+                    p.selected_function.label()
+                ));
+            }
         }
     }
 
@@ -1080,7 +1074,6 @@ pub(super) fn gen_parts(
         port_splits,
         pin_section,
         fn_calls,
-        inline_handles,
         irq_items,
     })
 }
@@ -1120,9 +1113,6 @@ pub fn make_generated_section(
         return make_default_gen_section(mcu_name, clock, custom_inits);
     };
     let GenParts {
-        // `inline_handles` is an RTIC concern: `fn main` never returns here, so
-        // a peripheral it keeps in scope simply lives.
-        inline_handles: _,
         use_block,
         extra_uses,
         afio_line,
@@ -1144,8 +1134,8 @@ pub fn make_generated_section(
     // controller mutably. Only when a pin is armed: an unused `mut` there would
     // warn on a line inside the generated block, which the reader cannot edit.
     let dp_mut = if irq_items.is_empty() { "" } else { "mut " };
-    // Nothing is appended after `fn main` any more: USART/SPI/I2C init live in
-    // `src/pins/configs/` and the ADC is a single line inside the GEN block.
+    // Nothing is appended after `fn main` any more: every peripheral's init,
+    // the ADC's included, lives in `src/pins/configs/`.
     format!(
         "{GEN_BEGIN}\n\
          use stm32f1xx_hal::{{\n\
@@ -1217,6 +1207,7 @@ pub fn config_files(
     timer: &BTreeMap<u8, TimerModuleConfig>,
     clock: &ClockConfig,
     gpio_native: bool,
+    adc: &crate::panels::mcu_module::adc::AdcSettings,
 ) -> Vec<(String, String)> {
     let funcs: Vec<&PinFunction> = all_pins
         .iter()
@@ -1254,6 +1245,22 @@ pub fn config_files(
                 i2c.get(&n),
             ));
         }
+    }
+    // ADC1 - one file for all its pads: the sample time is the ADC's, not a
+    // pad's. Exactly the pads main.rs's init call is gated on.
+    let adc_pads = adc1_pads(all_pins);
+    if let Some(first) = adc_pads.first() {
+        let pad = parse_pin(&first.name).map_or_else(String::new, |m| binding_of(first, &m));
+        let adcclk =
+            f1_hal_adcclk(clock).unwrap_or_else(|| frequencies(&typed_f1_clock(clock)).adcclk);
+        out.push((
+            "adc1.rs".to_string(),
+            adc_config_file(
+                crate::panels::mcu_module::adc::f1_sample_time(adc, 1),
+                adcclk,
+                &pad,
+            ),
+        ));
     }
     // CAN — single instance on STM32F1; the bit-timing register depends on the
     // APB1 (PCLK1) clock, so the clock config is read here. Both pads, like the
@@ -1467,6 +1474,112 @@ fn can_btr(bitrate: u32, pclk1: u32) -> u32 {
         return ((sjw - 1) << 24) | ((ts2 - 1) << 20) | ((ts1 - 1) << 16) | (brp - 1);
     }
     0
+}
+
+const ADC_TMPL: &str = include_str!("templates/f1_hal/adc.rs.tmpl");
+
+/// The channel stm32f1xx-hal's ADC1 reads the pad on - its `adc_pins!(pac::ADC1,
+/// ...)` table (adc.rs), transcribed. `None`: ADC1 cannot read the pad (an
+/// ADC3-only one, PF6..PF10).
+fn adc1_channel(port: char, pin: u8) -> Option<u8> {
+    match (port, pin) {
+        ('A', 0..=7) => Some(pin),
+        ('B', 0..=1) => Some(8 + pin),
+        ('C', 0..=5) => Some(10 + pin),
+        _ => None,
+    }
+}
+
+/// The wired ADC pads ADC1 can read, in pin order: the ONE predicate both
+/// main.rs's init call and `adc1.rs` read, so main.rs never calls a file that
+/// was not written.
+pub fn adc1_pads<'a>(all_pins: &[&'a Pin]) -> Vec<&'a Pin> {
+    all_pins
+        .iter()
+        .copied()
+        .filter(|p| !p.reserved && matches!(p.selected_function, PinFunction::AdcChannel { .. }))
+        .filter(|p| parse_pin(&p.name).is_some_and(|m| adc1_channel(m.port, m.pin_num).is_some()))
+        .collect()
+}
+
+/// `pins/configs/adc1.rs`: the sample time and the ADC clock in its block, and
+/// an example naming `pad`, the binding of the first pad it reads.
+fn adc_config_file(sample_time: u8, adcclk: u32, pad: &str) -> String {
+    use crate::panels::mcu_module::adc::F1_SAMPLE_CYCLES;
+    let sample_time = sample_time.min(7);
+    tmpl::render(
+        ADC_TMPL,
+        &[
+            ("{SAMPLE_TIME}", &sample_time.to_string()),
+            ("{CYCLES}", F1_SAMPLE_CYCLES[usize::from(sample_time)]),
+            ("{ADCCLK_HZ}", &underscored(adcclk)),
+            ("{HANDLE}", "_adc1"),
+            ("{PAD}", pad),
+        ],
+    )
+}
+
+/// `n` with its digits in threes - `12_000_000` - as Rust reads them.
+fn underscored(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('_');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Whether a pad is wired to an ADC channel - what the generated `use`
+/// imported `adc` on before the ADC moved into `adc1.rs`, so the projects
+/// [`adc_import_alias`] may keep it for.
+pub fn wires_adc(all_pins: &[&Pin]) -> bool {
+    all_pins.iter().any(|p| {
+        !p.reserved
+            && matches!(p.selected_function, PinFunction::AdcChannel { .. })
+            && parse_pin(&p.name).is_some()
+    })
+}
+
+/// The `adc` module, back in the generated `use stm32f1xx_hal::{...}` while
+/// the user's code still names `adc::...`. It was imported for the ADC the
+/// block used to build inline; that moved into `pins/configs/adc1.rs`, and
+/// code written for it - `_adc1.set_sample_time(adc::SampleTime::T_239)`, the
+/// only way to set one then - would stop compiling. Rebuilt with the block,
+/// so it goes the moment that code does.
+///
+/// Only where the block imported it before - an ADC pad `wired` - and never
+/// when the code above the block or below it binds an `adc` of its own (a
+/// `use`, a `mod adc`), which the import would collide with.
+pub fn adc_import_alias(code: String, wired: bool) -> String {
+    const OPEN: &str = "use stm32f1xx_hal::{\n";
+    const AFTER: &str = "    prelude::*,\n";
+    const ITEM: &str = "    // Your code below names `adc::`: kept for it (the ADC is pins/configs/adc1.rs).\n    adc,\n";
+    let (Some(begin), Some(end)) = (code.find(GEN_BEGIN), code.find(GEN_END)) else {
+        return code;
+    };
+    if !wired || begin >= end {
+        return code;
+    }
+    let outside = format!("{}\n{}", &code[..begin], &code[end + GEN_END.len()..]);
+    if !super::common::names_module(&outside, "adc") {
+        return code;
+    }
+    let Some(open) = code[begin..end].find(OPEN).map(|i| begin + i + OPEN.len()) else {
+        return code;
+    };
+    let close = code[open..end].find("};").map_or(end, |i| open + i);
+    if code[open..close].contains("    adc,\n") {
+        return code;
+    }
+    let at = code[open..close]
+        .find(AFTER)
+        .map_or(open, |i| open + i + AFTER.len());
+    let mut code = code;
+    code.insert_str(at, ITEM);
+    code
 }
 
 const CAN_TMPL: &str = include_str!("templates/f1_hal/can.rs.tmpl");
@@ -3757,6 +3870,180 @@ mod stale_io_mode_tests {
         assert!(none_in.starts_with("into_floating_input"), "{none_in}");
         let none_out = into_expr(&PinFunction::GpioOutput, None, "gpioa", "crl");
         assert!(none_out.starts_with("into_push_pull_output"), "{none_out}");
+    }
+}
+
+#[cfg(test)]
+mod adc_tests {
+    use super::*;
+    use crate::panels::mcu_module::adc::{AdcConfig, AdcSettings};
+
+    fn pins(wiring: &[&str]) -> Vec<Pin> {
+        wiring
+            .iter()
+            .map(|name| {
+                let mut p = Pin::new(1, name);
+                p.selected_function = PinFunction::AdcChannel { adc: 1, channel: 0 };
+                p
+            })
+            .collect()
+    }
+
+    fn files(pins: &[&Pin], adc: &AdcSettings) -> Vec<(String, String)> {
+        config_files(
+            pins,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &ClockConfig::None,
+            true,
+            adc,
+        )
+    }
+
+    fn main_rs(pins: &[&Pin]) -> String {
+        make_generated_section(
+            "STM32F103",
+            pins,
+            &ClockConfig::None,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            true,
+            "",
+        )
+    }
+
+    /// `adc1.rs` exists exactly when main.rs calls it - the one predicate both
+    /// read - and a pad ADC1 cannot read is said, not built for.
+    #[test]
+    fn the_adc_file_exists_iff_main_calls_it() {
+        for (wiring, called) in [
+            (&[][..], false),
+            (&["PA0"][..], true),
+            (&["PA0", "PB1"][..], true),
+            (&["PF6"][..], false),
+        ] {
+            let ps = pins(wiring);
+            let refs: Vec<&Pin> = ps.iter().collect();
+            let main = main_rs(&refs);
+            let has_file = files(&refs, &AdcSettings::new())
+                .iter()
+                .any(|(n, _)| n == "adc1.rs");
+            assert_eq!(
+                main.contains("pins::configs::adc1::init("),
+                called,
+                "{wiring:?}:\n{main}"
+            );
+            assert_eq!(has_file, called, "{wiring:?}");
+            assert!(!main.contains("adc::Adc::adc1("), "{main}");
+        }
+        let ps = pins(&["PF6"]);
+        let refs: Vec<&Pin> = ps.iter().collect();
+        assert!(
+            main_rs(&refs).contains("PF6 (ADC1  IN0) is NOT read"),
+            "{}",
+            main_rs(&refs)
+        );
+    }
+
+    /// The sample time is the Configuration tab's; the HAL default writes 3.
+    #[test]
+    fn the_sample_time_follows_the_card() {
+        let ps = pins(&["PA0"]);
+        let refs: Vec<&Pin> = ps.iter().collect();
+        let file = |adc: &AdcSettings| {
+            files(&refs, adc)
+                .into_iter()
+                .find(|(n, _)| n == "adc1.rs")
+                .unwrap()
+                .1
+        };
+        let default = file(&AdcSettings::new());
+        assert!(
+            default.contains("pub const SAMPLE_TIME: u8 = 3; // 28.5 cycles"),
+            "{default}"
+        );
+        assert!(
+            default.contains("_adc1.read(&mut pa0_adc1_in0)"),
+            "{default}"
+        );
+        assert!(
+            default.contains("pub type Handle = adc::Adc<pac::ADC1>;"),
+            "{default}"
+        );
+        assert!(
+            default.contains("pub const ADCCLK_HZ: u32 = 12_000_000;"),
+            "{default}"
+        );
+        assert_eq!(underscored(900), "900");
+        assert_eq!(underscored(1_000), "1_000");
+        assert_eq!(underscored(72_000_000), "72_000_000");
+        let mut slow = AdcSettings::new();
+        slow.insert(1, AdcConfig { sample_time: 7 });
+        assert!(file(&slow).contains("pub const SAMPLE_TIME: u8 = 7; // 239.5 cycles"));
+    }
+
+    fn with_tail(tail: &str) -> String {
+        with_head_tail("", tail)
+    }
+
+    fn with_head_tail(head: &str, tail: &str) -> String {
+        format!(
+            "{head}{GEN_BEGIN}\nuse stm32f1xx_hal::{{\n    pac,\n    prelude::*,\n}};\nfn main() -> ! {{\n{GEN_END}\n{tail}"
+        )
+    }
+
+    /// Code below the block written for the inline ADC keeps its `adc`; code
+    /// that no longer names it, or names it only through a full path or a
+    /// comment, or imports its own, does not get one.
+    #[test]
+    fn the_adc_import_stays_while_the_users_code_names_it() {
+        let old = with_tail("    _adc1.set_sample_time(adc::SampleTime::T_239);\n    loop {}\n}\n");
+        let once = adc_import_alias(old.clone(), true);
+        assert!(
+            once.contains("    prelude::*,\n    // Your code below names `adc::`"),
+            "{once}"
+        );
+        assert!(once.contains("\n    adc,\n};"), "{once}");
+        assert!(
+            once.ends_with("    _adc1.set_sample_time(adc::SampleTime::T_239);\n    loop {}\n}\n")
+        );
+        assert_eq!(adc_import_alias(once.clone(), true), once, "idempotent");
+        // Without an ADC pad the block never imported `adc`: nothing to keep.
+        assert_eq!(adc_import_alias(old.clone(), false), old, "no ADC pad");
+        for tail in [
+            "    loop {}\n}\n",
+            "    _adc1.set_sample_time(stm32f1xx_hal::adc::SampleTime::T_239);\n    loop {}\n}\n",
+            "    // adc::SampleTime::T_239 would be slower\n    loop {}\n}\n",
+            "    use stm32f1xx_hal::adc;\n    _adc1.set_sample_time(adc::SampleTime::T_239);\n    loop {}\n}\n",
+            "    let _v = adc::read();\n    loop {}\n}\n\nmod adc {\n    pub fn read() -> u16 { 0 }\n}\n",
+            "    use stm32f1xx_hal::{adc::SampleTime};\n    _adc1.set_sample_time(SampleTime::T_239);\n    loop {}\n}\n",
+        ] {
+            let code = with_tail(tail);
+            assert_eq!(adc_import_alias(code.clone(), true), code, "{tail}");
+        }
+        // An `adc` of the user's own ABOVE the block collides just the same.
+        let names = "    let _v = adc::read();\n    loop {}\n}\n";
+        for head in [
+            "mod adc;\n",
+            "use stm32f1xx_hal::adc;\n",
+            "use ads1115 as adc;\n",
+        ] {
+            let code = with_head_tail(head, names);
+            assert_eq!(adc_import_alias(code.clone(), true), code, "{head}");
+        }
+        // A `use` that only passes through `adc` binds something else: the
+        // `adc::` the same code names still needs the import.
+        let through = with_tail(
+            "    use stm32f1xx_hal::adc::SampleTime;\n    _adc1.set_sample_time(SampleTime::T_239);\n    _adc1.set_align(adc::Align::Left);\n    loop {}\n}\n",
+        );
+        assert!(adc_import_alias(through, true).contains("\n    adc,\n};"));
     }
 }
 

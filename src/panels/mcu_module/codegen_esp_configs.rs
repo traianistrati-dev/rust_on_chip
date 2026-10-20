@@ -112,6 +112,13 @@ fn example_for(
     )
 }
 
+/// The handle main.rs binds for instance `n` - `_uart0`, or `_uart0_gps` for a
+/// module labelled "gps" - so an example calls a name that exists.
+fn handle(stem: &str, n: u8, label: Option<&str>) -> String {
+    let sfx = super::codegen_esp::module_label_sfx(label.unwrap_or_default());
+    format!("_{stem}{n}{sfx}")
+}
+
 /// One `    <name>: <bound>,` line per wired signal, in `spec` order.
 fn params_for(sigs: &[&str], spec: &[(&str, &str)]) -> String {
     spec.iter()
@@ -324,7 +331,7 @@ fn uart_file(n: u8, sigs: &[&str], cfg: Option<&UsartModuleConfig>, rt: EspRunti
         ));
     }
 
-    let h = format!("_uart{n}");
+    let h = handle("uart", n, cfg.map(|c| c.custom_label.as_str()));
     let send = vec![
         "In main.rs, after the init above:".to_owned(),
         String::new(),
@@ -471,7 +478,10 @@ fn spi_slave_file(n: u8, sigs: &[&str], cfg: Option<&SpiModuleConfig>, rt: EspRu
             "The master drives it. `transfer` takes BOTH buffers and hands them".to_owned(),
             "back with the driver when the master has clocked the bytes through:".to_owned(),
             String::new(),
-            format!("    let (spi, rx, mut tx) = _spi{n};   // as generated above"),
+            format!(
+                "    let (spi, rx, mut tx) = {};   // as generated above",
+                handle("spi", n, cfg.map(|c| c.custom_label.as_str()))
+            ),
             "    tx.as_mut_slice().fill(0xA5);".to_owned(),
             "    let transfer = spi.transfer(8, rx, 8, tx).unwrap();".to_owned(),
             "    let (spi, (rx, tx)) = transfer.wait();".to_owned(),
@@ -582,7 +592,7 @@ fn spi_file(n: u8, sigs: &[&str], cfg: Option<&SpiModuleConfig>, rt: EspRuntime)
     let example = if on_dma {
         example_for(
             &format!("Using SPI{n}"),
-            &format!("_spi{n}"),
+            &handle("spi", n, cfg.map(|c| c.custom_label.as_str())),
             &[
                 "In main.rs, after the init above. The handle is a `SpiDmaBus`, not",
                 "an `Spi`: the GDMA moves the bytes, and each call returns once it",
@@ -628,7 +638,7 @@ fn spi_file(n: u8, sigs: &[&str], cfg: Option<&SpiModuleConfig>, rt: EspRuntime)
     } else {
         example_for(
             &format!("Using SPI{n}"),
-            &format!("_spi{n}"),
+            &handle("spi", n, cfg.map(|c| c.custom_label.as_str())),
             &[
                 "In main.rs, after the init above:",
                 "",
@@ -890,7 +900,7 @@ fn i2s_file(
     }
     let example = example_for(
         &format!("Using I2S{n}"),
-        &format!("_i2s{n}"),
+        &handle("i2s", n, cfg.map(|c| c.custom_label.as_str())),
         &[
             "main.rs hands back the driver and its ring buffer:",
             "",
@@ -2887,7 +2897,7 @@ fn i2c_file(n: u8, sigs: &[&str], cfg: Option<&I2cModuleConfig>, rt: EspRuntime)
     }
     let example = example_for(
         &format!("Using I2C{n}"),
-        &format!("_i2c{n}"),
+        &handle("i2c", n, cfg.map(|c| c.custom_label.as_str())),
         &[
             "In main.rs, after the init above:",
             "",

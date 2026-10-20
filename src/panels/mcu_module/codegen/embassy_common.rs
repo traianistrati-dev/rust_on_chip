@@ -1183,6 +1183,36 @@ mod emit_for_manual_compile {
             }
         }
         let main_rs = mcu.fresh_main_rs();
+        // `EIDE_F1_ADC=example`: the ADC at a sample time off the HAL's
+        // default, and below the block the reads `adc1.rs`'s example shows,
+        // plus the line an older project set the sample time with - naming
+        // `adc::`, which keeps the import (`stm32::adc_import_alias`).
+        // Compiled, so the example and the alias are both what builds.
+        let main_rs = if std::env::var("EIDE_F1_ADC").as_deref() == Ok("example") {
+            use crate::panels::mcu_module::codegen::GEN_END;
+            crate::panels::mcu_module::adc::set_f1_sample_time(&mut mcu.adc, 1, 7);
+            let mine = concat!(
+                "    let raw: u16 = _adc1.read(&mut pa0_adc1_in0).unwrap();\n",
+                "    let _mv = u32::from(raw) * 3300 / 4095;\n",
+                "    let _vref: u16 = _adc1.read_vref();\n",
+                "    let _celsius: i32 = _adc1.read_temp();\n",
+                "    _adc1.set_sample_time(adc::SampleTime::T_239);\n",
+            );
+            let end = main_rs.find(GEN_END).expect("the block");
+            let old = format!(
+                "{}{}",
+                &main_rs[..end],
+                main_rs[end..].replacen("    loop {\n", &format!("{mine}    loop {{\n"), 1)
+            );
+            let main_rs = mcu.update_main_rs(&old);
+            assert!(
+                main_rs.contains("\n    adc,\n") && main_rs.contains(mine),
+                "{main_rs}"
+            );
+            main_rs
+        } else {
+            main_rs
+        };
         // The numbers live in the timer's config module now; main.rs only calls
         // its `init`. Both halves are checked, so neither can quietly go missing.
         assert!(
@@ -1633,6 +1663,26 @@ mod emit_for_manual_compile {
             main_rs.contains("#[rtic::app"),
             "not an RTIC project:\n{main_rs}"
         );
+        // `EIDE_F1_ADC=example`: a helper below the block set the sample time
+        // the way a project from before `adc1.rs` did, naming `adc::` - which
+        // keeps the import at the crate root (`stm32::adc_import_alias`).
+        let main_rs = if std::env::var("EIDE_F1_ADC").as_deref() == Ok("example") {
+            crate::panels::mcu_module::adc::set_f1_sample_time(&mut mcu.adc, 1, 7);
+            let mine = concat!(
+                "\n#[allow(dead_code)]\n",
+                "fn slowest(adc1: &mut pins::configs::adc1::Handle) {\n",
+                "    adc1.set_sample_time(adc::SampleTime::T_239);\n",
+                "}\n",
+            );
+            let main_rs = mcu.update_main_rs(&format!("{main_rs}{mine}"));
+            assert!(
+                main_rs.contains("\n    adc,\n") && main_rs.contains(mine),
+                "{main_rs}"
+            );
+            main_rs
+        } else {
+            main_rs
+        };
 
         let files = manifest_sync::project_files(&f1, &mcu, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();

@@ -3567,6 +3567,9 @@ impl AppIde {
         // number did not see. Ticking COMP1 wrote no `configs/comp1.rs` and
         // changed no line of main.rs.
         hash_debug(&mut hasher, &mcu.comp);
+        // The ADC card's sample time, for the same reason: `adc1.rs` follows
+        // it, and nothing else the hash reads would.
+        hash_debug(&mut hasher, &mcu.adc);
 
         // The flash store, from the same tab: it decides a GEN line, a config
         // file, five dependencies and the partition table.

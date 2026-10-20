@@ -868,10 +868,10 @@ mod tests {
         assert_eq!(end_count, 1);
     }
 
-    // ── ADC init is a plain inline line (no helper fn) ───────────────────────
+    // ── ADC init is one call into pins/configs/adc1.rs ───────────────────────
 
     #[test]
-    fn test_adc_init_is_a_single_inline_line() {
+    fn adc_init_is_one_call_into_its_config_file() {
         use super::super::mock_mcu;
 
         let mut mcu = mock_mcu::create_stm32f103c8tx();
@@ -879,16 +879,33 @@ mod tests {
         mcu.apply_pin_function(10, PinFunction::AdcChannel { adc: 1, channel: 0 });
         let code = mcu.fresh_main_rs();
 
-        // One plain line inside the GENERATED block — `Clocks` passed BY VALUE.
-        assert_contains_substring(&code, "let mut _adc1 = adc::Adc::adc1(dp.ADC1, clocks);");
-        assert_not_contains_substring(&code, "clocks: &Clocks)");
-        // …and no helper fn is appended after `fn main` any more.
+        // One call inside the GENERATED block; the HAL's constructor is the
+        // config file's.
+        assert_contains_substring(
+            &code,
+            "let mut _adc1 = pins::configs::adc1::init(dp.ADC1, &clocks);",
+        );
+        assert_not_contains_substring(&code, "adc::Adc::adc1(");
+        assert_not_contains_substring(&code, "    adc,\n");
         assert_not_contains_substring(&code, "fn init_adc1");
-        assert_not_contains_substring(&code, "── Peripheral init helpers");
+        let init_pos = code.find("pins::configs::adc1::init(").unwrap();
+        assert!(
+            init_pos < code.find(GEN_END).unwrap(),
+            "inside the GEN block"
+        );
 
-        let init_pos = code.find("adc::Adc::adc1(").unwrap();
-        let gen_end = code.find(GEN_END).unwrap();
-        assert!(init_pos < gen_end, "ADC init must be inside the GEN block");
+        let cfgs = mcu.config_files();
+        let adc1 = &cfgs
+            .iter()
+            .find(|(n, _)| n == "adc1.rs")
+            .expect("adc1.rs")
+            .1;
+        assert!(adc1.contains("pub const SAMPLE_TIME: u8 = 3;"), "{adc1}");
+        assert!(adc1.contains("adc::Adc::adc1(adc1, *clocks)"), "{adc1}");
+        assert!(
+            adc1.contains("pub type Handle = adc::Adc<pac::ADC1>;"),
+            "{adc1}"
+        );
     }
 
     #[test]
@@ -906,7 +923,7 @@ mod tests {
 
         let twice = mcu.update_main_rs(&once);
         assert_eq!(
-            twice.matches("adc::Adc::adc1(").count(),
+            twice.matches("pins::configs::adc1::init(").count(),
             1,
             "ADC init duplicated"
         );
@@ -980,6 +997,7 @@ mod tests {
             &BTreeMap::new(),
             &crate::panels::mcu_module::clock::ClockConfig::None,
             true,
+            &Default::default(),
         )
     }
 
@@ -1331,7 +1349,97 @@ mod tests {
         assert_not_contains_substring(&out, "set_sample_time");
         assert_not_contains_substring(&out, "── Peripheral init helpers");
         assert_contains_substring(&out, "loop {}");
-        assert_contains_substring(&out, "let mut _adc1 = adc::Adc::adc1(dp.ADC1, clocks);");
+        assert_contains_substring(
+            &out,
+            "let mut _adc1 = pins::configs::adc1::init(dp.ADC1, &clocks);",
+        );
+    }
+
+    /// The ADC under RTIC is a `Local` like every bus, through `adc1.rs`'s
+    /// `Handle`; the reads the block shows follow its name.
+    #[test]
+    fn rtic_adc_handle_is_a_config_local() {
+        use super::super::mock_mcu;
+        use crate::panels::mcu_module::mcu::Runtime;
+
+        let mut mcu = mock_mcu::create_stm32f103c8tx();
+        mcu.runtime = Runtime::Rtic;
+        mcu.pending_runtime = Runtime::Rtic;
+        mcu.apply_pin_function(10, PinFunction::AdcChannel { adc: 1, channel: 0 });
+        let code = mcu.fresh_main_rs();
+        assert_contains_substring(&code, "adc1: pins::configs::adc1::Handle,");
+        assert_contains_substring(
+            &code,
+            "let adc1 = pins::configs::adc1::init(dp.ADC1, &clocks);",
+        );
+        assert_contains_substring(&code, "adc1.read(&mut pa0_adc1_in0)");
+        assert_not_contains_substring(&code, "_adc1.");
+        assert_not_contains_substring(&code, "adc::Adc<pac::ADC1>");
+        let files = mcu.config_files();
+        let adc1 = &files
+            .iter()
+            .find(|(n, _)| n == "adc1.rs")
+            .expect("adc1.rs")
+            .1;
+        assert!(
+            adc1.contains("//     let raw: u16 = adc1.read(&mut pa0_adc1_in0)"),
+            "the example names RTIC's binding:\n{adc1}"
+        );
+        assert!(!adc1.contains("_adc1."), "{adc1}");
+    }
+
+    /// RTIC's block imported `adc` at the crate root as Blocking's did, where
+    /// the tail's helpers can name it: kept for them, the same way.
+    #[test]
+    fn an_old_rtic_tail_naming_adc_keeps_its_import() {
+        use super::super::mock_mcu;
+        use crate::panels::mcu_module::mcu::Runtime;
+
+        let mut mcu = mock_mcu::create_stm32f103c8tx();
+        mcu.runtime = Runtime::Rtic;
+        mcu.pending_runtime = Runtime::Rtic;
+        mcu.apply_pin_function(10, PinFunction::AdcChannel { adc: 1, channel: 0 });
+        let fresh = mcu.fresh_main_rs();
+        let mine = concat!(
+            "\nfn slowest(adc1: &mut pins::configs::adc1::Handle) {\n",
+            "    adc1.set_sample_time(adc::SampleTime::T_239);\n",
+            "}\n",
+        );
+        let old = format!("{fresh}{mine}");
+        let once = mcu.update_main_rs(&old);
+        assert_contains_substring(
+            &once,
+            "    prelude::*,\n    // Your code below names `adc::`",
+        );
+        assert_contains_substring(&once, mine);
+        assert_eq!(mcu.update_main_rs(&once), once, "idempotent");
+        assert_not_contains_substring(&mcu.update_main_rs(&fresh), "\n    adc,\n");
+    }
+
+    /// A project from before `adc1.rs` whose own code sets the sample time the
+    /// only way it could then - `adc::SampleTime` below the block - keeps the
+    /// `adc` import for it, its code byte for byte; one that does not name it
+    /// loses the import.
+    #[test]
+    fn an_old_tail_naming_adc_keeps_its_import() {
+        use super::super::mock_mcu;
+
+        let mut mcu = mock_mcu::create_stm32f103c8tx();
+        mcu.apply_pin_function(10, PinFunction::AdcChannel { adc: 1, channel: 0 });
+        let fresh = mcu.fresh_main_rs();
+        let mine = "    _adc1.set_sample_time(adc::SampleTime::T_239);\n";
+        let end = fresh.find(GEN_END).unwrap();
+        let old = format!(
+            "{}{}",
+            &fresh[..end],
+            fresh[end..].replacen("    loop {\n", &format!("{mine}    loop {{\n"), 1)
+        );
+        assert!(old.contains(mine), "the fixture took");
+        let once = mcu.update_main_rs(&old);
+        assert_contains_substring(&once, "\n    adc,\n");
+        assert_contains_substring(&once, mine);
+        assert_eq!(mcu.update_main_rs(&once), once, "idempotent");
+        assert_not_contains_substring(&mcu.update_main_rs(&fresh), "\n    adc,\n");
     }
 
     // ── Clock codegen Tests ───────────────────────────────────────────────────
@@ -2405,6 +2513,22 @@ mod public_constants {
             if let Some(n) = target.and_then(|n| mcu.find_pin_mut(n)) {
                 n.selected_function = want;
             }
+        }
+        // And an ADC pad - the first free one with a channel - so `adc1.rs`
+        // (STM32F1) is among the files checked.
+        let adc = mcu
+            .iter_all_pins()
+            .filter(|p| !p.reserved && p.selected_function == PinFunction::Unset)
+            .find_map(|p| {
+                p.available_functions
+                    .iter()
+                    .find(|f| matches!(f, PinFunction::AdcChannel { .. }))
+                    .map(|f| (p.number, f.clone()))
+            });
+        if let Some((n, f)) = adc
+            && let Some(p) = mcu.find_pin_mut(n)
+        {
+            p.selected_function = f;
         }
         mcu.reconcile_modules();
     }

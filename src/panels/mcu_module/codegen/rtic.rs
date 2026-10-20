@@ -100,7 +100,51 @@ const BUS_HANDLES: &[(&str, &str, bool)] = &[
     // is a watchdog nothing can ever feed. `iwdg.rs` names its `Handle` for
     // exactly this. No WWDG row: RTIC is F1-only, and stm32f1xx-hal has none.
     ("_iwdg", "iwdg", false),
+    // The ADC, since it moved into `adc1.rs` with a `Handle` of its own.
+    ("_adc", "adc", true),
 ];
+
+/// A config file as RTIC binds its handle. The files are Blocking's, whose
+/// examples call `_serial1.write_all(..)`; under RTIC [`promote_bus_handles`]
+/// drops the underscore - the handle is a resource now, not a value nobody
+/// reads - so an example naming `_serial1` names nothing main.rs binds. Only
+/// the comment lines below the file's block, where the examples are, and only
+/// the handles [`BUS_HANDLES`] promotes, by the same rule.
+pub fn example_handles(file: &str) -> String {
+    let Some(end) = file.find(GEN_END) else {
+        return file.to_owned();
+    };
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let promoted = |ident: &str| {
+        BUS_HANDLES.iter().any(|(pfx, _, numbered)| {
+            ident
+                .strip_prefix(pfx)
+                .is_some_and(|tail| !numbered || tail.starts_with(|c: char| c.is_ascii_digit()))
+        })
+    };
+    let mut out = String::from(&file[..end]);
+    for line in file[end..].split_inclusive('\n') {
+        if !line.trim_start().starts_with("//") {
+            out.push_str(line);
+            continue;
+        }
+        let mut rest = line;
+        while let Some(i) = rest.find('_') {
+            let (before, from) = rest.split_at(i);
+            let ident_len = from.find(|c: char| !is_ident(c)).unwrap_or(from.len());
+            let ident = &from[..ident_len];
+            out.push_str(before);
+            if !before.chars().next_back().is_some_and(is_ident) && promoted(ident) {
+                out.push_str(&ident[1..]);
+            } else {
+                out.push_str(ident);
+            }
+            rest = &from[ident_len..];
+        }
+        out.push_str(rest);
+    }
+    out
+}
 
 /// Promote the bus handles in `fn_calls` from dropped temporaries to named
 /// bindings, returning the rewritten block and the resources to declare.
@@ -144,41 +188,10 @@ pub fn promote_bus_handles(fn_calls: &str) -> (String, Vec<BusHandle>) {
         out.push_str(&promoted.unwrap_or_else(|| line.to_string()));
         out.push('\n');
     }
-    (out, found)
-}
-
-/// The same promotion as [`promote_bus_handles`], for the peripherals whose
-/// type `gen_parts` had to spell out itself (see `GenParts::inline_handles`).
-///
-/// Only the `let mut _x = ` prefix moves: everything to the right of the `=` is
-/// the init expression and is left exactly as the shared generator wrote it, so
-/// the two runtimes cannot drift on what a peripheral is, only on where it
-/// lives.
-pub fn promote_inline_handles(
-    fn_calls: &str,
-    handles: &[(String, String, bool)],
-) -> (String, Vec<BusHandle>) {
-    let mut out = fn_calls.to_owned();
-    let mut found = Vec::new();
-    for (binding, ty, mutated) in handles {
-        let old = format!("let mut {binding} = ");
-        if !out.contains(&old) {
-            continue;
-        }
-        let name = binding.trim_start_matches('_').to_owned();
-        // The buses drop their `mut` because init only MOVES them, and RTIC
-        // hands tasks a `&mut` anyway. A PWM is different: init sets its duty
-        // and enables its channels, both through `&mut self`.
-        let keep = if *mutated { "let mut " } else { "let " };
-        out = out.replace(&old, &format!("{keep}{name} = "));
-        // Anything the init block said about the old name — `_pwm2_max`, the
-        // `set_duty` / `enable` calls — has to follow it.
-        out = out.replace(&format!("{binding}."), &format!("{name}."));
-        out = out.replace(&format!("{binding}_max"), &format!("{name}_max"));
-        found.push(BusHandle {
-            binding: name,
-            ty: ty.clone(),
-        });
+    // What the block says about the old name - the ADC's commented reads,
+    // `_adc1.read(...)` - follows it.
+    for h in &found {
+        out = out.replace(&format!("_{}.", h.binding), &format!("{}.", h.binding));
     }
     (out, found)
 }
@@ -614,20 +627,12 @@ pub fn make_generated_section(
         port_splits,
         pin_section,
         fn_calls,
-        inline_handles,
         ..
     } = parts;
 
     let irqs = irq_pins(all_pins);
     let locals_all = local_pins(all_pins);
     let (fn_calls, buses) = promote_bus_handles(&fn_calls);
-    // The ADC and each PWM timer have no config module to name a `Handle`, so
-    // `gen_parts` hands their concrete types over instead. Without this they
-    // were built in `#[init]` and dropped the moment it returned: the ADC
-    // unusable, and a PWM that keeps whatever duty init programmed but can
-    // never be changed again.
-    let (fn_calls, inline) = promote_inline_handles(&fn_calls, &inline_handles);
-    let buses: Vec<BusHandle> = buses.into_iter().chain(inline).collect();
     // `make_interrupt_source(&mut self)` needs a mutable binding. Rewriting only
     // the armed pins keeps `unused_mut` off the polled ones.
     let pin_section = irqs.iter().fold(pin_section, |acc, p| {

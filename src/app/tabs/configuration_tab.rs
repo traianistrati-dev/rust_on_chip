@@ -122,6 +122,24 @@ impl AppIde {
             .then(|| self.fpga_watch.get(self.project_dir.as_deref()).clone());
         let project_dir = self.project_dir.clone();
 
+        // The ADC card's facts, before the closure borrows `mcu.adc`: the pads
+        // ADC1 reads - the ones `adc1.rs` is written for - and the ADC clock
+        // stm32f1xx-hal really runs. On its own HAL only: the Async runtime
+        // generates no ADC yet, and a setting that reaches no file is not
+        // offered.
+        let show_adc = family == "stm32f1" && !is_async;
+        let adc1_pads: Vec<String> = if show_adc {
+            let all: Vec<&crate::panels::mcu_module::pins::logic::pin::Pin> =
+                mcu.iter_all_pins().collect();
+            crate::panels::mcu_module::codegen::stm32::adc1_pads(&all)
+                .iter()
+                .map(|p| p.name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let adcclk = crate::panels::mcu_module::codegen::stm32::f1_hal_adcclk(&mcu.clock);
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(4.0);
             ui.label(dim(concat!(
@@ -152,6 +170,11 @@ impl AppIde {
 
             comp_cards(ui, &mut mcu.comp, &comps, comp_gen, &family, is_async);
             ui.add_space(12.0);
+
+            if show_adc {
+                adc_card(ui, &mut mcu.adc, &adc1_pads, adcclk);
+                ui.add_space(12.0);
+            }
 
             // Before the watchdogs, whose section can end the tab early.
             let mesh = mcu.iot.ble_mesh.is_some()
@@ -1709,6 +1732,68 @@ fn dma_card(
                 format!("Free: {}", free.join(", "))
             }));
         }
+    });
+}
+
+/// The ADC1 card: its sample time, the one setting stm32f1xx-hal's ADC has
+/// that no pin carries. `init` in `pins/configs/adc1.rs` applies it, to every
+/// channel - the F1's SMPx can differ per channel, the HAL's
+/// `set_sample_time` cannot.
+fn adc_card(
+    ui: &mut egui::Ui,
+    settings: &mut crate::panels::mcu_module::adc::AdcSettings,
+    pads: &[String],
+    adcclk_hz: Option<u32>,
+) {
+    use crate::panels::mcu_module::adc;
+    ui.label(
+        egui::RichText::new(format!("{}  ADC1", ph::WAVE_SINE))
+            .size(13.0)
+            .strong(),
+    );
+    ui.add_space(4.0);
+    if pads.is_empty() {
+        ui.label(dim(
+            "No pin is wired to ADC1. Pick an ADC1 channel for a pad on the Pins tab, and \
+             its sample time is set here.",
+        ));
+        return;
+    }
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(dim(format!(
+            "Reads {}. One sample time for every channel; `init` in pins/configs/adc1.rs \
+             sets it.",
+            pads.join(", ")
+        )));
+        ui.add_space(4.0);
+        let mut st = adc::f1_sample_time(settings, 1);
+        ui.horizontal(|ui| {
+            ui.label("Sample time");
+            egui::ComboBox::from_id_salt("adc1_sample_time")
+                .selected_text(format!("{} cycles", adc::F1_SAMPLE_CYCLES[usize::from(st)]))
+                .show_ui(ui, |ui| {
+                    for (i, cycles) in (0u8..).zip(adc::F1_SAMPLE_CYCLES) {
+                        ui.selectable_value(&mut st, i, format!("{cycles} cycles"));
+                    }
+                });
+        });
+        adc::set_f1_sample_time(settings, 1, st);
+        // The conversion time, from the clock the HAL REALLY runs - not the
+        // Clock tab's own number when the two differ.
+        let note = match adcclk_hz {
+            Some(hz) => adc::f1_conversion_ns(st, hz).map_or_else(String::new, |ns| {
+                format!(
+                    "ADC clock {:.2} MHz: one conversion takes {:.2} us ({} cycles + 12.5).",
+                    f64::from(hz) / 1e6,
+                    ns as f64 / 1000.0,
+                    adc::F1_SAMPLE_CYCLES[usize::from(st)]
+                )
+            }),
+            None => "This Clock tab setup makes stm32f1xx-hal stop before the ADC exists - \
+                     see the Clock tab."
+                .to_owned(),
+        };
+        ui.label(dim(note));
     });
 }
 

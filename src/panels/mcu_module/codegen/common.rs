@@ -1481,6 +1481,127 @@ fn local_glob(head: &str, tail: &str) -> bool {
     uses.iter().any(|path| glob_from(path, &mods))
 }
 
+/// Whether user code `text` names module `name` as a path's first segment -
+/// `adc::SampleTime`, or `crate::adc::`, `self::adc::`, `super::adc::`, which
+/// reach the crate root's - and binds no `name` of its own, which one the
+/// generated block adds would collide with (E0252 for a `use`, E0255 for a
+/// `mod`). Comments and literals are not code; a full path
+/// (`stm32f1xx_hal::adc::...`) needs no import.
+pub fn names_module(text: &str, name: &str) -> bool {
+    let code = code_only(text);
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let pat = format!("{name}::");
+    let named = code.match_indices(&pat).any(|(at, _)| {
+        let before = &code[..at];
+        if before.chars().next_back().is_some_and(is_ident) {
+            return false;
+        }
+        let Some(path) = before.trim_end().strip_suffix("::") else {
+            // The first segment of a path - unless it stands in a `use` tree
+            // rooted elsewhere, `use hal::{adc::SampleTime}`: that is hal's.
+            return use_tree_root(before)
+                .is_none_or(|root| matches!(root, "" | "crate" | "self" | "super"));
+        };
+        let seg = path.trim_end().rsplit(|c: char| !is_ident(c)).next();
+        matches!(seg, Some("crate" | "self" | "super"))
+    });
+    named && !binds_name(&code, name)
+}
+
+/// The root of the `use` tree whose braces `before` ends inside - `hal` for
+/// `use hal::{timer, ` - or `None` outside one.
+fn use_tree_root(before: &str) -> Option<&str> {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let at = before.rmatch_indices("use").map(|(i, _)| i).find(|&i| {
+        !before[..i].chars().next_back().is_some_and(is_ident)
+            && before[i + 3..].starts_with(|c: char| c.is_whitespace() || c == '{' || c == ':')
+    })?;
+    let tree = &before[at + 3..];
+    if tree.contains(';') || tree.matches('{').count() <= tree.matches('}').count() {
+        return None;
+    }
+    let open = tree.find('{')?;
+    Some(tree[..open].trim().trim_end_matches("::").trim())
+}
+
+/// Whether `code` (see [`code_only`]) binds `name` at its top level: a `use`
+/// whose tree ENDS in it (`use x::adc;`, `use x::{adc, ..}`, `use y as adc;`,
+/// `use x::adc::{self}`), a `mod adc`, or an `extern crate y as adc`. A `use`
+/// that only passes through it - `use x::adc::SampleTime;` - binds
+/// `SampleTime`.
+fn binds_name(code: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let first_is = |s: &str| s.trim_start().split(|c: char| !is_ident(c)).next() == Some(name);
+    top_level_items(code).iter().any(|item| {
+        let item = bare_item(item);
+        if let Some(tree) = item.strip_prefix("use ") {
+            use_bindings(tree).iter().any(|b| b == name)
+        } else if let Some(rest) = item.strip_prefix("mod ") {
+            first_is(rest)
+        } else if let Some(rest) = item.strip_prefix("extern crate ") {
+            let rest = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+            rest.split_once(" as ")
+                .map_or_else(|| first_is(&rest), |(_, alias)| alias.trim() == name)
+        } else {
+            false
+        }
+    })
+}
+
+/// The names a `use` tree binds: `a::{b, c as d, e::{self, f}, g::*}` binds
+/// `b`, `d`, `e` and `f`. A glob binds none by name, `as _` none at all.
+fn use_bindings(tree: &str) -> Vec<String> {
+    fn walk(tree: &str, parent: Option<&str>, out: &mut Vec<String>) {
+        let tree = tree.trim();
+        if let Some(open) = tree.find('{') {
+            let prefix = tree[..open].trim().trim_end_matches("::").trim();
+            let owner = prefix
+                .rsplit("::")
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or(parent);
+            let inner = &tree[open + 1..];
+            let inner = inner.trim_end().strip_suffix('}').unwrap_or(inner);
+            let mut depth = 0usize;
+            let mut start = 0;
+            for (i, c) in inner.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => {
+                        walk(&inner[start..i], owner, out);
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            walk(&inner[start..], owner, out);
+            return;
+        }
+        if let Some((_, alias)) = tree.split_once(" as ") {
+            if alias.trim() != "_" {
+                out.push(alias.trim().to_owned());
+            }
+            return;
+        }
+        let mut segs = tree.rsplit("::").map(str::trim);
+        match segs.next() {
+            None | Some("" | "*") => {}
+            Some("self") => {
+                if let Some(owner) = segs.next().filter(|s| !s.is_empty()).or(parent) {
+                    out.push(owner.to_owned());
+                }
+            }
+            Some(leaf) => out.push(leaf.to_owned()),
+        }
+    }
+    let tree = tree.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = Vec::new();
+    walk(&tree, None, &mut out);
+    out
+}
+
 /// The items at the crate root of `code` (see [`code_only`]): the text up to
 /// each `;` or closing `}` at brace depth zero. Whatever stands inside a
 /// module's or a function's braces is part of that one item, not one of its
@@ -3328,5 +3449,82 @@ mod edge_hook_tests {
             ensure_edge_hooks(headed.clone(), &[hook("p0_14_in")]),
             headed
         );
+    }
+}
+
+#[cfg(test)]
+mod names_module_tests {
+    use super::{names_module, use_bindings};
+
+    #[test]
+    fn a_use_tree_binds_its_leaves() {
+        assert_eq!(use_bindings("stm32f1xx_hal::adc"), ["adc"]);
+        assert_eq!(
+            use_bindings("stm32f1xx_hal::adc::SampleTime"),
+            ["SampleTime"]
+        );
+        assert_eq!(
+            use_bindings("stm32f1xx_hal::{\n    pac,\n    prelude::*,\n    adc,\n}"),
+            ["pac", "adc"]
+        );
+        assert_eq!(
+            use_bindings("x::{adc as hal_adc, y::{self, z}}"),
+            ["hal_adc", "y", "z"]
+        );
+        assert_eq!(use_bindings("stm32f1xx_hal::adc::{self}"), ["adc"]);
+        assert_eq!(use_bindings("my_crate as adc"), ["adc"]);
+        assert_eq!(use_bindings("x::Trait as _"), Vec::<String>::new());
+        assert_eq!(use_bindings("x::*"), Vec::<String>::new());
+    }
+
+    /// Naming `adc::` asks for the import; binding an `adc` of one's own - a
+    /// `use` ending in it, a `mod`, an `extern crate .. as` - refuses it, and
+    /// a `use` that only passes through `adc` binds something else.
+    #[test]
+    fn naming_asks_and_binding_refuses() {
+        let names = "fn f() { x.set(adc::SampleTime::T_239); }\n";
+        assert!(names_module(names, "adc"));
+        assert!(names_module(
+            "fn f() { crate::adc::SampleTime::T_1; }",
+            "adc"
+        ));
+        assert!(names_module("mod m { use super::adc::SampleTime; }", "adc"));
+        assert!(!names_module(
+            "fn f() { stm32f1xx_hal::adc::SampleTime::T_1; }",
+            "adc"
+        ));
+        assert!(!names_module("fn f() { my_adc::x(); } // adc::y", "adc"));
+        for own in [
+            "use stm32f1xx_hal::adc;\n",
+            "use stm32f1xx_hal::{adc, pac};\n",
+            "use ads1115 as adc;\n",
+            "mod adc;\n",
+            "#[path = \"ads.rs\"]\npub mod adc;\n",
+            "mod adc {\n    pub fn read() -> u16 { 0 }\n}\n",
+            "extern crate ads1115 as adc;\n",
+        ] {
+            assert!(!names_module(&format!("{own}{names}"), "adc"), "{own}");
+        }
+        assert!(names_module(
+            &format!("use stm32f1xx_hal::adc::SampleTime;\n{names}"),
+            "adc"
+        ));
+        assert!(names_module(&format!("mod adcx;\n{names}"), "adc"));
+        // A path inside a `use` tree rooted in another crate is that crate's;
+        // one rooted at this crate, or a `use` already closed, is not.
+        assert!(!names_module(
+            "fn f() { use stm32f1xx_hal::{adc::SampleTime}; }",
+            "adc"
+        ));
+        assert!(!names_module(
+            "use embedded_hal::{adc::OneShot, blocking::delay::DelayMs};\n",
+            "adc"
+        ));
+        assert!(names_module("use crate::{adc::SampleTime};\n", "adc"));
+        assert!(names_module("use adc::SampleTime;\n", "adc"));
+        assert!(names_module(
+            "use stm32f1xx_hal::{timer::Timer};\nfn f() { adc::x(); }\n",
+            "adc"
+        ));
     }
 }

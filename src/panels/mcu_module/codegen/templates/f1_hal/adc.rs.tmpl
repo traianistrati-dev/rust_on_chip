@@ -1,0 +1,55 @@
+// <<< GENERATED>>>
+// ADC1 config (from the Configuration tab) - auto-updated; edit it there.
+// The sample time as stm32f1xx-hal's `SampleTime` index: 0 = 1.5, 1 = 7.5,
+// 2 = 13.5, 3 = 28.5, 4 = 41.5, 5 = 55.5, 6 = 71.5, 7 = 239.5 ADC clock cycles.
+pub const SAMPLE_TIME: u8 = {SAMPLE_TIME}; // {CYCLES} cycles
+// The ADC clock stm32f1xx-hal runs from this project's Clock tab, in Hz. One
+// conversion takes the sample time plus 12.5 of its cycles.
+#[allow(dead_code)]
+pub const ADCCLK_HZ: u32 = {ADCCLK_HZ};
+// <<< GENERATED END >>>
+
+// Everything below is editable - your changes are preserved on regeneration.
+//
+// ADC1 in one-shot mode: `init` powers it up, calibrates it and sets the
+// sample time; each `read` converts ONE pad and blocks until it is done. The
+// read is embedded-hal 0.2's `OneShot`, which stm32f1xx-hal's `prelude::*`
+// (main.rs imports it) brings into scope.
+use stm32f1xx_hal::{adc, pac, rcc::Clocks};
+
+/// The concrete type [`init`] hands back - a NAMED type, so it can be a struct
+/// field or an RTIC `Local` resource.
+pub type Handle = adc::Adc<pac::ADC1>;
+
+/// `SAMPLE_TIME` as the HAL's enum; past 7 it is the HAL's own default.
+const fn sample_time() -> adc::SampleTime {
+    match SAMPLE_TIME {
+        0 => adc::SampleTime::T_1,
+        1 => adc::SampleTime::T_7,
+        2 => adc::SampleTime::T_13,
+        4 => adc::SampleTime::T_41,
+        5 => adc::SampleTime::T_55,
+        6 => adc::SampleTime::T_71,
+        7 => adc::SampleTime::T_239,
+        _ => adc::SampleTime::T_28,
+    }
+}
+
+/// Power ADC1 up, calibrate it, and set the sample time.
+pub fn init(adc1: pac::ADC1, clocks: &Clocks) -> Handle {
+    let mut handle = adc::Adc::adc1(adc1, *clocks);
+    handle.set_sample_time(sample_time());
+    handle
+}
+
+// ── Using ADC1 ──
+// main.rs shows one read per wired pad, commented out below the init call.
+// In main.rs, after the init:
+//
+//     let raw: u16 = {HANDLE}.read(&mut {PAD}).unwrap(); // 0..=4095
+//     let mv = u32::from(raw) * 3300 / 4095;             // at VDDA = 3.3 V
+//
+// The internal channels need no pad:
+//
+//     let vref: u16 = {HANDLE}.read_vref();    // the ~1.2 V reference, raw
+//     let celsius: i32 = {HANDLE}.read_temp(); // a rough die temperature

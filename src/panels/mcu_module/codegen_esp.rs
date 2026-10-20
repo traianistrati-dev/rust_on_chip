@@ -2525,7 +2525,7 @@ fn bus_sections(
 
 /// `_<sanitized label>` suffix for a module's generated handle (`_uart1_imu`),
 /// or "" when the module has no user label. Mirror of `stm32::module_label_sfx`.
-fn module_label_sfx(label: &str) -> String {
+pub(crate) fn module_label_sfx(label: &str) -> String {
     let s = sanitize_label(label);
     if s.is_empty() {
         String::new()

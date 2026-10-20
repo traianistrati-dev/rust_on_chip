@@ -42,6 +42,7 @@ const GROUP_I2C_HEADER: &str = "@groupi2c";
 const I2C_POS_HEADER: &str = "@i2cpos";
 const WATCHDOG_HEADER: &str = "@watchdog";
 const COMP_HEADER: &str = "@comp";
+const ADC_HEADER: &str = "@adc";
 const FLASHSTORE_HEADER: &str = "@flashstore";
 const IOT_HEADER: &str = "@iot";
 const LABELS_HEADER: &str = "@labels";
@@ -268,6 +269,56 @@ pub fn parse_comp(text: &str) -> crate::panels::mcu_module::comparator::CompSett
                 },
             );
         }
+    }
+    out
+}
+
+/// The `@adc` section - one `<instance> <sample time index>` line per ADC
+/// whose settings differ from the HAL's default:
+///
+/// ```text
+/// @adc
+/// 1 7
+/// ```
+///
+/// Absent when none does, so a project that never touched the card writes the
+/// `mcu.config` it always wrote.
+pub fn adc_section(a: &crate::panels::mcu_module::adc::AdcSettings) -> String {
+    use crate::panels::mcu_module::adc::AdcConfig;
+    let body: String = a
+        .iter()
+        .filter(|(_, c)| **c != AdcConfig::default())
+        .map(|(n, c)| format!("{n} {}\n", c.sample_time))
+        .collect();
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("{ADC_HEADER}\n{body}")
+    }
+}
+
+/// Read `@adc` back. A line whose instance or sample time does not parse, or
+/// whose sample time is past the HAL's last step (7), is dropped - the card
+/// then shows the default, which is what the firmware gets. Fields after the
+/// second are ignored, for settings a later version adds.
+pub fn parse_adc(text: &str) -> crate::panels::mcu_module::adc::AdcSettings {
+    use crate::panels::mcu_module::adc::{AdcConfig, AdcSettings};
+    let mut out = AdcSettings::new();
+    let Some(body) = section_body(text, ADC_HEADER) else {
+        return out;
+    };
+    for line in body.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(n), Some(t)) = (f.next(), f.next()) else {
+            continue;
+        };
+        let (Ok(n), Ok(sample_time)) = (n.parse::<u8>(), t.parse::<u8>()) else {
+            continue;
+        };
+        if sample_time > 7 {
+            continue;
+        }
+        out.insert(n, AdcConfig { sample_time });
     }
     out
 }
@@ -2271,5 +2322,29 @@ mod module_notes_section_tests {
         let file = "@modulenotes\n(kind: GenericInterfaceSpi, instance: 3, text: \"t\", colour: \"red\")\n";
         let got = parse_notes(file);
         assert_eq!(got[&(ModuleKind::GenericInterfaceSpi, 3)].text, "t");
+    }
+}
+
+#[cfg(test)]
+mod adc_section_tests {
+    use super::{adc_section, parse_adc};
+    use crate::panels::mcu_module::adc::{AdcConfig, AdcSettings};
+
+    /// `@adc` round-trips; the default writes nothing; a line that does not
+    /// parse, or asks for a step past the HAL's last, is dropped.
+    #[test]
+    fn the_adc_section_round_trips_and_drops_what_it_cannot_read() {
+        let mut s = AdcSettings::new();
+        assert_eq!(adc_section(&s), "");
+        s.insert(1, AdcConfig::default());
+        assert_eq!(adc_section(&s), "", "the HAL default is not written");
+        s.insert(1, AdcConfig { sample_time: 7 });
+        let text = adc_section(&s);
+        assert_eq!(text, "@adc\n1 7\n");
+        assert_eq!(parse_adc(&text), s);
+        let bad = "@adc\n1 9\nx 2\n2\n3 5 extra\n";
+        let parsed = parse_adc(bad);
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(parsed[&3], AdcConfig { sample_time: 5 });
     }
 }

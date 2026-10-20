@@ -181,6 +181,7 @@ impl Mcu {
             module_notes: std::collections::BTreeMap::new(),
             watchdog: Default::default(),
             comp: Default::default(),
+            adc: Default::default(),
             flash_store: None,
             iot: Default::default(),
         }
@@ -1516,6 +1517,15 @@ impl Mcu {
             }
             s.push_str(&comp);
         }
+        // The ADC (`@adc`) — codegen input too: `pins/configs/adc1.rs`. Absent
+        // at the HAL's defaults, so an untouched project's file does not move.
+        let adc = mcu_config::adc_section(&self.adc);
+        if !adc.is_empty() {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&adc);
+        }
         // The flash store (`@flashstore`) — codegen input too.
         let flash_store = mcu_config::flashstore_section(self.flash_store.as_ref());
         if !flash_store.is_empty() {
@@ -1737,6 +1747,7 @@ impl Mcu {
         self.groups = mcu_config::parse_groups(text);
         self.watchdog = mcu_config::parse_watchdog(text);
         self.comp = mcu_config::parse_comp(text);
+        self.adc = mcu_config::parse_adc(text);
         self.flash_store = mcu_config::parse_flashstore(text);
         self.iot = mcu_config::parse_iot(text);
         // Interrupt edges (`@irq`) — a missing section means every input is

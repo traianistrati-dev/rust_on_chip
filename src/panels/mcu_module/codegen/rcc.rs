@@ -2161,8 +2161,6 @@ mod tests {
                         continue;
                     }
                     checked.insert(feature.as_str());
-                    let krate = work.join("crates").join(feature);
-                    std::fs::create_dir_all(krate.join("src")).expect("the crate folder");
                     // The importer's line, so `single-bank` stays where embassy's
                     // build script needs it, plus the time driver the project
                     // adds (the L1's ADC does not compile without embassy_time).
@@ -2171,65 +2169,33 @@ mod tests {
                         "time-driver-any",
                         true,
                     );
-                    let manifest = format!(
-                        "[package]\nname = \"clockcheck\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{hal}\n\n[workspace]\n"
+                    let main = crate::panels::mcu_module::stm32_harvest::check_main(&block_file(
+                        family, part, blocks,
+                    ));
+                    let result = crate::panels::mcu_module::stm32_harvest::cargo_check_crate(
+                        work,
+                        feature,
+                        &hal,
+                        target,
+                        &main,
+                        lock.as_deref(),
                     );
-                    std::fs::write(krate.join("Cargo.toml"), manifest).expect("writable");
-                    if let Some(lock) = &lock
-                        && !krate.join("Cargo.lock").exists()
-                    {
-                        std::fs::copy(lock, krate.join("Cargo.lock")).expect("the seed lock");
-                    }
-                    let main = format!(
-                        "#![no_std]\n#![no_main]\n\n#[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! {{\n    loop {{}}\n}}\n\n{}",
-                        block_file(family, part, blocks)
-                    );
-                    std::fs::write(krate.join("src").join("main.rs"), main).expect("writable");
-                    let mut cargo = std::process::Command::new("cargo");
-                    cargo
-                        .args([
-                            "check",
-                            "--quiet",
-                            "--target",
-                            target,
-                            "--message-format",
-                            "short",
-                        ])
-                        .current_dir(&krate)
-                        .env("CARGO_TARGET_DIR", work.join("target"))
-                        .env("CARGO_HTTP_MULTIPLEXING", "false")
-                        // What this test run carries that the crate must not
-                        // inherit: a pinned toolchain, a build target, and
-                        // the IDE's own features (rtic-macros counts them).
-                        .env_remove("RUSTUP_TOOLCHAIN")
-                        .env_remove("CARGO_BUILD_TARGET");
-                    for (key, _) in std::env::vars_os() {
-                        if key.to_string_lossy().starts_with("CARGO_FEATURE_") {
-                            cargo.env_remove(key);
-                        }
-                    }
-                    let out = cargo.output().expect("cargo runs");
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let errors: Vec<&str> = stderr
-                        .lines()
-                        .filter(|l| l.contains(": error") || l.starts_with("error"))
-                        .collect();
-                    let ok = out.status.success();
                     println!(
                         "{} {feature} ({} blocks)",
-                        if ok { "OK  " } else { "FAIL" },
+                        if result.is_ok() { "OK  " } else { "FAIL" },
                         blocks.len()
                     );
-                    for e in errors.iter().take(12) {
-                        println!("     {e}");
-                    }
-                    if ok {
-                        clean += 1;
-                    } else {
-                        failed.push(format!(
-                            "{feature}: cargo check fails: {}",
-                            errors.first().copied().unwrap_or("(no error line)")
-                        ));
+                    match result {
+                        Ok(()) => clean += 1,
+                        Err(errors) => {
+                            for e in errors.iter().take(12) {
+                                println!("     {e}");
+                            }
+                            failed.push(format!(
+                                "{feature}: cargo check fails: {}",
+                                errors.first().map_or("(no error line)", String::as_str)
+                            ));
+                        }
                     }
                 }
             }

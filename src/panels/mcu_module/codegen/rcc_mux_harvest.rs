@@ -24,12 +24,28 @@
 //!
 //! What a version's chips select comes from the chips themselves: every
 //! `kernel_clock: Mux(...)` entry, the list embassy's own build script reads
-//! (a name pattern would drop the older families, whose selector is `I2C1SW`).
-//! Each field's enum is read inside that field's own braces. The first
-//! harvester (a Python script) matched `Field { … enumm: Some(` across field
-//! boundaries, so a field with no enum swallowed the next field's: the C0's
-//! USART1SEL, the H7's LPUART1SEL and 48 more never reached the table. The
-//! check below pins that gap until the table is regenerated.
+//! (a name pattern would drop the older families, whose selector is `I2C1SW`),
+//! of the peripherals embassy makes singletons, as only those get a
+//! `config.rcc.mux` field ([`kernel_muxes`]). Each field's enum is read inside
+//! that field's own braces.
+//!
+//! The first harvester (a Python script) got both wrong. It matched
+//! `Field { … enumm: Some(` across field boundaries, so a field with no enum
+//! swallowed the next field's - the C0's USART1SEL, the H7's LPUART1SEL and 48
+//! more never reached the table (49 of the 50 belong in it) - and it kept 34
+//! selectors of peripherals with no register block (DFSDM, SWPMI, ADF, MDF,
+//! most of the N6), lines the Clock tab could write and embassy would not
+//! compile. Regenerated here, 2026-10-21: 477 selectors, +49 -34, 492.
+//!
+//! A version's selectors are all of its chips', and a CubeMX clock tree is a
+//! whole line's: the STM32L010's has the L0's USART1 mux, though the L010 has
+//! no USART1. So the table also says, by part-number prefix, which of its
+//! version's selectors a part lacks (`CHIP_LACKS`).
+//!
+//! Three tests: the table against the crate, byte for byte; every part's
+//! lookup against its own metadata ([`every_part_gets_exactly_its_selectors`]);
+//! and every selector compiled against embassy-stm32
+//! ([`every_mux_selector_compiles_against_embassy`]).
 //!
 //! ```text
 //! cargo test -- --ignored --exact panels::mcu_module::codegen::rcc_mux_harvest::the_rcc_mux_table_matches_metapac --nocapture
@@ -37,9 +53,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::panels::mcu_module::stm32_harvest::{chips, metapac_or_fail, regen};
+use super::rcc_mux::MuxField;
+use crate::panels::mcu_module::stm32_harvest::{
+    cargo_check_crate, check_main, check_or_write, chips, configurations, metapac_or_fail,
+};
 
 /// `(field, enum, [(value, variant)])`: one `MuxField`.
 type Selector = (String, String, Vec<(u32, String)>);
@@ -51,6 +70,8 @@ struct Table {
     versions: BTreeMap<String, Vec<Selector>>,
     /// Part-number prefix -> RCC version.
     chip_rcc: BTreeMap<String, String>,
+    /// Part-number prefix -> the selectors of its version the part lacks.
+    chip_lacks: BTreeMap<String, Vec<String>>,
     /// Family (`stm32l4+`) -> its one RCC version.
     family_rcc: BTreeMap<String, String>,
     /// How many chips the prefixes cover.
@@ -171,75 +192,111 @@ fn rcc_version(body: &str) -> Option<&str> {
     })
 }
 
-/// Every `kernel_clock: Mux(PeripheralRccRegister { register, field })` of a
-/// shared `metadata_NNNN.rs`: the selectors its chips use, lower-cased.
+/// The selectors a shared `metadata_NNNN.rs`'s chips use, lower-cased: the
+/// `kernel_clock: Mux(PeripheralRccRegister { register, field })` of every
+/// peripheral embassy-stm32 makes a singleton.
+///
+/// Only those reach `config.rcc.mux`: embassy builds `ClockMux` from its
+/// singletons, and a peripheral is one when metapac gives it a register block
+/// (a GPIO port and EXTI aside - its build script, `singletons`). A DFSDM,
+/// SWPMI, ADF or MDF with no register block in metapac 21 has a selector in
+/// the RCC and none in embassy, so a line naming it would not compile.
 fn kernel_muxes(body: &str) -> BTreeSet<String> {
+    blocks(body, "Peripheral")
+        .into_iter()
+        .filter(|p| singleton(p))
+        .filter_map(kernel_mux)
+        .collect()
+}
+
+/// Is this `Peripheral { … }` a singleton in embassy-stm32?
+fn singleton(peripheral: &str) -> bool {
+    let Some(at) = peripheral.find("registers:") else {
+        return false;
+    };
+    let registers = peripheral[at + "registers:".len()..].trim_start();
+    registers.starts_with("Some(") && !matches!(quoted(registers, "kind:"), Some("gpio" | "exti"))
+}
+
+/// The selector field this peripheral's kernel clock goes through, if a mux.
+fn kernel_mux(peripheral: &str) -> Option<String> {
     let upper = |s: &str| {
         all(s, |c| {
             c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'
         })
     };
-    body.match_indices("kernel_clock: Mux(PeripheralRccRegister {")
-        .filter_map(|(at, m)| {
-            let rest = body[at + m.len()..]
-                .trim_start()
-                .strip_prefix("register: \"")?;
-            let end = rest.find('"')?;
-            if !upper(&rest[..end]) {
-                return None;
-            }
-            let field = rest[end + 1..]
-                .strip_prefix(',')?
-                .trim_start()
-                .strip_prefix("field:")?;
-            let field = quoted(field, "")?;
-            upper(field).then(|| field.to_ascii_lowercase())
-        })
-        .collect()
+    let head = "kernel_clock: Mux(PeripheralRccRegister {";
+    let rest = peripheral[peripheral.find(head)? + head.len()..]
+        .trim_start()
+        .strip_prefix("register: \"")?;
+    let end = rest.find('"')?;
+    if !upper(&rest[..end]) {
+        return None;
+    }
+    let field = rest[end + 1..]
+        .strip_prefix(',')?
+        .trim_start()
+        .strip_prefix("field:")?;
+    let field = quoted(field, "")?;
+    upper(field).then(|| field.to_ascii_lowercase())
 }
 
 // ── The harvest ──────────────────────────────────────────────────────────────
 
 /// Shortest part-number prefix that pins a chip's RCC version, then without
 /// the rules a shorter one already implies.
-fn prefix_rules(chips: &BTreeMap<String, (String, String)>) -> BTreeMap<String, String> {
+///
+/// `keys` is chip -> what the rule answers: its RCC version for `CHIP_RCC`,
+/// the selectors it lacks for `CHIP_LACKS`.
+fn prefix_rules<K: Ord + Clone>(keys: &BTreeMap<String, K>) -> BTreeMap<String, K> {
     // In the order chips find them, as a shorter rule is judged first below.
-    let mut found: Vec<(String, String)> = Vec::new();
-    for (chip, (version, _)) in chips {
+    let mut found: Vec<(String, K)> = Vec::new();
+    for (chip, key) in keys {
         for n in 6..=chip.len() {
             let pre = &chip[..n];
-            let versions: BTreeSet<&str> = chips
+            let distinct: BTreeSet<&K> = keys
                 .iter()
                 .filter(|(c, _)| c.starts_with(pre))
-                .map(|(_, (v, _))| v.as_str())
+                .map(|(_, k)| k)
                 .collect();
-            if versions.len() == 1 {
+            if distinct.len() == 1 {
                 if !found.iter().any(|(p, _)| p == pre) {
-                    found.push((pre.to_owned(), version.clone()));
+                    found.push((pre.to_owned(), key.clone()));
                 }
                 break;
             }
         }
     }
     found.sort_by_key(|(p, _)| p.len()); // stable: ties keep their order
-    let mut rules: BTreeMap<String, String> = BTreeMap::new();
-    for (pre, version) in found {
+    let mut rules: BTreeMap<String, K> = BTreeMap::new();
+    for (pre, key) in found {
         if !rules
             .iter()
-            .any(|(p, v)| pre.starts_with(p.as_str()) && *v == version)
+            .any(|(p, k)| pre.starts_with(p.as_str()) && *k == key)
         {
-            rules.insert(pre, version);
+            rules.insert(pre, key);
         }
     }
     rules
 }
 
-/// The table stm32-metapac says, from `metapac`'s `src/chips` and `src/registers`.
-fn harvest(metapac: &Path) -> Table {
+/// What one chip's metadata says about its clock selectors.
+struct ChipMuxes {
+    /// Its RCC register version (`c0`, `h7rm0433`).
+    version: String,
+    /// Its family as the importer keys it: `stm32l4+`.
+    family: String,
+    /// The selectors its peripherals' kernel clocks go through, lower-cased.
+    fields: BTreeSet<String>,
+    /// Single or dual bank is an option-byte choice: embassy-stm32 then needs
+    /// `single-bank` (or `dual-bank`), or its build script panics.
+    bank_choice: bool,
+}
+
+/// Every chip folder of `metapac` that has an RCC block, and its selectors.
+fn chip_muxes(metapac: &Path) -> BTreeMap<String, ChipMuxes> {
     let chips_dir = metapac.join("src").join("chips");
-    // chip folder -> (RCC version, family as the importer keys it: `stm32l4+`)
-    let mut chip_rcc: BTreeMap<String, (String, String)> = BTreeMap::new();
-    let mut muxes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut out = BTreeMap::new();
     let mut shared: BTreeMap<String, (Option<String>, BTreeSet<String>)> = BTreeMap::new();
     for (chip, head) in chips(metapac) {
         if !chip.starts_with("stm32") {
@@ -259,8 +316,32 @@ fn harvest(metapac: &Path) -> Table {
             })
             .clone();
         let Some(version) = version else { continue };
-        chip_rcc.insert(chip, (version.clone(), family.to_ascii_lowercase()));
-        muxes.entry(version).or_default().extend(fields);
+        let bank_choice = configurations(&head).len() > 1;
+        out.insert(
+            chip,
+            ChipMuxes {
+                version,
+                family: family.to_ascii_lowercase(),
+                fields,
+                bank_choice,
+            },
+        );
+    }
+    out
+}
+
+/// The table stm32-metapac says, from `metapac`'s `src/chips` and `src/registers`.
+fn harvest(metapac: &Path) -> Table {
+    let chips = chip_muxes(metapac);
+    // chip folder -> (RCC version, family)
+    let mut chip_rcc: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut muxes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (chip, c) in &chips {
+        muxes
+            .entry(c.version.clone())
+            .or_default()
+            .extend(c.fields.iter().cloned());
+        chip_rcc.insert(chip.clone(), (c.version.clone(), c.family.clone()));
     }
 
     let mut versions = BTreeMap::new();
@@ -308,45 +389,39 @@ fn harvest(metapac: &Path) -> Table {
             )
         })
         .collect();
+
+    // Per part, the selectors of its version it does not have. A version's
+    // table is every one of its chips' selectors, and a CubeMX clock tree is
+    // a whole line's: an STM32L010's tree has the L0's USART1 mux, the L010
+    // has no USART1, and embassy gives it no `usart1sel`.
+    let lacks: BTreeMap<String, Vec<String>> = chips
+        .iter()
+        .map(|(chip, c)| {
+            let missing = versions
+                .get(&c.version)
+                .into_iter()
+                .flatten()
+                .map(|s: &Selector| &s.0)
+                .filter(|f| !c.fields.contains(*f))
+                .cloned()
+                .collect();
+            (chip.clone(), missing)
+        })
+        .collect();
+    let version_of: BTreeMap<String, String> = chip_rcc
+        .iter()
+        .map(|(chip, (version, _))| (chip.clone(), version.clone()))
+        .collect();
     Table {
         versions,
-        chip_rcc: prefix_rules(&chip_rcc),
+        chip_rcc: prefix_rules(&version_of),
+        // No entry is the common case: a part with everything its version has.
+        chip_lacks: prefix_rules(&lacks)
+            .into_iter()
+            .filter(|(_, l)| !l.is_empty())
+            .collect(),
         family_rcc,
         chips: chip_rcc.len(),
-    }
-}
-
-/// The table compiled into the IDE, as the same data.
-fn committed() -> Table {
-    let data = super::rcc_mux_data::VERSIONS;
-    Table {
-        versions: data
-            .iter()
-            .map(|(v, fields)| {
-                let fields = fields
-                    .iter()
-                    .map(|f| {
-                        let variants = f
-                            .variants
-                            .iter()
-                            .map(|(n, s)| (*n, (*s).to_owned()))
-                            .collect();
-                        (f.field.to_owned(), f.enum_name.to_owned(), variants)
-                    })
-                    .collect();
-                ((*v).to_owned(), fields)
-            })
-            .collect(),
-        chip_rcc: super::rcc_mux_data::CHIP_RCC
-            .iter()
-            .map(|(p, v)| ((*p).to_owned(), (*v).to_owned()))
-            .collect(),
-        family_rcc: super::rcc_mux_data::FAMILY_RCC
-            .iter()
-            .map(|(f, v)| ((*f).to_owned(), (*v).to_owned()))
-            .collect(),
-        // The doc line above CHIP_RCC says it; the data does not carry it.
-        chips: 0,
     }
 }
 
@@ -359,8 +434,8 @@ fn write(table: &Table, source: &str) -> String {
     let mut o = String::from(concat!(
         "//! Per-peripheral clock mux tables, harvested from stm32-metapac.\n",
         "//!\n",
-        "//! GENERATED - do not edit by hand. `codegen::rcc_mux_harvest` checks it\n",
-        "//! against the crate and, with `EIDE_REGEN=1`, rewrites it.\n",
+        "//! GENERATED by `cargo test` (`rcc_mux_harvest`, `EIDE_REGEN=1`) - do not\n",
+        "//! edit by hand.\n",
     ));
     let _ = writeln!(o, "//! Source: {source}");
     o.push_str(concat!(
@@ -411,6 +486,20 @@ fn write(table: &Table, source: &str) -> String {
     o.push_str(concat!(
         "];\n",
         "\n",
+        "/// Part-number prefix -> the selectors of its RCC version the part does\n",
+        "/// not have: a version's table is all of its chips', and a CubeMX clock\n",
+        "/// tree is a whole line's - the STM32L010's has the L0's USART1 mux, and\n",
+        "/// embassy gives the L010 no `usart1sel`. Longest match wins; a part with\n",
+        "/// no entry has every selector of its version.\n",
+        "pub static CHIP_LACKS: &[(&str, &[&str])] = &[\n",
+    ));
+    for (pre, fields) in &table.chip_lacks {
+        let fields: Vec<String> = fields.iter().map(|f| format!("\"{f}\"")).collect();
+        let _ = writeln!(o, "    (\"{pre}\", &[{}]),", fields.join(", "));
+    }
+    o.push_str(concat!(
+        "];\n",
+        "\n",
         "/// Families whose chips all share one RCC version — the fallback\n",
         "/// when a part number matches no prefix (a chip newer than this\n",
         "/// harvest). Ambiguous families are absent ON PURPOSE.\n",
@@ -457,21 +546,8 @@ fn rustfmt(text: &str) -> String {
 
 const PATH: &str = "src/panels/mcu_module/codegen/rcc_mux_data.rs";
 
-/// The selectors metapac lists that the committed table lacks: the first
-/// harvester's regex dropped them (see the module doc). The table is NOT the
-/// harvest until a regeneration adds them - which changes what the Clock tab
-/// emits on those parts, so it is a change of its own: after it, set this to
-/// 0 and move the selector count `the_harvested_tables_are_sane` pins in
-/// `rcc_mux.rs` (477) to the new total.
-const KNOWN_GAP: usize = 50;
-
-/// `rcc_mux_data.rs` against stm32-metapac 21.
-///
-/// Three things: the writer gives the committed file back from the
-/// committed data (so a regeneration changes only what the crate changed);
-/// every committed selector, prefix rule and family rule is what metapac
-/// says; and what metapac lists beyond the table is exactly the known gap.
-/// With `EIDE_REGEN=1` it writes the whole harvest instead - the gap included.
+/// `rcc_mux_data.rs` against stm32-metapac 21, byte for byte as `cargo fmt`
+/// leaves it; with `EIDE_REGEN=1` it writes the harvest.
 #[test]
 #[ignore]
 fn the_rcc_mux_table_matches_metapac() {
@@ -481,94 +557,203 @@ fn the_rcc_mux_table_matches_metapac() {
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_owned();
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(PATH);
-    let mut harvested = harvest(&metapac);
-    if regen() {
-        std::fs::write(&path, rustfmt(&write(&harvested, &source))).expect("writable");
-        println!("wrote {PATH}");
-        return;
-    }
+    check_or_write(PATH, &rustfmt(&write(&harvest(&metapac), &source)));
+}
 
-    // The writer, on the committed data: the committed file, byte for byte.
-    let file = std::fs::read_to_string(&path)
-        .expect("readable")
-        .replace("\r\n", "\n");
-    let mut table = committed();
-    table.chips = harvested.chips;
-    let rewritten = rustfmt(&write(&table, &source));
-    if rewritten != file {
-        // Where they part - or, one a prefix of the other, where the shorter ends.
-        let (old, new): (Vec<&str>, Vec<&str>) =
-            (file.lines().collect(), rewritten.lines().collect());
-        let at = old
-            .iter()
-            .zip(&new)
-            .position(|(a, b)| a != b)
-            .unwrap_or(old.len().min(new.len()));
-        panic!(
-            "the writer does not give {PATH} back, from line {} ({} lines in the file, {} written):\n  file:   {:?}\n  writer: {:?}",
-            at + 1,
-            old.len(),
-            new.len(),
-            old.get(at),
-            new.get(at)
-        );
-    }
-
-    // The routing: every rule as metapac says it.
-    assert_eq!(
-        table.chip_rcc, harvested.chip_rcc,
-        "CHIP_RCC moved: regenerate"
-    );
-    assert_eq!(
-        table.family_rcc, harvested.family_rcc,
-        "FAMILY_RCC moved: regenerate"
-    );
-
-    // Every committed selector is metapac's, field, enum and variants.
+/// What the IDE's lookup gives each of metapac's 1533 parts - the table's
+/// routing by prefix ([`super::rcc_mux::fields_for_chip`]: `CHIP_RCC`, then
+/// `CHIP_LACKS`) - is exactly the part's own: its version's selectors that its
+/// peripherals use. The prefixes are the shortest that hold across every
+/// chip, so this is the check that they still do.
+#[test]
+#[ignore]
+fn every_part_gets_exactly_its_selectors() {
     let mut wrong = Vec::new();
-    for (version, fields) in &table.versions {
-        let theirs = harvested
-            .versions
-            .get(version)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        for f in fields {
-            if !theirs.contains(f) {
-                wrong.push(format!(
-                    "{version}: {f:?}, metapac: {:?}",
-                    theirs.iter().find(|t| t.0 == f.0)
-                ));
-            }
+    let chips = chip_muxes(&metapac_or_fail());
+    for (chip, c) in &chips {
+        let table = super::rcc_mux_data::VERSIONS
+            .iter()
+            .find(|(v, _)| *v == c.version)
+            .map(|(_, f)| *f)
+            .unwrap_or(&[]);
+        let want: BTreeSet<&str> = table
+            .iter()
+            .map(|f| f.field)
+            .filter(|f| c.fields.contains(*f))
+            .collect();
+        let got: BTreeSet<&str> = super::rcc_mux::fields_for_chip(chip, &c.family)
+            .iter()
+            .map(|f| f.field)
+            .collect();
+        if got != want {
+            wrong.push(format!(
+                "{chip}: gets {:?}, has not {:?}",
+                got.difference(&want).collect::<Vec<_>>(),
+                want.difference(&got).collect::<Vec<_>>()
+            ));
         }
     }
+    println!("{} parts routed", chips.len());
     assert!(
         wrong.is_empty(),
-        "{} committed selectors metapac does not say:\n{}",
+        "{} parts:\n{}",
         wrong.len(),
         wrong.join("\n")
     );
+}
 
-    // And beyond it, exactly the known gap.
-    let mut missing = Vec::new();
-    for (version, fields) in &mut harvested.versions {
-        let ours = table
-            .versions
-            .get(version)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        fields.retain(|f| !ours.contains(f));
-        missing.extend(fields.iter().map(|f| format!("{version}/{}", f.0)));
+/// The target a part of `family` (`stm32wl`) builds for: its core's, as
+/// `stm32_pin_data::target_for` picks it - the WL's Cortex-M4 has no FPU.
+fn target_of(family: &str) -> &'static str {
+    match family {
+        "stm32c0" | "stm32f0" | "stm32g0" | "stm32l0" | "stm32u0" | "stm32wb0" => {
+            "thumbv6m-none-eabi"
+        }
+        "stm32f1" | "stm32f2" | "stm32l1" => "thumbv7m-none-eabi",
+        "stm32wl" => "thumbv7em-none-eabi",
+        "stm32f3" | "stm32f4" | "stm32f7" | "stm32g4" | "stm32h7" | "stm32l4" | "stm32l4+"
+        | "stm32wb" => "thumbv7em-none-eabihf",
+        "stm32h5" | "stm32l5" | "stm32n6" | "stm32u3" | "stm32u5" | "stm32wba" => {
+            "thumbv8m.main-none-eabihf"
+        }
+        other => panic!("{other}: no core known for this family"),
+    }
+}
+
+/// Every selector the table lists, compiled against embassy-stm32: each of
+/// its variants assigned exactly as the Clock tab writes it
+/// (`rcc_mux::emit_lines`), on a part whose peripherals use that selector.
+///
+/// The table is metapac's, and embassy-stm32 builds its `config.rcc.mux` from
+/// metapac too - but only from the peripherals the chip has, and through its
+/// own reading. A line the IDE writes that embassy does not have is a project
+/// that does not build, so the compiler has the last word. Per RCC version,
+/// the fewest published parts (application cores) that between them use
+/// every field; a version with no published part (WB0) is reported, not
+/// compiled - the import refuses those parts.
+///
+/// `EIDE_MUX_CHECK=<dir>`: where the crates build, one per part, sharing
+/// `<dir>\target` (a few GB: off the repo and off the matrix drive).
+/// `EIDE_MUX_LOCK=<Cargo.lock>` seeds every crate with a known-good lock file.
+#[test]
+#[ignore]
+fn every_mux_selector_compiles_against_embassy() {
+    use crate::panels::mcu_module::stm32_pin_data::embassy_publishes;
+    let work = std::env::var_os("EIDE_MUX_CHECK")
+        .map(PathBuf::from)
+        .expect("EIDE_MUX_CHECK=<folder>: where the check crates build (a few GB, off the repo)");
+    let lock = std::env::var_os("EIDE_MUX_LOCK").map(PathBuf::from);
+    let chips = chip_muxes(&metapac_or_fail());
+
+    // Which parts, and which of the table's selectors on each.
+    let mut plan: Vec<(&str, &ChipMuxes, Vec<&MuxField>)> = Vec::new();
+    let mut unreached = Vec::new();
+    for (version, fields) in super::rcc_mux_data::VERSIONS {
+        let candidates: Vec<(&String, &ChipMuxes)> = chips
+            .iter()
+            .filter(|(chip, c)| {
+                // A dual-core part's application core only, the one the IDE
+                // builds for: the H7's M7, the WL5's M4.
+                let second_core = (chip.starts_with("stm32h7") && chip.ends_with("-cm4"))
+                    || chip.ends_with("-cm0p");
+                c.version == *version && embassy_publishes(chip) && !second_core
+            })
+            .collect();
+        if candidates.is_empty() {
+            println!("{version}: no part embassy-stm32 publishes, nothing to compile");
+            continue;
+        }
+        let mut left: BTreeSet<&str> = fields.iter().map(|f| f.field).collect();
+        while !left.is_empty() {
+            // The part that uses the most of what is left; by name on a tie.
+            let Some((chip, c)) = candidates.iter().copied().max_by_key(|(chip, c)| {
+                let uses = left.iter().filter(|f| c.fields.contains(**f)).count();
+                (uses, std::cmp::Reverse(chip.as_str()))
+            }) else {
+                break;
+            };
+            let here: Vec<&MuxField> = fields
+                .iter()
+                .filter(|f| left.contains(&f.field) && c.fields.contains(f.field))
+                .collect();
+            if here.is_empty() {
+                break;
+            }
+            for f in &here {
+                left.remove(&f.field);
+            }
+            plan.push((chip.as_str(), c, here));
+        }
+        unreached.extend(
+            left.iter()
+                .map(|f| format!("{version}/{f}: no published part uses it")),
+        );
+    }
+
+    let mut failed = Vec::new();
+    for (chip, c, fields) in &plan {
+        let mut body = String::from(concat!(
+            "#[allow(unused)]\n",
+            "fn every_selector() {\n",
+            "    let mut config = embassy_stm32::Config::default();\n",
+            "    {\n",
+            "        use embassy_stm32::rcc;\n",
+        ));
+        let mut lines = 0;
+        for f in fields {
+            for (_, variant) in f.variants {
+                let _ = writeln!(
+                    body,
+                    "        config.rcc.mux.{} = rcc::mux::{}::{variant};",
+                    f.field, f.enum_name
+                );
+                lines += 1;
+            }
+        }
+        body.push_str("    }\n}\n");
+        let mut features = vec![format!("\"{chip}\""), "\"time-driver-any\"".to_owned()];
+        if c.bank_choice {
+            features.push("\"single-bank\"".to_owned());
+        }
+        let dependency = format!(
+            "embassy-stm32 = {{ version = \"0.6\", features = [{}] }}",
+            features.join(", ")
+        );
+        let result = cargo_check_crate(
+            &work,
+            chip,
+            &dependency,
+            target_of(&c.family),
+            &check_main(&body),
+            lock.as_deref(),
+        );
+        println!(
+            "{} {chip} ({}: {} selectors, {lines} lines)",
+            if result.is_ok() { "OK  " } else { "FAIL" },
+            c.version,
+            fields.len()
+        );
+        if let Err(errors) = result {
+            for e in errors.iter().take(12) {
+                println!("     {e}");
+            }
+            failed.push(format!(
+                "{chip}: {}",
+                errors.first().map_or("(no error line)", String::as_str)
+            ));
+        }
     }
     println!(
-        "{} selectors metapac lists beyond the table:\n{}",
-        missing.len(),
-        missing.join(", ")
+        "\n{}/{} parts check clean",
+        plan.len() - failed.len(),
+        plan.len()
     );
-    assert_eq!(
-        missing.len(),
-        KNOWN_GAP,
-        "the table's gap moved: see KNOWN_GAP for what a regeneration takes"
+    failed.extend(unreached);
+    assert!(
+        failed.is_empty(),
+        "{} failed:\n{}",
+        failed.len(),
+        failed.join("\n")
     );
 }
 
@@ -641,32 +826,62 @@ fn a_field_without_an_enum_does_not_take_the_next_ones() {
     );
 
     let meta = r#"
+    peripherals: &[
+        Peripheral {
             name: "RCC",
             address: 1073876992,
-            registers: Some(
-                PeripheralRegisters {
-                    kind: "rcc",
-                    version: "c0",
-                    block: "RCC",
-                },
-            ),
-            kernel_clock: Mux(PeripheralRccRegister {
-                register: "CCIPR",
-                field: "USART1SEL",
+            registers: Some(PeripheralRegisters {
+                kind: "rcc",
+                version: "c0",
+                block: "RCC",
+                ir: &rcc::REGISTERS,
             }),
+            rcc: None,
+        },
+        Peripheral {
+            name: "USART1",
+            address: 0x40013800,
+            registers: Some(PeripheralRegisters {
+                kind: "usart",
+                version: "v4",
+                block: "USART",
+                ir: &usart::REGISTERS,
+            }),
+            rcc: Some(PeripheralRcc {
+                bus_clock: "PCLK2",
+                kernel_clock: Mux(PeripheralRccRegister {
+                    register: "CCIPR",
+                    field: "USART1SEL",
+                }),
+            }),
+        },
+        Peripheral {
+            name: "DFSDM1",
+            address: 0x40016000,
+            registers: None,
+            rcc: Some(PeripheralRcc {
+                bus_clock: "PCLK2",
+                kernel_clock: Mux(PeripheralRccRegister {
+                    register: "CCIPR2",
+                    field: "DFSDMSEL",
+                }),
+            }),
+        },
+    ],
     "#;
     assert_eq!(rcc_version(meta), Some("c0"));
+    // DFSDM1 has no register block, so no singleton and no `ClockMux` field.
     assert_eq!(kernel_muxes(meta), BTreeSet::from(["usart1sel".to_owned()]));
 
     // The shortest unambiguous prefix, without the ones a shorter implies.
-    let chips: BTreeMap<String, (String, String)> = [
+    let chips: BTreeMap<String, String> = [
         ("stm32f401cc", "f4"),
         ("stm32f410t8", "f410"),
         ("stm32f411re", "f4"),
         ("stm32g431cb", "g4"),
     ]
     .into_iter()
-    .map(|(c, v)| (c.to_owned(), (v.to_owned(), "x".to_owned())))
+    .map(|(c, v)| (c.to_owned(), v.to_owned()))
     .collect();
     let rules = prefix_rules(&chips);
     assert_eq!(

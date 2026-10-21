@@ -673,6 +673,7 @@ impl FamilyBackend for WbaBackend {
             header = wba::invariant_header(&mcu.name, &mcu.id),
             section = wba::make_generated_section(
                 &mcu.name,
+                mux_chip(mcu),
                 &all,
                 &mcu.clock,
                 &mcu.watchdog_and_custom_inits(),
@@ -686,6 +687,7 @@ impl FamilyBackend for WbaBackend {
         let all = pins_of(mcu);
         let section = wba::make_generated_section(
             &mcu.name,
+            mux_chip(mcu),
             &all,
             &mcu.clock,
             &mcu.watchdog_and_custom_inits(),
@@ -923,11 +925,25 @@ fn async_periphs(mcu: &Mcu) -> embassy_stm32::AsyncPeriphs {
 /// [`rcc::for_dual_core`]). The id first, the display name for a form whose id
 /// is not a part number.
 fn stm32_clock_block(mcu: &Mcu) -> String {
-    let block = rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, mcu.clock_manual);
+    let block =
+        rcc::graph_clock_block_for(mux_chip(mcu), &mcu.family, &mcu.clock, mcu.clock_manual);
     match dual_core_feature(mcu) {
         Some(feature) => rcc::for_dual_core(&block, &feature),
         None => block,
     }
+}
+
+/// The part the clock block's per-part lookups key on (the RCC version, and
+/// the selectors this part lacks): the dependency line's chip feature first -
+/// the part the build is for, whatever the form's id says (`sensor_node`) -
+/// then the id, then the display name; the first the RCC table knows.
+fn mux_chip(mcu: &Mcu) -> &str {
+    mcu.hal_feature
+        .as_deref()
+        .into_iter()
+        .chain([mcu.id.as_str(), mcu.name.as_str()])
+        .find(|n| super::rcc_mux::rcc_version(n).is_some())
+        .unwrap_or(&mcu.id)
 }
 
 /// The per-core chip feature of `mcu`, if it is a dual-core part.
@@ -2255,6 +2271,27 @@ mod dual_core_tests {
         mcu.clock = ClockConfig::None;
         mcu.clock_manual = true;
         mcu
+    }
+
+    /// The clock selectors are looked up for the part the build is for: the
+    /// dependency line's chip over a free-text id, then the id, then the name.
+    /// A WBA62 renamed `sensor_node` still loses the SPI2 selector it lacks.
+    #[test]
+    fn the_mux_lookup_keys_on_the_part_being_built() {
+        let mut mcu = mcu_for("sensor_node", "my board", "stm32wba", Runtime::Async);
+        mcu.hal_feature = Some("stm32wba62cg".into());
+        assert_eq!(mux_chip(&mcu), "stm32wba62cg");
+        assert!(super::super::rcc_mux::lacks(mux_chip(&mcu)).contains(&"spi2sel"));
+        // No line: the id when it is a part number, else the display name.
+        mcu.hal_feature = None;
+        mcu.id = "stm32wba62cgux".into();
+        assert_eq!(mux_chip(&mcu), "stm32wba62cgux");
+        mcu.id = "sensor_node".into();
+        mcu.name = "STM32WBA62CGUx".into();
+        assert_eq!(mux_chip(&mcu), "STM32WBA62CGUx");
+        // Nothing the table knows: the id, as before.
+        mcu.name = "my board".into();
+        assert_eq!(mux_chip(&mcu), "sensor_node");
     }
 
     /// The line decides, not the names: a WL55 renamed to a board name keeps

@@ -145,6 +145,81 @@ pub(crate) fn check_or_write(rel: &str, harvested: &str) {
     );
 }
 
+// ── cargo check ──────────────────────────────────────────────────────────────
+
+/// The `main.rs` of a check crate: `body` after the bare minimum a `no_std`
+/// binary needs.
+pub(crate) fn check_main(body: &str) -> String {
+    format!(
+        "#![no_std]\n#![no_main]\n\n#[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! {{\n    loop {{}}\n}}\n\n{body}"
+    )
+}
+
+/// `cargo check` of one throw-away crate, `<work>\crates\<name>`, for
+/// `target`: `dependency` is its one `[dependencies]` line (the HAL), `main` its
+/// `main.rs`. Every crate shares `<work>\target`, so 40-odd chips build the
+/// common dependencies once; `lock` seeds a Cargo.lock so they also resolve
+/// once. `Err` holds the error lines.
+///
+/// The compiler is the only oracle for the names this IDE writes into a HAL it
+/// does not own: a field, an enum, a variant embassy-stm32 really has.
+pub(crate) fn cargo_check_crate(
+    work: &Path,
+    name: &str,
+    dependency: &str,
+    target: &str,
+    main: &str,
+    lock: Option<&Path>,
+) -> Result<(), Vec<String>> {
+    // Absolute: cargo runs in the crate and would read a relative
+    // CARGO_TARGET_DIR from there - a target per crate.
+    let work = std::path::absolute(work).expect("a folder path");
+    let krate = work.join("crates").join(name);
+    std::fs::create_dir_all(krate.join("src")).expect("the crate folder");
+    let manifest = format!(
+        "[package]\nname = \"clockcheck\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{dependency}\n\n[workspace]\n"
+    );
+    std::fs::write(krate.join("Cargo.toml"), manifest).expect("writable");
+    if let Some(lock) = lock
+        && !krate.join("Cargo.lock").exists()
+    {
+        std::fs::copy(lock, krate.join("Cargo.lock")).expect("the seed lock");
+    }
+    std::fs::write(krate.join("src").join("main.rs"), main).expect("writable");
+    let mut cargo = std::process::Command::new("cargo");
+    cargo
+        .args([
+            "check",
+            "--quiet",
+            "--target",
+            target,
+            "--message-format",
+            "short",
+        ])
+        .current_dir(&krate)
+        .env("CARGO_TARGET_DIR", work.join("target"))
+        .env("CARGO_HTTP_MULTIPLEXING", "false")
+        // What this test run carries that the crate must not inherit: a
+        // pinned toolchain, a build target, and the IDE's own features
+        // (rtic-macros counts them).
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO_BUILD_TARGET");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("CARGO_FEATURE_") {
+            cargo.env_remove(key);
+        }
+    }
+    let out = cargo.output().expect("cargo runs");
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.contains(": error") || l.starts_with("error"))
+        .map(str::to_owned)
+        .collect())
+}
+
 // ── metapac's metadata.rs ────────────────────────────────────────────────────
 
 /// The chip's own name, the first `name: "…"` of its metadata.rs

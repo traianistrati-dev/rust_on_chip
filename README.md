@@ -753,15 +753,17 @@ builds against, as the local cargo registry holds them: the flash geometry
 (`stm32_memory_map.rs`), the chip features embassy-stm32 publishes
 (`stm32_embassy_features.rs`), and the clock mux selectors
 (`codegen/rcc_mux_data.rs`). Each has an ignored test that harvests the crate
-again; with `EIDE_REGEN=1` the same test rewrites the file. For the first three
-the check is the committed file, byte for byte. The clock mux table is not the
-harvest yet: the script that first wrote it dropped 50 selectors (its pattern
-ran from a field with no enum into the next field's), so its test checks that
-the committed selectors and routing rules are metapac's and that exactly those
-50 are missing. Regenerating it adds them, which changes what the Clock tab can
-emit on those parts. A missing crate fails the test rather than skipping it.
-Run them by exact name - a module filter would also run the other ignored
-tests under it:
+again and compares it with the committed file, byte for byte; with
+`EIDE_REGEN=1` the same test rewrites the file. A missing crate fails the test
+rather than skipping it. (When these tests replaced the Python scripts, the
+clock mux table gained 49 selectors the old harvester's pattern had dropped -
+the C0's USART1SEL, the H7's LPUART1SEL, most RTCSELs - and lost 34 that
+embassy-stm32 has no `config.rcc.mux` field for: it only builds that struct
+from peripherals with a register block, which metapac's DFSDM, SWPMI, ADF and
+MDF do not have. It also learned, per part, which of its RCC version's
+selectors a part lacks - an STM32L010 has no USART1, though its CubeMX tree,
+the L0 line's, has the USART1 mux.) Run them by exact name - a module filter
+would also run the other ignored tests under it:
 
 ```powershell
 cargo test -- --ignored --exact panels::mcu_module::stm32_harvest::the_memory_map_matches_metapac
@@ -771,9 +773,13 @@ $env:EIDE_REGEN = "1"   # then the same command rewrites the table
 The others are `the_flash_geometry_matches_metapac`,
 `the_embassy_feature_list_matches_the_registry` (same module) and
 `panels::mcu_module::codegen::rcc_mux_harvest::the_rcc_mux_table_matches_metapac`.
-The clock sweep `every_vendor_tree_names_a_source_it_turns_on` also takes
-`EIDE_CLOCK_CHECK=<dir>`, which `cargo check`s the generated clock blocks of two
-parts per family against embassy-stm32.
+Two more go further and compile what the IDE writes against embassy-stm32, each
+in a folder you give it (a few GB of build output: keep it off the repo):
+`rcc_mux_harvest::every_mux_selector_compiles_against_embassy` with
+`EIDE_MUX_CHECK=<dir>` assigns every variant of every selector in the table on
+a part that has it, and the clock sweep `every_vendor_tree_names_a_source_it_turns_on`
+with `EIDE_CLOCK_CHECK=<dir>` checks the generated clock blocks of two parts per
+family.
 
 ### Checking that the generated code builds
 

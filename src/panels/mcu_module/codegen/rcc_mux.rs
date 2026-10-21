@@ -75,7 +75,11 @@ pub fn rcc_version(chip: &str) -> Option<&'static str> {
 /// answers for families whose chips all share one version. An unknown chip in
 /// an ambiguous family gets nothing, which costs a missing line rather than a
 /// wrong one.
-pub fn fields_for_chip(chip: &str, family: &str) -> &'static [MuxField] {
+///
+/// A version's table is every one of its chips' selectors, so the ones THIS
+/// part lacks are taken out ([`lacks`]): its CubeMX tree is the whole line's
+/// and may carry a mux for a peripheral the part does not have.
+pub fn fields_for_chip(chip: &str, family: &str) -> Vec<&'static MuxField> {
     let version = rcc_version(chip).or_else(|| {
         super::rcc_mux_data::FAMILY_RCC
             .iter()
@@ -83,17 +87,34 @@ pub fn fields_for_chip(chip: &str, family: &str) -> &'static [MuxField] {
             .map(|(_, v)| *v)
     });
     let Some(version) = version else {
-        return &[];
+        return Vec::new();
     };
+    let lacks = lacks(chip);
     super::rcc_mux_data::VERSIONS
         .iter()
         .find(|(v, _)| *v == version)
         .map(|(_, fields)| *fields)
         .unwrap_or(&[])
+        .iter()
+        .filter(|f| !lacks.contains(&f.field))
+        .collect()
+}
+
+/// The selectors of its RCC version a part does not have - an STM32L010's
+/// `usart1sel`: no USART1, so no field in embassy's `config.rcc.mux`. By
+/// prefix, longest match first, as [`rcc_version`].
+pub fn lacks(chip: &str) -> &'static [&'static str] {
+    let chip = chip.to_ascii_lowercase();
+    super::rcc_mux_data::CHIP_LACKS
+        .iter()
+        .filter(|(prefix, _)| chip.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, fields)| *fields)
+        .unwrap_or(&[])
 }
 
 /// The selectors a family can emit with no part number to go on.
-pub fn fields_for(family: &str) -> &'static [MuxField] {
+pub fn fields_for(family: &str) -> Vec<&'static MuxField> {
     fields_for_chip("", family)
 }
 
@@ -259,18 +280,63 @@ pub fn variant_of(graph: &ClockGraph, bound: &Bound) -> Option<&'static str> {
 /// every selector still on its reset value — a project that has not chosen a
 /// peripheral clock gets no line for it, so the generated block stays as small
 /// as what the user actually configured.
+///
+/// Two more are left out, lines that would compile and still be wrong (a
+/// missing line keeps the reset clock - see the module docs):
+///
+/// - `rtcsel`: embassy sets the RTC source from `config.rcc.ls`, before it
+///   applies `config.rcc.mux`, and RTCSEL holds until a backup-domain reset,
+///   so the mux line would do nothing;
+/// - a source the firmware does not run ([`source_not_running`]): the
+///   peripheral would panic on its first frequency query.
 pub fn emit_lines(graph: &ClockGraph, chip: &str, family: &str) -> Vec<String> {
     let mut out = Vec::new();
     for bound in propose(graph, chip, family) {
+        if bound.field.field == "rtcsel" {
+            continue;
+        }
         let Some(variant) = variant_of(graph, &bound) else {
             continue;
         };
+        if source_not_running(family, variant) {
+            continue;
+        }
         out.push(format!(
             "        config.rcc.mux.{} = rcc::mux::{}::{variant};",
             bound.field.field, bound.field.enum_name
         ));
     }
     out
+}
+
+/// A low-speed source the generated firmware does not have running on
+/// `family`: a peripheral muxed to it compiles, then panics in embassy's
+/// `frequency()` ("configured to use the 'lse' clock, which is not running").
+///
+/// - LSE: no generated block writes `config.rcc.ls`, so it never starts.
+/// - LSI: it runs by default, but embassy-stm32 0.6 reports it only on the
+///   families of `rcc/l.rs` (L0, L1, L4, L5, WB, WL, U0), `u3.rs`, `u5.rs`
+///   and `wba.rs`; `c0`, `g0`, `g4`, `h.rs` (H5, H7) and the F families
+///   pass `lsi: None`.
+fn source_not_running(family: &str, variant: &str) -> bool {
+    match variant {
+        "LSE" => true,
+        "LSI" => !matches!(
+            family,
+            "stm32l0"
+                | "stm32l1"
+                | "stm32l4"
+                | "stm32l4+"
+                | "stm32l5"
+                | "stm32wb"
+                | "stm32wl"
+                | "stm32u0"
+                | "stm32u3"
+                | "stm32u5"
+                | "stm32wba"
+        ),
+        _ => false,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -356,9 +422,46 @@ mod tests {
         ] {
             let fields = fields_for_chip(chip, family);
             // How MANY a family exposes is the vendor's business — L5 declares
-            // only `adcsel` and `clk48sel` as kernel-clock muxes, and that is
-            // the right answer for L5, not a gap to paper over.
+            // only four kernel-clock muxes (`adcsel`, `clk48sel`, `fdcansel`,
+            // `rtcsel`), and that is the right answer for L5, not a gap to
+            // paper over.
             assert!(!fields.is_empty(), "{chip} has no selectors at all");
+        }
+    }
+
+    /// A part keeps only the selectors it has: the L010 has no USART1, while
+    /// the L071 on the same RCC version does - and the CubeMX tree of either
+    /// carries the L0 line's USART1 mux.
+    #[test]
+    fn a_part_does_not_get_a_selector_it_lacks() {
+        let has = |chip: &str, field: &str| {
+            fields_for_chip(chip, "stm32l0")
+                .iter()
+                .any(|f| f.field == field)
+        };
+        assert_eq!(rcc_version("stm32l010c6tx"), rcc_version("stm32l071c8tx"));
+        assert!(has("stm32l071c8tx", "usart1sel"));
+        assert!(
+            !has("stm32l010c6tx", "usart1sel"),
+            "{:?}",
+            lacks("stm32l010c6tx")
+        );
+        assert!(has("stm32l010c6tx", "usart2sel"), "only what it lacks goes");
+        // Every entry names selectors of the version its prefix is on.
+        for (prefix, fields) in super::super::rcc_mux_data::CHIP_LACKS {
+            assert!(!fields.is_empty(), "{prefix}: an empty entry is no entry");
+            let version = rcc_version(prefix).unwrap_or_else(|| panic!("{prefix}: no version"));
+            let table = super::super::rcc_mux_data::VERSIONS
+                .iter()
+                .find(|(v, _)| *v == version)
+                .map(|(_, f)| *f)
+                .unwrap_or(&[]);
+            for f in *fields {
+                assert!(
+                    table.iter().any(|t| t.field == *f),
+                    "{prefix}: {f} is not {version}'s"
+                );
+            }
         }
     }
 
@@ -383,7 +486,11 @@ mod tests {
             }
         }
         assert_eq!(families, 35, "one table per RCC version that has selectors");
-        assert_eq!(selectors, 477, "the table is the harvest, unedited");
+        // 477 until 2026-10-21: the first harvester's pattern had dropped 49
+        // (C0 USART1SEL, H7 LPUART1SEL, the RTCSELs...) and kept 34 embassy
+        // has no field for (DFSDM, SWPMI, ADF, MDF, most of the N6) - see
+        // `rcc_mux_harvest`.
+        assert_eq!(selectors, 492, "the table is the harvest, unedited");
 
         // The case that proves the table is not a rule: field != enum.
         let wba = fields_for("stm32wba");
@@ -449,6 +556,57 @@ mod tests {
             println!("{l}");
         }
         assert!(!lines.is_empty(), "the tree's selections emit something");
+    }
+
+    /// Lines that would compile and be wrong are not written: never `rtcsel`
+    /// (embassy takes the RTC source from `config.rcc.ls`), never a source
+    /// the firmware does not run. Moved onto its LSE input, a selector that
+    /// emits a line on PCLK emits none; LSI depends on whether embassy
+    /// reports it on the family.
+    #[test]
+    fn no_line_runs_a_peripheral_off_a_clock_that_is_not_running() {
+        use crate::panels::mcu_module::clock::graph::parse_clock_ron;
+
+        let ron = include_str!("../../../../assets/mcus/examples/stm32wba55_graphclock.ron");
+        let gc = parse_clock_ron(ron).expect("the shipped tree parses");
+        let chip = "stm32wba55cgux";
+        let lines = emit_lines(&gc.graph, chip, "stm32wba");
+        assert!(lines.iter().all(|l| !l.contains("rtcsel")), "{lines:#?}");
+
+        // Every bound selector that can take the LSE, moved onto it.
+        let mut moved = 0;
+        for bound in propose(&gc.graph, chip, "stm32wba") {
+            let Some(input) = gc
+                .graph
+                .edges
+                .iter()
+                .find(|e| e.to == bound.node && same_clock(&e.from, "LSE"))
+            else {
+                continue;
+            };
+            let mut g = gc.graph.clone();
+            g.node_mut(&bound.node).expect("the bound node").state = NodeState::Index(input.input);
+            let field = format!("config.rcc.mux.{} ", bound.field.field);
+            assert!(
+                !emit_lines(&g, chip, "stm32wba")
+                    .iter()
+                    .any(|l| l.contains(&field)),
+                "{} on LSE",
+                bound.field.field
+            );
+            moved += 1;
+        }
+        assert!(
+            moved > 0,
+            "the WBA tree has selectors that can take the LSE"
+        );
+
+        assert!(source_not_running("stm32g0", "LSI"));
+        assert!(source_not_running("stm32h7", "LSI"));
+        assert!(!source_not_running("stm32l4", "LSI"));
+        assert!(!source_not_running("stm32wba", "LSI"));
+        assert!(source_not_running("stm32l4", "LSE"));
+        assert!(!source_not_running("stm32g0", "PCLK1"));
     }
 
     /// Values are carried, not assumed to be 0-based.

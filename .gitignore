@@ -7,3 +7,6 @@ Cargo.lock
 # Per-clone choice of where the codegen matrix writes its projects.
 # A path, not a setting: see scripts/verify-codegen.ps1 -WorkDir.
 scripts/matrix-dir.txt
+
+# Python bytecode, written next to scripts/*.py whenever one runs.
+__pycache__/

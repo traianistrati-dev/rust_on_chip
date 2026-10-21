@@ -57,6 +57,14 @@ mod i2s;
 mod irqs;
 mod ospi;
 mod pwm;
+
+/// The timer `time-driver-any` takes on this chip - [`pwm::time_driver_timer`]
+/// for the Clock tab, which checks embassy-time can run on it.
+pub fn time_driver_timer_of(
+    pins: &[&crate::panels::mcu_module::pins::logic::pin::Pin],
+) -> Option<u8> {
+    pwm::time_driver_timer(pins)
+}
 mod qspi;
 mod sai;
 mod sdmmc;

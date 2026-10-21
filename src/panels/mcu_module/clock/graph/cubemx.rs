@@ -749,6 +749,27 @@ mod chip_import_tests {
         // And the payoff: that tree generates real clock code, via the generic
         // recipe, on a family with no RCC recipe of its own.
         assert!(!generates_clock_code(&family), "still no family recipe");
+        // Not at its default: SYSCLK is HSI through HSIDIV /2, a divider no
+        // emitter writes (embassy would run the HSI undivided), so that is the
+        // skeleton. With HSIDIV at /1 it is plain HSI.
+        let at_default = ClockConfig::Graph(gc.clone());
+        assert!(!generates_clock_code_for(&family, &at_default));
+        assert!(
+            graph_clock_block(&family, &at_default, false).contains("not write (MSI, CSI, HSI48"),
+            "the skeleton names why"
+        );
+        let mut gc = gc;
+        let hsidiv = gc
+            .bindings
+            .get("hsi")
+            .cloned()
+            .expect("HSIDIV is bound as hsi");
+        let node = gc.graph.node_mut(&hsidiv).expect("the HSIDIV node");
+        let NodeKind::Divider { options } = &node.kind else {
+            panic!("HSIDIV is a divider: {:?}", node.kind)
+        };
+        let by_one = options.iter().position(|d| *d == 1).expect("a /1 option");
+        node.state = NodeState::Index(by_one);
         let clock = ClockConfig::Graph(gc);
         assert!(
             generates_clock_code_for(&family, &clock),

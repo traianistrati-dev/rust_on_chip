@@ -323,6 +323,11 @@ pub struct McuDefinition {
     /// existed still parses; those fall back to the `memory.x` size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sram_kb: Option<u32>,
+    /// The same for FLASH: the vendor's total, set when memory.x links less
+    /// of it (a bank past a gap, a dual-core H7's bank 2), so the chip
+    /// catalogue and its filter go on seeing the part's flash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash_kb: Option<u32>,
     /// DMA channels + whether they are muxed. See [`DmaDef`].
     #[serde(default)]
     pub dma: Option<DmaDef>,
@@ -403,6 +408,13 @@ impl McuDefinition {
         mcu.board_chip = self.board_chip.clone();
         mcu.board_flash = crate::size::parse_ld_number(&self.project.flash_size)
             .and_then(|b| u32::try_from(b).ok());
+        mcu.hal_feature = crate::panels::mcu_module::stm32_pin_data::embassy_feature_in(
+            self.project
+                .hal_dep_async
+                .as_deref()
+                .unwrap_or(&self.project.hal_dep),
+        )
+        .map(str::to_owned);
         mcu.usart_ip = self.usart_ip.clone();
         mcu.sdmmc_ip = self.sdmmc_ip.clone();
         mcu.grid = self.pins.grid.as_ref().map(|g| PinGrid {
@@ -424,7 +436,9 @@ impl McuDefinition {
         // a tree the generic recipe can read generates real code, so defaulting
         // it to "hand-written" would fence off a block nobody wrote and freeze
         // it there. A project's own `@clockmanual` still overrides this later.
-        mcu.clock_manual = !crate::panels::mcu_module::codegen::rcc::generates_clock_code_for(
+        // Whether the tree drives code at SOME selection, not at its vendor
+        // default: an MSI import is the skeleton until HSI or the PLL is picked.
+        mcu.clock_manual = !crate::panels::mcu_module::codegen::rcc::tree_drives_clock_code(
             &mcu.family,
             &mcu.clock,
         );

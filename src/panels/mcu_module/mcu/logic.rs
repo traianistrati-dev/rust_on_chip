@@ -78,6 +78,7 @@ impl Mcu {
             crate::panels::mcu_module::codegen::watchdog_gen::init_lines(
                 &self.watchdog,
                 &self.family,
+                crate::panels::mcu_module::watchdog::wdg_part(self),
                 self.runtime,
             ),
             store,
@@ -137,6 +138,7 @@ impl Mcu {
             // A bare chip until the definition says otherwise.
             board_chip: None,
             board_flash: None,
+            hal_feature: None,
             usart_ip: None,
             sdmmc_ip: None,
             selected_pin: None,

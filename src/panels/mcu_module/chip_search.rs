@@ -23,6 +23,7 @@
 
 use super::chip_filter::{ChipFilter, Metrics, RowMetrics, Verdict};
 use super::chip_sources::{ChipEntry, ChipSource};
+use super::stm32_support::Refusal;
 
 /// Where a hit can be acted on.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -77,6 +78,11 @@ pub struct Hit {
     /// inherits the numbers of the vendor file it shadows, and falls back to
     /// whatever its `memory.x` sizes say when there is no such file.
     pub metrics: RowMetrics,
+    /// Why no project can be built for this part, when none can: the row is
+    /// listed greyed with the reason rather than left out, because a search
+    /// that silently drops a part reads exactly like one that does not know
+    /// it. On a registry row, the reason its re-import is refused.
+    pub refused: Option<Refusal>,
 }
 
 /// A registry entry, as the search needs to see it.
@@ -184,6 +190,9 @@ fn pick_unified(rows: &[Indexed], sources: &[ChipSource]) -> Vec<usize> {
 struct Indexed {
     source: usize,
     entry: ChipEntry,
+    /// Judged once, when the catalogue is built: per frame it would be a
+    /// feature derivation for every row of every search.
+    refused: Option<Refusal>,
     /// `stm32f103c8tx` — lowercased once.
     key: String,
     /// The same without the `stm32` prefix, for the way people actually type.
@@ -203,6 +212,11 @@ impl Catalogue {
                     let short = key.strip_prefix("stm32").unwrap_or(&key).to_owned();
                     Indexed {
                         source: ix,
+                        refused: super::stm32_support::refusal(
+                            &entry.family,
+                            &entry.ref_name,
+                            &entry.cores,
+                        ),
                         entry,
                         key,
                         short,
@@ -307,6 +321,10 @@ impl Catalogue {
                 },
                 rank,
                 reimport: None,
+                // A registry row is never refused here: a definition that
+                // cannot build is blocked in New Project, with the reason,
+                // and picking it is how the user gets to read that.
+                refused: None,
                 // Only what the definition itself holds. The dedup below
                 // upgrades this the moment a vendor file for the same part
                 // turns up, which is the usual case — the chip got here by
@@ -380,6 +398,7 @@ impl Catalogue {
                         };
                         if keep {
                             seen.reimport = Some(disk_hit(row, rank, has_clock).origin);
+                            seen.refused = row.refused.clone();
                         }
                         false
                     }
@@ -461,6 +480,7 @@ fn disk_hit(row: &Indexed, rank: u8, has_clock: bool) -> Hit {
         rank,
         reimport: None,
         metrics: RowMetrics::of(&row.entry),
+        refused: row.refused.clone(),
     }
 }
 
@@ -584,6 +604,11 @@ mod tests {
                 let short = key.strip_prefix("stm32").unwrap_or(&key).to_owned();
                 Indexed {
                     source,
+                    refused: super::super::stm32_support::refusal(
+                        &entry.family,
+                        &entry.ref_name,
+                        &entry.cores,
+                    ),
                     entry,
                     key,
                     short,
@@ -830,7 +855,7 @@ mod tests {
         use super::super::chip_sources;
         use super::super::clock::graph::cubemx::graph_for_chip_xml;
         use super::super::clock::model::ClockConfig;
-        use super::super::codegen::rcc::generates_clock_code_for;
+        use super::super::codegen::rcc::tree_drives_clock_code;
 
         let c = Catalogue::build(chip_sources::all_sources());
         if c.sources.is_empty() {
@@ -877,7 +902,7 @@ mod tests {
                 },
                 None => ClockConfig::None,
             };
-            if generates_clock_code_for(family, &clock) {
+            if tree_drives_clock_code(family, &clock) {
                 yes.push(format!(
                     "{family}	{}",
                     parts_of.get(family.as_str()).copied().unwrap_or(0)
@@ -1128,6 +1153,40 @@ KEEPS THE COMMENTED SKELETON ({}):",
     /// This is what two CubeMX folders on one machine actually look like: both
     /// carry the part, and picking by position threw away flash, RAM and the
     /// peripheral table roughly half the time.
+    /// A part no project can be built for is in the list, with its reason,
+    /// and a filter that the part passes still shows it: refused is not
+    /// hidden, and it is not counted among the parts a filter could not judge.
+    #[test]
+    fn a_refused_part_is_listed_not_hidden() {
+        let cat = catalogue(
+            vec![source(SourceKind::CubeMxDb, true)],
+            vec![
+                (0, entry("STM32WL30KBVx", "stm32wl3")),
+                (0, entry("STM32G071CBTx", "stm32g0")),
+                (0, entry("STM32MP157CAAx", "stm32mp1")),
+            ],
+        );
+        let (hits, total) = find(&cat, "wl30", &[], 10);
+        assert_eq!(total, 1);
+        assert!(
+            matches!(&hits[0].refused, Some(Refusal::NoHal { feature, .. }) if feature == "stm32wl30kb"),
+            "{:?}",
+            hits[0].refused
+        );
+        let (hits, _) = find(&cat, "g071", &[], 10);
+        assert_eq!(hits[0].refused, None);
+        let (hits, _) = find(&cat, "mp157", &[], 10);
+        assert!(matches!(hits[0].refused, Some(Refusal::CortexA { .. })));
+
+        // The fixture's core, so the part passes the filter.
+        let mut filter = ChipFilter::default();
+        filter.cores.insert("Arm Cortex-M3".to_owned());
+        let r = cat.search("wl30", &[], &filter, 10);
+        assert_eq!(r.hits.len(), 1, "a filter it passes does not hide it");
+        assert!(r.hits[0].refused.is_some());
+        assert_eq!(r.unknown, 0);
+    }
+
     #[test]
     fn a_part_in_two_sources_is_one_part_and_keeps_the_better_copy() {
         let thin = ChipEntry {

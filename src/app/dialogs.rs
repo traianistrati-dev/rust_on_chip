@@ -755,6 +755,8 @@ impl AppIde {
         // on the UI thread) the verdict is `Unverified`, which is its own line —
         // "we could not check" and "it is fine" are different answers.
         let mut gap_chips: Vec<String> = Vec::new();
+        // Parts refused because nothing can be built for them, with the reason.
+        let mut refused_chips: Vec<String> = Vec::new();
         // The supporting-file caches, now owned by one struct so the routine
         // that uses them can live outside this method.
         let mut caches = ImportCaches::default();
@@ -778,11 +780,18 @@ impl AppIde {
                 clock_err.get_or_insert(e);
             }
             clocks += made.clocks;
+            refused_chips.extend(made.refused);
             for e in made.errors {
                 skipped += 1;
                 first_err.get_or_insert(e);
             }
             for def in made.defs {
+                // Already refused per part above; asked again of the definition,
+                // the question every route into the registry asks.
+                if let Some(r) = crate::panels::mcu_module::stm32_support::refusal_for_def(&def) {
+                    refused_chips.push(format!("{} - {}", def.display_name, r.reason()));
+                    continue;
+                }
                 let hal = match stm32_pin_data::embassy_feature_in(&def.project.hal_dep) {
                     Some(feat) => {
                         let known = embassy_features.get_or_insert_with(|| {
@@ -804,7 +813,7 @@ impl AppIde {
                 // gap would be a false alarm on the family that works best.
                 let gaps = chip_gaps(
                     &hal,
-                    crate::panels::mcu_module::codegen::rcc::generates_clock_code_for(
+                    crate::panels::mcu_module::codegen::rcc::tree_drives_clock_code(
                         &def.family,
                         &def.clock.to_config(&def.clock_limits),
                     ),
@@ -818,6 +827,8 @@ impl AppIde {
                     Ok(_) => {
                         last_id = Some(def.id.clone());
                         registry::merge_def(&mut self.mcu_registry, def);
+                        // The New Project gaps were worked out for the old copy.
+                        self.new_project_gaps = None;
                         saved += 1;
                     }
                     Err(e) => {
@@ -888,6 +899,39 @@ impl AppIde {
                     stm32_pin_data::EMBASSY_VERSION,
                 ));
             }
+            if !refused_chips.is_empty() {
+                let shown: Vec<&str> = refused_chips.iter().take(3).map(String::as_str).collect();
+                msg.push_str(&format!(
+                    "\n{}  {} part(s) refused - no project for them would build: {}{}",
+                    ph::WARNING,
+                    refused_chips.len(),
+                    shown.join(" | "),
+                    if refused_chips.len() > shown.len() {
+                        " | …"
+                    } else {
+                        ""
+                    },
+                ));
+            }
+            msg
+        } else if let Some(first) = refused_chips.first() {
+            // Red, not amber: nothing came in. The refusal leads; a file that
+            // could not be read in the same run is still said.
+            let mut msg = format!(
+                "{}  Not imported: {first}{}",
+                ph::X_CIRCLE,
+                match refused_chips.len() {
+                    1 => String::new(),
+                    n => format!(" (and {} more part(s) refused)", n - 1),
+                }
+            );
+            if skipped > 0 {
+                msg.push_str(&format!(
+                    "\n{}  {skipped} skipped{}",
+                    ph::WARNING,
+                    first_err.map(|e| format!(" ({e})")).unwrap_or_default()
+                ));
+            }
             msg
         } else {
             format!(
@@ -896,6 +940,67 @@ impl AppIde {
                 first_err.map(|e| format!(": {e}")).unwrap_or_default()
             )
         });
+    }
+
+    /// Import a `.ron` someone else wrote, through [`registry::import_file`] -
+    /// which refuses a part no project can be built for BEFORE it writes the
+    /// copy - and say what it is missing.
+    ///
+    /// A method of its own so the route scans judge THIS route by what it
+    /// asks: inside the New Project dialog they also saw that dialog's own
+    /// `stm32_support` calls, and would have passed with the refusal gone.
+    pub(super) fn import_ron_definition(&mut self, path: &std::path::Path) {
+        match registry::import_file(path) {
+            Ok(def) => {
+                let id = def.id.clone();
+                let name = def.display_name.clone();
+                let fam = def.family.clone();
+                // Checked here too, though the line came from
+                // someone else's file: whoever wrote it, a chip the
+                // crate does not publish, whose tree makes no clock
+                // code, or that has no DMA channels fails the same
+                // way for the person importing it. "It is their
+                // file" explains where it came from; it does not
+                // help the user whose project will not build.
+                let hal = match stm32_pin_data::embassy_feature_in(&def.project.hal_dep) {
+                    Some(feat) => feature_verdict(
+                        feat,
+                        crate::app::editor_panel::cargo_complete::known_features(
+                            stm32_pin_data::EMBASSY_CRATE,
+                            stm32_pin_data::EMBASSY_VERSION,
+                        )
+                        .as_deref(),
+                    ),
+                    None => FeatureVerdict::Present,
+                };
+                let gaps = chip_gaps(
+                    &hal,
+                    crate::panels::mcu_module::codegen::rcc::tree_drives_clock_code(
+                        &def.family,
+                        &def.clock.to_config(&def.clock_limits),
+                    ),
+                    uses_dma_def(&def.family)
+                        .then(|| def.dma.as_ref().map_or(0, |d| d.channels.len())),
+                );
+                let feat_note = if gaps.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", gaps.join("; "))
+                };
+                registry::merge_def(&mut self.mcu_registry, def);
+                self.new_project_gaps = None;
+                self.pending_mcu_id = Some(id);
+                let note = if codegen::family::backend_for(&fam).is_none() {
+                    format!(" — no codegen backend for '{fam}'")
+                } else {
+                    feat_note
+                };
+                self.mcu_import_status = Some(format!("{}  Imported {name}{note}", ph::CHECK));
+            }
+            Err(e) => {
+                self.mcu_import_status = Some(format!("{}  {e}", ph::WARNING));
+            }
+        }
     }
 
     /// "New Project" confirmation modal — picks a chip and clears all user files.
@@ -1037,10 +1142,18 @@ impl AppIde {
                         // ── Chip selector (driven by the MCU registry) ────────────
                         // (id, display_name) snapshot so the closure doesn't borrow the
                         // registry while mutating `pending_mcu_id`.
+                        // A definition no project can be built for stays listed - it
+                        // got here before the import refused such parts - and says so.
                         let options: Vec<(String, String)> = self
                             .mcu_registry
                             .iter()
-                            .map(|d| (d.id.clone(), d.display_name.clone()))
+                            .map(|d| {
+                                let name = match crate::panels::mcu_module::stm32_support::refusal_for_def(d) {
+                                    Some(_) => format!("{}  (cannot be built)", d.display_name),
+                                    None => d.display_name.clone(),
+                                };
+                                (d.id.clone(), name)
+                            })
                             .collect();
                         let selected_text = match &self.pending_mcu_id {
                             None => "— Empty —".to_string(),
@@ -1094,18 +1207,25 @@ impl AppIde {
                         if !gaps.is_empty() {
                             ui.add_space(3.0);
                             for g in &gaps {
+                                let colour = if g.starts_with(REFUSED_PREFIX) {
+                                    egui::Color32::from_rgb(220, 120, 90)
+                                } else {
+                                    egui::Color32::from_rgb(230, 190, 90)
+                                };
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "    {}  {g}",
                                         ph::ARROW_ELBOW_DOWN_RIGHT
                                     ))
                                     .size(11.0)
-                                    .color(egui::Color32::from_rgb(230, 190, 90)),
+                                    .color(colour),
                                 );
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    if gaps.iter().any(|g| g.starts_with(BACKEND_GAP_PREFIX)) {
+                                    if gaps.iter().any(|g| g.starts_with(REFUSED_PREFIX)) {
+                                        "    Blocked: no project can be created for this part."
+                                    } else if gaps.iter().any(|g| g.starts_with(BACKEND_GAP_PREFIX)) {
                                         "    Not a block: the project is written with an empty main.rs."
                                     } else {
                                         "    Not a block: the rest still generates; these parts come out as comments or TODOs."
@@ -1153,65 +1273,7 @@ impl AppIde {
                                         .set_title("Import MCU definition (.ron)")
                                         .pick_file()
                                     {
-                                        match registry::import_file(&path) {
-                                            Ok(def) => {
-                                                let id = def.id.clone();
-                                                let name = def.display_name.clone();
-                                                let fam = def.family.clone();
-                                                // Checked here too, though the line came from
-                                                // someone else's file: whoever wrote it, a chip the
-                                                // crate does not publish, whose tree makes no clock
-                                                // code, or that has no DMA channels fails the same
-                                                // way for the person importing it. "It is their
-                                                // file" explains where it came from; it does not
-                                                // help the user whose project will not build.
-                                                let hal = match stm32_pin_data::embassy_feature_in(
-                                                    &def.project.hal_dep,
-                                                ) {
-                                                    Some(feat) => feature_verdict(
-                                                        feat,
-                                                        crate::app::editor_panel::cargo_complete::known_features(
-                                                            stm32_pin_data::EMBASSY_CRATE,
-                                                            stm32_pin_data::EMBASSY_VERSION,
-                                                        )
-                                                        .as_deref(),
-                                                    ),
-                                                    None => FeatureVerdict::Present,
-                                                };
-                                                let gaps = chip_gaps(
-                                                    &hal,
-                                                    crate::panels::mcu_module::codegen::rcc::generates_clock_code_for(
-                                                        &def.family,
-                                                        &def.clock.to_config(&def.clock_limits),
-                                                    ),
-                                                    uses_dma_def(&def.family).then(|| {
-                                                        def.dma.as_ref().map_or(0, |d| d.channels.len())
-                                                    }),
-                                                );
-                                                let feat_note = if gaps.is_empty() {
-                                                    String::new()
-                                                } else {
-                                                    format!(" — {}", gaps.join("; "))
-                                                };
-                                                registry::merge_def(&mut self.mcu_registry, def);
-                                                self.pending_mcu_id = Some(id);
-                                                let note = if codegen::family::backend_for(&fam)
-                                                    .is_none()
-                                                {
-                                                    format!(" — no codegen backend for '{fam}'")
-                                                } else {
-                                                    feat_note
-                                                };
-                                                self.mcu_import_status = Some(format!(
-                                                    "{}  Imported {name}{note}",
-                                                    ph::CHECK
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                self.mcu_import_status =
-                                                    Some(format!("{}  {e}", ph::WARNING));
-                                            }
-                                        }
+                                        self.import_ron_definition(&path);
                                     }
                                 }
 
@@ -1326,12 +1388,27 @@ impl AppIde {
                 }
                 ui.separator();
                 ui.add_space(8.0);
+                // A part no project can be built for: greyed, with the reason,
+                // rather than a project that is written and then never builds.
+                let refused = self
+                    .pending_mcu_id
+                    .as_ref()
+                    .and_then(|id| self.mcu_registry.iter().find(|d| &d.id == id))
+                    .and_then(crate::panels::mcu_module::stm32_support::refusal_for_def)
+                    .map(|r| r.reason());
                 ui.horizontal(|ui| {
                     if ui
-                        .button(
-                            egui::RichText::new(format!("{} New Project", ph::NOTE_PENCIL))
-                                .color(egui::Color32::from_rgb(220, 80, 60)),
+                        .add_enabled(
+                            refused.is_none(),
+                            egui::Button::new(
+                                egui::RichText::new(format!("{} New Project", ph::NOTE_PENCIL))
+                                    .color(egui::Color32::from_rgb(220, 80, 60)),
+                            ),
                         )
+                        .on_disabled_hover_text(format!(
+                            "This part cannot be built: {}",
+                            refused.as_deref().unwrap_or_default()
+                        ))
                         .clicked()
                     {
                         // ── Adopt the chosen chip ─────────────────────────
@@ -1625,10 +1702,6 @@ fn every_import_route_decides_about_the_hal_feature() {
             "save_clock_to_definition",
             "re-saves a chip already in the registry; the dep line is untouched",
         ),
-        (
-            "import_wl30_for_real",
-            "a test of the FILE half; the HAL check is the dialog's, and needs the network",
-        ),
         // `show_new_project_dialog` used to be exempt here, importing
         // someone else's `.ron` unchecked. It now checks like the rest —
         // an exemption is a decision, and that one did not survive being
@@ -1661,8 +1734,10 @@ fn every_import_route_decides_about_the_hal_feature() {
             .collect();
 
         for (i, line) in lines.iter().enumerate() {
+            // A quoted one is a scan's own pattern, not a route.
             if !(line.contains("registry::merge_def(")
                 || line.contains("registry::save_definition("))
+                || line.contains("\"registry::")
             {
                 continue;
             }
@@ -1697,6 +1772,88 @@ fn every_import_route_decides_about_the_hal_feature() {
     );
 }
 
+/// Every route that puts a chip definition into the registry must have asked
+/// whether the part can be built at all - or be listed as knowingly exempt.
+///
+/// The same scan as the HAL-feature one above, for the same reason: which
+/// route delegates to which is exactly what reasoning gets wrong. A route may
+/// ask itself (`stm32_support::`) or go through the one callee that refuses
+/// before it writes (`registry::import_file`).
+#[test]
+fn every_import_route_decides_about_support() {
+    const EXEMPT: &[(&str, &str)] = &[
+        (
+            "show_mcu_form_dialog",
+            "the user authored the definition; the form warns, New Project blocks",
+        ),
+        (
+            "save_clock_to_definition",
+            "re-saves a chip already in the registry",
+        ),
+    ];
+    const ASKS: &[&str] = &["stm32_support::", "registry::import_file("];
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app");
+    let mut files = vec![root.join("dialogs.rs"), root.join("mcu_form_dialog.rs")];
+    files.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"));
+
+    let mut unasked: Vec<String> = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let fns: Vec<(usize, String)> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let rest = l.trim_start().split_once("fn ")?.1;
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                (!name.is_empty()).then_some((i, name))
+            })
+            .collect();
+        for (i, line) in lines.iter().enumerate() {
+            // A quoted one is a scan's own pattern, not a route.
+            if !(line.contains("registry::merge_def(")
+                || line.contains("registry::save_definition("))
+                || line.contains("\"registry::")
+            {
+                continue;
+            }
+            let Some((start, name)) = fns.iter().rev().find(|(f, _)| *f < i) else {
+                continue;
+            };
+            if EXEMPT.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let end = fns
+                .iter()
+                .find(|(f, _)| f > start)
+                .map_or(lines.len(), |(f, _)| *f);
+            if !lines[*start..end]
+                .iter()
+                .any(|l| ASKS.iter().any(|a| l.contains(a)))
+            {
+                unasked.push(format!(
+                    "{}:{}  fn {name} stores a definition without asking whether it can be built",
+                    path.file_name().unwrap().to_string_lossy(),
+                    i + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        unasked.is_empty(),
+        "a part no project can be built for can reach the registry.\nAsk \
+         `stm32_support::refusal_for_def`, or add the function to EXEMPT with the \
+         reason:\n{}",
+        unasked.join("\n")
+    );
+}
+
 /// The per-file caches the importer carries across a bulk run.
 ///
 /// 98 GPIO AF tables serve 2240 chips and a DMA table serves a whole family, so
@@ -1718,6 +1875,12 @@ pub(super) struct FileImport {
     pub clock_err: Option<String>,
     /// One line per chip that could not be made, ready for the status line.
     pub errors: Vec<String>,
+    /// One line per part refused because no project can be built for it:
+    /// `STM32MP157CAAx - <reason>`. Not an error - the file was fine.
+    pub refused: Vec<String>,
+    /// Whether the vendor clock tree was read at all - not when every part in
+    /// the file is refused.
+    pub tree_read: bool,
 }
 
 /// Everything the importer knows how to build from ONE vendor XML.
@@ -1734,10 +1897,28 @@ pub(super) fn definitions_from_file(
 ) -> FileImport {
     let mut out = FileImport::default();
 
+    // A file whose every part is refused needs no clock tree: a folder of the
+    // 232 STM32MP files would otherwise read 232 trees for nothing.
+    let every_part_refused = stm32_pin_data::convert_xml(xml).is_ok_and(|chips| {
+        !chips.is_empty()
+            && chips.iter().all(|c| {
+                crate::panels::mcu_module::stm32_support::refusal(
+                    &c.form.family,
+                    &c.form.display_name,
+                    &c.cores,
+                )
+                .is_some()
+            })
+    });
+
     // Once per file: a range file's variants are the same silicon and therefore
     // the same clock tree.
     let mut clock: Option<crate::panels::mcu_module::clock::graph::GraphClock> = None;
-    if let Some(db) = clock_src.and_then(|s| s.db.as_deref()) {
+    if let Some(db) = clock_src
+        .and_then(|s| s.db.as_deref())
+        .filter(|_| !every_part_refused)
+    {
+        out.tree_read = true;
         let family = stm32_pin_data::convert_xml(xml)
             .ok()
             .and_then(|c| c.first().map(|c| c.form.family.clone()))
@@ -1793,6 +1974,17 @@ pub(super) fn definitions_from_file(
         if !errs.is_empty() {
             out.errors
                 .push(format!("{}: {}", chip.form.display_name, errs[0]));
+            continue;
+        }
+        // Refused here, before a definition exists: an import that saved it
+        // with an amber line is how two unbuildable parts got onto this machine.
+        if let Some(r) = crate::panels::mcu_module::stm32_support::refusal(
+            &chip.form.family,
+            &chip.form.display_name,
+            &chip.cores,
+        ) {
+            out.refused
+                .push(format!("{} - {}", chip.form.display_name, r.reason()));
             continue;
         }
         let mut def = chip.form.to_definition();
@@ -1916,14 +2108,30 @@ impl AppIde {
     /// is adopted.
     pub(super) fn pending_chip_gaps(&mut self) -> &[String] {
         let id = self.pending_mcu_id.clone().unwrap_or_default();
-        if self.new_project_gaps.as_ref().map(|(k, _)| k.as_str()) != Some(id.as_str()) {
+        // Keyed on the refusal too: it is asked fresh every frame for the New
+        // Project button, and a definition fixed (or broken) under the same id
+        // must not leave "Blocked" beside an enabled button, or the reverse.
+        let refused = self
+            .mcu_registry
+            .iter()
+            .find(|d| d.id == id)
+            .and_then(crate::panels::mcu_module::stm32_support::refusal_for_def)
+            .map(|r| r.reason())
+            .unwrap_or_default();
+        let key = format!("{id}\n{refused}");
+        if self.new_project_gaps.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
             let gaps = self
                 .mcu_registry
                 .iter()
                 .find(|d| d.id == id)
                 .map(|d| {
+                    // A part no project can be built for says only that: the
+                    // clock and DMA lines would read as if the rest worked.
+                    if let Some(r) = crate::panels::mcu_module::stm32_support::refusal_for_def(d) {
+                        return vec![format!("{REFUSED_PREFIX}: {}", r.reason())];
+                    }
                     let mut gaps = local_chip_gaps(
-                        codegen::rcc::generates_clock_code_for(
+                        codegen::rcc::tree_drives_clock_code(
                             &d.family,
                             &d.clock.to_config(&d.clock_limits),
                         ),
@@ -1936,7 +2144,7 @@ impl AppIde {
                     gaps
                 })
                 .unwrap_or_default();
-            self.new_project_gaps = Some((id, gaps));
+            self.new_project_gaps = Some((key, gaps));
         }
         self.new_project_gaps
             .as_ref()
@@ -1956,7 +2164,27 @@ impl AppIde {
     }
 
     /// The `embassy-stm32` feature of the line the project BUILDS with, if any.
+    /// The open project's `[dependencies]` line naming an embassy-stm32 chip
+    /// feature - what the project REALLY builds with, a user's fix that
+    /// `keep_user_dep_edits` kept included.
+    pub(super) fn manifest_hal_line(&self) -> Option<&str> {
+        self.cargo_toml
+            .lines()
+            .skip_while(|l| l.trim() != "[dependencies]")
+            .skip(1)
+            .take_while(|l| !l.trim_start().starts_with('['))
+            .find(|l| stm32_pin_data::embassy_feature_in(l).is_some())
+    }
+
     fn hal_feature_now(&self) -> Option<String> {
+        // The manifest's own line first: the definition's may be one the user
+        // has since corrected in Cargo.toml.
+        if let Some(f) = self
+            .manifest_hal_line()
+            .and_then(stm32_pin_data::embassy_feature_in)
+        {
+            return Some(f.to_owned());
+        }
         let mcu = self.mcu.as_ref()?;
         let def = self.mcu_registry.iter().find(|d| d.id == mcu.id)?;
         let line = crate::panels::mcu_module::mcu_def::build_cfg(def, Some(mcu)).hal_dep;
@@ -2030,6 +2258,10 @@ pub(super) fn backend_gap(family: &str) -> Option<String> {
 /// closing line from "the rest still generates" to "main.rs is empty".
 pub(super) const BACKEND_GAP_PREFIX: &str = "no code generator";
 
+/// How the one gap that blocks starts: a part no project can be built for
+/// (`stm32_support::refusal_for_def`). Both dialogs close on "blocked" for it.
+pub(super) const REFUSED_PREFIX: &str = "cannot be built";
+
 #[cfg(test)]
 mod backend_gap_tests {
     use super::*;
@@ -2059,13 +2291,15 @@ mod real_import_tests {
     /// `definitions_from_file` existing: until it was pulled out of the dialog
     /// method, nothing about importing a chip could be run without a window.
     ///
-    /// Writes to the user's chip registry, so it is `#[ignore]`d:
+    /// embassy-stm32 publishes no STM32WL3 chip, so the import REFUSES it now,
+    /// with the reason; until then it saved the definition with an amber line.
+    /// Needs a chip source with clock trees, so it is `#[ignore]`d:
     ///
     /// ```text
     /// cargo test --bin rust_on_chip import_wl30_for_real -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "writes a definition into the user's chip registry"]
+    #[ignore = "needs a chip source with clock trees"]
     fn import_wl30_for_real() {
         use crate::panels::mcu_module::chip_sources;
 
@@ -2086,37 +2320,38 @@ mod real_import_tests {
         let mut caches = ImportCaches::default();
         let made = definitions_from_file(&path, &xml, Some(&src), &mut caches);
         println!(
-            "from {}: {} definition(s), {} with a clock tree, {} unbound id(s), errors={:?}",
+            "from {}: {} definition(s), {} refused, {} with a clock tree, errors={:?}",
             src.chips.display(),
             made.defs.len(),
+            made.refused.len(),
             made.clocks,
-            made.unbound.len(),
             made.errors
         );
         assert!(made.errors.is_empty(), "{:?}", made.errors);
-        assert_eq!(made.defs.len(), 1, "one part in this file");
-
-        let def = &made.defs[0];
-        let channels = def.dma.as_ref().map_or(0, |d| d.channels.len());
-        println!(
-            "  {} family={} dma_channels={} irq_vectors={} clock={}",
-            def.display_name,
-            def.family,
-            channels,
-            def.irq_vectors.len(),
-            matches!(
-                def.clock,
-                crate::panels::mcu_module::mcu_def::ClockDef::Graph(_)
-            )
+        assert!(made.defs.is_empty(), "nothing to save");
+        assert_eq!(made.refused.len(), 1, "one part in this file");
+        assert!(
+            made.refused[0].starts_with("STM32WL30KBVx - "),
+            "{}",
+            made.refused[0]
         );
-        // The reason the old stored definition was wrong: it predated the
-        // `parse_value` fix and carried no channels at all.
-        assert!(channels > 0, "the DMA channels must survive the import");
+        assert!(
+            made.refused[0].contains("stm32wl30kb"),
+            "{}",
+            made.refused[0]
+        );
+        assert!(!made.tree_read, "no tree read for a part that is refused");
 
-        match registry::save_definition(def) {
-            Ok(p) => println!("  saved: {p:?}"),
-            Err(e) => panic!("could not save: {e}"),
-        }
+        // Its DMA channels still parse - the reason the old stored definition
+        // was wrong was that it predated the `parse_value` fix.
+        let mut cache = std::collections::HashMap::new();
+        let channels = crate::panels::mcu_module::codegen::dma_data::dma_def_for(
+            &xml,
+            path.parent(),
+            &mut cache,
+        )
+        .map_or(0, |d| d.channels.len());
+        assert!(channels > 0, "the DMA channels must survive the import");
     }
 }
 
@@ -2164,6 +2399,7 @@ mod chip_gaps_tests {
             "src/app/clock_import_dialog.rs",
             "src/app/chip_search_ui.rs",
             "src/app/chip_filter_ui.rs",
+            "src/panels/mcu_module/stm32_support.rs",
         ] {
             let src =
                 std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
@@ -2209,7 +2445,7 @@ mod chip_gaps_tests {
         assert!(all.len() >= 9, "only {} bundled chips?", all.len());
         for d in &all {
             let gaps = local_chip_gaps(
-                crate::panels::mcu_module::codegen::rcc::generates_clock_code_for(
+                crate::panels::mcu_module::codegen::rcc::tree_drives_clock_code(
                     &d.family,
                     &d.clock.to_config(&d.clock_limits),
                 ),
@@ -2242,7 +2478,7 @@ mod chip_gaps_tests {
         for d in builtin_definitions() {
             let fam = &d.family;
             let backend = family::backend_for(fam).is_some();
-            let clock = rcc::generates_clock_code_for(fam, &d.clock.to_config(&d.clock_limits));
+            let clock = rcc::tree_drives_clock_code(fam, &d.clock.to_config(&d.clock_limits));
             let manual = rcc::supports_manual_clock(fam);
             let dma = uses_dma_def(fam);
             let nodes = rcc::codegen_node_ids(fam);
@@ -2984,7 +3220,7 @@ mod chip_gaps_tests {
         use crate::panels::mcu_module::chip_sources;
         use crate::panels::mcu_module::clock::graph::cubemx::graph_for_chip_xml;
         use crate::panels::mcu_module::clock::model::ClockConfig;
-        use crate::panels::mcu_module::codegen::rcc::generates_clock_code_for;
+        use crate::panels::mcu_module::codegen::rcc::tree_drives_clock_code;
         use crate::panels::mcu_module::stm32_pin_data::convert_xml;
 
         let Some(src) = chip_sources::all_sources()
@@ -3002,10 +3238,11 @@ mod chip_gaps_tests {
             .collect();
         let mut cache = std::collections::HashMap::new();
 
-        // (prefix, expected clock code, expected "has DMA channels")
-        for (prefix, want_clock, want_dma) in
-            [("STM32WL30", false, true), ("STM32G071", true, true)]
-        {
+        // (prefix, expected clock code, expected "has DMA channels", refused)
+        for (prefix, want_clock, want_dma, want_refused) in [
+            ("STM32WL30", false, true, true),
+            ("STM32G071", true, true, false),
+        ] {
             let Some(file) = files.iter().find(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -3019,7 +3256,15 @@ mod chip_gaps_tests {
                 panic!("{prefix} is not in the database at {}", src.chips.display());
             };
             let xml = std::fs::read_to_string(file).unwrap();
-            let family = convert_xml(&xml).unwrap()[0].form.family.clone();
+            let chip = convert_xml(&xml).unwrap().remove(0);
+            let family = chip.form.family.clone();
+            let refused = crate::panels::mcu_module::stm32_support::refusal(
+                &family,
+                &chip.form.display_name,
+                &chip.cores,
+            );
+            println!("  refused: {:?}", refused.as_ref().map(|r| r.reason()));
+            assert_eq!(refused.is_some(), want_refused, "{prefix} refusal");
 
             let clock = match graph_for_chip_xml(db, &xml, &family) {
                 Ok((gc, _)) => ClockConfig::Graph(gc),
@@ -3029,7 +3274,7 @@ mod chip_gaps_tests {
                     ClockConfig::None
                 }
             };
-            let has_clock = generates_clock_code_for(&family, &clock);
+            let has_clock = tree_drives_clock_code(&family, &clock);
             let channels = dma_def_channels(&xml, file, &mut cache);
             println!("{prefix} ({family}): clock={has_clock} dma_channels={channels}");
 
@@ -3088,6 +3333,25 @@ mod import_status_colour_tests {
             AMBER,
             "a warning may not read as success"
         );
+    }
+
+    /// Everything refused is red - nothing came in; refusals next to parts
+    /// that did come in are amber, like the gaps.
+    #[test]
+    fn a_refused_import_is_red_and_a_partial_one_amber() {
+        assert_eq!(
+            import_status_colour(&format!(
+                "{}  Not imported: STM32MP157CAAx - an STM32MP1/MP2 is a Cortex-A microprocessor",
+                ph::X_CIRCLE
+            )),
+            RED
+        );
+        let msg = format!(
+            "{}  Imported 2 chip(s) from 3 file(s)\n{}  1 part(s) refused - no project for them would build: STM32WL30KBVx - ...",
+            ph::CHECK,
+            ph::WARNING
+        );
+        assert_eq!(import_status_colour(&msg), AMBER);
     }
 
     #[test]

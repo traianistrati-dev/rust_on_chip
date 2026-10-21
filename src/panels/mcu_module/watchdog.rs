@@ -23,11 +23,13 @@
 //!
 //! * **LSI** — the IWDG's clock — is 40 kHz on F0/F1/F3 and 32 kHz everywhere
 //!   else (embassy `rcc/bd.rs`).
-//! * **IWDG prescaler** tops out at 256, except on `iwdg_v3` (H5/U5/WBA) where
-//!   it reaches 1024.
+//! * **IWDG prescaler** tops out at 256 - on every chip, including the
+//!   `iwdg_v3` ones (H5/U5/WBA) whose silicon reaches 1024. embassy-stm32 0.6
+//!   searches /4../256 only (`wdg/mod.rs`), so on those a longer period is not
+//!   a longer timeout but the `unwrap!` at boot.
 //! * **WWDG prescaler** tops out at 8 on `wwdg_v1` and 128 on `wwdg_v2`. v1
-//!   covers F1/F2/F3/F4/F7 **and L4**, which is the one that would have been
-//!   guessed wrong.
+//!   covers F0/F1/F2/F3/F4/F7, L0/L1 **and L4**, which is the one that would
+//!   have been guessed wrong.
 
 use serde::{Deserialize, Serialize};
 
@@ -131,14 +133,14 @@ pub fn limits_for(
             "stm32f0" | "stm32f1" | "stm32f3" => 40_000,
             _ => 32_000,
         },
-        // `iwdg_v3` — H5, U5, WBA — reaches /1024.
-        iwdg_max_prescaler: match family {
-            "stm32h5" | "stm32u5" | "stm32wba" => 1024,
-            _ => 256,
-        },
-        // `wwdg_v2` reaches /128. Note L4 is v1, unlike its neighbours.
+        // /256 everywhere: the driver's search stops there even where the
+        // silicon (`iwdg_v3` - H5, U5, WBA) goes on to /1024.
+        iwdg_max_prescaler: 256,
+        // `wwdg_v2` reaches /128, per stm32-metapac 21. Note L4 is v1, unlike
+        // its neighbours.
         wwdg_max_prescaler: match family {
-            "stm32g0" | "stm32g4" | "stm32c0" | "stm32h5" | "stm32u5" | "stm32wba" => 128,
+            "stm32c0" | "stm32g0" | "stm32g4" | "stm32h5" | "stm32h7" | "stm32l5" | "stm32n6"
+            | "stm32u0" | "stm32u3" | "stm32u5" | "stm32wb" | "stm32wba" | "stm32wl" => 128,
             _ => 8,
         },
         wwdg_available: wwdg_supported(family, runtime),
@@ -151,10 +153,75 @@ pub fn limits_for(
     }
 }
 
+/// The embassy-stm32 names of a part's two watchdogs, and the clock its WWDG
+/// counts.
+///
+/// Every STM32H7 but the H7R/S keeps its watchdogs in the D1 domain under names
+/// of their own, `IWDG1` and `WWDG1`, and that WWDG counts PCLK3; every other
+/// part has `IWDG` / `WWDG` on PCLK1. Checked against all 1533 stm32-metapac 21
+/// chips and the 2389 CubeMX parts that have one. A dual-core H7 is built for
+/// its Cortex-M7, which owns IWDG1 / WWDG1.
+///
+/// A rule on the part rather than a field in the definition, so the `.ron`
+/// files already on disk and the name-only imports get it as well. The family
+/// key cannot tell an H7R/S from an H7 - both CubeMX files say `STM32H7` - so
+/// the part number does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stm32Wdg {
+    /// The independent watchdog's singleton: `p.IWDG`, or `p.IWDG1`.
+    pub iwdg: &'static str,
+    /// The window watchdog's.
+    pub wwdg: &'static str,
+    /// The bus clock the WWDG counts, as the built-in clock graphs name it.
+    pub wwdg_bus: &'static str,
+}
+
+impl Stm32Wdg {
+    /// The bus as ST's documents write it, for the texts.
+    pub fn bus_label(&self) -> &'static str {
+        match self.wwdg_bus {
+            "pclk3" => "PCLK3",
+            _ => "PCLK1",
+        }
+    }
+}
+
+/// The part [`stm32_wdg`] decides on for `mcu`: the embassy chip feature its
+/// dependency line names - what the project compiles with - else its name or
+/// id. A board named `NUCLEO-H7S3L8` is an H7S by its line, whatever its name.
+pub fn wdg_part(mcu: &crate::panels::mcu_module::mcu::Mcu) -> &str {
+    mcu.hal_feature
+        .as_deref()
+        .unwrap_or_else(|| crate::panels::mcu_module::flash_store::part_of(mcu))
+}
+
+/// See [`Stm32Wdg`]. `part` is the chip feature, display name or id ([`wdg_part`]).
+pub fn stm32_wdg(family: &str, part: &str) -> Stm32Wdg {
+    let slug: String = part
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let rs = slug.starts_with("stm32h7r") || slug.starts_with("stm32h7s");
+    if family == "stm32h7" && !rs {
+        Stm32Wdg {
+            iwdg: "IWDG1",
+            wwdg: "WWDG1",
+            wwdg_bus: "pclk3",
+        }
+    } else {
+        Stm32Wdg {
+            iwdg: "IWDG",
+            wwdg: "WWDG",
+            wwdg_bus: "pclk1",
+        }
+    }
+}
+
 /// embassy's `get_timeout_us`, integer division included.
 ///
 /// Reproduced rather than approximated: `lsi_hz / prescaler` truncates, and at
-/// /1024 on a 32 kHz LSI that is 31 Hz, not 31.25 — a 1 % difference in the
+/// /256 on a 40 kHz LSI that is 156 Hz, not 156.25 — a 0.2 % difference in the
 /// advertised maximum. Showing a range the driver would reject is the failure
 /// this whole module exists to avoid.
 fn iwdg_timeout_us(lsi_hz: u32, prescaler: u32, reload: u32) -> u32 {
@@ -162,16 +229,45 @@ fn iwdg_timeout_us(lsi_hz: u32, prescaler: u32, reload: u32) -> u32 {
     (1_000_000u64 * (reload as u64 + 1) / ticks_hz as u64).min(u32::MAX as u64) as u32
 }
 
+/// What embassy's `IndependentWatchdog::new` does with `timeout_us`: the
+/// prescaler its search picks and the reload `reload_value` computes, BEFORE
+/// the register masks it to 12 bits. `None` past the /256 search (its
+/// `unwrap!`). Replayed, not approximated:
+/// `(timeout_us / psc * LSI / 1_000_000) as u16 - 1`, every division
+/// truncating - a negative reload is the `u16` underflow, a panic on a debug
+/// build, and one past [`MAX_RL`] wraps to a far shorter watchdog.
+fn embassy_iwdg(lsi_hz: u32, timeout_us: u32) -> Option<(u32, i64)> {
+    let psc = (2..=8)
+        .map(|p| 1u32 << p)
+        .find(|&psc| timeout_us <= iwdg_timeout_us(lsi_hz, psc, MAX_RL))?;
+    Some((
+        psc,
+        (timeout_us / psc) as i64 * lsi_hz as i64 / 1_000_000 - 1,
+    ))
+}
+
+/// The longest period at `psc` whose reload still fits the 12-bit counter:
+/// `t / psc * LSI / 1e6 <= MAX_RL + 1`, with the divisions truncating.
+fn iwdg_fits_at(lsi_hz: u32, psc: u32) -> u32 {
+    let q = ((MAX_RL as u64 + 2) * 1_000_000).div_ceil(lsi_hz as u64) - 1;
+    (q * psc as u64 + psc as u64 - 1).min(u32::MAX as u64) as u32
+}
+
 /// The IWDG timeouts this chip can express, in microseconds.
 ///
-/// The floor is one tick at the smallest prescaler (/4); below it embassy's
-/// `reload_value` computes `0 - 1` on a `u16` and panics. The ceiling is a full
-/// 12-bit counter at the largest prescaler.
+/// On embassy the floor is the shortest period whose reload is still 0 or more
+/// at /4 - 128 us on a 32 kHz LSI, not the one tick (125 us) it looks like:
+/// 125..127 truncate to a reload of -1, the `u16` underflow. The ceiling is a
+/// full counter at /256, but no further than the reload embassy computes
+/// still fits: on a 40 kHz LSI its search accepts 26.256 s while the reload
+/// comes out 4101, masked to 5 - a 38 ms watchdog. [`iwdg_problem`] also flags
+/// the one hole inside the range, at /128 on 40 kHz.
 pub fn iwdg_range_us(l: &WatchdogLimits) -> (u32, u32) {
     match l.iwdg_hal {
         IwdgHal::Embassy => (
-            iwdg_timeout_us(l.lsi_hz, 4, 0),
-            iwdg_timeout_us(l.lsi_hz, l.iwdg_max_prescaler, MAX_RL),
+            4 * 1_000_000u32.div_ceil(l.lsi_hz),
+            iwdg_timeout_us(l.lsi_hz, l.iwdg_max_prescaler, MAX_RL)
+                .min(iwdg_fits_at(l.lsi_hz, l.iwdg_max_prescaler)),
         ),
         // `(rl + 1) * divider / LSI_kHz`, in MILLISECONDS - so the floor
         // is one whole millisecond, not one LSI tick, and the ceiling is
@@ -538,20 +634,57 @@ impl WwdgConfig {
 /// the range is a dead end for the person reading it.
 pub fn iwdg_problem(cfg: &IwdgConfig, l: &WatchdogLimits) -> Option<String> {
     let (lo, hi) = iwdg_range_us(l);
-    (!(lo..=hi).contains(&cfg.timeout_us)).then(|| {
-        format!(
+    if !(lo..=hi).contains(&cfg.timeout_us) {
+        return Some(format!(
             "{} is outside this chip's IWDG range {}..={} us (LSI {} kHz, prescaler up to /{})",
             cfg.timeout_us,
             lo,
             hi,
             l.lsi_hz / 1000,
             l.iwdg_max_prescaler
+        ));
+    }
+    // Inside the range, embassy's search can still pick a prescaler at which
+    // its own reload overflows the counter: on a 40 kHz LSI, 13_110_400 ..=
+    // 13_128_205 us at /128.
+    let (psc, rl) =
+        embassy_iwdg(l.lsi_hz, cfg.timeout_us).filter(|_| l.iwdg_hal == IwdgHal::Embassy)?;
+    (rl > MAX_RL as i64).then(|| {
+        let real = ((rl as u64 & MAX_RL as u64) + 1) * psc as u64 * 1_000_000 / l.lsi_hz as u64;
+        format!(
+            "{} us: embassy-stm32 computes a reload of {rl} at /{psc}, past the 12-bit counter - the chip would reset after {real} us; take {} us or less",
+            cfg.timeout_us,
+            iwdg_fits_at(l.lsi_hz, psc)
         )
     })
 }
 
+/// The period the generated file writes for `timeout_us`: the same value
+/// when the driver takes it, otherwise the nearest one it does - inside the
+/// range, and below a hole rather than in it. A period outside both is a
+/// panic at boot or a different watchdog, never the one asked for; the tab
+/// flags the stored value through [`iwdg_problem`].
+pub fn iwdg_driver_value(l: &WatchdogLimits, timeout_us: u32) -> u32 {
+    let (lo, hi) = iwdg_range_us(l);
+    let t = timeout_us.clamp(lo, hi);
+    if l.iwdg_hal != IwdgHal::Embassy {
+        return t;
+    }
+    match embassy_iwdg(l.lsi_hz, t) {
+        Some((psc, rl)) if rl > MAX_RL as i64 => iwdg_fits_at(l.lsi_hz, psc),
+        _ => t,
+    }
+}
+
 /// The same for the WWDG, which has two ways to fail instead of one.
-pub fn wwdg_problem(cfg: &WwdgConfig, l: &WatchdogLimits, pclk1_hz: u32) -> Option<String> {
+///
+/// `bus` names the clock in the message: PCLK1, or PCLK3 on an STM32H7.
+pub fn wwdg_problem(
+    cfg: &WwdgConfig,
+    l: &WatchdogLimits,
+    pclk1_hz: u32,
+    bus: &str,
+) -> Option<String> {
     // Checked first: it is the one that holds no matter what the clock is, and
     // it is an `assert!` in the driver rather than an `unwrap!`.
     if cfg.window_us >= cfg.timeout_us {
@@ -561,14 +694,13 @@ pub fn wwdg_problem(cfg: &WwdgConfig, l: &WatchdogLimits, pclk1_hz: u32) -> Opti
         ));
     }
     let Some((lo, hi)) = wwdg_range_us(l, pclk1_hz) else {
-        return Some(
-            "PCLK1 is unknown, so the achievable range cannot be checked - set the Clock tab first"
-                .to_owned(),
-        );
+        return Some(format!(
+            "{bus} is unknown, so the achievable range cannot be checked - set the Clock tab first"
+        ));
     };
     (!(lo..=hi).contains(&cfg.timeout_us)).then(|| {
         format!(
-            "{} is outside this chip's WWDG range {}..={} us at PCLK1 {} MHz (prescaler up to /{})",
+            "{} is outside this chip's WWDG range {}..={} us at {bus} {} MHz (prescaler up to /{})",
             cfg.timeout_us,
             lo,
             hi,
@@ -611,7 +743,7 @@ mod tests {
     fn the_iwdg_range_matches_embassys_own_arithmetic() {
         // 32 kHz LSI, /256, full 12-bit reload: 1e6 * 4096 / (32000/256) = 32.768 s.
         let l = limits_for("stm32f4", Runtime::Blocking);
-        assert_eq!(iwdg_range_us(&l), (125, 32_768_000));
+        assert_eq!(iwdg_range_us(&l), (128, 32_768_000));
     }
 
     /// The F1 does NOT use this formula, and assuming it did was a real
@@ -633,15 +765,46 @@ mod tests {
         assert_eq!(iwdg_range_us(&f1).0, 1_000);
     }
 
+    /// The silicon of the H5, U5 and WBA reaches /1024, embassy 0.6's search
+    /// does not: it stops at /256 and `unwrap!`s past it. The range offered
+    /// is the driver's, and the old ceiling is now a problem the tab reports.
     #[test]
-    fn the_v3_prescaler_uses_truncating_division_like_the_driver() {
-        // 32000 / 1024 = 31.25, and embassy truncates to 31 - so the real
-        // maximum is 132.1 s, not the 134.2 s exact arithmetic would suggest.
-        // Advertising the larger number would put the driver's `unwrap!` one
-        // step past the end of our own range.
-        let l = limits_for("stm32u5", Runtime::Blocking);
-        assert_eq!(l.iwdg_max_prescaler, 1024);
-        assert_eq!(iwdg_range_us(&l).1, 132_129_032);
+    fn the_v3_iwdg_stops_where_embassys_search_stops() {
+        for fam in ["stm32h5", "stm32u5", "stm32wba"] {
+            let l = limits_for(fam, Runtime::Blocking);
+            assert_eq!(l.iwdg_max_prescaler, 256, "{fam}");
+            assert_eq!(iwdg_range_us(&l), (128, 32_768_000), "{fam}");
+            let old_default = IwdgConfig {
+                timeout_us: 132_129_032,
+            };
+            assert!(iwdg_problem(&old_default, &l).is_some(), "{fam}");
+        }
+    }
+
+    /// The window watchdog's prescaler, against stm32-metapac 21's WWDG
+    /// version per family: v2 reaches /128, v1 /8.
+    #[test]
+    fn the_wwdg_prescaler_follows_the_ip_version() {
+        for fam in [
+            "stm32c0", "stm32g0", "stm32g4", "stm32h5", "stm32h7", "stm32l5", "stm32n6", "stm32u0",
+            "stm32u3", "stm32u5", "stm32wb", "stm32wba", "stm32wl",
+        ] {
+            assert_eq!(
+                limits_for(fam, Runtime::Blocking).wwdg_max_prescaler,
+                128,
+                "{fam}"
+            );
+        }
+        for fam in [
+            "stm32f0", "stm32f2", "stm32f3", "stm32f4", "stm32f7", "stm32l0", "stm32l1", "stm32l4",
+        ] {
+            assert_eq!(
+                limits_for(fam, Runtime::Blocking).wwdg_max_prescaler,
+                8,
+                "{fam}"
+            );
+        }
+        assert_eq!(limits_for("stm32f1", Runtime::Async).wwdg_max_prescaler, 8);
     }
 
     #[test]
@@ -674,6 +837,66 @@ mod tests {
         );
     }
 
+    /// Every period the tab calls fine is one embassy's arithmetic writes
+    /// into the 12-bit counter as asked - swept over the whole range on both
+    /// LSI frequencies, the boundaries included. On a 40 kHz LSI the old
+    /// ceiling (26.256 s) wrapped to 38 ms, and 125..127 us underflowed at 32.
+    #[test]
+    fn every_accepted_iwdg_period_is_one_the_driver_writes() {
+        for (fam, runtime) in [
+            ("stm32f4", Runtime::Blocking),
+            ("stm32f0", Runtime::Blocking),
+            ("stm32f3", Runtime::Blocking),
+            ("stm32f1", Runtime::Async),
+        ] {
+            let l = limits_for(fam, runtime);
+            assert_eq!(l.iwdg_hal, IwdgHal::Embassy, "{fam}");
+            let (lo, hi) = iwdg_range_us(&l);
+            let mut t = lo;
+            let mut ok = 0u32;
+            while t <= hi {
+                if iwdg_problem(&IwdgConfig { timeout_us: t }, &l).is_none() {
+                    let (_, rl) = embassy_iwdg(l.lsi_hz, t).unwrap_or_else(|| panic!("{fam} {t}"));
+                    assert!(
+                        (0..=MAX_RL as i64).contains(&rl),
+                        "{fam}: {t} us -> reload {rl}"
+                    );
+                    ok += 1;
+                }
+                // Every driver value is one the driver writes, too.
+                let v = iwdg_driver_value(&l, t);
+                let (_, rl) = embassy_iwdg(l.lsi_hz, v).unwrap();
+                assert!(
+                    (0..=MAX_RL as i64).contains(&rl),
+                    "{fam}: {t} -> {v} -> {rl}"
+                );
+                t += 97;
+            }
+            assert!(ok > 1000, "{fam}: nothing accepted?");
+            for edge in [lo, hi, lo.saturating_sub(1), hi + 1] {
+                let v = iwdg_driver_value(&l, edge);
+                assert!((lo..=hi).contains(&v), "{fam}: {edge} -> {v}");
+            }
+        }
+        let forty = limits_for("stm32f0", Runtime::Blocking);
+        assert_eq!(iwdg_range_us(&forty), (100, 26_220_799));
+        // The hole at /128: flagged, and the file gets the end of the run below it.
+        assert!(
+            iwdg_problem(
+                &IwdgConfig {
+                    timeout_us: 13_120_000
+                },
+                &forty
+            )
+            .is_some()
+        );
+        assert_eq!(iwdg_driver_value(&forty, 13_120_000), 13_110_399);
+        assert_eq!(
+            iwdg_range_us(&limits_for("stm32f4", Runtime::Blocking)).0,
+            128
+        );
+    }
+
     #[test]
     fn the_defaults_are_always_inside_the_range() {
         // The property that matters for the Reset button: on every family it
@@ -689,6 +912,12 @@ mod tests {
             "stm32u5",
             "stm32wba",
             "stm32c0",
+            "stm32h5",
+            "stm32h7",
+            "stm32wl",
+            "stm32l1",
+            "stm32f0",
+            "stm32f3",
             "unknown-family",
         ] {
             let l = limits_for(fam, Runtime::Blocking);
@@ -697,13 +926,65 @@ mod tests {
                 None,
                 "{fam}"
             );
+            if l.iwdg_hal == IwdgHal::Embassy {
+                let (_, rl) =
+                    embassy_iwdg(l.lsi_hz, IwdgConfig::default_for(&l).timeout_us).unwrap();
+                assert!(
+                    (0..=MAX_RL as i64).contains(&rl),
+                    "{fam}: the default wraps ({rl})"
+                );
+            }
             for pclk1 in [8_000_000, 50_000_000, 170_000_000] {
                 let Some(w) = WwdgConfig::default_for(&l, pclk1) else {
                     continue;
                 };
-                assert_eq!(wwdg_problem(&w, &l, pclk1), None, "{fam} @ {pclk1}");
+                assert_eq!(
+                    wwdg_problem(&w, &l, pclk1, "PCLK1"),
+                    None,
+                    "{fam} @ {pclk1}"
+                );
             }
         }
+    }
+
+    /// The rule against every kind of part it has to tell apart, including
+    /// the H7R/S that shares the H7's family key.
+    #[test]
+    fn stm32_wdg_names_follow_the_part() {
+        let d1 = Stm32Wdg {
+            iwdg: "IWDG1",
+            wwdg: "WWDG1",
+            wwdg_bus: "pclk3",
+        };
+        for part in [
+            "STM32H743ZITx",
+            "STM32H723ZGTx",
+            "STM32H7A3ZITxQ",
+            "STM32H7B0VBTx",
+            "STM32H750VBTx",
+            "STM32H745ZITx",
+            "stm32h747xi",
+        ] {
+            assert_eq!(stm32_wdg("stm32h7", part), d1, "{part}");
+        }
+        let plain = Stm32Wdg {
+            iwdg: "IWDG",
+            wwdg: "WWDG",
+            wwdg_bus: "pclk1",
+        };
+        for (family, part) in [
+            ("stm32h7", "STM32H7S3L8Hx"),
+            ("stm32h7", "STM32H7R7I8Kx"),
+            ("stm32wl", "STM32WL55JCIx"),
+            ("stm32l1", "STM32L151CBTx"),
+            ("stm32u5", "STM32U575ZITxQ"),
+            ("stm32f4", "stm32f411re"),
+            ("stm32f1", "stm32f103c8t6"),
+        ] {
+            assert_eq!(stm32_wdg(family, part), plain, "{family} {part}");
+        }
+        assert_eq!(d1.bus_label(), "PCLK3");
+        assert_eq!(plain.bus_label(), "PCLK1");
     }
 
     #[test]
@@ -714,7 +995,7 @@ mod tests {
             window_us: 1000,
         };
         // Equal is not allowed either - the driver asserts strictly less.
-        let msg = wwdg_problem(&bad, &l, 50_000_000).expect("equal must be refused");
+        let msg = wwdg_problem(&bad, &l, 50_000_000, "PCLK1").expect("equal must be refused");
         assert!(msg.contains("shorter than"), "{msg}");
     }
 
@@ -723,7 +1004,7 @@ mod tests {
         let l = limits_for("stm32f4", Runtime::Blocking);
         let msg = iwdg_problem(&IwdgConfig { timeout_us: 1 }, &l).expect("1 us is too short");
         assert!(
-            msg.contains("125"),
+            msg.contains("128"),
             "the message must state the range: {msg}"
         );
     }

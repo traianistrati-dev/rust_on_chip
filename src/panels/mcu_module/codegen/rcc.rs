@@ -190,11 +190,29 @@ pub fn generic_recipe(g: &ClockGraph) -> Option<(ReadSpec, RccDescriptor)> {
     } else {
         (ReadSpec::f013(), RccDescriptor::f013())
     };
+    // Whether HSI must be switched on is the FAMILY's (embassy's default),
+    // decided in `generic_recipe_for`; the tree cannot say it.
     // The internal RC is 8 MHz on some families and 16 on others, and the tree
     // knows which. It only reaches the header comment — embassy computes the
     // real frequency itself — but a comment that says 16 MHz on an 8 MHz part
     // is a comment that will be believed.
-    if let Some(NodeState::Source { hz, .. }) = g.node("hsi").map(|n| &n.state) {
+    // A CubeMX H5/H7 binds its HSIDiv as `hsi`: the frequency is the source's
+    // - when that source IS the HSI. On a U5 the node bound as `hsi` can be
+    // `HSI48DivToRNG`, and its source the 48 MHz RC.
+    let hsi_src = match g.node("hsi").map(|n| &n.state) {
+        Some(NodeState::Source { hz, .. }) => Some(*hz),
+        _ => g
+            .edges
+            .iter()
+            .find(|e| e.to == "hsi")
+            .filter(|e| classify_source(&e.from) == MuxSource::Hsi)
+            .and_then(|e| g.node(&e.from))
+            .and_then(|n| match &n.state {
+                NodeState::Source { hz, .. } => Some(*hz),
+                _ => None,
+            }),
+    };
+    if let Some(hz) = hsi_src.as_ref() {
         spec.hsi_hz = *hz;
         if spec.reset.sys == SysSource::Hsi {
             spec.reset.sysclk_hz = *hz;
@@ -258,13 +276,34 @@ pub fn graph_clock_block_for(
     {
         return wrap(block, manual);
     }
+    // A family that reads no tree at all (U3, C0) is that, whatever the tree
+    // selects - blaming the source would suggest a fix that does not exist.
+    if rcc_recipe(family).is_none() && !generic_allowed(family) {
+        return wrap(
+            hand_written_skeleton(family, Skeleton::NoRecipe, manual),
+            manual,
+        );
+    }
+    // A tree that selects a source no emitter writes gets the skeleton.
+    if graph.is_some_and(|g| !tree_sources_supported(g)) {
+        return wrap(
+            hand_written_skeleton(family, Skeleton::Source, manual),
+            manual,
+        );
+    }
     // The family's verified recipe first; the tree's own shape only as a
     // fallback, so no existing family's output can change.
     let (spec, desc, verified) = match rcc_recipe(family) {
         Some((spec, desc)) => (spec, desc, true),
-        None => match graph.and_then(generic_recipe) {
+        None => match graph.and_then(|g| generic_recipe_for(family, g)) {
             Some((spec, desc)) => (spec, desc, false),
-            None => return wrap(hand_written_skeleton(), manual),
+            None => {
+                let why = match graph.and_then(|g| generic_refusal_for(family, g)) {
+                    Some(refusal) => Skeleton::Shape(refusal),
+                    None => Skeleton::NoRecipe,
+                };
+                return wrap(hand_written_skeleton(family, why, manual), manual);
+            }
         },
     };
     let values = match graph {
@@ -465,8 +504,8 @@ fn unverified_note() -> String {
         "    // NOTE: this IDE has no verified RCC recipe for this family, so the",
         "    // block below uses embassy's most common shape. The numbers come from",
         "    // the Clock tab and are correct; a field name might not exist for this",
-        "    // chip. If it doesn't, fix it here and tick \"Write the clock by hand\"",
-        "    // in the Clock tab to keep the fix across regeneration.",
+        "    // chip. If it doesn't, tick \"Write the clock by hand\" in the Clock tab",
+        "    // first, then fix it here: until then this block is regenerated.",
         "",
     ]
     .join("\n")
@@ -483,6 +522,48 @@ fn wrap(block: String, manual: bool) -> String {
     }
 }
 
+/// `block` for a dual-core part built for one core, whose chip feature is
+/// `feature` (`stm32wl55jc-cm4`).
+///
+/// embassy-stm32 under `_dual-core` has no `init` (`lib.rs`:
+/// `cfg(not(feature = "_dual-core"))`), only `init_primary`, which keeps the
+/// clock state in a `SharedData` the other core could read. So every `init`
+/// the block writes, the commented example included, becomes that call, and
+/// the static it needs comes first. Outside the manual markers: a hand-written
+/// clock then needs only the call, and the static is regenerated with the
+/// rest. Plain `.bss`, zeroed by cortex-m-rt - a fixed shared address only
+/// matters once a firmware for the other core exists, and this IDE writes one.
+pub fn for_dual_core(block: &str, feature: &str) -> String {
+    let body = block
+        .replace(
+            "embassy_stm32::init(config)",
+            "embassy_stm32::init_primary(config, &SHARED_DATA)",
+        )
+        .replace(
+            "embassy_stm32::init(Default::default())",
+            "embassy_stm32::init_primary(Default::default(), &SHARED_DATA)",
+        );
+    debug_assert!(!body.contains("embassy_stm32::init("), "{body}");
+    format!(
+        concat!(
+            "    // Dual-core part, built for one core (`{feature}`): embassy has no\n",
+            "    // `init` there, only `init_primary`. SHARED_DATA is what it would share\n",
+            "    // with the other core; this firmware programs one core only.\n",
+            "{shared}{body}"
+        ),
+        feature = feature,
+        shared = SHARED_DATA_STATIC,
+        body = body,
+    )
+}
+
+/// The static [`for_dual_core`] declares, as it writes it - so a caller can
+/// take it out again when the user's own code already declares one.
+pub const SHARED_DATA_STATIC: &str = concat!(
+    "    static SHARED_DATA: core::mem::MaybeUninit<embassy_stm32::SharedData> =\n",
+    "        core::mem::MaybeUninit::uninit();\n"
+);
+
 /// What a chip whose family has no RCC recipe gets: a WORKING default plus the
 /// shape of the real thing, commented out.
 ///
@@ -491,28 +572,139 @@ fn wrap(block: String, manual: bool) -> String {
 /// use, so setting the clock by hand is filling in numbers rather than looking
 /// up embassy's API. Both are inside the manual markers, so the moment it is
 /// edited the edit survives.
-fn hand_written_skeleton() -> String {
-    [
-        "    // Clock: this chip's family has no generated RCC recipe yet, so the",
-        "    // Clock tab's tree cannot be turned into code automatically. Set it",
-        "    // here — this block is kept across regeneration.",
-        "    //",
-        "    //   let mut config = embassy_stm32::Config::default();",
-        "    //   {",
-        "    //       use embassy_stm32::rcc;",
-        "    //       config.rcc.hse = Some(rcc::Hse {",
-        "    //           freq: embassy_stm32::time::Hertz(8_000_000),",
-        "    //           mode: rcc::HseMode::Oscillator,",
-        "    //       });",
-        "    //       config.rcc.sys = rcc::Sysclk::PLL1_P;",
-        "    //   }",
-        "    //   let p = embassy_stm32::init(config);",
-        "    //",
-        "    // Then delete the line below.",
-        "    let p = embassy_stm32::init(Default::default()); // reset clock (HSI)",
-        "",
-    ]
-    .join("\n")
+/// Why a block is the hand-written skeleton.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skeleton {
+    /// The family has no recipe and the tree no shape the generic one reads.
+    NoRecipe,
+    /// The tree selects a source no emitter writes (MSI, CSI, …).
+    Source,
+    /// The family has no recipe, and what the tree selects is one the
+    /// generic one does not write, for this reason.
+    Shape(GenericRefusal),
+}
+
+/// What embassy's `Config::default()` clocks a family from - what the active
+/// line of the skeleton really runs. On the MSI families it is NOT the HSI.
+fn default_clock_of(family: &str) -> &'static str {
+    match family {
+        "stm32l0" | "stm32l1" | "stm32l4" | "stm32l4+" | "stm32l5" | "stm32wb" | "stm32wl"
+        | "stm32u0" => "MSI",
+        "stm32u5" | "stm32u3" => "MSIS",
+        "stm32c0" => "HSISYS",
+        _ => "HSI",
+    }
+}
+
+/// The example is HSE straight to SYSCLK: `Sysclk::HSE` exists on every
+/// family and needs no PLL - `PLL1_P` is not a variant on L1/WL/U5, and on the
+/// H7 it is an `unwrap!` at boot with no `pll1` set. The WB and WL `Hse` takes
+/// a prescaler as well.
+///
+/// "Kept across regeneration" only inside the manual markers. A tree that
+/// moves to a selection no recipe writes reaches here with the switch still
+/// off, and that block is regenerated - so it says how to keep one instead.
+fn hand_written_skeleton(family: &str, why: Skeleton, manual: bool) -> String {
+    let mut head: Vec<String> = match why {
+        // Word for word what every existing hand-written project carries.
+        Skeleton::NoRecipe if manual => vec![
+            "    // Clock: this chip's family has no generated RCC recipe yet, so the".into(),
+            "    // Clock tab's tree cannot be turned into code automatically. Set it".into(),
+            "    // here — this block is kept across regeneration.".into(),
+        ],
+        Skeleton::NoRecipe => vec![
+            "    // Clock: this chip's family has no generated RCC recipe yet, so the".into(),
+            "    // Clock tab's tree cannot be turned into code automatically.".into(),
+        ],
+        Skeleton::Source => vec![
+            "    // Clock: the Clock tab selects a clock source the generated recipes do".into(),
+            "    // not write (MSI, CSI, HSI48, LSI, LSE, or an HSI or HSE behind a".into(),
+            "    // divider), so its tree is not turned into code.".into(),
+        ],
+        Skeleton::Shape(refusal) => {
+            let mut h: Vec<String> = vec![
+                "    // Clock: this family has no generated RCC recipe yet, and the Clock tab"
+                    .into(),
+                "    // selects what only that recipe can write safely:".into(),
+            ];
+            // Plain comment lines: indented like the example below, a reader
+            // uncommenting it would take the reason for code.
+            h.extend(refusal.lines().iter().map(|l| format!("    // {l}")));
+            h
+        }
+    };
+    // What keeps an edit - honestly: only the markers do.
+    if why != Skeleton::NoRecipe || !manual {
+        head.push(if manual {
+            "    // Set it here — this block is kept across regeneration.".into()
+        } else {
+            "    // To set it here, tick \"Write the clock by hand\" first: until then this".into()
+        });
+        if !manual {
+            head.push("    // block is regenerated.".into());
+        }
+    }
+    // The example's HSE, as the family's `Hse` spells it and at a frequency
+    // the part can run. WBA's is only a prescaler (a fixed 32 MHz crystal),
+    // and like the WBA recipe it needs RANGE1 off HSI. WB/WL's HSE32 is a
+    // fixed 32 MHz too, with a prescaler. On a U5 or an H7 with OTG_HS (an
+    // H7RS) 8 MHz is itself the panic - 16 is one the PHY takes, and every
+    // H7 runs it.
+    let hse = if family == "stm32wba" {
+        concat!(
+            "    //       config.rcc.hse = Some(rcc::Hse { prescaler: rcc::HsePrescaler::DIV1 });\n",
+            "    //       config.rcc.voltage_scale = rcc::VoltageScale::RANGE1;\n",
+        )
+        .to_owned()
+    } else {
+        let mhz = match family {
+            "stm32wb" | "stm32wl" => "32",
+            "stm32u5" | "stm32h7" => "16",
+            _ if why == Skeleton::Shape(GenericRefusal::UsbPhy) => "16",
+            _ => "8",
+        };
+        let prescaler = if matches!(family, "stm32wb" | "stm32wl") {
+            "    //           prescaler: rcc::HsePrescaler::DIV1,\n"
+        } else {
+            ""
+        };
+        format!(
+            concat!(
+                "    //       config.rcc.hse = Some(rcc::Hse {{\n",
+                "    //           freq: embassy_stm32::time::Hertz({mhz}_000_000),\n",
+                "    //           mode: rcc::HseMode::Oscillator,\n",
+                "{prescaler}",
+                "    //       }});\n",
+            ),
+            mhz = mhz,
+            prescaler = prescaler,
+        )
+    };
+    format!(
+        concat!(
+            "{head}\n",
+            "    //\n",
+            "    //   let mut config = embassy_stm32::Config::default();\n",
+            "    //   {{\n",
+            "    //       use embassy_stm32::rcc;\n",
+            "{hse}",
+            "    //       config.rcc.sys = {sys};\n",
+            "    //   }}\n",
+            "    //   let p = embassy_stm32::init(config);\n",
+            "    //\n",
+            "    // Then delete the line below.\n",
+            "    let p = embassy_stm32::init(Default::default()); // embassy's default clock ({clock})\n",
+        ),
+        head = head.join("\n"),
+        hse = hse,
+        // N6's SYSCLK is its own `SysClk`, not the `Sysclk` of every other module.
+        sys = if family == "stm32n6" {
+            "rcc::SysClk::Hse"
+        } else {
+            "rcc::Sysclk::HSE"
+        },
+        clock = default_clock_of(family),
+    )
 }
 
 /// Does this family's clock code come from the Clock tab at all?
@@ -568,8 +760,61 @@ pub fn generates_clock_code_for(family: &str, clock: &ClockConfig) -> bool {
     {
         return true;
     }
+    // The skeleton `graph_clock_block_for` falls back to for a tree that
+    // selects MSI, CSI, …: no clock code, so the block is the user's.
+    if family != "stm32f1"
+        && matches!(clock, ClockConfig::Graph(gc) if !tree_sources_supported(&gc.for_codegen()))
+    {
+        return false;
+    }
     generates_clock_code(family)
-        || matches!(clock, ClockConfig::Graph(gc) if generic_recipe(&gc.for_codegen()).is_some())
+        || matches!(clock, ClockConfig::Graph(gc) if generic_recipe_for(family, &gc.for_codegen()).is_some())
+}
+
+/// Can this tree drive the clock code at SOME selection - the question the
+/// hand-written default and the "missing pieces" reports ask, where
+/// [`generates_clock_code_for`] answers for the selection it has now.
+///
+/// An import sits at its vendor default, MSI on the L/U/W families and HSI
+/// /2 on an H5: the skeleton until HSI or the PLL is picked. Defaulting
+/// those to "written by hand" fenced the block off for good - the switch is
+/// saved only when on, so turning it off came back on at every open - and
+/// reported the chip as missing a clock it has.
+pub fn tree_drives_clock_code(family: &str, clock: &ClockConfig) -> bool {
+    if family == "stm32n6" {
+        return matches!(clock, ClockConfig::Graph(gc) if super::rcc_n6::block(&gc.for_codegen()).is_some());
+    }
+    generates_clock_code(family)
+        || matches!(clock, ClockConfig::Graph(gc) if generic_allowed(family) && generic_recipe(&gc.for_codegen()).is_some())
+}
+
+/// Why THIS tree is the skeleton when its family does generate from trees -
+/// what the Clock tab says instead of "no clock generator", which on an H7 at
+/// its PLL is false: the same tree at HSI generates. `None` when the clock is
+/// generated, or when the family reads no tree at all.
+pub fn skeleton_reason(family: &str, clock: &ClockConfig) -> Option<String> {
+    let ClockConfig::Graph(gc) = clock else {
+        return None;
+    };
+    if !family.starts_with("stm32") || generates_clock_code_for(family, clock) {
+        return None;
+    }
+    // U3, C0: no generator for any selection, which the tab says as that.
+    if rcc_recipe(family).is_none() && !generic_allowed(family) {
+        return None;
+    }
+    let g = gc.for_codegen();
+    if family != "stm32f1" && !tree_sources_supported(&g) {
+        return Some(
+            "the tree selects a source no generated recipe writes (MSI, CSI, HSI48, LSI, LSE, or an HSI or HSE behind a divider)."
+                .into(),
+        );
+    }
+    let refusal = generic_refusal_for(family, &g)?;
+    Some(format!(
+        "the tree selects {} That needs this family's own recipe, not written yet.",
+        refusal.lines().join(" ")
+    ))
 }
 
 /// Can the clock block be hand-written and PRESERVED for this family?
@@ -786,8 +1031,9 @@ impl RccDescriptor {
     /// still silent.
     ///
     /// L0/L1 also lack an output divider but are NOT this shape (`rcc/l.rs` has
-    /// `Pll { source, mul, div }`), so they land here and will need one field
-    /// corrected — which the emitted note says how to make permanent.
+    /// `Pll { source, mul, div }`). Through the generic recipe no family gets
+    /// its PLL written at all ([`generic_writes`]); the shape still decides
+    /// the HSI label and frequency its other blocks say.
     pub fn f013() -> Self {
         Self {
             pll_field: "pll",
@@ -1012,11 +1258,401 @@ impl ReadSpec {
 /// Read the user's clock selections out of `g` per `spec` — the ONE reader that
 /// replaced `graph_to_f4` / `graph_to_wba`. Missing/foreign nodes fall back to
 /// `spec.reset`, so a non-matching graph degrades to the reset state.
-pub fn read_rcc_values(g: &ClockGraph, spec: &ReadSpec) -> RccValues {
-    let index_of = |id: &str| match g.node(id).map(|n| &n.state) {
-        Some(NodeState::Index(i)) => Some(*i),
-        _ => None,
+/// What a clock mux's SELECTED input really is, read from the edge that feeds
+/// it rather than from the bare index.
+///
+/// The built-in trees put HSI, HSE and the PLL on inputs 0, 1 and 2. A tree
+/// imported from CubeMX lists the sources in ST's own order, which on the MSI
+/// families (L0/L1/L4/L5/U0/U5/WB/WL) starts with MSI - read by index, that
+/// MSI became `Sysclk::HSI` with HSI never switched on, and embassy's
+/// `hsi.unwrap()` panicked at boot. `None` when the mux is not in the tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MuxSource {
+    Hsi,
+    Hse,
+    Pll,
+    /// MSI, CSI, HSI48, HSISYS, LSI…: nothing an emitter here writes.
+    Other,
+}
+
+fn mux_source(g: &ClockGraph, mux: &str) -> Option<MuxSource> {
+    let NodeState::Index(i) = g.node(mux)?.state else {
+        return None;
     };
+    let Some(edge) = g.edges.iter().find(|e| e.to == mux && e.input == i) else {
+        // No edge to ask: the index is all there is, in the built-in order.
+        return Some(match i {
+            0 => MuxSource::Hsi,
+            1 => MuxSource::Hse,
+            _ => MuxSource::Pll,
+        });
+    };
+    // Walk back through dividers to the oscillator that feeds this input: a
+    // CubeMX F0/F3 binds the HSE predivider as `pllm`, so the PLL source's
+    // input is that divider, not `HSE`; a G0 feeds SYSCLK through HSISYS.
+    let mut id = edge.from.clone();
+    // Any division on the way, and a SELECTABLE one other than the PLL's own
+    // input prescaler (`pllm`, which the block writes).
+    let (mut divided, mut unwritten) = (false, false);
+    for _ in 0..4 {
+        if mux == "sw" && id.to_ascii_lowercase().contains("pll") {
+            return Some(MuxSource::Pll);
+        }
+        let Some(node) = g.node(&id) else { break };
+        match (&node.kind, &node.state) {
+            (NodeKind::Divider { options }, NodeState::Index(k)) => {
+                let by_more = options.get(*k).is_some_and(|d| *d != 1);
+                divided |= by_more;
+                unwritten |= by_more && id != "pllm";
+            }
+            (NodeKind::FixedDiv { by }, _) => divided |= *by != 1,
+            _ => break,
+        }
+        match g.edges.iter().find(|e| e.to == id) {
+            Some(up) => id = up.from.clone(),
+            None => break,
+        }
+    }
+    let class = classify_source(&id);
+    // SYSCLK from a DIVIDED HSI (H5/H7 HSIDiv, G0 HSISYS, L0 HSIRCDiv): no
+    // emitter writes that divider and embassy runs HSI undivided, so the block
+    // would run a clock the tree does not show. Behind the PLL a divider is
+    // the PLL's own input prescaler, which the block does write.
+    // Behind the PLL a fixed divider is the HAL's (F0/F3 HSI/2) and `pllm` is
+    // written; a selectable HSIDiv there is neither.
+    if class == MuxSource::Hsi && ((mux == "sw" && divided) || unwritten) {
+        return Some(MuxSource::Other);
+    }
+    // Nor does any write an HSE divider (WBA's HseDiv, an F0/F3 PLLDiv the
+    // binding never names `pllm`): the firmware runs the HSE undivided.
+    if class == MuxSource::Hse && unwritten {
+        return Some(MuxSource::Other);
+    }
+    Some(class)
+}
+
+/// The oscillator a node id names. `48` in an HSI's name is the 48 MHz RC
+/// (`HSI48`, `HSIRC48`, `HSIUSB48`), which no emitter writes.
+fn classify_source(id: &str) -> MuxSource {
+    let f = id.to_ascii_lowercase();
+    if f.contains("msi") || (f.starts_with("hsi") && f.contains("48")) {
+        MuxSource::Other
+    } else if f.starts_with("hsi") {
+        MuxSource::Hsi
+    } else if f.starts_with("hse") || f.contains("xtpre") {
+        // `pllxtpre`: the F1's HSE predivider, the PLL's HSE input.
+        MuxSource::Hse
+    } else if f.contains("pll") {
+        MuxSource::Pll
+    } else {
+        MuxSource::Other
+    }
+}
+
+/// Families the generic recipe must not write for: its `Sysclk::HSI` is
+/// spelled `HSI16` on the U3 and `HSISYS` on the C0, and neither has a PLL.
+pub fn generic_allowed(family: &str) -> bool {
+    !matches!(family, "stm32u3" | "stm32c0")
+}
+
+/// The generic recipe for `family`'s tree, when what the tree selects is a
+/// block that compiles AND boots there - the ONE answer
+/// [`graph_clock_block_for`], [`generates_clock_code_for`], `cpu_clock` and
+/// the Configuration tab's WWDG card all ask.
+///
+/// What it adds to [`generic_recipe`] is the family, which the tree cannot
+/// give: whether embassy's default leaves HSI off, which APB buses its
+/// `Config` has, and what [`generic_writes`] must refuse.
+pub fn generic_recipe_for(family: &str, g: &ClockGraph) -> Option<(ReadSpec, RccDescriptor)> {
+    let (spec, desc) = generic_recipe_adapted(family, g)?;
+    generic_refusal(family, g, &read_rcc_values(g, &spec))
+        .is_none()
+        .then_some((spec, desc))
+}
+
+/// Why the generic recipe does not write `family`'s tree as it stands -
+/// `None` when it does, or when there is no generic recipe for it at all.
+fn generic_refusal_for(family: &str, g: &ClockGraph) -> Option<GenericRefusal> {
+    let (spec, _) = generic_recipe_adapted(family, g)?;
+    generic_refusal(family, g, &read_rcc_values(g, &spec))
+}
+
+/// [`generic_recipe`] with what only the family knows, before
+/// [`generic_refusal`] decides.
+fn generic_recipe_adapted(family: &str, g: &ClockGraph) -> Option<(ReadSpec, RccDescriptor)> {
+    if !generic_allowed(family) {
+        return None;
+    }
+    let (mut spec, mut desc) = generic_recipe(g)?;
+    // embassy's own HSI, which no block sets - not the tree's. The minimal
+    // tree's 16 MHz is 8 on an F0/F3 and 64 on an H5/H7, and an imported
+    // L0/L1 tree (the f013 shape) would have said 8 for a 16 MHz HSI: the
+    // header, `cpu_clock` and the Async boot check all read this.
+    let (hsi_hz, hsi_label) = match family {
+        "stm32f0" | "stm32f3" => (8_000_000, "HSI8"),
+        "stm32h5" | "stm32h7" => (64_000_000, "HSI64"),
+        _ => (16_000_000, "HSI16"),
+    };
+    spec.hsi_hz = hsi_hz;
+    if spec.reset.sys == SysSource::Hsi {
+        spec.reset.sysclk_hz = hsi_hz;
+    }
+    desc.hsi_label = hsi_label;
+    // `rcc/l.rs` and `rcc/u5.rs` default to `hsi: false`: a block that selects
+    // HSI must turn it on, or `hsi.unwrap()` panics at boot. (H5/H7's `hsi`
+    // is an `Option<HSIPrescaler>`, on by default; F0/F3's is on.)
+    desc.hsi_needs_enable = matches!(
+        family,
+        "stm32l0"
+            | "stm32l1"
+            | "stm32l4"
+            | "stm32l4+"
+            | "stm32l5"
+            | "stm32wb"
+            | "stm32wl"
+            | "stm32u0"
+            | "stm32u5"
+    );
+    // F0 and U0 have one APB: embassy's `Config` has no `apb2_pre` there, so a
+    // tree with an `apb2` node (the minimal one has) named a missing field.
+    if matches!(family, "stm32f0" | "stm32u0") {
+        spec.apb = APB_1;
+        spec.reset.apb = spec.apb.iter().map(|(field, _)| (*field, 1)).collect();
+    }
+    Some((spec, desc))
+}
+
+/// Why [`generic_refusal`] refused - each a project that did not build or
+/// panicked in `embassy_stm32::init`, said in the skeleton and the Clock tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenericRefusal {
+    Pll,
+    HsePrescaler,
+    UsbPhy,
+    AdcAhb,
+}
+
+impl GenericRefusal {
+    /// What the tree selects and why it needs the family's recipe, as
+    /// comment-width lines.
+    fn lines(self) -> &'static [&'static str] {
+        match self {
+            GenericRefusal::Pll => {
+                &["the PLL - its fields and limits differ from family to family."]
+            }
+            GenericRefusal::HsePrescaler => {
+                &["the HSE - on this family its `Hse` takes a prescaler as well."]
+            }
+            GenericRefusal::UsbPhy => &[
+                "the HSE - on a part with USB OTG_HS, embassy also derives the USB PHY",
+                "clock from it and panics at boot unless it is 16, 19.2, 20, 24, 26 or",
+                "32 MHz; the generic block cannot tell whether this part has one.",
+            ],
+            GenericRefusal::AdcAhb => &[
+                "an AHB prescaler - on every F3 but the F37x the ADC runs from HCLK/1 by",
+                "default, and embassy panics at boot unless AHB is /1 then.",
+            ],
+        }
+    }
+}
+
+/// Why the generic block for `v` would not compile or boot on `family`, read
+/// against embassy-stm32 0.6's `rcc` modules - every refusal here is a
+/// project that failed to build or panicked in `embassy_stm32::init`.
+///
+/// Never the PLL. The generic `Pll { … }` is F4's or G4's, and of the
+/// families it reaches only F0/F3 and L4+/L5/WB/WL/U0 even have that shape;
+/// on those the tree's PLLMUL is a list the reader does not read (F0/F3: the
+/// block said MUL2 whatever the tab showed, then failed `PLL_OUT` at boot) or
+/// offers a PLLR the PAC lacks (WB/WL `/8`). That is each family's own
+/// recipe, Phase 4; until then a PLL is the skeleton, which boots.
+fn generic_refusal(family: &str, g: &ClockGraph, v: &RccValues) -> Option<GenericRefusal> {
+    if v.sys == SysSource::Pll {
+        return Some(GenericRefusal::Pll);
+    }
+    if v.sys == SysSource::Hse {
+        match family {
+            // `rcc/l.rs` gives the WB and WL `Hse` a `prescaler` the block does
+            // not write.
+            "stm32wb" | "stm32wl" => return Some(GenericRefusal::HsePrescaler),
+            // `rcc/u5.rs` (U59x/U5Ax/U5Fx/U5Gx) and `rcc/h.rs` (an H7RS) with
+            // OTG_HS take the USB PHY reference from `otghssel` / `usbphycsel`,
+            // which no block writes (the sweep checks), so from their default,
+            // the HSE itself - and panic unless it is one the PHY takes, USB
+            // used or not. Nothing here knows the PART, so on a U5 every HSE
+            // outside the list is refused: a U575 loses a block it could boot,
+            // not a U5A5 one it could not. An H7 is refused only on a tree with
+            // a USB PHY node (every H7RS tree): the same rule family-wide would
+            // take the 8 and 25 MHz HSE from every H743.
+            "stm32u5" if !USB_PHY_REF_HZ.contains(&v.hse_hz) => {
+                return Some(GenericRefusal::UsbPhy);
+            }
+            "stm32h7"
+                if g.nodes
+                    .iter()
+                    .any(|n| n.id.to_ascii_lowercase().contains("usbphy"))
+                    && !USB_PHY_REF_HZ.contains(&v.hse_hz) =>
+            {
+                return Some(GenericRefusal::UsbPhy);
+            }
+            _ => {}
+        }
+    }
+    // `rcc/f013.rs` on every F3 but the F37x: the ADC's default clock is
+    // HCLK/1, and `init` asserts that AHB is then /1 too.
+    if family == "stm32f3" && v.ahb != 1 {
+        return Some(GenericRefusal::AdcAhb);
+    }
+    None
+}
+
+/// The HSE frequencies embassy can make an OTG_HS PHY reference from
+/// (`Usbrefcksel` / `Usbphycsel` on U5 and H7RS).
+const USB_PHY_REF_HZ: [u32; 6] = [
+    16_000_000, 19_200_000, 20_000_000, 24_000_000, 26_000_000, 32_000_000,
+];
+
+/// HCLK and each APB bus's divider once the generated block has set the
+/// clock - what `main.rs` runs, which on the generic recipe is embassy's HSI
+/// and not the tree's. `None` when the block is the skeleton (embassy's
+/// default, which nothing here models) or the clock is not an RCC block; the
+/// F1 on Async writes embassy's block from its own reader.
+fn block_buses(family: &str, clock: &ClockConfig) -> Option<(u32, Vec<(u8, u32)>)> {
+    if family == "stm32f1" {
+        let c = f1_embassy_clock(clock);
+        if !f1_embassy_clock_ok(&c) {
+            return None;
+        }
+        let hclk = f1_embassy_sysclk_hz(&c) / u32::from(c.ahb_pre).max(1);
+        return Some((
+            hclk,
+            vec![(1, u32::from(c.apb1_pre)), (2, u32::from(c.apb2_pre))],
+        ));
+    }
+    let ClockConfig::Graph(gc) = clock else {
+        return None;
+    };
+    if !family.starts_with("stm32") || family == "stm32n6" {
+        return None;
+    }
+    let g = gc.for_codegen();
+    if !tree_sources_supported(&g) {
+        return None;
+    }
+    let spec = rcc_recipe(family)
+        .map(|(spec, _)| spec)
+        .or_else(|| generic_recipe_for(family, &g).map(|(spec, _)| spec))?;
+    let v = read_rcc_values(&g, &spec);
+    let buses = v
+        .apb
+        .iter()
+        .filter_map(|(field, d)| {
+            let bus = field
+                .strip_prefix("apb")?
+                .strip_suffix("_pre")?
+                .parse()
+                .ok()?;
+            Some((bus, (*d).max(1)))
+        })
+        .collect();
+    Some((v.sysclk_hz / v.ahb.max(1), buses))
+}
+
+/// Each APB bus's clock as `main.rs` runs it - `(bus, Hz)`; empty where
+/// [`block_buses`] knows nothing. What the Configuration tab's WWDG card
+/// checks against: the tree can show another (an H7's minimal tree at 16 MHz
+/// HSI, where embassy runs 64).
+pub fn apb_bus_clocks(family: &str, clock: &ClockConfig) -> Vec<(u8, u32)> {
+    block_buses(family, clock).map_or_else(Vec::new, |(hclk, buses)| {
+        buses.into_iter().map(|(bus, d)| (bus, hclk / d)).collect()
+    })
+}
+
+/// What a timer on each APB bus runs at - `(bus, Hz)`, by embassy's own rule
+/// (`calc_pclk`: the bus clock, or twice it behind a divider).
+pub fn apb_timer_clocks(family: &str, clock: &ClockConfig) -> Vec<(u8, u32)> {
+    block_buses(family, clock).map_or_else(Vec::new, |(hclk, buses)| {
+        buses
+            .into_iter()
+            .map(|(bus, d)| {
+                let pclk = hclk / d;
+                (bus, if d > 1 { pclk.saturating_mul(2) } else { pclk })
+            })
+            .collect()
+    })
+}
+
+/// What `embassy_stm32::init` refuses at boot on the Async runtime, for the
+/// Clock tab: the F1 block's own limits first (counted with the HSE the block
+/// switches on, which the tab's warnings count as 0 Hz while it is off), then
+/// [`time_driver_issue`].
+pub fn async_boot_issue(family: &str, clock: &ClockConfig, timer: Option<u8>) -> Option<String> {
+    if family == "stm32f1" && !f1_embassy_clock_ok(&f1_embassy_clock(clock)) {
+        return Some(
+            "embassy_stm32::init panics at boot on this clock (Async runtime): the PLL, a bus or the ADC is over the F1's limit, counted with the HSE the generated block switches on when the PLL needs it."
+                .into(),
+        );
+    }
+    time_driver_issue(family, clock, timer)
+}
+
+/// The boot check the Async runtime adds and the datasheet limits cannot see.
+///
+/// embassy-time ticks at 1 MHz (the IDE asks for no `tick-hz-*`), and
+/// `embassy_stm32::init` starts its timer with a prescaler of
+/// `clock / 1 MHz - 1`: under 1 MHz that is an overflow, and init panics. `timer` is the one
+/// `time-driver-any` takes ([`embassy_stm32::time_driver_timer_of`]), `None`
+/// when it is not known - then the slowest bus decides.
+///
+/// [`embassy_stm32::time_driver_timer_of`]: super::embassy_stm32::time_driver_timer_of
+pub fn time_driver_issue(family: &str, clock: &ClockConfig, timer: Option<u8>) -> Option<String> {
+    let buses = apb_timer_clocks(family, clock);
+    // The timers STM32 puts on APB2; a single-APB part has only bus 1.
+    let bus_of = |t: u8| {
+        if matches!(t, 1 | 8 | 9 | 10 | 11 | 15 | 16 | 17 | 19 | 20 | 21 | 22) {
+            2
+        } else {
+            1
+        }
+    };
+    let (bus, hz) = match timer {
+        Some(t) => buses
+            .iter()
+            .find(|(b, _)| *b == bus_of(t))
+            .or_else(|| buses.first())
+            .copied()?,
+        None => buses.iter().min_by_key(|(_, hz)| *hz).copied()?,
+    };
+    if hz >= 1_000_000 {
+        return None;
+    }
+    let who = timer.map_or_else(
+        || "embassy-time's timer".to_owned(),
+        |t| format!("TIM{t}, embassy-time's timer,"),
+    );
+    Some(format!(
+        "{who} would run at {} kHz from APB{bus} - under the 1 MHz embassy-time ticks at, so embassy_stm32::init panics at boot (Async runtime). Divide less on AHB or APB{bus}.",
+        hz / 1000
+    ))
+}
+
+/// Whether the sources a tree selects are ones the RCC emitters can write:
+/// HSI, HSE or the PLL for SYSCLK, and HSI or HSE behind the PLL. A tree that
+/// selects anything else (an imported L4/WL/U5 tree at its MSI default) gets
+/// the hand-written skeleton, which boots on embassy's own default clock -
+/// not a block naming a source the tree did not pick.
+pub fn tree_sources_supported(g: &ClockGraph) -> bool {
+    match mux_source(g, "sw") {
+        Some(MuxSource::Other) => false,
+        Some(MuxSource::Pll) => !matches!(
+            mux_source(g, "pllsrc"),
+            Some(MuxSource::Other | MuxSource::Pll)
+        ),
+        _ => true,
+    }
+}
+
+pub fn read_rcc_values(g: &ClockGraph, spec: &ReadSpec) -> RccValues {
     let divisor_of = |id: &str| -> Option<u32> {
         let node = g.node(id)?;
         let NodeKind::Divider { options } = &node.kind else {
@@ -1038,15 +1674,19 @@ pub fn read_rcc_values(g: &ClockGraph, spec: &ReadSpec) -> RccValues {
         }
     }
 
-    let sys = match index_of("sw") {
-        Some(0) => SysSource::Hsi,
-        Some(1) => SysSource::Hse,
+    // By the source behind the selected input (see [`mux_source`]); on the
+    // built-in trees that is the old index order exactly.
+    let sys = match mux_source(g, "sw") {
+        Some(MuxSource::Hsi) => SysSource::Hsi,
+        Some(MuxSource::Hse) => SysSource::Hse,
         _ => SysSource::Pll,
     };
-    // The pllsrc mux is 2-input (HSI=0, HSE=1): index != 0 → HSE; a missing
-    // node keeps the family default. (F4 used `== Some(1)`, WBA `!= Some(0)`;
-    // for the only real indices, 0 and 1, both agree with this.)
-    let pll_src_hse = index_of("pllsrc").map(|i| i != 0).unwrap_or(r.pll_src_hse);
+    // A missing node keeps the family default.
+    let pll_src_hse = match mux_source(g, "pllsrc") {
+        Some(MuxSource::Hse) => true,
+        Some(MuxSource::Hsi) => false,
+        _ => r.pll_src_hse,
+    };
 
     let pll_m = divisor_of("pllm").unwrap_or(r.pll_m);
     let pll_n = match g.node("plln").map(|n| &n.state) {
@@ -1071,7 +1711,10 @@ pub fn read_rcc_values(g: &ClockGraph, spec: &ReadSpec) -> RccValues {
         SysSource::Hse => hse_hz,
         SysSource::Pll => {
             let src = if pll_src_hse { hse_hz } else { spec.hsi_hz };
-            (src / pll_m.max(1)) * pll_n / pll_out.max(1)
+            // In u64: a tree at its extremes (64 MHz /1 x512) passes 4 GHz on
+            // the way, which overflowed - a panic in a debug build of the IDE.
+            ((src / pll_m.max(1)) as u64 * pll_n as u64 / pll_out.max(1) as u64)
+                .min(u32::MAX as u64) as u32
         }
     };
 
@@ -1273,6 +1916,723 @@ fn apb_human(field: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// On every built-in tree the source behind each input is exactly what
+    /// the old index order said, so no existing block can change.
+    #[test]
+    fn the_built_in_trees_read_their_sources_as_before() {
+        use crate::panels::mcu_module::clock::graph::{
+            minimal_graph, stm32f4::stm32f2_graph, stm32f4::stm32f4_graph, stm32g0::stm32g0_graph,
+            stm32g4::stm32g4_graph, stm32l4::stm32l4_graph, stm32wba::stm32wba_graph,
+        };
+        for (name, g) in [
+            ("minimal", minimal_graph()),
+            ("f2", stm32f2_graph()),
+            ("f4", stm32f4_graph()),
+            ("g0", stm32g0_graph()),
+            ("g4", stm32g4_graph()),
+            ("l4", stm32l4_graph()),
+            ("wba", stm32wba_graph()),
+        ] {
+            for (i, want) in [
+                (0, MuxSource::Hsi),
+                (1, MuxSource::Hse),
+                (2, MuxSource::Pll),
+            ] {
+                let mut g = g.clone();
+                g.node_mut("sw").unwrap().state = NodeState::Index(i);
+                assert_eq!(mux_source(&g, "sw"), Some(want), "{name} sw {i}");
+                for (j, src) in [(0, MuxSource::Hsi), (1, MuxSource::Hse)] {
+                    if let Some(n) = g.node_mut("pllsrc") {
+                        n.state = NodeState::Index(j);
+                        assert_eq!(mux_source(&g, "pllsrc"), Some(src), "{name} pllsrc {j}");
+                    }
+                    assert!(tree_sources_supported(&g), "{name} {i}/{j}");
+                }
+            }
+        }
+    }
+
+    /// A tree that lists MSI first, as ST's do: selecting MSI is not HSI -
+    /// the block is the skeleton, which boots on embassy's MSI default; and
+    /// selecting HSI on such a family turns HSI on.
+    #[test]
+    fn an_msi_first_tree_is_not_read_as_hsi() {
+        use crate::panels::mcu_module::clock::graph::Edge;
+        use crate::panels::mcu_module::clock::graph::minimal_graph;
+        let mut g = minimal_graph();
+        let mut msi = g.node("hsi").unwrap().clone();
+        msi.id = "MSIRC".into();
+        g.nodes.push(msi);
+        g.edges.retain(|e| e.to != "sw");
+        for (from, input) in [("MSIRC", 0), ("hsi", 1), ("hse", 2), ("pllclk", 3)] {
+            g.edges.push(Edge {
+                from: from.into(),
+                to: "sw".into(),
+                input,
+            });
+        }
+        if let NodeKind::Mux { inputs } = &mut g.node_mut("sw").unwrap().kind {
+            *inputs = 4;
+        }
+        let gc = |g: &ClockGraph| {
+            ClockConfig::Graph(crate::panels::mcu_module::clock::graph::GraphClock {
+                graph: g.clone(),
+                layout: Default::default(),
+                bindings: Default::default(),
+            })
+        };
+        g.node_mut("sw").unwrap().state = NodeState::Index(0);
+        assert_eq!(mux_source(&g, "sw"), Some(MuxSource::Other));
+        assert!(!generates_clock_code_for("stm32wl", &gc(&g)));
+        let block = graph_clock_block_for("stm32wl55jcix", "stm32wl", &gc(&g), false);
+        assert!(
+            block.contains("embassy_stm32::init(Default::default())"),
+            "{block}"
+        );
+        assert!(block.contains("embassy's default clock (MSI)"), "{block}");
+        assert!(!block.contains("Sysclk::HSI"), "{block}");
+
+        g.node_mut("sw").unwrap().state = NodeState::Index(1);
+        assert_eq!(mux_source(&g, "sw"), Some(MuxSource::Hsi));
+        let block = graph_clock_block_for("stm32wl55jcix", "stm32wl", &gc(&g), false);
+        assert!(block.contains("Sysclk::HSI"), "{block}");
+        assert!(block.contains("config.rcc.hsi = true;"), "{block}");
+    }
+
+    /// Every family's real CubeMX tree, at every SYSCLK and every PLL-source
+    /// input. Checked against the HAL itself, not against what the reader
+    /// meant: each `Sysclk::` / `PllSource::` the block names exists for that
+    /// part (stm32-metapac's `Sw` / `Pllsrc`; embassy's own enum on F0/F1/F3);
+    /// an HSI it selects on a family where embassy leaves HSI off is turned
+    /// on; and a tree whose sources are unsupported gets the skeleton.
+    /// Ignored: it needs STM32CubeMX and the cargo registry's metapac.
+    ///
+    /// `cargo test -- --ignored every_vendor_tree_names_a_source_it_turns_on --nocapture`
+    ///
+    /// With `EIDE_CLOCK_DUMP=<dir>` it also writes, for the first and last
+    /// single-core part of each family, every distinct block (and the
+    /// skeleton's example, uncommented) as `<feature>.rs`, the HAL line the
+    /// importer writes for it as `<feature>.dep`, and `targets.txt`, which
+    /// `scripts/check-clock-blocks.py` hands to `cargo check` against
+    /// embassy-stm32: the only oracle for the field names this sweep cannot see.
+    #[test]
+    #[ignore]
+    fn every_vendor_tree_names_a_source_it_turns_on() {
+        use crate::panels::mcu_module::clock::graph::cubemx;
+        use crate::panels::mcu_module::stm32_pin_data::embassy_chip_feature;
+        let Some(db) = cubemx::default_db_dir() else {
+            println!("skipped: no STM32CubeMX database on this machine");
+            return;
+        };
+        let home = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .map(|h| std::path::PathBuf::from(h).join(".cargo"))
+            })
+            .expect("a cargo home");
+        let mut metapacs: Vec<std::path::PathBuf> =
+            std::fs::read_dir(home.join("registry").join("src"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .flat_map(|r| std::fs::read_dir(r.path()).into_iter().flatten().flatten())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("stm32-metapac-21."))
+                })
+                .collect();
+        metapacs.sort();
+        let Some(metapac) = metapacs.pop() else {
+            println!("skipped: no stm32-metapac 21 in the cargo registry");
+            return;
+        };
+        // The variants of `<name>` in a metapac register file: a `pub enum`, or
+        // - where the values are sparse, as the F2's PLLN 192..=432 - a newtype
+        // whose `impl <name>` holds `pub const MUL192: Self = …`.
+        let variants = |text: &str, name: &str| -> Vec<String> {
+            let ident = |v: &String| {
+                v.starts_with(|c: char| c.is_ascii_uppercase())
+                    && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            };
+            let block = |head: &str| {
+                text.find(head).map(|at| {
+                    let body = &text[at..];
+                    &body[..body.find("\n    }").unwrap_or(body.len())]
+                })
+            };
+            if let Some(body) = block(&format!("pub enum {name} {{")) {
+                return body
+                    .lines()
+                    .filter_map(|l| l.trim().split_once(" = ").map(|(v, _)| v.trim().to_owned()))
+                    .filter(ident)
+                    .collect();
+            }
+            if text.contains(&format!("pub struct {name}("))
+                && let Some(body) = block(&format!("impl {name} {{"))
+            {
+                return body
+                    .lines()
+                    .filter_map(|l| {
+                        let c = l.trim().strip_prefix("pub const ")?;
+                        c.split_once(':').map(|(v, _)| v.trim().to_owned())
+                    })
+                    .filter(ident)
+                    .collect();
+            }
+            Vec::new()
+        };
+        let named = |block: &str, ty: &str| -> Vec<String> {
+            block
+                .split(&format!("rcc::{ty}::"))
+                .skip(1)
+                .map(|r| {
+                    r.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect()
+                })
+                .collect()
+        };
+        let mut files: Vec<_> = std::fs::read_dir(db.join("mcu"))
+            .expect("the CubeMX mcu folder")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "xml")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("STM32") && !n.starts_with("STM32MP"))
+            })
+            .collect();
+        files.sort();
+        let msi_family = |f: &str| {
+            matches!(
+                f,
+                "stm32l0"
+                    | "stm32l1"
+                    | "stm32l4"
+                    | "stm32l4+"
+                    | "stm32l5"
+                    | "stm32wb"
+                    | "stm32wl"
+                    | "stm32u0"
+                    | "stm32u5"
+            )
+        };
+        // One part per clock-tree file is enough: the tree is per family.
+        let mut seen = std::collections::BTreeSet::new();
+        // The option sweep once per (family, PAC rcc block, node, options):
+        // most of a family's trees offer the same lists.
+        let mut swept = std::collections::BTreeSet::new();
+        let dump = std::env::var_os("EIDE_CLOCK_DUMP").map(std::path::PathBuf::from);
+        // family -> [(feature, target, part, the HAL line, blocks)] for the dump.
+        type Dumped = (
+            String,
+            String,
+            String,
+            String,
+            std::collections::BTreeSet<String>,
+        );
+        let mut dumped: std::collections::BTreeMap<String, Vec<Dumped>> = Default::default();
+        let (mut blocks, mut skeletons, mut options) = (0usize, 0usize, 0usize);
+        let mut wrong = Vec::new();
+        for path in &files {
+            let xml = std::fs::read_to_string(path).expect("readable");
+            let Ok(chips) = crate::panels::mcu_module::stm32_pin_data::convert_xml(&xml) else {
+                continue;
+            };
+            let Some(chip) = chips.first() else { continue };
+            let family = chip.form.family.clone();
+            if family == "stm32f1" || family == "stm32n6" {
+                continue;
+            }
+            // A part the importer refuses never reaches the generator.
+            if crate::panels::mcu_module::stm32_support::refusal(
+                &family,
+                &chip.form.display_name,
+                &chip.cores,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            let Ok(key) = cubemx::clock_key_from_mcu_xml(&xml) else {
+                continue;
+            };
+            if !seen.insert(format!("{family} {key:?}")) {
+                continue;
+            }
+            let Ok((gc, _)) = cubemx::graph_for_chip_xml(&db, &xml, &family) else {
+                continue;
+            };
+            let feature = embassy_chip_feature(&chip.form.display_name);
+            let pac = std::fs::read_to_string(
+                metapac
+                    .join("src")
+                    .join("chips")
+                    .join(&feature)
+                    .join("pac.rs"),
+            )
+            .unwrap_or_default();
+            let Some(rcc_file) = pac
+                .split("#[path = \"../../peripherals/rcc_")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+            else {
+                continue; // a part embassy has no chip for
+            };
+            let regs = std::fs::read_to_string(
+                metapac
+                    .join("src")
+                    .join("peripherals")
+                    .join(format!("rcc_{rcc_file}")),
+            )
+            .unwrap_or_default();
+            let sw_ok = variants(&regs, "Sw");
+            let src_ok: Vec<String> = if matches!(family.as_str(), "stm32f0" | "stm32f3") {
+                ["HSE", "HSI", "HSI48"].map(String::from).to_vec()
+            } else {
+                variants(&regs, "Pllsrc")
+            };
+            let dump_here = dump.is_some() && !feature.contains("-cm");
+            let mut here = std::collections::BTreeSet::new();
+            let mux_inputs = |id: &str| -> usize {
+                match gc.for_codegen().node(id).map(|n| &n.kind) {
+                    Some(NodeKind::Mux { inputs }) => *inputs,
+                    _ => 0,
+                }
+            };
+            let (sw_n, src_n) = (mux_inputs("sw"), mux_inputs("pllsrc").max(1));
+            // A copy of the tree with SYSCLK on input `i` and the PLL on `j`.
+            let select = |i: usize, j: usize| {
+                let mut gc = gc.clone();
+                for (canon, k) in [("sw", i), ("pllsrc", j)] {
+                    let id = gc
+                        .bindings
+                        .get(canon)
+                        .cloned()
+                        .unwrap_or_else(|| canon.into());
+                    if let Some(n) = gc.graph.node_mut(&id)
+                        && matches!(n.kind, NodeKind::Mux { .. })
+                    {
+                        n.state = NodeState::Index(k);
+                    }
+                }
+                gc
+            };
+            // Every `rcc::<Type>::<VARIANT>` a block can name for a prescaler
+            // or a PLL factor, and the PAC enum embassy aliases it to.
+            let pac_enums: Vec<(&str, Vec<String>)> = [
+                ("AHBPrescaler", "Hpre"),
+                ("APBPrescaler", "Ppre"),
+                ("PllPreDiv", "Pllm"),
+                ("PllMul", "Plln"),
+                ("PllPDiv", "Pllp"),
+                ("PllQDiv", "Pllq"),
+                ("PllRDiv", "Pllr"),
+                ("PllDiv", "Plldiv"),
+            ]
+            .into_iter()
+            .map(|(ty, pac_name)| (ty, variants(&regs, pac_name)))
+            .collect();
+            let pac_wrong = |block: &str, at: &str, wrong: &mut Vec<String>| {
+                for (ty, ok) in &pac_enums {
+                    for v in named(block, ty) {
+                        if !ok.contains(&v) {
+                            wrong.push(format!("{at}: {ty}::{v} is not one of {ok:?}"));
+                        }
+                    }
+                }
+            };
+            // (SYSCLK input, PLL source, it names the PLL) of each block written.
+            let mut generated: Vec<(usize, usize, bool)> = Vec::new();
+            for i in 0..sw_n {
+                for j in 0..src_n {
+                    let gc = select(i, j);
+                    let supported = tree_sources_supported(&gc.for_codegen());
+                    let block = graph_clock_block_for(
+                        &chip.form.id,
+                        &family,
+                        &ClockConfig::Graph(gc),
+                        false,
+                    );
+                    let skeleton = block.contains("embassy_stm32::init(Default::default())");
+                    if dump_here {
+                        // The skeleton's example is code too, once uncommented.
+                        let code: String = block
+                            .lines()
+                            .map(|l| {
+                                l.strip_prefix("    //   ")
+                                    .map_or(l.to_owned(), |c| format!("    {c}"))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        here.insert(code);
+                    }
+                    if skeleton {
+                        skeletons += 1;
+                    } else {
+                        blocks += 1;
+                        generated.push((i, j, block.contains("PllMul::")));
+                    }
+                    let at = format!(
+                        "{family} ({}) SYSCLK input {i}, PLL source {j}",
+                        chip.form.display_name
+                    );
+                    pac_wrong(&block, &at, &mut wrong);
+                    if !supported && !skeleton {
+                        wrong.push(format!("{at}: an unsupported source, and still a block"));
+                    }
+                    for v in named(&block, "Sysclk") {
+                        if !sw_ok.contains(&v) {
+                            wrong.push(format!("{at}: Sysclk::{v} is not one of {sw_ok:?}"));
+                        }
+                    }
+                    for v in named(&block, "PllSource") {
+                        if !src_ok.contains(&v) {
+                            wrong.push(format!("{at}: PllSource::{v} is not one of {src_ok:?}"));
+                        }
+                    }
+                    if msi_family(&family)
+                        && block.contains("Sysclk::HSI")
+                        && !block.contains("config.rcc.hsi = true;")
+                    {
+                        wrong.push(format!("{at}: HSI selected, never turned on"));
+                    }
+                    // `generic_refusal`'s USB PHY rule reads the HSE because no
+                    // block moves these off it.
+                    if block.contains("mux.otghssel") || block.contains("mux.usbphycsel") {
+                        wrong.push(format!("{at}: a block writes the USB PHY selector"));
+                    }
+                }
+            }
+            // Then every option the tree offers, not only its default: the
+            // prescalers on the first selection that is written, the PLL's
+            // factors on the first that writes the PLL. (An imported WB/WL tree
+            // offers a PLLR /8 its PAC's `Pllr` does not have.)
+            let base = generated.first().copied();
+            let with_pll = generated.iter().find(|g| g.2).copied();
+            for (combo, nodes) in [
+                (base, &["ahb", "apb1", "apb2", "apb7"][..]),
+                (with_pll, &["pllm", "plln", "pllp", "pllq", "pllr"][..]),
+            ] {
+                let Some((i, j, _)) = combo else { continue };
+                for canon in nodes {
+                    let id = gc
+                        .bindings
+                        .get(*canon)
+                        .cloned()
+                        .unwrap_or_else(|| (*canon).to_owned());
+                    let states: Vec<NodeState> = match gc.graph.node(&id).map(|n| &n.kind) {
+                        Some(NodeKind::Divider { options }) => {
+                            (0..options.len()).map(NodeState::Index).collect()
+                        }
+                        Some(NodeKind::Choice { ratios }) => {
+                            (0..ratios.len()).map(NodeState::Index).collect()
+                        }
+                        Some(NodeKind::Multiplier { min, max }) => {
+                            (*min..=*max).map(NodeState::Value).collect()
+                        }
+                        _ => continue,
+                    };
+                    let kind = gc.graph.node(&id).map(|n| format!("{:?}", n.kind));
+                    if !swept.insert(format!("{family} {rcc_file} {canon} {kind:?} {i} {j}")) {
+                        continue;
+                    }
+                    for state in states {
+                        let mut gc = select(i, j);
+                        let shown = format!("{state:?}");
+                        if let Some(n) = gc.graph.node_mut(&id) {
+                            n.state = state;
+                        }
+                        let block = graph_clock_block_for(
+                            &chip.form.id,
+                            &family,
+                            &ClockConfig::Graph(gc),
+                            false,
+                        );
+                        options += 1;
+                        let at = format!(
+                            "{family} ({}) SYSCLK input {i}, PLL source {j}, {canon} {shown}",
+                            chip.form.display_name
+                        );
+                        pac_wrong(&block, &at, &mut wrong);
+                    }
+                }
+            }
+            if dump_here && !here.is_empty() {
+                let entry = (
+                    feature.clone(),
+                    chip.form.target.clone(),
+                    chip.form.display_name.clone(),
+                    chip.form.hal_dep.clone(),
+                    here,
+                );
+                let parts = dumped.entry(family.clone()).or_default();
+                if parts.len() < 2 {
+                    parts.push(entry);
+                } else {
+                    parts[1] = entry;
+                }
+            }
+        }
+        if let Some(dir) = &dump {
+            std::fs::create_dir_all(dir).expect("the dump folder");
+            let mut targets = String::new();
+            for (family, parts) in &dumped {
+                for (feature, target, part, hal_dep, blocks) in parts {
+                    let mut file = format!("// {family}: {part}\n");
+                    for (n, b) in blocks.iter().enumerate() {
+                        file.push_str(&format!("#[allow(unused)]\nfn case_{n}() {{\n{b}\n}}\n\n"));
+                    }
+                    std::fs::write(dir.join(format!("{feature}.rs")), file).expect("writable");
+                    // The line the importer writes: `single-bank`, the time driver.
+                    std::fs::write(dir.join(format!("{feature}.dep")), hal_dep).expect("writable");
+                    targets.push_str(&format!("{feature} {target} {}\n", blocks.len()));
+                }
+            }
+            std::fs::write(dir.join("targets.txt"), targets).expect("writable");
+        }
+        println!(
+            "{} trees: {blocks} generated blocks, {skeletons} skeletons, {options} options",
+            seen.len()
+        );
+        wrong.sort();
+        wrong.dedup();
+        assert!(
+            wrong.is_empty(),
+            "{} wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        assert!(seen.len() > 15, "suspiciously few trees: {seen:?}");
+        // And not vacuous: a gate that refused everything would pass the rest.
+        // Measured 1636 trees, 7976 blocks and 3202 options (2026-10-21).
+        assert!(
+            blocks > 5000 && options > 2000,
+            "suspiciously little generated: {blocks} blocks, {options} options"
+        );
+    }
+
+    /// The source behind an input, through its dividers: a divided HSI on
+    /// SYSCLK is not plain HSI, an HSE predivider bound as `pllm` is still the
+    /// HSE, and every spelling of the 48 MHz RC is unwritten.
+    #[test]
+    fn a_source_is_read_through_its_dividers() {
+        use crate::panels::mcu_module::clock::graph::{Edge, Node};
+        let node = |id: &str, kind: NodeKind, state: NodeState| Node {
+            id: id.into(),
+            kind,
+            state,
+            limit: None,
+        };
+        let edge = |from: &str, to: &str, input: usize| Edge {
+            from: from.into(),
+            to: to.into(),
+            input,
+        };
+        let src = NodeState::Source {
+            enabled: true,
+            hz: 64_000_000,
+        };
+        let source = || NodeKind::Source {
+            min_hz: 0,
+            max_hz: 0,
+            gated: false,
+        };
+        // H5: HSIRC -> HSIDiv (/1 /2 /4 /8) -> SYSCLK input 1.
+        let mut h5 = ClockGraph {
+            nodes: vec![
+                node("HSIRC", source(), src.clone()),
+                node(
+                    "hsi",
+                    NodeKind::Divider {
+                        options: vec![1, 2, 4, 8],
+                    },
+                    NodeState::Index(1),
+                ),
+                node("CSIRC", source(), src.clone()),
+                node("sw", NodeKind::Mux { inputs: 2 }, NodeState::Index(1)),
+            ],
+            edges: vec![
+                edge("HSIRC", "hsi", 0),
+                edge("CSIRC", "sw", 0),
+                edge("hsi", "sw", 1),
+            ],
+        };
+        assert_eq!(mux_source(&h5, "sw"), Some(MuxSource::Other), "HSI /2");
+        assert!(!tree_sources_supported(&h5));
+        h5.node_mut("hsi").unwrap().state = NodeState::Index(0);
+        assert_eq!(mux_source(&h5, "sw"), Some(MuxSource::Hsi), "HSI /1");
+        h5.node_mut("sw").unwrap().state = NodeState::Index(0);
+        assert_eq!(mux_source(&h5, "sw"), Some(MuxSource::Other), "CSI");
+
+        // F0/F3: HSE -> PREDIV bound as `pllm` -> PLL source input 1.
+        let f0 = ClockGraph {
+            nodes: vec![
+                node("HSE", source(), src.clone()),
+                node(
+                    "pllm",
+                    NodeKind::Divider {
+                        options: vec![1, 2, 3],
+                    },
+                    NodeState::Index(1),
+                ),
+                node("HSIRC", source(), src.clone()),
+                node("pllsrc", NodeKind::Mux { inputs: 2 }, NodeState::Index(1)),
+            ],
+            edges: vec![
+                edge("HSE", "pllm", 0),
+                edge("HSIRC", "pllsrc", 0),
+                edge("pllm", "pllsrc", 1),
+            ],
+        };
+        assert_eq!(mux_source(&f0, "pllsrc"), Some(MuxSource::Hse));
+
+        for id in ["HSI48", "HSIRC48", "HSIUSB48", "MSIRC", "CSI", "LSE"] {
+            assert_eq!(classify_source(id), MuxSource::Other, "{id}");
+        }
+        assert_eq!(classify_source("HSIRC"), MuxSource::Hsi);
+        assert_eq!(classify_source("pllxtpre"), MuxSource::Hse);
+        assert!(
+            !generic_allowed("stm32u3")
+                && !generic_allowed("stm32c0")
+                && generic_allowed("stm32h5")
+        );
+    }
+
+    /// The skeleton's example compiles on the families it is written for: no
+    /// `PLL1_P`, and the WB/WL prescaler; its comment names the real default.
+    #[test]
+    fn the_skeleton_names_the_familys_default_clock() {
+        let wl = hand_written_skeleton("stm32wl", Skeleton::NoRecipe, true);
+        assert!(!wl.contains("PLL1_P"), "{wl}");
+        assert!(wl.contains("prescaler: rcc::HsePrescaler::DIV1"), "{wl}");
+        assert!(wl.contains("(MSI)"), "{wl}");
+        let u5 = hand_written_skeleton("stm32u5", Skeleton::NoRecipe, true);
+        assert!(u5.contains("(MSIS)") && !u5.contains("prescaler"), "{u5}");
+        assert!(hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true).contains("(HSI)"));
+        assert!(
+            hand_written_skeleton("stm32h7", Skeleton::Source, true)
+                .contains("selects a clock source")
+        );
+        // Outside the markers it does not promise to keep an edit.
+        for why in [
+            Skeleton::NoRecipe,
+            Skeleton::Source,
+            Skeleton::Shape(GenericRefusal::Pll),
+            Skeleton::Shape(GenericRefusal::UsbPhy),
+        ] {
+            let kept = hand_written_skeleton("stm32h7", why, true);
+            let regenerated = hand_written_skeleton("stm32h7", why, false);
+            assert!(kept.contains("kept across regeneration"), "{kept}");
+            assert!(
+                !regenerated.contains("kept across regeneration"),
+                "{regenerated}"
+            );
+            assert!(
+                regenerated.contains("Write the clock by hand"),
+                "{regenerated}"
+            );
+            // Only the head differs: the example is the same code.
+            let example = |s: &str| s.split_once("\n    //\n").map(|(_, rest)| rest.to_owned());
+            assert_eq!(example(&kept), example(&regenerated));
+            assert!(example(&kept).is_some(), "{kept}");
+            // And no line repeats a word across its break ("To set it / it here").
+            for s in [&kept, &regenerated] {
+                let words: Vec<&str> = s.split_whitespace().filter(|w| *w != "//").collect();
+                assert!(!words.windows(2).any(|w| w[0] == w[1]), "{s}");
+            }
+        }
+        // Only the example is indented as code: nothing in the head is.
+        for r in [
+            GenericRefusal::Pll,
+            GenericRefusal::HsePrescaler,
+            GenericRefusal::UsbPhy,
+            GenericRefusal::AdcAhb,
+        ] {
+            let s = hand_written_skeleton("stm32wl", Skeleton::Shape(r), false);
+            let head = s.split_once("\n    //\n").map_or("", |(h, _)| h);
+            assert!(!head.lines().any(|l| l.starts_with("    //   ")), "{s}");
+        }
+        // The example compiles on the family it is printed for, and does not
+        // panic where the USB PHY rule refused: WBA's `Hse` is a prescaler.
+        let wba = hand_written_skeleton("stm32wba", Skeleton::Source, true);
+        assert!(
+            wba.contains("Hse { prescaler: rcc::HsePrescaler::DIV1 }"),
+            "{wba}"
+        );
+        assert!(!wba.contains("freq:"), "{wba}");
+        assert!(wba.contains("VoltageScale::RANGE1"), "{wba}");
+        let wb = hand_written_skeleton("stm32wb", Skeleton::NoRecipe, true);
+        assert!(
+            wb.contains("Hertz(32_000_000)") && wb.contains("HsePrescaler::DIV1"),
+            "{wb}"
+        );
+        let n6 = hand_written_skeleton("stm32n6", Skeleton::NoRecipe, true);
+        assert!(
+            n6.contains("rcc::SysClk::Hse") && !n6.contains("Sysclk::HSE"),
+            "{n6}"
+        );
+        assert!(
+            hand_written_skeleton("stm32f4", Skeleton::Source, true).contains("Hertz(8_000_000)")
+        );
+        let u5 = hand_written_skeleton("stm32u5", Skeleton::NoRecipe, true);
+        assert!(u5.contains("Hertz(16_000_000)"), "{u5}");
+        let rs = hand_written_skeleton("stm32h7", Skeleton::Shape(GenericRefusal::UsbPhy), false);
+        assert!(rs.contains("Hertz(16_000_000)"), "{rs}");
+        assert!(
+            hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true)
+                .contains("Hertz(16_000_000)")
+        );
+        // The reason is the refusal's, word for word.
+        let rs = hand_written_skeleton("stm32h7", Skeleton::Shape(GenericRefusal::UsbPhy), true);
+        assert!(
+            rs.contains("USB OTG_HS") && rs.contains("26 or\n    // 32 MHz"),
+            "{rs}"
+        );
+        // The hand-written projects that exist keep their text byte for byte.
+        assert!(
+            hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true).starts_with(concat!(
+                "    // Clock: this chip's family has no generated RCC recipe yet, so the\n",
+                "    // Clock tab's tree cannot be turned into code automatically. Set it\n",
+                "    // here — this block is kept across regeneration.\n    //\n"
+            ))
+        );
+    }
+
+    /// A dual-core skeleton: the static once, OUTSIDE the manual markers,
+    /// and no `init` left anywhere, the commented example included.
+    #[test]
+    fn a_dual_core_block_calls_init_primary() {
+        use super::super::common::clock_region;
+        let block = graph_clock_block_for("stm32wl55jcix", "stm32wl", &ClockConfig::None, true);
+        let out = for_dual_core(&block, "stm32wl55jc-cm4");
+        assert_eq!(
+            out.matches("static SHARED_DATA: core::mem::MaybeUninit<embassy_stm32::SharedData>")
+                .count(),
+            1,
+            "{out}"
+        );
+        let region = clock_region(&out).expect("the manual markers");
+        assert!(!region.contains("SHARED_DATA:"), "{out}");
+        assert!(
+            out.contains(
+                "let p = embassy_stm32::init_primary(Default::default(), &SHARED_DATA); // embassy's default clock (MSI)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("//   let p = embassy_stm32::init_primary(config, &SHARED_DATA);"),
+            "{out}"
+        );
+        assert!(!out.contains("embassy_stm32::init("), "{out}");
+        assert!(out.contains("`stm32wl55jc-cm4`"), "{out}");
+    }
+
     use super::*;
 
     /// The F2 recipe must carry a PLLN window; the F4/F7 one shares every other
@@ -1529,8 +2889,8 @@ mod tests {
         );
         assert!(s.contains("// Clock: this chip's family has no generated RCC recipe"));
         assert!(
-            s.contains("//       config.rcc.sys = rcc::Sysclk::PLL1_P;"),
-            "the shape to uncomment is there"
+            s.contains("//       config.rcc.sys = rcc::Sysclk::HSE;"),
+            "the shape to uncomment is there, in a form every family compiles"
         );
         // Nothing active is `mut`, so no project picks up a warning from it.
         assert!(!s.contains(
@@ -1566,10 +2926,8 @@ mod tests {
         assert!(rcc_recipe("stm32h5").is_none());
 
         let mut graph = minimal_graph();
-        // HSE 8 MHz /1 x60 /2 = 240 MHz on SYSCLK.
-        graph.node_mut("pllsrc").unwrap().state = NodeState::Index(1);
-        graph.node_mut("plln").unwrap().state = NodeState::Value(60);
-        graph.node_mut("sw").unwrap().state = NodeState::Index(2);
+        // HSE 8 MHz straight to SYSCLK.
+        graph.node_mut("sw").unwrap().state = NodeState::Index(1);
         let clock = ClockConfig::Graph(GraphClock {
             graph,
             layout: Default::default(),
@@ -1582,14 +2940,254 @@ mod tests {
         assert!(s.contains("let p = embassy_stm32::init(config);"));
         assert!(!s.contains("has no generated RCC recipe yet"));
         // And it says what the tree says.
-        assert!(s.contains("SYSCLK 240 MHz"), "{s}");
-        assert!(s.contains("mul: rcc::PllMul::MUL60,"), "{s}");
+        assert!(s.contains("SYSCLK 8 MHz"), "{s}");
+        assert!(s.contains("config.rcc.sys = rcc::Sysclk::HSE;"), "{s}");
         assert!(s.contains("Hertz(8000000)"), "{s}");
         // Honest about the one thing it guessed.
         assert!(s.contains("no verified RCC recipe for this family"));
         // Which in turn flips the hand-written default off, so it UPDATES.
         assert!(generates_clock_code_for("stm32h5", &clock));
         assert!(!generates_clock_code_for("stm32h5", &ClockConfig::None));
+    }
+
+    /// The generic block is one that compiles AND boots on the family, read
+    /// against embassy-stm32 0.6 (`generic_writes`): never a PLL, no HSE on
+    /// WB/WL (`Hse` takes a `prescaler`) or U5 (the OTG_HS reference panics),
+    /// no AHB prescaler on F3 (the ADC clock assert); HSI switched on where
+    /// embassy leaves it off, and no `apb2_pre` where `Config` has none.
+    #[test]
+    fn the_generic_block_compiles_and_boots_on_the_family() {
+        use crate::panels::mcu_module::clock::graph::{
+            GraphClock, minimal_graph, model::NodeState, stm32g4_graph,
+        };
+        let clock = |graph| {
+            ClockConfig::Graph(GraphClock {
+                graph,
+                layout: Default::default(),
+                bindings: Default::default(),
+            })
+        };
+        let refused = |family: &str, c: &ClockConfig| {
+            let s = graph_clock_block(family, c, false);
+            assert!(
+                s.contains("only that recipe can write safely"),
+                "{family}:\n{s}"
+            );
+            assert!(
+                s.contains("let p = embassy_stm32::init(Default::default());"),
+                "{s}"
+            );
+            assert!(!generates_clock_code_for(family, c), "{family}");
+            // The Clock tab says which selection, not "no generator".
+            assert!(
+                skeleton_reason(family, c).is_some_and(|r| r.contains("own recipe")),
+                "{family}"
+            );
+        };
+        let sw = |n: usize| {
+            let mut g = minimal_graph();
+            g.node_mut("sw").unwrap().state = NodeState::Index(n);
+            g
+        };
+
+        // A PLL, on every family the generic recipe reaches - L5 with the very
+        // G4 shape its `rcc/l.rs` has included.
+        let mut pll = sw(2);
+        pll.node_mut("pllsrc").unwrap().state = NodeState::Index(1);
+        pll.node_mut("plln").unwrap().state = NodeState::Value(60);
+        let pll = clock(pll);
+        for family in [
+            "stm32f0", "stm32f3", "stm32h5", "stm32h7", "stm32l0", "stm32l1", "stm32l5", "stm32u0",
+            "stm32u5", "stm32wb", "stm32wl",
+        ] {
+            refused(family, &pll);
+        }
+        refused("stm32l5", &clock(stm32g4_graph()));
+
+        let hse = clock(sw(1));
+        for family in ["stm32wb", "stm32wl"] {
+            refused(family, &hse);
+        }
+        // An H7 tree with no USB PHY node is not an H7RS: its HSE is written.
+        for family in ["stm32h7", "stm32f0", "stm32l1"] {
+            assert!(generates_clock_code_for(family, &hse), "{family}");
+            assert_eq!(skeleton_reason(family, &hse), None);
+        }
+        assert_eq!(skeleton_reason("stm32wba", &ClockConfig::None), None);
+
+        // HSI: turned on by the family, not by an MSI node the tree may lack.
+        let hsi = clock(sw(0));
+        for family in ["stm32l5", "stm32wb", "stm32u0", "stm32u5", "stm32l1"] {
+            let s = graph_clock_block(family, &hsi, false);
+            assert!(s.contains("config.rcc.hsi = true;"), "{family}:\n{s}");
+        }
+        for family in ["stm32h7", "stm32f3"] {
+            let s = graph_clock_block(family, &hsi, false);
+            assert!(s.contains("rcc::Sysclk::HSI"), "{s}");
+            assert!(!s.contains("config.rcc.hsi ="), "{family}:\n{s}");
+        }
+
+        // One APB on F0/U0.
+        for family in ["stm32f0", "stm32u0"] {
+            let s = graph_clock_block(family, &hsi, false);
+            assert!(s.contains("config.rcc.apb1_pre"), "{s}");
+            assert!(!s.contains("apb2_pre"), "{family}:\n{s}");
+        }
+        assert!(graph_clock_block("stm32f3", &hsi, false).contains("apb2_pre"));
+
+        // AHB /2: the F3's ADC assert refuses it, the F0 has no such check.
+        let mut ahb = sw(0);
+        ahb.node_mut("ahb").unwrap().state = NodeState::Index(1);
+        let ahb = clock(ahb);
+        refused("stm32f3", &ahb);
+        let s = graph_clock_block("stm32f0", &ahb, false);
+        assert!(s.contains("AHBPrescaler::DIV2"), "{s}");
+
+        // An H7RS or U5 with OTG_HS takes its USB PHY reference from the HSE.
+        let mut rs = sw(1);
+        rs.nodes
+            .push(crate::panels::mcu_module::clock::graph::Node {
+                id: "USBPHYCLKMux".into(),
+                kind: crate::panels::mcu_module::clock::graph::NodeKind::Mux { inputs: 3 },
+                state: NodeState::Index(0),
+                limit: None,
+            });
+        refused("stm32h7", &clock(rs.clone()));
+        refused("stm32u5", &clock(rs.clone()));
+        // A U5 is refused whatever its tree: the part decides, and the generic
+        // block does not know it.
+        refused("stm32u5", &hse);
+        let NodeState::Source { enabled, .. } = rs.node("hse").unwrap().state else {
+            panic!("the HSE is a source")
+        };
+        rs.node_mut("hse").unwrap().state = NodeState::Source {
+            enabled,
+            hz: 24_000_000,
+        };
+        assert!(generates_clock_code_for("stm32h7", &clock(rs.clone())));
+        assert!(generates_clock_code_for("stm32u5", &clock(rs)));
+
+        // embassy's HSI, not the tree's: the minimal tree's 16 MHz is 8 on an
+        // F0 and 64 on an H7 - what the header says and the boot check counts.
+        let s = graph_clock_block("stm32f0", &hsi, false);
+        assert!(s.contains("SYSCLK 8 MHz (HSI8)"), "{s}");
+        let s = graph_clock_block("stm32h7", &hsi, false);
+        assert!(s.contains("SYSCLK 64 MHz (HSI64)"), "{s}");
+        assert!(graph_clock_block("stm32l1", &hsi, false).contains("SYSCLK 16 MHz (HSI16)"));
+
+        // U3 and C0 read no tree: the skeleton says so whatever is selected,
+        // and the tab does not blame the source.
+        for family in ["stm32u3", "stm32c0"] {
+            let s = graph_clock_block(family, &hsi, false);
+            assert!(s.contains("has no generated RCC recipe yet, so the"), "{s}");
+            assert_eq!(skeleton_reason(family, &hsi), None);
+        }
+
+        // Whether THIS selection generates is one question; whether the tree
+        // can drive the code at all is another: an import at a selection the
+        // generic block does not write (its MSI default, a PLL) is not
+        // "written by hand".
+        let unwritten = clock(sw(2));
+        assert!(!generates_clock_code_for("stm32u5", &unwritten));
+        assert!(tree_drives_clock_code("stm32u5", &unwritten));
+        assert!(tree_drives_clock_code("stm32l4", &unwritten));
+        assert!(!tree_drives_clock_code("stm32u3", &unwritten));
+        assert!(!tree_drives_clock_code("stm32h7", &ClockConfig::None));
+    }
+
+    /// The Async runtime's own boot check: embassy-time's timer at 1 MHz or
+    /// more, on the bus that timer is on - for a family's recipe as much as
+    /// for the generic one.
+    #[test]
+    fn a_timer_under_a_megahertz_is_a_boot_panic_on_async() {
+        use crate::panels::mcu_module::clock::graph::{
+            GraphClock, minimal_graph, model::NodeState, stm32f4_graph,
+        };
+        let clock = |graph| {
+            ClockConfig::Graph(GraphClock {
+                graph,
+                layout: Default::default(),
+                bindings: Default::default(),
+            })
+        };
+        // 8 MHz HSI straight to SYSCLK, AHB /16: everything at 500 kHz on an F0.
+        let mut slow = minimal_graph();
+        slow.node_mut("hsi").unwrap().state = NodeState::Source {
+            enabled: true,
+            hz: 8_000_000,
+        };
+        slow.node_mut("ahb").unwrap().state = NodeState::Index(4);
+        let slow = clock(slow);
+        assert_eq!(apb_timer_clocks("stm32f0", &slow), vec![(1, 500_000)]);
+        assert_eq!(apb_bus_clocks("stm32f0", &slow), vec![(1, 500_000)]);
+        // The bus clocks are what main.rs runs: an H7's HSI is embassy's 64 MHz
+        // whatever the minimal tree says, and a timer behind /2 runs at twice
+        // its bus.
+        let mut h7 = minimal_graph();
+        h7.node_mut("apb1").unwrap().state = NodeState::Index(1);
+        let h7 = clock(h7);
+        assert_eq!(
+            apb_bus_clocks("stm32h7", &h7),
+            vec![(1, 32_000_000), (2, 64_000_000)]
+        );
+        assert_eq!(
+            apb_timer_clocks("stm32h7", &h7),
+            vec![(1, 64_000_000), (2, 64_000_000)]
+        );
+        // The F1 on Async: the WWDG card's bus too (its only runtime with one),
+        // from the block's own reader - the shipped 72 MHz tree, APB1 /2.
+        let f1 = clock(crate::panels::mcu_module::clock::graph::stm32f1_graph(
+            &Default::default(),
+        ));
+        assert_eq!(
+            apb_bus_clocks("stm32f1", &f1),
+            vec![(1, 36_000_000), (2, 72_000_000)]
+        );
+        let why = time_driver_issue("stm32f0", &slow, Some(15)).expect("a panic at boot");
+        assert!(
+            why.contains("TIM15") && why.contains("500 kHz") && why.contains("APB1"),
+            "{why}"
+        );
+        // The shipped F4 tree is well above it, on either bus.
+        let f4 = clock(stm32f4_graph());
+        assert_eq!(time_driver_issue("stm32f4", &f4, Some(9)), None);
+        assert_eq!(time_driver_issue("stm32f4", &f4, None), None);
+        // ...until its AHB is divided by 512.
+        let mut g = stm32f4_graph();
+        let n = g.node_mut("ahb").unwrap();
+        let crate::panels::mcu_module::clock::graph::NodeKind::Divider { options } = &n.kind else {
+            panic!("AHB is a divider")
+        };
+        n.state = NodeState::Index(options.iter().position(|d| *d == 512).expect("/512"));
+        assert!(time_driver_issue("stm32f4", &clock(g), Some(9)).is_some());
+        // The skeleton runs embassy's default: nothing to accuse.
+        let mut pll = minimal_graph();
+        pll.node_mut("sw").unwrap().state = NodeState::Index(2);
+        pll.node_mut("ahb").unwrap().state = NodeState::Index(8);
+        assert!(apb_timer_clocks("stm32h7", &clock(pll)).is_empty());
+        assert_eq!(time_driver_issue("stm32h7", &ClockConfig::None, None), None);
+
+        // The F1's own refusal: x16 on the 8 MHz crystal is a 128 MHz PLL,
+        // counted with the HSE on even where the tree left it off.
+        use crate::panels::mcu_module::clock::model::Stm32f1Clock;
+        let f1 =
+            |c: Stm32f1Clock| clock(crate::panels::mcu_module::clock::graph::stm32f1_graph(&c));
+        assert_eq!(
+            async_boot_issue("stm32f1", &f1(Stm32f1Clock::default()), Some(4)),
+            None
+        );
+        let fast = Stm32f1Clock {
+            hse_enabled: false,
+            pll_mul: 16,
+            ..Stm32f1Clock::default()
+        };
+        let why = async_boot_issue("stm32f1", &f1(fast), Some(4)).expect("a panic at boot");
+        assert!(why.contains("over the F1's limit"), "{why}");
+        // Everywhere else it is the time-driver check.
+        assert_eq!(
+            async_boot_issue("stm32f0", &slow, Some(15)),
+            time_driver_issue("stm32f0", &slow, Some(15))
+        );
     }
 
     /// Peripheral kernel clocks reach `main.rs` — the whole of layer 1.
@@ -1668,7 +3266,9 @@ mod tests {
     ///
     /// F0/F1/F3 have no PLL output divider at all. The generic recipe used to
     /// key on one and refuse the tree, which is how an STM32F358 imported with
-    /// its whole clock tree still generated no clock code.
+    /// its whole clock tree still generated no clock code. The generic path
+    /// writes no PLL now (`generic_writes`); the shape stays, emitted from its
+    /// descriptor, for the F0/F3 recipe.
     #[test]
     fn a_pll_with_no_output_divider_is_its_own_shape() {
         use crate::panels::mcu_module::clock::graph::{
@@ -1705,7 +3305,10 @@ mod tests {
             layout: Default::default(),
             bindings: Default::default(),
         });
-        let block = graph_clock_block("stm32f3", &clock, false);
+        let ClockConfig::Graph(gc) = &clock else {
+            unreachable!()
+        };
+        let block = emit_rcc_block(&desc, &read_rcc_values(&gc.graph, &spec));
         assert!(block.contains("src: rcc::PllSource::HSE,"), "{block}");
         assert!(block.contains("mul: rcc::PllMul::MUL9,"), "{block}");
         assert!(
@@ -1714,6 +3317,9 @@ mod tests {
         );
         // 8 MHz HSE /1 x9 = 72 MHz, the classic F1/F3 maximum.
         assert!(block.contains("SYSCLK 72 MHz"), "{block}");
+        // Through the generic recipe it is the skeleton: an imported tree's
+        // PLLMUL is a list its reader does not read.
+        assert!(!generates_clock_code_for("stm32f3", &clock));
 
         // And an empty graph is still refused — the spine is what makes it work.
         let empty = ClockGraph {
@@ -1802,7 +3408,7 @@ mod tests {
 
         let generated = graph_clock_block("stm32h5", &ClockConfig::None, true);
         let edited = generated.replace(
-            "let p = embassy_stm32::init(Default::default()); // reset clock (HSI)",
+            "let p = embassy_stm32::init(Default::default()); // embassy's default clock (HSI)",
             "let p = embassy_stm32::init(my_config()); // 250 MHz, by hand",
         );
         let existing = format!(
@@ -1936,8 +3542,12 @@ mod tests {
         // tree it carries, via `generic_recipe`. It used to get the reset init
         // no matter what the tree said — which meant a configured Clock tab
         // produced no clock code at all.
+        let mut graph = stm32f4_graph();
+        // HSI straight to SYSCLK: the H7's `pll1` is not the F4's `pll`.
+        graph.node_mut("sw").unwrap().state =
+            crate::panels::mcu_module::clock::graph::NodeState::Index(0);
         let g = GraphClock {
-            graph: stm32f4_graph(),
+            graph,
             layout: Default::default(),
             bindings: Default::default(),
         };
@@ -1948,6 +3558,14 @@ mod tests {
         );
         assert!(s.contains("no verified RCC recipe for this family"), "{s}");
         assert!(s.contains("let p = embassy_stm32::init(config);"), "{s}");
+        // Its PLL is the skeleton: the F4 shape names fields the H7 lacks.
+        let g = GraphClock {
+            graph: stm32f4_graph(),
+            layout: Default::default(),
+            bindings: Default::default(),
+        };
+        let s = graph_clock_block("stm32h7", &ClockConfig::Graph(g), false);
+        assert!(s.contains("only that recipe can write safely"), "{s}");
 
         // Non-graph clock → reset init.
         assert!(

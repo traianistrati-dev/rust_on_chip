@@ -745,10 +745,11 @@ mod emit_for_manual_compile {
         }
 
         // -- Watchdogs on the WBA ------------------------------------------
-        // Its own backend and its own limits: `iwdg_v3` prescales to /1024
-        // (four times further than the F4) and `wwdg_v2` to /128, so the
-        // defaults here are numbers no other family produces - worth
-        // compiling rather than assuming the embassy templates carry over.
+        // Its own backend and its own limits: `wwdg_v2` prescales to /128
+        // (sixteen times further than the F4), so the WWDG default here is a
+        // number no other row produces - worth compiling rather than assuming
+        // the embassy templates carry over. Its `iwdg_v3` would reach /1024,
+        // but embassy 0.6 stops at /256, so the IWDG default is the F4's.
         {
             use crate::panels::mcu_module::watchdog::{
                 IwdgConfig, WatchdogSettings, WwdgConfig, iwdg_range_us, limits_for, wwdg_range_us,
@@ -2682,10 +2683,17 @@ mod emit_for_manual_compile {
         use crate::panels::mcu_module::codegen::dma_data;
         use crate::panels::mcu_module::modules::{AsyncBusMode, ModuleConfig, UsartMode};
 
+        // `EIDE_CHIP_XML` names another part's file: a FULL path. Each one then
+        // gets its own directory, so four chips' builds do not pile into one
+        // `target/`; the default part keeps the one it always had.
+        let chosen = std::env::var("EIDE_CHIP_XML").ok();
         let Some(path) = vendor_chip_file("EIDE_CHIP_XML", "STM32G431C(6-8-B)Tx.xml") else {
-            eprintln!(
-                "STM32G431C(6-8-B)Tx.xml is in none of this machine's chip sources - nothing emitted"
-            );
+            match &chosen {
+                Some(p) => eprintln!("EIDE_CHIP_XML={p} is not a file - nothing emitted"),
+                None => eprintln!(
+                    "STM32G431C(6-8-B)Tx.xml is in none of this machine's chip sources - nothing emitted"
+                ),
+            }
             return;
         };
         let path = path.as_path();
@@ -2726,6 +2734,17 @@ mod emit_for_manual_compile {
         def.irq_vectors = irqs;
         def.usart_ip = stm32_pin_data::usart_ip_version(&xml);
         def.sdmmc_ip = stm32_pin_data::sdmmc_ip_version(&xml);
+        // A part embassy publishes twice (the STM32L1 `A` / `X` dies) compiles
+        // on either feature, so only the line itself shows which one it got.
+        if let Ok(want) = std::env::var("EIDE_EXPECT_FEATURE") {
+            assert_eq!(
+                stm32_pin_data::embassy_feature_in(&def.project.hal_dep),
+                Some(want.as_str()),
+                "{}: {}",
+                def.display_name,
+                def.project.hal_dep
+            );
+        }
         let mut mcu = def.build_mcu();
         mcu.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
 
@@ -3020,6 +3039,20 @@ mod emit_for_manual_compile {
             if want == PinFunction::SpiMiso(1) && std::env::var("EIDE_SPI_TXONLY").is_ok() {
                 continue;
             }
+            // `EIDE_IMPORT_SKIP=I2s,Dac` leaves those functions out. A chip whose
+            // DMA requests sit on FIXED channels cannot run every bus at once:
+            // on the STM32L151 USART1 and SPI2 both need DMA1 CH4/CH5, and the
+            // IDE rightly writes a TODO for the second - which no compiler takes.
+            let skip = std::env::var("EIDE_IMPORT_SKIP").unwrap_or_default();
+            let kind = format!("{want:?}");
+            if skip
+                .split(',')
+                .map(str::trim)
+                .any(|k| !k.is_empty() && kind.starts_with(k))
+            {
+                println!("left out by EIDE_IMPORT_SKIP: {kind}");
+                continue;
+            }
             let num = mcu
                 .iter_all_pins()
                 .find(|p| {
@@ -3198,6 +3231,22 @@ mod emit_for_manual_compile {
             }
         }
 
+        // `EIDE_IMPORT_WDG=1` switches both watchdogs on at the periods the
+        // tab hands out unedited, as the F4 and WBA rows do. Only a compile
+        // tells `p.IWDG` from the H7's `p.IWDG1`.
+        if std::env::var_os("EIDE_IMPORT_WDG").is_some() {
+            use crate::panels::mcu_module::watchdog::{
+                IwdgConfig, WwdgConfig, iwdg_range_us, limits_for, wwdg_range_us,
+            };
+            let l = limits_for(&mcu.family, mcu.runtime);
+            mcu.watchdog.iwdg = Some(IwdgConfig {
+                timeout_us: iwdg_range_us(&l).1,
+            });
+            mcu.watchdog.wwdg = Some(WwdgConfig {
+                timeout_us: wwdg_range_us(&l, 100_000_000).unwrap().1,
+                window_us: 0,
+            });
+        }
         let main_rs = mcu.fresh_main_rs();
         assert!(
             !main_rs.contains("DMA_TX_TODO"),
@@ -3206,8 +3255,20 @@ mod emit_for_manual_compile {
         // What the app writes when it saves this async project - a harness
         // that wrote anything else would compile a manifest the IDE never does.
         let files = manifest_sync::project_files(&def, &mcu, &main_rs);
+        // A green link proves nothing about RAM: the linker takes any region.
+        // memory.x must be the contiguous block the chip has.
+        if let Some(map) = stm32_pin_data::embassy_feature_in(&def.project.hal_dep)
+            .and_then(stm32_pin_data::memory_map)
+        {
+            let ram = crate::size::parse_memory_x(&files.memory_x).ram.expect("a RAM region");
+            assert_eq!(ram.origin, map.ram_origin as u64, "{}", files.memory_x);
+            assert!(ram.length <= map.ram_kib as u64 * 1024, "{}", files.memory_x);
+        }
         let user: Vec<(String, String)> = mcu.pin_tree_files();
-        let dir = std::env::temp_dir().join("eide_dma_check");
+        let dir = std::env::temp_dir().join(match chosen {
+            Some(_) => format!("eide_dma_{}", def.id),
+            None => "eide_dma_check".to_owned(),
+        });
         project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
             .expect("write dma project");

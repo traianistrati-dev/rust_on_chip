@@ -511,6 +511,8 @@ impl AppIde {
             match registry::save_definition(&def) {
                 Ok(path) => {
                     registry::merge_def(&mut self.mcu_registry, def.clone());
+                    // The New Project gaps were worked out for the old copy.
+                    self.new_project_gaps = None;
                     self.export_msg = format!(
                         "{}  MCU '{}' saved to {}",
                         ph::CHECK_CIRCLE,

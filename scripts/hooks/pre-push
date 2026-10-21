@@ -167,6 +167,10 @@ else
                 fams="$fams esp f1 embassy rp" ;;
             src/panels/mcu_module/stm32_flash_geometry.rs)
                 fams="$fams f1 embassy" ;;
+            # The chip-feature list and the memory map feed the importer: every
+            # imported-chip row, and the N6 one, convert through it.
+            src/panels/mcu_module/stm32_embassy_features.rs|            src/panels/mcu_module/stm32_memory_map.rs)
+                fams="$fams import n6" ;;
             # The IoT tab: generated for the ESP chips (Wi-Fi, ESP-NOW,
             # Bluetooth, Thread on the C6 / H2 / C5), the two Pico W boards
             # (Wi-Fi, Bluetooth) and the nRF52 (Bluetooth, Thread), nowhere

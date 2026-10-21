@@ -2797,6 +2797,7 @@ impl AppIde {
                 // Keep the live registry in step, so reopening the project (or
                 // the chip picker) sees the edited tree without a restart.
                 registry::merge_def(&mut self.mcu_registry, def);
+                self.new_project_gaps = None;
                 // What was just saved IS the chip's factory clock now, so the
                 // Reset button must aim at it — otherwise Reset would revert to
                 // the tree this one replaced.

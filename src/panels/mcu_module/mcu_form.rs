@@ -222,6 +222,10 @@ pub struct McuForm {
     pub sram_kb: Option<u32>,
     /// `ram_size` as the definition had it, which is what `sram_kb` describes.
     pub loaded_ram_size: String,
+    /// The vendor's FLASH total, carried the way `sram_kb` is.
+    pub flash_kb: Option<u32>,
+    /// `flash_size` as the definition had it, which is what `flash_kb` describes.
+    pub loaded_flash_size: String,
     /// The chip's DMA channels, carried through untouched: imported from the
     /// vendor database, not authorable here (see [`super::mcu_def::DmaDef`]).
     /// Editing a chip in this form must not silently drop them.
@@ -304,6 +308,8 @@ impl McuForm {
             board_chip: None,
             sram_kb: None,
             loaded_ram_size: String::new(),
+            flash_kb: None,
+            loaded_flash_size: String::new(),
             dma: None,
             irq_vectors: Vec::new(),
             usart_ip: None,
@@ -341,6 +347,8 @@ impl McuForm {
             board_chip: None,
             sram_kb: None,
             loaded_ram_size: String::new(),
+            flash_kb: None,
+            loaded_flash_size: String::new(),
             dma: None,
             irq_vectors: Vec::new(),
             usart_ip: None,
@@ -540,6 +548,8 @@ impl McuForm {
             board_chip: def.board_chip.clone(),
             sram_kb: def.sram_kb,
             loaded_ram_size: def.project.ram_size.clone(),
+            flash_kb: def.flash_kb,
+            loaded_flash_size: def.project.flash_size.clone(),
             dma: def.dma.clone(),
             irq_vectors: def.irq_vectors.clone(),
             usart_ip: def.usart_ip.clone(),
@@ -664,6 +674,40 @@ impl McuForm {
                 self.family.trim()
             ));
         }
+        // What Save would write instead: a region typed larger than the part
+        // has there is brought within it (`repair_memory`), and the user should
+        // read that now rather than find another number on disk.
+        if self.family.trim().starts_with("stm32") {
+            let def = self.to_definition();
+            let (now, saved) = (
+                (
+                    self.flash_size.trim(),
+                    self.ram_origin.trim(),
+                    self.ram_size.trim(),
+                ),
+                (
+                    def.project.flash_size.as_str(),
+                    def.project.ram_origin.as_str(),
+                    def.project.ram_size.as_str(),
+                ),
+            );
+            if now != saved {
+                w.push(format!(
+                    "Saved as FLASH {} and RAM {} at {}: what memory.x can link on this part - the contiguous run (stm32-metapac), bank 1 only on a dual-core H7.",
+                    saved.0, saved.2, saved.1
+                ));
+            }
+        }
+        // Not an error: the user authored this definition, and may be about to
+        // correct the line. Saving it is allowed; New Project says it is blocked.
+        if let Some(r) = super::stm32_support::refusal_for(
+            self.family.trim(),
+            self.display_name.trim(),
+            self.cpu.trim(),
+            self.hal_dep.trim(),
+        ) {
+            w.push(format!("This part cannot be built: {}.", r.reason()));
+        }
         // ARM only: most Espressif parts leave this empty, because the ESP
         // template writes the esp-hal line itself.
         if self.toolchain == ToolchainKind::RustEmbedded && self.hal_dep.trim().is_empty() {
@@ -771,7 +815,7 @@ impl McuForm {
                 })
                 .collect()
         };
-        McuDefinition {
+        let mut def = McuDefinition {
             board_chip: self.board_chip.clone(),
             id: self.id.trim().to_string(),
             display_name: self.display_name.trim().to_string(),
@@ -781,6 +825,9 @@ impl McuForm {
             // The form has no field for this. An edited chip keeps the value
             // from its definition.
             sram_kb: self.sram_kb_kept(),
+            flash_kb: self
+                .flash_kb
+                .filter(|_| self.flash_size.trim() == self.loaded_flash_size.trim()),
             dma: self.dma.clone(),
             irq_vectors: self.irq_vectors.clone(),
             usart_ip: self.usart_ip.clone(),
@@ -823,7 +870,11 @@ impl McuForm {
                 _ => Default::default(),
             },
             clock_presets: Vec::new(),
-        }
+        };
+        // A RAM region the AI import or a hand edit put at 0x20000000 with the
+        // chip's whole total cannot work on a part whose RAM is split.
+        super::stm32_pin_data::repair_memory(&mut def);
+        def
     }
 
     /// Serialize the built definition to pretty RON (what gets written to disk).

@@ -61,15 +61,21 @@ fn hz_of(mcu: &Mcu, main_rs: &str) -> Option<u64> {
         _ => None,
     };
     let graph = graph.as_deref();
+    if graph.is_some_and(|g| !rcc::tree_sources_supported(g)) {
+        return None;
+    }
     let spec = match rcc::rcc_recipe(family) {
         Some((spec, _)) => spec,
-        None => graph.and_then(rcc::generic_recipe)?.0,
+        None => rcc::generic_recipe_for(family, graph?)?.0,
     };
     let v = match graph {
         Some(g) => rcc::read_rcc_values(g, &spec),
         None => spec.reset.clone(),
     };
-    (v.sysclk_hz > 0).then(|| u64::from(v.sysclk_hz / v.ahb.max(1)))
+    // An H7's core runs at SYSCLK / D1CPRE, which no block writes (/1): the
+    // tree's `ahb` there is HPRE, the buses' divider, not the CPU's.
+    let ahb = if family == "stm32h7" { 1 } else { v.ahb.max(1) };
+    (v.sysclk_hz > 0).then(|| u64::from(v.sysclk_hz / ahb))
 }
 
 /// The MHz an ESP firmware asks esp-hal for: `CpuClock::_160MHz`, or `max`

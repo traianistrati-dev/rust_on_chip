@@ -244,6 +244,11 @@ if ($WorkDir -and -not $Snapshot) {
 # need it; everything else is built from definitions bundled in the repo.
 $CUBE_DB = if ($env:EIDE_CUBE_DB) { $env:EIDE_CUBE_DB }
            else { "H:\stm32cube-database-master\stm32cube-database-master\db\mcu" }
+# The full STM32CubeMX install. The mirror above holds only the U5/WB/WBA/WL
+# parts, so the rows for the other families name a file here. `p` is that FILE,
+# so a machine without it skips the row rather than reporting NO OUTPUT.
+$CUBE_MX = if ($env:EIDE_CUBEMX_MCU) { $env:EIDE_CUBEMX_MCU }
+           else { "C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeMX\db\mcu" }
 
 # label, emit test, environment for the run, quick?, prerequisite path, and `w`
 # — how many warnings the case is allowed, default none.
@@ -634,9 +639,31 @@ $ALL_CASES = @(
     # An older comp file with the user's lines, upgraded by the app's sync.
     @{ n = "imported chip, comp upgraded";  t = "emit_comp_project";          e = @{ EIDE_COMP_UPGRADE = "edited" }; q = $false; p = $CUBE_DB; fam = "import" }
 
+    # STM32L1 sells two dies under one part number: `...TxA` is embassy's `-a`,
+    # `...TxX` its `-x`, and either part also compiles on the bare die's
+    # feature - so a green build alone proves nothing, and the harness checks
+    # the line itself (EIDE_EXPECT_FEATURE). Linked, because the -a die is the
+    # one with the RAM memory.x describes. I2S stays out: the L1's DMA requests
+    # sit on fixed channels, and USART1 and SPI2 both need DMA1 CH4/CH5.
+    @{ n = "imported L151, die -a";        t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "$CUBE_MX\STM32L151RCTxA.xml"; EIDE_EXPECT_FEATURE = "stm32l151rc-a"; EIDE_IMPORT_SKIP = "I2s" }; q = $true; p = "$CUBE_MX\STM32L151RCTxA.xml"; fam = "import"; lk = $true }
+    @{ n = "imported L151, die -x";        t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "$CUBE_MX\STM32L151VDTxX.xml"; EIDE_EXPECT_FEATURE = "stm32l151vd-x"; EIDE_IMPORT_SKIP = "I2s" }; q = $false; p = "$CUBE_MX\STM32L151VDTxX.xml"; fam = "import"; lk = $true }
+    # Three parts that imported, compiled and linked before phase 2 and still
+    # could not start, each for its own reason. Both watchdogs on, at the
+    # tab's defaults (EIDE_IMPORT_WDG), and the harness checks memory.x's RAM
+    # against the chip's contiguous block - a link alone accepts any region.
+    #   H743  IWDG1/WWDG1, not p.IWDG; RAM is the 512K AXISRAM at 0x24000000,
+    #         where 0x20000000 + 864K put the stack in unmapped memory
+    #   WL55  dual-core: embassy has only init_primary under `_dual-core`, and
+    #         the M4 has no FPU (thumbv7em-none-eabi)
+    #   U575  768K of contiguous SRAM, not the 786K total, and an IWDG whose
+    #         /1024 the driver never reaches
+    @{ n = "imported H743, watchdogs + RAM"; t = "emit_imported_dma_project"; e = @{ EIDE_CHIP_XML = "$CUBE_MX\STM32H743ZITx.xml"; EIDE_EXPECT_FEATURE = "stm32h743zi"; EIDE_IMPORT_WDG = "1" }; q = $false; p = "$CUBE_MX\STM32H743ZITx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported WL55, dual-core";     t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "$CUBE_MX\STM32WL55JCIx.xml"; EIDE_EXPECT_FEATURE = "stm32wl55jc-cm4"; EIDE_IMPORT_WDG = "1" }; q = $false; p = "$CUBE_MX\STM32WL55JCIx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported U575, RAM";           t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "$CUBE_MX\STM32U575ZITxQ.xml"; EIDE_EXPECT_FEATURE = "stm32u575zi"; EIDE_IMPORT_WDG = "1" }; q = $false; p = "$CUBE_MX\STM32U575ZITxQ.xml"; fam = "import"; lk = $true }
+
     # STM32N6 — the first family whose clock block does not come from the
     # descriptor model. Cortex-M55 on a v8-M Main triple, a chip feature derived
-    # through the `x`+suffix rule, and an RCC block with four-PLL types in it:
+    # from the part number's position, and an RCC block with four-PLL types in it:
     # three separate derivations that were each wrong until this project was
     # emitted end to end.
     @{ n = "STM32N6 clock + project";      t = "emit_n6_project";            e = @{}; q = $true; p = $CUBE_DB; fam = "n6" }
@@ -665,6 +692,9 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
            "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD",
+           # The imported-chip rows. EIDE_CHIP_XML is read by the N6 harness too,
+           # so a value left over from an L151 row would make the N6 row convert an L1.
+           "EIDE_CHIP_XML", "EIDE_EXPECT_FEATURE", "EIDE_IMPORT_SKIP", "EIDE_IMPORT_WDG",
            # Not ours, but set by the Thread rows - never left for the next case.
            "CMAKE")
 

@@ -59,19 +59,46 @@ impl AppIde {
                 crate::panels::mcu_module::flash_store::rp_geometry(mcu.board_flash).ok();
         }
         let limits = wdg::limits_for(&family, mcu.runtime);
-        // The WWDG's whole range is relative to PCLK1, so the Clock tab feeds
-        // this one. 0 = no clock model → the range is unknowable, and the tab
-        // says so rather than inventing one.
-        let pclk1 = match &mcu.clock {
-            crate::panels::mcu_module::clock::ClockConfig::Graph(gc) => {
-                crate::panels::mcu_module::clock::graph::evaluate(&gc.graph)
-                    .get("pclk1")
-                    .copied()
-                    .unwrap_or(0)
-            }
+        // The WWDG's whole range is relative to the clock it counts - PCLK1, or
+        // PCLK3 on an STM32H7 - so the Clock tab feeds this one. 0 = no clock
+        // model → the range is unknowable, and the tab says so rather than
+        // inventing one.
+        let wdg_names = wdg::stm32_wdg(&family, wdg::wdg_part(mcu));
+        let (wwdg_hz, wwdg_unknown) = match &mcu.clock {
+            // A hand-written clock is not the tree, on any graph: the tab
+            // cannot know the bus the firmware runs.
+            _ if mcu.clock_manual => (
+                0,
+                "the clock is written by hand, so the tab cannot know the one main.rs runs",
+            ),
+            // The bus as the generated block runs it - not the tree's, which
+            // can differ (embassy's own HSI, the F1 block switching its HSE on)
+            // or not reach main.rs at all (the skeleton). The F1 has a WWDG
+            // only on Async, which is embassy's block. No block writes an H7's
+            // PCLK3.
+            crate::panels::mcu_module::clock::ClockConfig::Graph(_) => (
+                crate::panels::mcu_module::codegen::rcc::apb_bus_clocks(&family, &mcu.clock)
+                    .into_iter()
+                    .find(|(bus, _)| wdg_names.wwdg_bus == "pclk1" && *bus == 1)
+                    .map_or(0, |(_, hz)| hz),
+                // Why there is none, honestly - three different reasons.
+                if family == "stm32n6" {
+                    "the N6's bus clocks are not modelled for this check yet"
+                } else if family == "stm32f1"
+                    && !crate::panels::mcu_module::codegen::rcc::f1_embassy_clock_ok(
+                        &crate::panels::mcu_module::codegen::rcc::f1_embassy_clock(&mcu.clock),
+                    )
+                {
+                    // Not "the warnings say why": they count a switched-off
+                    // HSE as 0 Hz, and the block switches it on.
+                    "embassy refuses this clock on the F1 at boot - the PLL, a bus or the ADC is over its limit"
+                } else {
+                    "the generated clock code does not set this bus from the Clock tab's tree"
+                },
+            ),
             // No clock graph (F1's own model, or a chip with none): the WWDG
             // range is unknowable and the card says so instead of guessing.
-            _ => 0,
+            _ => (0, "this chip has no clock tree to read it from"),
         };
 
         // Straight from the code generator - see `family::dma_uses`. Re-run per
@@ -258,7 +285,14 @@ impl AppIde {
             } else {
                 iwdg_card(ui, &mut mcu.watchdog.iwdg, &limits);
                 ui.add_space(12.0);
-                wwdg_card(ui, &mut mcu.watchdog.wwdg, &limits, pclk1);
+                wwdg_card(
+                    ui,
+                    &mut mcu.watchdog.wwdg,
+                    &limits,
+                    wwdg_hz,
+                    wdg_names.bus_label(),
+                    wwdg_unknown,
+                );
             }
             ui.add_space(10.0);
         });
@@ -1022,7 +1056,16 @@ fn iwdg_card(ui: &mut egui::Ui, cfg: &mut Option<IwdgConfig>, l: &WatchdogLimits
     });
 }
 
-fn wwdg_card(ui: &mut egui::Ui, cfg: &mut Option<WwdgConfig>, l: &WatchdogLimits, pclk1: u32) {
+/// `bus_hz` is the clock the WWDG counts and `bus` its name, PCLK1 or PCLK3;
+/// `unknown` says why `bus_hz` is 0 when it is.
+fn wwdg_card(
+    ui: &mut egui::Ui,
+    cfg: &mut Option<WwdgConfig>,
+    l: &WatchdogLimits,
+    bus_hz: u32,
+    bus: &str,
+    unknown: &str,
+) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         // Shown disabled rather than hidden: a control that vanishes on one chip
         // is harder to understand than one that says why it cannot be used.
@@ -1043,33 +1086,44 @@ fn wwdg_card(ui: &mut egui::Ui, cfg: &mut Option<WwdgConfig>, l: &WatchdogLimits
             )));
             return;
         }
-        let range = wdg::wwdg_range_us(l, pclk1);
+        let range = wdg::wwdg_range_us(l, bus_hz);
         let mut on = cfg.is_some();
         ui.horizontal(|ui| {
-            let can_enable = range.is_some();
+            // One that is ON can always be turned off: with its clock unknown
+            // it is still generated, unchecked.
+            let can_enable = range.is_some() || cfg.is_some();
             if ui
                 .add_enabled(can_enable, egui::Checkbox::new(&mut on, ""))
-                .on_disabled_hover_text(
-                    "Set the system clock first - every WWDG period is relative to PCLK1",
-                )
+                .on_disabled_hover_text(format!(
+                    "Every WWDG period is relative to {bus}, and {bus} is unknown: {unknown}"
+                ))
                 .changed()
             {
-                *cfg = on.then(|| WwdgConfig::default_for(l, pclk1)).flatten();
+                *cfg = on.then(|| WwdgConfig::default_for(l, bus_hz)).flatten();
             }
             ui.label(egui::RichText::new(format!("{}  WWDG", ph::SHIELD)).strong());
             ui.label(dim("window watchdog"));
         });
         match range {
             Some((lo, hi)) => ui.label(dim(format!(
-                "Counts down from PCLK1 ({} MHz), so its period moves with the Clock tab. \
+                "Counts down from {bus} ({} MHz), so its period moves with the Clock tab. \
                  Range {} .. {}.",
-                pclk1 / 1_000_000,
+                bus_hz / 1_000_000,
                 human_us(lo),
                 human_us(hi)
             ))),
-            None => ui.label(dim(
-                "PCLK1 is unknown - configure the Clock tab and the achievable range appears here.",
-            )),
+            None => match cfg {
+                Some(c) => ui.colored_label(
+                    egui::Color32::from_rgb(230, 190, 90),
+                    format!(
+                        "On, with a {} period that cannot be checked: {bus} is unknown - {unknown}. A period too long for the real {bus} panics at boot; turn it off, or check it by hand.",
+                        human_us(c.timeout_us)
+                    ),
+                ),
+                None => ui.label(dim(format!(
+                    "{bus} is unknown - {unknown} - so the WWDG's range cannot be checked here."
+                ))),
+            },
         };
         let (Some(c), Some((lo, hi))) = (cfg.as_mut(), range) else {
             return;
@@ -1087,10 +1141,10 @@ fn wwdg_card(ui: &mut egui::Ui, cfg: &mut Option<WwdgConfig>, l: &WatchdogLimits
         ));
         problem_and_reset(
             ui,
-            wdg::wwdg_problem(c, l, pclk1),
-            "Restore the longest period at this PCLK1, window disabled",
+            wdg::wwdg_problem(c, l, bus_hz, bus),
+            &format!("Restore the longest period at this {bus}, window disabled"),
             || {
-                if let Some(d) = WwdgConfig::default_for(l, pclk1) {
+                if let Some(d) = WwdgConfig::default_for(l, bus_hz) {
                     *c = d;
                 }
             },

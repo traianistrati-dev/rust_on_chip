@@ -19,7 +19,7 @@
 //! trigger lines and `EVENTOUT` — see `is_noise_signal`.
 
 use super::mcu_catalog::ToolchainKind;
-use super::mcu_def::{GridCellDef, PinDef, PinGridDef};
+use super::mcu_def::{GridCellDef, McuDefinition, PinDef, PinGridDef};
 use super::mcu_form::{ClockChoice, McuForm, PinRow, parse_functions};
 
 /// One chip produced from the XML (a range file yields several), plus any
@@ -27,6 +27,9 @@ use super::mcu_form::{ClockChoice, McuForm, PinRow, parse_functions};
 pub struct ConvertedChip {
     pub form: McuForm,
     pub warnings: Vec<String>,
+    /// Every `<Core>` the vendor lists, in its order - what
+    /// `stm32_support::refusal` tells a Cortex-A part by.
+    pub cores: Vec<String>,
 }
 
 /// Parse one STM32 open-pin-data `<Mcu>` document into one form per flash
@@ -252,10 +255,23 @@ pub fn convert_xml_with_af(xml: &str, af: Option<&GpioAf>) -> Result<Vec<Convert
         form.max_mhz = max_mhz;
         form.toolchain = ToolchainKind::RustEmbedded;
         form.target = target.clone();
-        form.flash_origin = "0x08000000".into();
-        form.flash_size = flash_k.map(|k| format!("{k}K")).unwrap_or_default();
-        form.ram_origin = "0x20000000".into();
-        form.ram_size = ram_k.map(|k| format!("{k}K")).unwrap_or_default();
+        // The memory.x regions: the largest contiguous FLASH and RAM, from
+        // stm32-metapac, never more than this file's own totals. The totals at
+        // the two fixed origins were wrong on some five hundred parts - an
+        // H743's 864K is five blocks, and its stack landed in unmapped memory.
+        let mem = memory_layout(&name, flash_k, ram_k);
+        form.flash_origin = mem.flash_origin;
+        form.flash_size = mem.flash_size;
+        form.ram_origin = mem.ram_origin;
+        form.ram_size = mem.ram_size;
+        if let Some(total) = mem.sram_kb {
+            form.sram_kb = Some(total);
+            form.loaded_ram_size = form.ram_size.clone();
+        }
+        if let Some(total) = mem.flash_kb {
+            form.flash_kb = Some(total);
+            form.loaded_flash_size = form.flash_size.clone();
+        }
         // On a dual-core part probe-rs lists the cores in the order the
         // vendor does, so its core 0 - the one flashing, RTT and the debugger
         // attach to - is the application core this firmware is built for
@@ -263,6 +279,10 @@ pub fn convert_xml_with_af(xml: &str, af: Option<&GpioAf>) -> Result<Vec<Convert
         form.probe_chip = name.clone();
         form.hal_dep = hal_dep_for(&family, &line, &name);
         form.memory_comment = format!("Imported from STM32 open-pin-data ({ref_name})");
+        for note in &mem.notes {
+            form.memory_comment.push_str(" - ");
+            form.memory_comment.push_str(note);
+        }
         form.clock = clock;
         form.pins = [
             sides[0].clone(),
@@ -274,6 +294,7 @@ pub fn convert_xml_with_af(xml: &str, af: Option<&GpioAf>) -> Result<Vec<Convert
         chips.push(ConvertedChip {
             form,
             warnings: base_warnings.clone(),
+            cores: cores.clone(),
         });
     }
     Ok(chips)
@@ -1313,23 +1334,61 @@ pub fn embassy_feature_in(dep_line: &str) -> Option<&str> {
     if !line.starts_with(EMBASSY_CRATE) {
         return None;
     }
-    let features = line.split_once("features")?.1;
-    let start = features.find('"')? + 1;
-    let rest = &features[start..];
-    let end = rest.find('"')?;
-    Some(&rest[..end]).filter(|f| !f.is_empty())
+    // The CHIP feature, wherever it sits: the IDE itself writes
+    // `time-driver-any` first on Async, and a user may list `defmt` there. The
+    // first entry used to be taken, so such a line was judged as a chip called
+    // `defmt` - and refused. `stm32` + a letter, so `stm32-hrtim` is not one.
+    let list = line.split_once("features")?.1;
+    let list = &list[list.find('[')? + 1..];
+    let list = &list[..list.find(']')?];
+    list.split(',')
+        .map(|f| f.trim().trim_matches('"'))
+        .find(|f| {
+            f.strip_prefix("stm32")
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|c| c.is_ascii_lowercase())
+        })
 }
 
-/// The embassy-stm32 chip feature for a concrete part: the part number without
-/// the trailing package + temperature code (open-pin-data names end in a
-/// `<PackageLetter>x` pair — `STM32F411RETx` → `stm32f411re`), plus the core
-/// suffix on a dual-core part (`STM32H745ZITx` → `stm32h745zi-cm7`).
-fn embassy_chip_feature(name: &str) -> String {
-    let base = embassy_part_feature(name);
+/// Does embassy-stm32 [`EMBASSY_VERSION`] publish this chip feature?
+///
+/// Offline, against the list harvested from the crate's own Cargo.toml (see
+/// [`super::stm32_embassy_features`]). The network check in the import dialog
+/// stays for a line the user has edited to another version.
+pub(crate) fn embassy_publishes(feature: &str) -> bool {
+    super::stm32_embassy_features::FEATURES
+        .binary_search(&feature)
+        .is_ok()
+}
+
+/// The embassy-stm32 chip feature for a concrete part: its part number
+/// (`STM32F411RETx` → `stm32f411re`), the die on the STM32L1 parts embassy
+/// publishes twice (`STM32L151C8TxA` → `stm32l151c8-a`), and the core suffix on
+/// a dual-core part (`STM32H745ZITx` → `stm32h745zi-cm7`).
+///
+/// It is also the stm32-metapac chip directory of the part, so the per-part
+/// facts read from metapac key on it rather than on the bare part number.
+pub(crate) fn embassy_chip_feature(name: &str) -> String {
+    with_core_suffix(embassy_part_feature(name))
+}
+
+/// `base` with its application core's suffix when embassy publishes the part
+/// only per core (see [`DUAL_CORE_PARTS`]); unchanged otherwise.
+fn with_core_suffix(base: String) -> String {
     match DUAL_CORE_PARTS.binary_search_by(|(part, _)| (*part).cmp(base.as_str())) {
         Ok(i) => format!("{base}-{}", DUAL_CORE_PARTS[i].1),
         Err(_) => base,
     }
+}
+
+/// The per-core chip feature when `name` is a dual-core part
+/// (`STM32WL55JCIx` → `stm32wl55jc-cm4`), `None` for every other part.
+///
+/// Such a firmware is built with embassy's `_dual-core` feature, under which
+/// `embassy_stm32::init` does not exist - only `init_primary`.
+pub fn per_core_feature(name: &str) -> Option<String> {
+    let feature = embassy_chip_feature(name);
+    feature.contains("-cm").then_some(feature)
 }
 
 /// Every part embassy-stm32 0.6 publishes ONLY per core, with the core the
@@ -1343,8 +1402,8 @@ fn embassy_chip_feature(name: &str) -> String {
 /// targeted: nothing generated here runs on it.
 ///
 /// Generated from embassy-stm32 0.6's Cargo.toml (every `-cm4`, `-cm7` and
-/// `-cm0p` feature, grouped by part); `per_core_parts_match_the_published_features`
-/// checks it against that file.
+/// `-cm0p` feature, grouped by part); `the_dual_core_table_agrees_with_the_chip_list`
+/// checks it against the list harvested from that file.
 const DUAL_CORE_PARTS: [(&str, &str); 30] = [
     ("stm32h745bg", "cm7"),
     ("stm32h745bi", "cm7"),
@@ -1378,28 +1437,407 @@ const DUAL_CORE_PARTS: [(&str, &str); 30] = [
     ("stm32wl55jc", "cm4"),
 ];
 
+/// How many characters of the slug are the part number: `stm32` + line + pin
+/// count + flash size. Eleven on every line embassy-stm32 0.6 publishes
+/// (`stm32f103c8`, `stm32h7r3l8`, `stm32n645a0`), twelve on the lines whose
+/// name has five characters (`stm32wba55cg`, and the STM32MP parts).
+fn part_number_len(slug: &str) -> usize {
+    if slug.starts_with("stm32wba") || slug.starts_with("stm32mp") {
+        12
+    } else {
+        11
+    }
+}
+
 /// The part-number half of [`embassy_chip_feature`], before any core suffix.
+///
+/// Cut by POSITION, not by looking for the temperature `x`. What follows the
+/// part number is the package letter, the temperature code (`x` in CubeMX
+/// names, a digit in an orderable code such as `STM32F411RET6`) and then ST's
+/// option letters, which embassy ignores (`N` no crystal, `Q` secure, `QG`,
+/// `P`, `S`, `Z`) - except on STM32L1, where `A` and `X` name a different die
+/// that embassy publishes as `-a` / `-x`. The old rule stripped two or three
+/// characters after an `x`, so `STM32L151VDTxX` became `stm32l151vdt` (not
+/// published) and `STM32L151C8TxA` the bare `stm32l151c8`, a 10K die for a
+/// 32K part.
+///
+/// Getting this wrong is not a small error: the derived name goes straight
+/// into Cargo.toml, and a feature that does not exist makes the whole project
+/// unresolvable, which kills rust-analyzer for it entirely.
 fn embassy_part_feature(name: &str) -> String {
     let slug = slugify(name);
-    // `x` stands for the temperature range, and embassy's feature stops just
-    // before the package letter that precedes it: STM32F103C8Tx -> stm32f103c8.
+    let n = part_number_len(&slug);
+    let Some(base) = slug.get(..n) else {
+        return slug;
+    };
+    // The part number is written in one piece. A separator inside it means the
+    // name is SHORTER than a part number - a board, `STM32F401C-DISCO` - and a
+    // cut across it would read the board's letters as pin count and flash:
+    // `stm32f401cd`, a real part in another package, which builds until a pin
+    // the board has is used. The whole slug stays, unpublished, and is flagged.
+    let mut seen = 0;
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            seen += 1;
+            if seen == n {
+                break;
+            }
+        } else if seen > 5 {
+            return slug;
+        }
+    }
+    // A lower-case `x` INSIDE the part number of a name otherwise written in
+    // capitals is ST's wildcard: `STM32H743xI` is every package of the part,
+    // as a datasheet title spells it. Cut by position it would become the one
+    // package that is really called X, the 240-ball H7. No single part is
+    // named, so none is derived - with the wildcard dropped the result is
+    // shorter than any feature, and the check says so before cargo does.
+    let chars: Vec<char> = name.chars().filter(char::is_ascii_alphanumeric).collect();
+    if chars.iter().any(char::is_ascii_uppercase) && chars.iter().take(n).skip(5).any(|c| *c == 'x')
+    {
+        let mut kept = 0;
+        return chars
+            .iter()
+            .filter(|c| {
+                kept += 1;
+                !(**c == 'x' && (6..=n).contains(&kept))
+            })
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+    }
+    if !slug.starts_with("stm32l1") {
+        return base.to_owned();
+    }
+    match l1_die(name, &slug, n) {
+        Some(b'a') => format!("{base}-a"),
+        Some(b'x') => format!("{base}-x"),
+        _ => base.to_owned(),
+    }
+}
+
+/// The die letter of an STM32L1 name, if it carries one: after the package
+/// letter and the temperature code (`…TxA`, the orderable `…T6A`, `…T6ATR` on
+/// a reel), or the way a datasheet writes it, right after the part number and
+/// a dash (`STM32L151C6-A`). Anything else that follows a part number -
+/// `STM32L151CB board` - is not a die, and gets the bare one.
+fn l1_die(name: &str, slug: &str, n: usize) -> Option<u8> {
+    let base = &slug[..n];
+    // Read from the WORD that starts with the part number: in the slug, text
+    // after the code (`… board`, `(Cat.3)`) joins on and hides the letter.
+    let lower = name.to_ascii_lowercase();
+    let word = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|w| w.starts_with(base))
+        .unwrap_or(slug);
+    let b = word.as_bytes();
+    let coded = b.len() >= n + 3
+        && b[n].is_ascii_alphabetic()
+        && (b[n + 1] == b'x' || b[n + 1].is_ascii_digit())
+        && matches!(&word[n + 3..], "" | "tr");
+    if coded {
+        return Some(b[n + 2]);
+    }
+    let spaced: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    b"ax".iter().copied().find(|d| {
+        let marked = format!("{base}-{}", *d as char);
+        spaced.split(' ').any(|word| word == marked)
+    })
+}
+
+/// The derivation [`embassy_part_feature`] replaced, kept ONLY to recognise a
+/// line it wrote - see [`upgraded_feature`].
+fn legacy_part_feature(name: &str) -> String {
+    let slug = slugify(name);
     if slug.len() > 2 && slug.ends_with('x') {
         return slug[..slug.len() - 2].to_string();
     }
-    // 387 parts carry ONE more character after the `x` — an `N` for the
-    // no-crystal variants (STM32C071C8TxN), a `Q` for the secure ones
-    // (STM32N645A0HxQ). embassy does not distinguish those, so the same three
-    // characters come off: verified against the published feature list, where
-    // `stm32c071c8` and `stm32n645a0` exist and `stm32c071c8t` /
-    // `stm32n645a0h` do not.
-    //
-    // Getting this wrong is not a small error: the derived name goes straight
-    // into Cargo.toml, and a feature that does not exist makes the whole
-    // project unresolvable — which kills rust-analyzer for it entirely.
     if slug.len() > 3 && slug.as_bytes()[slug.len() - 2] == b'x' {
         return slug[..slug.len() - 3].to_string();
     }
     slug
+}
+
+/// Every feature an earlier importer wrote for `name`.
+///
+/// Until 2026-08-25 a name ending in `x` lost two characters and any other
+/// name was written whole (`stm32l151c8txa`); then [`legacy_part_feature`]
+/// cut three after an `x` too (`stm32l151c8`). Each with and without the core
+/// suffix, which a dual-core part only got later still.
+fn legacy_features(name: &str) -> Vec<String> {
+    let slug = slugify(name);
+    let first = if slug.len() > 2 && slug.ends_with('x') {
+        slug[..slug.len() - 2].to_string()
+    } else {
+        slug
+    };
+    let mut out: Vec<String> = Vec::new();
+    for rule in [first, legacy_part_feature(name)] {
+        for f in [with_core_suffix(rule.clone()), rule] {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
+/// What `stored` should become: the current feature for `name`, when `stored`
+/// is what an earlier rule wrote for that part and the current one is
+/// published. `None` for any other line, which is the user's choice.
+///
+/// Only ever towards a published feature: the WL33 `…xX` derives nothing
+/// embassy has under any rule, and trading one unresolvable line for another
+/// would only hide which rule wrote it. A bare L1 die chosen by hand for an
+/// `…xA` part IS what the second rule wrote, and moves too: it is the smaller
+/// die, which that part is not.
+pub(crate) fn upgraded_feature(name: &str, stored: &str) -> Option<String> {
+    let want = embassy_chip_feature(name);
+    (stored != want
+        && embassy_publishes(&want)
+        && legacy_features(name).iter().any(|f| f == stored))
+    .then_some(want)
+}
+
+/// `line` with its chip feature upgraded (see [`upgraded_feature`]), when it is
+/// an embassy-stm32 line pinning [`EMBASSY_VERSION`] - the list it is judged
+/// against is that version's.
+pub(crate) fn upgraded_hal_line(line: &str, name: &str) -> Option<String> {
+    let stored = embassy_feature_in(line)?;
+    if !line.contains(&format!("version = \"{EMBASSY_VERSION}\"")) {
+        return None;
+    }
+    let want = upgraded_feature(name, stored)?;
+    Some(line.replacen(&format!("\"{stored}\""), &format!("\"{want}\""), 1))
+}
+
+/// Bring a saved definition's embassy-stm32 chip feature up to the current
+/// derivation, when its line still carries what an earlier rule wrote for the
+/// same part (see [`upgraded_feature`]). `true` when anything changed.
+///
+/// A definition keeps the line it was imported with, so without this the 41
+/// STM32L1 `…xA` parts would keep building against the smaller die, and some
+/// four hundred option-letter parts (`…TxN`, `…xQ`, `…xX`, `…xQG`) would keep a
+/// feature cargo cannot resolve, until each was imported again. Both lines are
+/// repaired, the Async one too where a definition has its own. A dual-core
+/// part saved before the application core was the one built for also gets
+/// that core's target: the old parser took the LAST `<Core>`, the WL55's M0+.
+/// Projects follow in `project_gen::splice_config`.
+pub(crate) fn repair_hal_feature(def: &mut McuDefinition) -> bool {
+    if !def.family.starts_with("stm32") || def.family == "stm32f1" {
+        return false;
+    }
+    // From the names the project's manifest is upgraded from as well
+    // (`project_gen::upgraded_hal_lines`): a definition moved past what its
+    // project follows would have the System tab checking a feature the
+    // manifest does not have. The CubeMX name for an import, the id an AI
+    // import or Auto-fill made from the display name.
+    let names: Vec<String> = [&def.project.probe_chip, &def.project.pkg_name]
+        .into_iter()
+        .filter(|n| !n.trim().is_empty())
+        .cloned()
+        .collect();
+    // And only to the feature the display name derives: an id is lower case
+    // and has lost its dashes, so `stm32l151c6a` (from `STM32L151C6-A`) would
+    // read as the bare die, and `stm32h743xi` (from the wildcard `STM32H743xI`)
+    // as the X package. Where the names disagree nothing moves, on either side.
+    let named = embassy_chip_feature(&def.display_name);
+    let upgrade = |line: &str| {
+        names
+            .iter()
+            .find_map(|n| upgraded_hal_line(line, n))
+            .filter(|up| embassy_feature_in(up) == Some(named.as_str()))
+    };
+    let mut changed = false;
+    if let Some(up) = upgrade(&def.project.hal_dep) {
+        def.project.hal_dep = up;
+        changed = true;
+    }
+    if let Some(up) = def.project.hal_dep_async.as_deref().and_then(upgrade) {
+        def.project.hal_dep_async = Some(up);
+        changed = true;
+    }
+    let core = embassy_feature_in(&def.project.hal_dep)
+        .and_then(|f| f.rsplit_once("-cm"))
+        .map(|(_, core)| core.to_owned());
+    let app = match (core.as_deref(), def.family.as_str()) {
+        (Some("7"), _) => Some(("thumbv7em-none-eabihf", "ARM Cortex-M7")),
+        (Some("4"), "stm32wl") => Some(("thumbv7em-none-eabi", "ARM Cortex-M4")),
+        _ => None,
+    };
+    if let Some((target, cpu)) = app
+        && (def.project.target != target || def.cpu != cpu)
+    {
+        def.project.target = target.to_owned();
+        def.cpu = cpu.to_owned();
+        changed = true;
+    }
+    changed
+}
+
+/// The memory.x regions of `feature`'s chip (an embassy-stm32 chip feature,
+/// which is also its stm32-metapac directory), or `None` for a part metapac
+/// gives no internal flash (N6) or does not know.
+pub(crate) fn memory_map(feature: &str) -> Option<&'static super::stm32_memory_map::Map> {
+    use super::stm32_memory_map::{MAPS, PARTS};
+    let i = PARTS.binary_search_by(|(f, _)| (*f).cmp(feature)).ok()?;
+    MAPS.get(PARTS[i].1 as usize)
+}
+
+/// FLASH and RAM for memory.x, as the importer writes them.
+pub(crate) struct MemLayout {
+    pub flash_origin: String,
+    pub flash_size: String,
+    pub ram_origin: String,
+    pub ram_size: String,
+    /// The vendor's RAM total, when memory.x links less of it - what the chip
+    /// catalogue goes on listing.
+    pub sram_kb: Option<u32>,
+    /// The same for FLASH: the vendor total, when memory.x links less.
+    pub flash_kb: Option<u32>,
+    /// One sentence per region that differs from the vendor's figure.
+    pub notes: Vec<String>,
+}
+
+/// [`MemLayout`] for the part `name`, whose vendor file says `flash_k` /
+/// `ram_k` KiB: the metapac run, cut to the vendor figure when that is
+/// smaller. Without a map, the vendor totals at the two usual origins.
+pub(crate) fn memory_layout(name: &str, flash_k: Option<u64>, ram_k: Option<u64>) -> MemLayout {
+    let kib = |k: Option<u64>| k.map(|k| format!("{k}K")).unwrap_or_default();
+    let Some(map) = memory_map(&embassy_chip_feature(name)) else {
+        return MemLayout {
+            flash_origin: "0x08000000".into(),
+            flash_size: kib(flash_k),
+            ram_origin: "0x20000000".into(),
+            ram_size: kib(ram_k),
+            sram_kb: None,
+            flash_kb: None,
+            notes: Vec::new(),
+        };
+    };
+    let feature = embassy_chip_feature(name);
+    let flash = flash_k.map_or(map.flash_kib as u64, |k| k.min(map.flash_kib as u64));
+    let ram = ram_k.map_or(map.ram_kib as u64, |k| k.min(map.ram_kib as u64));
+    let mut notes = Vec::new();
+    let flash_kb = flash_k.filter(|t| *t > flash);
+    if let Some(total) = flash_kb {
+        notes.push(flash_note(&feature, map, total - flash));
+    }
+    let sram_kb = ram_k.filter(|t| *t > ram || map.ram_origin != 0x2000_0000);
+    if let Some(total) = sram_kb {
+        notes.push(ram_note(&feature, map, total.saturating_sub(ram)));
+    }
+    MemLayout {
+        flash_origin: format!("0x{:08X}", map.flash_origin),
+        flash_size: format!("{flash}K"),
+        ram_origin: format!("0x{:08X}", map.ram_origin),
+        ram_size: format!("{ram}K"),
+        sram_kb: sram_kb.map(|t| t as u32),
+        flash_kb: flash_kb.map(|t| t as u32),
+        notes,
+    }
+}
+
+fn flash_note(feature: &str, map: &super::stm32_memory_map::Map, rest_k: u64) -> String {
+    if feature.contains("-cm") {
+        format!(
+            "FLASH is {}: the other {rest_k}K are bank 2, where the Cortex-M4 boots",
+            map.flash_regions
+        )
+    } else {
+        format!(
+            "FLASH is {}, the largest contiguous run (stm32-metapac); the other {rest_k}K are past a gap",
+            map.flash_regions
+        )
+    }
+}
+
+fn ram_note(feature: &str, map: &super::stm32_memory_map::Map, rest_k: u64) -> String {
+    // On a WB the rest IS contiguous: SRAM2a/2b follow SRAM1, and are left out
+    // because the radio core owns them (embassy's own `mem_filter`).
+    let radio = feature.starts_with("stm32wb")
+        && !feature.starts_with("stm32wba")
+        && !feature.starts_with("stm32wb0");
+    if radio {
+        format!(
+            "RAM is {} (stm32-metapac); the other {rest_k}K are SRAM2a/SRAM2b, reserved for the radio core and not linked",
+            map.ram_regions
+        )
+    } else {
+        format!(
+            "RAM is {}, the largest contiguous block (stm32-metapac); the other {rest_k}K are not linked",
+            map.ram_regions
+        )
+    }
+}
+
+/// Bring a saved STM32 definition's memory.x regions within its chip, when
+/// they are what the old importer wrote: the vendor TOTAL at the fixed origin.
+/// `true` when a region changed.
+///
+/// Only a region that cannot work is touched: RAM at 0x20000000 longer than
+/// the RAM that is there (an H743's 864K over its 128K DTCM), FLASH longer
+/// than its contiguous run (an H743ZG's 1024K over two 512K banks with a gap).
+/// A layout that fits - the DTCM chosen by hand, a bootloader offset - stays.
+pub(crate) fn repair_memory(def: &mut McuDefinition) -> bool {
+    use super::mcu_form::parse_ld_number;
+    if !def.family.starts_with("stm32") {
+        return false;
+    }
+    let feature = embassy_feature_in(&def.project.hal_dep)
+        .map(str::to_owned)
+        .unwrap_or_else(|| embassy_chip_feature(&def.display_name));
+    let Some(map) = memory_map(&feature) else {
+        return false;
+    };
+    let mut changed = false;
+    let p = &mut def.project;
+    let ram = (parse_ld_number(&p.ram_origin), parse_ld_number(&p.ram_size));
+    if let (Some(0x2000_0000), Some(bytes)) = ram {
+        let old_k = bytes / 1024;
+        if old_k > map.ram_kib_at_base as u64 {
+            let new_k = old_k.min(map.ram_kib as u64);
+            p.ram_origin = format!("0x{:08X}", map.ram_origin);
+            p.ram_size = format!("{new_k}K");
+            def.sram_kb.get_or_insert(old_k as u32);
+            p.memory_comment.push_str(" - ");
+            p.memory_comment
+                .push_str(&ram_note(&feature, map, old_k - new_k));
+            changed = true;
+        }
+    }
+    let flash = (
+        parse_ld_number(&p.flash_origin),
+        parse_ld_number(&p.flash_size),
+    );
+    // Cut only past a REAL gap: a size no larger than the part's whole flash,
+    // on a part whose banks do not run on. A 128K STM32F103C8 - most C8 dies
+    // have it - is the user's to try, and not a gap.
+    if let (Some(origin), Some(bytes)) = flash {
+        let old_k = bytes / 1024;
+        if origin == map.flash_origin as u64
+            && old_k > map.flash_kib as u64
+            && old_k <= map.flash_total_kib as u64
+            && map.flash_total_kib > map.flash_kib
+        {
+            def.flash_kb.get_or_insert(old_k as u32);
+            p.flash_size = format!("{}K", map.flash_kib);
+            p.memory_comment.push_str(" - ");
+            p.memory_comment
+                .push_str(&flash_note(&feature, map, old_k - map.flash_kib as u64));
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Lower-case, keep only `a–z 0–9` — a valid registry id / file stem.
@@ -1735,6 +2173,23 @@ mod tests {
             ),
             Some("stm32h563zi")
         );
+        // The chip, not whichever feature is listed first.
+        assert_eq!(
+            embassy_feature_in(
+                "embassy-stm32 = { version = \"0.6\", features = [\"time-driver-any\", \"stm32h743zi\"] }"
+            ),
+            Some("stm32h743zi")
+        );
+        assert_eq!(
+            embassy_feature_in(
+                "embassy-stm32 = { features = [\"defmt\", \"stm32-hrtim\", \"stm32f334r8\"] }"
+            ),
+            Some("stm32f334r8")
+        );
+        assert_eq!(
+            embassy_feature_in("embassy-stm32 = { features = [\"defmt\"] }"),
+            None
+        );
         // Lines that are not an embassy dependency, or carry no feature.
         assert_eq!(
             embassy_feature_in("stm32f1xx-hal = { features = [\"x\"] }"),
@@ -1971,6 +2426,561 @@ mod tests {
         assert_eq!(embassy_feature_in(&line), Some("stm32wl55jc-cm4"), "{line}");
     }
 
+    /// The question codegen asks before writing `init_primary`: yes on every
+    /// per-core part, by either spelling of its name, and no on the rest.
+    #[test]
+    fn per_core_feature_names_only_the_dual_core_parts() {
+        for (name, want) in [
+            ("stm32h745zitx", "stm32h745zi-cm7"),
+            ("STM32H747AGIx", "stm32h747ag-cm7"),
+            ("STM32WL55JCIx", "stm32wl55jc-cm4"),
+            ("stm32wl55jcix", "stm32wl55jc-cm4"),
+            ("STM32H755ZI", "stm32h755zi-cm7"),
+        ] {
+            assert_eq!(per_core_feature(name).as_deref(), Some(want), "{name}");
+        }
+        // A die variant is not a core: `stm32l151c8-a` stays single-core.
+        for name in [
+            "stm32h743zitx",
+            "STM32WLE5JCIx",
+            "STM32WL5MOCHx",
+            "stm32f411retx",
+            "STM32L151C8TxA",
+            "",
+        ] {
+            assert_eq!(per_core_feature(name), None, "{name}");
+        }
+        for (part, _) in DUAL_CORE_PARTS {
+            assert_eq!(
+                per_core_feature(part),
+                Some(embassy_chip_feature(part)),
+                "{part}"
+            );
+        }
+    }
+
+    /// The generated map is sorted for its binary search, and the parts phase 2
+    /// is verified on get the regions embassy's own memory-x feature would.
+    #[test]
+    fn the_memory_map_names_each_parts_contiguous_regions() {
+        use super::super::stm32_memory_map::PARTS;
+        assert!(PARTS.windows(2).all(|w| w[0].0 < w[1].0), "unsorted");
+        let m = |f: &str| memory_map(f).unwrap_or_else(|| panic!("{f}: no map"));
+        let h743 = m("stm32h743zi");
+        assert_eq!(
+            (h743.ram_origin, h743.ram_kib, h743.ram_regions),
+            (0x2400_0000, 512, "AXISRAM")
+        );
+        assert_eq!((h743.flash_origin, h743.flash_kib), (0x0800_0000, 2048));
+        assert_eq!(h743.ram_kib_at_base, 128, "the DTCM");
+        assert_eq!(m("stm32h743zg").flash_kib, 512, "two 512K banks with a gap");
+        assert_eq!(
+            m("stm32h745zi-cm7").flash_kib,
+            1024,
+            "bank 1: the M4 boots from bank 2"
+        );
+        let u575 = m("stm32u575zi");
+        assert_eq!((u575.ram_origin, u575.ram_kib), (0x2000_0000, 768));
+        let wl55 = m("stm32wl55jc-cm4");
+        assert_eq!(
+            (wl55.flash_kib, wl55.ram_origin, wl55.ram_kib),
+            (256, 0x2000_0000, 64)
+        );
+        assert_eq!(m("stm32l151rc-a").ram_kib, 32);
+        assert_eq!(m("stm32l151vd-x").ram_kib, 80);
+        assert_eq!(m("stm32l151vd").ram_kib, 48, "the other die");
+        assert_eq!(
+            m("stm32wb55rg").ram_kib,
+            192,
+            "SRAM2a/2b are the radio core's"
+        );
+        // metapac's U3 bank 2 starts inside bank 1; CubeMX has one block.
+        let u375 = m("stm32u375cg");
+        assert_eq!(
+            (u375.flash_kib, u375.flash_total_kib),
+            (1024, 1024),
+            "{}",
+            u375.flash_regions
+        );
+        assert_eq!(m("stm32u375ce").flash_kib, 512);
+        // N6 has no internal flash, so no map; nor does an unknown part.
+        assert!(memory_map("stm32n657a0").is_none());
+        assert!(memory_map("stm32f411").is_none());
+    }
+
+    /// The import writes those regions, cut to the vendor figure, with a note
+    /// on every one that differs from it; a part whose totals were right is
+    /// written exactly as before.
+    #[test]
+    fn the_import_links_the_contiguous_regions() {
+        let h745 = &convert_xml(H745).expect("parses")[0].form;
+        assert_eq!(
+            (h745.flash_origin.as_str(), h745.flash_size.as_str()),
+            ("0x08000000", "1024K")
+        );
+        assert_eq!(
+            (h745.ram_origin.as_str(), h745.ram_size.as_str()),
+            ("0x24000000", "512K")
+        );
+        assert_eq!(
+            h745.sram_kb,
+            Some(864),
+            "the catalogue keeps the chip's total"
+        );
+        assert_eq!(h745.loaded_ram_size, h745.ram_size);
+        assert!(
+            h745.memory_comment.contains("RAM is AXISRAM"),
+            "{}",
+            h745.memory_comment
+        );
+        assert!(
+            h745.memory_comment
+                .contains("bank 2, where the Cortex-M4 boots"),
+            "{}",
+            h745.memory_comment
+        );
+        assert!(!h745.memory_comment.contains("*/"));
+
+        let wl = &convert_xml(WL55).expect("parses")[0].form;
+        assert_eq!(
+            (
+                wl.flash_origin.as_str(),
+                wl.flash_size.as_str(),
+                wl.ram_origin.as_str(),
+                wl.ram_size.as_str()
+            ),
+            ("0x08000000", "256K", "0x20000000", "64K")
+        );
+        assert_eq!(wl.sram_kb, None);
+        assert_eq!(
+            wl.memory_comment,
+            "Imported from STM32 open-pin-data (STM32WL55JCIx)"
+        );
+
+        // A vendor figure SMALLER than the run wins: memory.x never promises
+        // more than the part's own file.
+        let small = memory_layout("STM32U575ZITxQ", Some(1024), Some(256));
+        assert_eq!(
+            (small.flash_size.as_str(), small.ram_size.as_str()),
+            ("1024K", "256K")
+        );
+        assert!(small.notes.is_empty());
+        // The U3's flash is one block, whatever metapac's bank address says.
+        let u3 = memory_layout("STM32U375CGUx", Some(1024), Some(256));
+        assert_eq!(u3.flash_size, "1024K");
+        assert!(
+            u3.notes.iter().all(|n| !n.contains("FLASH")),
+            "{:?}",
+            u3.notes
+        );
+        // The WB's SRAM2 is the radio core's, not past a gap.
+        let wb = memory_layout("STM32WB55RGVx", Some(1024), Some(256));
+        assert_eq!(wb.ram_size, "192K");
+        assert!(
+            wb.notes.iter().any(|n| n.contains("radio core")),
+            "{:?}",
+            wb.notes
+        );
+        assert!(
+            wb.notes.iter().all(|n| !n.contains("largest contiguous")),
+            "{:?}",
+            wb.notes
+        );
+        // A cut FLASH keeps the vendor total for the catalogue, as RAM does.
+        let zg = memory_layout("STM32H743ZGTx", Some(1024), Some(864));
+        assert_eq!((zg.flash_size.as_str(), zg.flash_kb), ("512K", Some(1024)));
+        // No map: today's fixed origins and the vendor totals.
+        let n6 = memory_layout("STM32N657A0HxQ", None, Some(4096));
+        assert_eq!(
+            (
+                n6.flash_origin.as_str(),
+                n6.ram_origin.as_str(),
+                n6.ram_size.as_str()
+            ),
+            ("0x08000000", "0x20000000", "4096K")
+        );
+    }
+
+    /// A definition saved with the old totals gets the regions on load; one
+    /// that already fits - including a layout chosen by hand - is left alone.
+    #[test]
+    fn a_saved_memory_map_that_cannot_work_is_repaired() {
+        let base = crate::panels::mcu_module::builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.family == "stm32f1")
+            .expect("the bundled STM32F1");
+        let saved = |family: &str, name: &str, feature: &str, mem: [&str; 4]| {
+            let mut d = base.clone();
+            d.family = family.into();
+            d.display_name = name.into();
+            d.sram_kb = None;
+            d.project.hal_dep =
+                format!("embassy-stm32 = {{ version = \"0.6\", features = [\"{feature}\"] }}");
+            d.project.flash_origin = mem[0].into();
+            d.project.flash_size = mem[1].into();
+            d.project.ram_origin = mem[2].into();
+            d.project.ram_size = mem[3].into();
+            d.project.memory_comment = "Imported".into();
+            d
+        };
+        let mut h743 = saved(
+            "stm32h7",
+            "STM32H743ZITx",
+            "stm32h743zi",
+            ["0x08000000", "2048K", "0x20000000", "864K"],
+        );
+        assert!(repair_memory(&mut h743));
+        assert_eq!(
+            (
+                h743.project.ram_origin.as_str(),
+                h743.project.ram_size.as_str()
+            ),
+            ("0x24000000", "512K")
+        );
+        assert_eq!(h743.project.flash_size, "2048K");
+        assert_eq!(h743.sram_kb, Some(864));
+        assert!(
+            h743.project
+                .memory_comment
+                .starts_with("Imported - RAM is AXISRAM")
+        );
+        assert!(!repair_memory(&mut h743), "a second pass changes nothing");
+
+        let mut zg = saved(
+            "stm32h7",
+            "STM32H743ZGTx",
+            "stm32h743zg",
+            ["0x08000000", "1024K", "0x20000000", "864K"],
+        );
+        assert!(repair_memory(&mut zg));
+        assert_eq!(zg.project.flash_size, "512K");
+        assert_eq!(
+            zg.flash_kb,
+            Some(1024),
+            "the catalogue keeps the vendor total"
+        );
+        assert!(
+            zg.project.memory_comment.contains("past a gap"),
+            "{}",
+            zg.project.memory_comment
+        );
+
+        let mut u575 = saved(
+            "stm32u5",
+            "STM32U575ZITxQ",
+            "stm32u575zi",
+            ["0x08000000", "2048K", "0x20000000", "786K"],
+        );
+        assert!(repair_memory(&mut u575));
+        assert_eq!(
+            (
+                u575.project.ram_origin.as_str(),
+                u575.project.ram_size.as_str()
+            ),
+            ("0x20000000", "768K")
+        );
+
+        for mem in [
+            // The DTCM, chosen by hand: it fits.
+            ["0x08000000", "2048K", "0x20000000", "128K"],
+            // A bootloader offset and a shorter image.
+            ["0x08020000", "1920K", "0x24000000", "512K"],
+        ] {
+            let mut d = saved("stm32h7", "STM32H743ZITx", "stm32h743zi", mem);
+            let before = d.clone();
+            assert!(!repair_memory(&mut d), "{mem:?}");
+            assert_eq!(d, before);
+        }
+        // A FLASH the part has, typed by the user: 128K on an F103C8, whose
+        // metapac run is 64K but which has no second bank to be past.
+        let mut c8 = saved(
+            "stm32f1",
+            "STM32F103C8Tx",
+            "stm32f103c8",
+            ["0x08000000", "128K", "0x20000000", "20K"],
+        );
+        c8.project.hal_dep = base.project.hal_dep.clone();
+        let before = c8.clone();
+        assert!(!repair_memory(&mut c8), "{}", c8.project.flash_size);
+        assert_eq!(c8, before);
+        // A U3 saved at its full 1024K is right.
+        // A dual-core H7 saved at its vendor total: bank 1 only.
+        let mut h745 = saved(
+            "stm32h7",
+            "STM32H745ZITx",
+            "stm32h745zi-cm7",
+            ["0x08000000", "2048K", "0x24000000", "512K"],
+        );
+        assert!(repair_memory(&mut h745));
+        assert_eq!(h745.project.flash_size, "1024K");
+        assert!(
+            h745.project.memory_comment.contains("Cortex-M4 boots"),
+            "{}",
+            h745.project.memory_comment
+        );
+        assert_eq!(h745.flash_kb, Some(2048));
+        let mut u3 = saved(
+            "stm32u3",
+            "STM32U375CGUx",
+            "stm32u375cg",
+            ["0x08000000", "1024K", "0x20000000", "256K"],
+        );
+        assert!(!repair_memory(&mut u3), "{}", u3.project.flash_size);
+        let mut wl = saved(
+            "stm32wl",
+            "STM32WL55JCIx",
+            "stm32wl55jc-cm4",
+            ["0x08000000", "256K", "0x20000000", "64K"],
+        );
+        assert!(!repair_memory(&mut wl));
+        // Not an STM32, nothing to judge.
+        let mut f1 = base.clone();
+        assert!(!repair_memory(&mut f1));
+        assert_eq!(f1, base);
+
+        // And the load route runs it.
+        let mut d = saved(
+            "stm32h7",
+            "STM32H743ZITx",
+            "stm32h743zi",
+            ["0x08000000", "2048K", "0x20000000", "864K"],
+        );
+        d.id = "stm32h743zitx".into();
+        let text = ron::ser::to_string(&d).expect("serialisable");
+        let loaded = crate::panels::mcu_module::registry::parse_definition(&text).expect("parses");
+        assert_eq!(loaded.project.ram_origin, "0x24000000");
+    }
+
+    /// Every part in the vendor database, through the REAL importer, against
+    /// stm32-metapac ITSELF - not against the table the importer read: memory.x
+    /// never describes more FLASH or RAM than metapac has contiguous at that
+    /// origin. Ignored: it needs STM32CubeMX and the cargo registry's metapac.
+    ///
+    /// The one rule it shares with the harvest script: a flash bank that starts
+    /// inside the one before it (the U375/U385's BANK_2) follows it, as CubeMX
+    /// says the silicon does.
+    ///
+    /// `cargo test -- --ignored every_cubemx_part_links_memory_it_has --nocapture`
+    #[test]
+    #[ignore]
+    fn every_cubemx_part_links_memory_it_has() {
+        use std::path::PathBuf;
+        let mcu_dir = match std::env::var_os("EIDE_CUBE_DB") {
+            Some(dir) => PathBuf::from(dir),
+            None => match crate::panels::mcu_module::clock::graph::cubemx::default_db_dir() {
+                Some(db) => db.join("mcu"),
+                None => {
+                    println!("skipped: no STM32CubeMX database on this machine");
+                    return;
+                }
+            },
+        };
+        let home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .map(|h| PathBuf::from(h).join(".cargo"))
+            });
+        let mut metapacs: Vec<PathBuf> = home
+            .map(|h| h.join("registry").join("src"))
+            .and_then(|src| std::fs::read_dir(src).ok())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|reg| {
+                std::fs::read_dir(reg.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("stm32-metapac-21."))
+            })
+            .collect();
+        metapacs.sort();
+        let Some(metapac) = metapacs.pop() else {
+            println!("skipped: no stm32-metapac 21 in the cargo registry");
+            return;
+        };
+
+        /// (name, kind, address, size) of every region of the configuration
+        /// embassy uses: the only one, or the single-bank one.
+        fn regions(text: &str) -> Vec<(String, String, u64, u64)> {
+            let mem = &text[text.find("memory:").unwrap()..text.find("peripherals:").unwrap()];
+            let mut configs = Vec::new();
+            let (mut depth, mut start, mut i) = (0i32, 0usize, mem.find("&[").unwrap() + 2);
+            while i < mem.len() {
+                if mem[i..].starts_with("&[") {
+                    depth += 1;
+                    if depth == 1 {
+                        start = i;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if mem.as_bytes()[i] == b']' {
+                    if depth == 1 {
+                        configs.push(&mem[start..i]);
+                    }
+                    depth -= 1;
+                    if depth < 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let pick = match configs.as_slice() {
+                [one] => *one,
+                many => many
+                    .iter()
+                    .find(|c| c.contains("BANK_1") && !c.contains("BANK_2"))
+                    .copied()
+                    .expect("a single-bank configuration"),
+            };
+            let field = |r: &str, key: &str| -> String {
+                let at = r.find(key).unwrap() + key.len();
+                r[at..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| !matches!(c, ',' | '\n' | '}'))
+                    .collect::<String>()
+                    .trim()
+                    .trim_matches('"')
+                    .to_owned()
+            };
+            pick.split("MemoryRegion {")
+                .skip(1)
+                .map(|r| {
+                    let num = |s: String| match s.strip_prefix("0x") {
+                        Some(h) => u64::from_str_radix(h, 16).unwrap(),
+                        None => s.parse().unwrap(),
+                    };
+                    (
+                        field(r, "name:"),
+                        field(r, "kind:")
+                            .trim_start_matches("MemoryRegionKind::")
+                            .to_owned(),
+                        num(field(r, "address:")),
+                        num(field(r, "size:")),
+                    )
+                })
+                .collect()
+        }
+        /// Bytes contiguous from `origin` over the regions of `kind` that pass.
+        fn run_from(
+            regions: &[(String, String, u64, u64)],
+            kind: &str,
+            origin: u64,
+            keep: &dyn Fn(&str) -> bool,
+        ) -> u64 {
+            let mut rs: Vec<_> = regions
+                .iter()
+                .filter(|r| r.1 == kind && r.3 != 0 && keep(&r.0))
+                .collect();
+            rs.sort_by_key(|r| r.2);
+            let mut end = origin;
+            for r in rs {
+                // Contiguous, or (the U3) starting inside the run so far.
+                if r.2 == end || (r.2 > origin && r.2 < end) {
+                    end += r.3;
+                }
+            }
+            end - origin
+        }
+
+        let mut files: Vec<_> = std::fs::read_dir(&mcu_dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", mcu_dir.display()))
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "xml")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("STM32"))
+            })
+            .collect();
+        files.sort();
+        let (mut checked, mut unmapped) = (0usize, 0usize);
+        let mut wrong = Vec::new();
+        let num = |s: &str| crate::panels::mcu_module::mcu_form::parse_ld_number(s).unwrap_or(0);
+        for path in &files {
+            let xml = std::fs::read_to_string(path).expect("readable");
+            for chip in convert_xml(&xml).unwrap_or_else(|e| panic!("{}: {e}", path.display())) {
+                let f = &chip.form;
+                let feature = embassy_chip_feature(&f.display_name);
+                let meta = metapac
+                    .join("src")
+                    .join("chips")
+                    .join(&feature)
+                    .join("metadata.rs");
+                let Ok(text) = std::fs::read_to_string(&meta) else {
+                    unmapped += 1;
+                    continue;
+                };
+                let rs = regions(&text);
+                if !rs.iter().any(|r| r.1 == "Flash" && r.0.starts_with("BANK")) {
+                    unmapped += 1; // N6: no internal flash
+                    continue;
+                }
+                checked += 1;
+                let chip_name = text
+                    .split("name: \"")
+                    .nth(1)
+                    .and_then(|t| t.split('"').next())
+                    .unwrap_or_default()
+                    .to_owned();
+                let ram_ok = |name: &str| {
+                    let radio = chip_name.starts_with("STM32WB")
+                        && !chip_name.starts_with("STM32WBA")
+                        && !chip_name.starts_with("STM32WB0");
+                    !(radio && name.starts_with("SRAM2"))
+                        && !name.starts_with("SDRAM_")
+                        && !name.starts_with("FMC_")
+                        && !name.starts_with("OCTOSPI_")
+                };
+                let dual_h7 = feature.starts_with("stm32h7") && feature.contains("-cm");
+                let flash_ok = |name: &str| {
+                    name.starts_with("BANK") && !(dual_h7 && name.starts_with("BANK_2"))
+                };
+                let ram = run_from(&rs, "Ram", num(&f.ram_origin), &ram_ok);
+                if num(&f.ram_size) > ram {
+                    wrong.push(format!(
+                        "{}: RAM {} {} but {}K there",
+                        f.display_name,
+                        f.ram_origin,
+                        f.ram_size,
+                        ram / 1024
+                    ));
+                }
+                let flash = run_from(&rs, "Flash", num(&f.flash_origin), &flash_ok);
+                if num(&f.flash_size) > flash {
+                    wrong.push(format!(
+                        "{}: FLASH {} {} but {}K there",
+                        f.display_name,
+                        f.flash_origin,
+                        f.flash_size,
+                        flash / 1024
+                    ));
+                }
+            }
+        }
+        println!(
+            "{checked} parts checked against {}, {unmapped} without one",
+            metapac.display()
+        );
+        assert!(
+            wrong.is_empty(),
+            "{} wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        assert!(checked > 2000, "suspiciously few: {checked}");
+    }
+
     /// The binary search needs the table sorted, and each line has exactly
     /// one application core: the M7 on the H7, the M4 on the WL.
     #[test]
@@ -1991,15 +3001,301 @@ mod tests {
         }
     }
 
-    /// The table against the list it was generated from: embassy-stm32 0.6's
-    /// own Cargo.toml, unpacked in the local cargo registry. Ignored because
-    /// it reads outside the repo.
+    /// Every suffix ST puts after a part number, on the names the importer, the
+    /// form's Auto-fill and the AI import really hand over. Each expected value
+    /// is checked against the published list as well, so the table cannot
+    /// pin a feature that does not exist.
+    #[test]
+    fn every_suffix_class_derives_the_published_feature() {
+        let cases = [
+            // The STM32L1 dies embassy publishes twice.
+            ("STM32L151C8TxA", "stm32l151c8-a"),
+            ("STM32L151RCTxA", "stm32l151rc-a"),
+            ("STM32L100C6UxA", "stm32l100c6-a"),
+            ("STM32L162VCTxA", "stm32l162vc-a"),
+            ("STM32L151VDTxX", "stm32l151vd-x"),
+            ("STM32L151VDYxX", "stm32l151vd-x"),
+            ("STM32L162VDYxX", "stm32l162vd-x"),
+            // ...and the bare die next to them.
+            ("STM32L151VDTx", "stm32l151vd"),
+            ("STM32L151C8Tx", "stm32l151c8"),
+            // Option letters embassy ignores.
+            ("STM32N657A0HxQG", "stm32n657a0"),
+            ("STM32N645A0HxQ", "stm32n645a0"),
+            ("STM32WB35CCUxA", "stm32wb35cc"),
+            ("STM32WB30CEUxA", "stm32wb30ce"),
+            ("STM32WB35CEUxA", "stm32wb35ce"),
+            ("STM32WB15CCUxE", "stm32wb15cc"),
+            ("STM32H7R3L8HxH", "stm32h7r3l8"),
+            ("STM32U375REYxG", "stm32u375re"),
+            ("STM32G431CBTxZ", "stm32g431cb"),
+            ("STM32L496QGIxS", "stm32l496qg"),
+            ("STM32F412REYxP", "stm32f412re"),
+            ("STM32C071C8TxN", "stm32c071c8"),
+            ("STM32H563AIIxQ", "stm32h563ai"),
+            ("STM32WBA55CGUx", "stm32wba55cg"),
+            ("STM32H745ZITx", "stm32h745zi-cm7"),
+            // Orderable codes: a temperature digit instead of the `x`.
+            ("STM32F411RET6", "stm32f411re"),
+            ("STM32L151C6T6A", "stm32l151c6-a"),
+            ("STM32L151C6T6TR", "stm32l151c6"),
+            ("STM32WBA55CGU6", "stm32wba55cg"),
+            ("STM32H743ZIT6", "stm32h743zi"),
+            // A datasheet's spelling, lower case, and a board name.
+            ("STM32L151C6-A", "stm32l151c6-a"),
+            ("STM32L151VD-X", "stm32l151vd-x"),
+            ("stm32l151vdtxx", "stm32l151vd-x"),
+            ("STM32F411RE-Nucleo", "stm32f411re"),
+            ("STM32F411RE", "stm32f411re"),
+            // Free text after an L1 part number is not a die.
+            ("STM32L151CB board", "stm32l151cb"),
+            ("STM32L151C8 Blackpill", "stm32l151c8"),
+            ("STM32L151C8 Xmas", "stm32l151c8"),
+            ("STM32L151CBT6 Xmas", "stm32l151cb"),
+            ("STM32L151C6-A (Cat.3)", "stm32l151c6-a"),
+            ("STM32L151C6T6ATR", "stm32l151c6-a"),
+            // The X package is a real part when it is written in capitals.
+            ("STM32H743XIHx", "stm32h743xi"),
+            // An orderable code followed by more text keeps its die.
+            ("STM32L151C8T6A board", "stm32l151c8-a"),
+            ("STM32L151C6T6A (Cat.3)", "stm32l151c6-a"),
+            ("STM32L151VDT6X board", "stm32l151vd-x"),
+            ("STM32L151C8TxA board", "stm32l151c8-a"),
+            ("STM32L151C8T6A-Nucleo", "stm32l151c8-a"),
+        ];
+        for (name, want) in cases {
+            assert_eq!(embassy_chip_feature(name), want, "{name}");
+            assert!(embassy_publishes(want), "{want} ({name}) is not published");
+        }
+        // Too short to be a part number: returned as it is, never a panic.
+        assert_eq!(embassy_chip_feature("STM32F4"), "stm32f4");
+        assert_eq!(embassy_chip_feature(""), "");
+        // A board shorter than a part number names no part either.
+        for name in ["STM32F401C-DISCO", "STM32F429I-EVAL"] {
+            let f = embassy_chip_feature(name);
+            assert!(!embassy_publishes(&f), "{name} -> {f}");
+        }
+        // A wildcard names no single part: nothing published comes out.
+        for name in ["STM32H743xI", "STM32H745xI", "STM32H7x3ZI", "STM32WBA5xCG"] {
+            let f = embassy_chip_feature(name);
+            assert!(!embassy_publishes(&f), "{name} -> {f}");
+            assert!(!f.contains('x') || name.ends_with('x'), "{name} -> {f}");
+        }
+        // The die reaches the manifest on both dependency-line routes.
+        let line = hal_dep_for("stm32l1", "STM32L151", "STM32L151C8TxA");
+        assert_eq!(embassy_feature_in(&line), Some("stm32l151c8-a"), "{line}");
+        let line = hal_dep_for_name("stm32l1", "STM32L151VDTxX");
+        assert_eq!(embassy_feature_in(&line), Some("stm32l151vd-x"), "{line}");
+    }
+
+    /// Every feature embassy publishes comes back out of a part name built
+    /// the way CubeMX spells it, so the position rule holds on every line, not
+    /// just the ones the table above names. The other core of a dual-core part
+    /// is skipped: nothing generated here targets it.
+    #[test]
+    fn every_published_feature_round_trips() {
+        let list = &super::super::stm32_embassy_features::FEATURES;
+        assert!(
+            list.windows(2).all(|w| w[0] < w[1]),
+            "unsorted or duplicated, so the binary search would miss features"
+        );
+        let mut checked = 0;
+        for feature in list {
+            let (base, suffix) = feature.split_once('-').unwrap_or((feature, ""));
+            let app_core = DUAL_CORE_PARTS.contains(&(base, suffix));
+            let die = match suffix {
+                "" => "",
+                "a" => "A",
+                "x" => "X",
+                _ if app_core => "",
+                "cm4" | "cm0p" => continue,
+                other => panic!("{feature}: a suffix nobody has a rule for ({other})"),
+            };
+            let name = format!("STM32{}Tx{die}", base[5..].to_ascii_uppercase());
+            assert_eq!(embassy_chip_feature(&name), *feature, "{name}");
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            list.len() - 30,
+            "the 26 H7 Cortex-M4 and 4 WL Cortex-M0+ features"
+        );
+    }
+
+    /// The per-core table against the published list: each part has its
+    /// application core's feature and no bare one, and no per-core part is
+    /// missing from the table.
+    #[test]
+    fn the_dual_core_table_agrees_with_the_chip_list() {
+        let mut per_core: Vec<&str> = super::super::stm32_embassy_features::FEATURES
+            .iter()
+            .filter_map(|f| f.split_once('-'))
+            .filter(|(_, core)| core.starts_with("cm"))
+            .map(|(part, _)| part)
+            .collect();
+        per_core.dedup();
+        let table: Vec<&str> = DUAL_CORE_PARTS.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            per_core, table,
+            "the per-core parts moved: regenerate DUAL_CORE_PARTS"
+        );
+        for (part, core) in DUAL_CORE_PARTS {
+            assert!(
+                embassy_publishes(&format!("{part}-{core}")),
+                "{part}-{core}"
+            );
+            assert!(
+                !embassy_publishes(part),
+                "{part}: a bare feature is published after all"
+            );
+        }
+    }
+
+    /// A definition saved by the old rule is brought up to the new one on
+    /// load; a line the user chose, an F1 line, and a line that is already
+    /// right are left as they are.
+    #[test]
+    fn a_saved_line_from_the_old_rule_is_repaired() {
+        let base = crate::panels::mcu_module::builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.family == "stm32f1")
+            .expect("the bundled STM32F1");
+        let saved = |family: &str, name: &str, feature: &str| {
+            let mut d = base.clone();
+            d.family = family.into();
+            d.display_name = name.into();
+            // As an import writes it: the CubeMX name is the probe name.
+            d.project.probe_chip = name.into();
+            d.project.hal_dep = format!(
+                "embassy-stm32 = {{ version = \"0.6\", features = [\"{feature}\", \"single-bank\"] }}"
+            );
+            d
+        };
+        for (family, name, old, new) in [
+            ("stm32l1", "STM32L151C8TxA", "stm32l151c8", "stm32l151c8-a"),
+            ("stm32l1", "STM32L151VDTxX", "stm32l151vdt", "stm32l151vd-x"),
+            (
+                "stm32n6",
+                "STM32N657A0HxQG",
+                "stm32n657a0hxqg",
+                "stm32n657a0",
+            ),
+            // Saved before the per-core table: the bare part number.
+            ("stm32wl", "STM32WL55JCIx", "stm32wl55jc", "stm32wl55jc-cm4"),
+            // The first rule, before 2026-08-25: the whole slug.
+            (
+                "stm32l1",
+                "STM32L151C8TxA",
+                "stm32l151c8txa",
+                "stm32l151c8-a",
+            ),
+            ("stm32c0", "STM32C071C8TxN", "stm32c071c8txn", "stm32c071c8"),
+            ("stm32n6", "STM32N645A0HxQ", "stm32n645a0hxq", "stm32n645a0"),
+            // An orderable code with text after it: the die it names.
+            (
+                "stm32l1",
+                "STM32L151C8T6A board",
+                "stm32l151c8t6aboard",
+                "stm32l151c8-a",
+            ),
+            // A board name the first rule wrote whole: the bare die, not -a.
+            (
+                "stm32l1",
+                "STM32L151CB board",
+                "stm32l151cbboard",
+                "stm32l151cb",
+            ),
+        ] {
+            let mut d = saved(family, name, old);
+            assert!(repair_hal_feature(&mut d), "{name}");
+            assert_eq!(embassy_feature_in(&d.project.hal_dep), Some(new), "{name}");
+            // Only the chip feature moved; the rest of the line is the user's.
+            assert!(
+                d.project.hal_dep.contains("\"single-bank\""),
+                "{}",
+                d.project.hal_dep
+            );
+            assert!(
+                !repair_hal_feature(&mut d),
+                "{name}: a second pass changes nothing"
+            );
+        }
+        for (family, name, feature) in [
+            ("stm32l1", "STM32L151C8TxA", "stm32l151c8-a"), // already right
+            ("stm32l1", "STM32L151C8TxA", "stm32l152c8-a"), // the user's pick
+            ("stm32f4", "STM32F411RETx", "stm32f411re"),
+            // The old rule's line, but the new one names no published chip
+            // either: left for the import refusal to explain.
+            ("stm32wl3", "STM32WL33KCVxX", "stm32wl33kcv"),
+        ] {
+            let mut d = saved(family, name, feature);
+            let before = d.project.hal_dep.clone();
+            assert!(!repair_hal_feature(&mut d), "{name} {feature}");
+            assert_eq!(d.project.hal_dep, before);
+        }
+        // A line pinning another version is judged against another list.
+        let mut other = saved("stm32l1", "STM32L151C8TxA", "stm32l151c8");
+        other.project.hal_dep = other.project.hal_dep.replace("\"0.6\"", "\"0.4\"");
+        assert!(!repair_hal_feature(&mut other), "{}", other.project.hal_dep);
+        // The Async line of a definition that has one moves with the other.
+        let mut both = saved("stm32l1", "STM32L151C8TxA", "stm32l151c8");
+        both.project.hal_dep_async = Some(both.project.hal_dep.clone());
+        assert!(repair_hal_feature(&mut both));
+        let async_line = both.project.hal_dep_async.as_deref().unwrap();
+        assert_eq!(
+            embassy_feature_in(async_line),
+            Some("stm32l151c8-a"),
+            "{async_line}"
+        );
+        // A WL55 saved when the last core won: the M0+ target goes with it.
+        let mut wl = saved("stm32wl", "STM32WL55JCIx", "stm32wl55jc");
+        wl.project.target = "thumbv6m-none-eabi".into();
+        wl.cpu = "ARM Cortex-M0+".into();
+        assert!(repair_hal_feature(&mut wl));
+        assert_eq!(
+            (wl.project.target.as_str(), wl.cpu.as_str()),
+            ("thumbv7em-none-eabi", "ARM Cortex-M4")
+        );
+        // Repaired only from a name its project's manifest is upgraded from
+        // too: a display name alone, beside a hand-set id and another probe
+        // name, moves neither - so the two never disagree.
+        let mut hand = saved("stm32l1", "STM32L151C8TxA", "stm32l151c8");
+        hand.project.probe_chip = "STM32L151C8".into();
+        hand.project.pkg_name = "my_board".into();
+        assert!(!repair_hal_feature(&mut hand), "{}", hand.project.hal_dep);
+        // An id that lost the datasheet's dash: the display name says -a, the
+        // id the bare die - they disagree, and nothing moves.
+        let mut dash = saved("stm32l1", "STM32L151C6-A", "stm32l151c6a");
+        dash.project.probe_chip = String::new();
+        dash.project.pkg_name = "stm32l151c6a".into();
+        assert!(!repair_hal_feature(&mut dash), "{}", dash.project.hal_dep);
+        // An F1, even one whose line names embassy: the family is not judged.
+        let mut f1 = saved("stm32f1", "STM32F103C8Tx", "stm32f103c8tx");
+        let before = f1.clone();
+        assert!(!repair_hal_feature(&mut f1));
+        assert_eq!(f1, before);
+        let mut f1 = base.clone();
+        assert!(!repair_hal_feature(&mut f1));
+        assert_eq!(f1, base);
+        // And the load route runs it.
+        let mut d = saved("stm32l1", "STM32L151C8TxA", "stm32l151c8");
+        d.id = "stm32l151c8txa".into();
+        let text = ron::ser::to_string(&d).expect("serialisable");
+        let loaded = crate::panels::mcu_module::registry::parse_definition(&text).expect("parses");
+        assert_eq!(
+            embassy_feature_in(&loaded.project.hal_dep),
+            Some("stm32l151c8-a")
+        );
+    }
+
+    /// The embedded list against the manifest it was harvested from: the
+    /// embassy-stm32 release unpacked in the local cargo registry. Ignored
+    /// because it reads outside the repo; re-run after moving EMBASSY_VERSION.
     ///
-    /// `cargo test -- --ignored per_core_parts_match --nocapture`
+    /// `cargo test -- --ignored embedded_feature_table_matches --nocapture`
     #[test]
     #[ignore]
-    fn per_core_parts_match_the_published_features() {
-        use std::collections::{BTreeMap, BTreeSet};
+    fn embedded_feature_table_matches_the_registry() {
         use std::path::PathBuf;
 
         let home = std::env::var_os("CARGO_HOME")
@@ -2022,49 +3318,204 @@ mod tests {
                     .flatten()
             })
             .map(|e| e.path())
+            // A release, not a prerelease: the harvest script reads only those.
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(&prefix))
+                    .and_then(|n| n.strip_prefix(prefix.as_str()))
+                    .is_some_and(|patch| patch.parse::<u32>().is_ok())
             })
             .collect();
-        unpacked.sort();
+        // By patch number, so 0.6.10 sorts after 0.6.9.
+        unpacked.sort_by_key(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.rsplit('.').next())
+                .and_then(|n| n.parse::<u32>().ok())
+        });
         let dir = unpacked
             .last()
             .expect("embassy-stm32 0.6 in the cargo registry: build any STM32 project once");
         let text = std::fs::read_to_string(dir.join("Cargo.toml")).expect("a readable manifest");
         println!("checking against {}", dir.display());
 
-        // Feature keys sit at column 0: `stm32h745zi-cm7 = [`.
-        let features: BTreeSet<&str> = text
+        // Chip keys sit at column 0 of `[features]`: `stm32h745zi-cm7 = [`.
+        let mut published: Vec<&str> = text
             .lines()
+            .skip_while(|l| l.trim() != "[features]")
+            .skip(1)
+            .take_while(|l| !l.starts_with('['))
             .filter_map(|l| l.split_once(" = "))
             .map(|(k, _)| k.trim())
-            .filter(|k| k.starts_with("stm32"))
+            .filter(|k| {
+                let b = k.as_bytes();
+                k.starts_with("stm32")
+                    && b.get(5).is_some_and(u8::is_ascii_lowercase)
+                    && b.iter()
+                        .skip(5)
+                        .find(|c| !c.is_ascii_lowercase())
+                        .is_some_and(u8::is_ascii_digit)
+            })
             .collect();
-        let mut per_core: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for f in &features {
-            // `stm32l151c6-a` is a die revision, not a core.
-            if let Some((part, core)) = f.split_once('-').filter(|(_, c)| c.starts_with("cm")) {
-                per_core.entry(part).or_default().push(core);
+        published.sort_unstable();
+        let embedded = super::super::stm32_embassy_features::FEATURES.to_vec();
+        let missing: Vec<_> = published.iter().filter(|f| !embedded.contains(f)).collect();
+        let extra: Vec<_> = embedded.iter().filter(|f| !published.contains(f)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "regenerate with scripts/harvest-embassy-features.py: {} new, {} gone\nnew: {missing:?}\ngone: {extra:?}",
+            missing.len(),
+            extra.len()
+        );
+    }
+
+    /// Every part in the vendor database, through the REAL importer: its
+    /// feature is published, or its line is one embassy-stm32 0.6 has no chip
+    /// for at all. Ignored because it needs STM32CubeMX installed.
+    ///
+    /// Also pins the two things a rule change could break silently: a part
+    /// that resolved under the old rule still resolves, and on STM32L1 the
+    /// `A` / `X` die letter and the `-a` / `-x` feature go together.
+    ///
+    /// `cargo test -- --ignored every_cubemx_part_derives --nocapture`
+    #[test]
+    #[ignore]
+    fn every_cubemx_part_derives_a_published_feature() {
+        use std::collections::BTreeMap;
+
+        // `EIDE_CUBE_DB` names an `mcu` folder of another copy, such as the
+        // open-pin-data repository the chip search also reads.
+        let mcu_dir = match std::env::var_os("EIDE_CUBE_DB") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => match crate::panels::mcu_module::clock::graph::cubemx::default_db_dir() {
+                Some(db) => db.join("mcu"),
+                None => {
+                    println!("skipped: no STM32CubeMX database on this machine");
+                    return;
+                }
+            },
+        };
+        // Lines embassy-stm32 0.6 builds no chip for: the Cortex-A MPUs, three
+        // whole families, the lines newer than its chip list, and the modules.
+        // The H543/H553 and U335..U366 parts are in open-pin-data only.
+        const GAP_LINES: &[&str] = &[
+            "stm32mp1",
+            "stm32mp2",
+            "stm32wl3",
+            "stm32wb0",
+            "stm32g411",
+            "stm32g414",
+            "stm32h5e",
+            "stm32h5f",
+            "stm32h563li",
+            "stm32h573li",
+            "stm32u3b5",
+            "stm32u3c5",
+            "stm32wba2",
+            "stm32wba5m",
+            "stm32wba6m",
+            "stm32wb1m",
+            "stm32wb5m",
+            "stm32wl5m",
+            "stm32f723rc",
+            "stm32f723re",
+            "stm32l485jc",
+            "stm32l485je",
+            "stm32wl4",
+            "stm32h543",
+            "stm32h553",
+            "stm32u335",
+            "stm32u345",
+            "stm32u356",
+            "stm32u366",
+        ];
+        let mut files: Vec<_> = std::fs::read_dir(&mcu_dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", mcu_dir.display()))
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "xml")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("STM32"))
+            })
+            .collect();
+        files.sort();
+        let (mut present, mut f1) = (0usize, 0usize);
+        let mut gaps: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut wrong = Vec::new();
+        for path in &files {
+            let xml = std::fs::read_to_string(path).expect("readable");
+            let chips = convert_xml(&xml).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            for chip in chips {
+                let name = &chip.form.display_name;
+                let slug = slugify(name);
+                if chip.form.family == "stm32f1" {
+                    let line = f1_embassy_hal_dep(&chip.form.probe_chip, &chip.form.id)
+                        .unwrap_or_else(|| panic!("{name}: no Async line"));
+                    let feature = embassy_feature_in(&line).unwrap_or_default().to_owned();
+                    if !embassy_publishes(&feature) {
+                        wrong.push(format!(
+                            "{name}: the F1 Async feature {feature} is not published"
+                        ));
+                    }
+                    f1 += 1;
+                    continue;
+                }
+                let feature = embassy_feature_in(&chip.form.hal_dep)
+                    .unwrap_or_else(|| panic!("{name}: no embassy line in {}", chip.form.hal_dep))
+                    .to_owned();
+                if slug.starts_with("stm32l1") {
+                    let die = slug.as_bytes().get(13).copied();
+                    let suffix = feature.rsplit_once('-').map(|(_, s)| s.as_bytes()[0]);
+                    let lettered = matches!(die, Some(b'a' | b'x'));
+                    if lettered != suffix.is_some() || (lettered && die != suffix) {
+                        wrong.push(format!(
+                            "{name}: die {:?} but {feature}",
+                            die.map(char::from)
+                        ));
+                    }
+                }
+                // A part an older rule resolved resolves still, and to the
+                // same feature unless the new one is the die that old rule
+                // could not see.
+                for legacy in legacy_features(name) {
+                    if !embassy_publishes(&legacy) || legacy == feature {
+                        continue;
+                    }
+                    if !embassy_publishes(&feature) {
+                        wrong.push(format!("{name}: {legacy} resolved, {feature} does not"));
+                    } else if !feature.ends_with("-a") && !feature.ends_with("-x") {
+                        wrong.push(format!("{name}: {legacy} became {feature}"));
+                    }
+                }
+                if embassy_publishes(&feature) {
+                    present += 1;
+                } else if let Some(line) = GAP_LINES.iter().find(|l| slug.starts_with(**l)) {
+                    *gaps.entry(line).or_default() += 1;
+                } else {
+                    wrong.push(format!("{name}: {feature} is not published"));
+                }
             }
         }
-        let table: Vec<&str> = DUAL_CORE_PARTS.iter().map(|(p, _)| *p).collect();
-        assert_eq!(
-            per_core.keys().copied().collect::<Vec<_>>(),
-            table,
-            "the per-core parts moved: regenerate DUAL_CORE_PARTS"
+        println!(
+            "{} files: {present} published, {f1} F1 (via the Async line), {} in gap lines",
+            files.len(),
+            gaps.values().sum::<usize>()
         );
-        for (part, core) in DUAL_CORE_PARTS {
-            assert!(
-                features.contains(format!("{part}-{core}").as_str()),
-                "{part}-{core} is not published"
-            );
-            assert!(
-                !features.contains(part),
-                "{part}: a bare feature is published after all"
-            );
+        for (line, n) in &gaps {
+            println!("  {line:<12} {n}");
         }
+        assert!(
+            wrong.is_empty(),
+            "{} wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        assert!(
+            present + f1 > 2000,
+            "suspiciously few parts: {present} + {f1}"
+        );
     }
 
     /// The real STM32WL55JCIx header: two cores, the application core first.

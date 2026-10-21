@@ -84,6 +84,9 @@ pub fn draw_graph_clock(
     presets: &[ClockPreset],
     defaults: Option<&ClockGraph>,
     family: &str,
+    // What the runtime adds to the limits: embassy-time's floor on Async
+    // (`rcc::time_driver_issue`), worked out by the caller, which knows it.
+    boot_issue: Option<&str>,
     state: &mut ClockUiState,
     clock_manual: &mut bool,
 ) -> ClockTabOut {
@@ -133,7 +136,16 @@ pub fn draw_graph_clock(
             egui::ScrollArea::vertical()
                 .id_salt("ginfo_scroll")
                 .show(ui, |ui| {
-                    if graph_info_zone(ui, gc, limits, &freqs, is_stm32f1, family, *clock_manual) {
+                    if graph_info_zone(
+                        ui,
+                        gc,
+                        limits,
+                        &freqs,
+                        is_stm32f1,
+                        family,
+                        *clock_manual,
+                        boot_issue,
+                    ) {
                         changed = true;
                     }
                 });
@@ -2004,10 +2016,19 @@ fn graph_info_zone(
     is_stm32f1: bool,
     family: &str,
     manual: bool,
+    boot_issue: Option<&str>,
 ) -> bool {
     // The checkbox itself moved to the toolbar; what stays here is what it
     // MEANS — the amber warnings that a diagram driving nothing would hide.
     clock_manual_note(ui, family, gc, manual);
+    // Red like a limit: the chip would not get past `embassy_stm32::init`.
+    // Not in manual mode - main.rs then runs the user's own clock.
+    if let Some(why) = boot_issue.filter(|_| !manual) {
+        ui.colored_label(
+            egui::Color32::from_rgb(230, 90, 80),
+            format!("{}  {why}", ph::X_CIRCLE),
+        );
+    }
     let changed = false;
     if is_stm32f1 {
         let c = graph_to_stm32f1(&gc.for_codegen());
@@ -2136,13 +2157,23 @@ fn clock_manual_note(ui: &mut egui::Ui, family: &str, gc: &GraphClock, manual: b
     }
     let (generated, from_tree) = clock_codegen_state(family, gc);
     if !generated {
-        ui.label(
-            egui::RichText::new(format!(
+        let why = crate::panels::mcu_module::codegen::rcc::skeleton_reason(
+            family,
+            &ClockConfig::Graph(gc.clone()),
+        );
+        let text = match why {
+            // Not "boots on embassy's default": in manual mode main.rs holds
+            // the user's own block.
+            Some(why) => format!("{}  not generated from this tree: {why}", ph::WARNING),
+            None => format!(
                 "{}  {family} has no clock generator - the System tab lists what this chip is missing",
                 ph::WARNING
-            ))
-            .size(11.0)
-            .color(egui::Color32::from_rgb(225, 185, 60)),
+            ),
+        };
+        ui.label(
+            egui::RichText::new(text)
+                .size(11.0)
+                .color(egui::Color32::from_rgb(225, 185, 60)),
         );
     } else if from_tree {
         ui.label(
@@ -2446,7 +2477,17 @@ mod tests {
                 }
                 let mut manual = false;
                 let limits = ClockLimits::default();
-                draw_graph_clock(ui, gc, &limits, &[], None, "stm32g0", state, &mut manual);
+                draw_graph_clock(
+                    ui,
+                    gc,
+                    &limits,
+                    &[],
+                    None,
+                    "stm32g0",
+                    None,
+                    state,
+                    &mut manual,
+                );
             });
         }
 
@@ -2555,7 +2596,17 @@ mod tests {
                     let _ = crate::headless::run_ui(&ctx, input, |ui| {
                         let mut manual = false;
                         let limits = ClockLimits::default();
-                        draw_graph_clock(ui, gc, &limits, &[], None, "stm32g0", state, &mut manual);
+                        draw_graph_clock(
+                            ui,
+                            gc,
+                            &limits,
+                            &[],
+                            None,
+                            "stm32g0",
+                            None,
+                            state,
+                            &mut manual,
+                        );
                     });
                 };
             for _ in 0..4 {

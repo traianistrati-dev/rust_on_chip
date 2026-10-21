@@ -237,6 +237,11 @@ pub struct Mcu {
     /// counted from it, and a range past the real chip would wrap onto the
     /// boot block. `None` when the definition does not state it.
     pub board_flash: Option<u32>,
+    /// The embassy-stm32 chip feature the definition's dependency line names
+    /// (`stm32wl55jc-cm4`), `None` when it names none. What decides a
+    /// dual-core build: the id and the name are free text, the line is what
+    /// the project compiles with.
+    pub hal_feature: Option<String>,
     pub usart_ip: Option<String>,
     /// The chip's SDMMC IP version — the gate on WHICH constructor shape the
     /// SDMMC codegen may emit, see

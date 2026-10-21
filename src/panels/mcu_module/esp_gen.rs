@@ -1308,6 +1308,7 @@ pub fn definition(chip: &EspChip) -> Result<McuDefinition, String> {
         // stays unknown on purpose: it is a separate SPI part chosen by whoever
         // built the module, so the same die ships as 2, 4, 8 or 16 MB.
         sram_kb: Some(chip.dram_bytes / 1024),
+        flash_kb: None,
         toolchain: ToolchainKind::EspRust,
         project: ProjectDef {
             pkg_name: chip.id.clone(),

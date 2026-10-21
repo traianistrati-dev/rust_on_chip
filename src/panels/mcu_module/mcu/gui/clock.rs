@@ -1,7 +1,7 @@
 //! Clock tab rendering — dispatches to the per-family clock GUI.
 
 use crate::panels::mcu_module::clock::{ClockConfig, gui as clock_gui};
-use crate::panels::mcu_module::codegen::rcc::generates_clock_code_for;
+use crate::panels::mcu_module::codegen::rcc::tree_drives_clock_code;
 use crate::panels::mcu_module::mcu::model::Mcu;
 use eframe::egui;
 
@@ -22,6 +22,18 @@ impl Mcu {
     ) -> clock_gui::ClockTabOut {
         // Destructure so the config borrows mutably while the chip's limits,
         // presets and family stay readable alongside it.
+        // On Async, what `embassy_stm32::init` refuses at boot and the
+        // datasheet limits below cannot see.
+        let boot_issue = if self.is_async() {
+            let pins: Vec<_> = self.iter_all_pins().collect();
+            crate::panels::mcu_module::codegen::rcc::async_boot_issue(
+                &self.family,
+                &self.clock,
+                crate::panels::mcu_module::codegen::embassy_stm32::time_driver_timer_of(&pins),
+            )
+        } else {
+            None
+        };
         let Mcu {
             clock,
             clock_limits,
@@ -41,6 +53,7 @@ impl Mcu {
                     clock_presets,
                     clock_defaults.as_ref(),
                     family,
+                    boot_issue.as_deref(),
                     state,
                     clock_manual,
                 );
@@ -60,7 +73,7 @@ impl Mcu {
                     *clock_defaults = Some(graph);
                 }
                 if out.remove_clock || out.adopt_defaults {
-                    *clock_manual = !generates_clock_code_for(family, clock);
+                    *clock_manual = !tree_drives_clock_code(family, clock);
                 }
                 out
             }
@@ -79,7 +92,7 @@ impl Mcu {
                         // generated, so the hand-written default this chip got
                         // for having no recipe no longer holds — leaving it on
                         // would fence the block off and freeze it there.
-                        *clock_manual = !generates_clock_code_for(family, clock);
+                        *clock_manual = !tree_drives_clock_code(family, clock);
                         clock_gui::ClockTabOut {
                             changed: true,
                             ..Default::default()

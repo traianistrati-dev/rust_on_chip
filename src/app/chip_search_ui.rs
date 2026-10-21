@@ -377,15 +377,22 @@ fn result_row(ui: &mut egui::Ui, hit: &Hit, selected: bool, row_h: f32) -> Optio
             } else {
                 egui::RichText::new(format!("{}  {}", ph::DOWNLOAD_SIMPLE, hit.name))
             };
-            let btn = ui.add(
+            // Refused: still a row, greyed, with the reason where the click
+            // would have been - the part is not missing from the list, it is
+            // one that cannot be built.
+            let refused = hit.refused.as_ref().filter(|_| !known);
+            let btn = ui.add_enabled(
+                refused.is_none(),
                 egui::Button::new(label)
                     .selected(selected)
                     .min_size(egui::vec2(170.0, 0.0)),
             );
-            let btn = if known {
-                btn.on_hover_text("Use this chip")
-            } else {
-                btn.on_hover_text("Import this chip from its vendor file and select it")
+            let btn = match refused {
+                Some(r) => {
+                    btn.on_disabled_hover_text(format!("Cannot be imported: {}", r.reason()))
+                }
+                None if known => btn.on_hover_text("Use this chip"),
+                None => btn.on_hover_text("Import this chip from its vendor file and select it"),
             };
             if btn.clicked() {
                 click = Some(RowClick::Pick);
@@ -397,31 +404,42 @@ fn result_row(ui: &mut egui::Ui, hit: &Hit, selected: bool, row_h: f32) -> Optio
             );
             // What this row can actually deliver — said before the click, not
             // discovered after it.
-            let (tag, color) = match &hit.origin {
-                Origin::Registry { .. } => {
-                    ("already added", egui::Color32::from_rgb(120, 200, 120))
-                }
-                Origin::Disk {
-                    has_clock: true, ..
-                } => ("pins + clock", egui::Color32::from_rgb(120, 190, 200)),
-                Origin::Disk {
-                    has_clock: false, ..
-                } => ("pins only", egui::Color32::from_rgb(225, 185, 60)),
+            let (tag, color) = match (&hit.origin, refused) {
+                (_, Some(r)) => (r.tag(), egui::Color32::from_rgb(220, 120, 90)),
+                (origin, None) => match origin {
+                    Origin::Registry { .. } => {
+                        ("already added", egui::Color32::from_rgb(120, 200, 120))
+                    }
+                    Origin::Disk {
+                        has_clock: true, ..
+                    } => ("pins + clock", egui::Color32::from_rgb(120, 190, 200)),
+                    Origin::Disk {
+                        has_clock: false, ..
+                    } => ("pins only", egui::Color32::from_rgb(225, 185, 60)),
+                },
             };
             ui.label(egui::RichText::new(tag).size(10.0).color(color));
             // A chip already in the registry can still be refreshed from its
             // vendor file: the data may have moved on (a newer CubeMX) or the
             // import itself may have been fixed since. Secondary, never the
             // primary action - the row's job is still "pick this chip".
-            if hit.reimport.is_some()
-                && ui
-                    .small_button(ph::ARROW_CLOCKWISE)
+            if hit.reimport.is_some() {
+                let reimport = ui
+                    .add_enabled(
+                        hit.refused.is_none(),
+                        egui::Button::new(ph::ARROW_CLOCKWISE).small(),
+                    )
                     .on_hover_text(
                         "Re-import from the vendor file, overwriting the stored definition",
-                    )
-                    .clicked()
-            {
-                click = Some(RowClick::Reimport);
+                    );
+                let reimport = match &hit.refused {
+                    Some(r) => reimport
+                        .on_disabled_hover_text(format!("Cannot be re-imported: {}", r.reason())),
+                    None => reimport,
+                };
+                if reimport.clicked() {
+                    click = Some(RowClick::Reimport);
+                }
             }
             if !hit.detail.is_empty() {
                 ui.add(
@@ -480,6 +498,16 @@ fn row_action(sources: &[chip_sources::ChipSource], hit: &Hit, click: RowClick) 
         }),
         Origin::Registry { .. } => None,
     };
+    // A refused part never reaches the importer from here: the button is
+    // greyed, and this holds whatever drew it.
+    if hit.refused.is_some()
+        && !matches!(
+            (&hit.origin, click),
+            (Origin::Registry { .. }, RowClick::Pick)
+        )
+    {
+        return None;
+    }
     match click {
         RowClick::Pick => match &hit.origin {
             Origin::Registry { id } => Some(Action::Select(id.clone())),
@@ -502,7 +530,10 @@ fn registry_rows(defs: &[McuDefinition]) -> Vec<RegistryRow<'_>> {
             // A registry entry carries no vendor row of its own, so these
             // come from the definition itself. The search upgrades them from
             // the vendor file whenever one exists.
-            flash_kb: chip_filter::parse_memory_kb(&d.project.flash_size),
+            // The vendor total first, as for RAM: memory.x may link less.
+            flash_kb: d
+                .flash_kb
+                .or_else(|| chip_filter::parse_memory_kb(&d.project.flash_size)),
             // `sram_kb` first: an Espressif part has no `memory.x` of ours
             // to read a RAM size out of, because esp-hal writes its own.
             ram_kb: d
@@ -1063,6 +1094,7 @@ mod tests {
             rank: 0,
             reimport,
             metrics: RowMetrics::default(),
+            refused: None,
         }
     }
 
@@ -1577,5 +1609,19 @@ mod tests {
         ));
         // A source gone since the search ran asks for nothing.
         assert!(row_action(&[], disk_row, RowClick::Pick).is_none());
+        // A refused part: no import from either button; a refused REGISTRY
+        // row is still selected, which is where New Project explains it.
+        let refusal =
+            crate::panels::mcu_module::stm32_support::refusal("stm32wl3", "STM32WL30KBVx", &[]);
+        let mut refused_disk = disk_row.clone();
+        refused_disk.refused = refusal.clone();
+        assert!(row_action(&sources, &refused_disk, RowClick::Pick).is_none());
+        let mut refused_reg = registry_row.clone();
+        refused_reg.refused = refusal;
+        assert!(row_action(&sources, &refused_reg, RowClick::Reimport).is_none());
+        assert!(matches!(
+            row_action(&sources, &refused_reg, RowClick::Pick),
+            Some(Action::Select(_))
+        ));
     }
 }

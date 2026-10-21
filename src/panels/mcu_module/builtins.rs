@@ -186,6 +186,7 @@ mod tests {
             family: family.into(),
             package: package.into(),
             sram_kb,
+            flash_kb: None,
             max_mhz: Some(max_mhz),
             // Built-in chips keep using the hand-written family tables in
             // `codegen::dma_map`; only imported ones carry vendor DMA data.

@@ -399,9 +399,68 @@ pub fn splice_config(
         .map(|(style, body)| splice_block(existing, style, &body))
         .unwrap_or_default();
     match file {
-        ConfigFile::CargoToml => keep_user_dep_edits(existing, &spliced),
+        // Upgraded only when the IDE manages the file: without the markers it
+        // is the user's, line for line (see `splice_block`).
+        ConfigFile::CargoToml => {
+            let (begin, end) = (Cmt::Hash.begin(), Cmt::Hash.end());
+            let managed =
+                matches!((existing.find(begin), existing.find(end)), (Some(b), Some(e)) if b < e);
+            if managed {
+                keep_user_dep_edits(&upgraded_hal_lines(existing, c), &spliced)
+            } else {
+                keep_user_dep_edits(existing, &spliced)
+            }
+        }
         _ => spliced,
     }
+}
+
+/// `existing` with an embassy-stm32 line an earlier importer derived brought
+/// up to the definition's own feature.
+///
+/// The project was written from the old line, and [`keep_user_dep_edits`]
+/// cannot tell a line nobody touched from a user's override - so after the
+/// registry repaired the definition (`stm32_pin_data::repair_hal_feature`),
+/// an STM32L151C8TxA project went on building the smaller die, and the System
+/// tab checked a feature its manifest did not have. Only a line that IS what
+/// an older rule wrote for this part moves, and only to what the definition
+/// now says; any other edit stays the user's.
+fn upgraded_hal_lines<'a>(existing: &'a str, c: &ProjectDef) -> std::borrow::Cow<'a, str> {
+    use super::stm32_pin_data::{embassy_feature_in, upgraded_hal_line};
+    let Some(want) = embassy_feature_in(&c.hal_dep) else {
+        return existing.into();
+    };
+    // Every name the old line could have been derived from: the probe name is
+    // the CubeMX part on an import, the package name the id an AI import or
+    // Auto-fill made from the display name (`stm32f411ceu6`).
+    let names: Vec<&str> = [c.probe_chip.as_str(), c.pkg_name.as_str()]
+        .into_iter()
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    let mut out = String::with_capacity(existing.len());
+    let mut in_deps = false;
+    let mut changed = false;
+    for line in existing.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_deps = trimmed.starts_with("[dependencies]");
+        }
+        let up = in_deps
+            .then(|| {
+                names.iter().find_map(|part| {
+                    upgraded_hal_line(line, part).filter(|up| embassy_feature_in(up) == Some(want))
+                })
+            })
+            .flatten();
+        match up {
+            Some(up) => {
+                out.push_str(&up);
+                changed = true;
+            }
+            None => out.push_str(line),
+        }
+    }
+    if changed { out.into() } else { existing.into() }
 }
 
 /// `cargo_toml` with its generated block re-spliced from `c`, when that block
@@ -3467,6 +3526,56 @@ mod tests {
         }
     }
 
+    /// A line an older importer wrote is not a user edit: it follows the
+    /// definition, and keeps whatever else the user changed on it. A line with
+    /// another feature, the user's choice, still survives.
+    #[test]
+    fn a_hal_line_from_an_older_rule_follows_the_definition() {
+        let mut c = embassy_project();
+        c.probe_chip = "STM32L151C8TxA".into();
+        c.hal_dep = "embassy-stm32 = { version = \"0.6\", features = [\"stm32l151c8-a\"] }".into();
+        let tc = ToolchainKind::RustEmbedded;
+        let generated = gen_config(ConfigFile::CargoToml, &c, &tc);
+        assert!(generated.contains(&c.hal_dep), "fixture sanity:\n{generated}");
+        for (old, want) in [
+            // What the second rule wrote, with the user's own debug feature.
+            (
+                "embassy-stm32 = { version = \"0.6\", features = [\"stm32l151c8\", \"defmt\"] }",
+                "embassy-stm32 = { version = \"0.6\", features = [\"stm32l151c8-a\", \"defmt\"] }",
+            ),
+            // What the first rule wrote.
+            (
+                "embassy-stm32 = { version = \"0.6\", features = [\"stm32l151c8txa\"] }",
+                "embassy-stm32 = { version = \"0.6\", features = [\"stm32l151c8-a\"] }",
+            ),
+            // The user's own pick: kept.
+            (
+                "embassy-stm32 = { version = \"0.6\", features = [\"stm32l152c8-a\"] }",
+                "embassy-stm32 = { version = \"0.6\", features = [\"stm32l152c8-a\"] }",
+            ),
+        ] {
+            let existing = generated.replace(&c.hal_dep, old);
+            let out = splice_config(ConfigFile::CargoToml, &existing, &c, &tc);
+            assert!(out.contains(want), "{old}\n->\n{out}");
+            assert_eq!(splice_config(ConfigFile::CargoToml, &out, &c, &tc), out);
+        }
+    }
+
+    /// The old line was derived from the display name, which a ProjectDef does
+    /// not carry; the package name (the id made from it) finds it instead.
+    #[test]
+    fn a_hal_line_derived_from_the_display_name_follows_too() {
+        let mut c = embassy_project();
+        c.probe_chip = "STM32F411CE".into();
+        c.pkg_name = "stm32f411ceu6".into();
+        c.hal_dep = "embassy-stm32 = { version = \"0.6\", features = [\"stm32f411ce\"] }".into();
+        let tc = ToolchainKind::RustEmbedded;
+        let generated = gen_config(ConfigFile::CargoToml, &c, &tc);
+        let old = "embassy-stm32 = { version = \"0.6\", features = [\"stm32f411ceu6\"] }";
+        let out = splice_config(ConfigFile::CargoToml, &generated.replace(&c.hal_dep, old), &c, &tc);
+        assert!(out.contains(&c.hal_dep), "{out}");
+    }
+
     /// The reported bug: the HAL line sits INSIDE the generated block, so fixing
     /// a wrong chip feature by hand was undone by the next project open — the
     /// user could not repair a project the importer had guessed wrong for.
@@ -3544,6 +3653,13 @@ mod tests {
             hand,
             "no markers means the IDE does not own this file"
         );
+        // Not even a line an older importer wrote, for a part whose feature
+        // moved since: without markers it is the user's.
+        let mut l1 = embassy_project();
+        l1.probe_chip = "STM32L151C8TxA".into();
+        l1.hal_dep = "embassy-stm32 = { version = \"0.6\", features = [\"stm32l151c8-a\"] }".into();
+        let hand = "[package]\nname = \"mine\"\n\n[dependencies]\nembassy-stm32 = { version = \"0.6\", features = [\"stm32l151c8\"] }\n";
+        assert_eq!(splice_config(ConfigFile::CargoToml, hand, &l1, &tc), hand);
     }
 
     #[test]

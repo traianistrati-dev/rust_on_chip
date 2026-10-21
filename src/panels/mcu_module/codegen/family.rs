@@ -214,6 +214,7 @@ impl FamilyBackend for Stm32f1Backend {
         files.extend(super::watchdog_gen::config_files(
             &mcu.watchdog,
             &mcu.family,
+            crate::panels::mcu_module::watchdog::wdg_part(mcu),
             mcu.runtime,
         ));
         files
@@ -398,7 +399,12 @@ fn esp_fresh_main_rs(mcu: &Mcu, runtime: EspRuntime) -> String {
 fn esp_tab_inits(mcu: &Mcu) -> String {
     format!(
         "{}{}",
-        super::watchdog_gen::init_lines(&mcu.watchdog, &mcu.family, mcu.runtime),
+        super::watchdog_gen::init_lines(
+            &mcu.watchdog,
+            &mcu.family,
+            crate::panels::mcu_module::watchdog::wdg_part(mcu),
+            mcu.runtime,
+        ),
         super::flash_store_gen::init_lines_for(mcu),
     )
 }
@@ -411,7 +417,12 @@ fn esp_config_files(mcu: &Mcu, runtime: EspRuntime) -> Vec<(String, String)> {
     // The watchdogs come from a TAB, not from the Pins canvas, so they are
     // collected here rather than threaded through the pin-driven builder. The
     // flash store's file is added for every family in `Mcu::config_files`.
-    let mut out = super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family, mcu.runtime);
+    let mut out = super::watchdog_gen::config_files(
+        &mcu.watchdog,
+        &mcu.family,
+        crate::panels::mcu_module::watchdog::wdg_part(mcu),
+        mcu.runtime,
+    );
     let all = pins_of(mcu);
     let configured: Vec<&Pin> = all
         .iter()
@@ -688,7 +699,12 @@ impl FamilyBackend for WbaBackend {
         // Like the generic embassy backend: bus inits stay inline in
         // main.rs, so `pins/configs/` here holds only the pin-less
         // peripherals the Configuration tab owns.
-        super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family, mcu.runtime)
+        super::watchdog_gen::config_files(
+            &mcu.watchdog,
+            &mcu.family,
+            crate::panels::mcu_module::watchdog::wdg_part(mcu),
+            mcu.runtime,
+        )
     }
     // No per-peripheral config files yet — bus init is documented inline (v1).
 }
@@ -747,7 +763,7 @@ impl FamilyBackend for StmEmbassyBackend {
             section = embassy_common::make_generated_section(
                 &mcu.name,
                 &all,
-                &rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, mcu.clock_manual),
+                &stm32_clock_block(mcu),
                 &mcu.watchdog_and_custom_inits(),
             ),
             tail = USER_TAIL,
@@ -759,10 +775,10 @@ impl FamilyBackend for StmEmbassyBackend {
         let section = embassy_common::make_generated_section(
             &mcu.name,
             &all,
-            &rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, mcu.clock_manual),
+            &stm32_clock_block(mcu),
             &mcu.watchdog_and_custom_inits(),
         );
-        let section = super::common::keep_manual_clock(existing, section, mcu.clock_manual);
+        let section = keep_stm32_clock(mcu, existing, section);
         embassy_common::splice_section(existing, &section, &mcu.name, &mcu.id)
     }
 
@@ -770,7 +786,12 @@ impl FamilyBackend for StmEmbassyBackend {
         // Only the watchdogs: this backend keeps every bus init inline in
         // main.rs, so `pins/configs/` exists here purely for the tab-driven,
         // pin-less peripherals.
-        super::watchdog_gen::config_files(&mcu.watchdog, &mcu.family, mcu.runtime)
+        super::watchdog_gen::config_files(
+            &mcu.watchdog,
+            &mcu.family,
+            crate::panels::mcu_module::watchdog::wdg_part(mcu),
+            mcu.runtime,
+        )
     }
 }
 // ── Async STM32 (embassy-stm32 + embassy-executor) ──────────────────────────
@@ -816,7 +837,7 @@ impl FamilyBackend for AsyncEmbassyBackend {
 
     fn update_main_rs(&self, mcu: &Mcu, existing: &str) -> String {
         let section = async_section(mcu);
-        let section = super::common::keep_manual_clock(existing, section, mcu.clock_manual);
+        let section = keep_stm32_clock(mcu, existing, section);
         embassy_stm32::splice_section(existing, &section, &mcu.name, &mcu.id)
     }
 
@@ -835,6 +856,7 @@ impl FamilyBackend for AsyncEmbassyBackend {
         files.extend(super::watchdog_gen::config_files(
             &mcu.watchdog,
             &mcu.family,
+            crate::panels::mcu_module::watchdog::wdg_part(mcu),
             mcu.runtime,
         ));
         files
@@ -896,6 +918,138 @@ fn async_periphs(mcu: &Mcu) -> embassy_stm32::AsyncPeriphs {
     )
 }
 
+/// The clock block of an embassy STM32 project: the Clock tab's recipe, and on
+/// a dual-core part the `init_primary` its embassy build needs (see
+/// [`rcc::for_dual_core`]). The id first, the display name for a form whose id
+/// is not a part number.
+fn stm32_clock_block(mcu: &Mcu) -> String {
+    let block = rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, mcu.clock_manual);
+    match dual_core_feature(mcu) {
+        Some(feature) => rcc::for_dual_core(&block, &feature),
+        None => block,
+    }
+}
+
+/// The per-core chip feature of `mcu`, if it is a dual-core part.
+///
+/// The dependency line decides when there is one: it is what turns
+/// `_dual-core` on, whatever the id and name say (`lora_node`, `NUCLEO-H745ZI-Q`).
+/// The id and name only when no line names a feature.
+fn dual_core_feature(mcu: &Mcu) -> Option<String> {
+    use crate::panels::mcu_module::stm32_pin_data::per_core_feature;
+    if !mcu.family.starts_with("stm32") || mcu.family == "stm32f1" {
+        return None;
+    }
+    match &mcu.hal_feature {
+        Some(f) => f.contains("-cm").then(|| f.clone()),
+        None => per_core_feature(&mcu.id).or_else(|| per_core_feature(&mcu.name)),
+    }
+}
+
+/// [`super::common::keep_manual_clock`], plus what a dual-core part needs of
+/// the block it keeps.
+///
+/// Under `_dual-core` neither of the generator's own `init` spellings can
+/// compile, whoever wrote them - a skeleton from before `init_primary`, or a
+/// block seeded from a clock tree that has changed since - so both become
+/// `init_primary`, in the kept region too. A call written any other way is
+/// the user's, and stays. A `SHARED_DATA` static the user declared already (as
+/// embassy's own `SharedData` docs show), in the kept region or below the
+/// generated section, is theirs as well: the generated one would be E0428
+/// beside it.
+fn keep_stm32_clock(mcu: &Mcu, existing: &str, section: String) -> String {
+    use super::common::{GEN_END, clock_region, keep_manual_clock};
+    let kept = keep_manual_clock(existing, section, mcu.clock_manual);
+    if dual_core_feature(mcu).is_none() {
+        return kept;
+    }
+    let kept = kept
+        .replace(
+            "embassy_stm32::init(config)",
+            "embassy_stm32::init_primary(config, &SHARED_DATA)",
+        )
+        .replace(
+            "embassy_stm32::init(Default::default())",
+            "embassy_stm32::init_primary(Default::default(), &SHARED_DATA)",
+        );
+    let user_static = (mcu.clock_manual
+        && clock_region(existing).is_some_and(|r| declares_shared_data(r, 1)))
+        || existing
+            .find(GEN_END)
+            .is_some_and(|end| declares_shared_data(&existing[end..], 1));
+    if user_static {
+        kept.replacen(rcc::SHARED_DATA_STATIC, "", 1)
+    } else {
+        kept
+    }
+}
+
+/// Whether `text` - which starts inside `main` at brace depth `depth` -
+/// declares a `SHARED_DATA` static that `main`'s `init_primary` can see: in
+/// `main`'s own body, or at file scope after `main` closes. A commented-out
+/// one, or one inside another function, is not one, and dropping the
+/// generated static for it would leave `&SHARED_DATA` with nothing behind it.
+fn declares_shared_data(text: &str, depth: i32) -> bool {
+    let mut depth = depth;
+    let mut in_main = depth > 0;
+    let mut in_block = false;
+    let mut gated = false;
+    for line in text.lines() {
+        // Code only: no `/* … */` (across lines too) and no `// …`.
+        let mut code = String::new();
+        let mut rest = line;
+        loop {
+            if in_block {
+                match rest.find("*/") {
+                    Some(end) => {
+                        rest = &rest[end + 2..];
+                        in_block = false;
+                    }
+                    None => break,
+                }
+            } else {
+                match rest.find("/*") {
+                    Some(start) => {
+                        code.push_str(&rest[..start]);
+                        rest = &rest[start + 2..];
+                        in_block = true;
+                    }
+                    None => {
+                        code.push_str(rest);
+                        break;
+                    }
+                }
+            }
+        }
+        let code = code.split("//").next().unwrap_or("").to_owned();
+        let visible = if in_main { depth == 1 } else { depth == 0 };
+        // A static behind `#[cfg(…)]` may not exist in this build: the
+        // generated one stays, and the user's cfg decides which is used.
+        let declared = code
+            .split_once("static SHARED_DATA")
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with(':'));
+        if visible && declared && !gated {
+            return true;
+        }
+        if !code.trim().is_empty() {
+            gated = code.trim_start().starts_with("#[cfg");
+        }
+        for c in code.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        in_main = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// The async generated section for `mcu`: the GPIO/raw pin bindings (minus the
 /// pins a bus driver consumes) followed by the peripheral `init(...)` calls.
 fn async_section(mcu: &Mcu) -> String {
@@ -910,7 +1064,7 @@ fn async_section(mcu: &Mcu) -> String {
         .copied()
         .filter(|p| !periphs.consumed_pins.iter().any(|c| c == p.gpio()))
         .collect();
-    let mut clock = rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, mcu.clock_manual);
+    let mut clock = stm32_clock_block(mcu);
     // PA15, PB3 and PB4 stay the JTAG port on an F1 unless released - and a
     // project that wires one compiles either way, with a pad that does nothing.
     if mcu.family == "stm32f1"
@@ -2083,6 +2237,190 @@ pub fn backend_for_runtime(family: &str, runtime: Runtime) -> Option<&'static dy
 }
 
 #[cfg(test)]
+mod dual_core_tests {
+    use super::*;
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::clock::model::ClockConfig;
+    use crate::panels::mcu_module::codegen::common::clock_region;
+
+    /// An Mcu for `id` / `name` on `family`, with no clock tree and the clock
+    /// block hand-written - the shape of a part whose family has no recipe.
+    fn mcu_for(id: &str, name: &str, family: &str, runtime: Runtime) -> Mcu {
+        let mut def = builtin_for("stm32f103c8t6").expect("the bundled F103");
+        def.id = id.into();
+        def.display_name = name.into();
+        def.family = family.into();
+        let mut mcu = def.build_mcu();
+        mcu.runtime = runtime;
+        mcu.clock = ClockConfig::None;
+        mcu.clock_manual = true;
+        mcu
+    }
+
+    /// The line decides, not the names: a WL55 renamed to a board name keeps
+    /// its `-cm4` line, so `_dual-core` is on and `init` does not exist; and a
+    /// part whose name says H745 but whose line is single-core gets `init`.
+    #[test]
+    fn the_dependency_line_decides_dual_core() {
+        let mut def = builtin_for("stm32f103c8t6").expect("the bundled F103");
+        def.family = "stm32wl".into();
+        def.id = "lora_node".into();
+        def.display_name = "LoRa node".into();
+        def.project.hal_dep =
+            "embassy-stm32 = { version = \"0.6\", features = [\"stm32wl55jc-cm4\"] }".into();
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Async;
+        mcu.clock = ClockConfig::None;
+        let main = mcu.fresh_main_rs();
+        assert!(main.contains("init_primary("), "{main}");
+        assert!(!main.contains("embassy_stm32::init("), "{main}");
+
+        def.family = "stm32h7".into();
+        def.id = "stm32h745zitx".into();
+        def.display_name = "STM32H745ZITx".into();
+        def.project.hal_dep =
+            "embassy-stm32 = { version = \"0.6\", features = [\"stm32h743zi\"] }".into();
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Async;
+        mcu.clock = ClockConfig::None;
+        let main = mcu.fresh_main_rs();
+        assert!(!main.contains("init_primary"), "{main}");
+    }
+
+    #[test]
+    fn a_dual_core_part_builds_with_init_primary() {
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            for (id, name, family) in [
+                ("stm32h745zitx", "STM32H745ZITx", "stm32h7"),
+                ("stm32wl55jcix", "STM32WL55JCIx", "stm32wl"),
+                // A form id that is not a part number: the name decides.
+                ("my_h745", "STM32H755ZI", "stm32h7"),
+            ] {
+                let main = mcu_for(id, name, family, runtime).fresh_main_rs();
+                assert!(
+                    main.contains("embassy_stm32::init_primary("),
+                    "{id} {runtime:?}\n{main}"
+                );
+                assert_eq!(
+                    main.matches("static SHARED_DATA:").count(),
+                    1,
+                    "{id}\n{main}"
+                );
+                assert!(
+                    !main.contains("embassy_stm32::init("),
+                    "{id} {runtime:?}\n{main}"
+                );
+            }
+            for (id, name, family) in [
+                ("stm32h743zitx", "STM32H743ZITx", "stm32h7"),
+                ("stm32wle5jcix", "STM32WLE5JCIx", "stm32wl"),
+                ("stm32g431c6tx", "STM32G431C6Tx", "stm32g4"),
+            ] {
+                let main = mcu_for(id, name, family, runtime).fresh_main_rs();
+                assert!(!main.contains("SHARED_DATA"), "{id}\n{main}");
+                assert!(!main.contains("init_primary"), "{id}\n{main}");
+            }
+        }
+    }
+
+    /// A project written before this: its untouched skeleton is carried to
+    /// `init_primary`, an edited block is kept as the user left it, and a
+    /// second pass changes nothing.
+    #[test]
+    fn an_old_dual_core_skeleton_is_upgraded_unless_edited() {
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mcu = mcu_for("stm32wl55jcix", "STM32WL55JCIx", "stm32wl", runtime);
+            let fresh = mcu.fresh_main_rs();
+            // What the generator wrote before: the same file with the plain
+            // block, which the section embeds verbatim.
+            let single = rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, true);
+            let dual = stm32_clock_block(&mcu);
+            assert!(fresh.contains(&dual), "{fresh}");
+            let old = fresh.replace(&dual, &single);
+            assert!(
+                old.contains("embassy_stm32::init(Default::default())"),
+                "{old}"
+            );
+            assert!(!old.contains("SHARED_DATA"), "{old}");
+            assert!(clock_region(&old).is_some(), "{old}");
+            let up = mcu.update_main_rs(&old);
+            assert!(
+                up.contains("init_primary(Default::default(), &SHARED_DATA)"),
+                "{runtime:?}\n{up}"
+            );
+            assert!(!up.contains("embassy_stm32::init("), "{up}");
+            assert_eq!(up.matches("static SHARED_DATA:").count(), 1, "{up}");
+            assert_eq!(mcu.update_main_rs(&up), up, "a second pass changes nothing");
+
+            let edited = old.replace(
+                "let p = embassy_stm32::init(Default::default()); // embassy's default clock (MSI)",
+                "let p = embassy_stm32::init(my_config()); // by hand",
+            );
+            let kept = mcu.update_main_rs(&edited);
+            assert!(
+                kept.contains("embassy_stm32::init(my_config()); // by hand"),
+                "{kept}"
+            );
+            assert_eq!(kept.matches("static SHARED_DATA:").count(), 1, "{kept}");
+
+            // A region seeded from another tree: not the current block, but
+            // the generator's own spelling, which cannot compile here.
+            let seeded = old.replace(
+                "// embassy's default clock (MSI)",
+                "// seeded from an older tree",
+            );
+            let up = mcu.update_main_rs(&seeded);
+            assert!(
+                up.contains(
+                    "init_primary(Default::default(), &SHARED_DATA); // seeded from an older tree"
+                ),
+                "{up}"
+            );
+            assert!(!up.contains("embassy_stm32::init("), "{up}");
+
+            // The user declared the static themselves, as embassy's docs show:
+            // in the region, or below the generated section. One static.
+            let own = old.replace(
+                "    let p = embassy_stm32::init(Default::default()); // embassy's default clock (MSI)",
+                "    static SHARED_DATA: core::mem::MaybeUninit<embassy_stm32::SharedData> = core::mem::MaybeUninit::uninit();\n    let p = embassy_stm32::init_primary(Default::default(), &SHARED_DATA);",
+            );
+            assert_ne!(own, old, "the fixture must have changed the region");
+            let up = mcu.update_main_rs(&own);
+            assert_eq!(up.matches("static SHARED_DATA").count(), 1, "{up}");
+            assert_eq!(mcu.update_main_rs(&up), up, "and it stays one");
+
+            // Commented out, the user's static is not one: the generated one stays.
+            let commented = own.replace(
+                "    static SHARED_DATA: core::mem::MaybeUninit",
+                "    // static SHARED_DATA: core::mem::MaybeUninit",
+            );
+            let up = mcu.update_main_rs(&commented);
+            assert!(
+                up.lines()
+                    .any(|l| l.trim_start().starts_with("static SHARED_DATA:")),
+                "{up}"
+            );
+            // Nor one inside a block comment.
+            let blocked = own
+                .replace(
+                    "    static SHARED_DATA: core::mem::MaybeUninit",
+                    "    /* static SHARED_DATA: core::mem::MaybeUninit",
+                )
+                .replace(
+                    "MaybeUninit::uninit();\n    let p",
+                    "MaybeUninit::uninit(); */\n    let p",
+                );
+            let up = mcu.update_main_rs(&blocked);
+            assert!(
+                up.lines()
+                    .any(|l| l.trim_start().starts_with("static SHARED_DATA:")),
+                "{up}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2131,10 +2469,10 @@ mod tests {
         use crate::panels::mcu_module::mcu_def::McuDefinition;
         let mut def: McuDefinition =
             crate::panels::mcu_module::builtins::builtin_for("stm32f103c8t6").unwrap();
-        // A family with no RCC recipe (h7). Its clock is no longer left at the
-        // reset default: `generic_recipe` reads the tree's canonical spine and
-        // emits an explicit block, which is the point of that path — a chip
-        // whose Clock tab is full has no business generating `Default::default`.
+        // A family with no RCC recipe (h7). Its clock is not left at the reset
+        // default without saying why: `generic_recipe` reads the tree's spine,
+        // and the F103's 72 MHz PLL is a shape the H7's `pll1` does not take,
+        // so the block is the skeleton that names it.
         def.family = "stm32h7".into();
         def.id = "stm32h743zi".into();
         let code = def.build_mcu().fresh_main_rs();
@@ -2145,9 +2483,9 @@ mod tests {
         );
         assert!(code.contains("fn main() -> !"));
         assert!(
-            code.contains("embassy_stm32::init(config)")
-                && code.contains("no verified RCC recipe for this family"),
-            "the tree drives the clock, and the block says the shape is a guess"
+            code.contains("embassy_stm32::init(Default::default())")
+                && code.contains("only that recipe can write safely"),
+            "the PLL the tree selects is not written, and the block says why"
         );
         assert!(code.contains(crate::panels::mcu_module::codegen::GEN_BEGIN));
     }

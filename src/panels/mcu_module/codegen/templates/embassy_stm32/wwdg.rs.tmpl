@@ -7,28 +7,30 @@ pub const WINDOW_US: u32 = {WINDOW};
 
 // Everything below is editable - your changes are preserved on regeneration.
 //
-// The WINDOW watchdog counts down from PCLK1, so its period moves with the
-// Clock tab - the values above were checked against the clock configured there.
+// The WINDOW watchdog counts down from {BUS}, so its period moves with the
+// clock. The Configuration tab checks the values above against the clock it
+// can see main.rs run; where it cannot (a hand-written clock, a bus no recipe
+// sets) it says so on the card, and they are unchecked.
 //
 // Two things to know before using it:
 //   * `new` STARTS it. There is no way to stop it short of a reset.
 //   * petting too EARLY resets the chip, exactly like petting too late. That is
 //     what the closed window means.
-use embassy_stm32::peripherals::WWDG;
+use embassy_stm32::peripherals::{WWDG};
 use embassy_stm32::wdg::WindowWatchdog;
 use embassy_stm32::Peri;
 
 /// Handle type, so it can be stored in a struct or an RTIC resource.
-pub type Handle = WindowWatchdog<'static, WWDG>;
+pub type Handle = WindowWatchdog<'static, {WWDG}>;
 
 /// Configure AND START the window watchdog.
-pub fn init(wwdg: Peri<'static, WWDG>) -> Handle {
+pub fn init(wwdg: Peri<'static, {WWDG}>) -> Handle {
     WindowWatchdog::new(wwdg, TIMEOUT_US, WINDOW_US)
 }
 
 // -- Using the WWDG --
 //
-//     let mut wdg = pins::configs::wwdg::init(p.WWDG);   // already running
+//     let mut wdg = pins::configs::wwdg::init(p.{WWDG});   // already running
 //     loop {
 //         // …work that takes at least WINDOW_US…
 //         wdg.pet();

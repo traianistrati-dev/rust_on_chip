@@ -2801,6 +2801,24 @@ impl AppIde {
                     self.refresh_hal_check();
                     // Read the shared slot BEFORE borrowing `self.mcu` mutably.
                     let hal = self.hal_verdict_now();
+                    // A definition no project can be built for, with the reason.
+                    // Judged on the line the project's manifest REALLY has - a
+                    // user's fix, kept by keep_user_dep_edits, builds - and on the
+                    // definition's only when the manifest has none.
+                    let refused = self
+                        .mcu
+                        .as_ref()
+                        .and_then(|m| self.mcu_registry.iter().find(|d| d.id == m.id))
+                        .and_then(|d| {
+                            use crate::panels::mcu_module::stm32_support;
+                            match self.manifest_hal_line() {
+                                Some(line) => {
+                                    stm32_support::refusal_for(&d.family, &d.display_name, &d.cpu, line)
+                                }
+                                None => stm32_support::refusal_for_def(d),
+                            }
+                        })
+                        .map(|r| r.reason());
                     // A background thread finishing does not wake egui. Without
                     // this nudge the verdict would sit in the slot unseen until
                     // something else happened to cause a repaint — which, if the
@@ -2811,7 +2829,7 @@ impl AppIde {
                             .request_repaint_after(std::time::Duration::from_millis(250));
                     }
                     match &mut self.mcu {
-                        Some(mcu) => Self::show_system_tab(ui, mcu, hal),
+                        Some(mcu) => Self::show_system_tab(ui, mcu, hal, refused.as_deref()),
                         None => no_mcu = Some("System configuration"),
                     }
                 }
@@ -2848,6 +2866,7 @@ impl AppIde {
         ui: &mut egui::Ui,
         mcu: &mut crate::panels::mcu_module::mcu::Mcu,
         hal: Option<crate::app::dialogs::FeatureVerdict>,
+        refused: Option<&str>,
     ) {
         use crate::panels::mcu_module::mcu::Runtime;
 
@@ -2860,7 +2879,10 @@ impl AppIde {
             // nothing ever explained why the clock in `main.rs` is a commented
             // skeleton and the DMA a `TODO`. The verdict now travels with the
             // chip instead of with the moment it was imported.
-            let clock_ok = crate::panels::mcu_module::codegen::rcc::generates_clock_code_for(
+            // The family's verdict on the tree, not on its selection: a chip at
+            // its MSI default is not missing a clock (the Clock tab says why
+            // that selection is the skeleton).
+            let clock_ok = crate::panels::mcu_module::codegen::rcc::tree_drives_clock_code(
                 &mcu.family,
                 &mcu.clock,
             );
@@ -2876,6 +2898,9 @@ impl AppIde {
             };
             if let Some(g) = crate::app::dialogs::backend_gap(&mcu.family) {
                 gaps.insert(0, g);
+            }
+            if let Some(r) = refused {
+                gaps.insert(0, format!("{}: {r}", crate::app::dialogs::REFUSED_PREFIX));
             }
             if !gaps.is_empty() {
                 ui.add_space(10.0);
@@ -2902,7 +2927,9 @@ impl AppIde {
                     // find out now rather than from generated code.
                     ui.label(
                         egui::RichText::new(
-                            if gaps
+                            if refused.is_some() {
+                                "    The project cannot build. main.rs is still regenerated, so nothing you wrote is lost."
+                            } else if gaps
                                 .iter()
                                 .any(|g| g.starts_with(crate::app::dialogs::BACKEND_GAP_PREFIX))
                             {

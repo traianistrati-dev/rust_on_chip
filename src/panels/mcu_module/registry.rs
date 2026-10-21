@@ -75,13 +75,18 @@ fn load_registry_from(user_dir: Option<&Path>) -> Vec<McuDefinition> {
 /// Parse + validate a definition from RON text. Pure (no I/O) so it is unit
 /// testable and reused by both [`load_registry`] and [`import_file`].
 pub fn parse_definition(text: &str) -> Result<McuDefinition, String> {
-    let def: McuDefinition = ron::from_str(text).map_err(|e| format!("RON parse error: {e}"))?;
+    let mut def: McuDefinition =
+        ron::from_str(text).map_err(|e| format!("RON parse error: {e}"))?;
     if def.id.trim().is_empty() {
         return Err("definition has an empty `id`".to_owned());
     }
     if def.display_name.trim().is_empty() {
         return Err("definition has an empty `display_name`".to_owned());
     }
+    // A line an older importer derived is brought up to the current rule; the
+    // file itself is rewritten only when the definition is next saved.
+    super::stm32_pin_data::repair_hal_feature(&mut def);
+    super::stm32_pin_data::repair_memory(&mut def);
     Ok(def)
 }
 
@@ -157,15 +162,27 @@ fn open_in_file_manager(path: &Path) {
 ///
 /// Persistence failures are non-fatal: the chip is still usable this session.
 pub fn import_file(path: &Path) -> Result<McuDefinition, String> {
+    import_file_into(path, user_mcus_dir().as_deref())
+}
+
+/// [`import_file`] into `dir`, so a test can point it somewhere harmless.
+///
+/// A part no project can be built for is refused BEFORE the copy is written:
+/// the folder is read again at every start, so a refusal made only in the
+/// dialog would bring the definition back on the next launch.
+fn import_file_into(path: &Path, dir: Option<&Path>) -> Result<McuDefinition, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
     let def = parse_definition(&text)?;
+    if let Some(r) = super::stm32_support::refusal_for_def(&def) {
+        return Err(format!("Not imported {}: {}", def.display_name, r.reason()));
+    }
 
-    if let Some(dir) = user_mcus_dir() {
-        if std::fs::create_dir_all(&dir).is_ok() {
-            // Name the persisted copy by id so re-imports overwrite cleanly.
-            let dest = dir.join(format!("{}.ron", def.id));
-            let _ = std::fs::write(&dest, &text);
-        }
+    if let Some(dir) = dir
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        // Name the persisted copy by id so re-imports overwrite cleanly.
+        let dest = dir.join(format!("{}.ron", def.id));
+        let _ = std::fs::write(&dest, &text);
     }
 
     Ok(def)
@@ -255,6 +272,39 @@ mod tests {
         let unknown = "// rust_on_chip:mcu=no_such_chip\n";
         assert!(detect_chip_id(&defs, Some(unknown), None).is_none());
         assert!(detect_chip_id(&defs, None, None).is_none());
+    }
+
+    /// A definition no project can be built for is refused with the reason,
+    /// and nothing is written into the folder the registry loads from.
+    #[test]
+    fn a_refused_ron_is_not_copied_in() {
+        let tmp = std::env::temp_dir().join(format!("eide_refused_ron_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut def = builtins::builtin_for("stm32f103c8t6").expect("the bundled F103");
+        def.id = "stm32wb09tefx".into();
+        def.display_name = "STM32WB09TEFx".into();
+        def.family = "stm32wb0".into();
+        def.project.hal_dep =
+            "embassy-stm32 = { version = \"0.6\", features = [\"stm32wb09te\"] }".into();
+        let src = tmp.join("in.ron");
+        std::fs::write(&src, ron::ser::to_string(&def).unwrap()).unwrap();
+        let store = tmp.join("mcus");
+        let err = import_file_into(&src, Some(&store)).expect_err("refused");
+        assert!(err.starts_with("Not imported STM32WB09TEFx: "), "{err}");
+        assert!(err.contains("stm32wb09te"), "{err}");
+        assert!(!store.exists(), "nothing written");
+        // The same file for a part that builds goes in.
+        let mut ok = def.clone();
+        ok.id = "stm32wb55cgux".into();
+        ok.display_name = "STM32WB55CGUx".into();
+        ok.family = "stm32wb".into();
+        ok.project.hal_dep =
+            "embassy-stm32 = { version = \"0.6\", features = [\"stm32wb55cg\"] }".into();
+        std::fs::write(&src, ron::ser::to_string(&ok).unwrap()).unwrap();
+        import_file_into(&src, Some(&store)).expect("imports");
+        assert!(store.join("stm32wb55cgux.ron").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

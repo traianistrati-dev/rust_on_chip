@@ -345,24 +345,46 @@ pub fn nrf_init_lines(w: &WatchdogSettings, is_async: bool, wdt: &str) -> String
 /// before a chip or runtime change would otherwise generate a file that cannot
 /// compile. Dropping it here rather than in the UI means the invariant holds
 /// however the settings got into the model.
-pub fn config_files(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Vec<(String, String)> {
+///
+/// `part` names the chip (`flash_store::part_of`): an STM32H7's watchdogs are
+/// `IWDG1` / `WWDG1`, see [`watchdog::stm32_wdg`].
+pub fn config_files(
+    w: &WatchdogSettings,
+    family: &str,
+    part: &str,
+    runtime: Runtime,
+) -> Vec<(String, String)> {
     if super::super::watchdog::is_esp(family) {
         return esp_config_files(w, family);
     }
     let f1_hal = super::family::uses_stm32f1xx_hal(family, runtime);
+    let names = watchdog::stm32_wdg(family, part);
     let mut out = Vec::new();
     if let Some(i) = w.iwdg {
         // The F1 HAL takes milliseconds, so the stored microseconds are
         // converted HERE rather than in the model: the tab keeps one unit for
         // both families, and only the generator knows what each HAL wants.
         // Truncating is right - rounding up could step past the range.
+        //
+        // Outside the driver's range a period is a panic at boot, not a longer
+        // or shorter timeout: the file gets the nearest value it takes. That
+        // is what a project saved while the tab still offered /1024 on H5, U5
+        // and WBA holds, and the tab flags the stored value.
+        let timeout_us =
+            watchdog::iwdg_driver_value(&watchdog::limits_for(family, runtime), i.timeout_us);
         let body = if f1_hal {
             tmpl::render(
                 IWDG_TMPL_F1,
-                &[("{TIMEOUT_MS}", &(i.timeout_us / 1_000).to_string())],
+                &[("{TIMEOUT_MS}", &(timeout_us / 1_000).to_string())],
             )
         } else {
-            tmpl::render(IWDG_TMPL, &[("{TIMEOUT}", &i.timeout_us.to_string())])
+            tmpl::render(
+                IWDG_TMPL,
+                &[
+                    ("{TIMEOUT}", &timeout_us.to_string()),
+                    ("{IWDG}", names.iwdg),
+                ],
+            )
         };
         out.push(("iwdg.rs".to_owned(), body));
     }
@@ -375,6 +397,8 @@ pub fn config_files(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Vec
                     &[
                         ("{TIMEOUT}", &x.timeout_us.to_string()),
                         ("{WINDOW}", &x.window_us.to_string()),
+                        ("{WWDG}", names.wwdg),
+                        ("{BUS}", names.bus_label()),
                     ],
                 ),
             ));
@@ -387,14 +411,14 @@ pub fn config_files(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Vec
 ///
 /// Emitted BEFORE the custom-module inits: a watchdog that is meant to catch a
 /// hang during start-up is worth arming before the code that might hang.
-pub fn init_lines(w: &WatchdogSettings, family: &str, runtime: Runtime) -> String {
+pub fn init_lines(w: &WatchdogSettings, family: &str, part: &str, runtime: Runtime) -> String {
     // The ESP's names, types and lifecycles share nothing with the STM32
     // pair's, so that branch REPLACES this one rather than adding to it. Only
     // the header below is common.
     let s = if super::super::watchdog::is_esp(family) {
         esp_init_lines(w, family)
     } else {
-        stm32_init_lines(w, family, runtime)
+        stm32_init_lines(w, family, part, runtime)
     };
     if s.is_empty() {
         return s;
@@ -403,7 +427,8 @@ pub fn init_lines(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Strin
 }
 
 /// The STM32 half of [`init_lines`].
-fn stm32_init_lines(w: &WatchdogSettings, family: &str, runtime: Runtime) -> String {
+fn stm32_init_lines(w: &WatchdogSettings, family: &str, part: &str, runtime: Runtime) -> String {
+    let names = watchdog::stm32_wdg(family, part);
     let mut s = String::new();
     if w.iwdg.is_some() {
         if super::family::uses_stm32f1xx_hal(family, runtime) {
@@ -422,12 +447,18 @@ fn stm32_init_lines(w: &WatchdogSettings, family: &str, runtime: Runtime) -> Str
             s.push_str("    let mut _iwdg = pins::configs::iwdg::init(dp.IWDG);\n");
         } else {
             s.push_str("    // Configured, NOT started - call unleash() when ready.\n");
-            s.push_str("    let mut _iwdg = pins::configs::iwdg::init(p.IWDG);\n");
+            s.push_str(&format!(
+                "    let mut _iwdg = pins::configs::iwdg::init(p.{});\n",
+                names.iwdg
+            ));
         }
     }
     if w.wwdg.is_some() && super::super::watchdog::wwdg_supported(family, runtime) {
         s.push_str("    // Running from this line on; pet() too early also resets.\n");
-        s.push_str("    let mut _wwdg = pins::configs::wwdg::init(p.WWDG);\n");
+        s.push_str(&format!(
+            "    let mut _wwdg = pins::configs::wwdg::init(p.{});\n",
+            names.wwdg
+        ));
     }
     s
 }
@@ -452,7 +483,7 @@ mod tests {
 
     #[test]
     fn the_configured_durations_reach_the_generated_file() {
-        let files = config_files(&both(), "stm32f4", Runtime::Blocking);
+        let files = config_files(&both(), "stm32f4", "", Runtime::Blocking);
         let iwdg = &files.iter().find(|(n, _)| n == "iwdg.rs").unwrap().1;
         assert!(
             iwdg.contains("pub const TIMEOUT_US: u32 = 32768000;"),
@@ -471,10 +502,10 @@ mod tests {
         // The family check lives here, not only in the UI: a WWDG configured on
         // an F4 and then carried to an F1 by a chip change would otherwise
         // generate a file referencing a driver that does not exist.
-        let files = config_files(&both(), "stm32f1", Runtime::Blocking);
+        let files = config_files(&both(), "stm32f1", "", Runtime::Blocking);
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["iwdg.rs"]);
-        let calls = init_lines(&both(), "stm32f1", Runtime::Blocking);
+        let calls = init_lines(&both(), "stm32f1", "", Runtime::Blocking);
         assert!(calls.contains("iwdg::init"), "{calls}");
         assert!(!calls.contains("wwdg"), "{calls}");
     }
@@ -491,15 +522,15 @@ mod tests {
             }),
             ..Default::default()
         };
-        let f1 = &config_files(&w, "stm32f1", Runtime::Blocking)[0].1;
+        let f1 = &config_files(&w, "stm32f1", "", Runtime::Blocking)[0].1;
         assert!(f1.contains("pub const TIMEOUT_MS: u32 = 26214;"), "{f1}");
         assert!(f1.contains("stm32f1xx_hal::watchdog"), "{f1}");
         assert!(!f1.contains("embassy"), "{f1}");
-        assert!(init_lines(&w, "stm32f1", Runtime::Blocking).contains("init(dp.IWDG)"));
+        assert!(init_lines(&w, "stm32f1", "", Runtime::Blocking).contains("init(dp.IWDG)"));
 
-        let f4 = &config_files(&w, "stm32f4", Runtime::Blocking)[0].1;
+        let f4 = &config_files(&w, "stm32f4", "", Runtime::Blocking)[0].1;
         assert!(f4.contains("pub const TIMEOUT_US: u32 = 26214000;"), "{f4}");
-        assert!(init_lines(&w, "stm32f4", Runtime::Blocking).contains("init(p.IWDG)"));
+        assert!(init_lines(&w, "stm32f4", "", Runtime::Blocking).contains("init(p.IWDG)"));
     }
 
     fn esp_all() -> WatchdogSettings {
@@ -521,7 +552,7 @@ mod tests {
     /// lands in the file that calls it.
     #[test]
     fn an_esp_gets_the_rtc_and_timer_group_watchdogs() {
-        let files = config_files(&esp_all(), "esp32c3", Runtime::Blocking);
+        let files = config_files(&esp_all(), "esp32c3", "", Runtime::Blocking);
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["rwdt.rs", "mwdt0.rs", "mwdt1.rs"]);
 
@@ -548,7 +579,7 @@ mod tests {
         assert!(mwdt1.contains("peripherals::TIMG1"), "{mwdt1}");
         assert!(!mwdt1.contains("TIMG0"), "{mwdt1}");
 
-        let calls = init_lines(&esp_all(), "esp32c3", Runtime::Blocking);
+        let calls = init_lines(&esp_all(), "esp32c3", "", Runtime::Blocking);
         assert!(calls.contains("rwdt::init(peripherals.LPWR)"), "{calls}");
         // `init()` takes nothing — that is what lets it work on the async
         // runtime, where TIMG0 already belongs to the scheduler.
@@ -568,10 +599,10 @@ mod tests {
     /// generate a file naming a `TIMG1` that does not exist.
     #[test]
     fn the_c2_drops_the_second_timer_group() {
-        let files = config_files(&esp_all(), "esp32c2", Runtime::Blocking);
+        let files = config_files(&esp_all(), "esp32c2", "", Runtime::Blocking);
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["rwdt.rs", "mwdt0.rs"]);
-        let calls = init_lines(&esp_all(), "esp32c2", Runtime::Blocking);
+        let calls = init_lines(&esp_all(), "esp32c2", "", Runtime::Blocking);
         assert!(calls.contains("mwdt0"), "{calls}");
         assert!(!calls.contains("mwdt1"), "{calls}");
     }
@@ -580,27 +611,97 @@ mod tests {
     /// to an ESP generates nothing, and the reverse holds too.
     #[test]
     fn a_setting_from_the_other_family_generates_nothing() {
-        assert!(config_files(&both(), "esp32c3", Runtime::Blocking).is_empty());
-        assert_eq!(init_lines(&both(), "esp32c3", Runtime::Blocking), "");
-        assert!(config_files(&esp_all(), "stm32f4", Runtime::Blocking).is_empty());
-        assert_eq!(init_lines(&esp_all(), "stm32f4", Runtime::Blocking), "");
+        assert!(config_files(&both(), "esp32c3", "", Runtime::Blocking).is_empty());
+        assert_eq!(init_lines(&both(), "esp32c3", "", Runtime::Blocking), "");
+        assert!(config_files(&esp_all(), "stm32f4", "", Runtime::Blocking).is_empty());
+        assert_eq!(init_lines(&esp_all(), "stm32f4", "", Runtime::Blocking), "");
     }
 
     #[test]
     fn nothing_enabled_generates_nothing() {
         let none = WatchdogSettings::default();
-        assert!(config_files(&none, "stm32f4", Runtime::Blocking).is_empty());
-        assert_eq!(init_lines(&none, "stm32f4", Runtime::Blocking), "");
+        assert!(config_files(&none, "stm32f4", "", Runtime::Blocking).is_empty());
+        assert_eq!(init_lines(&none, "stm32f4", "", Runtime::Blocking), "");
+    }
+
+    /// A period from before the /256 ceiling generates the longest one the
+    /// driver takes rather than a boot panic; one inside the range is
+    /// written as it is.
+    #[test]
+    fn an_iwdg_period_the_driver_rejects_is_clamped() {
+        let at = |us: u32, family: &str| {
+            let w = WatchdogSettings {
+                iwdg: Some(IwdgConfig { timeout_us: us }),
+                ..Default::default()
+            };
+            config_files(&w, family, "", Runtime::Blocking)[0].1.clone()
+        };
+        assert!(at(132_129_032, "stm32u5").contains("TIMEOUT_US: u32 = 32768000;"));
+        assert!(at(1, "stm32f4").contains("TIMEOUT_US: u32 = 128;"));
+        // On a 40 kHz LSI: the ceiling the reload fits, and not the hole at /128.
+        assert!(at(30_000_000, "stm32f0").contains("TIMEOUT_US: u32 = 26220799;"));
+        assert!(at(13_120_000, "stm32f3").contains("TIMEOUT_US: u32 = 13110399;"));
+        assert!(at(2_000_000, "stm32u5").contains("TIMEOUT_US: u32 = 2000000;"));
+        // The F1 HAL in its own unit, against its own (shorter) ceiling.
+        assert!(at(30_000_000, "stm32f1").contains("TIMEOUT_MS: u32 = 26214;"));
+    }
+
+    /// An STM32H7 keeps its watchdogs in the D1 domain under names of their
+    /// own: `p.IWDG` does not exist there, so the old files did not compile.
+    /// The H7R/S, on the same family key, keep the plain names.
+    #[test]
+    fn an_h7_names_the_d1_watchdogs() {
+        let file = |files: &[(String, String)], name: &str| {
+            files.iter().find(|(n, _)| n == name).unwrap().1.clone()
+        };
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let files = config_files(&both(), "stm32h7", "STM32H743ZITx", runtime);
+            let iwdg = file(&files, "iwdg.rs");
+            for want in [
+                "use embassy_stm32::peripherals::IWDG1;",
+                "IndependentWatchdog<'static, IWDG1>",
+                "Peri<'static, IWDG1>",
+                "iwdg::init(p.IWDG1)",
+            ] {
+                assert!(iwdg.contains(want), "{want}\n{iwdg}");
+            }
+            assert!(!iwdg.contains("peripherals::IWDG;"), "{iwdg}");
+            let wwdg = file(&files, "wwdg.rs");
+            for want in [
+                "use embassy_stm32::peripherals::WWDG1;",
+                "WindowWatchdog<'static, WWDG1>",
+                "Peri<'static, WWDG1>",
+                "wwdg::init(p.WWDG1)",
+                "counts down from PCLK3",
+            ] {
+                assert!(wwdg.contains(want), "{want}\n{wwdg}");
+            }
+            let calls = init_lines(&both(), "stm32h7", "STM32H743ZITx", runtime);
+            assert!(calls.contains("iwdg::init(p.IWDG1);"), "{calls}");
+            assert!(calls.contains("wwdg::init(p.WWDG1);"), "{calls}");
+        }
+        let files = config_files(&both(), "stm32h7", "STM32H7S3L8Hx", Runtime::Blocking);
+        let wwdg = file(&files, "wwdg.rs");
+        assert!(
+            wwdg.contains("use embassy_stm32::peripherals::WWDG;"),
+            "{wwdg}"
+        );
+        assert!(wwdg.contains("counts down from PCLK1"), "{wwdg}");
+        let calls = init_lines(&both(), "stm32h7", "STM32H7S3L8Hx", Runtime::Blocking);
+        assert!(
+            !calls.contains("IWDG1") && !calls.contains("WWDG1"),
+            "{calls}"
+        );
     }
 
     #[test]
     fn the_two_lifecycles_are_spelled_out_where_they_bite() {
         // The asymmetry is invisible from the call site, so it has to be in the
         // text: one is armed later, the other is already running.
-        let calls = init_lines(&both(), "stm32f4", Runtime::Blocking);
+        let calls = init_lines(&both(), "stm32f4", "", Runtime::Blocking);
         assert!(calls.contains("NOT started"), "{calls}");
         assert!(calls.contains("Running from this line"), "{calls}");
-        let files = config_files(&both(), "stm32f4", Runtime::Blocking);
+        let files = config_files(&both(), "stm32f4", "", Runtime::Blocking);
         let wwdg = &files.iter().find(|(n, _)| n == "wwdg.rs").unwrap().1;
         assert!(wwdg.contains("no way to stop it"), "{wwdg}");
     }

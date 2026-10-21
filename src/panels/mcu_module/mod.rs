@@ -42,6 +42,8 @@ pub mod registry;
 pub mod ron_text;
 pub mod stm32_embassy_features;
 pub mod stm32_flash_geometry;
+#[cfg(test)]
+mod stm32_harvest;
 pub mod stm32_memory_map;
 pub mod stm32_pin_data;
 pub mod stm32_support;

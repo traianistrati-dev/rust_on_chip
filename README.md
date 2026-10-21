@@ -336,8 +336,9 @@ grows into it fails to link, and a LENGTH edited by hand past it trips an
 (Blocking, Native) a generated `F1Flash` adapter over `FlashWriter` — that
 glue lives in `flash_store_hal.rs`, regenerated whole, so your `flash_store.rs`
 is the same under both HALs and survives a runtime switch. The page size of
-every part comes from a table harvested from stm32-metapac
-(`scripts/harvest-flash-geometry.py`), and the build checks the range against
+every part comes from a table harvested from stm32-metapac (see
+[Tables harvested from the vendor crates](#tables-harvested-from-the-vendor-crates)),
+and the build checks the range against
 the driver's own `FLASH_SIZE` / `MAX_ERASE_SIZE`. Every flashing path erases
 only the sectors it writes, so the settings survive a reflash.
 
@@ -743,6 +744,36 @@ zooms and pans like the Pins one.
 | **Async** | every STM32, all ESP32, all Pico, every nRF52, the nRF5340 and the nRF54L15 | `embassy-executor` tasks; on ESP via `esp-rtos`, on RP via `embassy-rp`, on the nRF via `embassy-nrf`. On the F1 it swaps `stm32f1xx-hal` for `embassy-stm32`; USB and CAN are not generated there yet, and embassy-time takes one timer (TIM4 on an F103C8). |
 
 Where a runtime is greyed out, the tab **says why** rather than just refusing.
+
+### Tables harvested from the vendor crates
+
+Four STM32 tables are compiled into the IDE from the crates a generated project
+builds against, as the local cargo registry holds them: the flash geometry
+(`stm32_flash_geometry.rs`), the memory map memory.x is written from
+(`stm32_memory_map.rs`), the chip features embassy-stm32 publishes
+(`stm32_embassy_features.rs`), and the clock mux selectors
+(`codegen/rcc_mux_data.rs`). Each has an ignored test that harvests the crate
+again; with `EIDE_REGEN=1` the same test rewrites the file. For the first three
+the check is the committed file, byte for byte. The clock mux table is not the
+harvest yet: the script that first wrote it dropped 50 selectors (its pattern
+ran from a field with no enum into the next field's), so its test checks that
+the committed selectors and routing rules are metapac's and that exactly those
+50 are missing. Regenerating it adds them, which changes what the Clock tab can
+emit on those parts. A missing crate fails the test rather than skipping it.
+Run them by exact name - a module filter would also run the other ignored
+tests under it:
+
+```powershell
+cargo test -- --ignored --exact panels::mcu_module::stm32_harvest::the_memory_map_matches_metapac
+$env:EIDE_REGEN = "1"   # then the same command rewrites the table
+```
+
+The others are `the_flash_geometry_matches_metapac`,
+`the_embassy_feature_list_matches_the_registry` (same module) and
+`panels::mcu_module::codegen::rcc_mux_harvest::the_rcc_mux_table_matches_metapac`.
+The clock sweep `every_vendor_tree_names_a_source_it_turns_on` also takes
+`EIDE_CLOCK_CHECK=<dir>`, which `cargo check`s the generated clock blocks of two
+parts per family against embassy-stm32.
 
 ### Checking that the generated code builds
 

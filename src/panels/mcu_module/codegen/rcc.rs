@@ -2009,12 +2009,22 @@ mod tests {
     ///
     /// `cargo test -- --ignored every_vendor_tree_names_a_source_it_turns_on --nocapture`
     ///
-    /// With `EIDE_CLOCK_DUMP=<dir>` it also writes, for the first and last
-    /// single-core part of each family, every distinct block (and the
-    /// skeleton's example, uncommented) as `<feature>.rs`, the HAL line the
-    /// importer writes for it as `<feature>.dep`, and `targets.txt`, which
-    /// `scripts/check-clock-blocks.py` hands to `cargo check` against
-    /// embassy-stm32: the only oracle for the field names this sweep cannot see.
+    /// It keeps, for the first and last single-core part of each family, every
+    /// distinct block (and the skeleton's example, uncommented) and the HAL line
+    /// the importer writes for that part. Two knobs use them:
+    ///
+    /// - `EIDE_CLOCK_DUMP=<dir>` writes them as `<feature>.rs`, `<feature>.dep`
+    ///   and `targets.txt`;
+    /// - `EIDE_CLOCK_CHECK=<dir>` `cargo check`s each part's blocks against
+    ///   embassy-stm32 - one crate per feature under `<dir>\crates`, one shared
+    ///   `<dir>\target` (a few GB: keep it off the repo and off the matrix
+    ///   drive) - and fails on any that does not compile. The compiler is the
+    ///   only oracle for the field names this sweep cannot see:
+    ///   `config.rcc.pll` on an H7 (whose field is `pll1`), an `Hse` without
+    ///   the `prescaler` the WB and WL require. `EIDE_CLOCK_LOCK=<Cargo.lock>`
+    ///   seeds every crate with a known-good lock file (any generated STM32
+    ///   project's), so 40-odd crates resolve once; `EIDE_CLOCK_ONLY` names the
+    ///   features to check (comma-separated).
     #[test]
     #[ignore]
     fn every_vendor_tree_names_a_source_it_turns_on() {
@@ -2024,29 +2034,7 @@ mod tests {
             println!("skipped: no STM32CubeMX database on this machine");
             return;
         };
-        let home = std::env::var_os("CARGO_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("USERPROFILE")
-                    .or_else(|| std::env::var_os("HOME"))
-                    .map(|h| std::path::PathBuf::from(h).join(".cargo"))
-            })
-            .expect("a cargo home");
-        let mut metapacs: Vec<std::path::PathBuf> =
-            std::fs::read_dir(home.join("registry").join("src"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .flat_map(|r| std::fs::read_dir(r.path()).into_iter().flatten().flatten())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("stm32-metapac-21."))
-                })
-                .collect();
-        metapacs.sort();
-        let Some(metapac) = metapacs.pop() else {
+        let Some(metapac) = crate::panels::mcu_module::stm32_harvest::metapac() else {
             println!("skipped: no stm32-metapac 21 in the cargo registry");
             return;
         };
@@ -2128,6 +2116,10 @@ mod tests {
         // most of a family's trees offer the same lists.
         let mut swept = std::collections::BTreeSet::new();
         let dump = std::env::var_os("EIDE_CLOCK_DUMP").map(std::path::PathBuf::from);
+        // Absolute: each crate's cargo runs in its own folder, and would read a
+        // relative CARGO_TARGET_DIR from there - a target per crate.
+        let check = std::env::var_os("EIDE_CLOCK_CHECK")
+            .map(|d| std::path::absolute(std::path::PathBuf::from(d)).expect("a folder path"));
         // family -> [(feature, target, part, the HAL line, blocks)] for the dump.
         type Dumped = (
             String,
@@ -2136,6 +2128,124 @@ mod tests {
             String,
             std::collections::BTreeSet<String>,
         );
+        /// One part's blocks as a source file: each in a function of its own.
+        fn block_file(
+            family: &str,
+            part: &str,
+            blocks: &std::collections::BTreeSet<String>,
+        ) -> String {
+            let mut file = format!("// {family}: {part}\n");
+            for (n, b) in blocks.iter().enumerate() {
+                file.push_str(&format!("#[allow(unused)]\nfn case_{n}() {{\n{b}\n}}\n\n"));
+            }
+            file
+        }
+        /// `cargo check` of every kept part's blocks under `work` (see the doc
+        /// above): a line per part, and what failed.
+        fn cargo_check(
+            work: &std::path::Path,
+            dumped: &std::collections::BTreeMap<String, Vec<Dumped>>,
+        ) -> Vec<String> {
+            let only: Vec<String> = std::env::var("EIDE_CLOCK_ONLY")
+                .unwrap_or_default()
+                .split([',', ' '])
+                .filter(|f| !f.is_empty())
+                .map(str::to_owned)
+                .collect();
+            let lock = std::env::var_os("EIDE_CLOCK_LOCK").map(std::path::PathBuf::from);
+            let (mut clean, mut failed) = (0usize, Vec::new());
+            let mut checked = std::collections::BTreeSet::new();
+            for (family, parts) in dumped {
+                for (feature, target, part, hal_dep, blocks) in parts {
+                    if !only.is_empty() && !only.contains(feature) {
+                        continue;
+                    }
+                    checked.insert(feature.as_str());
+                    let krate = work.join("crates").join(feature);
+                    std::fs::create_dir_all(krate.join("src")).expect("the crate folder");
+                    // The importer's line, so `single-bank` stays where embassy's
+                    // build script needs it, plus the time driver the project
+                    // adds (the L1's ADC does not compile without embassy_time).
+                    let hal = crate::panels::mcu_module::project_gen::toggle_hal_feature(
+                        hal_dep.trim(),
+                        "time-driver-any",
+                        true,
+                    );
+                    let manifest = format!(
+                        "[package]\nname = \"clockcheck\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{hal}\n\n[workspace]\n"
+                    );
+                    std::fs::write(krate.join("Cargo.toml"), manifest).expect("writable");
+                    if let Some(lock) = &lock
+                        && !krate.join("Cargo.lock").exists()
+                    {
+                        std::fs::copy(lock, krate.join("Cargo.lock")).expect("the seed lock");
+                    }
+                    let main = format!(
+                        "#![no_std]\n#![no_main]\n\n#[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! {{\n    loop {{}}\n}}\n\n{}",
+                        block_file(family, part, blocks)
+                    );
+                    std::fs::write(krate.join("src").join("main.rs"), main).expect("writable");
+                    let mut cargo = std::process::Command::new("cargo");
+                    cargo
+                        .args([
+                            "check",
+                            "--quiet",
+                            "--target",
+                            target,
+                            "--message-format",
+                            "short",
+                        ])
+                        .current_dir(&krate)
+                        .env("CARGO_TARGET_DIR", work.join("target"))
+                        .env("CARGO_HTTP_MULTIPLEXING", "false")
+                        // What this test run carries that the crate must not
+                        // inherit: a pinned toolchain, a build target, and
+                        // the IDE's own features (rtic-macros counts them).
+                        .env_remove("RUSTUP_TOOLCHAIN")
+                        .env_remove("CARGO_BUILD_TARGET");
+                    for (key, _) in std::env::vars_os() {
+                        if key.to_string_lossy().starts_with("CARGO_FEATURE_") {
+                            cargo.env_remove(key);
+                        }
+                    }
+                    let out = cargo.output().expect("cargo runs");
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let errors: Vec<&str> = stderr
+                        .lines()
+                        .filter(|l| l.contains(": error") || l.starts_with("error"))
+                        .collect();
+                    let ok = out.status.success();
+                    println!(
+                        "{} {feature} ({} blocks)",
+                        if ok { "OK  " } else { "FAIL" },
+                        blocks.len()
+                    );
+                    for e in errors.iter().take(12) {
+                        println!("     {e}");
+                    }
+                    if ok {
+                        clean += 1;
+                    } else {
+                        failed.push(format!(
+                            "{feature}: cargo check fails: {}",
+                            errors.first().copied().unwrap_or("(no error line)")
+                        ));
+                    }
+                }
+            }
+            println!("\n{clean}/{} features check clean", clean + failed.len());
+            // A name that matched nothing compiled nothing: never a pass.
+            for f in only.iter().filter(|f| !checked.contains(f.as_str())) {
+                failed.push(format!(
+                    "{f}: EIDE_CLOCK_ONLY names no part this sweep keeps (the first and last single-core part of each family, lower case)"
+                ));
+            }
+            if checked.is_empty() && only.is_empty() {
+                failed
+                    .push("EIDE_CLOCK_CHECK: no part was kept, so nothing was checked".to_owned());
+            }
+            failed
+        }
         let mut dumped: std::collections::BTreeMap<String, Vec<Dumped>> = Default::default();
         let (mut blocks, mut skeletons, mut options) = (0usize, 0usize, 0usize);
         let mut wrong = Vec::new();
@@ -2197,7 +2307,7 @@ mod tests {
             } else {
                 variants(&regs, "Pllsrc")
             };
-            let dump_here = dump.is_some() && !feature.contains("-cm");
+            let dump_here = (dump.is_some() || check.is_some()) && !feature.contains("-cm");
             let mut here = std::collections::BTreeSet::new();
             let mux_inputs = |id: &str| -> usize {
                 match gc.for_codegen().node(id).map(|n| &n.kind) {
@@ -2384,10 +2494,7 @@ mod tests {
             let mut targets = String::new();
             for (family, parts) in &dumped {
                 for (feature, target, part, hal_dep, blocks) in parts {
-                    let mut file = format!("// {family}: {part}\n");
-                    for (n, b) in blocks.iter().enumerate() {
-                        file.push_str(&format!("#[allow(unused)]\nfn case_{n}() {{\n{b}\n}}\n\n"));
-                    }
+                    let file = block_file(family, part, blocks);
                     std::fs::write(dir.join(format!("{feature}.rs")), file).expect("writable");
                     // The line the importer writes: `single-bank`, the time driver.
                     std::fs::write(dir.join(format!("{feature}.dep")), hal_dep).expect("writable");
@@ -2395,6 +2502,11 @@ mod tests {
                 }
             }
             std::fs::write(dir.join("targets.txt"), targets).expect("writable");
+        }
+        // Before the asserts, so a block that names a wrong source is
+        // compiled as well and both are reported.
+        if let Some(work) = &check {
+            wrong.extend(cargo_check(work, &dumped));
         }
         println!(
             "{} trees: {blocks} generated blocks, {skeletons} skeletons, {options} options",

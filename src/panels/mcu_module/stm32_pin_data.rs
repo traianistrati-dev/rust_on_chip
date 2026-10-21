@@ -2756,9 +2756,9 @@ mod tests {
     /// never describes more FLASH or RAM than metapac has contiguous at that
     /// origin. Ignored: it needs STM32CubeMX and the cargo registry's metapac.
     ///
-    /// The one rule it shares with the harvest script: a flash bank that starts
-    /// inside the one before it (the U375/U385's BANK_2) follows it, as CubeMX
-    /// says the silicon does.
+    /// The one rule it shares with the memory-map harvest (`stm32_harvest`): a
+    /// flash bank that starts inside the one before it (the U375/U385's BANK_2)
+    /// follows it, as CubeMX says the silicon does.
     ///
     /// `cargo test -- --ignored every_cubemx_part_links_memory_it_has --nocapture`
     #[test]
@@ -2775,34 +2775,7 @@ mod tests {
                 }
             },
         };
-        let home = std::env::var_os("CARGO_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("USERPROFILE")
-                    .or_else(|| std::env::var_os("HOME"))
-                    .map(|h| PathBuf::from(h).join(".cargo"))
-            });
-        let mut metapacs: Vec<PathBuf> = home
-            .map(|h| h.join("registry").join("src"))
-            .and_then(|src| std::fs::read_dir(src).ok())
-            .into_iter()
-            .flatten()
-            .flatten()
-            .flat_map(|reg| {
-                std::fs::read_dir(reg.path())
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-            })
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("stm32-metapac-21."))
-            })
-            .collect();
-        metapacs.sort();
-        let Some(metapac) = metapacs.pop() else {
+        let Some(metapac) = crate::panels::mcu_module::stm32_harvest::metapac() else {
             println!("skipped: no stm32-metapac 21 in the cargo registry");
             return;
         };
@@ -2810,29 +2783,8 @@ mod tests {
         /// (name, kind, address, size) of every region of the configuration
         /// embassy uses: the only one, or the single-bank one.
         fn regions(text: &str) -> Vec<(String, String, u64, u64)> {
-            let mem = &text[text.find("memory:").unwrap()..text.find("peripherals:").unwrap()];
-            let mut configs = Vec::new();
-            let (mut depth, mut start, mut i) = (0i32, 0usize, mem.find("&[").unwrap() + 2);
-            while i < mem.len() {
-                if mem[i..].starts_with("&[") {
-                    depth += 1;
-                    if depth == 1 {
-                        start = i;
-                    }
-                    i += 2;
-                    continue;
-                }
-                if mem.as_bytes()[i] == b']' {
-                    if depth == 1 {
-                        configs.push(&mem[start..i]);
-                    }
-                    depth -= 1;
-                    if depth < 0 {
-                        break;
-                    }
-                }
-                i += 1;
-            }
+            use crate::panels::mcu_module::stm32_harvest as harvest;
+            let configs = harvest::configurations(text);
             let pick = match configs.as_slice() {
                 [one] => *one,
                 many => many
@@ -2841,33 +2793,9 @@ mod tests {
                     .copied()
                     .expect("a single-bank configuration"),
             };
-            let field = |r: &str, key: &str| -> String {
-                let at = r.find(key).unwrap() + key.len();
-                r[at..]
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| !matches!(c, ',' | '\n' | '}'))
-                    .collect::<String>()
-                    .trim()
-                    .trim_matches('"')
-                    .to_owned()
-            };
-            pick.split("MemoryRegion {")
-                .skip(1)
-                .map(|r| {
-                    let num = |s: String| match s.strip_prefix("0x") {
-                        Some(h) => u64::from_str_radix(h, 16).unwrap(),
-                        None => s.parse().unwrap(),
-                    };
-                    (
-                        field(r, "name:"),
-                        field(r, "kind:")
-                            .trim_start_matches("MemoryRegionKind::")
-                            .to_owned(),
-                        num(field(r, "address:")),
-                        num(field(r, "size:")),
-                    )
-                })
+            harvest::regions(pick)
+                .into_iter()
+                .map(|r| (r.name, r.kind, r.address, r.size))
                 .collect()
         }
         /// Bytes contiguous from `origin` over the regions of `kind` that pass.
@@ -3285,87 +3213,6 @@ mod tests {
         assert_eq!(
             embassy_feature_in(&loaded.project.hal_dep),
             Some("stm32l151c8-a")
-        );
-    }
-
-    /// The embedded list against the manifest it was harvested from: the
-    /// embassy-stm32 release unpacked in the local cargo registry. Ignored
-    /// because it reads outside the repo; re-run after moving EMBASSY_VERSION.
-    ///
-    /// `cargo test -- --ignored embedded_feature_table_matches --nocapture`
-    #[test]
-    #[ignore]
-    fn embedded_feature_table_matches_the_registry() {
-        use std::path::PathBuf;
-
-        let home = std::env::var_os("CARGO_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("USERPROFILE")
-                    .or_else(|| std::env::var_os("HOME"))
-                    .map(|h| PathBuf::from(h).join(".cargo"))
-            })
-            .expect("a cargo home");
-        let prefix = format!("{EMBASSY_CRATE}-{EMBASSY_VERSION}.");
-        let mut unpacked: Vec<PathBuf> = std::fs::read_dir(home.join("registry").join("src"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .flat_map(|reg| {
-                std::fs::read_dir(reg.path())
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-            })
-            .map(|e| e.path())
-            // A release, not a prerelease: the harvest script reads only those.
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|n| n.strip_prefix(prefix.as_str()))
-                    .is_some_and(|patch| patch.parse::<u32>().is_ok())
-            })
-            .collect();
-        // By patch number, so 0.6.10 sorts after 0.6.9.
-        unpacked.sort_by_key(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.rsplit('.').next())
-                .and_then(|n| n.parse::<u32>().ok())
-        });
-        let dir = unpacked
-            .last()
-            .expect("embassy-stm32 0.6 in the cargo registry: build any STM32 project once");
-        let text = std::fs::read_to_string(dir.join("Cargo.toml")).expect("a readable manifest");
-        println!("checking against {}", dir.display());
-
-        // Chip keys sit at column 0 of `[features]`: `stm32h745zi-cm7 = [`.
-        let mut published: Vec<&str> = text
-            .lines()
-            .skip_while(|l| l.trim() != "[features]")
-            .skip(1)
-            .take_while(|l| !l.starts_with('['))
-            .filter_map(|l| l.split_once(" = "))
-            .map(|(k, _)| k.trim())
-            .filter(|k| {
-                let b = k.as_bytes();
-                k.starts_with("stm32")
-                    && b.get(5).is_some_and(u8::is_ascii_lowercase)
-                    && b.iter()
-                        .skip(5)
-                        .find(|c| !c.is_ascii_lowercase())
-                        .is_some_and(u8::is_ascii_digit)
-            })
-            .collect();
-        published.sort_unstable();
-        let embedded = super::super::stm32_embassy_features::FEATURES.to_vec();
-        let missing: Vec<_> = published.iter().filter(|f| !embedded.contains(f)).collect();
-        let extra: Vec<_> = embedded.iter().filter(|f| !published.contains(f)).collect();
-        assert!(
-            missing.is_empty() && extra.is_empty(),
-            "regenerate with scripts/harvest-embassy-features.py: {} new, {} gone\nnew: {missing:?}\ngone: {extra:?}",
-            missing.len(),
-            extra.len()
         );
     }
 

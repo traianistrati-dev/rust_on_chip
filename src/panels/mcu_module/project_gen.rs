@@ -2321,7 +2321,7 @@ pub fn deps_fingerprint(cargo_toml: &str) -> String {
 
 /// Add or remove `"feature"` inside the `features = [ … ]` array of a single
 /// dependency `line`, idempotently.
-fn toggle_hal_feature(line: &str, feature: &str, add: bool) -> String {
+pub(crate) fn toggle_hal_feature(line: &str, feature: &str, add: bool) -> String {
     let quoted = format!("\"{feature}\"");
     let present = line.contains(&quoted);
     if add == present {

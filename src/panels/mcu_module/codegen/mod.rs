@@ -23,6 +23,8 @@ pub mod nvic;
 pub mod rcc;
 pub mod rcc_mux;
 mod rcc_mux_data;
+#[cfg(test)]
+mod rcc_mux_harvest;
 pub mod rcc_n6;
 pub mod rp;
 pub mod rtic;

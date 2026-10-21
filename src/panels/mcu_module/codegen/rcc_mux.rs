@@ -20,8 +20,8 @@
 //! and the enum is NOT the field capitalised: on WBA, `usart2sel` and
 //! `usart3sel` both use `Usartsel`, while `i2c2sel` and `i2c4sel` both use
 //! `I2c1sel`. So the table is harvested from `stm32-metapac`'s register IR —
-//! the same data embassy's own build script reads — by
-//! `scripts/harvest-rcc-mux.py`, into [`rcc_mux_data`](super::rcc_mux_data).
+//! the same data embassy's own build script reads — by an ignored test,
+//! `rcc_mux_harvest`, into [`rcc_mux_data`](super::rcc_mux_data).
 //!
 //! # Proposed by name, CONFIRMED by sources
 //!

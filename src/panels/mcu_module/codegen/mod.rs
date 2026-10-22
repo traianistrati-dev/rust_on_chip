@@ -76,6 +76,12 @@ impl Mcu {
         family::backend_for_runtime(&self.family, self.runtime)
     }
 
+    /// Does an update write main.rs's header above the GENERATED block anew
+    /// ([`family::FamilyBackend::rebuilds_header`])? Then it is the IDE's too.
+    pub fn rebuilds_main_header(&self) -> bool {
+        self.backend().is_some_and(|b| b.rebuilds_header())
+    }
+
     /// Whether code generation for this MCU is on the async (embassy) path — the
     /// project [`Runtime`](crate::panels::mcu_module::mcu::Runtime) is Async AND
     /// the family supports it. Drives the embassy async deps + the System-tab

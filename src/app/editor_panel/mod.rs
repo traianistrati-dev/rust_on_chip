@@ -53,6 +53,7 @@ pub(crate) mod find_replace;
 pub(super) mod fold;
 mod fold_ui;
 mod format;
+mod gen_zone;
 mod generics;
 mod idle_sync;
 pub(crate) mod impl_picker;
@@ -1642,6 +1643,18 @@ impl AppIde {
         // The overlays and gutters below position what they draw through one
         // row table of this galley, built on the first lookup any of them makes.
         let galley_rows = crate::editor::gui::text_pos::GalleyRows::new(&editor_resp.galley);
+        // The GENERATED blocks' tint. First, so every overlay below draws
+        // over it, and outside the fold guard: it is placed through
+        // `fold_map`, not by pairing the buffer with the galley.
+        self.paint_generated_zone(
+            ui,
+            &editor_resp,
+            &galley_rows,
+            editor_clip,
+            &display_code,
+            displayed_file,
+            &fold_map,
+        );
         // Where each "N refs" pill ended, for the inline diagnostic message that
         // is drawn much later (via `handle_editor_completion`) and used to paint
         // straight through them.

@@ -159,19 +159,24 @@ fn initial_file(style: Cmt, body: &str) -> String {
     format!("{}\n{}", gen_block(style, body), style.tail())
 }
 
+/// `(begin, past the END marker)` of the generated block in `existing`: the
+/// first BEGIN and the first END, when the END comes after it.
+fn block_in(existing: &str, style: Cmt) -> Option<(usize, usize)> {
+    let (begin, end) = (style.begin(), style.end());
+    let (b, e) = (existing.find(begin)?, existing.find(end)?);
+    (b < e).then_some((b, e + end.len()))
+}
+
 /// Refresh the generated block in `existing`, preserving everything the user
 /// added before or after the markers. Falls back to a fresh layout when the
 /// markers are missing (legacy or hand-cleared file).
 fn splice_block(existing: &str, style: Cmt, body: &str) -> String {
-    let (begin, end) = (style.begin(), style.end());
-    if let (Some(b), Some(e)) = (existing.find(begin), existing.find(end)) {
-        if b < e {
-            let before = &existing[..b];
-            // Trim leading newlines after the end marker, then re-add exactly one
-            // so repeated splices are idempotent (no blank-line creep).
-            let after = existing[e + end.len()..].trim_start_matches('\n');
-            return format!("{before}{}\n{after}", gen_block(style, body));
-        }
+    if let Some((b, past)) = block_in(existing, style) {
+        let before = &existing[..b];
+        // Trim leading newlines after the end marker, then re-add exactly one
+        // so repeated splices are idempotent (no blank-line creep).
+        let after = existing[past..].trim_start_matches('\n');
+        return format!("{before}{}\n{after}", gen_block(style, body));
     }
     if existing.trim().is_empty() {
         initial_file(style, body)
@@ -229,6 +234,12 @@ pub fn splice_partitions_csv(existing: &str, rows: Option<&str>) -> String {
             splice_block(existing, Cmt::Hash, &kept)
         }
     }
+}
+
+/// Where `partitions.csv`'s generated block sits in `text`, as
+/// [`splice_partitions_csv`] finds it - what the editor shades.
+pub fn partitions_csv_block(text: &str) -> Option<(usize, usize)> {
+    block_in(text, Cmt::Hash)
 }
 
 /// Does the project's `partitions.csv` carry the IDE's block? Only such a file
@@ -335,29 +346,38 @@ pub enum ConfigFile {
 }
 
 impl ConfigFile {
+    /// The comment syntax this file's generated block is framed with.
+    fn style(self) -> Cmt {
+        match self {
+            ConfigFile::CargoToml | ConfigFile::CargoConfig | ConfigFile::GitIgnore => Cmt::Hash,
+            ConfigFile::MemoryX => Cmt::Block,
+            ConfigFile::BuildRs => Cmt::Slash,
+        }
+    }
+
     /// The generated body + comment style for this file, or `None` when the file
     /// does not apply to the toolchain (e.g. `memory.x`/`build.rs` for ESP, which
     /// esp-hal supplies itself).
     fn body(self, c: &ProjectDef, toolchain: &ToolchainKind) -> Option<(Cmt, String)> {
         use ToolchainKind::{EspRust, RustEmbedded};
-        match self {
+        let body = match self {
             ConfigFile::CargoToml => match toolchain {
-                RustEmbedded => Some((Cmt::Hash, cargo_toml_embedded(c))),
-                EspRust => Some((Cmt::Hash, cargo_toml_esp(c))),
-                _ => None,
+                RustEmbedded => cargo_toml_embedded(c),
+                EspRust => cargo_toml_esp(c),
+                _ => return None,
             },
             ConfigFile::CargoConfig => match toolchain {
-                RustEmbedded => Some((Cmt::Hash, cargo_config_embedded(c))),
-                EspRust => Some((Cmt::Hash, cargo_config_esp(c))),
-                _ => None,
+                RustEmbedded => cargo_config_embedded(c),
+                EspRust => cargo_config_esp(c),
+                _ => return None,
             },
             ConfigFile::MemoryX => match toolchain {
-                RustEmbedded => Some((Cmt::Block, memory_x(c))),
-                _ => None,
+                RustEmbedded => memory_x(c),
+                _ => return None,
             },
             ConfigFile::BuildRs => match toolchain {
-                RustEmbedded => Some((Cmt::Slash, build_rs_embedded())),
-                _ => None,
+                RustEmbedded => build_rs_embedded(),
+                _ => return None,
             },
             // `project_structure.config` is per-user view state (node positions
             // in the Structure diagram) — it changes on every drag, so it is
@@ -366,16 +386,21 @@ impl ConfigFile {
             // The IoT tab's `secrets.rs` holds the Wi-Fi and broker passwords,
             // so it is never committed either - listed even before the tab is
             // used, so the first commit after it is cannot carry them.
-            ConfigFile::GitIgnore => Some((
-                Cmt::Hash,
-                format!(
-                    "/target\n{}\n{}\n",
-                    crate::panels::mcu_module::structure_config::FILE_NAME,
-                    crate::panels::mcu_module::codegen::iot_gen::SECRETS_IGNORE,
-                ),
-            )),
-        }
+            ConfigFile::GitIgnore => format!(
+                "/target\n{}\n{}\n",
+                crate::panels::mcu_module::structure_config::FILE_NAME,
+                crate::panels::mcu_module::codegen::iot_gen::SECRETS_IGNORE,
+            ),
+        };
+        Some((self.style(), body))
     }
+}
+
+/// Where `file`'s generated block sits in `text`: from its BEGIN marker to
+/// just past its END, found as a refresh finds it (see `splice_block`) -
+/// what the editor shades. `None` without both markers in that order.
+pub fn generated_block(file: ConfigFile, text: &str) -> Option<(usize, usize)> {
+    block_in(text, file.style())
 }
 
 /// Fresh full content for a config file (generated block + user tail), or an

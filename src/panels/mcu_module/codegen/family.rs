@@ -75,6 +75,13 @@ pub trait FamilyBackend {
     /// preserving user-editable code outside the markers.
     fn update_main_rs(&self, mcu: &Mcu, existing: &str) -> String;
 
+    /// Does [`update_main_rs`](FamilyBackend::update_main_rs) write the whole
+    /// header above the markers anew, so nothing typed there survives? The
+    /// editor then shades it with the block. Default: the header is kept.
+    fn rebuilds_header(&self) -> bool {
+        false
+    }
+
     /// Per-peripheral init module bodies for `src/pins/configs/` — `(file_name,
     /// generated_body)`. Default: none (families without separate config files).
     fn config_files(&self, _mcu: &Mcu) -> Vec<(String, String)> {
@@ -697,6 +704,11 @@ impl FamilyBackend for WbaBackend {
         wba::splice_section(existing, &section, &mcu.name, &mcu.id)
     }
 
+    /// `embassy_common::splice_section` writes the header anew.
+    fn rebuilds_header(&self) -> bool {
+        true
+    }
+
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
         // Like the generic embassy backend: bus inits stay inline in
         // main.rs, so `pins/configs/` here holds only the pin-less
@@ -784,6 +796,11 @@ impl FamilyBackend for StmEmbassyBackend {
         embassy_common::splice_section(existing, &section, &mcu.name, &mcu.id)
     }
 
+    /// `embassy_common::splice_section` writes the header anew.
+    fn rebuilds_header(&self) -> bool {
+        true
+    }
+
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
         // Only the watchdogs: this backend keeps every bus init inline in
         // main.rs, so `pins/configs/` exists here purely for the tab-driven,
@@ -841,6 +858,11 @@ impl FamilyBackend for AsyncEmbassyBackend {
         let section = async_section(mcu);
         let section = keep_stm32_clock(mcu, existing, section);
         embassy_stm32::splice_section(existing, &section, &mcu.name, &mcu.id)
+    }
+
+    /// `embassy_stm32::splice_section` writes the header anew.
+    fn rebuilds_header(&self) -> bool {
+        true
     }
 
     /// One `async fn` per armed input that got an EXTI line, awaited from its

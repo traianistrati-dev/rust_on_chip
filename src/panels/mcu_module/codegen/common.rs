@@ -204,9 +204,14 @@ pub const CLOCK_END: &str = "    // <<< CLOCK END >>>";
 
 /// The hand-written clock region of `source`, markers included.
 pub fn clock_region(source: &str) -> Option<&str> {
+    clock_region_span(source).map(|(begin, end)| &source[begin..end])
+}
+
+/// Where [`clock_region`] sits in `source`: `(begin, end)` in bytes.
+pub fn clock_region_span(source: &str) -> Option<(usize, usize)> {
     let begin = source.find(CLOCK_BEGIN)?;
     let end = source[begin..].find(CLOCK_END)? + begin + CLOCK_END.len();
-    Some(&source[begin..end])
+    Some((begin, end))
 }
 
 /// Carry the user's hand-written clock block from `existing` into `section`.

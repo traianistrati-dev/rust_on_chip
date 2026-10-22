@@ -276,18 +276,21 @@ pub fn graph_clock_block_for(
     {
         return wrap(block, manual);
     }
+    // What the part needs written whatever its tree: on a WBA with SAI1,
+    // `init(Default::default())` itself panics.
+    let floor = super::rcc_mux::lines_without_a_tree(chip, family);
     // A family that reads no tree at all (U3, C0) is that, whatever the tree
     // selects - blaming the source would suggest a fix that does not exist.
     if rcc_recipe(family).is_none() && !generic_allowed(family) {
         return wrap(
-            hand_written_skeleton(family, Skeleton::NoRecipe, manual),
+            hand_written_skeleton(family, Skeleton::NoRecipe, manual, &floor),
             manual,
         );
     }
     // A tree that selects a source no emitter writes gets the skeleton.
     if graph.is_some_and(|g| !tree_sources_supported(g)) {
         return wrap(
-            hand_written_skeleton(family, Skeleton::Source, manual),
+            hand_written_skeleton(family, Skeleton::Source, manual, &floor),
             manual,
         );
     }
@@ -302,7 +305,7 @@ pub fn graph_clock_block_for(
                     Some(refusal) => Skeleton::Shape(refusal),
                     None => Skeleton::NoRecipe,
                 };
-                return wrap(hand_written_skeleton(family, why, manual), manual);
+                return wrap(hand_written_skeleton(family, why, manual, &floor), manual);
             }
         },
     };
@@ -311,10 +314,26 @@ pub fn graph_clock_block_for(
         None => spec.reset.clone(),
     };
     // Per-peripheral kernel clocks: USART1SEL, I2C1SEL, ADCSEL and the rest.
-    // The Clock tab has always shown these; until now nothing read them.
+    // The Clock tab has always shown these; until now nothing read them. Only
+    // onto a source this block leaves running (`emit_rcc_block` below): the
+    // HSI it switches on, the HSE it starts, the PLL1 output it enables.
+    let hsi_used =
+        values.sys == SysSource::Hsi || (values.sys == SysSource::Pll && !values.pll_src_hse);
+    let running = super::rcc_mux::Running {
+        hsi: super::rcc_mux::hsi_by_default(family) || (desc.hsi_needs_enable && hsi_used),
+        // What the block STARTS (`emit_rcc_block`), not the tree's tick: an
+        // imported tree has its HSE ticked whatever SYSCLK runs on.
+        hse: hse_used(&values),
+        pll1: (values.sys == SysSource::Pll).then_some(match desc.pll_out_field {
+            "divq" => 'q',
+            "divr" => 'r',
+            // `divp`, or none at all: F0/F1/F3 report their PLL as `pll1_p`.
+            _ => 'p',
+        }),
+    };
     let mux = match graph {
-        Some(g) => super::rcc_mux::emit_lines(g, chip, family),
-        None => Vec::new(),
+        Some(g) => super::rcc_mux::emit_lines(g, chip, family, &running),
+        None => floor,
     };
     // The reset shortcut only applies when the chip's HW default equals this
     // reset (HSI). L4/L5/U5 default to MSI, so a reset-equivalent graph must
@@ -322,7 +341,8 @@ pub fn graph_clock_block_for(
     //
     // A peripheral selection also disqualifies it: the buses may be at reset
     // while USART1 has been moved to HSI, and `init(Default::default())` has
-    // nowhere to say so.
+    // nowhere to say so. So does a WBA with SAI1, which panics in `init` on
+    // the default `sai1sel`.
     if spec.reset_is_hw_default && values == spec.reset && mux.is_empty() {
         return wrap(EMBASSY_RESET_INIT.to_string(), manual);
     }
@@ -604,7 +624,11 @@ fn default_clock_of(family: &str) -> &'static str {
 /// "Kept across regeneration" only inside the manual markers. A tree that
 /// moves to a selection no recipe writes reaches here with the switch still
 /// off, and that block is regenerated - so it says how to keep one instead.
-fn hand_written_skeleton(family: &str, why: Skeleton, manual: bool) -> String {
+///
+/// `floor` is what the part needs written whatever its clock
+/// ([`lines_without_a_tree`](super::rcc_mux::lines_without_a_tree)): with
+/// any, the active code is a `Config` carrying them, not `Default::default()`.
+fn hand_written_skeleton(family: &str, why: Skeleton, manual: bool, floor: &[String]) -> String {
     let mut head: Vec<String> = match why {
         // Word for word what every existing hand-written project carries.
         Skeleton::NoRecipe if manual => vec![
@@ -680,6 +704,37 @@ fn hand_written_skeleton(family: &str, why: Skeleton, manual: bool) -> String {
             prescaler = prescaler,
         )
     };
+    // The lines a part needs whatever its clock (`rcc_mux::lines_without_a_tree`)
+    // go in the example AND in the active code: `Default::default()` alone
+    // panics in `init` there.
+    let example_floor: String = floor
+        .iter()
+        .map(|l| format!("    //       {}\n", l.trim_start()))
+        .collect();
+    let active = if floor.is_empty() {
+        format!(
+            concat!(
+                "    // Then delete the line below.\n",
+                "    let p = embassy_stm32::init(Default::default()); // embassy's default clock ({clock})\n",
+            ),
+            clock = default_clock_of(family),
+        )
+    } else {
+        format!(
+            concat!(
+                "    // Then delete the lines below. Not `Default::default()`: on this part\n",
+                "    // embassy's default `config.rcc.mux` panics in `init`.\n",
+                "    let mut config = embassy_stm32::Config::default();\n",
+                "    {{\n",
+                "        use embassy_stm32::rcc;\n",
+                "{floor}\n",
+                "    }}\n",
+                "    let p = embassy_stm32::init(config); // embassy's default clock ({clock})\n",
+            ),
+            floor = floor.join("\n"),
+            clock = default_clock_of(family),
+        )
+    };
     format!(
         concat!(
             "{head}\n",
@@ -689,21 +744,22 @@ fn hand_written_skeleton(family: &str, why: Skeleton, manual: bool) -> String {
             "    //       use embassy_stm32::rcc;\n",
             "{hse}",
             "    //       config.rcc.sys = {sys};\n",
+            "{example_floor}",
             "    //   }}\n",
             "    //   let p = embassy_stm32::init(config);\n",
             "    //\n",
-            "    // Then delete the line below.\n",
-            "    let p = embassy_stm32::init(Default::default()); // embassy's default clock ({clock})\n",
+            "{active}",
         ),
         head = head.join("\n"),
         hse = hse,
+        example_floor = example_floor,
+        active = active,
         // N6's SYSCLK is its own `SysClk`, not the `Sysclk` of every other module.
         sys = if family == "stm32n6" {
             "rcc::SysClk::Hse"
         } else {
             "rcc::Sysclk::HSE"
         },
-        clock = default_clock_of(family),
     )
 }
 
@@ -1732,6 +1788,12 @@ pub fn read_rcc_values(g: &ClockGraph, spec: &ReadSpec) -> RccValues {
     }
 }
 
+/// Does the block start the HSE? Only when SYSCLK, directly or through the
+/// PLL, runs on it; the tree's HSE tick alone starts nothing.
+fn hse_used(v: &RccValues) -> bool {
+    v.sys == SysSource::Hse || (v.sys == SysSource::Pll && v.pll_src_hse)
+}
+
 /// Emit the full clock block for `values` using the family's `desc`.
 ///
 /// Byte-for-byte compatible with the previous hand-written `f4`/`wba` emitters —
@@ -1780,8 +1842,7 @@ pub fn emit_rcc_block(desc: &RccDescriptor, v: &RccValues) -> String {
     b.push_str("    {\n        use embassy_stm32::rcc;\n");
 
     // ── HSE ─────────────────────────────────────────────────────────────
-    let hse_used = v.sys == SysSource::Hse || (v.sys == SysSource::Pll && v.pll_src_hse);
-    if hse_used {
+    if hse_used(v) {
         match desc.hse_style {
             HseStyle::Freq => b.push_str(&format!(
                 "        config.rcc.hse = Some(rcc::Hse {{ freq: embassy_stm32::time::Hertz({}), \
@@ -1997,6 +2058,70 @@ mod tests {
         let block = graph_clock_block_for("stm32wl55jcix", "stm32wl", &gc(&g), false);
         assert!(block.contains("Sysclk::HSI"), "{block}");
         assert!(block.contains("config.rcc.hsi = true;"), "{block}");
+    }
+
+    /// A WBA55 tree no recipe writes (SYSCLK on the HSE behind its /2) gets
+    /// the skeleton - and on a part with SAI1 its active code is NOT
+    /// `init(Default::default())`, which panics in `init` there on the
+    /// default `sai1sel` (PLL1_P). A WBA52 has no SAI1 and keeps it.
+    #[test]
+    fn a_wba_skeleton_boots_on_a_part_with_sai1() {
+        use crate::panels::mcu_module::clock::graph::parse_clock_ron;
+
+        let ron = include_str!("../../../../assets/mcus/examples/stm32wba55_graphclock.ron");
+        let mut gc = parse_clock_ron(ron).expect("the shipped tree parses");
+        gc.graph.node_mut("HseDiv").expect("HseDiv").state = NodeState::Index(1);
+        let hse = gc
+            .graph
+            .edges
+            .iter()
+            .find(|e| e.to == "SysClkSource" && e.from == "HseDiv")
+            .expect("SYSCLK can take the HSE")
+            .input;
+        gc.graph.node_mut("SysClkSource").expect("sw").state = NodeState::Index(hse);
+        let clock = ClockConfig::Graph(gc);
+        let active = |block: &str| -> Vec<String> {
+            block
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let block = graph_clock_block_for("stm32wba55cgux", "stm32wba", &clock, false);
+        assert!(
+            block.contains("selects a clock source the generated recipes do"),
+            "the skeleton path: {block}"
+        );
+        let code = active(&block);
+        assert!(
+            code.iter().all(|l| !l.contains("Default::default()")),
+            "{block}"
+        );
+        assert!(
+            code.iter()
+                .any(|l| l == "        config.rcc.mux.sai1sel = rcc::mux::Sai1sel::HSI;"),
+            "{block}"
+        );
+        assert!(
+            code.iter()
+                .any(|l| l.starts_with("    let p = embassy_stm32::init(config);")),
+            "{block}"
+        );
+        // The example carries it too, so following it keeps the part booting.
+        assert!(
+            block.contains("    //       config.rcc.mux.sai1sel = rcc::mux::Sai1sel::HSI;"),
+            "{block}"
+        );
+
+        let block = graph_clock_block_for("stm32wba52cgux", "stm32wba", &clock, false);
+        assert!(
+            active(&block)
+                .iter()
+                .any(|l| l.starts_with("    let p = embassy_stm32::init(Default::default());")),
+            "{block}"
+        );
+        assert!(!block.contains("sai1sel"), "{block}");
     }
 
     /// Every family's real CubeMX tree, at every SYSCLK and every PLL-source
@@ -2586,15 +2711,15 @@ mod tests {
     /// `PLL1_P`, and the WB/WL prescaler; its comment names the real default.
     #[test]
     fn the_skeleton_names_the_familys_default_clock() {
-        let wl = hand_written_skeleton("stm32wl", Skeleton::NoRecipe, true);
+        let wl = hand_written_skeleton("stm32wl", Skeleton::NoRecipe, true, &[]);
         assert!(!wl.contains("PLL1_P"), "{wl}");
         assert!(wl.contains("prescaler: rcc::HsePrescaler::DIV1"), "{wl}");
         assert!(wl.contains("(MSI)"), "{wl}");
-        let u5 = hand_written_skeleton("stm32u5", Skeleton::NoRecipe, true);
+        let u5 = hand_written_skeleton("stm32u5", Skeleton::NoRecipe, true, &[]);
         assert!(u5.contains("(MSIS)") && !u5.contains("prescaler"), "{u5}");
-        assert!(hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true).contains("(HSI)"));
+        assert!(hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true, &[]).contains("(HSI)"));
         assert!(
-            hand_written_skeleton("stm32h7", Skeleton::Source, true)
+            hand_written_skeleton("stm32h7", Skeleton::Source, true, &[])
                 .contains("selects a clock source")
         );
         // Outside the markers it does not promise to keep an edit.
@@ -2604,8 +2729,8 @@ mod tests {
             Skeleton::Shape(GenericRefusal::Pll),
             Skeleton::Shape(GenericRefusal::UsbPhy),
         ] {
-            let kept = hand_written_skeleton("stm32h7", why, true);
-            let regenerated = hand_written_skeleton("stm32h7", why, false);
+            let kept = hand_written_skeleton("stm32h7", why, true, &[]);
+            let regenerated = hand_written_skeleton("stm32h7", why, false, &[]);
             assert!(kept.contains("kept across regeneration"), "{kept}");
             assert!(
                 !regenerated.contains("kept across regeneration"),
@@ -2632,49 +2757,60 @@ mod tests {
             GenericRefusal::UsbPhy,
             GenericRefusal::AdcAhb,
         ] {
-            let s = hand_written_skeleton("stm32wl", Skeleton::Shape(r), false);
+            let s = hand_written_skeleton("stm32wl", Skeleton::Shape(r), false, &[]);
             let head = s.split_once("\n    //\n").map_or("", |(h, _)| h);
             assert!(!head.lines().any(|l| l.starts_with("    //   ")), "{s}");
         }
         // The example compiles on the family it is printed for, and does not
         // panic where the USB PHY rule refused: WBA's `Hse` is a prescaler.
-        let wba = hand_written_skeleton("stm32wba", Skeleton::Source, true);
+        let wba = hand_written_skeleton("stm32wba", Skeleton::Source, true, &[]);
         assert!(
             wba.contains("Hse { prescaler: rcc::HsePrescaler::DIV1 }"),
             "{wba}"
         );
         assert!(!wba.contains("freq:"), "{wba}");
         assert!(wba.contains("VoltageScale::RANGE1"), "{wba}");
-        let wb = hand_written_skeleton("stm32wb", Skeleton::NoRecipe, true);
+        let wb = hand_written_skeleton("stm32wb", Skeleton::NoRecipe, true, &[]);
         assert!(
             wb.contains("Hertz(32_000_000)") && wb.contains("HsePrescaler::DIV1"),
             "{wb}"
         );
-        let n6 = hand_written_skeleton("stm32n6", Skeleton::NoRecipe, true);
+        let n6 = hand_written_skeleton("stm32n6", Skeleton::NoRecipe, true, &[]);
         assert!(
             n6.contains("rcc::SysClk::Hse") && !n6.contains("Sysclk::HSE"),
             "{n6}"
         );
         assert!(
-            hand_written_skeleton("stm32f4", Skeleton::Source, true).contains("Hertz(8_000_000)")
+            hand_written_skeleton("stm32f4", Skeleton::Source, true, &[])
+                .contains("Hertz(8_000_000)")
         );
-        let u5 = hand_written_skeleton("stm32u5", Skeleton::NoRecipe, true);
+        let u5 = hand_written_skeleton("stm32u5", Skeleton::NoRecipe, true, &[]);
         assert!(u5.contains("Hertz(16_000_000)"), "{u5}");
-        let rs = hand_written_skeleton("stm32h7", Skeleton::Shape(GenericRefusal::UsbPhy), false);
+        let rs = hand_written_skeleton(
+            "stm32h7",
+            Skeleton::Shape(GenericRefusal::UsbPhy),
+            false,
+            &[],
+        );
         assert!(rs.contains("Hertz(16_000_000)"), "{rs}");
         assert!(
-            hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true)
+            hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true, &[])
                 .contains("Hertz(16_000_000)")
         );
         // The reason is the refusal's, word for word.
-        let rs = hand_written_skeleton("stm32h7", Skeleton::Shape(GenericRefusal::UsbPhy), true);
+        let rs = hand_written_skeleton(
+            "stm32h7",
+            Skeleton::Shape(GenericRefusal::UsbPhy),
+            true,
+            &[],
+        );
         assert!(
             rs.contains("USB OTG_HS") && rs.contains("26 or\n    // 32 MHz"),
             "{rs}"
         );
         // The hand-written projects that exist keep their text byte for byte.
         assert!(
-            hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true).starts_with(concat!(
+            hand_written_skeleton("stm32h7", Skeleton::NoRecipe, true, &[]).starts_with(concat!(
                 "    // Clock: this chip's family has no generated RCC recipe yet, so the\n",
                 "    // Clock tab's tree cannot be turned into code automatically. Set it\n",
                 "    // here — this block is kept across regeneration.\n    //\n"

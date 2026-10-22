@@ -79,12 +79,21 @@ mod tests {
         let pc13 = pin("PC13", PinFunction::GpioInput);
         let pa9 = pin("PA9", PinFunction::UsartTx(1));
         let refs: Vec<&Pin> = vec![&pb5, &pc13, &pa9];
-        let section =
-            make_generated_section("STM32WBA55CG", "", &refs, &ClockConfig::None, "", false);
+        let section = make_generated_section(
+            "STM32WBA55CG",
+            "stm32wba55cgux",
+            &refs,
+            &ClockConfig::None,
+            "",
+            false,
+        );
 
         // Shape: gpio imports (both kinds), embassy init, one line per pin.
         assert!(section.contains("use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};"));
-        assert!(section.contains("embassy_stm32::init(Default::default())"));
+        // Not `init(Default::default())`: the WBA55 has SAI1, and embassy's
+        // default `sai1sel` (PLL1_P) panics in `init`.
+        assert!(section.contains("config.rcc.mux.sai1sel = rcc::mux::Sai1sel::HSI;"));
+        assert!(section.contains("let p = embassy_stm32::init(config);"));
         assert!(section.contains(
             "let mut pb5_out = Output::new(p.PB5, Level::Low, Speed::Low); // GPIO Output"
         ));
@@ -123,18 +132,36 @@ mod tests {
     /// No configured pins → no gpio import, a placeholder comment, still valid.
     #[test]
     fn empty_config_omits_imports() {
-        let section =
-            make_generated_section("STM32WBA55CG", "", &[], &ClockConfig::None, "", false);
+        let section = make_generated_section(
+            "STM32WBA52CG",
+            "stm32wba52cgux",
+            &[],
+            &ClockConfig::None,
+            "",
+            false,
+        );
         assert!(!section.contains("use embassy_stm32::gpio"));
         assert!(section.contains("No pins configured yet"));
         assert!(section.contains("fn main() -> !"));
-        // No WBA clock graph → embassy's own default init.
+        // No WBA clock graph → embassy's own default init, on a part without
+        // SAI1; one with it boots only with `sai1sel` set.
         assert!(section.contains("embassy_stm32::init(Default::default())"));
+        let wba55 = make_generated_section(
+            "STM32WBA55CG",
+            "stm32wba55cgux",
+            &[],
+            &ClockConfig::None,
+            "",
+            false,
+        );
+        assert!(!wba55.contains("init(Default::default())"), "{wba55}");
+        assert!(wba55.contains("Sai1sel::HSI"), "{wba55}");
     }
 
     /// The Clock-tab graph maps onto the embassy RCC config: the default
     /// 100 MHz preset emits the exact PLL fields + RANGE1 (the PLL panics in
-    /// range 2), and an HSI-reset graph falls back to `Default::default()`.
+    /// range 2), and an HSI-reset graph falls back to `Default::default()` on
+    /// a part without SAI1.
     #[test]
     fn clock_graph_maps_to_embassy_rcc_config() {
         use crate::panels::mcu_module::clock::graph::{GraphClock, stm32wba_graph};
@@ -182,11 +209,32 @@ mod tests {
                 enabled: false,
                 hz: 32_000_000,
             };
-        let s3 = make_generated_section("WBA", "", &[], &ClockConfig::Graph(gc3), "", false);
+        let s3 = make_generated_section(
+            "WBA",
+            "stm32wba52cgux",
+            &[],
+            &ClockConfig::Graph(gc3.clone()),
+            "",
+            false,
+        );
         assert!(
             s3.contains("embassy_stm32::init(Default::default())"),
             "{s3}"
         );
+        // A WBA55 at reset still writes the block, for its `sai1sel`.
+        let s3 = make_generated_section(
+            "WBA",
+            "stm32wba55cgux",
+            &[],
+            &ClockConfig::Graph(gc3),
+            "",
+            false,
+        );
+        assert!(
+            s3.contains("config.rcc.mux.sai1sel = rcc::mux::Sai1sel::HSI;"),
+            "{s3}"
+        );
+        assert!(s3.contains("let p = embassy_stm32::init(config);"), "{s3}");
     }
 
     /// Splice replaces only the GEN block, keeping the user tail.

@@ -83,7 +83,20 @@ map — and, from the STM32Cube database, its clock tree — in one click.
 Eight families have a **hand-drawn, fully interactive clock tree** (F1, F2, F4,
 F7, G0, G4, L4, WBA — F4 and F7 share one). The rest read theirs from the
 STM32Cube database, and the IDE knows every family's **peripheral clock
-selectors** — over 150 part-prefix rules spanning C0 through WL.
+selectors** — over 150 part-prefix rules spanning C0 through WL, and which
+selectors each part lacks. A selector is written only onto a clock the
+generated firmware has running (the buses, the HSI or HSE the block starts,
+the PLL output it enables, what embassy starts by default), and the RNG never
+onto a 32 kHz clock (embassy's driver hangs on it). A pick it cannot write
+(PLL2, PLLSAI, an external clock) is left out where embassy's own default for
+that selector runs — embassy writes register value 0 for every selector not
+set — and is replaced by a running clock, with a comment saying so, where
+that default is itself stopped (the WBA's RNG defaults to the LSE). An RTC on
+the LSE starts the LSE (`config.rcc.ls`), which needs the board's 32.768 kHz
+crystal, without moving the RTC or stopping the LSI when the LSE is started
+for a peripheral instead. A WBA with SAI1 always gets `sai1sel = HSI`, even
+without a generated clock: embassy's default selects PLL1_P there and its
+`init` panics.
 
 With a CubeMX install detected, that is roughly **2,800 orderable parts**. The
 STM32_open_pin_data checkout reaches a few hundred more (including STM32WL4,

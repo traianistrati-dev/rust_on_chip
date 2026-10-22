@@ -699,6 +699,14 @@ fn every_mux_selector_compiles_against_embassy() {
             "    {\n",
             "        use embassy_stm32::rcc;\n",
         ));
+        // The lines `emit_lines` starts the LSE with: every family but the
+        // N6, whose `Config` has no `ls`.
+        if c.family != "stm32n6" {
+            use super::rcc_mux::{LSE_ON, LSI_ON, RTC_ON_LSI};
+            for line in [LSE_ON, RTC_ON_LSI, LSI_ON] {
+                let _ = writeln!(body, "{line}");
+            }
+        }
         let mut lines = 0;
         for f in fields {
             for (_, variant) in f.variants {

@@ -947,12 +947,35 @@ fn async_periphs(mcu: &Mcu) -> embassy_stm32::AsyncPeriphs {
 /// [`rcc::for_dual_core`]). The id first, the display name for a form whose id
 /// is not a part number.
 fn stm32_clock_block(mcu: &Mcu) -> String {
-    let block =
-        rcc::graph_clock_block_for(mux_chip(mcu), &mcu.family, &mcu.clock, mcu.clock_manual);
+    let block = rcc::graph_clock_block_with(
+        mux_chip(mcu),
+        &mcu.family,
+        &mcu.clock,
+        mcu.clock_manual,
+        i2s_blocks(mcu),
+    );
     match dual_core_feature(mcu) {
         Some(feature) => rcc::for_dual_core(&block, &feature),
         None => block,
     }
+}
+
+/// The SPI blocks a pad runs as I2S, bit *n* for SPI*n* (`I2S2` IS `SPI2`),
+/// half-wired ones included: their clock selector gets no stand-in.
+fn i2s_blocks(mcu: &Mcu) -> u8 {
+    pins_of(mcu)
+        .iter()
+        .fold(0, |mask, pin| match pin.selected_function {
+            PinFunction::I2sCk(n)
+            | PinFunction::I2sWs(n)
+            | PinFunction::I2sSd(n)
+            | PinFunction::I2sMck(n)
+                if n < 8 =>
+            {
+                mask | 1 << n
+            }
+            _ => mask,
+        })
 }
 
 /// The part the clock block's per-part lookups key on (the RCC version, and
@@ -2295,6 +2318,36 @@ mod dual_core_tests {
         mcu
     }
 
+    /// A pad run as I2S reaches the clock block: on an H743, SPI1-3 share one
+    /// selector, so an I2S2 pad keeps it off the PER stand-in - SPI2's kernel
+    /// clock is its audio clock. Without one, the stand-in is written.
+    #[test]
+    fn an_i2s_pad_keeps_its_spi_selector_off_a_stand_in() {
+        let mut mcu = mcu_for(
+            "stm32h743zitx",
+            "STM32H743ZITx",
+            "stm32h7",
+            Runtime::Blocking,
+        );
+        mcu.hal_feature = None;
+        let spi = "config.rcc.mux.spi123sel = rcc::mux::";
+        let block = stm32_clock_block(&mcu);
+        assert!(block.contains(spi), "{block}");
+        let num = mcu
+            .iter_all_pins()
+            .find(|p| p.name == "PA5")
+            .map(|p| p.number)
+            .expect("a PA5 pad");
+        mcu.find_pin_mut(num).expect("the pad").selected_function = PinFunction::I2sCk(2);
+        assert_eq!(i2s_blocks(&mcu), 1 << 2);
+        let block = stm32_clock_block(&mcu);
+        assert!(!block.contains(spi), "{block}");
+        assert!(
+            block.contains("config.rcc.mux.adcsel = rcc::mux::Adcsel::PER;"),
+            "{block}"
+        );
+    }
+
     /// The clock selectors are looked up for the part the build is for: the
     /// dependency line's chip over a free-text id, then the id, then the name.
     /// A WBA62 renamed `sensor_node` still loses the SPI2 selector it lacks.
@@ -2391,8 +2444,10 @@ mod dual_core_tests {
             let mcu = mcu_for("stm32wl55jcix", "STM32WL55JCIx", "stm32wl", runtime);
             let fresh = mcu.fresh_main_rs();
             // What the generator wrote before: the same file with the plain
-            // block, which the section embeds verbatim.
-            let single = rcc::graph_clock_block_for(&mcu.id, &mcu.family, &mcu.clock, true);
+            // block, which the section embeds verbatim - and before the
+            // stand-ins, so `Default::default()`: told no part, the WL (two
+            // RCC versions) has no selectors to stand in for.
+            let single = rcc::graph_clock_block(&mcu.family, &mcu.clock, true);
             let dual = stm32_clock_block(&mcu);
             assert!(fresh.contains(&dual), "{fresh}");
             let old = fresh.replace(&dual, &single);
@@ -2542,9 +2597,14 @@ mod tests {
         );
         assert!(code.contains("fn main() -> !"));
         assert!(
-            code.contains("embassy_stm32::init(Default::default())")
+            code.contains("embassy's default clock (HSI)")
                 && code.contains("only that recipe can write safely"),
             "the PLL the tree selects is not written, and the block says why"
+        );
+        // embassy's default ADC clock, PLL2_P, does not run: a stand-in.
+        assert!(
+            code.contains("config.rcc.mux.adcsel = rcc::mux::Adcsel::PER;"),
+            "{code}"
         );
         assert!(code.contains(crate::panels::mcu_module::codegen::GEN_BEGIN));
     }

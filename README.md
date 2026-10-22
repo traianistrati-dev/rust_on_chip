@@ -87,13 +87,20 @@ selectors** — over 150 part-prefix rules spanning C0 through WL, and which
 selectors each part lacks. A selector is written only onto a clock the
 generated firmware has running (the buses, the HSI or HSE the block starts,
 the PLL output it enables, what embassy starts by default), and the RNG never
-onto a 32 kHz clock (embassy's driver hangs on it). A pick it cannot write
-(PLL2, PLLSAI, an external clock) is left out where embassy's own default for
-that selector runs — embassy writes register value 0 for every selector not
-set — and is replaced by a running clock, with a comment saying so, where
-that default is itself stopped (the WBA's RNG defaults to the LSE). An RTC on
-the LSE starts the LSE (`config.rcc.ls`), which needs the board's 32.768 kHz
-crystal, without moving the RTC or stopping the LSI when the LSE is started
+onto a 32 kHz clock (embassy's driver hangs on it). Embassy writes register
+value 0 to every selector the block does not set, so a pick it cannot write
+(PLL2, PLLSAI, an external clock), or no pick at all, leaves that default.
+Where the default is itself a stopped clock (the H7's ADC on PLL2_P, the G4's
+on no clock at all, the WBA's RNG on the LSE), the selector gets a running
+one with a comment saying so - but only where that was checked against
+embassy's driver: the ADC (on the L4, L4+, L5, WB and WL only at a clock
+within its ceiling, since embassy does not divide it there), SPI not run as
+I2S, FDCAN, the RNG, USB on the HSI48 (with the CRS sync it needs), SPDIFRX
+and the U5's DAC. SAI, SDMMC and the rest keep embassy's default: a panic
+naming the stopped clock where the driver asks for its frequency, a
+peripheral without a clock where it does not. An RTC on the LSE starts the
+LSE (`config.rcc.ls`), which needs the board's 32.768 kHz crystal, without
+moving the RTC or stopping the LSI when the LSE is started
 for a peripheral instead. A WBA with SAI1 always gets `sai1sel = HSI`, even
 without a generated clock: embassy's default selects PLL1_P there and its
 `init` panics.

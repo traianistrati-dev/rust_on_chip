@@ -143,9 +143,15 @@ mod tests {
         assert!(!section.contains("use embassy_stm32::gpio"));
         assert!(section.contains("No pins configured yet"));
         assert!(section.contains("fn main() -> !"));
-        // No WBA clock graph → embassy's own default init, on a part without
-        // SAI1; one with it boots only with `sai1sel` set.
-        assert!(section.contains("embassy_stm32::init(Default::default())"));
+        // No WBA clock graph: embassy's own default clock, with the RNG off
+        // its default LSE (which embassy never reports on the WBA) - and, on a
+        // part with SAI1, `sai1sel` set.
+        assert!(
+            section.contains("let p = embassy_stm32::init(config);"),
+            "{section}"
+        );
+        assert!(section.contains("config.rcc.mux.rngsel = rcc::mux::Rngsel::HSI; // embassy's default, LSE, is not running"), "{section}");
+        assert!(!section.contains("sai1sel"), "{section}");
         let wba55 = make_generated_section(
             "STM32WBA55CG",
             "stm32wba55cgux",
@@ -160,8 +166,8 @@ mod tests {
 
     /// The Clock-tab graph maps onto the embassy RCC config: the default
     /// 100 MHz preset emits the exact PLL fields + RANGE1 (the PLL panics in
-    /// range 2), and an HSI-reset graph falls back to `Default::default()` on
-    /// a part without SAI1.
+    /// range 2), and an HSI-reset graph still writes the block: every WBA
+    /// needs its RNG off the LSE.
     #[test]
     fn clock_graph_maps_to_embassy_rcc_config() {
         use crate::panels::mcu_module::clock::graph::{GraphClock, stm32wba_graph};
@@ -217,11 +223,9 @@ mod tests {
             "",
             false,
         );
-        assert!(
-            s3.contains("embassy_stm32::init(Default::default())"),
-            "{s3}"
-        );
-        // A WBA55 at reset still writes the block, for its `sai1sel`.
+        assert!(!s3.contains("Default::default()"), "{s3}");
+        assert!(s3.contains("config.rcc.mux.rngsel = rcc::mux::Rngsel::HSI; // embassy's default, LSE, is not running"), "{s3}");
+        // A WBA55 at reset also writes its `sai1sel`.
         let s3 = make_generated_section(
             "WBA",
             "stm32wba55cgux",

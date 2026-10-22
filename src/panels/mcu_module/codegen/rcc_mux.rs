@@ -82,13 +82,7 @@ pub fn rcc_version(chip: &str) -> Option<&'static str> {
 /// part lacks are taken out ([`lacks`]): its CubeMX tree is the whole line's
 /// and may carry a mux for a peripheral the part does not have.
 pub fn fields_for_chip(chip: &str, family: &str) -> Vec<&'static MuxField> {
-    let version = rcc_version(chip).or_else(|| {
-        super::rcc_mux_data::FAMILY_RCC
-            .iter()
-            .find(|(f, _)| *f == family)
-            .map(|(_, v)| *v)
-    });
-    let Some(version) = version else {
+    let Some(version) = version_for(chip, family) else {
         return Vec::new();
     };
     let lacks = lacks(chip);
@@ -100,6 +94,16 @@ pub fn fields_for_chip(chip: &str, family: &str) -> Vec<&'static MuxField> {
         .iter()
         .filter(|f| !lacks.contains(&f.field))
         .collect()
+}
+
+/// The part's RCC version, or the family's where every part shares one.
+fn version_for(chip: &str, family: &str) -> Option<&'static str> {
+    rcc_version(chip).or_else(|| {
+        super::rcc_mux_data::FAMILY_RCC
+            .iter()
+            .find(|(f, _)| *f == family)
+            .map(|(_, v)| *v)
+    })
 }
 
 /// The selectors of its RCC version a part does not have - an STM32L010's
@@ -278,10 +282,10 @@ pub fn variant_of(graph: &ClockGraph, bound: &Bound) -> Option<&'static str> {
 
 /// The `config.rcc.mux.…` lines for a whole tree, in field order.
 ///
-/// Empty for a family with no table, for a tree with no mux nodes, and for
-/// every selector still on its reset value — a project that has not chosen a
-/// peripheral clock gets no line for it, so the generated block stays as small
-/// as what the user actually configured.
+/// Empty for a family with no table. Otherwise a line for every selector the
+/// tree picks a running source for, and for every selector whose embassy
+/// default is a stopped clock ([`stand_in`]) - picked or not, so a tree with
+/// no mux nodes still gets those.
 ///
 /// A pick that would compile and still be wrong is not written as the tree
 /// says it:
@@ -322,6 +326,26 @@ pub fn emit_lines(graph: &ClockGraph, chip: &str, family: &str, running: &Runnin
         .collect();
     // Every family's `Config` has `ls` but the N6's (which has its own emitter).
     let rtc_lse = family != "stm32n6" && rtc_on_lse(graph);
+    lines_for(&picks, rtc_lse, chip, family, running)
+}
+
+/// The lines for a block with no tree to read: nothing is picked, so only
+/// the selectors whose embassy default is a stopped clock get one - the
+/// WBA's `sai1sel` among them ([`wba_sai`]).
+pub fn lines_without_a_tree(chip: &str, family: &str, running: &Running) -> Vec<String> {
+    lines_for(&[], false, chip, family, running)
+}
+
+/// Every selector of the part, in field order: the tree's pick where it has
+/// one ([`emit_lines`]), else a stand-in where embassy's default - register
+/// value 0 - is a clock this firmware does not run ([`stand_in`]).
+fn lines_for(
+    picks: &[(Bound, &'static str)],
+    rtc_lse: bool,
+    chip: &str,
+    family: &str,
+    running: &Running,
+) -> Vec<String> {
     let lse = family != "stm32n6"
         && (rtc_lse
             || picks
@@ -347,31 +371,79 @@ pub fn emit_lines(graph: &ClockGraph, chip: &str, family: &str, running: &Runnin
     let ok = |field: &MuxField, variant: &str| {
         !too_slow(field, variant) && source_running(family, running, lse, lsi, variant)
     };
+    let version = version_for(chip, family).unwrap_or("");
+    let fits = |field: &MuxField, variant: &str| {
+        ok(field, variant) && may_stand_in(version, field, variant, running)
+    };
+    let mut crs = false;
     let wba_sai = wba_sai(chip, family);
-    let mut sai_written = false;
-    for (bound, variant) in &picks {
-        let field = bound.field;
+    for field in fields_for_chip(chip, family) {
+        if field.field == "rtcsel" {
+            continue;
+        }
         if wba_sai && field.field == "sai1sel" {
             out.push(WBA_SAI_HSI.to_owned());
-            sai_written = true;
-        } else if ok(field, variant) {
-            out.push(mux_line(field, variant));
-        } else if let Some(other) = stand_in(field, &ok) {
-            let why = if too_slow(field, variant) {
-                "too slow for the RNG"
-            } else {
-                "not running in this firmware"
-            };
-            out.push(format!(
-                "{} // the tree picks {variant}: {why}",
-                mux_line(field, other)
-            ));
+            continue;
+        }
+        let pick = picks
+            .iter()
+            .find(|(b, _)| b.field.field == field.field)
+            .map(|(_, v)| *v);
+        match pick {
+            Some(variant) if ok(field, variant) => out.push(mux_line(field, variant)),
+            Some(variant) => {
+                if let Some(other) = stand_in(field, &ok, &fits) {
+                    crs |= usb_clock(field);
+                    let why = if too_slow(field, variant) {
+                        "too slow for the RNG"
+                    } else {
+                        "not running in this firmware"
+                    };
+                    out.push(format!(
+                        "{} // the tree picks {variant}: {why}",
+                        mux_line(field, other)
+                    ));
+                }
+            }
+            None => {
+                if let Some(other) = stand_in(field, &ok, &fits) {
+                    crs |= usb_clock(field);
+                    let default = match field.variants.iter().find(|(value, _)| *value == 0) {
+                        Some((_, zero)) => format!("embassy's default, {zero}, is not running"),
+                        None => "embassy's default selects no clock".to_owned(),
+                    };
+                    out.push(format!("{} // {default}", mux_line(field, other)));
+                }
+            }
         }
     }
-    if wba_sai && !sai_written {
-        out.push(WBA_SAI_HSI.to_owned());
+    if crs {
+        out.push(HSI48_USB_SYNC.to_owned());
     }
     out
+}
+
+/// The untrimmed HSI48 is not a USB clock: embassy's `Hsi48Config` says the
+/// CRS sync is "required if HSI48 is going to be used as USB clock", and it
+/// defaults to off. Idle without USB start-of-frame packets.
+const HSI48_USB_SYNC: &str =
+    "        config.rcc.hsi48 = Some(rcc::Hsi48Config { sync_from_usb: true });";
+
+/// A selector that clocks USB: a stand-in on it is the HSI48 ([`may_stand_in`]).
+fn usb_clock(field: &MuxField) -> bool {
+    matches!(kind_of(field).as_str(), "usb" | "clk48")
+}
+
+/// `usart1sel` -> `usart`, `spi123sel` -> `spi`, `clk48sel` -> `clk48`.
+fn kind_of(field: &MuxField) -> String {
+    let core = core_name(field.field);
+    let trimmed = core.trim_end_matches(|c: char| c.is_ascii_digit());
+    // `clk48`: the digits ARE the name.
+    if trimmed == "clk" {
+        core
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 /// The lines that start the LSE, and undo what `default_lse()` does besides.
@@ -395,12 +467,23 @@ fn too_slow(field: &MuxField, variant: &str) -> bool {
     field.field == "rngsel" && matches!(variant, "LSI" | "LSE")
 }
 
-/// What a selector gets when the tree's pick cannot be written. Nothing,
-/// when register value 0 - what a missing line leaves - is a clock that
-/// runs; else the running variant with the lowest value, a 32 kHz one only
-/// when nothing else runs. `None` when no variant runs: then a missing line
-/// is all there is.
-fn stand_in(field: &MuxField, ok: &impl Fn(&MuxField, &str) -> bool) -> Option<&'static str> {
+/// The lowest analog clock ceiling embassy documents for an ADC its `v3.rs`
+/// drives: the STM32WL55's 36 MHz (`adc/v3.rs`). A SYSCLK at or under it is
+/// a stand-in no `v3` ADC runs out of spec on.
+const V3_ADC_SAFE_HZ: u32 = 36_000_000;
+
+/// What a selector gets when the tree's pick cannot be written, or the tree
+/// picks nothing. Nothing, when register value 0 - what a missing line
+/// leaves - is a clock that runs; else the running variant with the lowest
+/// value that [`may_stand_in`] allows, a 32 kHz one only when nothing else
+/// runs. `None` when there is none: then a missing line is all there is -
+/// a panic naming the stopped clock where embassy's driver asks for its
+/// frequency, a peripheral without a clock where it does not.
+fn stand_in(
+    field: &MuxField,
+    ok: &impl Fn(&MuxField, &str) -> bool,
+    fits: &impl Fn(&MuxField, &str) -> bool,
+) -> Option<&'static str> {
     let zero = field.variants.iter().find(|(value, _)| *value == 0);
     if zero.is_some_and(|(_, name)| ok(field, name)) {
         return None;
@@ -408,9 +491,57 @@ fn stand_in(field: &MuxField, ok: &impl Fn(&MuxField, &str) -> bool) -> Option<&
     field
         .variants
         .iter()
-        .filter(|(_, name)| ok(field, name))
+        .filter(|(_, name)| fits(field, name))
         .min_by_key(|(value, name)| (matches!(*name, "LSI" | "LSE"), *value))
         .map(|(_, name)| *name)
+}
+
+/// May `variant` replace a stopped clock on this selector of RCC `version`?
+/// Only where it was checked against embassy-stm32 0.6's driver: the driver
+/// takes its timing from the clock it is given, or the stand-in is within
+/// the peripheral's limits at the SYSCLK the block runs. Everything else -
+/// SAI, SDMMC, CEC (embassy has no driver), PSSI, DSI, LTDC - keeps the
+/// missing line: a wrong audio or video clock would run without a word.
+fn may_stand_in(version: &str, field: &MuxField, variant: &str, running: &Running) -> bool {
+    match kind_of(field).as_str() {
+        // `g4.rs` and `v4.rs` pick their prescaler from the kernel frequency
+        // (60 / 50 MHz ceilings). `v3.rs` (L4, L4+, L5, WB, WL, H7RS) sets
+        // none: the clock reaches the ADC undivided - and with none at all,
+        // calibration spins forever in `Adc::new`, no panic. So a stand-in
+        // within fADC: the L4's SYSCLK, at most 80 MHz like its ADC; elsewhere
+        // the HSI16, or a SYSCLK under [`V3_ADC_SAFE_HZ`]. Not the H7RS's PER,
+        // a fixed 64 MHz against a ceiling no source gives.
+        "adc" => match version {
+            "g4" | "h7" | "h7ab" | "h7rm0433" => true,
+            "l4" => variant == "SYS",
+            "l4plus" | "l5" | "wb" | "wl5" | "wle" => match variant {
+                "HSI" => true,
+                "SYS" => running.sys_hz <= V3_ADC_SAFE_HZ,
+                _ => false,
+            },
+            _ => false,
+        },
+        // The SPI drivers derive the baud divider from the frequency; an SPI
+        // block run as I2S needs its audio clock.
+        "spi" => !core_name(field.field)
+            .chars()
+            .filter_map(|c| c.to_digit(10))
+            .any(|n| n < 8 && running.i2s & (1 << n) != 0),
+        // Bit timing from the frequency (`fdcan/util.rs`).
+        "fdcan" => true,
+        // An oscillator straight, never a bus or a divided clock: the RNG's
+        // clock must stay above HCLK/32 (clock error detection) and under
+        // its own ceiling.
+        "rng" => matches!(variant, "HSI" | "HSI48" | "MSI"),
+        // USB and what feeds it: the HSI48, synced by the CRS ([`usb_clock`]).
+        "usb" | "clk48" => variant == "HSI48",
+        // No clock divider: it measures the stream in kernel-clock ticks,
+        // and the HSI's 64 MHz covers every rate up to 88.2 kHz.
+        "spdifrx" => variant == "HSI",
+        // DAC1SEL is the sample-and-hold clock: LSE or LSI, both 32 kHz.
+        "dac" => variant == "LSI",
+        _ => false,
+    }
 }
 
 /// Does `init` read this part's `sai1sel`? embassy-stm32 0.6 does on a WBA
@@ -423,16 +554,6 @@ fn wba_sai(chip: &str, family: &str) -> bool {
         && fields_for_chip(chip, family)
             .iter()
             .any(|f| f.field == "sai1sel")
-}
-
-/// The lines a block needs with no tree to read: a WBA with SAI1 cannot
-/// boot on embassy's default `ClockMux` ([`wba_sai`]).
-pub fn lines_without_a_tree(chip: &str, family: &str) -> Vec<String> {
-    if wba_sai(chip, family) {
-        vec![WBA_SAI_HSI.to_owned()]
-    } else {
-        Vec::new()
-    }
 }
 
 /// Does the tree run the RTC from the LSE? Read off the RTC mux's selected
@@ -463,6 +584,11 @@ pub struct Running {
     /// The PLL1 output the block enables (`'p'`, `'q'`, `'r'`): the one that
     /// drives SYSCLK, the only one it configures.
     pub pll1: Option<char>,
+    /// The SPI blocks the project runs as I2S, bit *n* for SPI*n*: their
+    /// kernel clock is an audio clock, which no stand-in replaces.
+    pub i2s: u8,
+    /// SYSCLK as the block runs it - what `SYS` gives a peripheral.
+    pub sys_hz: u32,
 }
 
 impl Running {
@@ -472,7 +598,22 @@ impl Running {
             hsi: hsi_by_default(family),
             hse: false,
             pll1: None,
+            i2s: 0,
+            sys_hz: default_sys_hz(family),
         }
+    }
+}
+
+/// SYSCLK under embassy's `Config::default()`: the MSI at 4 MHz on the
+/// `l.rs` families, U3 and U5, the HSI elsewhere - 64 MHz on the H7, /2 on
+/// the H5, HSISYS (48 MHz /4) on the C0.
+fn default_sys_hz(family: &str) -> u32 {
+    match family {
+        f if l_family(f) || matches!(f, "stm32u3" | "stm32u5") => 4_000_000,
+        "stm32h7" => 64_000_000,
+        "stm32h5" => 32_000_000,
+        "stm32c0" => 12_000_000,
+        _ => 16_000_000,
     }
 }
 
@@ -986,10 +1127,11 @@ mod tests {
             );
         }
 
-        assert_eq!(lines_without_a_tree(chip, family), want);
-        assert_eq!(lines_without_a_tree("stm32wba65rix", family), want);
-        assert!(lines_without_a_tree("stm32wba52cgux", family).is_empty());
-        assert!(lines_without_a_tree("stm32g474re", "stm32g4").is_empty());
+        // Without a tree too.
+        let bare = |chip: &str| sai(&lines_without_a_tree(chip, family, &running));
+        assert_eq!(bare(chip), want);
+        assert_eq!(bare("stm32wba65rix"), want);
+        assert!(bare("stm32wba52cgux").is_empty());
         // The WBA52 reads the WBA5 tree too; its lines name no SAI1.
         let wba52 = emit_lines(&gc.graph, "stm32wba52cgux", family, &running);
         assert!(sai(&wba52).is_empty(), "{wba52:#?}");
@@ -1074,7 +1216,12 @@ mod tests {
         for (input, variant) in [(1, "LSI"), (2, "LSE")] {
             g.node_mut("RNGMult").expect("the RNG mux").state = NodeState::Index(input);
             let lines = emit_lines(&g, chip, family, &Running::defaults(family));
-            assert!(lines.is_empty(), "{variant}: {lines:#?}");
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| !l.contains("rngsel") && !l.contains("config.rcc.ls")),
+                "{variant}: {lines:#?}"
+            );
         }
     }
 
@@ -1089,8 +1236,9 @@ mod tests {
         let ok = |f: &MuxField, v: &str| {
             !too_slow(f, v) && source_running("stm32wba", &running, false, true, v)
         };
-        assert_eq!(stand_in(field("usart1sel"), &ok), None);
-        assert_eq!(stand_in(field("rngsel"), &ok), Some("HSI"));
+        let fits = |f: &MuxField, v: &str| ok(f, v) && may_stand_in("wba", f, v, &running);
+        assert_eq!(stand_in(field("usart1sel"), &ok, &fits), None);
+        assert_eq!(stand_in(field("rngsel"), &ok, &fits), Some("HSI"));
         // A 32 kHz clock only when nothing faster runs: the LPTIM with no
         // bus clock left.
         let lptim = MuxField {
@@ -1098,10 +1246,171 @@ mod tests {
             enum_name: "Lptimsel",
             variants: &[(0, "PLL2_P"), (1, "LSI"), (2, "HSI")],
         };
-        assert_eq!(stand_in(&lptim, &ok), Some("HSI"));
+        assert_eq!(stand_in(&lptim, &ok, &ok), Some("HSI"));
         let off = |f: &MuxField, v: &str| v == "LSI" && ok(f, v);
-        assert_eq!(stand_in(&lptim, &off), Some("LSI"));
-        assert_eq!(stand_in(&lptim, &|_: &MuxField, _: &str| false), None);
+        assert_eq!(stand_in(&lptim, &off, &off), Some("LSI"));
+        let none = |_: &MuxField, _: &str| false;
+        assert_eq!(stand_in(&lptim, &none, &none), None);
+        // The policy decides the candidates, the running clocks value 0.
+        assert_eq!(stand_in(&lptim, &ok, &none), None);
+    }
+
+    /// The stand-ins are the ones checked against embassy-stm32 0.6's
+    /// drivers, version by version; everything else keeps the missing line.
+    #[test]
+    fn the_stand_in_policy_is_the_checked_one() {
+        let f = |field: &'static str| MuxField {
+            field,
+            enum_name: "",
+            variants: &[],
+        };
+        let r = Running::defaults("stm32h7");
+        let may =
+            |version: &str, field: &'static str, v: &str| may_stand_in(version, &f(field), v, &r);
+        // ADC: prescaled by `g4.rs` / `v4.rs`; undivided by `v3.rs`.
+        assert!(may("g4", "adc12sel", "SYS") && may("g4", "adc345sel", "SYS"));
+        assert!(may("h7", "adcsel", "PER") && may("h7rm0433", "adcsel", "PER"));
+        assert!(!may("h7rs", "adcsel", "PER"));
+        assert!(may("l4", "adcsel", "SYS") && !may("l4", "adcsel", "HSI"));
+        // `v3.rs`: SYS only at a SYSCLK no v3 ADC runs out of spec on.
+        let at = |hz: u32| Running { sys_hz: hz, ..r };
+        for v3 in ["l4plus", "l5", "wb", "wl5", "wle"] {
+            assert!(
+                may_stand_in(v3, &f("adcsel"), "SYS", &at(16_000_000)),
+                "{v3}"
+            );
+            assert!(
+                !may_stand_in(v3, &f("adcsel"), "SYS", &at(48_000_000)),
+                "{v3}"
+            );
+        }
+        assert!(may("wl5", "adcsel", "HSI"));
+        // The L4's own ceiling is its SYSCLK's: 80 MHz.
+        assert!(may_stand_in("l4", &f("adcsel"), "SYS", &at(80_000_000)));
+        // The H7RS's PER is 64 MHz whatever SYSCLK runs.
+        assert!(!may_stand_in("h7rs", &f("adcsel"), "PER", &at(16_000_000)));
+        // SPI, but not a block run as I2S.
+        assert!(may("h7", "spi123sel", "PER"));
+        let i2s2 = Running { i2s: 1 << 2, ..r };
+        assert!(!may_stand_in("h7", &f("spi123sel"), "PER", &i2s2));
+        assert!(may_stand_in("h7", &f("spi45sel"), "PER", &i2s2));
+        assert!(may("g4", "fdcansel", "PCLK1"));
+        assert!(may("wba", "rngsel", "HSI") && may("wl5", "rngsel", "MSI"));
+        assert!(!may("g0x1", "rngsel", "HSI_DIV_8") && !may("g0x1", "rngsel", "SYS"));
+        assert!(may("h7", "usbsel", "HSI48") && may("u0", "clk48sel", "HSI48"));
+        assert!(!may("u0", "clk48sel", "MSI"));
+        assert!(may("h7", "spdifrxsel", "HSI") && may("u5", "dac1sel", "LSI"));
+        // Audio, storage, a driver embassy does not have.
+        for field in [
+            "sai1sel",
+            "sai23sel",
+            "sdmmcsel",
+            "sdiosel",
+            "cecsel",
+            "pssisel",
+            "dsisel",
+            "ltdcsel",
+            "otghssel",
+            "usbphycsel",
+        ] {
+            assert!(
+                !may("h7", field, "PER") && !may("h7", field, "HSI"),
+                "{field}"
+            );
+        }
+    }
+
+    /// Without a tree, the selectors whose embassy default is stopped get a
+    /// stand-in that says why - on an H743 the ADC, SPI1-3, SPDIFRX and the
+    /// USB (with the CRS sync); the SAI and SDMMC keep the missing line.
+    #[test]
+    fn a_stopped_default_gets_a_stand_in_without_a_tree() {
+        let h7 = |i2s: u8| {
+            lines_without_a_tree(
+                "stm32h743zitx",
+                "stm32h7",
+                &Running {
+                    i2s,
+                    ..Running::defaults("stm32h7")
+                },
+            )
+        };
+        let lines = h7(0);
+        for (field, to, default) in [
+            (
+                "adcsel",
+                "::PER;",
+                "// embassy's default, PLL2_P, is not running",
+            ),
+            (
+                "spi123sel",
+                "::PER;",
+                "// embassy's default, PLL1_Q, is not running",
+            ),
+            (
+                "usbsel",
+                "::HSI48;",
+                "// embassy's default selects no clock",
+            ),
+        ] {
+            let head = format!("        config.rcc.mux.{field} = ");
+            let got: Vec<&String> = lines.iter().filter(|l| l.starts_with(&head)).collect();
+            assert_eq!(got.len(), 1, "{field}: {lines:#?}");
+            assert!(
+                got[0].contains(to) && got[0].ends_with(default),
+                "{lines:#?}"
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("spdifrxsel") && l.contains("::HSI;")),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(HSI48_USB_SYNC),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains("sai") && !l.contains("sdmmc") && !l.contains("cec")),
+            "{lines:#?}"
+        );
+        // SPI2 run as I2S: SPI1-3 share the selector, so it is left alone.
+        assert!(h7(1 << 2).iter().all(|l| !l.contains("spi123sel")));
+
+        let g4 = lines_without_a_tree("stm32g474retx", "stm32g4", &Running::defaults("stm32g4"));
+        assert_eq!(
+            g4,
+            [
+                "        config.rcc.mux.adc12sel = rcc::mux::Adcsel::SYS; // embassy's default selects no clock",
+                "        config.rcc.mux.adc345sel = rcc::mux::Adcsel::SYS; // embassy's default selects no clock",
+                "        config.rcc.mux.fdcansel = rcc::mux::Fdcansel::PCLK1; // embassy's default, HSE, is not running",
+            ],
+        );
+        let adc_on_sys = |chip: &str, family: &str, sys_hz: u32| {
+            let running = Running {
+                sys_hz,
+                ..Running::defaults(family)
+            };
+            lines_without_a_tree(chip, family, &running)
+                .iter()
+                .any(|l| l.starts_with("        config.rcc.mux.adcsel = rcc::mux::Adcsel::SYS;"))
+        };
+        assert!(adc_on_sys("stm32l476rgtx", "stm32l4", 80_000_000));
+        // The L4+'s ADC takes SYSCLK undivided: at embassy's 4 MHz MSI, yes;
+        // at 120 MHz no stand-in - its ADC ceiling is under that.
+        assert!(adc_on_sys("stm32l4r5zitx", "stm32l4+", 4_000_000));
+        assert!(!adc_on_sys("stm32l4r5zitx", "stm32l4+", 120_000_000));
+        // The WBA52: no SAI1, but an RNG whose default is the LSE.
+        assert_eq!(
+            lines_without_a_tree("stm32wba52cgux", "stm32wba", &Running::defaults("stm32wba")),
+            [
+                "        config.rcc.mux.rngsel = rcc::mux::Rngsel::HSI; // embassy's default, LSE, is not running"
+            ],
+        );
     }
 
     /// `default_lse()` moves the RTC to the LSE and stops the LSI. Started
@@ -1236,8 +1545,17 @@ mod tests {
 
         g.node_mut("RTCClkSource").expect("the RTC mux").state = NodeState::Index(1);
         let lines = emit_lines(&g, chip, family, &running);
-        // No `ls.lsi = true` either: an LSI alone crashes the L5.
-        assert_eq!(lines, [LSE_ON], "{lines:#?}");
+        // No `ls.lsi = true` either: an LSI alone crashes the L5. (Its ADC
+        // stand-in follows: the tree has no ADC mux.)
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some(LSE_ON),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("config.rcc.ls.")),
+            "{lines:#?}"
+        );
         // A part with no `rtcsel` field.
         let f0 = "stm32f072rbtx";
         assert!(

@@ -718,6 +718,12 @@ fn every_mux_selector_compiles_against_embassy() {
                 lines += 1;
             }
         }
+        // And what a block with no tree writes for this part: its stand-ins,
+        // the CRS sync that goes with an HSI48 one.
+        let running = super::rcc_mux::Running::defaults(&c.family);
+        for line in super::rcc_mux::lines_without_a_tree(chip, &c.family, &running) {
+            let _ = writeln!(body, "{line}");
+        }
         body.push_str("    }\n}\n");
         let mut features = vec![format!("\"{chip}\""), "\"time-driver-any\"".to_owned()];
         if c.bank_choice {

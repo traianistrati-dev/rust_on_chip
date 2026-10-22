@@ -254,6 +254,19 @@ pub fn graph_clock_block_for(
     clock: &ClockConfig,
     manual: bool,
 ) -> String {
+    graph_clock_block_with(chip, family, clock, manual, 0)
+}
+
+/// The same, told which SPI blocks the project runs as I2S (bit *n* for
+/// SPI*n*): their kernel clock is an audio clock, so a stopped one gets no
+/// stand-in ([`rcc_mux::Running::i2s`](super::rcc_mux::Running::i2s)).
+pub fn graph_clock_block_with(
+    chip: &str,
+    family: &str,
+    clock: &ClockConfig,
+    manual: bool,
+    i2s: u8,
+) -> String {
     // `for_codegen` applies the chip's id bindings; with none declared it
     // borrows the graph unchanged, so the emitted block is byte-identical.
     let graph = match clock {
@@ -276,9 +289,17 @@ pub fn graph_clock_block_for(
     {
         return wrap(block, manual);
     }
-    // What the part needs written whatever its tree: on a WBA with SAI1,
-    // `init(Default::default())` itself panics.
-    let floor = super::rcc_mux::lines_without_a_tree(chip, family);
+    // What embassy's own `Config::default()` - the skeleton's active code -
+    // needs on this part: the selectors whose default is a stopped clock. On
+    // a WBA with SAI1, `init(Default::default())` itself panics.
+    let floor = super::rcc_mux::lines_without_a_tree(
+        chip,
+        family,
+        &super::rcc_mux::Running {
+            i2s,
+            ..super::rcc_mux::Running::defaults(family)
+        },
+    );
     // A family that reads no tree at all (U3, C0) is that, whatever the tree
     // selects - blaming the source would suggest a fix that does not exist.
     if rcc_recipe(family).is_none() && !generic_allowed(family) {
@@ -330,10 +351,12 @@ pub fn graph_clock_block_for(
             // `divp`, or none at all: F0/F1/F3 report their PLL as `pll1_p`.
             _ => 'p',
         }),
+        i2s,
+        sys_hz: values.sysclk_hz,
     };
     let mux = match graph {
         Some(g) => super::rcc_mux::emit_lines(g, chip, family, &running),
-        None => floor,
+        None => super::rcc_mux::lines_without_a_tree(chip, family, &running),
     };
     // The reset shortcut only applies when the chip's HW default equals this
     // reset (HSI). L4/L5/U5 default to MSI, so a reset-equivalent graph must
@@ -625,7 +648,7 @@ fn default_clock_of(family: &str) -> &'static str {
 /// moves to a selection no recipe writes reaches here with the switch still
 /// off, and that block is regenerated - so it says how to keep one instead.
 ///
-/// `floor` is what the part needs written whatever its clock
+/// `floor` is what embassy's default clock needs written on this part
 /// ([`lines_without_a_tree`](super::rcc_mux::lines_without_a_tree)): with
 /// any, the active code is a `Config` carrying them, not `Default::default()`.
 fn hand_written_skeleton(family: &str, why: Skeleton, manual: bool, floor: &[String]) -> String {
@@ -704,9 +727,10 @@ fn hand_written_skeleton(family: &str, why: Skeleton, manual: bool, floor: &[Str
             prescaler = prescaler,
         )
     };
-    // The lines a part needs whatever its clock (`rcc_mux::lines_without_a_tree`)
-    // go in the example AND in the active code: `Default::default()` alone
-    // panics in `init` there.
+    // The lines embassy's default clock needs on this part
+    // (`rcc_mux::lines_without_a_tree`) go in the example AND in the active
+    // code: `Default::default()` alone leaves a peripheral on a stopped clock,
+    // or panics in `init` (a WBA's `sai1sel`).
     let example_floor: String = floor
         .iter()
         .map(|l| format!("    //       {}\n", l.trim_start()))
@@ -723,7 +747,7 @@ fn hand_written_skeleton(family: &str, why: Skeleton, manual: bool, floor: &[Str
         format!(
             concat!(
                 "    // Then delete the lines below. Not `Default::default()`: on this part\n",
-                "    // embassy's default `config.rcc.mux` panics in `init`.\n",
+                "    // embassy's default `config.rcc.mux` selects clocks that do not run.\n",
                 "    let mut config = embassy_stm32::Config::default();\n",
                 "    {{\n",
                 "        use embassy_stm32::rcc;\n",
@@ -2046,11 +2070,16 @@ mod tests {
         assert_eq!(mux_source(&g, "sw"), Some(MuxSource::Other));
         assert!(!generates_clock_code_for("stm32wl", &gc(&g)));
         let block = graph_clock_block_for("stm32wl55jcix", "stm32wl", &gc(&g), false);
+        // embassy's default clock - with the RNG off PLL1_Q, which it does
+        // not run.
         assert!(
-            block.contains("embassy_stm32::init(Default::default())"),
+            block.contains("let p = embassy_stm32::init(config); // embassy's default clock (MSI)"),
             "{block}"
         );
-        assert!(block.contains("embassy's default clock (MSI)"), "{block}");
+        assert!(
+            block.contains("        config.rcc.mux.rngsel = rcc::mux::Rngsel::MSI;"),
+            "{block}"
+        );
         assert!(!block.contains("Sysclk::HSI"), "{block}");
 
         g.node_mut("sw").unwrap().state = NodeState::Index(1);
@@ -2063,7 +2092,8 @@ mod tests {
     /// A WBA55 tree no recipe writes (SYSCLK on the HSE behind its /2) gets
     /// the skeleton - and on a part with SAI1 its active code is NOT
     /// `init(Default::default())`, which panics in `init` there on the
-    /// default `sai1sel` (PLL1_P). A WBA52 has no SAI1 and keeps it.
+    /// default `sai1sel` (PLL1_P). A WBA52 has no SAI1, but its RNG defaults
+    /// to the LSE embassy never reports there: a `Config` on it too.
     #[test]
     fn a_wba_skeleton_boots_on_a_part_with_sai1() {
         use crate::panels::mcu_module::clock::graph::parse_clock_ron;
@@ -2114,14 +2144,13 @@ mod tests {
             "{block}"
         );
 
+        // The WBA52 has no SAI1 - but an RNG whose default is the LSE.
         let block = graph_clock_block_for("stm32wba52cgux", "stm32wba", &clock, false);
+        assert!(!block.contains("sai1sel"), "{block}");
         assert!(
-            active(&block)
-                .iter()
-                .any(|l| l.starts_with("    let p = embassy_stm32::init(Default::default());")),
+            active(&block).iter().any(|l| l.ends_with("config.rcc.mux.rngsel = rcc::mux::Rngsel::HSI; // embassy's default, LSE, is not running")),
             "{block}"
         );
-        assert!(!block.contains("sai1sel"), "{block}");
     }
 
     /// Every family's real CubeMX tree, at every SYSCLK and every PLL-source
@@ -2460,7 +2489,11 @@ mod tests {
                         &ClockConfig::Graph(gc),
                         false,
                     );
-                    let skeleton = block.contains("embassy_stm32::init(Default::default())");
+                    // The skeleton runs embassy's default clock - through a
+                    // `Config` where its default `config.rcc.mux` needs a
+                    // stand-in - and so does the reset shortcut.
+                    let skeleton = block.contains("// embassy's default clock (")
+                        || block.contains("embassy_stm32::init(Default::default())");
                     if dump_here {
                         // The skeleton's example is code too, once uncommented.
                         let code: String = block
@@ -2835,7 +2868,7 @@ mod tests {
         assert!(!region.contains("SHARED_DATA:"), "{out}");
         assert!(
             out.contains(
-                "let p = embassy_stm32::init_primary(Default::default(), &SHARED_DATA); // embassy's default clock (MSI)"
+                "let p = embassy_stm32::init_primary(config, &SHARED_DATA); // embassy's default clock (MSI)"
             ),
             "{out}"
         );
@@ -3187,10 +3220,9 @@ mod tests {
                 s.contains("only that recipe can write safely"),
                 "{family}:\n{s}"
             );
-            assert!(
-                s.contains("let p = embassy_stm32::init(Default::default());"),
-                "{s}"
-            );
+            // embassy's default clock, with whatever stand-ins its default
+            // `config.rcc.mux` needs on the family (the U5's DAC1SEL).
+            assert!(s.contains("embassy's default clock ("), "{s}");
             assert!(!generates_clock_code_for(family, c), "{family}");
             // The Clock tab says which selection, not "no generator".
             assert!(

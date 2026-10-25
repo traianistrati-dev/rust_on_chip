@@ -5,7 +5,7 @@
 //! async runtime uses `#[embassy_executor::main] async fn main(Spawner)` and the
 //! executor drives the future. GPIO bindings are byte-for-byte identical
 //! (`Output::new` / `Input::new` are the same embassy types in both modes), so
-//! the per-pin body comes straight from [`embassy_common::gpio_bindings`] and
+//! the per-pin body comes straight from [`embassy_common::gpio_bindings_exti`] and
 //! round-trips through [`super::parse_main_rs`] the same way.
 //!
 //! Selected for every STM32 family that runs on `embassy-stm32` when the project

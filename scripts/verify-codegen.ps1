@@ -661,6 +661,17 @@ $ALL_CASES = @(
     @{ n = "imported WL55, dual-core";     t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "$CUBE_MX\STM32WL55JCIx.xml"; EIDE_EXPECT_FEATURE = "stm32wl55jc-cm4"; EIDE_IMPORT_WDG = "1" }; q = $false; p = "$CUBE_MX\STM32WL55JCIx.xml"; fam = "import"; lk = $true }
     @{ n = "imported U575, RAM";           t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "$CUBE_MX\STM32U575ZITxQ.xml"; EIDE_EXPECT_FEATURE = "stm32u575zi"; EIDE_IMPORT_WDG = "1" }; q = $false; p = "$CUBE_MX\STM32U575ZITxQ.xml"; fam = "import"; lk = $true }
 
+    # Blocking EXTI on real parts: `ExtiInput::new_blocking` parked in a static,
+    # one `#[interrupt]` per vector, on the vector names each part really has -
+    # the PR register and EXTI9_5 on the G431 and F411, the split RPR/FPR and
+    # EXTI0_1/2_3/4_15 on the G0B1, a vector per line on the WBA55 (its own
+    # backend). Each row also refuses a pad for a line clash, and arms two
+    # lines of one vector where the part has one. Linked.
+    @{ n = "imported G431 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "both"; EIDE_EXTI_SHARED = "1" }; q = $true; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported G0B1 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "rising"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32G0B1R(B-C-E)Tx.xml" }; q = $false; p = "$CUBE_MX\STM32G0B1R(B-C-E)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported WBA55 Blocking EXTI"; t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "falling"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32WBA55CGUx.xml" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported F411 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "both"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32F411R(C-E)Tx.xml" }; q = $false; p = "$CUBE_MX\STM32F411R(C-E)Tx.xml"; fam = "import"; lk = $true }
+
     # STM32N6 — the first family whose clock block does not come from the
     # descriptor model. Cortex-M55 on a v8-M Main triple, a chip feature derived
     # from the part number's position, and an RCC block with four-PLL types in it:
@@ -695,6 +706,8 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            # The imported-chip rows. EIDE_CHIP_XML is read by the N6 harness too,
            # so a value left over from an L151 row would make the N6 row convert an L1.
            "EIDE_CHIP_XML", "EIDE_EXPECT_FEATURE", "EIDE_IMPORT_SKIP", "EIDE_IMPORT_WDG",
+           # The Blocking EXTI rows: the runtime and the edge knobs.
+           "EIDE_RUNTIME", "EIDE_EXTI", "EIDE_EXTI_SHARED",
            # Not ours, but set by the Thread rows - never left for the next case.
            "CMAKE")
 

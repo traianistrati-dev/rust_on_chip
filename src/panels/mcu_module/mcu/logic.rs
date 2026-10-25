@@ -2258,6 +2258,12 @@ impl Mcu {
             if func == PinFunction::Unset {
                 pin.custom_label.clear();
             }
+            // An interrupt edge belongs to a GPIO Input: anything else keeps
+            // none, or it stays saved out of sight and arms the pad again the
+            // day it joins a Custom module (see `Mcu::codegen_view`).
+            if func != PinFunction::GpioInput {
+                pin.irq = None;
+            }
             (pin.number, pin.name.clone(), func.clone())
         };
         self.show_info = None;

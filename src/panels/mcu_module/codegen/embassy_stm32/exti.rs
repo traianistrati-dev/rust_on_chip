@@ -19,7 +19,7 @@ pub struct ExtiPin {
 
 /// The EXTI line a pad sits on: `PB5` → 5. Lines are numbered by PIN, not by
 /// port, which is the whole reason two pads can collide on one.
-pub(super) fn exti_line(singleton: &str) -> Option<u8> {
+pub(crate) fn exti_line(singleton: &str) -> Option<u8> {
     let rest = singleton.strip_prefix(['P', 'p'])?;
     let mut cs = rest.chars();
     if !cs.next()?.is_ascii_alphabetic() {
@@ -37,7 +37,7 @@ pub(super) fn exti_line(singleton: &str) -> Option<u8> {
 /// 11 to 14 are on that vector too. So the numbers in the name are read as
 /// bounds, and the NARROWEST vector containing the line wins (a G0 lists both
 /// `EXTI0_1` and `EXTI4_15`; line 1 belongs to the first).
-pub(super) fn exti_vector(vectors: &[String], n: u8) -> Option<&str> {
+pub(crate) fn exti_vector(vectors: &[String], n: u8) -> Option<&str> {
     let bounds = |v: &str| -> Option<(u8, u8)> {
         let rest = v.strip_prefix("EXTI")?;
         let nums: Vec<u8> = rest
@@ -65,7 +65,7 @@ pub(super) fn exti_vector(vectors: &[String], n: u8) -> Option<&str> {
 /// Two ways to lose: the line is already taken (PA5 and PB5 are both line 5, and
 /// embassy hands the channel to exactly one), or the chip's vector list does not
 /// name a vector for it. Both are stated in `main.rs` rather than dropped.
-pub(super) fn exti_plan(pins: &[&Pin], vectors: &[String]) -> (Vec<ExtiPin>, String) {
+pub(crate) fn exti_plan(pins: &[&Pin], vectors: &[String]) -> (Vec<ExtiPin>, String) {
     let mut out: Vec<ExtiPin> = Vec::new();
     let mut notes = String::new();
     // Sorted by singleton so the winner of a line clash is stable across runs —
@@ -84,20 +84,17 @@ pub(super) fn exti_plan(pins: &[&Pin], vectors: &[String]) -> (Vec<ExtiPin>, Str
             continue; // not a P<port><n> pad — no EXTI to speak of
         };
         if let Some(prev) = out.iter().find(|e| e.line == line) {
+            // `\n    //` escapes, not raw newlines: a line break inside the
+            // literal carries this file's indentation into main.rs.
             notes.push_str(&format!(
-                "    // {singleton} is NOT on an interrupt: EXTI line {line} is already taken by
-                     // {}. One pad per line — the channel is a peripheral, and embassy hands
-                     // it to exactly one.
-",
+                "    // {singleton} is NOT on an interrupt: EXTI line {line} is already taken by\n    // {}. One pad per line — the channel is a peripheral, and embassy hands\n    // it to exactly one.\n",
                 prev.singleton
             ));
             continue;
         }
         let Some(vector) = exti_vector(vectors, line) else {
             notes.push_str(&format!(
-                "    // {singleton} is NOT on an interrupt: this chip's vector list names none for
-                     // EXTI line {line}, so there is nothing to bind the handler to.
-"
+                "    // {singleton} is NOT on an interrupt: this chip's vector list names none for\n    // EXTI line {line}, so there is nothing to bind the handler to.\n"
             ));
             continue;
         };
@@ -200,6 +197,188 @@ pub fn exti_spawns(armed: &[ExtiPin]) -> String {
     out
 }
 
+// ── Blocking: `ExtiInput<Blocking>` + `#[interrupt]` ─────────────────────────
+//
+// The same plan, a different owner. With no executor the pin is parked in a
+// static and the vector's handler asks it - the F1's Blocking shape, on
+// embassy's driver. `embassy_stm32::init` already unmasks every EXTI vector in
+// the NVIC once the `exti` feature is on, and 0.6 binds no handler of its own
+// unless `bind_interrupts!` says so, so the `#[interrupt]` below owns the
+// vector and nothing is unmasked here.
+
+/// The `TriggerEdge` `new_blocking` arms the line with.
+pub(crate) fn exti_trigger(edge: Edge) -> &'static str {
+    match edge {
+        Edge::Rising => "TriggerEdge::Rising",
+        Edge::Falling => "TriggerEdge::Falling",
+        Edge::Both => "TriggerEdge::Any",
+    }
+}
+
+/// The static an armed input is parked in: its binding, upper-cased.
+pub(crate) fn exti_static(binding: &str) -> String {
+    binding.to_ascii_uppercase()
+}
+
+/// The `use` lines the Blocking items and the arming need.
+///
+/// `cortex_m::interrupt::Mutex`, not `critical_section::Mutex`: `cortex-m` is
+/// already a dependency of every Blocking project here, with
+/// `critical-section-single-core`, so this adds nothing to Cargo.toml.
+/// `embassy_stm32::interrupt` brings both the `#[interrupt]` attribute and the
+/// `EXTIn` names it checks the handler's name against.
+pub(crate) const EXTI_BLOCKING_USES: &str = "use embassy_stm32::exti::{ExtiInput, TriggerEdge};\n\
+     use embassy_stm32::interrupt;\n\
+     use embassy_stm32::mode::Blocking;\n\
+     use core::cell::RefCell;\n\
+     use cortex_m::interrupt::Mutex;\n";
+
+/// The hooks the Blocking handlers call: the names the Async tasks call, so a
+/// runtime switch finds the hook it seeded, but plain `fn`s - an interrupt
+/// cannot await.
+pub fn exti_blocking_hooks(armed: &[ExtiPin]) -> Vec<EdgeHook> {
+    armed
+        .iter()
+        .map(|e| EdgeHook {
+            name: exti_hook(e),
+            what: e.singleton.clone(),
+            caller: e.vector.clone(),
+            is_async: false,
+        })
+        .collect()
+}
+
+/// The vectors the armed inputs land on, each with its pins, in the order of
+/// each vector's lowest line - so the handlers read in the order of the pins.
+fn exti_by_vector(armed: &[ExtiPin]) -> Vec<(&str, Vec<&ExtiPin>)> {
+    let mut groups: Vec<(&str, Vec<&ExtiPin>)> = Vec::new();
+    for e in armed {
+        match groups.iter_mut().find(|(v, _)| *v == e.vector) {
+            Some((_, ps)) => ps.push(e),
+            None => groups.push((e.vector.as_str(), vec![e])),
+        }
+    }
+    for (_, ps) in &mut groups {
+        ps.sort_by_key(|e| e.line);
+    }
+    groups.sort_by_key(|(_, ps)| ps.first().map_or(u8::MAX, |e| e.line));
+    groups
+}
+
+/// The module-level items: one static per armed input, one `#[interrupt]` per
+/// VECTOR. Statics because a handler takes no arguments and cannot borrow a
+/// local; one handler per vector because that is what the NVIC gives -
+/// `EXTI9_5` carries five lines, so its handler asks each pin.
+///
+/// The body is NOT here: the handler is rebuilt on every regeneration, so it
+/// calls a hook seeded once below the tail - AFTER the critical section, with
+/// the level it read, so the hook may take one itself. ONE local, a tuple on a
+/// shared vector: one per pin would differ by a letter, which
+/// `clippy::similar_names` denies under Strict, and would start with the pin's
+/// name, which is how the IDE finds a pin's binding in the block.
+pub fn exti_blocking_items(armed: &[ExtiPin]) -> String {
+    let mut out = String::new();
+    for e in armed {
+        out.push_str(&format!(
+            "/// {} — parked here so its interrupt handler can reach it.\n",
+            e.singleton
+        ));
+        out.push_str(&format!(
+            "static {}: Mutex<RefCell<Option<ExtiInput<'static, Blocking>>>> = Mutex::new(RefCell::new(None));\n",
+            exti_static(&e.binding)
+        ));
+    }
+    if !armed.is_empty() {
+        out.push('\n');
+    }
+    for (vector, group) in exti_by_vector(armed) {
+        if group.len() == 1 {
+            out.push_str(&format!(
+                "/// {} (EXTI line {}). `{}` below `main` is yours, a plain `fn`.\n",
+                group[0].singleton,
+                group[0].line,
+                exti_hook(group[0])
+            ));
+        } else {
+            out.push_str(&format!(
+                "/// `{vector}` is shared by {} lines — each pin is asked in turn, and\n/// each pin's hook below `main` is yours, a plain `fn`.\n",
+                group.len()
+            ));
+        }
+        out.push_str("#[interrupt]\n");
+        out.push_str(&format!("fn {vector}() {{\n"));
+        let slot = |i: usize| {
+            if group.len() == 1 {
+                "fired".to_owned()
+            } else {
+                format!("fired.{i}")
+            }
+        };
+        out.push_str(&if group.len() == 1 {
+            "    let mut fired = None;\n".to_owned()
+        } else {
+            format!(
+                "    let mut fired = ({});\n",
+                vec!["None"; group.len()].join(", ")
+            )
+        });
+        out.push_str("    cortex_m::interrupt::free(|cs| {\n");
+        for (i, e) in group.iter().enumerate() {
+            out.push_str(&format!(
+                "        if let Some(pin) = {}.borrow(cs).borrow_mut().as_mut() {{\n",
+                exti_static(&e.binding)
+            ));
+            // A private vector still asks: one register read, and it keeps the
+            // two shapes identical to read.
+            out.push_str("            if pin.is_pending() {\n");
+            out.push_str("                // Cleared FIRST: leave the pending bit set and the\n");
+            out.push_str("                // handler re-enters the moment it returns.\n");
+            out.push_str("                pin.clear_pending();\n");
+            out.push_str(&format!(
+                "                {} = Some(pin.is_high());\n",
+                slot(i)
+            ));
+            out.push_str("            }\n");
+            out.push_str("        }\n");
+        }
+        out.push_str("    });\n");
+        for (i, e) in group.iter().enumerate() {
+            out.push_str(&format!(
+                "    if let Some(high) = {} {{\n{}    }}\n",
+                slot(i),
+                edge_call(&exti_hook(e), "high", false, "        ")
+            ));
+        }
+        out.push_str("}\n\n");
+    }
+    out
+}
+
+/// One armed input's lines in `main`: built AND parked in one critical section.
+///
+/// `new_blocking` arms the line the moment it returns, and the NVIC is already
+/// open. An edge that came before the static held the pin would reach a handler
+/// that cannot clear it - the pending bit stays, the handler re-enters for good
+/// and `main` never runs again (a button bouncing at power-up is enough). Inside
+/// `free` the edge waits until the pin is there to clear.
+///
+/// The `let` keeps the trailing label, so [`super::super::parse_main_rs`]
+/// reads the pin back like any other input.
+pub(crate) fn exti_blocking_binding(
+    var: &str,
+    singleton: &str,
+    line: u8,
+    pull: &str,
+    edge: Edge,
+    label: &str,
+) -> String {
+    format!(
+        "    // {singleton} is built and parked in ONE critical section: an edge that comes\n    // early waits until its handler has the pin to clear.\n    cortex_m::interrupt::free(|cs| {{\n        let {var} = ExtiInput::new_blocking(p.{singleton}, p.EXTI{line}, {pull}, {trigger}); // {label}\n        *{up}.borrow(cs).borrow_mut() = Some({var});\n    }});",
+        trigger = exti_trigger(edge),
+        up = exti_static(var),
+    )
+}
+
 #[cfg(test)]
 #[cfg(test)]
 mod exti_tests {
@@ -283,7 +462,7 @@ mod exti_tests {
     /// reason — embassy hands the EXTI channel to exactly one.
     #[test]
     fn one_pad_per_line_and_the_other_is_told_why() {
-        let pins = vec![armed("PA5", Edge::Rising), armed("PB5", Edge::Falling)];
+        let pins = [armed("PA5", Edge::Rising), armed("PB5", Edge::Falling)];
         let refs: Vec<&Pin> = pins.iter().collect();
         let (plan, notes) = exti_plan(&refs, &vectors(&["EXTI9_5"]));
 
@@ -298,11 +477,33 @@ mod exti_tests {
     /// No vector for the line → no binding to hang the handler on, said out loud.
     #[test]
     fn a_line_with_no_vector_is_refused() {
-        let pins = vec![armed("PA5", Edge::Rising)];
+        let pins = [armed("PA5", Edge::Rising)];
         let refs: Vec<&Pin> = pins.iter().collect();
         let (plan, notes) = exti_plan(&refs, &vectors(&["EXTI0", "EXTI1"]));
         assert!(plan.is_empty(), "{plan:?}");
         assert!(notes.contains("names none for"), "{notes}");
+    }
+
+    /// Both refusals are comment lines at `main`'s own four spaces. They were
+    /// raw newlines inside the literal, which put this file's 21 columns of
+    /// indentation in front of every continuation line of the generated file.
+    #[test]
+    fn a_refusal_note_is_indented_like_main() {
+        let pins = [armed("PA5", Edge::Rising), armed("PB5", Edge::Falling)];
+        let refs: Vec<&Pin> = pins.iter().collect();
+        let (_, clash) = exti_plan(&refs, &vectors(&["EXTI9_5"]));
+        let pins = [armed("PA3", Edge::Rising)];
+        let refs: Vec<&Pin> = pins.iter().collect();
+        let (_, no_vector) = exti_plan(&refs, &vectors(&["EXTI0"]));
+        for notes in [clash, no_vector] {
+            assert!(notes.lines().count() >= 2, "{notes}");
+            for line in notes.lines() {
+                assert!(
+                    line.starts_with("    // ") && !line.starts_with("     "),
+                    "`{line}` in:\n{notes}"
+                );
+            }
+        }
     }
 
     /// An input with no edge is one you poll: no plan, no task, no feature.
@@ -310,7 +511,7 @@ mod exti_tests {
     fn an_unarmed_input_is_left_alone() {
         let mut p = Pin::new(1, "PA5");
         p.selected_function = PinFunction::GpioInput;
-        let pins = vec![p];
+        let pins = [p];
         let refs: Vec<&Pin> = pins.iter().collect();
         let (plan, notes) = exti_plan(&refs, &vectors(&["EXTI9_5"]));
         assert!(plan.is_empty());
@@ -325,7 +526,7 @@ mod exti_tests {
             (Edge::Falling, "wait_for_falling_edge"),
             (Edge::Both, "wait_for_any_edge"),
         ] {
-            let pins = vec![armed("PA5", edge)];
+            let pins = [armed("PA5", edge)];
             let refs: Vec<&Pin> = pins.iter().collect();
             let (plan, _) = exti_plan(&refs, &vectors(&["EXTI9_5"]));
             let tasks = exti_tasks(&plan);

@@ -141,9 +141,11 @@ impl Mcu {
     /// selected or reset). Dispatches on `self.family` + `self.runtime`; families
     /// without a registered backend produce an empty file.
     pub fn fresh_main_rs(&self) -> String {
-        let code = self
+        let view = self.codegen_view();
+        let this = view.as_ref();
+        let code = this
             .backend()
-            .map(|b| b.fresh_main_rs(self))
+            .map(|b| b.fresh_main_rs(this))
             .unwrap_or_default();
         // The header's panic handler: the IoT tab's restart, or the halt.
         let code = iot_gen::panic_main(code, self);
@@ -153,9 +155,9 @@ impl Mcu {
         let code = common::ensure_module_models(code, &self.modules);
         // The handler of an armed input calls a hook the user owns: seeded
         // once below the tail, never rewritten (see `common::EdgeHook`).
-        let hooks = self
+        let hooks = this
             .backend()
-            .map(|b| b.edge_hooks(self))
+            .map(|b| b.edge_hooks(this))
             .unwrap_or_default();
         let code = common::ensure_edge_hooks(code, &hooks);
         // An untouched seed follows the runtime (`fn` / `async fn`); an
@@ -173,9 +175,11 @@ impl Mcu {
     /// Families without a GEN block (ESP32-C3 has its own scheme; STM8 has
     /// no backend) return the existing file unchanged.
     pub fn update_main_rs(&self, existing: &str) -> String {
-        let code = self
+        let view = self.codegen_view();
+        let this = view.as_ref();
+        let code = this
             .backend()
-            .map(|b| b.update_main_rs(self, existing))
+            .map(|b| b.update_main_rs(this, existing))
             .unwrap_or_else(|| existing.to_owned());
         // The header's panic handler: the IoT tab's restart, or the halt.
         let code = iot_gen::panic_main(code, self);
@@ -184,9 +188,9 @@ impl Mcu {
         let code = common::ensure_module_models(code, &self.modules);
         // The handler of an armed input calls a hook the user owns: seeded
         // once below the tail, never rewritten (see `common::EdgeHook`).
-        let hooks = self
+        let hooks = this
             .backend()
-            .map(|b| b.edge_hooks(self))
+            .map(|b| b.edge_hooks(this))
             .unwrap_or_default();
         let code = common::ensure_edge_hooks(code, &hooks);
         // An untouched seed follows the runtime (`fn` / `async fn`); an
@@ -200,6 +204,35 @@ impl Mcu {
         let code = common::spawner_alias(code);
         // Strict-lints exemption on the (freshly re-spliced) entry fn.
         common::strict_main_exemption(code, self.strict_lints)
+    }
+
+    /// The chip as code generation sees it: an interrupt edge only on a GPIO
+    /// Input that no module owns.
+    ///
+    /// The canvas offers the edge only there, and hides it on a pad a module
+    /// owns, but the edge outlived the pad going back to Unset and the pad
+    /// then joining a Custom module. Its handler took the pin away from the
+    /// module that names it: E0425 on an embassy Blocking project (the binding
+    /// lives in the handler's critical section), E0382 on Async (moved into
+    /// the task). The same pad on a timer-interface module is the same story.
+    /// Borrowed, so nothing is copied, when no edge has to go.
+    fn codegen_view(&self) -> std::borrow::Cow<'_, Mcu> {
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+        let owned = super::mcu::gui::modules::module_owned_pins(self);
+        let stale = |p: &crate::panels::mcu_module::pins::logic::pin::Pin| {
+            p.irq.is_some()
+                && (p.selected_function != PinFunction::GpioInput || owned.contains(&p.number))
+        };
+        if !self.iter_all_pins().any(stale) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut view = self.clone();
+        for p in view.iter_all_pins_mut() {
+            if stale(p) {
+                p.irq = None;
+            }
+        }
+        std::borrow::Cow::Owned(view)
     }
 
     /// The flash store's line at the head of the user's tail, on or off with
@@ -228,9 +261,11 @@ impl Mcu {
     /// Per-peripheral init module bodies for `src/pins/configs/` — `(file_name,
     /// generated_body)`. Empty for families without separate config files.
     pub fn config_files(&self) -> Vec<(String, String)> {
-        let mut files = self
+        let view = self.codegen_view();
+        let this = view.as_ref();
+        let mut files = this
             .backend()
-            .map(|b| b.config_files(self))
+            .map(|b| b.config_files(this))
             .unwrap_or_default();
         // User-authored Custom modules produce a file each. They are generated
         // HERE rather than in a family backend because the struct is generic
@@ -1889,7 +1924,7 @@ mod tests {
 ";
 
         // Blocking embassy (non-F1 STM32).
-        let blocking = embassy_common::make_generated_section("X", &pins, "", line);
+        let blocking = embassy_common::make_generated_section("X", &pins, "", line, &[]);
         assert!(
             blocking.contains(line),
             "embassy blocking:
@@ -1947,6 +1982,60 @@ mod tests {
             let at = code.find(line).expect("line");
             assert!(b < at && at < e, "must be inside the GEN block");
         }
+    }
+
+    /// An edge left on a pad that then joins a Custom module is not armed: the
+    /// handler would take the pin away from the module that names it (E0425 on
+    /// an embassy Blocking project). And a pad that stops being a GPIO Input
+    /// keeps no hidden edge at all.
+    #[test]
+    fn a_module_owned_pad_is_never_armed() {
+        use super::super::mock_mcu;
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        use crate::panels::mcu_module::pins::logic::pin::Edge;
+
+        let mut mcu = mock_mcu::create_stm32f103c8tx();
+        mcu.family = "stm32g4".into();
+        mcu.irq_vectors = [
+            "EXTI0",
+            "EXTI1",
+            "EXTI2",
+            "EXTI3",
+            "EXTI4",
+            "EXTI9_5",
+            "EXTI15_10",
+        ]
+        .map(String::from)
+        .to_vec();
+        mcu.apply_pin_function(10, PinFunction::GpioInput); // PA0
+        mcu.find_pin_mut(10).unwrap().irq = Some(Edge::Rising);
+        let armed = mcu.fresh_main_rs();
+        assert!(armed.contains("ExtiInput::new_blocking("), "{armed}");
+
+        // Back to Unset: the edge goes with the function.
+        mcu.apply_pin_function(10, PinFunction::Unset);
+        assert_eq!(mcu.find_pin(10).unwrap().irq, None);
+
+        // A project saved with the old stale edge, the pad now in a module.
+        mcu.apply_pin_function(10, PinFunction::GpioInput);
+        mcu.find_pin_mut(10).unwrap().irq = Some(Edge::Rising);
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .unwrap();
+        *m.config.custom_label_mut() = "knob".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = vec![10];
+            c.applied_pins = c.pins.clone();
+        }
+        let main = mcu.fresh_main_rs();
+        assert!(!main.contains("ExtiInput"), "{main}");
+        assert!(main.contains("let pa0_in = Input::new(p.PA0"), "{main}");
+        assert!(main.contains("Knob::new(pa0_in"), "{main}");
+        // The stored edge is the user's; only the generator looks past it.
+        assert_eq!(mcu.find_pin(10).unwrap().irq, Some(Edge::Rising));
     }
 
     /// A pin owned by a peripheral init is MOVED there, so it can't also go into

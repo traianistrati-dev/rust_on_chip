@@ -38,12 +38,15 @@ pub fn make_generated_section(
     clock: &ClockConfig,
     custom_inits: &str,
     manual: bool,
+    // The chip's interrupt vectors, for the armed inputs' handlers.
+    vectors: &[String],
 ) -> String {
     embassy_common::make_generated_section(
         mcu_name,
         pins,
         &super::rcc::graph_clock_block_for(chip, "stm32wba", clock, manual),
         custom_inits,
+        vectors,
     )
 }
 
@@ -86,6 +89,7 @@ mod tests {
             &ClockConfig::None,
             "",
             false,
+            &[],
         );
 
         // Shape: gpio imports (both kinds), embassy init, one line per pin.
@@ -121,8 +125,15 @@ mod tests {
         let mut pc13 = pin("PC13", PinFunction::GpioInput);
         pc13.io_mode = Some(GpioMode::PullUp);
         let refs: Vec<&Pin> = vec![&pc13];
-        let section =
-            make_generated_section("STM32WBA55CG", "", &refs, &ClockConfig::None, "", false);
+        let section = make_generated_section(
+            "STM32WBA55CG",
+            "",
+            &refs,
+            &ClockConfig::None,
+            "",
+            false,
+            &[],
+        );
         assert!(
             section.contains("let pc13_in = Input::new(p.PC13, Pull::Up); // GPIO Input"),
             "{section}"
@@ -139,6 +150,7 @@ mod tests {
             &ClockConfig::None,
             "",
             false,
+            &[],
         );
         assert!(!section.contains("use embassy_stm32::gpio"));
         assert!(section.contains("No pins configured yet"));
@@ -159,6 +171,7 @@ mod tests {
             &ClockConfig::None,
             "",
             false,
+            &[],
         );
         assert!(!wba55.contains("init(Default::default())"), "{wba55}");
         assert!(wba55.contains("Sai1sel::HSI"), "{wba55}");
@@ -179,8 +192,15 @@ mod tests {
             layout: Default::default(),
             bindings: Default::default(),
         };
-        let section =
-            make_generated_section("WBA", "", &[], &ClockConfig::Graph(gc.clone()), "", false);
+        let section = make_generated_section(
+            "WBA",
+            "",
+            &[],
+            &ClockConfig::Graph(gc.clone()),
+            "",
+            false,
+            &[],
+        );
         for needle in [
             "config.rcc.hse = Some(rcc::Hse { prescaler: rcc::HsePrescaler::DIV1 });",
             "source: rcc::PllSource::HSE,",
@@ -201,7 +221,7 @@ mod tests {
         let mut gc2 = gc.clone();
         gc2.graph.node_mut("sw").unwrap().state =
             crate::panels::mcu_module::clock::graph::NodeState::Index(1);
-        let s2 = make_generated_section("WBA", "", &[], &ClockConfig::Graph(gc2), "", false);
+        let s2 = make_generated_section("WBA", "", &[], &ClockConfig::Graph(gc2), "", false, &[]);
         assert!(s2.contains("config.rcc.sys = rcc::Sysclk::HSE;"));
         assert!(!s2.contains("config.rcc.pll1"));
         assert!(s2.contains("VoltageScale::RANGE1"));
@@ -222,6 +242,7 @@ mod tests {
             &ClockConfig::Graph(gc3.clone()),
             "",
             false,
+            &[],
         );
         assert!(!s3.contains("Default::default()"), "{s3}");
         assert!(s3.contains("config.rcc.mux.rngsel = rcc::mux::Rngsel::HSI; // embassy's default, LSE, is not running"), "{s3}");
@@ -233,6 +254,7 @@ mod tests {
             &ClockConfig::Graph(gc3),
             "",
             false,
+            &[],
         );
         assert!(
             s3.contains("config.rcc.mux.sai1sel = rcc::mux::Sai1sel::HSI;"),
@@ -247,7 +269,7 @@ mod tests {
         let v1 = format!(
             "{}{}\n{USER_TAIL}",
             invariant_header("X", "x"),
-            make_generated_section("X", "", &[], &ClockConfig::None, "", false)
+            make_generated_section("X", "", &[], &ClockConfig::None, "", false, &[])
         );
         let edited = v1.replace(
             "// Your main loop code here.",
@@ -256,7 +278,7 @@ mod tests {
         let pb5 = pin("PB5", PinFunction::GpioOutput);
         let v2 = splice_section(
             &edited,
-            &make_generated_section("X", "", &[&pb5], &ClockConfig::None, "", false),
+            &make_generated_section("X", "", &[&pb5], &ClockConfig::None, "", false, &[]),
             "X",
             "x",
         );

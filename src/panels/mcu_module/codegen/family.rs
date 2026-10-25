@@ -685,6 +685,7 @@ impl FamilyBackend for WbaBackend {
                 &mcu.clock,
                 &mcu.watchdog_and_custom_inits(),
                 mcu.clock_manual,
+                &mcu.irq_vectors,
             ),
             tail = USER_TAIL,
         )
@@ -699,6 +700,7 @@ impl FamilyBackend for WbaBackend {
             &mcu.clock,
             &mcu.watchdog_and_custom_inits(),
             mcu.clock_manual,
+            &mcu.irq_vectors,
         );
         let section = super::common::keep_manual_clock(existing, section, mcu.clock_manual);
         wba::splice_section(existing, &section, &mcu.name, &mcu.id)
@@ -707,6 +709,12 @@ impl FamilyBackend for WbaBackend {
     /// `embassy_common::splice_section` writes the header anew.
     fn rebuilds_header(&self) -> bool {
         true
+    }
+
+    /// One plain `fn` per armed input, called from its EXTI vector's
+    /// `#[interrupt]` - the names the Async tasks call.
+    fn edge_hooks(&self, mcu: &Mcu) -> Vec<EdgeHook> {
+        blocking_exti_hooks(mcu)
     }
 
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
@@ -721,6 +729,14 @@ impl FamilyBackend for WbaBackend {
         )
     }
     // No per-peripheral config files yet — bus init is documented inline (v1).
+}
+
+/// The hooks of an embassy Blocking project (generic STM32 and WBA): the
+/// inputs `exti_plan` gave a line on this chip's vectors, the plan the section
+/// builder follows - a refused pad has no handler, so no hook.
+fn blocking_exti_hooks(mcu: &Mcu) -> Vec<EdgeHook> {
+    let (armed, _) = embassy_stm32::exti_plan(&pins_of(mcu), &mcu.irq_vectors);
+    embassy_stm32::exti_blocking_hooks(&armed)
 }
 
 // ── Generic STM32 (embassy-stm32, blocking) ─────────────────────────────────
@@ -779,6 +795,7 @@ impl FamilyBackend for StmEmbassyBackend {
                 &all,
                 &stm32_clock_block(mcu),
                 &mcu.watchdog_and_custom_inits(),
+                &mcu.irq_vectors,
             ),
             tail = USER_TAIL,
         )
@@ -791,6 +808,7 @@ impl FamilyBackend for StmEmbassyBackend {
             &all,
             &stm32_clock_block(mcu),
             &mcu.watchdog_and_custom_inits(),
+            &mcu.irq_vectors,
         );
         let section = keep_stm32_clock(mcu, existing, section);
         embassy_common::splice_section(existing, &section, &mcu.name, &mcu.id)
@@ -799,6 +817,12 @@ impl FamilyBackend for StmEmbassyBackend {
     /// `embassy_common::splice_section` writes the header anew.
     fn rebuilds_header(&self) -> bool {
         true
+    }
+
+    /// One plain `fn` per armed input, called from its EXTI vector's
+    /// `#[interrupt]` - the names the Async tasks call.
+    fn edge_hooks(&self, mcu: &Mcu) -> Vec<EdgeHook> {
+        blocking_exti_hooks(mcu)
     }
 
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {

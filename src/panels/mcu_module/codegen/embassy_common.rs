@@ -13,7 +13,7 @@
 
 use super::common::retarget_pristine_tail;
 use super::{AUTOGEN_BANNER, GEN_BEGIN, GEN_END, USER_TAIL, mcu_id_marker_line, pin_binding};
-use crate::panels::mcu_module::pins::logic::pin::{GpioMode, Pin};
+use crate::panels::mcu_module::pins::logic::pin::{Edge, GpioMode, Pin};
 use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
 
 /// Invariant file header (above `GEN_BEGIN`, survives every re-splice).
@@ -36,12 +36,14 @@ pub fn invariant_header(mcu_name: &str, mcu_id: &str) -> String {
 }
 
 /// The gpio `use` line (only the types actually used, so no unused-import
-/// warnings) and the per-pin `let` binding body — shared by the blocking and
-/// async section builders (the GPIO API is identical between the two; only the
-/// entry point differs). An empty pin set yields an empty `use` line and a
-/// placeholder-comment body.
+/// warnings) and the per-pin `let` binding body for the BLOCKING section
+/// builder, with no input armed (the GPIO API is the async one's too; only the
+/// entry point and the EXTI differ). An empty pin set yields an empty `use`
+/// line and a placeholder-comment body. The section builder arms inputs, so it
+/// calls [`bindings`] itself; this is what the binding tests read.
+#[cfg(test)]
 pub(super) fn gpio_bindings(pins: &[&Pin]) -> (String, String) {
-    gpio_bindings_exti(pins, &[])
+    bindings(pins, &[], true)
 }
 
 /// [`gpio_bindings`], with the inputs that were given an EXTI line.
@@ -50,7 +52,19 @@ pub(super) fn gpio_bindings(pins: &[&Pin]) -> (String, String) {
 /// instead of an `Input`, because the two are different types and only the
 /// second can be awaited. The pull and the trailing `// GPIO Input` comment are
 /// unchanged, so [`super::parse_main_rs`] still reads the pin back.
+///
+/// An armed input that is NOT in `exti` gets no note here: `exti_plan` already
+/// wrote why (a line clash, or no vector), and the Blocking note would be wrong.
 pub(super) fn gpio_bindings_exti(pins: &[&Pin], exti: &[(String, u8)]) -> (String, String) {
+    bindings(pins, exti, false)
+}
+
+/// `exti` names the inputs `exti_plan` gave a line. `blocking` picks what they
+/// become: an `ExtiInput<Blocking>` parked in its static for the `#[interrupt]`
+/// (see `embassy_stm32::exti_blocking_items`), or the `ExtiInput<Async>` a task
+/// awaits. A refused input binds as a plain `Input` on both, and `exti_plan`
+/// writes why.
+fn bindings(pins: &[&Pin], exti: &[(String, u8)], blocking: bool) -> (String, String) {
     let configured: Vec<&&Pin> = pins
         .iter()
         .filter(|p| p.selected_function != PinFunction::Unset)
@@ -118,15 +132,18 @@ pub(super) fn gpio_bindings_exti(pins: &[&Pin], exti: &[(String, u8)]) -> (Strin
         format!("use embassy_stm32::gpio::{{{}}};\n", imports.join(", "))
     };
     // `ExtiInput` lives in its own module, and its type carries the MODE — the
-    // tasks below name `ExtiInput<'static, Async>`, so both come in here.
-    if !exti.is_empty() {
+    // tasks below name `ExtiInput<'static, Async>`, so both come in here. On
+    // Blocking the statics name `Blocking`, and the handlers need the rest.
+    if !exti.is_empty() && blocking {
+        use_line.push_str(super::embassy_stm32::EXTI_BLOCKING_USES);
+    } else if !exti.is_empty() {
         use_line.push_str("use embassy_stm32::exti::ExtiInput;\n");
         use_line.push_str("use embassy_stm32::mode::Async;\n");
     }
 
     let mut body = String::new();
     for p in &configured {
-        body.push_str(&pin_binding_line(p, exti));
+        body.push_str(&pin_binding_line(p, exti, blocking));
         body.push('\n');
     }
     // NB: no "no pins" placeholder here — the caller decides, since the async
@@ -149,8 +166,17 @@ pub fn make_generated_section(
     // `let x = Foo::new(pa0_out, …);` lines for the Custom modules — appended
     // after the pin bindings they consume (see `Mcu::custom_module_inits`).
     custom_inits: &str,
+    // The chip's interrupt vectors (`Mcu::irq_vectors`). An armed input gets a
+    // handler only on a line one of them serves; none - a chip imported without
+    // vendor data - and every armed input is refused, in writing.
+    vectors: &[String],
 ) -> String {
-    let (use_line, mut body) = gpio_bindings(pins);
+    // The Async plan, so both runtimes refuse the same pads for the same
+    // reasons: a line already taken, or no vector for it.
+    let (exti, exti_notes) = super::embassy_stm32::exti_plan(pins, vectors);
+    let lines: Vec<(String, u8)> = exti.iter().map(|e| (e.singleton.clone(), e.line)).collect();
+    let (use_line, mut body) = bindings(pins, &lines, true);
+    body.push_str(&exti_notes);
     if body.is_empty() {
         body.push_str(NO_PINS_PLACEHOLDER);
     }
@@ -160,7 +186,7 @@ pub fn make_generated_section(
     format!(
         "{GEN_BEGIN}\n\
          {use_line}\n\
-         #[entry]\n\
+         {items}#[entry]\n\
          #[allow(unused_variables, unused_mut)]\n\
          fn main() -> ! {{\n\
          \x20   // {mcu_name}\n\
@@ -168,6 +194,8 @@ pub fn make_generated_section(
          \n\
          {body}\
          {GEN_END}\n",
+        // Statics and handlers are items: above the entry, not inside it.
+        items = super::embassy_stm32::exti_blocking_items(&exti),
     )
 }
 
@@ -194,7 +222,7 @@ pub fn splice_section(existing: &str, new_section: &str, mcu_name: &str, mcu_id:
 /// `let pXY = Input::new(...)`; anything else → the raw singleton `let pXY =
 /// p.PXY;` (hand to a driver). The trailing `// <Label>` is what
 /// [`super::parse_main_rs`] reads back.
-fn pin_binding_line(p: &Pin, exti: &[(String, u8)]) -> String {
+fn pin_binding_line(p: &Pin, exti: &[(String, u8)], blocking: bool) -> String {
     let func = &p.selected_function;
     // The GPIO that actually provides the chosen function - normally the pin's
     // own name, but a package pin with two pads bonded together answers to a
@@ -216,6 +244,15 @@ fn pin_binding_line(p: &Pin, exti: &[(String, u8)]) -> String {
                 _ => "Pull::None",
             };
             match exti.iter().find(|(g, _)| g == singleton) {
+                // Blocking: parked for the vector's `#[interrupt]`.
+                Some((_, line)) if blocking => super::embassy_stm32::exti_blocking_binding(
+                    &var,
+                    singleton,
+                    *line,
+                    pull,
+                    p.irq.unwrap_or(Edge::Rising),
+                    &label,
+                ),
                 // `Irqs` is the same struct the DMA peripherals bind into —
                 // `ExtiInput::new` takes the binding, not just the channel.
                 Some((_, line)) => format!(
@@ -292,12 +329,17 @@ mod emit_for_manual_compile {
     ///
     /// So: ask the sources the IDE itself would search, and take the first that
     /// has the file. The env override still wins, for pointing at a specific
-    /// copy.
+    /// copy - and a bare FILE NAME there is searched for the same way, so a
+    /// matrix row can name another part without naming this machine's paths.
     fn vendor_chip_file(env_var: &str, file: &str) -> Option<std::path::PathBuf> {
-        if let Ok(p) = std::env::var(env_var) {
+        let named = std::env::var(env_var).ok();
+        if let Some(p) = &named
+            && p.contains(['/', '\\'])
+        {
             let p = std::path::PathBuf::from(p);
             return p.is_file().then_some(p);
         }
+        let file = named.as_deref().unwrap_or(file);
         crate::panels::mcu_module::chip_sources::all_sources()
             .into_iter()
             .filter(|s| s.has_clock())
@@ -2746,7 +2788,14 @@ mod emit_for_manual_compile {
             );
         }
         let mut mcu = def.build_mcu();
-        mcu.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
+        // `EIDE_RUNTIME=blocking` builds the same chip on the Blocking backend
+        // (generic STM32 or WBA) - with `EIDE_EXTI`, the `#[interrupt]` handlers
+        // on the vectors this part really has, which is the half no bundled
+        // definition can test: none of them carries a vector list.
+        mcu.runtime = match std::env::var("EIDE_RUNTIME").as_deref() {
+            Ok("blocking") => crate::panels::mcu_module::mcu::model::Runtime::Blocking,
+            _ => crate::panels::mcu_module::mcu::model::Runtime::Async,
+        };
 
         // Take the first pin the chip itself offers for each bus signal, so this
         // works for whatever part `EIDE_CHIP_XML` names.
@@ -2801,6 +2850,46 @@ mod emit_for_manual_compile {
                     p.selected_function = PinFunction::GpioInput;
                     p.irq = Some(edge);
                 }
+            }
+        }
+        // `EIDE_EXTI_SHARED=1` arms two more free pads on DIFFERENT lines of
+        // ONE vector (`EXTI9_5`, `EXTI4_15`...), so the handler that asks each
+        // of its pins is compiled too - the pair above shares a LINE, so only
+        // one of it ever gets a handler. A part with a vector per line (WBA)
+        // has no such pair, and says so.
+        if std::env::var_os("EIDE_EXTI_SHARED").is_some() {
+            use crate::panels::mcu_module::codegen::embassy_stm32::{exti_line, exti_vector};
+            use crate::panels::mcu_module::pins::logic::pin::Edge;
+            let taken: Vec<u8> = mcu
+                .iter_all_pins()
+                .filter(|p| p.irq.is_some())
+                .filter_map(|p| exti_line(p.gpio()))
+                .collect();
+            let free: Vec<(usize, u8, String)> = mcu
+                .iter_all_pins()
+                .filter(|p| !p.reserved && p.selected_function == PinFunction::Unset)
+                .filter_map(|p| {
+                    let line = exti_line(p.gpio())?;
+                    let vector = exti_vector(&mcu.irq_vectors, line)?.to_owned();
+                    (!taken.contains(&line)).then_some((p.number, line, vector))
+                })
+                .collect();
+            let shared = free.iter().find_map(|(n1, l1, v1)| {
+                free.iter()
+                    .find(|(_, l2, v2)| l2 != l1 && v2 == v1)
+                    .map(|(n2, _, _)| (*n1, *n2, v1.clone()))
+            });
+            match shared {
+                Some((a, b, vector)) => {
+                    println!("shared vector exercised: {vector}");
+                    for (num, edge) in [(a, Edge::Rising), (b, Edge::Both)] {
+                        if let Some(p) = mcu.find_pin_mut(num) {
+                            p.selected_function = PinFunction::GpioInput;
+                            p.irq = Some(edge);
+                        }
+                    }
+                }
+                None => println!("no vector serves two free lines - shared handler not exercised"),
             }
         }
         // `EIDE_HSPI=lanes` wires an HSPI device on controller 1 with that many
@@ -3252,6 +3341,15 @@ mod emit_for_manual_compile {
             !main_rs.contains("DMA_TX_TODO"),
             "a muxed chip should need no TODO:\n{main_rs}"
         );
+        // A Blocking EXTI row that armed nothing would pass by building GPIO.
+        if mcu.runtime == crate::panels::mcu_module::mcu::model::Runtime::Blocking
+            && std::env::var_os("EIDE_EXTI").is_some()
+        {
+            assert!(
+                main_rs.contains("ExtiInput::new_blocking(") && main_rs.contains("#[interrupt]"),
+                "no Blocking EXTI handler was generated:\n{main_rs}"
+            );
+        }
         // What the app writes when it saves this async project - a harness
         // that wrote anything else would compile a manifest the IDE never does.
         let files = manifest_sync::project_files(&def, &mcu, &main_rs);
@@ -3345,5 +3443,401 @@ mod af_binding_tests {
         let p = af_pin("PB4", "FMC_A1", None, Some(GpioMode::PushPull));
         let (_, body) = gpio_bindings(&[&p]);
         assert_eq!(body.trim(), "let pb4_fmc_a1 = p.PB4; // FMC_A1");
+    }
+}
+
+#[cfg(test)]
+mod pin_interrupts {
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::codegen::parse_main_rs;
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::mcu_def::McuDefinition;
+    use crate::panels::mcu_module::pins::logic::pin::model::Edge;
+    use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+    use crate::panels::mcu_module::{manifest_sync, stm32_pin_data};
+
+    /// What an F4 names its EXTI vectors: five private lines, two shared.
+    const F4_VECTORS: &[&str] = &[
+        "EXTI0",
+        "EXTI1",
+        "EXTI2",
+        "EXTI3",
+        "EXTI4",
+        "EXTI9_5",
+        "EXTI15_10",
+    ];
+
+    /// The F103 definition retargeted to an embassy family: `stm32f4` reaches
+    /// `StmEmbassyBackend`, `stm32wba` reaches `WbaBackend` (a WBA has one
+    /// vector per line). `arm` is the inputs to arm; PA1 is a plain input beside
+    /// them, so the two shapes are proved to differ.
+    fn def(family: &str, vectors: bool) -> McuDefinition {
+        let mut def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        def.family = family.into();
+        def.id = format!("{family}_armed_input");
+        // The dependency line an import writes - the F103's is stm32f1xx-hal,
+        // which has no `exti` feature to ask for.
+        let (part, target) = if family == "stm32wba" {
+            ("STM32WBA55CGUx", "thumbv8m.main-none-eabihf")
+        } else {
+            ("STM32F411RETx", "thumbv7em-none-eabihf")
+        };
+        def.project.hal_dep = stm32_pin_data::hal_dep_for_name(family, part);
+        def.project.target = target.into();
+        if vectors {
+            def.irq_vectors = if family == "stm32wba" {
+                (0..16).map(|n| format!("EXTI{n}")).collect()
+            } else {
+                F4_VECTORS.iter().map(|v| (*v).to_owned()).collect()
+            };
+        }
+        def
+    }
+
+    fn stm32(family: &str, runtime: Runtime, arm: &[(&str, Edge)]) -> Mcu {
+        let mut mcu = def(family, true).build_mcu();
+        arm_pins(&mut mcu, runtime, arm);
+        mcu
+    }
+
+    fn arm_pins(mcu: &mut Mcu, runtime: Runtime, arm: &[(&str, Edge)]) {
+        mcu.runtime = runtime;
+        for p in mcu.iter_all_pins_mut() {
+            if let Some((_, edge)) = arm.iter().find(|(n, _)| *n == p.name) {
+                p.selected_function = PinFunction::GpioInput;
+                p.irq = Some(*edge);
+            } else if p.name == "PA1" {
+                p.selected_function = PinFunction::GpioInput;
+            }
+        }
+    }
+
+    const FAMILIES: [&str; 2] = ["stm32f4", "stm32wba"];
+
+    /// An armed input gets a real handler on Blocking: built with
+    /// `new_blocking`, parked in a static, served by its vector's `#[interrupt]`,
+    /// which calls the user's hook - a plain `fn`, since nothing can await here.
+    #[test]
+    fn blocking_arms_a_real_handler() {
+        for family in FAMILIES {
+            for (edge, trigger) in [
+                (Edge::Rising, "TriggerEdge::Rising"),
+                (Edge::Falling, "TriggerEdge::Falling"),
+                (Edge::Both, "TriggerEdge::Any"),
+            ] {
+                let code = stm32(family, Runtime::Blocking, &[("PA0", edge)]).fresh_main_rs();
+                assert!(
+                    code.contains(&format!(
+                        "let pa0_in = ExtiInput::new_blocking(p.PA0, p.EXTI0, Pull::None, {trigger}); // GPIO Input"
+                    )),
+                    "{family} {edge:?}:\n{code}"
+                );
+                assert!(
+                    code.contains(
+                        "static PA0_IN: Mutex<RefCell<Option<ExtiInput<'static, Blocking>>>> = Mutex::new(RefCell::new(None));"
+                    ),
+                    "{family}:\n{code}"
+                );
+                assert!(
+                    code.contains("#[interrupt]\nfn EXTI0() {"),
+                    "{family}:\n{code}"
+                );
+                assert!(
+                    code.contains(
+                        "    if let Some(high) = fired {\n        #[deny(unused_must_use)]\n        on_pa0_in_edge(high);\n    }"
+                    ),
+                    "{family}:\n{code}"
+                );
+                // The pending bit is cleared before the hook runs, or the
+                // handler re-enters the moment it returns.
+                assert!(
+                    code.find("pin.clear_pending();") < code.find("on_pa0_in_edge(high);"),
+                    "{family}:\n{code}"
+                );
+                for want in [
+                    "use embassy_stm32::exti::{ExtiInput, TriggerEdge};",
+                    "use embassy_stm32::interrupt;",
+                    "use embassy_stm32::mode::Blocking;",
+                    "use core::cell::RefCell;",
+                    "use cortex_m::interrupt::Mutex;",
+                    // PA1 is still a plain input, so `Input` stays imported.
+                    "use embassy_stm32::gpio::{Input, Pull};",
+                ] {
+                    assert!(code.contains(want), "{family} needs `{want}`:\n{code}");
+                }
+                assert!(
+                    code.contains("let pa1_in = Input::new(p.PA1, Pull::None);"),
+                    "{code}"
+                );
+                // Nothing of the Async shape: no executor, no binding struct.
+                for not in [
+                    "embassy_executor",
+                    "Irqs",
+                    "mode::Async",
+                    "armed for an interrupt",
+                ] {
+                    assert!(!code.contains(not), "{family}: `{not}` in\n{code}");
+                }
+                // Items above the entry, the arming inside it.
+                assert!(code.find("fn EXTI0()") < code.find("#[entry]"), "{code}");
+                assert!(
+                    code.find("#[entry]") < code.find("ExtiInput::new_blocking"),
+                    "{code}"
+                );
+            }
+        }
+    }
+
+    /// The pin is built AND parked inside one critical section: `new_blocking`
+    /// arms the line at once and the NVIC is already open, so an edge before
+    /// the static held the pin would reach a handler that cannot clear it.
+    #[test]
+    fn the_pin_is_built_and_parked_in_one_critical_section() {
+        let code = stm32("stm32f4", Runtime::Blocking, &[("PA0", Edge::Rising)]).fresh_main_rs();
+        let lines: Vec<&str> = code.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("ExtiInput::new_blocking(p.PA0"))
+            .unwrap_or_else(|| panic!("no arming:\n{code}"));
+        assert_eq!(
+            lines[at - 1],
+            "    cortex_m::interrupt::free(|cs| {",
+            "{code}"
+        );
+        assert_eq!(
+            lines[at + 1],
+            "        *PA0_IN.borrow(cs).borrow_mut() = Some(pa0_in);",
+            "{code}"
+        );
+        assert_eq!(lines[at + 2], "    });", "{code}");
+    }
+
+    /// `EXTI9_5` carries five lines: ONE handler asks each of its pins, in line
+    /// order, through one `fired` tuple, and calls each pin's hook.
+    #[test]
+    fn a_shared_vector_asks_each_pin() {
+        let code = stm32(
+            "stm32f4",
+            Runtime::Blocking,
+            &[("PB8", Edge::Rising), ("PB5", Edge::Both)],
+        )
+        .fresh_main_rs();
+        assert_eq!(code.matches("fn EXTI9_5()").count(), 1, "{code}");
+        assert!(
+            code.contains("    let mut fired = (None, None);\n"),
+            "{code}"
+        );
+        assert!(code.contains("`EXTI9_5` is shared by 2 lines"), "{code}");
+        let pb5 = code.find("PB5_IN.borrow(cs)").expect("PB5 asked");
+        let pb8 = code.find("PB8_IN.borrow(cs)").expect("PB8 asked");
+        assert!(pb5 < pb8, "line order:\n{code}");
+        assert!(code.contains("fired.0 = Some(pin.is_high());"), "{code}");
+        assert!(code.contains("fired.1 = Some(pin.is_high());"), "{code}");
+        assert!(code.contains("on_pb5_in_edge(high);"), "{code}");
+        assert!(code.contains("on_pb8_in_edge(high);"), "{code}");
+        assert!(
+            code.contains("TriggerEdge::Any"),
+            "PB5 is on both edges:\n{code}"
+        );
+    }
+
+    /// PA5 and PB5 are both line 5. One gets it; the other stays a plain input
+    /// and says why - the same pad, refused for the same reason, as on Async.
+    #[test]
+    fn a_line_clash_is_refused_in_writing() {
+        let code = stm32(
+            "stm32f4",
+            Runtime::Blocking,
+            &[("PA5", Edge::Rising), ("PB5", Edge::Rising)],
+        )
+        .fresh_main_rs();
+        assert!(
+            code.contains("ExtiInput::new_blocking(p.PA5, p.EXTI5"),
+            "{code}"
+        );
+        assert!(
+            code.contains("let pb5_in = Input::new(p.PB5, Pull::None);"),
+            "{code}"
+        );
+        assert!(
+            code.contains("    // PB5 is NOT on an interrupt: EXTI line 5 is already taken by\n"),
+            "{code}"
+        );
+        assert!(
+            !code.contains("PB5_IN"),
+            "a refused pad gets no static:\n{code}"
+        );
+        assert!(!code.contains("on_pb5_in_edge"), "nor a hook:\n{code}");
+    }
+
+    /// A chip imported without vendor data has no vector list: every armed
+    /// input is refused, said so, and nothing EXTI is imported.
+    #[test]
+    fn no_vectors_no_handler() {
+        for family in FAMILIES {
+            let mut mcu = def(family, false).build_mcu();
+            arm_pins(&mut mcu, Runtime::Blocking, &[("PA0", Edge::Rising)]);
+            let code = mcu.fresh_main_rs();
+            assert!(
+                code.contains("let pa0_in = Input::new(p.PA0, Pull::None);"),
+                "{code}"
+            );
+            assert!(
+                code.contains("names none for\n    // EXTI line 0"),
+                "{code}"
+            );
+            for not in ["#[interrupt]", "embassy_stm32::exti", "on_pa0_in_edge"] {
+                assert!(!code.contains(not), "{family}: `{not}` in\n{code}");
+            }
+        }
+    }
+
+    /// An unarmed input is untouched — arming is opt-in, not implied.
+    #[test]
+    fn an_unarmed_input_has_no_handler() {
+        for family in FAMILIES {
+            let code = stm32(family, Runtime::Blocking, &[]).fresh_main_rs();
+            for not in ["#[interrupt]", "static ", "embassy_stm32::exti", "_edge("] {
+                assert!(!code.contains(not), "{family}: `{not}` in\n{code}");
+            }
+            assert!(
+                code.contains("let pa1_in = Input::new(p.PA1, Pull::None);"),
+                "{code}"
+            );
+        }
+    }
+
+    /// The hook is the user's: seeded once below the tail as a plain `fn`,
+    /// never rewritten, and a regeneration keeps what they wrote in it.
+    #[test]
+    fn the_hook_is_seeded_once_and_kept() {
+        for family in FAMILIES {
+            let mcu = stm32(family, Runtime::Blocking, &[("PA0", Edge::Rising)]);
+            let fresh = mcu.fresh_main_rs();
+            assert_eq!(
+                fresh.matches("fn on_pa0_in_edge(_high: bool) {").count(),
+                1,
+                "{fresh}"
+            );
+            assert!(!fresh.contains("async fn on_pa0_in_edge"), "{fresh}");
+            let end = fresh
+                .find(crate::panels::mcu_module::codegen::GEN_END)
+                .expect("block end");
+            assert!(
+                fresh.find("fn on_pa0_in_edge(") > Some(end),
+                "below the block:\n{fresh}"
+            );
+            let edited = fresh.replace(
+                "fn on_pa0_in_edge(_high: bool) {\n    // Your code here.\n",
+                "fn on_pa0_in_edge(_high: bool) {\n    // Your code here.\n    user_did_this();\n",
+            );
+            assert_ne!(edited, fresh, "the seed has the shape this test edits");
+            let again = mcu.update_main_rs(&mcu.update_main_rs(&edited));
+            assert!(again.contains("    user_did_this();\n"), "{again}");
+            assert_eq!(again.matches("fn on_pa0_in_edge(").count(), 1, "{again}");
+        }
+    }
+
+    /// An untouched project switched between Blocking and Async lands on the
+    /// project the other runtime writes fresh: the hook keeps its NAME, and
+    /// its seed swaps `fn` and `async fn` with its caller.
+    #[test]
+    fn a_pristine_switch_lands_on_the_fresh_project() {
+        for family in FAMILIES {
+            let arm = [("PA0", Edge::Falling)];
+            let blocking = stm32(family, Runtime::Blocking, &arm);
+            let asynch = stm32(family, Runtime::Async, &arm);
+            let b_fresh = blocking.fresh_main_rs();
+            let a_fresh = asynch.fresh_main_rs();
+            assert!(
+                a_fresh.contains("async fn on_pa0_in_edge(_high: bool)"),
+                "{a_fresh}"
+            );
+            assert_eq!(
+                asynch.update_main_rs(&b_fresh),
+                a_fresh,
+                "{family}: Blocking -> Async"
+            );
+            assert_eq!(
+                blocking.update_main_rs(&a_fresh),
+                b_fresh,
+                "{family}: Async -> Blocking"
+            );
+        }
+    }
+
+    /// The Pins canvas still reads every input back - the armed one from the
+    /// `let` inside the critical section, like any other.
+    #[test]
+    fn the_pins_still_parse() {
+        for family in FAMILIES {
+            let code = stm32(
+                family,
+                Runtime::Blocking,
+                &[("PA0", Edge::Rising), ("PB5", Edge::Both)],
+            )
+            .fresh_main_rs();
+            let parsed = parse_main_rs(&code);
+            for pad in ["PA0", "PA1", "PB5"] {
+                assert!(
+                    parsed
+                        .iter()
+                        .any(|(n, f)| n == pad && *f == PinFunction::GpioInput),
+                    "{family}: {pad} reads back as an input: {parsed:?}"
+                );
+            }
+            assert_eq!(parsed.len(), 3, "{family}: nothing extra: {parsed:?}");
+        }
+    }
+
+    /// `embassy_stm32::exti` is behind a Cargo feature: an armed Blocking
+    /// project asks for it, and one with nothing armed does not.
+    #[test]
+    fn the_manifest_asks_for_exti_only_when_armed() {
+        for family in FAMILIES {
+            let def = def(family, true);
+            for (arm, want) in [(&[("PA0", Edge::Rising)][..], true), (&[][..], false)] {
+                let mut mcu = def.build_mcu();
+                arm_pins(&mut mcu, Runtime::Blocking, arm);
+                let main_rs = mcu.fresh_main_rs();
+                let toml = manifest_sync::project_files(&def, &mcu, &main_rs).cargo_toml;
+                assert_eq!(
+                    toml.lines()
+                        .any(|l| l.trim_start().starts_with("embassy-stm32")
+                            && l.contains("\"exti\"")),
+                    want,
+                    "{family} armed={want}:\n{toml}"
+                );
+            }
+        }
+    }
+
+    /// The backend reports the hooks its handlers call - plain `fn`s, named as
+    /// the Async tasks name them, one per pad that got a line.
+    #[test]
+    fn the_backend_reports_one_sync_hook_per_armed_pad() {
+        use crate::panels::mcu_module::codegen::family::backend_for_runtime;
+        for family in FAMILIES {
+            let mcu = stm32(
+                family,
+                Runtime::Blocking,
+                &[
+                    ("PA5", Edge::Rising),
+                    ("PB5", Edge::Rising),
+                    ("PA0", Edge::Both),
+                ],
+            );
+            let hooks = backend_for_runtime(&mcu.family, mcu.runtime)
+                .expect("a backend")
+                .edge_hooks(&mcu);
+            let names: Vec<&str> = hooks.iter().map(|h| h.name.as_str()).collect();
+            assert_eq!(
+                names,
+                ["on_pa0_in_edge", "on_pa5_in_edge"],
+                "{family}: PB5 lost line 5"
+            );
+            assert!(hooks.iter().all(|h| !h.is_async), "{family}: {hooks:?}");
+            assert_eq!(hooks[0].caller, "EXTI0", "{family}");
+        }
     }
 }

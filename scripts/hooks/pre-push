@@ -155,7 +155,7 @@ else
             src/panels/mcu_module/codegen/templates/nrf_hal/*|            src/panels/mcu_module/codegen/templates/embassy_nrf/*|            src/panels/mcu_module/codegen/templates/common/nrf_*)
                 fams="$fams nrf" ;;
             src/panels/mcu_module/codegen/wba.rs)
-                fams="$fams embassy" ;;
+                fams="$fams embassy import" ;;
             src/panels/mcu_module/codegen/rcc_n6.rs)
                 fams="$fams n6" ;;
             src/panels/mcu_module/codegen_esp_configs.rs|            src/panels/mcu_module/codegen_esp.rs|            assets/mcus/esp*.ron)

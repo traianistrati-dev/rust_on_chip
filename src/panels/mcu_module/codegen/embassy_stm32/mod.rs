@@ -1,17 +1,28 @@
-//! Async `embassy-stm32` code generation — the [`Runtime::Async`] path.
+//! `embassy-stm32` bus-driver code generation for both runtimes, and the
+//! [`Runtime::Async`] entry point.
 //!
-//! Structurally the twin of [`super::embassy_common`] (blocking), differing only
-//! in the *entry point*: instead of `#[cortex_m_rt::entry] fn main() -> !`, the
-//! async runtime uses `#[embassy_executor::main] async fn main(Spawner)` and the
-//! executor drives the future. GPIO bindings are byte-for-byte identical
-//! (`Output::new` / `Input::new` are the same embassy types in both modes), so
-//! the per-pin body comes straight from [`embassy_common::gpio_bindings_exti`] and
-//! round-trips through [`super::parse_main_rs`] the same way.
+//! [`peripherals`] builds the bus drivers in either [`PeriphMode`], leaving out
+//! the modules whose "Generate driver" switch is off (`raw`): USART/LPUART,
+//! SPI, I2C, PWM, DAC and QSPI/OCTOSPI/XSPI/HSPI on both runtimes, SDMMC, SAI,
+//! I2S and COMP on Async only. [`super::family::AsyncEmbassyBackend`] runs it on
+//! Async (every STM32, the F1 included), and the generic STM32 and WBA backends
+//! (`StmEmbassyBackend`, `WbaBackend`) on Blocking (every STM32 but the F1).
+//! The EXTI plan ([`exti_plan`], [`exti_blocking_hooks`]) serves the Blocking
+//! backends too.
 //!
-//! Selected for every STM32 family that runs on `embassy-stm32` when the project
-//! Runtime is Async (see [`super::family::AsyncEmbassyBackend`]). The clock block
-//! is shared with the blocking backend ([`super::rcc::graph_clock_block`]) —
-//! `embassy_stm32::init` is runtime-agnostic.
+//! The rest is Async only: [`invariant_header`], [`make_generated_section`] and
+//! [`splice_section`] are structurally the twin of [`super::embassy_common`]'s,
+//! which Blocking uses, differing only in the *entry point*: instead of
+//! `#[cortex_m_rt::entry] fn main() -> !`, the async runtime uses
+//! `#[embassy_executor::main] async fn main(Spawner)` and the executor drives
+//! the future. GPIO bindings are byte-for-byte identical (`Output::new` /
+//! `Input::new` are the same embassy types in both modes), so the per-pin body
+//! comes straight from [`embassy_common::gpio_bindings_exti`] and round-trips
+//! through [`super::parse_main_rs`] the same way.
+//!
+//! The clock block is shared with the blocking backend
+//! ([`super::rcc::graph_clock_block`]) — `embassy_stm32::init` is
+//! runtime-agnostic.
 //!
 //! [`Runtime::Async`]: crate::panels::mcu_module::mcu::Runtime
 
@@ -32,7 +43,7 @@ use super::{AUTOGEN_BANNER, GEN_BEGIN, GEN_END, mcu_id_marker_line};
 use crate::panels::mcu_module::comparator;
 
 use crate::panels::mcu_module::modules::{
-    AsyncBusMode, DacModuleConfig, HspiModuleConfig, I2cModuleConfig, I2sModuleConfig,
+    AsyncBusMode, DacModuleConfig, HspiModuleConfig, I2cModuleConfig, I2sModuleConfig, ModuleKind,
     OspiModuleConfig, Parity, PwmMode, PwmPolarity, QspiModuleConfig, SaiModuleConfig,
     SdmmcModuleConfig, SpiBitOrder, SpiModuleConfig, StopBits, TimerModuleConfig, UsartDirection,
     UsartFlow, UsartMode, UsartModuleConfig, XspiModuleConfig,
@@ -44,7 +55,7 @@ use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
 
 use crate::panels::mcu_module::stm32_pin_data;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod afio;
 mod comp;
@@ -208,9 +219,11 @@ fn label_sfx(label: &str) -> String {
     }
 }
 
-/// Everything the async backend derives from the wired bus peripherals: the pins
-/// they consume (to drop from raw bindings), the `main.rs` init call lines, and
-/// the `src/pins/configs/*.rs` bodies. One pass over USART + SPI + I2C.
+/// The bus drivers [`peripherals`] derives for either runtime: the pins they
+/// take, the main.rs init lines (with the NOT-initialised notes), and the
+/// `src/pins/configs/*.rs` bodies - one pass over USART/LPUART, SPI, I2C, PWM,
+/// DAC, QSPI/OCTOSPI/XSPI/HSPI, SDMMC, SAI, I2S and COMP. On Blocking,
+/// `any_async_dma` is false and `dma_irqs`, `dma_uses` and `exti` are empty.
 pub struct AsyncPeriphs {
     /// Pin names moved into a driver → excluded from the raw GPIO bindings.
     pub consumed_pins: Vec<String>,
@@ -232,6 +245,11 @@ pub struct AsyncPeriphs {
     /// The inputs armed with an interrupt edge, resolved to their EXTI line and
     /// vector. Each becomes a task that awaits the edge.
     pub exti: Vec<ExtiPin>,
+    /// What THIS runtime leaves out that the other one generates, as `(name,
+    /// why)`: on Blocking the peripherals embassy drives only asynchronously,
+    /// on Async the timer embassy-time takes. The Apply preview of a runtime
+    /// switch names them, from the same pass that writes main.rs's note.
+    pub runtime_gaps: Vec<(String, &'static str)>,
 }
 
 /// What the VENDOR DATABASE told us about this chip, as one argument.
@@ -254,7 +272,164 @@ pub struct ChipData<'a> {
     pub irq_vectors: &'a [String],
 }
 
+/// Which runtime [`peripherals`] generates the bus drivers for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeriphMode {
+    /// `#[embassy_executor::main]`: buffered and DMA drivers, interrupts bound
+    /// in one `Irqs`, inputs awaited on their EXTI line.
+    Async,
+    /// `#[entry] fn main() -> !` on embassy-stm32: the `new_blocking*` drivers,
+    /// which bind no interrupt and take no channel. A peripheral embassy drives
+    /// only asynchronously (SAI, I2S, SDMMC, COMP) is NOT initialised, and
+    /// main.rs says why where its init would be.
+    Blocking,
+}
+
+/// [`peripherals`] on the Async runtime, every module generating its driver.
+#[allow(clippy::too_many_arguments)]
 pub fn async_peripherals(
+    family: &str,
+    chip: ChipData<'_>,
+    comp: CompInputs<'_>,
+    pins: &[&Pin],
+    usart: &BTreeMap<u8, UsartModuleConfig>,
+    spi: &BTreeMap<u8, SpiModuleConfig>,
+    i2c: &BTreeMap<u8, I2cModuleConfig>,
+    lpuart: &BTreeMap<u8, UsartModuleConfig>,
+    timer: &BTreeMap<u8, TimerModuleConfig>,
+    i2s: &BTreeMap<u8, I2sModuleConfig>,
+    dac: &BTreeMap<u8, DacModuleConfig>,
+    sai: &BTreeMap<u8, SaiModuleConfig>,
+    sdmmc: &BTreeMap<u8, SdmmcModuleConfig>,
+    qspi: Option<&QspiModuleConfig>,
+    ospi: &BTreeMap<u8, OspiModuleConfig>,
+    xspi: &BTreeMap<u8, XspiModuleConfig>,
+    hspi: &BTreeMap<u8, HspiModuleConfig>,
+) -> AsyncPeriphs {
+    peripherals(
+        PeriphMode::Async,
+        &BTreeSet::new(),
+        family,
+        chip,
+        comp,
+        pins,
+        usart,
+        spi,
+        i2c,
+        lpuart,
+        timer,
+        i2s,
+        dac,
+        sai,
+        sdmmc,
+        qspi,
+        ospi,
+        xspi,
+        hspi,
+    )
+}
+
+/// The `(kind, instance)` peripherals [`peripherals`] generates a driver for,
+/// and so the modules a "Generate driver" switch applies to - with the
+/// singleton(s) embassy names each one by (`USART4` is `UART4` on some parts).
+pub fn driver_singletons(kind: ModuleKind, n: u8) -> Vec<String> {
+    use ModuleKind as K;
+    match kind {
+        K::GenericInterfaceUsart => vec![format!("USART{n}"), format!("UART{n}")],
+        K::GenericInterfaceLpuart => vec![format!("LPUART{n}")],
+        K::GenericInterfaceSpi => vec![format!("SPI{n}")],
+        K::GenericInterfaceI2c => vec![format!("I2C{n}")],
+        K::GenericInterfaceTimer => vec![format!("TIM{n}")],
+        K::GenericInterfaceDac => vec![format!("DAC{n}")],
+        K::GenericInterfaceQspi => vec!["QUADSPI".to_owned()],
+        K::GenericInterfaceOspi => vec![format!("OCTOSPI{n}")],
+        K::GenericInterfaceXspi => vec![format!("XSPI{n}")],
+        K::GenericInterfaceHspi => vec![format!("HSPI{n}")],
+        K::GenericInterfaceSdmmc => vec![sdmmc_peri(n)],
+        K::GenericInterfaceSai => vec![format!("SAI{n}")],
+        // I2S{n} IS SPI{n}: embassy has no I2S singleton.
+        K::GenericInterfaceI2s => vec![format!("SPI{n}")],
+        _ => Vec::new(),
+    }
+}
+
+/// The `main.rs` note for a module whose driver is not generated because the
+/// user turned it off: its pads stay the labelled raw bindings above.
+fn raw_note(what: &str) -> String {
+    format!(
+        "    // {what} is NOT initialised: its module's \"Generate driver\" is off, so the
+    // pads stay bound raw above, for your own code.
+"
+    )
+}
+
+/// Why each peripheral embassy drives only asynchronously gets no driver on
+/// the Blocking runtime - main.rs's note and the Apply preview's line.
+pub const SDMMC_BLOCKING_GAP: &str =
+    "embassy's SD driver is async - every block transfer awaits the controller's interrupt.";
+pub const SAI_BLOCKING_GAP: &str =
+    "embassy drives SAI only through a DMA ring buffer, read and written with `.await`.";
+pub const I2S_BLOCKING_GAP: &str =
+    "embassy has no blocking I2S - it streams through a DMA ring buffer, written with `.await`.";
+/// Not async, COMP: `Comp::new` and `output_level()` are plain calls, but the
+/// constructor takes an interrupt binding, and the Blocking runtime writes no
+/// `Irqs` block.
+pub const COMP_BLOCKING_GAP: &str = "embassy's Comp::new takes an interrupt binding, and the \
+     Blocking runtime writes no Irqs block (only its wait_for_* edge calls are async).";
+/// ...and why the timer embassy-time takes gets none on Async.
+pub const TIME_DRIVER_GAP: &str = "embassy-time runs on it: the \"time-driver-any\" feature \
+     takes it on this chip, so `Peripherals` has no field for it. Move the PWM to another timer.";
+
+/// Whether [`peripherals`] can build module `(kind, n)`'s driver at all on
+/// `mode`'s runtime - and so whether its "Generate driver" switch decides
+/// anything. Not on Blocking for the peripherals embassy drives only
+/// asynchronously, never for the F1's SDIO, and not on Async for the timer
+/// embassy-time takes (`time_driver`, from [`time_driver_timer_of`]).
+pub fn driver_generated(
+    mode: PeriphMode,
+    family: &str,
+    kind: ModuleKind,
+    n: u8,
+    time_driver: Option<u8>,
+) -> bool {
+    use ModuleKind as K;
+    if driver_singletons(kind, n).is_empty() {
+        return false;
+    }
+    match (mode, kind) {
+        (
+            PeriphMode::Blocking,
+            K::GenericInterfaceSdmmc | K::GenericInterfaceSai | K::GenericInterfaceI2s,
+        ) => false,
+        (_, K::GenericInterfaceSdmmc) => family != "stm32f1",
+        (PeriphMode::Async, K::GenericInterfaceTimer) => Some(n) != time_driver,
+        _ => true,
+    }
+}
+
+/// The `main.rs` note for a peripheral embassy drives only asynchronously.
+fn async_only_note(what: &str, why: &str) -> String {
+    crate::panels::mcu_module::errata::comment(
+        &format!(
+            "{what} is NOT initialised: {why} The Async runtime generates it; on \
+             Blocking its pads stay bound raw above."
+        ),
+        "    ",
+    )
+}
+
+/// The bus drivers of an embassy-stm32 project, for `mode`'s runtime.
+///
+/// Every pad a driver takes is still bound by its own labelled `let` line,
+/// and the driver is handed that variable (`embassy_common::driver_arg`):
+/// the line is how the canvas gets the pin back when the project reopens.
+///
+/// `raw` holds the modules, by `(kind, instance)`, the user keeps raw - no
+/// driver, the pads left to their own code.
+#[allow(clippy::too_many_arguments)]
+pub fn peripherals(
+    mode: PeriphMode,
+    raw: &BTreeSet<(ModuleKind, u8)>,
     family: &str,
     chip: ChipData<'_>,
     comp: CompInputs<'_>,
@@ -284,9 +459,13 @@ pub fn async_peripherals(
     // HSPI, keyed by controller instance — these pads are instance-numbered.
     hspi: &BTreeMap<u8, HspiModuleConfig>,
 ) -> AsyncPeriphs {
+    let blocking = mode == PeriphMode::Blocking;
+    // What each driver is handed for a pad: its binding's variable.
+    let arg = |gpio: &str| format!(", {}", super::embassy_common::driver_arg(pins, gpio));
     let mut consumed = Vec::new();
     let mut calls = String::new();
     let mut files = Vec::new();
+    let mut runtime_gaps: Vec<(String, &'static str)> = Vec::new();
     let mut any_async_dma = false;
     let mut any_spi_i2c = false;
     // I2C peripherals on DMA: their event/error interrupts go in the SAME
@@ -318,7 +497,14 @@ pub fn async_peripherals(
     } else {
         chip.irq_vectors
     };
-    let (exti, exti_notes) = exti_plan(pins, vectors);
+    // On Blocking the section builder plans the inputs itself
+    // (`embassy_common::make_generated_section`): an `#[interrupt]` per vector,
+    // not a binding in `Irqs`.
+    let (exti, exti_notes) = if blocking {
+        (Vec::new(), String::new())
+    } else {
+        exti_plan(pins, vectors)
+    };
     for e in &exti {
         extra_binds.push((
             e.vector.clone(),
@@ -359,13 +545,18 @@ pub fn async_peripherals(
     // module's name and the DMA request table differ. Looping over the two
     // instead of copying the block is what keeps a fix to one from missing the
     // other.
-    for (peri, stem, bus, wires, cfgs) in [
+    // usart_v1/v2 (F1, F2, F4, F7's older blocks) have no driver-enable pad and
+    // cannot swap TX and RX, so embassy compiles neither `new_with_de` nor
+    // `new_half_duplex_on_rx` there - on either runtime.
+    let usart_v3 = stm32_pin_data::usart_has_swap_invert(chip.usart_ip);
+    for (peri, stem, bus, wires, cfgs, kind) in [
         (
             "USART",
             "usart",
             dma_map::Bus::Usart,
             usart_wires(pins),
             usart,
+            ModuleKind::GenericInterfaceUsart,
         ),
         (
             "LPUART",
@@ -373,6 +564,7 @@ pub fn async_peripherals(
             dma_map::Bus::Lpuart,
             lpuart_wires(pins),
             lpuart,
+            ModuleKind::GenericInterfaceLpuart,
         ),
     ] {
         for w in wires {
@@ -380,6 +572,10 @@ pub fn async_peripherals(
             // `USART4` or `UART4`: the pin function is the same, the singleton
             // embassy generates is not.
             let peri = serial_word(peri, family, chip.irq_vectors, n);
+            if raw.contains(&(kind, n)) {
+                calls.push_str(&raw_note(&format!("{peri}{n}")));
+                continue;
+            }
             let cfg = cfgs.get(&n);
             let dir = cfg.map(|c| c.direction).unwrap_or_default();
             let flow = cfg.map(|c| c.flow).unwrap_or_default();
@@ -390,6 +586,45 @@ pub fn async_peripherals(
             if (dir.needs_tx() && tx.is_none()) || (dir.needs_rx() && rx.is_none()) {
                 continue;
             }
+            // The buffered transport has no half: embassy builds only
+            // `BufferedUart::new*`, with both pads. A one-way choice made on
+            // Blocking, which reads no transport, can arrive here with it.
+            if !blocking
+                && cfg.map(|c| c.mode).unwrap_or_default() == UsartMode::Buffered
+                && matches!(dir, UsartDirection::TxOnly | UsartDirection::RxOnly)
+            {
+                calls.push_str(&format!(
+                    "    // {peri}{n} is NOT initialised: the buffered transport has no one-way half -
+    // embassy's BufferedUart takes both pads. Set the module's Async transport to
+    // DMA, or its direction to receive and transmit.
+"
+                ));
+                continue;
+            }
+            if dir == UsartDirection::HalfDuplexOnRx && !usart_v3 {
+                calls.push_str(&format!(
+                    "    // {peri}{n} is NOT initialised: half duplex on the RX pad swaps TX and RX
+    // inside the USART, and this chip's (usart_v1/v2) cannot. Use the TX pad.
+"
+                ));
+                continue;
+            }
+            // On Blocking only the flow forms a `new_blocking*` call takes.
+            let flow = if blocking {
+                blocking_serial_flow(dir, flow)
+            } else {
+                flow
+            };
+            let flow = if flow == UsartFlow::De && !usart_v3 {
+                calls.push_str(&format!(
+                    "    // {peri}{n}'s driver enable is left off: this chip's USART (usart_v1/v2) has
+    // no DE pad. The pad stays bound raw above.
+"
+                ));
+                UsartFlow::None
+            } else {
+                flow
+            };
             // Same for flow control: the option is only honoured once its pad is
             // wired, so a half-finished choice generates the plain form instead
             // of code that names a pin that isn't there.
@@ -417,12 +652,12 @@ pub fn async_peripherals(
             if dir.needs_rx() {
                 let pin = rx.unwrap_or_default();
                 consumed.push(pin.to_owned());
-                pin_args.push_str(&format!(", p.{pin}"));
+                pin_args.push_str(&arg(pin));
             }
             if dir.needs_tx() {
                 let pin = tx.unwrap_or_default();
                 consumed.push(pin.to_owned());
-                pin_args.push_str(&format!(", p.{pin}"));
+                pin_args.push_str(&arg(pin));
             }
             // RTS/DE first, then CTS — `serial_shape` lists the parameters in
             // that order because embassy's constructors do.
@@ -430,13 +665,26 @@ pub fn async_peripherals(
                 && let Some(pin) = &w.rts
             {
                 consumed.push(pin.clone());
-                pin_args.push_str(&format!(", p.{pin}"));
+                pin_args.push_str(&arg(pin));
             }
             if flow.needs_cts()
                 && let Some(pin) = &w.cts
             {
                 consumed.push(pin.clone());
-                pin_args.push_str(&format!(", p.{pin}"));
+                pin_args.push_str(&arg(pin));
+            }
+            if blocking {
+                // A polled UART: no binding, no buffer, no channel - whatever
+                // transport the module names, which is the Async runtime's.
+                calls.push_str(&format!(
+                    "    let mut {handle} = pins::configs::{stem}{n}::init(p.{peri}{n}{pin_args});
+"
+                ));
+                files.push((
+                    format!("{stem}{n}.rs"),
+                    serial_config_file_blocking(peri, n, cfg, usart_v3),
+                ));
+                continue;
             }
             if cfg.map(|c| c.mode) == Some(UsartMode::Dma) {
                 any_async_dma = true;
@@ -477,7 +725,7 @@ pub fn async_peripherals(
                     n,
                     cfg,
                     &serial_irq(chip.irq_vectors, peri, n),
-                    stm32_pin_data::usart_has_swap_invert(chip.usart_ip),
+                    usart_v3,
                 ),
             ));
         }
@@ -487,11 +735,17 @@ pub fn async_peripherals(
     // One config module per TIMER, taking exactly the channels wired on the
     // canvas. No interrupts and no DMA: `SimplePwm` writes the compare
     // registers directly, so there is nothing to bind.
-    let time_driver = time_driver_timer(pins);
+    // Blocking runs no embassy-time, so every timer is the user's.
+    let time_driver = if blocking {
+        None
+    } else {
+        time_driver_timer(pins)
+    };
     for (n, mut wiring) in pwm_wires(pins) {
         // embassy-time runs on a timer of its own, and the one it takes is no
         // longer a field of `Peripherals`: `p.TIM4` on an STM32F103C8 is E0609.
-        // Its pads stay bound raw, and main.rs says why.
+        // Its pads stay bound raw, and main.rs says why - before the switch,
+        // which this timer does not have (`driver_generated`).
         if Some(n) == time_driver {
             calls.push_str(&format!(
                 "    // TIM{n} is NOT initialised: embassy-time runs on it. The \"time-driver-any\"
@@ -499,6 +753,11 @@ pub fn async_peripherals(
     // to another timer.
 "
             ));
+            runtime_gaps.push((format!("TIM{n}"), TIME_DRIVER_GAP));
+            continue;
+        }
+        if raw.contains(&(ModuleKind::GenericInterfaceTimer, n)) {
+            calls.push_str(&raw_note(&format!("TIM{n}")));
             continue;
         }
         // A timer with pads but no module entry generates at the module's own
@@ -593,10 +852,7 @@ pub fn async_peripherals(
         }
 
         let params = wiring.params();
-        let args: String = params
-            .iter()
-            .map(|(_, _, pin, _)| format!(", p.{pin}"))
-            .collect();
+        let args: String = params.iter().map(|(_, _, pin, _)| arg(pin)).collect();
         for (_, _, pin, _) in &params {
             consumed.push((*pin).to_owned());
         }
@@ -626,6 +882,10 @@ pub fn async_peripherals(
     // octal one REQUIRES the strobe. Sixteen data pads exist in silicon; none of
     // the ones past IO7 has a call that takes it.
     for (n, w) in hspi_wires(pins) {
+        if raw.contains(&(ModuleKind::GenericInterfaceHspi, n)) {
+            calls.push_str(&raw_note(&format!("HSPI{n}")));
+            continue;
+        }
         let cfg = hspi
             .get(&n)
             .cloned()
@@ -671,7 +931,7 @@ pub fn async_peripherals(
         for p in &pins_used {
             consumed.push(p.clone());
         }
-        let args: String = pins_used.iter().map(|p| format!(", p.{p}")).collect();
+        let args: String = pins_used.iter().map(|p| arg(p)).collect();
         calls.push_str(&format!(
             "    let mut {handle} = pins::configs::hspi{n}::init(p.HSPI{n}{args});\n"
         ));
@@ -682,6 +942,10 @@ pub fn async_peripherals(
     // The OCTOSPI block one step wider. Same rule: the wiring narrows the mode,
     // the mode names the constructor — and here the STROBES pick the suffix.
     for (n, w) in xspi_wires(pins) {
+        if raw.contains(&(ModuleKind::GenericInterfaceXspi, n)) {
+            calls.push_str(&raw_note(&format!("XSPI{n}")));
+            continue;
+        }
         let cfg = xspi
             .get(&n)
             .cloned()
@@ -727,7 +991,7 @@ pub fn async_peripherals(
         for p in &pins_used {
             consumed.push(p.clone());
         }
-        let args: String = pins_used.iter().map(|p| format!(", p.{p}")).collect();
+        let args: String = pins_used.iter().map(|p| arg(p)).collect();
         calls.push_str(&format!(
             "    let mut {handle} = pins::configs::xspi{n}::init(p.XSPI{n}{args});\n"
         ));
@@ -739,6 +1003,10 @@ pub fn async_peripherals(
     // two pads, octal and dual-quad share eight — so the module says which, and
     // the wiring has to be able to carry it.
     for (n, w) in ospi_wires(pins) {
+        if raw.contains(&(ModuleKind::GenericInterfaceOspi, n)) {
+            calls.push_str(&raw_note(&format!("OCTOSPI{n}")));
+            continue;
+        }
         let cfg = ospi
             .get(&n)
             .cloned()
@@ -772,13 +1040,13 @@ pub fn async_peripherals(
 
         // embassy's order: clock, then the data lines, then the chip select,
         // then the strobe.
-        let mut args = format!(", p.{}", w.clk);
+        let mut args = arg(&w.clk);
         for pin in w.io.values() {
-            args.push_str(&format!(", p.{pin}"));
+            args.push_str(&arg(pin));
         }
-        args.push_str(&format!(", p.{}", w.ncs));
+        args.push_str(&arg(&w.ncs));
         if with_dqs {
-            args.push_str(&format!(", p.{}", w.dqs.clone().unwrap()));
+            args.push_str(&arg(&w.dqs.clone().unwrap()));
         }
         calls.push_str(&format!(
             "    let mut {handle} = pins::configs::ospi{n}::init(p.OCTOSPI{n}{args});\n"
@@ -800,6 +1068,9 @@ pub fn async_peripherals(
         };
         let handle = format!("_qspi{}", label_sfx(&cfg.custom_label));
         match (w.bank1.as_ref(), w.bank2.as_ref()) {
+            _ if raw.contains(&(ModuleKind::GenericInterfaceQspi, cfg.instance)) => {
+                calls.push_str(&raw_note("QUADSPI"));
+            }
             (None, None) => {
                 calls.push_str(
                     "    // QUADSPI is NOT initialised: neither bank is complete. A bank is its
@@ -822,12 +1093,12 @@ pub fn async_peripherals(
                 let mut args = String::new();
                 for b in [b1, b2].into_iter().flatten() {
                     for pin in b.io.values() {
-                        args.push_str(&format!(", p.{pin}"));
+                        args.push_str(&arg(pin));
                     }
                 }
-                args.push_str(&format!(", p.{}", w.clk));
+                args.push_str(&arg(&w.clk));
                 for b in [b1, b2].into_iter().flatten() {
-                    args.push_str(&format!(", p.{}", b.ncs));
+                    args.push_str(&arg(&b.ncs));
                 }
                 calls.push_str(&format!(
                     "    let mut {handle} = pins::configs::qspi::init(p.QUADSPI{args});\n"
@@ -852,6 +1123,13 @@ pub fn async_peripherals(
             .unwrap_or_else(|| SdmmcModuleConfig::new(n));
         let peri = sdmmc_peri(n);
         let handle = format!("_sd{n}{}", label_sfx(&cfg.custom_label));
+        // The refusals first: a module with no driver to build has no switch
+        // either (`driver_generated`), so main.rs gives the real reason.
+        if blocking {
+            calls.push_str(&async_only_note(&peri, SDMMC_BLOCKING_GAP));
+            runtime_gaps.push((peri.clone(), SDMMC_BLOCKING_GAP));
+            continue;
+        }
 
         // The F1's SDIO is the older controller, which takes a DMA channel -
         // and embassy-stm32 0.6 routes none to it on the F1 (no `SdmmcDma`
@@ -862,6 +1140,10 @@ pub fn async_peripherals(
     // channel, and its driver needs one. The pads are bound raw.
 "
             ));
+            continue;
+        }
+        if raw.contains(&(ModuleKind::GenericInterfaceSdmmc, n)) {
+            calls.push_str(&raw_note(&peri));
             continue;
         }
 
@@ -890,7 +1172,7 @@ pub fn async_peripherals(
         let pin_args: String = [&w.ck, &w.cmd]
             .into_iter()
             .chain(w.lanes.values())
-            .map(|p| format!(", p.{p}"))
+            .map(|p| arg(p))
             .collect();
 
         // The peripheral's own interrupt goes in the SAME `Irqs` as any DMA
@@ -933,6 +1215,15 @@ pub fn async_peripherals(
     // One unit, up to two independent sub-blocks. `split_subblocks` happens
     // once inside the config module, which is why the module is the unit.
     for (n, blocks) in sai_wires(pins) {
+        if blocking {
+            calls.push_str(&async_only_note(&format!("SAI{n}"), SAI_BLOCKING_GAP));
+            runtime_gaps.push((format!("SAI{n}"), SAI_BLOCKING_GAP));
+            continue;
+        }
+        if raw.contains(&(ModuleKind::GenericInterfaceSai, n)) {
+            calls.push_str(&raw_note(&format!("SAI{n}")));
+            continue;
+        }
         let cfg = sai
             .get(&n)
             .cloned()
@@ -947,7 +1238,7 @@ pub fn async_peripherals(
                 .into_iter()
                 .flatten()
             {
-                args.push_str(&format!(", p.{pin}"));
+                args.push_str(&arg(pin));
                 consumed.push(pin.clone());
             }
             let (dma_arg, note) = dma_args(
@@ -982,12 +1273,16 @@ pub fn async_peripherals(
     // No DMA and no interrupt: `new_blocking` writes the data register, which
     // is the whole peripheral for a set-point or a bias.
     for (n, chans) in dac_wires(pins) {
+        if raw.contains(&(ModuleKind::GenericInterfaceDac, n)) {
+            calls.push_str(&raw_note(&format!("DAC{n}")));
+            continue;
+        }
         let cfg = dac
             .get(&n)
             .cloned()
             .unwrap_or_else(|| DacModuleConfig::new(n));
         let handle = format!("_dac{n}{}", label_sfx(&cfg.custom_label));
-        let args: String = chans.iter().map(|(_, pin)| format!(", p.{pin}")).collect();
+        let args: String = chans.iter().map(|(_, pin)| arg(pin)).collect();
         for (_, pin) in &chans {
             consumed.push(pin.clone());
         }
@@ -1022,6 +1317,15 @@ pub fn async_peripherals(
             ));
             continue;
         }
+        if blocking {
+            calls.push_str(&async_only_note(&format!("I2S{n}"), I2S_BLOCKING_GAP));
+            runtime_gaps.push((format!("I2S{n}"), I2S_BLOCKING_GAP));
+            continue;
+        }
+        if raw.contains(&(ModuleKind::GenericInterfaceI2s, n)) {
+            calls.push_str(&raw_note(&format!("I2S{n}")));
+            continue;
+        }
 
         let tx = cfg.direction.is_tx();
         let (dma_arg, note) = dma_args(
@@ -1037,11 +1341,7 @@ pub fn async_peripherals(
         any_async_dma = true;
         calls.push_str(&note);
 
-        let mck_arg = w
-            .mck
-            .as_ref()
-            .map(|p| format!(", p.{p}"))
-            .unwrap_or_default();
+        let mck_arg = w.mck.as_ref().map(|p| arg(p)).unwrap_or_default();
         for pin in [Some(&w.sd), Some(&w.ws), Some(&w.ck), w.mck.as_ref()]
             .into_iter()
             .flatten()
@@ -1049,13 +1349,19 @@ pub fn async_peripherals(
             consumed.push(pin.clone());
         }
         calls.push_str(&format!(
-            "    let mut {handle} = pins::configs::i2s{n}::init(p.SPI{n}, p.{}, p.{}, p.{}{mck_arg}, {dma_arg});\n",
-            w.sd, w.ws, w.ck
+            "    let mut {handle} = pins::configs::i2s{n}::init(p.SPI{n}{}{}{}{mck_arg}, {dma_arg});\n",
+            arg(&w.sd),
+            arg(&w.ws),
+            arg(&w.ck)
         ));
         files.push((format!("i2s{n}.rs"), i2s_config_file(n, &cfg, &w, &handle)));
     }
 
     for (n, sck, mosi, miso) in spi_wires(pins) {
+        if raw.contains(&(ModuleKind::GenericInterfaceSpi, n)) {
+            calls.push_str(&raw_note(&format!("SPI{n}")));
+            continue;
+        }
         any_spi_i2c = true;
         consumed.push(sck.clone());
         consumed.push(mosi.clone());
@@ -1066,13 +1372,11 @@ pub fn async_peripherals(
         // and `read`/`transfer` on such a bus would panic (`rx_dma.unwrap()`),
         // which is why this returns a different value - see `spi_config_file`.
         let tx_only = miso.is_none();
-        let miso_arg = miso
-            .as_ref()
-            .map(|p| format!(", p.{p}"))
-            .unwrap_or_default();
+        let miso_arg = miso.as_ref().map(|p| arg(p)).unwrap_or_default();
+        let (sck, mosi) = (arg(&sck), arg(&mosi));
         let cfg = spi.get(&n);
         let sfx = cfg.map(|c| label_sfx(&c.custom_label)).unwrap_or_default();
-        let dma = cfg.map(|c| is_dma(c.async_mode)).unwrap_or(false);
+        let dma = !blocking && cfg.map(|c| is_dma(c.async_mode)).unwrap_or(false);
         any_async_dma |= dma;
         if dma {
             let (args, note) = dma_args(
@@ -1088,24 +1392,32 @@ pub fn async_peripherals(
             calls.push_str(&note);
             calls.push_str(&format!(
                 "    let mut _spi{n}{sfx} = \
-                 pins::configs::spi{n}::init(p.SPI{n}, p.{sck}, p.{mosi}{miso_arg}, {args});\n"
+                 pins::configs::spi{n}::init(p.SPI{n}{sck}{mosi}{miso_arg}, {args});\n"
             ));
         } else {
             calls.push_str(&format!(
                 "    let mut _spi{n}{sfx} = \
-                 pins::configs::spi{n}::init(p.SPI{n}, p.{sck}, p.{mosi}{miso_arg});\n"
+                 pins::configs::spi{n}::init(p.SPI{n}{sck}{mosi}{miso_arg});\n"
             ));
         }
-        files.push((format!("spi{n}.rs"), spi_config_file(n, cfg, tx_only)));
+        files.push((
+            format!("spi{n}.rs"),
+            spi_config_file_for(mode, n, cfg, tx_only),
+        ));
     }
 
     for (n, scl, sda) in i2c_wires(pins) {
+        if raw.contains(&(ModuleKind::GenericInterfaceI2c, n)) {
+            calls.push_str(&raw_note(&format!("I2C{n}")));
+            continue;
+        }
         any_spi_i2c = true;
         consumed.push(scl.clone());
         consumed.push(sda.clone());
+        let (scl, sda) = (arg(&scl), arg(&sda));
         let cfg = i2c.get(&n);
         let sfx = cfg.map(|c| label_sfx(&c.custom_label)).unwrap_or_default();
-        let dma = cfg.map(|c| is_dma(c.async_mode)).unwrap_or(false);
+        let dma = !blocking && cfg.map(|c| is_dma(c.async_mode)).unwrap_or(false);
         any_async_dma |= dma;
         if dma {
             dma_i2c_instances.push(n);
@@ -1122,17 +1434,17 @@ pub fn async_peripherals(
             calls.push_str(&note);
             calls.push_str(&format!(
                 "    let mut _i2c{n}{sfx} = \
-                 pins::configs::i2c{n}::init(p.I2C{n}, p.{scl}, p.{sda}, {args});\n"
+                 pins::configs::i2c{n}::init(p.I2C{n}{scl}{sda}, {args});\n"
             ));
         } else {
             calls.push_str(&format!(
                 "    let mut _i2c{n}{sfx} = \
-                 pins::configs::i2c{n}::init(p.I2C{n}, p.{scl}, p.{sda});\n"
+                 pins::configs::i2c{n}::init(p.I2C{n}{scl}{sda});\n"
             ));
         }
         files.extend(super::common::i2c_bus_files(
             &format!("i2c{n}"),
-            i2c_config_file(n, cfg),
+            i2c_config_file_for(mode, n, cfg),
             cfg,
         ));
     }
@@ -1151,17 +1463,23 @@ pub fn async_peripherals(
             if cfg.inverting_input.needs_pin() && inm.is_none() {
                 continue;
             }
+            if blocking {
+                calls.push_str(&async_only_note(&format!("COMP{n}"), COMP_BLOCKING_GAP));
+                runtime_gaps.push((format!("COMP{n}"), COMP_BLOCKING_GAP));
+                continue;
+            }
             consumed.push(inp.clone());
             let inm_arg = match (cfg.inverting_input.needs_pin(), inm) {
                 (true, Some(p)) => {
                     consumed.push(p.clone());
-                    format!(", p.{p}")
+                    arg(p)
                 }
                 _ => String::new(),
             };
             comp_binds.push((comp_irq(chip.irq_vectors, *n, comp.instances), *n));
             calls.push_str(&format!(
-                "    let mut _comp{n} = pins::configs::comp{n}::init(p.COMP{n}, p.{inp}{inm_arg}, Irqs);\n"
+                "    let mut _comp{n} = pins::configs::comp{n}::init(p.COMP{n}{}{inm_arg}, Irqs);\n",
+                arg(inp)
             ));
             files.push((format!("comp{n}.rs"), comp_config_file(*n, cfg, generation)));
         }
@@ -1233,6 +1551,7 @@ pub fn async_peripherals(
         any_spi_i2c,
         dma_uses,
         exti,
+        runtime_gaps,
     }
 }
 
@@ -1629,5 +1948,437 @@ mod f1_async_tests {
         let out = run("stm32f1", &[pb5]);
         assert_eq!(out.exti.len(), 1, "{:?}", out.exti);
         assert_eq!(out.exti[0].vector, "EXTI9_5");
+    }
+}
+
+/// The pass on the Blocking runtime: embassy's `new_blocking*` drivers, no
+/// interrupt and no channel anywhere, and a written reason for each peripheral
+/// embassy drives only asynchronously.
+#[cfg(test)]
+mod blocking_tests {
+    use super::*;
+    use crate::panels::mcu_module::pins::logic::pin::Pin;
+
+    /// usart_v4 (G0, G4, H7, U5) and usart_v2 (F4).
+    const V4: &str = "sci3_v2_1";
+    const V2: &str = "sci2_v1_2_Cube";
+
+    fn mk(name: &str, f: PinFunction) -> Pin {
+        let mut p = Pin::new(1, name);
+        p.available_functions = vec![f.clone()];
+        p.selected_function = f;
+        p
+    }
+
+    fn uart_pins() -> Vec<Pin> {
+        vec![
+            mk("PA9", PinFunction::UsartTx(1)),
+            mk("PA10", PinFunction::UsartRx(1)),
+            mk("PA11", PinFunction::UsartCts(1)),
+            mk("PA12", PinFunction::UsartRts(1)),
+        ]
+    }
+
+    #[derive(Default)]
+    struct Mods {
+        usart: BTreeMap<u8, UsartModuleConfig>,
+        spi: BTreeMap<u8, SpiModuleConfig>,
+        i2c: BTreeMap<u8, I2cModuleConfig>,
+        raw: BTreeSet<(ModuleKind, u8)>,
+    }
+
+    fn run(mode: PeriphMode, usart_ip: &str, pins: &[Pin], m: &Mods) -> AsyncPeriphs {
+        let refs: Vec<&Pin> = pins.iter().collect();
+        peripherals(
+            mode,
+            &m.raw,
+            "stm32g4",
+            ChipData {
+                dma: None,
+                irq_vectors: &[],
+                usart_ip: Some(usart_ip),
+                sdmmc_ip: Some("sdmmc2_v1_0"),
+            },
+            CompInputs {
+                settings: &Default::default(),
+                instances: &[],
+                pins: &[],
+            },
+            &refs,
+            &m.usart,
+            &m.spi,
+            &m.i2c,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    fn file<'a>(out: &'a AsyncPeriphs, name: &str) -> &'a str {
+        out.config_files
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.as_str())
+            .unwrap_or_else(|| panic!("no {name}: {:?}", out.config_files))
+    }
+
+    fn usart(f: impl FnOnce(&mut UsartModuleConfig)) -> Mods {
+        let mut c = UsartModuleConfig::new(1);
+        f(&mut c);
+        Mods {
+            usart: [(1, c)].into(),
+            ..Mods::default()
+        }
+    }
+
+    /// A UART on Blocking is polled: `new_blocking` with the pads' bindings,
+    /// no `Irqs` to bind it in, no buffer, and a file that reads and writes
+    /// through `embedded-io`.
+    #[test]
+    fn a_blocking_uart_is_polled_and_takes_its_pads_bindings() {
+        let out = run(PeriphMode::Blocking, V4, &uart_pins(), &Mods::default());
+        assert!(
+            out.init_calls.contains(
+                "let mut _serial1 = pins::configs::usart1::init(p.USART1, pa10_usart1_rx, pa9_usart1_tx);"
+            ),
+            "{}",
+            out.init_calls
+        );
+        assert!(out.dma_irqs.is_empty(), "{}", out.dma_irqs);
+        assert!(!out.any_async_dma);
+        let body = file(&out, "usart1.rs");
+        assert!(
+            body.contains("SerialIo(Uart::new_blocking(usart, rx, tx, get_config()).unwrap())"),
+            "{body}"
+        );
+        assert!(
+            body.contains("impl embedded_io::Read for SerialIo<'_>"),
+            "{body}"
+        );
+        for gone in [
+            "Irqs",
+            "StaticCell",
+            "embedded_io_async",
+            "BUF_LEN",
+            "Binding",
+        ] {
+            assert!(!body.contains(gone), "{gone}:\n{body}");
+        }
+        assert!(out.consumed_pins.contains(&"PA9".to_owned()));
+        assert!(out.consumed_pins.contains(&"PA10".to_owned()));
+    }
+
+    /// The module's DMA transport is the Async runtime's; on Blocking the
+    /// one-way UART is the polled half, and no channel is asked for.
+    #[test]
+    fn a_dma_uart_is_polled_on_blocking_too() {
+        let tx_only = usart(|c| {
+            c.mode = UsartMode::Dma;
+            c.direction = UsartDirection::TxOnly;
+        });
+        let out = run(PeriphMode::Blocking, V4, &uart_pins(), &tx_only);
+        assert!(
+            out.init_calls
+                .contains("pins::configs::usart1::init(p.USART1, pa9_usart1_tx);"),
+            "{}",
+            out.init_calls
+        );
+        let body = file(&out, "usart1.rs");
+        assert!(body.contains("-> UartTx<'d, Blocking>"), "{body}");
+        assert!(
+            body.contains("UartTx::new_blocking(usart, tx, get_config()).unwrap()"),
+            "{body}"
+        );
+        assert!(out.dma_uses.is_empty(), "{:?}", out.dma_uses);
+
+        let rx_only = usart(|c| {
+            c.mode = UsartMode::Dma;
+            c.direction = UsartDirection::RxOnly;
+            c.flow = UsartFlow::Rts;
+        });
+        let out = run(PeriphMode::Blocking, V4, &uart_pins(), &rx_only);
+        let body = file(&out, "usart1.rs");
+        assert!(
+            body.contains(
+                "SerialRx(UartRx::new_blocking_with_rts(usart, rx, rts, get_config()).unwrap())"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("impl embedded_io::Read for SerialRx<'_>"),
+            "{body}"
+        );
+        assert!(
+            out.init_calls
+                .contains("init(p.USART1, pa10_usart1_rx, pa12_usart1_rts);"),
+            "{}",
+            out.init_calls
+        );
+    }
+
+    /// Flow control only in the forms a `new_blocking*` call takes: RTS on its
+    /// own is a buffered-only form, so the pad is left to its binding.
+    #[test]
+    fn blocking_flow_is_what_a_blocking_constructor_takes() {
+        let rts = usart(|c| c.flow = UsartFlow::Rts);
+        let out = run(PeriphMode::Blocking, V4, &uart_pins(), &rts);
+        let body = file(&out, "usart1.rs");
+        assert!(
+            body.contains("Uart::new_blocking(usart, rx, tx, get_config())"),
+            "{body}"
+        );
+        assert!(!out.consumed_pins.contains(&"PA12".to_owned()));
+
+        let both = usart(|c| c.flow = UsartFlow::CtsRts);
+        let out = run(PeriphMode::Blocking, V4, &uart_pins(), &both);
+        assert!(
+            out.init_calls.contains(
+                "init(p.USART1, pa10_usart1_rx, pa9_usart1_tx, pa12_usart1_rts, pa11_usart1_cts);"
+            ),
+            "{}",
+            out.init_calls
+        );
+        let body = file(&out, "usart1.rs");
+        assert!(
+            body.contains("Uart::new_blocking_with_rtscts(usart, rx, tx, rts, cts, get_config())"),
+            "{body}"
+        );
+    }
+
+    /// usart_v1/v2 have no driver-enable pad, on either runtime: the DE choice
+    /// is dropped in writing rather than emitted as a call that is not there.
+    #[test]
+    fn driver_enable_needs_a_usart_v3() {
+        let de = usart(|c| c.flow = UsartFlow::De);
+        for mode in [PeriphMode::Async, PeriphMode::Blocking] {
+            let out = run(mode, V2, &uart_pins(), &de);
+            assert!(
+                out.init_calls.contains("driver enable is left off"),
+                "{mode:?}: {}",
+                out.init_calls
+            );
+            assert!(!file(&out, "usart1.rs").contains("with_de"), "{mode:?}");
+            assert!(!out.consumed_pins.contains(&"PA12".to_owned()), "{mode:?}");
+
+            let out = run(mode, V4, &uart_pins(), &de);
+            assert!(file(&out, "usart1.rs").contains("_with_de("), "{mode:?}");
+        }
+    }
+
+    /// Half duplex on the RX pad swaps the pads inside the USART, which
+    /// usart_v1/v2 cannot: NOT initialised, and said so, on both runtimes.
+    #[test]
+    fn half_duplex_on_rx_needs_a_usart_v3() {
+        let hd = usart(|c| c.direction = UsartDirection::HalfDuplexOnRx);
+        for mode in [PeriphMode::Async, PeriphMode::Blocking] {
+            let out = run(mode, V2, &uart_pins(), &hd);
+            assert!(
+                out.init_calls
+                    .contains("USART1 is NOT initialised: half duplex on the RX pad"),
+                "{mode:?}: {}",
+                out.init_calls
+            );
+            assert!(out.config_files.is_empty(), "{mode:?}");
+        }
+        let out = run(PeriphMode::Blocking, V4, &uart_pins(), &hd);
+        let body = file(&out, "usart1.rs");
+        assert!(
+            body.contains(
+                "Uart::new_blocking_half_duplex_on_rx(usart, rx, get_config(), HalfDuplexReadback::NoReadback)"
+            ),
+            "{body}"
+        );
+    }
+
+    /// SPI and I2C are the blocking buses whatever the module's async mode,
+    /// with Blocking's own text and no timeout embassy-time would have to run.
+    #[test]
+    fn spi_and_i2c_are_the_blocking_buses_on_blocking() {
+        let pins = [
+            mk("PA5", PinFunction::SpiSck(1)),
+            mk("PA7", PinFunction::SpiMosi(1)),
+            mk("PA6", PinFunction::SpiMiso(1)),
+            mk("PB8", PinFunction::I2cScl(1)),
+            mk("PB9", PinFunction::I2cSda(1)),
+        ];
+        let m = Mods {
+            spi: [(
+                1,
+                SpiModuleConfig {
+                    async_mode: AsyncBusMode::AsyncDma,
+                    ..SpiModuleConfig::new(1)
+                },
+            )]
+            .into(),
+            i2c: [(
+                1,
+                I2cModuleConfig {
+                    async_mode: AsyncBusMode::AsyncDma,
+                    timeout_ms: 50,
+                    ..I2cModuleConfig::new(1)
+                },
+            )]
+            .into(),
+            ..Mods::default()
+        };
+        let out = run(PeriphMode::Blocking, V4, &pins, &m);
+        assert!(
+            out.init_calls.contains(
+                "pins::configs::spi1::init(p.SPI1, pa5_spi1_sck, pa7_spi1_mosi, pa6_spi1_miso);"
+            ),
+            "{}",
+            out.init_calls
+        );
+        assert!(
+            out.init_calls
+                .contains("pins::configs::i2c1::init(p.I2C1, pb8_i2c1_scl, pb9_i2c1_sda);"),
+            "{}",
+            out.init_calls
+        );
+        assert!(out.dma_irqs.is_empty() && !out.any_async_dma);
+        let spi = file(&out, "spi1.rs");
+        assert!(
+            spi.contains("Spi::new_blocking(spi, sck, mosi, miso, get_config())"),
+            "{spi}"
+        );
+        assert!(
+            spi.contains(
+                "// `init` returns a STANDARD `embedded-hal` 1.0 `SpiBus<u8>` (BLOCKING).\n//\n"
+            ),
+            "{spi}"
+        );
+        assert!(!spi.contains("async"), "{spi}");
+        let i2c = file(&out, "i2c1/mod.rs");
+        assert!(
+            i2c.contains("I2c::new_blocking(i2c, scl, sda, get_config())"),
+            "{i2c}"
+        );
+        assert!(
+            i2c.contains("The module's 50 ms timeout is not applied"),
+            "{i2c}"
+        );
+        assert!(!i2c.contains("embassy_time"), "{i2c}");
+        assert!(!i2c.contains("async"), "{i2c}");
+
+        // The Async runtime keeps its text, word for word.
+        let out = run(PeriphMode::Async, V4, &pins, &Mods::default());
+        let spi = file(&out, "spi1.rs");
+        assert!(
+            spi.contains("(BLOCKING). A blocking\n// bus in an async project"),
+            "{spi}"
+        );
+        assert!(
+            spi.contains("// ── Using SPI1 ──\n// Blocking init inside an async project"),
+            "{spi}"
+        );
+    }
+
+    /// SAI, I2S and SDMMC are async in embassy: NOT initialised on Blocking,
+    /// with the reason where the init would be, and their pads left bound.
+    #[test]
+    fn async_only_peripherals_say_why_on_blocking() {
+        let pins = [
+            mk("PB13", PinFunction::I2sCk(2)),
+            mk("PB12", PinFunction::I2sWs(2)),
+            mk("PB15", PinFunction::I2sSd(2)),
+            mk("PE5", PinFunction::SaiSck { sai: 1, block: 1 }),
+            mk("PE6", PinFunction::SaiSd { sai: 1, block: 1 }),
+            mk("PE4", PinFunction::SaiFs { sai: 1, block: 1 }),
+            mk("PC12", PinFunction::SdmmcCk { unit: 1 }),
+            mk("PD2", PinFunction::SdmmcCmd { unit: 1 }),
+            mk("PC8", PinFunction::SdmmcD { unit: 1, lane: 0 }),
+        ];
+        let out = run(PeriphMode::Blocking, V4, &pins, &Mods::default());
+        for what in [
+            "I2S2 is NOT initialised",
+            "SAI1 is NOT initialised",
+            "SDMMC1 is NOT initialised",
+        ] {
+            assert!(out.init_calls.contains(what), "{what}: {}", out.init_calls);
+        }
+        assert!(out.config_files.is_empty(), "{:?}", out.config_files);
+        assert!(out.consumed_pins.is_empty(), "{:?}", out.consumed_pins);
+        assert!(out.dma_irqs.is_empty(), "{}", out.dma_irqs);
+    }
+
+    /// No embassy-time on Blocking, so the timer `time-driver-any` would take
+    /// is the PWM's like any other.
+    #[test]
+    fn the_time_driver_timer_is_free_on_blocking() {
+        let pins = [mk(
+            "PB6",
+            PinFunction::TimerPwm {
+                timer: 4,
+                channel: 1,
+            },
+        )];
+        let out = run(PeriphMode::Async, V4, &pins, &Mods::default());
+        assert!(
+            out.init_calls.contains("TIM4 is NOT initialised"),
+            "{}",
+            out.init_calls
+        );
+        let out = run(PeriphMode::Blocking, V4, &pins, &Mods::default());
+        assert!(
+            out.init_calls
+                .contains("let mut _pwm4 = pins::configs::pwm4::init(p.TIM4, pb6_tim4_ch1);"),
+            "{}",
+            out.init_calls
+        );
+    }
+
+    /// A module kept raw generates no driver, on either runtime: its pads stay
+    /// the labelled bindings, and main.rs says the switch is off.
+    #[test]
+    fn a_raw_module_generates_no_driver() {
+        let m = Mods {
+            raw: [(ModuleKind::GenericInterfaceUsart, 1)].into(),
+            ..Mods::default()
+        };
+        for mode in [PeriphMode::Async, PeriphMode::Blocking] {
+            let out = run(mode, V4, &uart_pins(), &m);
+            assert!(
+                out.init_calls
+                    .contains("USART1 is NOT initialised: its module's \"Generate driver\" is off"),
+                "{mode:?}: {}",
+                out.init_calls
+            );
+            assert!(out.config_files.is_empty(), "{mode:?}");
+            assert!(out.consumed_pins.is_empty(), "{mode:?}");
+            assert!(out.dma_irqs.is_empty(), "{mode:?}: {}", out.dma_irqs);
+        }
+    }
+
+    /// The buffered transport has no half - embassy's `BufferedUart` takes
+    /// both pads - so a one-way UART picked on Blocking, which reads no
+    /// transport, is refused on Async in writing rather than emitted with a
+    /// pad parameter its constructor names and `init` does not have.
+    #[test]
+    fn a_buffered_one_way_uart_is_refused_on_async() {
+        for dir in [UsartDirection::TxOnly, UsartDirection::RxOnly] {
+            let buffered = usart(|c| {
+                c.mode = UsartMode::Buffered;
+                c.direction = dir;
+            });
+            let out = run(PeriphMode::Async, V4, &uart_pins(), &buffered);
+            assert!(
+                out.init_calls.contains(
+                    "USART1 is NOT initialised: the buffered transport has no one-way half"
+                ),
+                "{dir:?}: {}",
+                out.init_calls
+            );
+            assert!(out.config_files.is_empty(), "{dir:?}");
+            // The same pick on Blocking is built.
+            let out = run(PeriphMode::Blocking, V4, &uart_pins(), &buffered);
+            assert!(out.init_calls.contains("usart1::init("), "{dir:?}");
+        }
     }
 }

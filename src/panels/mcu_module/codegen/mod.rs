@@ -38,8 +38,8 @@ use super::mcu::{Mcu, Runtime};
 // Re-export public API for backward compatibility
 pub use common::{
     AUTOGEN_BANNER, GEN_BEGIN, GEN_END, LEGACY_AUTOGEN_BANNER, MCU_ID_MARKER, USER_TAIL,
-    mcu_id_marker_line, parse_main_rs, parse_mcu_id, parse_pin_labels, pin_binding, sanitize_label,
-    var_suffix,
+    mcu_id_marker_line, parse_driver_inits, parse_main_rs, parse_mcu_id, parse_pin_labels,
+    pin_binding, sanitize_label, var_suffix,
 };
 
 /// Type-parameter name for a pin in a Custom module's struct: the pin's own name
@@ -351,6 +351,209 @@ impl Mcu {
         true
     }
 
+    /// Give back the pads an old Async project's driver inits name, as listed by
+    /// [`common::parse_driver_inits`]: each pad that came back Unset takes the
+    /// function it offers for that driver's peripheral - `PA10` in `usart1`'s
+    /// call is USART1's RX, the one USART1 function the pad has. Run right
+    /// after the pins are restored, before anything reconciles the modules, so
+    /// the saved Virtual Modules (and their settings) find their pads again.
+    ///
+    /// A pad offering two functions of that peripheral takes the first one
+    /// the others have not taken; a pad offering none - a different chip, a
+    /// call the user edited - stays Unset.
+    pub fn recover_driver_pins(&mut self, inits: &[(String, Vec<String>)]) {
+        use crate::panels::mcu_module::modules::{ModuleKind as K, module_signal_of};
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+        for (stem, pads) in inits {
+            let digits = stem.len() - stem.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+            let (word, n) = stem.split_at(stem.len() - digits);
+            let n: u8 = if n.is_empty() {
+                1
+            } else {
+                n.parse().unwrap_or(0)
+            };
+            let kind = match word {
+                "usart" => K::GenericInterfaceUsart,
+                "lpuart" => K::GenericInterfaceLpuart,
+                "spi" => K::GenericInterfaceSpi,
+                "i2c" => K::GenericInterfaceI2c,
+                "pwm" => K::GenericInterfaceTimer,
+                "dac" => K::GenericInterfaceDac,
+                "qspi" => K::GenericInterfaceQspi,
+                "ospi" => K::GenericInterfaceOspi,
+                "xspi" => K::GenericInterfaceXspi,
+                "hspi" => K::GenericInterfaceHspi,
+                "sd" => K::GenericInterfaceSdmmc,
+                "sai" => K::GenericInterfaceSai,
+                "i2s" => K::GenericInterfaceI2s,
+                // A comparator is no module: its pads are `COMP{n}_INP` then
+                // `COMP{n}_INM`, in that order in the call.
+                "comp" => {
+                    for (pad, suffix) in pads.iter().zip(["INP", "INM"]) {
+                        let Some(pin) = self
+                            .iter_all_pins_mut()
+                            .find(|p| !p.reserved && p.name == *pad)
+                        else {
+                            continue;
+                        };
+                        if pin.selected_function != PinFunction::Unset {
+                            continue;
+                        }
+                        let f = pin.available_functions.iter().find(|f| {
+                            matches!(f, PinFunction::Other(s)
+                                if crate::panels::mcu_module::comparator::instance_of_signal(s, suffix) == Some(n))
+                        });
+                        if let Some(f) = f.cloned() {
+                            pin.selected_function = f;
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            // The signal each pad had, from the module `@modules` restored:
+            // nothing has reconciled it against the (still bare) pins yet, so
+            // its connections are the ones saved with the project.
+            let saved: Vec<(usize, crate::panels::mcu_module::modules::ModuleSignal)> = self
+                .modules
+                .iter()
+                .filter(|m| !m.kind.is_custom() && m.kind == kind && m.instance() == n)
+                .flat_map(|m| m.connections.iter().map(|c| (c.mcu_pin, c.signal)))
+                .collect();
+            for pad in pads {
+                // The signals this peripheral's other pads already hold.
+                let taken: Vec<_> = self
+                    .iter_all_pins()
+                    .filter_map(|p| module_signal_of(&p.selected_function))
+                    .filter(|(k, i, _)| *k == kind && *i == n)
+                    .map(|(_, _, s)| s)
+                    .collect();
+                let Some(pin) = self.iter_all_pins_mut().find(|p| {
+                    !p.reserved
+                        && (p.name == *pad
+                            || p.available_functions.iter().any(|f| p.gpio_for(f) == pad))
+                }) else {
+                    continue;
+                };
+                if pin.selected_function != PinFunction::Unset {
+                    continue;
+                }
+                let number = pin.number;
+                let mut candidates: Vec<&PinFunction> = pin
+                    .available_functions
+                    .iter()
+                    .filter(|f| pin.gpio_for(f) == pad)
+                    .filter(|f| {
+                        module_signal_of(f)
+                            .is_some_and(|(k, i, s)| k == kind && i == n && !taken.contains(&s))
+                    })
+                    .collect();
+                // A pad offering two signals of one timer (PA11: BKIN2, CH1N
+                // and CH4 on a G4) is the case the vendor's alphabetical order
+                // gets wrong: a plain channel before its complement, both
+                // before a break - the old emitter refused a complement on a
+                // timer `ComplementaryPwm` does not cover, so it never passed
+                // one there.
+                let rank = |f: &PinFunction| match f {
+                    PinFunction::TimerPwm { .. } => 0,
+                    PinFunction::TimerPwmN { timer, .. }
+                        if embassy_stm32::is_advanced_timer(*timer) =>
+                    {
+                        1
+                    }
+                    PinFunction::TimerPwmN { .. } => 3,
+                    PinFunction::TimerBreak { .. } => 2,
+                    _ => 0,
+                };
+                candidates.sort_by_key(|f| rank(f));
+                let by_module = candidates.iter().find(|f| {
+                    module_signal_of(f).is_some_and(|(_, _, s)| saved.contains(&(number, s)))
+                });
+                let f = by_module.or(candidates.first()).map(|f| (*f).clone());
+                if let Some(f) = f {
+                    pin.selected_function = f;
+                }
+            }
+        }
+    }
+
+    /// The modules whose pads this project's OWN code already takes: the text
+    /// below main.rs's generated block names a pad's binding (`pa9_usart1_tx`)
+    /// or the peripheral itself (`p.USART1`).
+    ///
+    /// Asked once, when a project saved before the Blocking runtime generated
+    /// drivers is opened - it has no `@drivers` section. Its raw bindings were
+    /// the only way to a bus, so code that wires one by hand is normal there,
+    /// and a driver taking those pads first would break it (E0382). Those
+    /// modules start with "Generate driver" off (`Mcu::raw_modules`). Every
+    /// other one generates, which is what a new project does.
+    ///
+    /// Only the embassy STM32 families: the F1's Blocking backend has always
+    /// generated its drivers, and the others read no switch.
+    pub fn modules_used_by_hand(
+        &self,
+        main_rs: &str,
+    ) -> std::collections::BTreeSet<crate::panels::mcu_module::modules::NotesKey> {
+        let mut used = std::collections::BTreeSet::new();
+        if !self.family.starts_with("stm32") || self.family == "stm32f1" {
+            return used;
+        }
+        let Some(end) = main_rs.find(GEN_END) else {
+            return used;
+        };
+        let code = common::code_only(&main_rs[end + GEN_END.len()..]);
+        // `p.USART1`, not a bare `USART1`: a register block of the same name
+        // from the PAC is not this peripheral's singleton.
+        let names_peripheral = |name: &str| {
+            code.match_indices(&format!("p.{name}")).any(|(at, hit)| {
+                let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                let before = code[..at].chars().next_back().is_none_or(|c| !ident(c));
+                let after = code[at + hit.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !ident(c));
+                before && after
+            })
+        };
+        for m in self.modules.iter().filter(|m| !m.kind.is_custom()) {
+            let n = m.instance();
+            let singletons = embassy_stm32::driver_singletons(m.kind, n);
+            if singletons.is_empty() {
+                continue;
+            }
+            let by_pad = m
+                .connections
+                .iter()
+                .filter_map(|c| self.find_pin(c.mcu_pin))
+                .any(|p| common::has_ident(&code, &embassy_common::binding_var(p)));
+            if by_pad || singletons.iter().any(|s| names_peripheral(s)) {
+                used.insert((m.kind, n));
+            }
+        }
+        // A PWM pad the old block moved into a Custom module's struct: that
+        // timer was wired by hand too, through `Struct::new(pa8_tim1_ch1)`
+        // in the block rather than in the user's own code. Keyed by the
+        // pad's timer, as the PWM pass checks it.
+        for m in self.modules.iter().filter(|m| m.kind.is_custom()) {
+            let crate::panels::mcu_module::modules::ModuleConfig::Custom(cfg) = &m.config else {
+                continue;
+            };
+            for p in cfg.applied_pins.iter().filter_map(|n| self.find_pin(*n)) {
+                if let crate::panels::mcu_module::pins::logic::pin_function::PinFunction::TimerPwm {
+                    timer,
+                    ..
+                } = p.selected_function
+                {
+                    used.insert((
+                        crate::panels::mcu_module::modules::ModuleKind::GenericInterfaceTimer,
+                        timer,
+                    ));
+                }
+            }
+        }
+        used
+    }
+
     /// `let <name> = <Struct>::new(<pin bindings…>);` for every Custom module —
     /// the lines spliced into main.rs's generated section, right after the pin
     /// bindings the call consumes.
@@ -359,12 +562,23 @@ impl Mcu {
     /// GPIO In/Out and PWM. A peripheral pin (USART TX, SPI SCK…) is moved into
     /// its `pins::configs::*::init(…)` call, so handing it to a custom struct
     /// too would not compile — those modules get a commented line explaining it
-    /// instead of code that breaks the build.
+    /// instead of code that breaks the build. So is a PWM pad on embassy, whose
+    /// timer module is a driver too (`FamilyBackend::driver_pins`).
     pub fn custom_module_inits(&self) -> String {
         use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
         use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
         let mut out = String::new();
-        for m in self.modules.iter().filter(|m| m.kind == ModuleKind::Custom) {
+        let customs = || self.modules.iter().filter(|m| m.kind == ModuleKind::Custom);
+        // Asked only when there is a Custom module: on embassy it runs the
+        // whole peripheral pass.
+        let driven = if customs().next().is_some() {
+            self.backend()
+                .map(|b| b.driver_pins(self))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for m in customs() {
             let ModuleConfig::Custom(cfg) = &m.config else {
                 continue;
             };
@@ -390,10 +604,38 @@ impl Mcu {
                         PinFunction::GpioInput
                             | PinFunction::GpioOutput
                             | PinFunction::TimerPwm { .. }
-                    )
+                    ) || driven.iter().any(|d| d == p.gpio())
                 })
                 .map(|p| p.name.as_str())
                 .collect();
+            // A PWM pad is refused only because a generated timer driver
+            // takes it, and the way out is that timer's own switch.
+            let driven_pwm: Vec<u8> = pins
+                .iter()
+                .filter(|p| driven.iter().any(|d| d == p.gpio()))
+                .filter_map(|p| match p.selected_function {
+                    PinFunction::TimerPwm { timer, .. } => Some(timer),
+                    _ => None,
+                })
+                .collect();
+            let timers: std::collections::BTreeSet<u8> = driven_pwm.iter().copied().collect();
+            if !taken.is_empty() && driven_pwm.len() == taken.len() {
+                let names: Vec<String> = timers.iter().map(|t| format!("TIM{t}")).collect();
+                out.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!(
+                        "Custom module `{var}` not built here: {} {} driven by the generated \
+                         PWM of {}, so {} cannot also be moved into `{struct_name}`. Switch \
+                         that timer's \"Generate driver\" off to hand {} to the module.",
+                        taken.join(", "),
+                        if taken.len() == 1 { "is" } else { "are" },
+                        names.join(", "),
+                        if taken.len() == 1 { "it" } else { "they" },
+                        if taken.len() == 1 { "it" } else { "them" },
+                    ),
+                    "    ",
+                ));
+                continue;
+            }
             if !taken.is_empty() {
                 out.push_str(&format!(
                     "    // Custom module `{var}` not built here: {} {} owned by a \
@@ -1924,7 +2166,7 @@ mod tests {
 ";
 
         // Blocking embassy (non-F1 STM32).
-        let blocking = embassy_common::make_generated_section("X", &pins, "", line, &[]);
+        let blocking = embassy_common::make_generated_section("X", &pins, "", "", line, &[]);
         assert!(
             blocking.contains(line),
             "embassy blocking:
@@ -2036,6 +2278,51 @@ mod tests {
         assert!(main.contains("Knob::new(pa0_in"), "{main}");
         // The stored edge is the user's; only the generator looks past it.
         assert_eq!(mcu.find_pin(10).unwrap().irq, Some(Edge::Rising));
+    }
+
+    /// A PWM pad goes into a Custom module where main.rs binds it on its own -
+    /// stm32f1xx-hal on Blocking - and not where a generated timer driver takes
+    /// it: embassy's `SimplePwm` on Async moves the pad first (E0382).
+    #[test]
+    fn a_pwm_pad_a_timer_driver_takes_stays_out_of_a_custom_module() {
+        use super::super::mock_mcu;
+        use crate::panels::mcu_module::mcu::Runtime;
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+
+        let mut mcu = mock_mcu::create_stm32f103c8tx();
+        let pa8 = mcu
+            .iter_all_pins()
+            .find(|p| p.name == "PA8")
+            .map(|p| p.number)
+            .expect("PA8");
+        mcu.apply_pin_function(
+            pa8,
+            PinFunction::TimerPwm {
+                timer: 1,
+                channel: 1,
+            },
+        );
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .unwrap();
+        *m.config.custom_label_mut() = "motor".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = vec![pa8];
+            c.applied_pins = c.pins.clone();
+        }
+
+        let inits = mcu.custom_module_inits();
+        assert!(
+            inits.contains("Motor::new(") && !inits.contains("not built here"),
+            "F1 Blocking binds the pad on its own:\n{inits}"
+        );
+        mcu.runtime = Runtime::Async;
+        let inits = mcu.custom_module_inits();
+        assert!(inits.contains("not built here"), "{inits}");
+        assert!(!inits.contains("Motor::new("), "{inits}");
     }
 
     /// A pin owned by a peripheral init is MOVED there, so it can't also go into
@@ -2691,5 +2978,383 @@ mod public_constants {
                 "wwdg.rs"
             ]
         );
+    }
+}
+
+/// The "Generate driver" switch (`Mcu::raw_modules`), and the two ways an
+/// older project's pads come back: the modules its code wires by hand start
+/// raw, and an old Async project's pads are read out of its init calls.
+#[cfg(test)]
+mod driver_switch_tests {
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::mcu_config;
+    use crate::panels::mcu_module::modules::ModuleKind;
+    use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+
+    /// The F103's pin data under an STM32F411's family: an embassy part.
+    fn f411(runtime: Runtime, wire: &[(&str, PinFunction)]) -> Mcu {
+        let mut def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        def.id = "stm32f411re".into();
+        def.display_name = "STM32F411RETx".into();
+        def.family = "stm32f4".into();
+        let mut mcu = def.build_mcu();
+        mcu.runtime = runtime;
+        mcu.pending_runtime = runtime;
+        for (name, f) in wire {
+            let n = mcu
+                .iter_all_pins()
+                .find(|p| p.name == *name)
+                .map(|p| p.number)
+                .unwrap_or_else(|| panic!("no {name}"));
+            mcu.apply_pin_function(n, f.clone());
+        }
+        mcu.reconcile_modules();
+        mcu
+    }
+
+    fn usart_and_spi(runtime: Runtime) -> Mcu {
+        f411(
+            runtime,
+            &[
+                ("PA9", PinFunction::UsartTx(1)),
+                ("PA10", PinFunction::UsartRx(1)),
+                ("PA5", PinFunction::SpiSck(1)),
+                ("PA7", PinFunction::SpiMosi(1)),
+                ("PA6", PinFunction::SpiMiso(1)),
+            ],
+        )
+    }
+
+    /// Off: no driver file, no init, the pads still bound - and main.rs says
+    /// why where the init would be.
+    #[test]
+    fn a_module_switched_off_generates_no_driver() {
+        let mut mcu = usart_and_spi(Runtime::Blocking);
+        mcu.raw_modules
+            .insert((ModuleKind::GenericInterfaceUsart, 1));
+        let code = mcu.fresh_main_rs();
+        assert!(code.contains("USART1 is NOT initialised"), "{code}");
+        assert!(!code.contains("pins::configs::usart1::init("), "{code}");
+        assert!(
+            code.contains("let pa9_usart1_tx = p.PA9; // USART1  TX"),
+            "{code}"
+        );
+        assert!(code.contains("pins::configs::spi1::init("), "{code}");
+        let files = mcu.config_files();
+        assert!(!files.iter().any(|(n, _)| n == "usart1.rs"), "{files:?}");
+        assert!(files.iter().any(|(n, _)| n == "spi1.rs"));
+    }
+
+    /// `@drivers` is written on every STM32, empty or not - its presence is
+    /// the marker - and reads back the same set.
+    #[test]
+    fn the_switches_round_trip_through_mcu_config() {
+        let mut mcu = usart_and_spi(Runtime::Blocking);
+        let text = mcu.mcu_config_text();
+        assert_eq!(
+            mcu_config::parse_drivers(&text),
+            Some(Default::default()),
+            "{text}"
+        );
+
+        mcu.raw_modules.insert((ModuleKind::GenericInterfaceSpi, 1));
+        let text = mcu.mcu_config_text();
+        assert!(
+            text.contains("@drivers\nraw GenericInterfaceSpi 1\n"),
+            "{text}"
+        );
+        let mut back = usart_and_spi(Runtime::Blocking);
+        back.apply_mcu_config(&text);
+        assert_eq!(back.raw_modules, mcu.raw_modules);
+
+        // A project from before the section: the marker is missing, and every
+        // module generates until the open path says otherwise.
+        assert_eq!(mcu_config::parse_drivers("@runtime\nblocking\n"), None);
+        back.apply_mcu_config("@runtime\nblocking\n");
+        assert!(back.raw_modules.is_empty());
+    }
+
+    /// An older Blocking project wired its buses by hand from the raw bindings;
+    /// those modules start raw, so that code still compiles. A comment or a
+    /// string naming the binding is not use, and neither is the generated
+    /// block itself.
+    #[test]
+    fn the_modules_a_projects_code_wires_by_hand_start_raw() {
+        let mcu = usart_and_spi(Runtime::Blocking);
+        let old = mcu.fresh_main_rs();
+        let with = |tail: &str| format!("{old}{tail}");
+
+        let used = mcu.modules_used_by_hand(&with(
+            "fn wire(p: P) {\n    let u = Uart::new_blocking(p.USART1, pa10_usart1_rx, pa9_usart1_tx, cfg);\n}\n",
+        ));
+        assert!(
+            used.contains(&(ModuleKind::GenericInterfaceUsart, 1)),
+            "{used:?}"
+        );
+        assert!(
+            !used.contains(&(ModuleKind::GenericInterfaceSpi, 1)),
+            "{used:?}"
+        );
+
+        let used = mcu.modules_used_by_hand(&with("    let spi = make(p.SPI1);\n"));
+        assert!(
+            used.contains(&(ModuleKind::GenericInterfaceSpi, 1)),
+            "{used:?}"
+        );
+
+        for not_use in [
+            "    // pa9_usart1_tx goes to the GPS\n",
+            "    let s = \"pa9_usart1_tx\";\n",
+            "    let pa9_usart1_tx2 = 0;\n",
+            "    let q = p.SPI10;\n",
+        ] {
+            let used = mcu.modules_used_by_hand(&with(not_use));
+            assert!(used.is_empty(), "{not_use:?} -> {used:?}");
+        }
+        // The generated block alone uses nothing.
+        assert!(mcu.modules_used_by_hand(&old).is_empty());
+
+        // The F1's Blocking backend has always generated its drivers.
+        let mut f1 = usart_and_spi(Runtime::Blocking);
+        f1.family = "stm32f1".into();
+        assert!(
+            f1.modules_used_by_hand(&with("    let x = pa9_usart1_tx;\n"))
+                .is_empty()
+        );
+    }
+
+    /// An Async project from before phase 3 handed its drivers `p.PA10` and
+    /// bound no such pad: the init calls are where they come back from.
+    #[test]
+    fn an_old_async_projects_driver_pads_come_back_from_its_init_calls() {
+        let old = "\
+// <<< GENERATED BEGIN — do not edit between these markers >>>
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let p = embassy_stm32::init(Default::default());
+
+    let mut pc13_out = Output::new(p.PC13, Level::Low, Speed::Low); // GPIO Output
+
+    // ── Peripheral initialisation ──
+    let mut _serial1 = pins::configs::usart1::init(p.USART1, p.PA10, p.PA9, Irqs);
+    let mut _spi1 = pins::configs::spi1::init(p.SPI1, p.PA5, p.PA7, p.PA6);
+    // let mut _x = pins::configs::i2c1::init(p.I2C1, p.PB6, p.PB7);
+// <<< GENERATED END >>>
+";
+        let inits = super::parse_driver_inits(old);
+        assert_eq!(
+            inits,
+            [
+                (
+                    "usart1".to_owned(),
+                    vec!["PA10".to_owned(), "PA9".to_owned()]
+                ),
+                (
+                    "spi1".to_owned(),
+                    vec!["PA5".to_owned(), "PA7".to_owned(), "PA6".to_owned()]
+                ),
+            ]
+        );
+        let saved = super::parse_main_rs(old);
+        let mut mcu = f411(Runtime::Async, &[]);
+        mcu.apply_saved_pins(&saved);
+        mcu.recover_driver_pins(&inits);
+        let f = |name: &str| {
+            mcu.iter_all_pins()
+                .find(|p| p.name == name)
+                .map(|p| p.selected_function.clone())
+                .unwrap()
+        };
+        assert_eq!(f("PC13"), PinFunction::GpioOutput);
+        assert_eq!(f("PA10"), PinFunction::UsartRx(1));
+        assert_eq!(f("PA9"), PinFunction::UsartTx(1));
+        assert_eq!(f("PA5"), PinFunction::SpiSck(1));
+        assert_eq!(f("PA7"), PinFunction::SpiMosi(1));
+        assert_eq!(f("PA6"), PinFunction::SpiMiso(1));
+        assert_eq!(
+            f("PB6"),
+            PinFunction::Unset,
+            "a commented-out call is not one"
+        );
+
+        // And the project the IDE writes now reads back from its own lines.
+        let now = mcu.fresh_main_rs();
+        assert!(super::parse_driver_inits(&now).is_empty(), "{now}");
+        let back = super::parse_main_rs(&now);
+        for (name, func) in [
+            ("PA10", PinFunction::UsartRx(1)),
+            ("PA5", PinFunction::SpiSck(1)),
+        ] {
+            assert!(
+                back.contains(&(name.to_owned(), func.clone())),
+                "{name}: {back:?}"
+            );
+        }
+
+        // `saved_pins` has something to apply even when no pad has a line.
+        let only_drivers = old.replace(
+            "    let mut pc13_out = Output::new(p.PC13, Level::Low, Speed::Low); // GPIO Output\n",
+            "",
+        );
+        assert!(super::parse_main_rs(&only_drivers).is_empty());
+        assert!(mcu_config::saved_pins(None, &only_drivers).is_some());
+    }
+}
+
+/// What the adversarial review of phase 3 found on the way in from an older
+/// project: a PWM pad a Custom module took, a pad offering two signals of one
+/// timer, and a project with nothing a switch could decide.
+#[cfg(test)]
+mod upgrade_edge_tests {
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+    use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+
+    fn f411(wire: &[(&str, PinFunction)]) -> Mcu {
+        let mut def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        def.id = "stm32f411re".into();
+        def.display_name = "STM32F411RETx".into();
+        def.family = "stm32f4".into();
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+        for (name, f) in wire {
+            let n = mcu
+                .iter_all_pins()
+                .find(|p| p.name == *name)
+                .map(|p| p.number)
+                .unwrap_or_else(|| panic!("no {name}"));
+            mcu.apply_pin_function(n, f.clone());
+        }
+        mcu.reconcile_modules();
+        mcu
+    }
+
+    fn number(mcu: &Mcu, name: &str) -> usize {
+        mcu.iter_all_pins()
+            .find(|p| p.name == name)
+            .map(|p| p.number)
+            .unwrap_or_else(|| panic!("no {name}"))
+    }
+
+    /// Before phase 3 a PWM pad was the way to hand a timer channel to a
+    /// Custom module on embassy Blocking: the block built `Motor::new(pa8_..)`
+    /// and the user's code named only `motor`. Opened now, that timer stays
+    /// raw, so the Custom module is still built; a new project is told to
+    /// switch the timer's driver off instead.
+    #[test]
+    fn a_pwm_pad_an_old_custom_module_took_keeps_its_timer_raw() {
+        let mut mcu = f411(&[(
+            "PA8",
+            PinFunction::TimerPwm {
+                timer: 1,
+                channel: 1,
+            },
+        )]);
+        let pa8 = number(&mcu, "PA8");
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .unwrap();
+        *m.config.custom_label_mut() = "motor".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = vec![pa8];
+            c.applied_pins = c.pins.clone();
+        }
+        let timer = (ModuleKind::GenericInterfaceTimer, 1);
+
+        // A new project: the timer generates, and the refusal names its switch.
+        let inits = mcu.custom_module_inits();
+        assert!(inits.contains("Generate driver"), "{inits}");
+        assert!(!inits.contains("Use GPIO In/Out or PWM pins"), "{inits}");
+
+        // The old project, as the block was then: the pad raw, the struct built.
+        mcu.raw_modules.insert(timer);
+        let old = format!("{}    motor.start();\n", mcu.fresh_main_rs());
+        assert!(old.contains("Motor::new("), "{old}");
+        mcu.raw_modules.clear();
+        let used = mcu.modules_used_by_hand(&old);
+        assert!(used.contains(&timer), "{used:?}");
+        mcu.raw_modules = used;
+        let now = mcu.update_main_rs(&old);
+        assert!(now.contains("Motor::new("), "{now}");
+        assert!(!now.contains("pins::configs::pwm1::init("), "{now}");
+    }
+
+    /// A pad offering two signals of one timer takes the one its saved module
+    /// wired, not the vendor's alphabetical first - and without a module, an
+    /// output before its complement, both before a break.
+    #[test]
+    fn a_pad_with_two_signals_of_one_timer_comes_back_as_it_was_wired() {
+        let shared = [
+            PinFunction::TimerBreak { timer: 1, input: 2 },
+            PinFunction::TimerPwmN {
+                timer: 1,
+                channel: 1,
+            },
+            PinFunction::TimerPwm {
+                timer: 1,
+                channel: 4,
+            },
+        ];
+        for wired in [
+            PinFunction::TimerPwm {
+                timer: 1,
+                channel: 4,
+            },
+            PinFunction::TimerPwmN {
+                timer: 1,
+                channel: 1,
+            },
+        ] {
+            let mut mcu = f411(&[]);
+            let pa11 = number(&mcu, "PA11");
+            if let Some(p) = mcu.find_pin_mut(pa11) {
+                p.available_functions = shared.to_vec();
+            }
+            mcu.apply_pin_function(pa11, wired.clone());
+            mcu.reconcile_modules();
+            // The open: pads reset, the saved module still holding its wire.
+            mcu.apply_saved_pins(&[]);
+            mcu.recover_driver_pins(&[("pwm1".to_owned(), vec!["PA11".to_owned()])]);
+            assert_eq!(mcu.find_pin(pa11).unwrap().selected_function, wired);
+        }
+
+        let mut mcu = f411(&[]);
+        let pa11 = number(&mcu, "PA11");
+        if let Some(p) = mcu.find_pin_mut(pa11) {
+            p.available_functions = shared.to_vec();
+        }
+        mcu.recover_driver_pins(&[("pwm1".to_owned(), vec!["PA11".to_owned()])]);
+        assert_eq!(
+            mcu.find_pin(pa11).unwrap().selected_function,
+            PinFunction::TimerPwm {
+                timer: 1,
+                channel: 4
+            },
+            "no module: the output, not the break"
+        );
+    }
+
+    /// A project with no module a driver exists for writes no `@drivers`: it
+    /// round-trips as it did before the switch, and a rescan could find
+    /// nothing in it anyway.
+    #[test]
+    fn a_project_without_driver_modules_writes_no_marker() {
+        let mcu = f411(&[("PC13", PinFunction::GpioOutput)]);
+        assert!(
+            !mcu.mcu_config_text().contains("@drivers"),
+            "{}",
+            mcu.mcu_config_text()
+        );
+        let mcu = f411(&[
+            ("PA9", PinFunction::UsartTx(1)),
+            ("PA10", PinFunction::UsartRx(1)),
+        ]);
+        assert!(mcu.mcu_config_text().contains("@drivers"));
     }
 }

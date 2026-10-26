@@ -304,9 +304,10 @@ mod hspi_tests {
         // clock, then IO0..IO7, then the chip select, then the strobe — the
         // order embassy declares the arguments in.
         let want = concat!(
-            "pins::configs::hspi1::init(p.HSPI1, p.PA1,",
-            " p.PB0, p.PB1, p.PB2, p.PB3, p.PB4, p.PB5, p.PB6, p.PB7,",
-            " p.PA2, p.PC0);"
+            "pins::configs::hspi1::init(p.HSPI1, pa1_hspi1_clk,",
+            " pb0_hspi1_io0, pb1_hspi1_io1, pb2_hspi1_io2, pb3_hspi1_io3,",
+            " pb4_hspi1_io4, pb5_hspi1_io5, pb6_hspi1_io6, pb7_hspi1_io7,",
+            " pa2_hspi1_ncs, pc0_hspi1_dqs0);"
         );
         assert!(out.init_calls.contains(want), "{}", out.init_calls);
     }

@@ -1356,7 +1356,7 @@ fn user_regions(file: &str) -> (&str, &str) {
 /// (nested) - and its string and char literals emptied, its line breaks
 /// kept: what is left is the code's shape. A `/*` or a `//` inside a literal
 /// (an `Accept: */*` header, a URL) is text, not a comment.
-fn code_only(text: &str) -> String {
+pub(super) fn code_only(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let mut depth = 0usize;
@@ -2301,7 +2301,7 @@ fn item_text(body: &str, ident: &str) -> Option<String> {
 
 /// Whether `ident` occurs in `text` as a whole identifier - not as the tail of
 /// `on_p0_14_in_edge_old`, nor the head of `on_p0_14_in_edge2`.
-fn has_ident(text: &str, ident: &str) -> bool {
+pub(super) fn has_ident(text: &str, ident: &str) -> bool {
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     text.match_indices(ident).any(|(at, _)| {
         let before = text[..at].chars().next_back().is_none_or(|c| !is_ident(c));
@@ -2702,6 +2702,57 @@ pub fn parse_pin_labels(source: &str) -> Vec<(String, String)> {
 /// `;`. Without this, every USART/SPI/I2C pin on an ESP project was lost on
 /// reload: `apply_saved_pins` clears the diagram and re-applies only what parsed
 /// here, so an unparsed pin comes back Unset and its Virtual Module unwired.
+/// The driver inits of an embassy `main.rs` generated block, as `(config
+/// module, GPIO pads)`: `pins::configs::usart1::init(p.USART1, p.PA10, p.PA9,
+/// Irqs)` is `("usart1", ["PA10", "PA9"])`.
+///
+/// Before phase 3 the Async runtime handed every driver its pads as `p.PXn`
+/// and bound none of them, so the pads had no labelled line for
+/// [`parse_main_rs`] to read and came back Unset on every open. These calls
+/// are all such a project says about them - `Mcu::recover_driver_pins` turns
+/// them back into pin functions. A pad handed by its binding, as every driver
+/// is now, is not listed: its own `let` line restores it.
+pub fn parse_driver_inits(source: &str) -> Vec<(String, Vec<String>)> {
+    let (Some(begin), Some(end)) = (source.find(GEN_BEGIN), source.find(GEN_END)) else {
+        return Vec::new();
+    };
+    if begin >= end {
+        return Vec::new();
+    }
+    let is_gpio = |s: &str| {
+        let mut c = s.chars();
+        c.next() == Some('P')
+            && c.next().is_some_and(|port| port.is_ascii_uppercase())
+            && !s[2..].is_empty()
+            && s[2..].chars().all(|d| d.is_ascii_digit())
+    };
+    let mut out = Vec::new();
+    for line in source[begin..end].lines() {
+        let line = line.trim();
+        if line.starts_with("//") {
+            continue;
+        }
+        let Some(at) = line.find("pins::configs::") else {
+            continue;
+        };
+        let rest = &line[at + "pins::configs::".len()..];
+        let Some((stem, args)) = rest.split_once("::init(") else {
+            continue;
+        };
+        let args = args.rsplit_once(')').map_or(args, |(a, _)| a);
+        let pads: Vec<String> = args
+            .split(',')
+            .filter_map(|a| a.trim().strip_prefix("p."))
+            .filter(|a| is_gpio(a))
+            .map(str::to_owned)
+            .collect();
+        if !pads.is_empty() {
+            out.push((stem.to_owned(), pads));
+        }
+    }
+    out
+}
+
 pub fn parse_main_rs(source: &str) -> Vec<(String, PinFunction)> {
     let Some(begin_pos) = source.find(GEN_BEGIN) else {
         return vec![];

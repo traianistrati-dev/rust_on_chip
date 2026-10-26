@@ -34,11 +34,12 @@ pub(super) fn spi_wires(pins: &[&Pin]) -> Vec<(u8, String, String, Option<String
         .collect()
 }
 
-// ── Async SPI config file (blocking | async-DMA) ──────────────────────────────
+// ── SPI config file (blocking on both runtimes, async-DMA on Async) ───────────
 
 /// Blocking SPI (`Spi::new_blocking`) exposed as the STANDARD blocking
-/// `embedded-hal` 1.0 `SpiBus<u8>`. No DMA — compiles out of the box.
-pub(super) const ASYNC_SPI_TMPL_BLOCKING: &str =
+/// `embedded-hal` 1.0 `SpiBus<u8>`. No DMA — compiles out of the box. The
+/// Blocking runtime's only SPI, and the Async one's "Blocking" choice.
+pub(super) const SPI_TMPL_BLOCKING: &str =
     include_str!("../templates/embassy_stm32/spi_blocking.rs.tmpl");
 
 /// Async DMA SPI (`Spi::new`) exposed as `embedded-hal-async` `SpiBus<u8>`
@@ -46,9 +47,37 @@ pub(super) const ASYNC_SPI_TMPL_BLOCKING: &str =
 pub(super) const ASYNC_SPI_TMPL_DMA: &str =
     include_str!("../templates/embassy_stm32/spi_dma.rs.tmpl");
 
-/// Render the SPI config file for instance `n`, picking the blocking or
-/// async-DMA template from the module's [`AsyncBusMode`].
+/// The blocking SPI template's runtime text, on the Async runtime: why a
+/// blocking bus is there at all, and how to get the DMA one.
+const SPI_ASYNC_INTRO: &str = " A blocking
+// bus in an async project is a common, valid pattern; for `.await`-able DMA SPI
+// switch this module to \"Async-DMA\" in the IDE.";
+const SPI_ASYNC_USAGE: &str =
+    "// Blocking init inside an async project: the handle is an `embedded-hal` 1.0
+// `SpiBus` — no `.await`, the transfer busy-waits. Fine for short bursts;
+// switch the module to Async-DMA when a transfer is long enough to matter.
+";
+/// …and on the Blocking runtime, where it is the only bus there is.
+const SPI_BLOCKING_USAGE: &str =
+    "// The handle is an `embedded-hal` 1.0 `SpiBus`: each transfer busy-waits until
+// its last byte is clocked out.
+";
+
+/// Render the SPI config file for instance `n` on the Async runtime, picking
+/// the blocking or async-DMA template from the module's [`AsyncBusMode`].
+#[cfg(test)]
 pub fn spi_config_file(n: u8, cfg: Option<&SpiModuleConfig>, tx_only: bool) -> String {
+    spi_config_file_for(PeriphMode::Async, n, cfg, tx_only)
+}
+
+/// [`spi_config_file`] for either runtime. On Blocking the bus is always the
+/// blocking one: the DMA template's `.await` has no executor to run on.
+pub fn spi_config_file_for(
+    runtime: PeriphMode,
+    n: u8,
+    cfg: Option<&SpiModuleConfig>,
+    tx_only: bool,
+) -> String {
     let mode = cfg.map(|c| c.mode).unwrap_or(0);
     let clk = cfg.map(|c| c.clock_hz).unwrap_or(1_000_000);
     let order = cfg.map(|c| c.bit_order).unwrap_or_default();
@@ -63,10 +92,18 @@ pub fn spi_config_file(n: u8, cfg: Option<&SpiModuleConfig>, tx_only: bool) -> S
             order.embassy()
         )
     };
-    let template = match (cfg.map(|c| c.async_mode).unwrap_or_default(), tx_only) {
-        (AsyncBusMode::Blocking, false) => ASYNC_SPI_TMPL_BLOCKING,
+    let bus_mode = match runtime {
+        PeriphMode::Async => cfg.map(|c| c.async_mode).unwrap_or_default(),
+        PeriphMode::Blocking => AsyncBusMode::Blocking,
+    };
+    let (intro, usage) = match runtime {
+        PeriphMode::Async => (SPI_ASYNC_INTRO, SPI_ASYNC_USAGE),
+        PeriphMode::Blocking => ("", SPI_BLOCKING_USAGE),
+    };
+    let template = match (bus_mode, tx_only) {
+        (AsyncBusMode::Blocking, false) => SPI_TMPL_BLOCKING,
         (AsyncBusMode::AsyncDma, false) => ASYNC_SPI_TMPL_DMA,
-        (AsyncBusMode::Blocking, true) => ASYNC_SPI_TMPL_BLOCKING_TX,
+        (AsyncBusMode::Blocking, true) => SPI_TMPL_BLOCKING_TX,
         (AsyncBusMode::AsyncDma, true) => ASYNC_SPI_TMPL_DMA_TX,
     };
     let sfx = cfg
@@ -82,6 +119,8 @@ pub fn spi_config_file(n: u8, cfg: Option<&SpiModuleConfig>, tx_only: bool) -> S
             ("{MODE}", &mode.to_string()),
             ("{EXTRA_CFG}", &extra),
             ("{CLK}", &clk.to_string()),
+            ("{INTRO}", intro),
+            ("{USAGE}", usage),
         ],
     )
 }
@@ -98,7 +137,7 @@ pub(super) const ASYNC_SPI_TMPL_DMA_TX: &str =
     include_str!("../templates/embassy_stm32/spi_dma_tx.rs.tmpl");
 
 /// The same shape without DMA: `new_blocking_txonly`, no channels at all.
-pub(super) const ASYNC_SPI_TMPL_BLOCKING_TX: &str =
+pub(super) const SPI_TMPL_BLOCKING_TX: &str =
     include_str!("../templates/embassy_stm32/spi_blocking_tx.rs.tmpl");
 
 #[cfg(test)]
@@ -202,7 +241,7 @@ mod spi_txonly_tests {
         );
         assert!(
             out.init_calls
-                .contains("init(p.SPI1, p.PA5, p.PA7, p.DMA1_CH1, Irqs)"),
+                .contains("init(p.SPI1, pa5_spi1_sck, pa7_spi1_mosi, p.DMA1_CH1, Irqs)"),
             "one channel, no MISO argument:\n{}",
             out.init_calls
         );

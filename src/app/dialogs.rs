@@ -2708,11 +2708,17 @@ mod chip_gaps_tests {
     /// deliberate and everywhere, and a first cut of this flagged all of them.
     ///
     /// COVERAGE, stated because it is narrow: the DEFAULT project for each
-    /// bundled chip - the runtime each definition ships with, and no peripheral
-    /// wired. Emitters reached only by a configured bus on the Async runtime are
-    /// NOT exercised here, and at least one such line exists today
-    /// (`embassy_stm32/usart.rs`, the async USART DMA binding). Widening this to every
-    /// runtime x wiring is what `scripts/verify-codegen.ps1` is for.
+    /// bundled chip - the runtime each definition ships with (Blocking for all
+    /// of them), and no peripheral wired. Emitters reached only by a configured
+    /// bus are NOT exercised here, on any runtime. Neither is embassy-stm32 at
+    /// all: the one bundled STM32, the F103, ships on stm32f1xx-hal, so neither
+    /// its Async drivers nor its Blocking ones (the `usart_blocking*` /
+    /// `spi_blocking` / `i2c_blocking` templates, the `raw_note` /
+    /// `async_only_note` text in `embassy_stm32/mod.rs`) are reached. At least
+    /// one such line exists today (`embassy_stm32/usart.rs`, the async USART DMA
+    /// binding). Building every runtime x wiring is what
+    /// `scripts/verify-codegen.ps1` is for; it compiles those projects but does
+    /// not scan them for this scar.
     #[test]
     fn no_generated_file_carries_a_joined_continuation() {
         use crate::panels::mcu_module::builtins::builtin_definitions;

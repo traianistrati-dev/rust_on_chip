@@ -239,7 +239,7 @@ mod qspi_tests {
         // Eleven pads after the peripheral itself: eight data lines, the
         // shared clock, and a chip select per bank.
         assert_eq!(
-            out.init_calls.matches(", p.").count(),
+            out.init_calls.matches("_qspi_").count(),
             11,
             "{}",
             out.init_calls

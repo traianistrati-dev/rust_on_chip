@@ -1,0 +1,69 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 7, 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+{EXTRA_CONSTS}// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// RECEIVE ONLY: the TX pad is free for something else. `init` returns a value
+// implementing `embedded_io::Read` (BLOCKING). Reading polls the data
+// register: a byte that arrives while your code is busy elsewhere is lost.
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::usart::{Config, DataBits, Parity, RxPin, StopBits, UartRx};
+use embassy_stm32::{peripherals, Peri};
+{FLOW_USE}
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.baudrate = BAUDRATE;
+    config.data_bits = match DATA_BITS {
+        7 => DataBits::DataBits7,
+        9 => DataBits::DataBits9,
+        _ => DataBits::DataBits8,
+    };
+    config.parity = match PARITY {
+        'O' => Parity::ParityOdd,
+        'E' => Parity::ParityEven,
+        _ => Parity::ParityNone,
+    };
+    config.stop_bits = match STOP_BITS {
+        2 => StopBits::STOP2,
+        _ => StopBits::STOP1,
+    };
+{EXTRA_CONFIG}    config
+}
+
+/// Initialise {PERI} as a blocking, receive-only UART.
+pub fn init<'d>(
+    usart: Peri<'d, peripherals::{PERI}>,
+    rx: Peri<'d, impl RxPin<peripherals::{PERI}>>,
+{FLOW_PARAMS}) -> SerialRx<'d> {
+    SerialRx({CTOR}.unwrap())
+}
+
+/// embassy's blocking `UartRx`, with the `embedded-io` `Read` it has no impl
+/// of: its own `blocking_read` fills the whole slice it is given, so a read
+/// asks for one byte - more would wait for bytes that may never come.
+pub struct SerialRx<'d>(pub UartRx<'d, Blocking>);
+
+impl embedded_io::ErrorType for SerialRx<'_> {
+    type Error = embassy_stm32::usart::Error;
+}
+
+impl embedded_io::Read for SerialRx<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.0.blocking_read(&mut buf[..1])?;
+        Ok(1)
+    }
+}
+
+// ── Using {PERI} ──
+//     use embedded_io::Read;
+//     let mut buf = [0u8; 4];
+//     {HANDLE}.read_exact(&mut buf).ok(); // blocks until 4 bytes arrive

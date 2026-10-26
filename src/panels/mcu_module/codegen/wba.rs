@@ -7,15 +7,25 @@
 //! peripheral singletons and the `Output`/`Input` wrappers work fine under
 //! `cortex_m_rt::entry`, so the generated project fits the same base
 //! `Cargo.toml` (cortex-m-rt + panic-halt + the `hal_dep` line) every other
-//! `RustEmbedded` family uses.
+//! `RustEmbedded` family uses - plus what the generated config files speak
+//! (`manifest_sync`: embedded-io 0.7 for a UART, embedded-hal 1.0 for SPI and
+//! I2C).
 //!
-//! Scope of v1: GPIO input/output pins get real, compiling init; bus / analog
-//! pins (USART/SPI/I2C/ADC/…) are bound to their raw `embassy_stm32`
-//! peripheral singleton (`let pa9 = p.PA9;`) with the role in the comment —
-//! ready to hand to `embassy_stm32::usart::Uart::new(...)` etc. Every line
-//! round-trips through [`super::parse_main_rs`], so the Pins canvas restores on
-//! reopen. Full peripheral-driver generation (like the STM32F1 config files)
-//! is a later step.
+//! Scope: GPIO input/output pins bind to `Output::new` / `Input::new`. The bus
+//! drivers come from the embassy pass every embassy STM32 shares
+//! (`family::stm32_periphs` -> `embassy_stm32::peripherals(PeriphMode::Blocking, ..)`):
+//! USART/LPUART (polled `new_blocking*` behind an embedded-io Read+Write),
+//! SPI and I2C (blocking embedded-hal 1.0), PWM, DAC and the
+//! QSPI/OCTOSPI/XSPI/HSPI ports each get a `pins/configs/*.rs` file. Their
+//! `init` calls arrive as `periph_calls` and go after the bindings. A raw-bound
+//! bus pad keeps its labelled `let pa9_usart1_tx = p.PA9; // USART1  TX` line,
+//! and the driver is handed that variable. A pad bound as GPIO/Flex is handed
+//! as `p.PXn` and its binding left out. Every remaining line round-trips
+//! through [`super::parse_main_rs`], so the Pins canvas restores on reopen.
+//! Pads of modules with no driver (ADC, ...) stay raw bindings. SAI/I2S/SDMMC/COMP,
+//! which embassy drives only asynchronously, and any module whose
+//! "Generate driver" switch is off (`Mcu::raw_modules`), get a
+//! "NOT initialised" comment in main.rs and keep their pads raw.
 
 use super::super::clock::model::ClockConfig;
 use super::embassy_common;
@@ -31,11 +41,14 @@ pub use embassy_common::{invariant_header, splice_section};
 /// `RccDescriptor::wba()`), so this no longer sniffs the graph's shape.
 /// `chip` is the part the peripheral clock selectors are looked up for: a
 /// WBA62 shares the WBA6 tree's SPI2 mux and has no SPI2 (`rcc_mux::lacks`).
+#[allow(clippy::too_many_arguments)]
 pub fn make_generated_section(
     mcu_name: &str,
     chip: &str,
     pins: &[&Pin],
     clock: &ClockConfig,
+    // The bus drivers' init lines - see `embassy_common::make_generated_section`.
+    periph_calls: &str,
     custom_inits: &str,
     manual: bool,
     // The chip's interrupt vectors, for the armed inputs' handlers.
@@ -45,6 +58,7 @@ pub fn make_generated_section(
         mcu_name,
         pins,
         &super::rcc::graph_clock_block_for(chip, "stm32wba", clock, manual),
+        periph_calls,
         custom_inits,
         vectors,
     )
@@ -87,6 +101,7 @@ mod tests {
             "stm32wba55cgux",
             &refs,
             &ClockConfig::None,
+            "",
             "",
             false,
             &[],
@@ -131,6 +146,7 @@ mod tests {
             &refs,
             &ClockConfig::None,
             "",
+            "",
             false,
             &[],
         );
@@ -148,6 +164,7 @@ mod tests {
             "stm32wba52cgux",
             &[],
             &ClockConfig::None,
+            "",
             "",
             false,
             &[],
@@ -169,6 +186,7 @@ mod tests {
             "stm32wba55cgux",
             &[],
             &ClockConfig::None,
+            "",
             "",
             false,
             &[],
@@ -198,6 +216,7 @@ mod tests {
             &[],
             &ClockConfig::Graph(gc.clone()),
             "",
+            "",
             false,
             &[],
         );
@@ -221,7 +240,8 @@ mod tests {
         let mut gc2 = gc.clone();
         gc2.graph.node_mut("sw").unwrap().state =
             crate::panels::mcu_module::clock::graph::NodeState::Index(1);
-        let s2 = make_generated_section("WBA", "", &[], &ClockConfig::Graph(gc2), "", false, &[]);
+        let s2 =
+            make_generated_section("WBA", "", &[], &ClockConfig::Graph(gc2), "", "", false, &[]);
         assert!(s2.contains("config.rcc.sys = rcc::Sysclk::HSE;"));
         assert!(!s2.contains("config.rcc.pll1"));
         assert!(s2.contains("VoltageScale::RANGE1"));
@@ -241,6 +261,7 @@ mod tests {
             &[],
             &ClockConfig::Graph(gc3.clone()),
             "",
+            "",
             false,
             &[],
         );
@@ -252,6 +273,7 @@ mod tests {
             "stm32wba55cgux",
             &[],
             &ClockConfig::Graph(gc3),
+            "",
             "",
             false,
             &[],
@@ -269,7 +291,7 @@ mod tests {
         let v1 = format!(
             "{}{}\n{USER_TAIL}",
             invariant_header("X", "x"),
-            make_generated_section("X", "", &[], &ClockConfig::None, "", false, &[])
+            make_generated_section("X", "", &[], &ClockConfig::None, "", "", false, &[])
         );
         let edited = v1.replace(
             "// Your main loop code here.",
@@ -278,7 +300,7 @@ mod tests {
         let pb5 = pin("PB5", PinFunction::GpioOutput);
         let v2 = splice_section(
             &edited,
-            &make_generated_section("X", "", &[&pb5], &ClockConfig::None, "", false, &[]),
+            &make_generated_section("X", "", &[&pb5], &ClockConfig::None, "", "", false, &[]),
             "X",
             "x",
         );

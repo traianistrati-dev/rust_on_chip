@@ -1,15 +1,23 @@
-//! Shared `embassy-stm32` (blocking) code generation.
+//! Shared `embassy-stm32` Blocking code generation: every STM32 on the
+//! Blocking runtime except the F1 (stm32f1xx-hal, `stm32.rs`).
 //!
-//! Every STM32 family that targets embassy generates the SAME `main.rs` shape —
-//! `embassy_stm32::init(...)` under `#[cortex_m_rt::entry]`, then one `let`
-//! binding per pin via the uniform `Output::new` / `Input::new` / raw-singleton
-//! API. The ONLY per-family difference is the clock block (the RCC mapping),
-//! which each backend renders itself and passes in here as a string.
+//! Each generates the SAME `main.rs` shape. First the EXTI statics and
+//! `#[interrupt]` handlers of the armed inputs, above `#[entry]`. Then
+//! `embassy_stm32::init(...)` under `#[cortex_m_rt::entry]`, and one labelled
+//! `let` per pin via `Output::new` / `Input::new` / `Flex` / the raw singleton.
+//! After that come the bus drivers' `pins::configs::*::init(..)` lines from
+//! `embassy_stm32::peripherals(PeriphMode::Blocking, ..)`, each handed its
+//! pad's labelled binding ([`driver_arg`]; a pad that does not bind raw is
+//! handed as `p.PXn`, and [`unbound_by_drivers`] leaves its binding out), and a
+//! "NOT initialised" note where a driver is refused, async-only or switched
+//! off. Last are the Configuration tab's and the Custom modules' inits. The
+//! per-chip parts arrive as strings: the clock block and the driver lines.
 //!
-//! Used by the STM32WBA backend (which supplies a real RCC clock block) and the
-//! generic STM32 backend (which leaves the clock at embassy's reset default).
-//! GPIO bindings round-trip through [`super::parse_main_rs`], so the Pins canvas
-//! restores on reopen.
+//! Used by the STM32WBA backend and the generic STM32 backend. Both render the
+//! Clock tab's RCC block (`rcc::graph_clock_block_*`), and fall back to
+//! embassy's default only when the tree cannot be read. GPIO bindings
+//! round-trip through [`super::parse_main_rs`], so the Pins canvas restores on
+//! reopen.
 
 use super::common::retarget_pristine_tail;
 use super::{AUTOGEN_BANNER, GEN_BEGIN, GEN_END, USER_TAIL, mcu_id_marker_line, pin_binding};
@@ -157,12 +165,15 @@ pub(super) const NO_PINS_PLACEHOLDER: &str =
 
 /// The generated section: gpio `use` items (only when needed), `#[entry]`, the
 /// caller-supplied `clock_block` (which must define `let p = …` and end in
-/// `\n`), and one `let` binding per configured pin. Opens `fn main()` —
-/// `USER_TAIL` closes it with the editable loop.
+/// `\n`), one `let` binding per configured pin, then `periph_calls`. Opens
+/// `fn main()` — `USER_TAIL` closes it with the editable loop.
 pub fn make_generated_section(
     mcu_name: &str,
     pins: &[&Pin],
     clock_block: &str,
+    // The bus drivers' `pins::configs::*::init(…)` lines ("" when none), which
+    // take the bindings above them - see `embassy_stm32::peripherals`.
+    periph_calls: &str,
     // `let x = Foo::new(pa0_out, …);` lines for the Custom modules — appended
     // after the pin bindings they consume (see `Mcu::custom_module_inits`).
     custom_inits: &str,
@@ -177,6 +188,12 @@ pub fn make_generated_section(
     let lines: Vec<(String, u8)> = exti.iter().map(|e| (e.singleton.clone(), e.line)).collect();
     let (use_line, mut body) = bindings(pins, &lines, true);
     body.push_str(&exti_notes);
+    if !periph_calls.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(periph_calls);
+    }
     if body.is_empty() {
         body.push_str(NO_PINS_PLACEHOLDER);
     }
@@ -218,6 +235,49 @@ pub fn splice_section(existing: &str, new_section: &str, mcu_name: &str, mcu_id:
     }
 }
 
+/// The variable [`pin_binding_line`] binds `p` to (`pa9_usart1_tx`).
+pub(super) fn binding_var(p: &Pin) -> String {
+    pin_binding(
+        &p.gpio().to_ascii_lowercase(),
+        &p.selected_function,
+        &p.custom_label,
+    )
+}
+
+/// Whether `p` binds as its bare singleton (`let pa9_usart1_tx = p.PA9;`), the
+/// one shape a driver's `init` can be handed. A GPIO binds as an `Output` or an
+/// `Input`, and a generic alternate function with a mode as a `Flex`.
+pub(super) fn binds_raw(p: &Pin) -> bool {
+    match &p.selected_function {
+        PinFunction::Unset | PinFunction::GpioOutput | PinFunction::GpioInput => false,
+        PinFunction::Other(signal) => p.af_of(signal).is_none() || p.io_mode.is_none(),
+        _ => true,
+    }
+}
+
+/// What a driver's `init` is handed for the pad on GPIO `gpio`: the variable
+/// its labelled `let` line binds, so that line stays in main.rs - it is what
+/// [`super::parse_main_rs`] reads the pin back from on reopen. A pad that does
+/// not bind raw is handed as `p.PXn` itself, and the section leaves its
+/// binding out ([`unbound_by_drivers`]).
+pub(super) fn driver_arg(pins: &[&Pin], gpio: &str) -> String {
+    pins.iter()
+        .find(|p| p.selected_function != PinFunction::Unset && p.gpio() == gpio)
+        .filter(|p| binds_raw(p))
+        .map(|p| binding_var(p))
+        .unwrap_or_else(|| format!("p.{gpio}"))
+}
+
+/// `pins` minus those a driver takes as `p.PXn` (see [`driver_arg`]): their
+/// binding would move the singleton first. `driven` is the GPIOs the drivers
+/// take, as `AsyncPeriphs::consumed_pins` lists them.
+pub(super) fn unbound_by_drivers<'a>(pins: &[&'a Pin], driven: &[String]) -> Vec<&'a Pin> {
+    pins.iter()
+        .copied()
+        .filter(|p| binds_raw(p) || !driven.iter().any(|d| d == p.gpio()))
+        .collect()
+}
+
 /// One pin's `let` line. Output → `let mut pXY = Output::new(...)`; input →
 /// `let pXY = Input::new(...)`; anything else → the raw singleton `let pXY =
 /// p.PXY;` (hand to a driver). The trailing `// <Label>` is what
@@ -228,8 +288,7 @@ fn pin_binding_line(p: &Pin, exti: &[(String, u8)], blocking: bool) -> String {
     // own name, but a package pin with two pads bonded together answers to a
     // different one depending on what you picked (see `Pin::gpio_for`).
     let singleton = p.gpio(); // embassy singleton = "PB5"
-    let base = singleton.to_ascii_lowercase(); // "PB5" → "pb5"
-    let var = pin_binding(&base, func, &p.custom_label);
+    let var = binding_var(p);
     let label = func.label();
     match func {
         PinFunction::GpioOutput => format!(
@@ -2708,6 +2767,15 @@ mod emit_for_manual_compile {
     /// A REAL chip imported from the vendor database, with USART/SPI/I2C all on
     /// async DMA — the point of the mux rule.
     ///
+    /// `EIDE_RUNTIME=blocking` builds the same wiring on the Blocking backend
+    /// instead: embassy's polled / blocking drivers (`new_blocking*`), with the
+    /// SPI/I2C `async_mode` and the USART transport ignored, `EIDE_USART_DIR`
+    /// picking the one-way or half-duplex `new_blocking` form, and SDMMC/SAI
+    /// left to their written "NOT initialised" refusal. There
+    /// `EIDE_EXPECT_CONFIGS` fails a row whose drivers all fell away, and
+    /// `EIDE_BLK_UPGRADE=used` opens a project from before the Blocking drivers,
+    /// whose hand-wired USART must come back with "Generate driver" off.
+    ///
     /// STM32G4 has no hand-written request table and never will need one: its
     /// controller is muxed, so any free channel serves any peripheral. Whether
     /// the channel names, the interrupt names and the `bind_interrupts!`
@@ -3336,7 +3404,51 @@ mod emit_for_manual_compile {
                 window_us: 0,
             });
         }
-        let main_rs = mcu.fresh_main_rs();
+        // `EIDE_BLK_UPGRADE=used`: a project from before the Blocking runtime
+        // generated drivers, whose own code wires USART{un} from the raw
+        // bindings the way it had to then. Opened, that module must start with
+        // "Generate driver" off - and the project must build with the code in.
+        let upgraded = std::env::var("EIDE_BLK_UPGRADE").as_deref() == Ok("used");
+        let main_rs = if upgraded {
+            use crate::panels::mcu_module::modules::ModuleKind;
+            let key = (ModuleKind::GenericInterfaceUsart, un);
+            let var = |f: PinFunction| {
+                mcu.iter_all_pins()
+                    .find(|p| p.selected_function == f)
+                    .map(|p| super::binding_var(p))
+                    .unwrap_or_else(|| panic!("{f:?} is not wired, so nothing uses it"))
+            };
+            let (rx, tx) = (var(PinFunction::UsartRx(un)), var(PinFunction::UsartTx(un)));
+            // The pads bound raw, as every Blocking project bound them then.
+            mcu.raw_modules.insert(key);
+            let old = mcu.fresh_main_rs();
+            mcu.raw_modules.clear();
+            let end = old.find(super::GEN_END).expect("the block") + super::GEN_END.len();
+            let by_hand = format!(
+                "\n    let mut uart = embassy_stm32::usart::Uart::new_blocking(\n        \
+                 p.USART{un}, {rx}, {tx}, Default::default()).unwrap();\n    \
+                 uart.blocking_write(b\"wired by hand\").ok();\n"
+            );
+            let old = format!("{}{by_hand}{}", &old[..end], &old[end..]);
+            // What the open path does with a config that has no `@drivers`.
+            mcu.raw_modules = mcu.modules_used_by_hand(&old);
+            assert!(
+                mcu.raw_modules.contains(&key),
+                "the hand-wired USART{un} was not kept raw: {:?}",
+                mcu.raw_modules
+            );
+            mcu.update_main_rs(&old)
+        } else {
+            mcu.fresh_main_rs()
+        };
+        if upgraded {
+            let have = mcu.config_files();
+            assert!(
+                !have.iter().any(|(n, _)| *n == format!("usart{un}.rs")),
+                "a driver was generated for the hand-wired USART{un}"
+            );
+            assert!(main_rs.contains("wired by hand"), "{main_rs}");
+        }
         assert!(
             !main_rs.contains("DMA_TX_TODO"),
             "a muxed chip should need no TODO:\n{main_rs}"
@@ -3349,6 +3461,16 @@ mod emit_for_manual_compile {
                 main_rs.contains("ExtiInput::new_blocking(") && main_rs.contains("#[interrupt]"),
                 "no Blocking EXTI handler was generated:\n{main_rs}"
             );
+        }
+        // `EIDE_EXPECT_CONFIGS=usart1.rs,spi1.rs` names config files the row
+        // must generate: a Blocking row whose drivers all fell away would pass
+        // by compiling the GPIO alone.
+        if let Ok(want) = std::env::var("EIDE_EXPECT_CONFIGS") {
+            let have = mcu.config_files();
+            let names: Vec<&str> = have.iter().map(|(n, _)| n.as_str()).collect();
+            for name in want.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                assert!(names.contains(&name), "{name} was not generated: {names:?}");
+            }
         }
         // What the app writes when it saves this async project - a harness
         // that wrote anything else would compile a manifest the IDE never does.

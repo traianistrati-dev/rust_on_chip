@@ -2,7 +2,7 @@
 
 use super::*;
 
-// ── Async PWM config file (embassy SimplePwm) ─────────────────────────────────
+// ── PWM config file (embassy SimplePwm / ComplementaryPwm, both runtimes) ─────
 
 /// `src/pins/configs/pwm{N}.rs`: embassy's `SimplePwm` over ONE timer.
 ///
@@ -10,7 +10,7 @@ use super::*;
 /// is what owns the frequency — one prescaler and one reload value serve all
 /// four channels, so a per-channel frequency could not be honoured. Only the
 /// channels actually wired on the canvas become parameters; the rest are `None`.
-pub(super) const ASYNC_PWM_TMPL: &str = include_str!("../templates/embassy_stm32/pwm.rs.tmpl");
+pub(super) const PWM_TMPL: &str = include_str!("../templates/embassy_stm32/pwm.rs.tmpl");
 
 /// The advanced-control timers, the only ones embassy's `ComplementaryPwm`
 /// accepts: its bound is `AdvancedInstance4Channel`. TIM15/16/17 carry a CH1N
@@ -20,7 +20,7 @@ pub fn is_advanced_timer(n: u8) -> bool {
     matches!(n, 1 | 8 | 20)
 }
 
-/// Render [`ASYNC_PWM_TMPL`] for timer `n` from its wiring and its module
+/// Render [`PWM_TMPL`] for timer `n` from its wiring and its module
 /// config.
 ///
 /// Two shapes come out of one template. With plain channels only it is
@@ -396,7 +396,7 @@ pub fn pwm_config_file(n: u8, cfg: &TimerModuleConfig, wiring: &PwmWiring, handl
     };
 
     tmpl::render(
-        ASYNC_PWM_TMPL,
+        PWM_TMPL,
         &[
             ("{GPIO_USE}", &use_line("gpio", &dedup(gpio_items))),
             ("{BREAK_STRUCT}", &break_struct),
@@ -602,8 +602,9 @@ mod pwm_tests {
         let (name, body) = &out.config_files[0];
         assert_eq!(name, "pwm3.rs");
         assert!(
-            out.init_calls
-                .contains("let mut _pwm3 = pins::configs::pwm3::init(p.TIM3, p.PA6, p.PA7);"),
+            out.init_calls.contains(
+                "let mut _pwm3 = pins::configs::pwm3::init(p.TIM3, pa6_tim3_ch1, pa7_tim3_ch2);"
+            ),
             "{}",
             out.init_calls
         );
@@ -662,8 +663,9 @@ mod pwm_tests {
 
         // Both pads are parameters, the plain one before its complement.
         assert!(
-            out.init_calls
-                .contains("let mut _pwm1 = pins::configs::pwm1::init(p.TIM1, p.PA8, p.PB13);"),
+            out.init_calls.contains(
+                "let mut _pwm1 = pins::configs::pwm1::init(p.TIM1, pa8_tim1_ch1, pb13_tim1_ch1n);"
+            ),
             "{}",
             out.init_calls
         );
@@ -756,7 +758,7 @@ mod pwm_tests {
         // The plain channel still works, and the refused pad is NOT passed in.
         assert!(
             out.init_calls
-                .contains("pins::configs::pwm16::init(p.TIM16, p.PA6);"),
+                .contains("pins::configs::pwm16::init(p.TIM16, pa6_tim16_ch1);"),
             "{}",
             out.init_calls
         );
@@ -816,7 +818,7 @@ mod pwm_tests {
         assert!(body.contains("(pwm, BreakPads { bkin1 })"), "{body}");
         assert!(
             out.init_calls.contains(
-                "let (mut _pwm1, _pwm1_break_pads) = pins::configs::pwm1::init(p.TIM1, p.PA8, p.PA6);"
+                "let (mut _pwm1, _pwm1_break_pads) = pins::configs::pwm1::init(p.TIM1, pa8_tim1_ch1, pa6_tim1_bkin1);"
             ),
             "{}",
             out.init_calls
@@ -874,7 +876,7 @@ mod pwm_tests {
         // …and the refused pad is not passed in, nor held.
         assert!(
             out.init_calls
-                .contains("pins::configs::pwm16::init(p.TIM16, p.PA6);"),
+                .contains("pins::configs::pwm16::init(p.TIM16, pa6_tim16_ch1);"),
             "{}",
             out.init_calls
         );
@@ -987,7 +989,7 @@ mod pwm_tests {
             "{names:?}"
         );
         assert!(
-            out.init_calls.contains("init(p.TIM1, p.PA8)"),
+            out.init_calls.contains("init(p.TIM1, pa8_tim1_ch1)"),
             "{}",
             out.init_calls
         );

@@ -181,6 +181,7 @@ impl Mcu {
             i2c_child_pos: std::collections::BTreeMap::new(),
             groups: Vec::new(),
             module_notes: std::collections::BTreeMap::new(),
+            raw_modules: std::collections::BTreeSet::new(),
             watchdog: Default::default(),
             comp: Default::default(),
             adc: Default::default(),
@@ -1628,6 +1629,32 @@ impl Mcu {
             }
             s.push_str(&labels);
         }
+        // The "Generate driver" switches (`@drivers`). On an embassy STM32 the
+        // section is written even with every switch on, because its PRESENCE
+        // says the project was saved since the Blocking runtime generated
+        // drivers - see `Mcu::raw_modules`. The F1 needs no such marker (its
+        // Blocking backend always generated them), so there it is written only
+        // for a switch turned off, which its Async runtime reads.
+        //
+        // And only where a later scan could find something: a project with no
+        // module a driver exists for round-trips byte for byte, as it did
+        // before the switch.
+        let driver_module = self.modules.iter().any(|m| {
+            !m.kind.is_custom()
+                && !crate::panels::mcu_module::codegen::embassy_stm32::driver_singletons(
+                    m.kind,
+                    m.instance(),
+                )
+                .is_empty()
+        });
+        if self.family.starts_with("stm32")
+            && (!self.raw_modules.is_empty() || (self.family != "stm32f1" && driver_module))
+        {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&mcu_config::drivers_section(&self.raw_modules));
+        }
         // Virtual Module notes (`@modulenotes`). Written here like any other
         // section, but NOT codegen input - see `Mcu::module_notes`.
         let notes = mcu_config::notes_section(&self.module_notes);
@@ -1748,6 +1775,10 @@ impl Mcu {
         self.i2c_child_pos = mcu_config::parse_i2c_pos(text);
         self.groups = mcu_config::parse_groups(text);
         self.watchdog = mcu_config::parse_watchdog(text);
+        // No `@drivers`: a project from before the switch, whose modules all
+        // generate - unless its code wires one by hand, which the open path
+        // asks once main.rs is read (`Mcu::modules_used_by_hand`).
+        self.raw_modules = mcu_config::parse_drivers(text).unwrap_or_default();
         self.comp = mcu_config::parse_comp(text);
         self.adc = mcu_config::parse_adc(text);
         self.flash_store = mcu_config::parse_flashstore(text);
@@ -1793,8 +1824,16 @@ impl Mcu {
         self.runtime = self.pending_runtime;
         self.gpio_api = self.pending_gpio_api;
         let pending = std::mem::take(&mut self.pending_module_styles);
+        // An Init API nothing reads here is kept as the module has it: the
+        // preview never named a change to it, so Apply must not make one.
+        let api_live = self.api_style_live();
         for m in &mut self.modules {
             if let Some(&(api, async_mode)) = pending.get(&m.id) {
+                let api = if api_live {
+                    api
+                } else {
+                    module_style(&m.config).0
+                };
                 set_module_style(&mut m.config, api, async_mode);
             }
         }
@@ -1805,16 +1844,29 @@ impl Mcu {
         self.config_regen_forced = true;
     }
 
+    /// Whether a module's Init API (`api_style`) is read by any generator for
+    /// this chip: only stm32f1xx-hal's, so only on the F1. Keyed on the family,
+    /// not the runtime - an F1 carries its staged choice across a switch to
+    /// Async and back. Elsewhere a staged Portable/Native changes no file, so
+    /// it neither dirties the Apply bar nor gets a line in its preview.
+    fn api_style_live(&self) -> bool {
+        crate::panels::mcu_module::codegen::family::reads_api_style(&self.family)
+    }
+
     /// Whether any staged choice differs from the applied one (drives the Apply
     /// button's enabled state).
     pub fn style_dirty(&self) -> bool {
         if self.pending_runtime != self.runtime || self.pending_gpio_api != self.gpio_api {
             return true;
         }
+        let api_live = self.api_style_live();
         self.modules.iter().any(|m| {
             self.pending_module_styles
                 .get(&m.id)
-                .is_some_and(|&staged| staged != module_style(&m.config))
+                .is_some_and(|&staged| {
+                    let cur = module_style(&m.config);
+                    (api_live && staged.0 != cur.0) || staged.1 != cur.1
+                })
         })
     }
 
@@ -1861,7 +1913,8 @@ impl Mcu {
             };
             let (cur_api, cur_async) = module_style(&m.config);
             let name = crate::panels::mcu_module::mcu::gui::modules::module_base_name(m);
-            if api != cur_api {
+            // Only where a generator reads it - see `api_style_live`.
+            if api != cur_api && self.api_style_live() {
                 out.push(format!("{name} init: {cur_api:?} -> {api:?}"));
             }
             // Neither serial config HAS an `async_mode` - `module_style` reports
@@ -1999,6 +2052,27 @@ impl Mcu {
                             m.name
                         ));
                     }
+                }
+            }
+        }
+        // What the staged runtime's driver pass leaves out that this one
+        // generates: SDMMC, SAI, I2S and COMP going to embassy Blocking, the
+        // timer embassy-time takes going to Async. Read off the same pass that
+        // writes main.rs's note, so the two cannot disagree; a gap this side
+        // already has is not news.
+        if self.family.starts_with("stm32") && self.is_async() != preview.is_async() {
+            use crate::panels::mcu_module::codegen::family::embassy_runtime_gaps;
+            let runtime = if preview.is_async() {
+                "Async"
+            } else {
+                "Blocking"
+            };
+            let now = embassy_runtime_gaps(self);
+            for (what, why) in embassy_runtime_gaps(&preview) {
+                if !now.iter().any(|(n, _)| *n == what) {
+                    out.push(format!(
+                        "! {what}: not generated on the {runtime} runtime - {why} Its pads stay raw bindings."
+                    ));
                 }
             }
         }
@@ -4546,5 +4620,141 @@ mod device_groups {
                 ..Default::default()
             }]
         );
+    }
+}
+
+/// What the Apply preview says about a runtime switch the generators answer
+/// differently, on the STM32s whose drivers embassy writes.
+#[cfg(test)]
+mod the_apply_preview_names_what_a_runtime_switch_drops {
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::codegen::embassy_stm32::{SAI_BLOCKING_GAP, TIME_DRIVER_GAP};
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::modules::{ApiStyle, AsyncBusMode, ModuleKind};
+    use crate::panels::mcu_module::pins::PinFunction;
+
+    /// The bundled F103's pads under `family`'s name, the fixture the codegen
+    /// tests build an embassy STM32 from, with `wiring` applied at `runtime`.
+    fn stm32(family: &str, runtime: Runtime, wiring: &[(&str, PinFunction)]) -> Mcu {
+        let mut def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        if family != "stm32f1" {
+            def.family = family.into();
+            def.id = "stm32f411re".into();
+        }
+        let mut mcu = def.build_mcu();
+        mcu.runtime = runtime;
+        for (name, func) in wiring {
+            let n = mcu
+                .iter_all_pins()
+                .find(|p| p.name == *name)
+                .map(|p| p.number)
+                .unwrap_or_else(|| panic!("no pad {name}"));
+            if let Some(p) = mcu.find_pin_mut(n) {
+                p.selected_function = func.clone();
+            }
+        }
+        mcu.reconcile_modules();
+        mcu.sync_pending_style();
+        mcu
+    }
+
+    /// The preview's "not generated" lines for switching `mcu` to `to`.
+    fn gaps(mut mcu: Mcu, to: Runtime) -> Vec<String> {
+        mcu.pending_runtime = to;
+        mcu.apply_change_list()
+            .into_iter()
+            .filter(|l| l.starts_with("! ") && l.contains("not generated on the"))
+            .collect()
+    }
+
+    /// TIM4 is the timer `time-driver-any` takes on the F103's pads; TIM2 is
+    /// not, so it is generated on both runtimes.
+    fn pwm() -> Vec<(&'static str, PinFunction)> {
+        vec![
+            (
+                "PB8",
+                PinFunction::TimerPwm {
+                    timer: 4,
+                    channel: 3,
+                },
+            ),
+            (
+                "PA2",
+                PinFunction::TimerPwm {
+                    timer: 2,
+                    channel: 3,
+                },
+            ),
+        ]
+    }
+
+    /// Into Async, the timer embassy-time takes loses its PWM: main.rs is
+    /// about to say so, and now the preview does first, with main.rs's
+    /// reason. On the F1 too, whose Blocking PWM is stm32f1xx-hal's.
+    #[test]
+    fn into_async_the_time_driver_timer_is_named() {
+        let want = format!(
+            "! TIM4: not generated on the Async runtime - {TIME_DRIVER_GAP} Its pads stay raw bindings."
+        );
+        for family in ["stm32f4", "stm32f1"] {
+            let list = gaps(stm32(family, Runtime::Blocking, &pwm()), Runtime::Async);
+            assert_eq!(list, [want.clone()], "{family}");
+        }
+    }
+
+    /// Into embassy Blocking, a SAI loses its driver; the timer embassy-time
+    /// held comes back, which is no loss and gets no line.
+    #[test]
+    fn into_blocking_the_async_only_peripherals_are_named() {
+        let mut wiring = pwm();
+        // Block A complete - SCK, SD and FS - which is what the pass builds.
+        wiring.extend([
+            ("PB12", PinFunction::SaiSck { sai: 1, block: 1 }),
+            ("PB13", PinFunction::SaiSd { sai: 1, block: 1 }),
+            ("PB14", PinFunction::SaiFs { sai: 1, block: 1 }),
+        ]);
+        let list = gaps(stm32("stm32f4", Runtime::Async, &wiring), Runtime::Blocking);
+        assert_eq!(
+            list,
+            [format!(
+                "! SAI1: not generated on the Blocking runtime - {SAI_BLOCKING_GAP} Its pads stay raw bindings."
+            )]
+        );
+        // Back to Async: the SAI gap is this side's, the TIM4 one the new one's.
+        let back = gaps(stm32("stm32f4", Runtime::Blocking, &wiring), Runtime::Async);
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(back[0].starts_with("! TIM4:"), "{back:?}");
+    }
+
+    /// No runtime change, nothing new left out: the F1 between its two
+    /// stm32f1xx-hal runtimes, and back off Async onto them.
+    #[test]
+    fn a_switch_that_drops_nothing_says_nothing() {
+        let f1 = || stm32("stm32f1", Runtime::Blocking, &pwm());
+        assert!(gaps(f1(), Runtime::Native).is_empty());
+        assert!(gaps(stm32("stm32f1", Runtime::Async, &pwm()), Runtime::Blocking).is_empty());
+    }
+
+    /// A staged Init API is the F1's alone: elsewhere no generator reads it,
+    /// so it dirties nothing and the preview has no line for it.
+    #[test]
+    fn a_staged_init_api_counts_only_on_the_f1() {
+        for (family, live) in [("stm32f1", true), ("stm32f4", false)] {
+            let mut mcu = stm32(family, Runtime::Blocking, &[]);
+            assert!(
+                mcu.add_module(ModuleKind::GenericInterfaceUsart),
+                "{family}"
+            );
+            mcu.sync_pending_style();
+            let id = mcu.modules[0].id.clone();
+            mcu.pending_module_styles
+                .insert(id, (ApiStyle::Native, AsyncBusMode::Blocking));
+            assert_eq!(mcu.style_dirty(), live, "{family}");
+            let line = mcu
+                .style_diff_summary()
+                .iter()
+                .any(|l| l.contains("init: Portable -> Native"));
+            assert_eq!(line, live, "{family}");
+        }
     }
 }

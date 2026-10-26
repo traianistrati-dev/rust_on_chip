@@ -41,24 +41,57 @@ pub(super) const ASYNC_I2C_TMPL_BLOCKING: &str =
 pub(super) const ASYNC_I2C_TMPL_DMA: &str =
     include_str!("../templates/embassy_stm32/i2c_dma.rs.tmpl");
 
-/// Render the I2C config file for instance `n`, picking the blocking or
-/// async-DMA template from the module's [`AsyncBusMode`].
+/// The blocking I2C template's runtime text - see `SPI_ASYNC_INTRO`.
+const I2C_ASYNC_INTRO: &str = " A blocking bus in
+// an async project is a common, valid pattern; for `.await`-able DMA I2C switch
+// this module to \"Async-DMA\" in the IDE.";
+const I2C_ASYNC_USAGE: &str =
+    "// Blocking init inside an async project: the handle is an `embedded-hal` 1.0
+// `I2c` — no `.await`. Switch the module to Async-DMA for long transfers.
+";
+const I2C_BLOCKING_USAGE: &str =
+    "// The handle is an `embedded-hal` 1.0 `I2c`: each transfer busy-waits until the
+// device has answered.
+";
+
+/// Render the I2C config file for instance `n` on the Async runtime, picking
+/// the blocking or async-DMA template from the module's [`AsyncBusMode`].
+#[cfg(test)]
 pub fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>) -> String {
+    i2c_config_file_for(PeriphMode::Async, n, cfg)
+}
+
+/// [`i2c_config_file`] for either runtime. On Blocking the bus is always the
+/// blocking one, and the module's timeout is left out: embassy's I2C has the
+/// field only with embassy-time, which the Blocking runtime does not link.
+pub fn i2c_config_file_for(runtime: PeriphMode, n: u8, cfg: Option<&I2cModuleConfig>) -> String {
     let clk = cfg.map(|c| c.clock_hz).unwrap_or(100_000);
     // 0 means "embassy's default", so nothing is written and the existing
     // output is unchanged. Clamped otherwise: a 0 ms timeout would fail every
     // transfer instantly, which reads as broken wiring.
     let tmo = cfg.map(|c| c.timeout_ms).unwrap_or(0);
-    let extra = if tmo == 0 {
-        String::new()
-    } else {
-        format!(
+    let extra = match (tmo, runtime) {
+        (0, _) => String::new(),
+        (_, PeriphMode::Blocking) => format!(
+            "    // The module's {tmo} ms timeout is not applied: embassy's I2C has a timeout
+    // only with embassy-time, which the Blocking runtime does not run.
+"
+        ),
+        (_, PeriphMode::Async) => format!(
             "    config.timeout = embassy_time::Duration::from_millis({});
 ",
             tmo.clamp(1, 60_000)
-        )
+        ),
     };
-    let template = match cfg.map(|c| c.async_mode).unwrap_or_default() {
+    let (intro, usage) = match runtime {
+        PeriphMode::Async => (I2C_ASYNC_INTRO, I2C_ASYNC_USAGE),
+        PeriphMode::Blocking => ("", I2C_BLOCKING_USAGE),
+    };
+    let bus_mode = match runtime {
+        PeriphMode::Async => cfg.map(|c| c.async_mode).unwrap_or_default(),
+        PeriphMode::Blocking => AsyncBusMode::Blocking,
+    };
+    let template = match bus_mode {
         AsyncBusMode::Blocking => ASYNC_I2C_TMPL_BLOCKING,
         AsyncBusMode::AsyncDma => ASYNC_I2C_TMPL_DMA,
     };
@@ -75,6 +108,8 @@ pub fn i2c_config_file(n: u8, cfg: Option<&I2cModuleConfig>) -> String {
             ("{EXTRA_CFG}", &extra),
             ("{CLK}", &clk.to_string()),
             ("{DEVICES}", &super::super::common::i2c_device_mods(cfg)),
+            ("{INTRO}", intro),
+            ("{USAGE}", usage),
         ],
     )
 }

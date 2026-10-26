@@ -1,0 +1,91 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 7, 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+{EXTRA_CONSTS}// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// `init` returns a value implementing the STANDARD `embedded-io` traits
+// (`Read` + `Write`, BLOCKING), so your application code stays portable across
+// chips/HALs:
+//
+//     fn app<S: embedded_io::Read + embedded_io::Write>(s: &mut S) { /* … */ }
+//
+// Reading polls the data register: a byte that arrives while your code is busy
+// elsewhere is lost. The Async runtime's UART is interrupt-buffered instead.
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::usart::{Config, DataBits, Parity, StopBits, Uart};
+{FLOW_USE}
+use embassy_stm32::{peripherals, Peri};
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.baudrate = BAUDRATE;
+    config.data_bits = match DATA_BITS {
+        7 => DataBits::DataBits7,
+        9 => DataBits::DataBits9,
+        _ => DataBits::DataBits8,
+    };
+    config.parity = match PARITY {
+        'O' => Parity::ParityOdd,
+        'E' => Parity::ParityEven,
+        _ => Parity::ParityNone,
+    };
+    config.stop_bits = match STOP_BITS {
+        2 => StopBits::STOP2,
+        _ => StopBits::STOP1,
+    };
+{EXTRA_CONFIG}    config
+}
+
+/// Initialise {PERI} as a blocking `embedded-io` Read + Write value.
+pub fn init<'d>(
+    usart: Peri<'d, peripherals::{PERI}>,
+{PIN_PARAMS}{FLOW_PARAMS}) -> SerialIo<'d> {
+    SerialIo({CTOR}.unwrap())
+}
+
+/// embassy's blocking `Uart`, with the `embedded-io` `Read` it has no impl
+/// of: its own `blocking_read` fills the whole slice it is given, so a read
+/// asks for one byte - more would wait for bytes that may never come.
+pub struct SerialIo<'d>(pub Uart<'d, Blocking>);
+
+impl embedded_io::ErrorType for SerialIo<'_> {
+    type Error = embassy_stm32::usart::Error;
+}
+
+impl embedded_io::Read for SerialIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.0.blocking_read(&mut buf[..1])?;
+        Ok(1)
+    }
+}
+
+impl embedded_io::Write for SerialIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.0.blocking_write(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.0.blocking_flush()
+    }
+}
+
+// ── Using {PERI} ──
+// The handle is an `embedded-io` Read + Write over embassy's blocking Uart.
+// In main.rs, after the init above:
+//
+//     use embedded_io::{Read, Write};
+//
+//     {HANDLE}.write_all(b"hello\r\n").ok();
+//
+//     // Receive exactly N bytes (blocks until they arrive)
+//     let mut buf = [0u8; 4];
+//     {HANDLE}.read_exact(&mut buf).ok();

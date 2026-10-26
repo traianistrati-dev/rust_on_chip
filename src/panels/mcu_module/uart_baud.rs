@@ -31,9 +31,16 @@
 //! aside: nothing in the repo says which APB bus each USART instance sits on,
 //! and on the newer families a per-instance clock mux decides it. They get
 //! [`Plan::Unchecked`] rather than a guess.
+//!
+//! Wherever embassy-stm32 builds the drivers, a module's "Generate driver"
+//! switch can leave its pads raw, and then no driver takes the rate at all
+//! ([`Chip::plan_for`]).
+
+use std::collections::BTreeSet;
 
 use super::codegen::{family::is_esp, nrf, rp, stm32};
 use super::mcu::{Mcu, Runtime};
+use super::modules::{ModuleKind, NotesKey};
 use super::pins::logic::pin_function::PinFunction;
 
 /// Within this much of the rate asked for, the link is simply right.
@@ -425,16 +432,24 @@ fn f1_tab_pclks(clock: &crate::panels::mcu_module::clock::ClockConfig) -> Option
     (p1 > 0 && p2 > 0).then_some((p1, p2))
 }
 
-/// What [`Chip::plan`] needs from the MCU, read once.
+/// What [`Chip::plan`] and [`Chip::plan_for`] need from the MCU, read once.
 ///
 /// Owned rather than borrowed: the module panel draws while `mcu.modules` is
-/// borrowed mutably out of the same `Mcu`, so the clock has to be read first.
+/// borrowed mutably out of the same `Mcu` (and `mcu.raw_modules` by the
+/// "Generate driver" switch), so the clock and the switch have to be read
+/// first.
 /// Each clock is `None` when not known at all ([`Chip::bare`]) and `Some(Err)`
 /// when the HAL refuses the clock setup.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chip {
     family: String,
     runtime: Runtime,
+    /// The modules whose "Generate driver" switch is off (`Mcu::raw_modules`),
+    /// only where that switch decides anything - embassy-stm32's drivers on
+    /// the staged runtime (`family::embassy_drivers`). Empty elsewhere, so an
+    /// entry left over on an F1 off Async (stm32f1xx-hal, which ignores it)
+    /// changes no verdict.
+    raw: BTreeSet<NotesKey>,
     /// F1: (PCLK1, PCLK2) as the runtime's HAL will program them - the chain on
     /// stm32f1xx-hal, the tab itself on embassy-stm32.
     f1_pclks: Option<Result<(u32, u32), ()>>,
@@ -469,36 +484,65 @@ impl Chip {
                 Err(())
             }
         });
+        // The same staged runtime the switch itself is drawn for, so the baud
+        // row and the switch agree on whether it decides anything.
+        let switchable =
+            super::codegen::family::embassy_drivers(family, mcu.pending_runtime == Runtime::Async);
         Self {
             family: mcu.family.clone(),
             // The STAGED runtime, like every other row of the module panel
             // (`pending_is_async`): the panel previews what Apply will build.
             runtime: mcu.pending_runtime,
+            raw: if switchable {
+                mcu.raw_modules.clone()
+            } else {
+                BTreeSet::new()
+            },
             f1_pclks,
             rp_blocking_hz,
             xtal_hz: esp_xtal_hz(mcu),
         }
     }
 
-    /// A chip known only by family and runtime - no clock at all.
+    /// A chip known only by family and runtime - no clock at all, and every
+    /// module's driver generated.
     pub fn bare(family: &str, runtime: Runtime) -> Self {
         Self {
             family: family.to_owned(),
             runtime,
+            raw: BTreeSet::new(),
             f1_pclks: None,
             rp_blocking_hz: None,
             xtal_hz: None,
         }
     }
 
-    /// How the module on USART/UART `instance` can be checked.
+    /// How the `kind` module on `instance` can be checked: [`Chip::plan`],
+    /// unless its "Generate driver" switch is off. Then its pads stay raw
+    /// bindings and no driver takes the rate, whatever the clock - so the
+    /// switch is read before the clock, and a raw module on a clock the HAL
+    /// refuses is unused, not doomed.
+    ///
+    /// The kind matters because a USART and an LPUART share instance numbers.
+    pub fn plan_for(&self, kind: ModuleKind, instance: u8) -> Plan {
+        if self.raw.contains(&(kind, instance)) {
+            return Plan::NotUsed(NOT_USED_RAW);
+        }
+        self.plan(instance)
+    }
+
+    /// How the module on USART/UART `instance` can be checked, with its driver
+    /// generated - what the hardware does with the rate, which is what the
+    /// pin popup states ([`max_baud_text`]). [`Chip::plan_for`] adds the
+    /// module's "Generate driver" switch.
     ///
     /// The runtime matters only where it swaps the HAL: an Async RP is
-    /// embassy-rp on embassy's own clocks, and an STM32 other than the F1 builds
-    /// a driver only on Async. The F1 builds one on every runtime - on
-    /// stm32f1xx-hal off Async, on embassy-stm32 on it, with the PCLKs each
-    /// programs (see [`Chip::of`]) - and an ESP or an nRF divides the same way
-    /// on both.
+    /// embassy-rp on embassy's own clocks, and the F1 is on stm32f1xx-hal off
+    /// Async and on embassy-stm32 on it, with the PCLKs each programs (see
+    /// [`Chip::of`]). Every other STM32 builds its driver on embassy-stm32 on
+    /// every runtime, from a clock whose per-instance bus is not modelled, so
+    /// it is Unchecked on all of them. An ESP or an nRF divides the same way on
+    /// both.
     pub fn plan(&self, instance: u8) -> Plan {
         let f = self.family.as_str();
         if f == "stm32f1" {
@@ -538,11 +582,7 @@ impl Chip {
             };
         }
         if f.starts_with("stm32") {
-            return if self.runtime == Runtime::Async {
-                Plan::Unchecked(NO_BUS_MAP)
-            } else {
-                Plan::NotUsed(NOT_USED_RAW)
-            };
+            return Plan::Unchecked(NO_BUS_MAP);
         }
         if rp::is_rp(f) {
             // clk_peri follows clk_sys on both HALs. Async code calls
@@ -623,7 +663,7 @@ fn esp_xtal_hz(mcu: &Mcu) -> Option<u32> {
 const NO_CLOCK: &str = "This chip has no clock tree to check the rate against.";
 const NO_BUS_MAP: &str = "Which clock feeds each USART is not modelled for this family yet, so the rate can't be checked against it.";
 const NO_FAMILY: &str = "Rates are not checked for this chip family.";
-const NOT_USED_RAW: &str = "This runtime binds the USART pins raw and builds no driver, so the baud rate never reaches the generated code.";
+const NOT_USED_RAW: &str = "This module's \"Generate driver\" is off: its pads stay raw bindings for your own code, so the baud rate never reaches the generated code.";
 const F1_NO_UART45: &str = "stm32f1xx-hal 0.10 has no Serial for UART4 or UART5, so no driver is generated for it and the baud rate never reaches the code.";
 const F1_FREEZE: &str = "stm32f1xx-hal's freeze asserts on this clock setup (the Clock tab flags the limit it breaks), so the chip panics before the UART is set up.";
 const F1_EMBASSY_INIT: &str = "embassy-stm32's clock init asserts on this clock setup (the Clock tab flags the limit it breaks), so the chip panics before the UART is set up.";
@@ -1428,26 +1468,112 @@ mod tests {
         assert_eq!(at(40), Some(40_000_000));
     }
 
-    /// Imported STM32s: Blocking builds no driver, Async is not checked yet.
+    /// Imported STM32s are not checked yet on any runtime: each builds an
+    /// embassy-stm32 driver (Native and RTIC fall back to the Blocking
+    /// backends), but which clock feeds each USART is not modelled.
     #[test]
     fn other_stm32_families_say_why_they_are_not_checked() {
-        assert_eq!(
-            Chip::bare("stm32g4", Runtime::Blocking).plan(1),
-            Plan::NotUsed(NOT_USED_RAW)
-        );
-        assert_eq!(
-            Chip::bare("stm32wba", Runtime::Blocking).plan(1),
-            Plan::NotUsed(NOT_USED_RAW)
-        );
-        assert!(matches!(
-            Chip::bare("stm32l4", Runtime::Async).plan(1),
-            Plan::Unchecked(_)
-        ));
+        for (family, rt) in [
+            ("stm32g4", Runtime::Blocking),
+            ("stm32g4", Runtime::Native),
+            ("stm32g4", Runtime::Rtic),
+            ("stm32wba", Runtime::Blocking),
+            ("stm32l4", Runtime::Async),
+        ] {
+            assert_eq!(
+                Chip::bare(family, rt).plan(1),
+                Plan::Unchecked(NO_BUS_MAP),
+                "{family} {rt:?}"
+            );
+        }
         // No clock known at all is "unchecked", not "doomed".
         assert!(matches!(
             Chip::bare("stm32f1", Runtime::Blocking).plan(1),
             Plan::Unchecked(_)
         ));
+    }
+
+    /// A module whose "Generate driver" is off gets no driver, so its rate is
+    /// unused - keyed by the KIND too, since USART1 and LPUART1 share the 1.
+    /// Read from the F103 relabelled as a G4: `Chip::of` takes only the
+    /// family, the runtime, the clock and the switch from it.
+    #[test]
+    fn a_module_with_its_driver_off_does_not_use_the_rate() {
+        let mut mcu = builtin("stm32f103c8t6");
+        mcu.family = "stm32g4".to_owned();
+        mcu.raw_modules
+            .insert((ModuleKind::GenericInterfaceUsart, 1));
+        for rt in [Runtime::Blocking, Runtime::Async] {
+            set_runtime(&mut mcu, rt);
+            let chip = Chip::of(&mcu);
+            assert_eq!(
+                chip.plan_for(ModuleKind::GenericInterfaceUsart, 1),
+                Plan::NotUsed(NOT_USED_RAW),
+                "{rt:?}"
+            );
+            for (kind, n) in [
+                (ModuleKind::GenericInterfaceLpuart, 1),
+                (ModuleKind::GenericInterfaceUsart, 2),
+            ] {
+                assert_eq!(
+                    chip.plan_for(kind, n),
+                    Plan::Unchecked(NO_BUS_MAP),
+                    "{kind:?} {n} {rt:?}"
+                );
+            }
+            // The pin popup states the hardware's limit, switch or not.
+            assert_eq!(chip.plan(1), Plan::Unchecked(NO_BUS_MAP), "{rt:?}");
+        }
+    }
+
+    /// The F1 has the switch only on Async (embassy-stm32). Off Async it is on
+    /// stm32f1xx-hal, which builds the driver whatever a leftover entry says,
+    /// so the rate is still checked there.
+    #[test]
+    fn the_f1_driver_switch_counts_only_on_async() {
+        let mut mcu = builtin("stm32f103c8t6");
+        mcu.raw_modules
+            .insert((ModuleKind::GenericInterfaceUsart, 1));
+        set_runtime(&mut mcu, Runtime::Async);
+        assert_eq!(
+            Chip::of(&mcu).plan_for(ModuleKind::GenericInterfaceUsart, 1),
+            Plan::NotUsed(NOT_USED_RAW)
+        );
+        for rt in [Runtime::Blocking, Runtime::Rtic] {
+            set_runtime(&mut mcu, rt);
+            assert_eq!(
+                Chip::of(&mcu).plan_for(ModuleKind::GenericInterfaceUsart, 1),
+                Plan::Checked(Source {
+                    divider: Divider::F1 { pclk: 72_000_000 },
+                    clock: "PCLK2",
+                }),
+                "{rt:?}"
+            );
+        }
+    }
+
+    /// The switch is read before the clock: a raw module on a clock embassy
+    /// refuses is unused, not doomed.
+    #[test]
+    fn a_raw_module_is_unused_even_on_a_doomed_clock() {
+        use crate::panels::mcu_module::clock::Stm32f1Clock;
+        let mut mcu = builtin("stm32f103c8t6");
+        mcu.apply_saved_clock(Stm32f1Clock {
+            apb1_pre: 1, // PCLK1 72 MHz, over the 36 MHz ceiling
+            ..Stm32f1Clock::default()
+        });
+        mcu.raw_modules
+            .insert((ModuleKind::GenericInterfaceUsart, 2));
+        set_runtime(&mut mcu, Runtime::Async);
+        let chip = Chip::of(&mcu);
+        assert_eq!(
+            chip.plan_for(ModuleKind::GenericInterfaceUsart, 2),
+            Plan::NotUsed(NOT_USED_RAW)
+        );
+        assert_eq!(
+            chip.plan_for(ModuleKind::GenericInterfaceUsart, 3),
+            Plan::Doomed(F1_EMBASSY_INIT)
+        );
     }
 
     /// What the panel prints, for the cases a user meets.
@@ -1492,6 +1618,7 @@ mod tests {
         let h = hint(&Plan::NotUsed(NOT_USED_RAW), 115_200);
         assert_eq!(h.verdict, "not used by the generated code");
         assert_eq!(h.severity, None);
+        assert!(h.why.contains("Generate driver"), "{}", h.why);
         assert!(h.why.contains("raw"), "{}", h.why);
     }
 

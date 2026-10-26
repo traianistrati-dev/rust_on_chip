@@ -6,9 +6,7 @@ pub const CLOCK_HZ: u32 = {CLK};
 
 // Everything below is editable — your changes are preserved on regeneration.
 //
-// `init` returns a STANDARD `embedded-hal` 1.0 `SpiBus<u8>` (BLOCKING). A blocking
-// bus in an async project is a common, valid pattern; for `.await`-able DMA SPI
-// switch this module to "Async-DMA" in the IDE.
+// `init` returns a STANDARD `embedded-hal` 1.0 `SpiBus<u8>` (BLOCKING).{INTRO}
 //
 //     fn app<S: embedded_hal::spi::SpiBus<u8>>(spi: &mut S) { /* … */ }
 use embassy_stm32::spi::{Config, MisoPin, MosiPin, SckPin, Spi, MODE_0, MODE_1, MODE_2, MODE_3};
@@ -38,10 +36,7 @@ pub fn init<'d>(
 }
 
 // ── Using SPI{N} ──
-// Blocking init inside an async project: the handle is an `embedded-hal` 1.0
-// `SpiBus` — no `.await`, the transfer busy-waits. Fine for short bursts;
-// switch the module to Async-DMA when a transfer is long enough to matter.
-//
+{USAGE}//
 //     use embedded_hal::spi::SpiBus;
 //
 //     let mut buf = [0x9F, 0x00, 0x00];

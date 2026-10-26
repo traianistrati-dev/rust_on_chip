@@ -1610,6 +1610,32 @@ impl AppIde {
                                     crate::panels::mcu_module::stm32_pin_data::usart_has_swap_invert(
                                         mcu.usart_ip.as_deref(),
                                     );
+                                // Whether a "Generate driver" switch decides
+                                // anything here: embassy-stm32's drivers, on
+                                // the STAGED runtime the rows describe.
+                                let drivers_switchable =
+                                    crate::panels::mcu_module::codegen::family::embassy_drivers(
+                                        &family, is_async,
+                                    );
+                                // Whether the rows' STAGED runtime is the one
+                                // that is built: only then may a row narrow the
+                                // stored config to it (`module_config_ui`).
+                                let runtime_applied = mcu.pending_runtime == mcu.runtime;
+                                // ...and for which module: not one whose driver
+                                // the staged runtime cannot build at all - the
+                                // timer embassy-time takes is one, read now from
+                                // every pad's functions.
+                                let periph_mode = if is_async {
+                                    crate::panels::mcu_module::codegen::embassy_stm32::PeriphMode::Async
+                                } else {
+                                    crate::panels::mcu_module::codegen::embassy_stm32::PeriphMode::Blocking
+                                };
+                                let time_driver = if is_async {
+                                    let pins: Vec<_> = mcu.iter_all_pins().collect();
+                                    crate::panels::mcu_module::codegen::embassy_stm32::time_driver_timer_of(&pins)
+                                } else {
+                                    None
+                                };
                                 // Which nRF SPIM / TWIM modules share one
                                 // block, by module id, on the STAGED runtime
                                 // the rows below describe. Also read now: each
@@ -2051,6 +2077,7 @@ impl AppIde {
                                                         &pin_blocked, &mut pin_labels,
                                                         &pin_funcs_current, &pin_funcs,
                                                         &mut pin_fn_choice, is_async, is_native,
+                                                        runtime_applied,
                                                         &family, pending, chip_dma.as_ref(),
                                                         usart_line_extras,
                                                         block_partner.get(&m.id).map(String::as_str),
@@ -2059,6 +2086,24 @@ impl AppIde {
                                                 });
                                                 if !my_out.is_empty() {
                                                     said.insert(m.id.clone(), my_out);
+                                                }
+                                                // Beside the settings, keyed by
+                                                // (kind, instance) like the notes
+                                                // below - see `Mcu::raw_modules`.
+                                                if drivers_switchable
+                                                    && crate::panels::mcu_module::codegen::embassy_stm32::driver_generated(
+                                                        periph_mode,
+                                                        &family,
+                                                        m.kind,
+                                                        m.instance(),
+                                                        time_driver,
+                                                    )
+                                                {
+                                                    mod_gui::driver_switch(
+                                                        ui,
+                                                        &mut mcu.raw_modules,
+                                                        (m.kind, m.instance()),
+                                                    );
                                                 }
                                                 ui.add_space(4.0);
                                                 // Notes, link, image. Outside the
@@ -2978,7 +3023,10 @@ impl AppIde {
             {
                 mcu.pending_runtime = Runtime::Blocking;
             }
-            runtime_details(ui, "rt_details_blocking", BLOCKING_DETAILS, BLOCKING_EXAMPLE);
+            // Per family, like the Async pane: the one fixed pane was the F1's
+            // and told an F4 about io.rs and a Portable | Native choice.
+            let details = family::blocking_details(&mcu.family);
+            runtime_details(ui, "rt_details_blocking", details.rows, details.example);
             ui.add_space(6.0);
 
             // ── Native (concrete HAL) ────────────────────────────────────────
@@ -4026,8 +4074,11 @@ fn runtime_card(
 // the next line's indentation). A literal joined by hand from a continuation
 // keeps the indentation as a run of spaces, and the card subtitles are
 // monospace, so the run rendered as a gap the width of a word.
-// `no_runtime_card_text_has_a_run_of_spaces` holds this; the Async pane's rows
-// are held by `async_details_rows_have_no_double_space` in `family`.
+// `no_runtime_card_text_has_a_run_of_spaces` holds this; the Blocking and
+// Async panes, which are per family and live in `family`
+// (`blocking_details`, `async_details`), are held there by
+// `blocking_details_rows_have_no_double_space` and
+// `async_details_rows_have_no_double_space`.
 //
 // The two-space "  ·  " between a subtitle's parts is deliberate.
 
@@ -4041,49 +4092,6 @@ fn blocking_subtitle(family: &str) -> String {
         family::blocking_hal_note(family)
     )
 }
-
-const BLOCKING_DETAILS: &[(&str, &str)] = &[
-    (
-        "On Apply:",
-        "Regenerates main.rs with the #[entry] entry, rewrites every \
-                   src/pins/configs/*.rs to the portable init, (re)writes src/pins/io.rs, \
-                   and reconciles Cargo.toml — then triggers a build.",
-    ),
-    (
-        "Entry:",
-        "#[cortex_m_rt::entry] fn main() -> ! — classic bare-metal, runs forever.",
-    ),
-    (
-        "Drivers:",
-        "Each USART/SPI/I2C initializes in src/pins/configs/*.rs and is exposed \
-                  through STANDARD portable traits — embedded-io (serial) + embedded-hal 1.0 \
-                  (SpiBus / I2c / OutputPin). App code generic over those traits ports across \
-                  chips/HALs unchanged.",
-    ),
-    (
-        "Virtual modules:",
-        "Each USART/SPI/I2C module keeps its Init API: Portable | Native (HAL \
-                          type) selector on the Pins tab. Portable = the trait wrapper (its .0 \
-                          still hands back the raw HAL object); Native = the concrete HAL type \
-                          for that one module only. SPI/I2C are always blocking here.",
-    ),
-    (
-        "GPIO / io.rs:",
-        "GPIO API = Portable (System tab) -> src/pins/io.rs wraps the pins as \
-                       DigitalOut / DigitalIn + a Delay over embedded-hal 1.0. GPIO API = Native \
-                       -> raw HAL pins and io.rs is not emitted.",
-    ),
-    (
-        "Cargo.toml:",
-        "Adds embedded-io (serial) + embedded-hal 1.0 (SPI/I2C/GPIO) + the \
-                     embedded-hal-0-2 bridge alias; nb is added only while a Native-mode module \
-                     needs it. The embassy-* async crates are removed.",
-    ),
-    ("Applies to:", "Every chip — this is the default runtime."),
-];
-
-const BLOCKING_EXAMPLE: &str = "let mut _serial1 = pins::configs::usart1::init(...);\n\
-    fn app<S: embedded_io::Read + embedded_io::Write>(s: &mut S) { /* portable */ }";
 
 const NATIVE_SUBTITLE: &str = "#[entry] fn main() -> !  ·  concrete HAL types everywhere \
     (Serial / Spi / BlockingI2c) — no portable bridges";
@@ -4121,8 +4129,8 @@ const NATIVE_DETAILS: &[(&str, &str)] = &[
     ),
     (
         "Applies to:",
-        "STM32F1 only (the family with concrete-HAL templates). Grayed on other \
-                     families, whose blocking HAL types are already concrete.",
+        "STM32F1 only, the one family with concrete-HAL (Native) templates. On \
+                     every other chip the card is greyed, and the reason beside it says why.",
     ),
 ];
 
@@ -4183,15 +4191,20 @@ const RTIC_EXAMPLE: &str = "#[task(binds = EXTI0, local = [pa0_in_button])]\n\
 #[cfg(test)]
 mod no_runtime_card_text_has_a_run_of_spaces {
     use super::{
-        BLOCKING_DETAILS, BLOCKING_EXAMPLE, NATIVE_DETAILS, NATIVE_EXAMPLE, NATIVE_SUBTITLE,
-        RTIC_DETAILS, RTIC_EXAMPLE, RTIC_SUBTITLE, async_subtitle, blocking_subtitle,
+        NATIVE_DETAILS, NATIVE_EXAMPLE, NATIVE_SUBTITLE, RTIC_DETAILS, RTIC_EXAMPLE, RTIC_SUBTITLE,
+        async_subtitle, blocking_subtitle,
     };
     use crate::panels::mcu_module::codegen::family::{
-        async_unavailable_reason, native_unavailable_reason, rtic_unavailable_reason,
+        async_unavailable_reason, blocking_details, native_unavailable_reason,
+        rtic_unavailable_reason,
     };
 
+    /// One chip per pane: the F1's stm32f1xx-hal, embassy-stm32 (the F4, and
+    /// the WBA with its own backend), both Picos, three nRF generations and
+    /// the ESP.
     const FAMILIES: &[&str] = &[
-        "stm32f1", "stm32f4", "rp2040", "nrf52833", "nrf5340", "nrf54l15", "esp32c3",
+        "stm32f1", "stm32f4", "stm32wba", "rp2040", "rp235x", "nrf52833", "nrf5340", "nrf54l15",
+        "esp32c3",
     ];
 
     /// Prose and subtitles: never three spaces in a row. Two is the "  ·  "
@@ -4216,19 +4229,19 @@ mod no_runtime_card_text_has_a_run_of_spaces {
     fn subtitles_rows_examples_and_reasons() {
         prose("native subtitle", NATIVE_SUBTITLE);
         prose("rtic subtitle", RTIC_SUBTITLE);
-        for (name, rows) in [
-            ("blocking", BLOCKING_DETAILS),
-            ("native", NATIVE_DETAILS),
-            ("rtic", RTIC_DETAILS),
-        ] {
+        for (name, rows) in [("native", NATIVE_DETAILS), ("rtic", RTIC_DETAILS)] {
             for (label, body) in rows {
                 prose(&format!("{name} {label}"), body);
             }
         }
-        code("blocking example", BLOCKING_EXAMPLE);
         code("native example", NATIVE_EXAMPLE);
         code("rtic example", RTIC_EXAMPLE);
         for family in FAMILIES {
+            let blocking = blocking_details(family);
+            for (label, body) in blocking.rows {
+                prose(&format!("{family} blocking {label}"), body);
+            }
+            code(&format!("{family} blocking example"), blocking.example);
             prose(
                 &format!("{family} blocking subtitle"),
                 &blocking_subtitle(family),
@@ -4269,6 +4282,10 @@ const DETAIL_LIBS: &[&str] = &[
     "cyw43-pio",
     "static_cell",
     "stm32f1xx-hal",
+    // The Blocking HAL-direct pane's (`family::blocking_details`).
+    "esp-hal",
+    "rp-hal",
+    "nrf-hal",
     "cortex-m-rt",
     "bxcan",
     "usb-device",

@@ -283,7 +283,14 @@ fn rebuild(def: &McuDefinition, cfg: Option<&str>, main_rs: Option<&str>) -> Mcu
         if let Some(saved) = mcu_config::saved_pins(cfg, src) {
             match &saved {
                 SavedPins::ByNumber(pins) => mcu.apply_saved_pins_by_number(pins),
-                SavedPins::ByName(pins) => mcu.apply_saved_pins(pins),
+                SavedPins::ByName(pins) => {
+                    mcu.apply_saved_pins(pins);
+                    // As the open does: an old Async STM32 names its driver
+                    // pads only in the init calls.
+                    mcu.recover_driver_pins(
+                        &crate::panels::mcu_module::codegen::parse_driver_inits(src),
+                    );
+                }
             }
         }
     }

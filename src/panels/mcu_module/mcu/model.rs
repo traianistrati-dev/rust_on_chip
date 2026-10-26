@@ -18,9 +18,18 @@ pub const PIN_SPACING: f32 = 3.0;
 /// targets.
 ///
 /// - [`Runtime::Blocking`] (default): the classic bare-metal path — a
-///   `#[cortex_m_rt::entry] fn main() -> !` with PORTABLE blocking APIs
-///   (`embedded-io` / `embedded-hal` 1.0 bridges), so driver code is portable
-///   across HALs. Per-module the peripheral can opt into Native.
+///   `#[cortex_m_rt::entry] fn main() -> !` (esp-hal's own entry on the ESP)
+///   with no executor. What drives the peripherals depends on the family:
+///   - **STM32F1**: stm32f1xx-hal behind PORTABLE blocking APIs (`embedded-io`
+///     / `embedded-hal` 1.0 bridges), so driver code is portable across HALs.
+///     Per-module the peripheral can opt into Native.
+///   - **Every other STM32** (`StmEmbassyBackend`, `WbaBackend`): embassy-stm32
+///     used synchronously - polled USART/LPUART and blocking SPI, I2C, PWM,
+///     DAC and QSPI/OCTOSPI/XSPI/HSPI drivers, which speak embedded-io /
+///     embedded-hal 1.0 themselves. No Native opt-in; SDMMC, SAI, I2S and COMP
+///     are generated on Async only; each module has a "Generate driver" switch
+///     ([`Mcu::raw_modules`]).
+///   - **ESP / RP / nRF**: their HAL's own types, bound directly.
 /// - [`Runtime::Native`]: also bare-metal `#[entry] fn main()`, but the
 ///   peripherals expose the CONCRETE HAL types (`Serial`/`Spi`/`BlockingI2c` on
 ///   stm32f1xx-hal) — no portable bridges, no extra trait crates, max HAL
@@ -475,6 +484,19 @@ pub struct Mcu {
         crate::panels::mcu_module::modules::NotesKey,
         crate::panels::mcu_module::modules::ModuleNotes,
     >,
+    /// The Virtual Modules whose "Generate driver" switch is OFF, keyed like
+    /// [`Self::module_notes`] by `(kind, instance)`: no `pins/configs/` driver
+    /// on embassy-stm32, the pads left as their labelled raw bindings for the
+    /// user's own code (`embassy_stm32::peripherals`, `raw`).
+    ///
+    /// A project saved before the Blocking runtime generated drivers holds
+    /// code that wires those pads by hand. It has no `@drivers` section, and
+    /// on open the modules its code uses start OFF
+    /// (`Mcu::modules_used_by_hand`), so that code keeps compiling.
+    ///
+    /// Persisted in `mcu.config` `@drivers`. CODEGEN input, so it feeds
+    /// `calculate_mcu_state_hash`.
+    pub raw_modules: std::collections::BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
     /// IWDG / WWDG settings from the Configuration tab. Not a `VirtualModule`:
     /// those live on the Pins canvas and own pins, and a watchdog has none.
     /// Persisted in `mcu.config` `@watchdog`; feeds `calculate_mcu_state_hash`

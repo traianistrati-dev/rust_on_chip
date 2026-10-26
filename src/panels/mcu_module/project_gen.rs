@@ -737,28 +737,66 @@ pub fn ensure_peripheral_deps(
     sources: &[&str],
 ) -> String {
     let eh1 = needs_spi || needs_i2c || needs_gpio; // SpiBus / I2c / OutputPin…
-    let eh02 = needs_usart || eh1; // every bridge speaks to the HAL's eh 0.2
+    ensure_peripheral_crates(
+        cargo_toml,
+        PeripheralCrates {
+            can: needs_can,
+            io: needs_usart,
+            // every bridge speaks to the HAL's eh 0.2
+            eh02: needs_usart || eh1,
+            eh1,
+            nb: needs_nb,
+        },
+        sources,
+    )
+}
+
+/// The crates [`ensure_peripheral_deps`] manages, one flag each. The STM32F1
+/// bridges tie them together (a USART bridge is `embedded-io` over the HAL's
+/// embedded-hal 0.2); embassy-stm32 on the Blocking runtime does not - its
+/// UART speaks `embedded-io` and its SPI/I2C embedded-hal 1.0 directly - so
+/// `manifest_sync` asks for each one.
+pub struct PeripheralCrates {
+    pub can: bool,
+    pub io: bool,
+    pub eh02: bool,
+    pub eh1: bool,
+    pub nb: bool,
+}
+
+/// [`ensure_peripheral_deps`], one flag per crate.
+pub fn ensure_peripheral_crates(
+    cargo_toml: &str,
+    needs: PeripheralCrates,
+    sources: &[&str],
+) -> String {
     let mut s = cargo_toml.to_owned();
-    s = ensure_dep(&s, "bxcan", needs_can, "bxcan = \"0.7\"", sources);
+    s = ensure_dep(&s, "bxcan", needs.can, "bxcan = \"0.7\"", sources);
     s = ensure_dep(
         &s,
         "embedded-io",
-        needs_usart,
+        needs.io,
         "embedded-io  = \"0.7\"",
         sources,
     );
     s = ensure_dep(
         &s,
         "embedded-hal-0-2",
-        eh02,
+        needs.eh02,
         "embedded-hal-0-2 = { package = \"embedded-hal\", version = \"0.2.7\", features = [\"unproven\"] }",
         sources,
     );
-    s = ensure_dep(&s, "embedded-hal", eh1, "embedded-hal = \"1.0\"", sources);
+    s = ensure_dep(
+        &s,
+        "embedded-hal",
+        needs.eh1,
+        "embedded-hal = \"1.0\"",
+        sources,
+    );
     // nb is nb-based-serial / CAN — decided by the caller (see `needs_nb` doc).
     // Note: `ensure_dep` is a no-op when nb is already present, so a user's
     // pinned `nb = "1.1.0"` is PRESERVED (not reset to "1") while it's needed.
-    s = ensure_dep(&s, "nb", needs_nb, "nb           = \"1\"", sources);
+    s = ensure_dep(&s, "nb", needs.nb, "nb           = \"1\"", sources);
     s
 }
 
@@ -1932,6 +1970,31 @@ pub fn ensure_async_deps(
     needs_eh_async: bool,
     sources: &[&str],
 ) -> String {
+    ensure_async_deps_with(
+        cargo_toml,
+        needs_async,
+        flavor,
+        needs_async_usart,
+        needs_async_usart,
+        needs_eh,
+        needs_eh_async,
+        sources,
+    )
+}
+
+/// [`ensure_async_deps`] with `static_cell` needed on its own: an STM32's
+/// SAI and I2S keep their DMA ring buffer in one too, with no USART.
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_async_deps_with(
+    cargo_toml: &str,
+    needs_async: bool,
+    flavor: AsyncFlavor<'_>,
+    needs_async_usart: bool,
+    needs_static_cell: bool,
+    needs_eh: bool,
+    needs_eh_async: bool,
+    sources: &[&str],
+) -> String {
     let is_esp = matches!(flavor, AsyncFlavor::Esp(_));
     let mut s = ensure_dep(
         cargo_toml,
@@ -1969,7 +2032,7 @@ pub fn ensure_async_deps(
     s = ensure_dep(
         &s,
         "static_cell",
-        needs_async_usart,
+        needs_static_cell,
         "static_cell = \"2\"",
         sources,
     );

@@ -7,8 +7,8 @@
 //! `init_*` and is drawn as a wire to that module's box instead. Neither does a
 //! pin a virtual module already names: a Custom module carries its pins' fields
 //! inside its own box, and a PWM channel claimed by a Timer module disappears
-//! into that module's handle (see [`super::modules::module_owned_pins`]). The
-//! arrow
+//! into that module's handle - unless the timer's "Generate driver" is off
+//! (see [`super::modules::module_owned_pins`]). The arrow
 //! points away from the chip for a driven signal, into it for one the MCU reads,
 //! and carries no head when the function's direction is unknown (see
 //! [`io_dir`]). Each arrow carries a small text field to rename the pin; the
@@ -737,9 +737,9 @@ mod tests {
 
     /// A PWM channel belongs to its Timer module, which already carries the
     /// name that reaches the generated code (`_pwm2`). Floating a second
-    /// rename field beside the chip put two "name" boxes on one pin, and on
-    /// embassy the pin's one is dead - the pad is passed straight into
-    /// `init`, never bound.
+    /// rename field beside the chip put two "name" boxes on one pin, and the
+    /// pin's one is dead: on embassy its binding is moved into `init` on the
+    /// next line, and on the F1 into `pwm_hz`.
     #[test]
     fn a_pwm_channel_owned_by_a_timer_gets_no_floating_field() {
         let mcu = f103_with(&[
@@ -777,6 +777,43 @@ mod tests {
                 channel: 1
             }) == Some(IoDir::Out)
         );
+    }
+
+    /// A timer whose "Generate driver" is off gets no driver, so its channel
+    /// pad is a raw binding the user names - and gets its field back. Only on
+    /// an embassy backend, where the switch decides anything: the F1's
+    /// stm32f1xx-hal ignores the set and still moves the pad into `pwm_hz`.
+    #[test]
+    fn a_raw_timer_gives_its_channel_pad_back() {
+        let raw = |mcu: &mut Mcu| {
+            mcu.raw_modules
+                .insert((ModuleKind::GenericInterfaceTimer, 2));
+        };
+        let pa0 = [(
+            "PA0",
+            PinFunction::TimerPwm {
+                timer: 2,
+                channel: 1,
+            },
+        )];
+
+        // An embassy-Blocking STM32: the F103's pads under another family's
+        // name, which is all `module_owned_pins` reads.
+        let mut g0 = f103_with(&pa0);
+        g0.family = "stm32g0".into();
+        let pin = pin_num(&g0, "PA0");
+        assert!(super::super::modules::module_owned_pins(&g0).contains(&pin));
+        raw(&mut g0);
+        assert!(
+            !super::super::modules::module_owned_pins(&g0).contains(&pin),
+            "a raw timer's channel is the user's binding again"
+        );
+        assert!(has_io_pins(&g0), "and it reserves its field's gutter");
+
+        // The F1 on Blocking: stm32f1xx-hal reads no switch.
+        let mut f1 = f103_with(&pa0);
+        raw(&mut f1);
+        assert!(super::super::modules::module_owned_pins(&f1).contains(&pin_num(&f1, "PA0")));
     }
 
     /// …and with nothing but that channel wired, the canvas reserves no gutter

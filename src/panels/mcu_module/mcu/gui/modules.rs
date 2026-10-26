@@ -191,11 +191,18 @@ const BOX_H_MAX: f32 = 130.0;
 /// * a **Custom** module draws its pins' rename fields INSIDE its own box,
 ///   grouped under the module name;
 /// * a **Timer** module owns the whole PWM handle (`_pwm1`), and its channel
-///   pads are handed straight to that handle's `init`. On embassy they never
-///   become a binding at all (`consumed` in the async backend), and on the F1
-///   they name a variable `pwm_hz` moves out on the next line — so a field
-///   beside the chip would edit a name the user cannot use either way, next to
-///   the module's own field, which is the one that counts.
+///   pads are handed straight to that handle's `init`. On embassy, both
+///   runtimes, each channel pad keeps its labelled `let` line and that
+///   variable is moved into `pwm{n}::init` (`embassy_common::driver_arg`); on
+///   the F1's stm32f1xx-hal `pwm_hz` moves it out on the next line — so a
+///   field beside the chip would rename a variable the user cannot use either
+///   way, next to the module's own field, which is the one that counts.
+///
+/// The exception is a timer whose "Generate driver" switch is off
+/// (`Mcu::raw_modules`, on an embassy backend): no driver takes its pads, so
+/// they are the user's raw bindings again and get their fields back. Only the
+/// CHx pads do - `io_arrows::io_dir` gives a CHxN or BKIN pad no direction,
+/// so those stay without a field whatever owns them.
 pub fn module_owned_pins(mcu: &Mcu) -> std::collections::HashSet<usize> {
     let mut owned: std::collections::HashSet<usize> = mcu
         .modules
@@ -206,10 +213,15 @@ pub fn module_owned_pins(mcu: &Mcu) -> std::collections::HashSet<usize> {
             _ => Vec::new(),
         })
         .collect();
+    // The applied runtime: the fields name what main.rs binds now.
+    let switchable = codegen::family::embassy_drivers(&mcu.family, mcu.is_async());
     owned.extend(
         mcu.modules
             .iter()
-            .filter(|m| m.kind == ModuleKind::GenericInterfaceTimer)
+            .filter(|m| {
+                m.kind == ModuleKind::GenericInterfaceTimer
+                    && !(switchable && mcu.raw_modules.contains(&(m.kind, m.instance())))
+            })
             .flat_map(|m| m.connections.iter().map(|c| c.mcu_pin)),
     );
     owned
@@ -827,14 +839,71 @@ pub fn module_title(m: &VirtualModule) -> String {
     }
 }
 
+/// What a module's handle names depend on beyond the module itself: which
+/// backend writes main.rs, on the APPLIED runtime - the caption names what the
+/// generated code binds now.
+///
+/// Read once from the `Mcu` and owned, because the canvas draws its boxes
+/// while `mcu.modules` is borrowed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HandleCtx {
+    /// The Native runtime: every USART is the split `(Tx, Rx)` pair, whatever
+    /// its `api_style`.
+    native_forced: bool,
+    /// stm32f1xx-hal writes the drivers (the F1 off Async), the one backend
+    /// whose USART binding follows `api_style` and the DMA transport.
+    f1_hal: bool,
+    /// embassy-stm32 writes them (`family::embassy_drivers`).
+    embassy: bool,
+    is_async: bool,
+    /// The modules whose "Generate driver" is off (`Mcu::raw_modules`), only
+    /// where that switch decides anything: on embassy.
+    raw: BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
+}
+
+impl HandleCtx {
+    pub(crate) fn of(mcu: &Mcu) -> Self {
+        let is_async = mcu.is_async();
+        let embassy = codegen::family::embassy_drivers(&mcu.family, is_async);
+        Self {
+            native_forced: mcu.is_native(),
+            // `is_async` rather than the stored runtime, so an Async that is
+            // inert on this family still reads as the HAL that runs.
+            f1_hal: mcu.family == "stm32f1" && !is_async,
+            embassy,
+            is_async,
+            raw: if embassy {
+                mcu.raw_modules.clone()
+            } else {
+                BTreeSet::new()
+            },
+        }
+    }
+
+    /// Whether main.rs binds no handle for `m` at all: embassy writes no
+    /// driver for a module whose "Generate driver" is off, nor on Blocking for
+    /// the three peripherals it drives only asynchronously.
+    fn unbound(&self, m: &VirtualModule) -> bool {
+        use ModuleKind as K;
+        self.embassy
+            && (self.raw.contains(&(m.kind, m.instance()))
+                || (!self.is_async
+                    && matches!(
+                        m.kind,
+                        K::GenericInterfaceSai | K::GenericInterfaceSdmmc | K::GenericInterfaceI2s
+                    )))
+    }
+}
+
 /// The binding name(s) this module generates, as a list.
 ///
 /// [`handle_preview`] renders them for the box, where one string is what a
 /// painter wants. Callers that need to FIND those bindings in the source want
 /// them apart: a Native USART is two handles (`_tx0, _rx0`), and searching for
-/// the joined string would match neither line.
-pub(crate) fn handle_names(m: &VirtualModule, native_forced: bool) -> Vec<String> {
-    handle_preview(m, native_forced)
+/// the joined string would match neither line. Empty for a module main.rs
+/// binds no handle for, so a goto lights only its pins.
+pub(crate) fn handle_names(m: &VirtualModule, ctx: &HandleCtx) -> Vec<String> {
+    handle_preview(m, ctx)
         .split(',')
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
@@ -843,8 +912,12 @@ pub(crate) fn handle_names(m: &VirtualModule, native_forced: bool) -> Vec<String
 
 /// Live preview of the generated handle variable name(s), with the user's
 /// label appended — the module analogue of the pin's `pc13_out_board_led`
-/// caption. SPI/I2C have one handle; USART has two (`_txN` / `_rxN`).
-fn handle_preview(m: &VirtualModule, native_forced: bool) -> String {
+/// caption. SPI/I2C have one handle; USART has two (`_txN` / `_rxN`). Empty
+/// where main.rs binds none ([`HandleCtx::unbound`]).
+fn handle_preview(m: &VirtualModule, ctx: &HandleCtx) -> String {
+    if ctx.unbound(m) {
+        return String::new();
+    }
     let n = m.instance();
     let lbl = sanitize_label(m.config.custom_label());
     let sfx = if lbl.is_empty() {
@@ -856,19 +929,48 @@ fn handle_preview(m: &VirtualModule, native_forced: bool) -> String {
         // USART: Native returns the split `(Tx, Rx)` handles → two names; Portable
         // (and the async embedded-io bridge) returns one value → `_serialN`.
         // `native_forced` is the project-level Native runtime (all peripherals
-        // Native regardless of the per-module `api_style`).
+        // Native regardless of the per-module `api_style`). Only stm32f1xx-hal
+        // reads `api_style`, and only it hands DMA back as a pair too; embassy
+        // Async splits a full-duplex DMA UART into `_serialN_tx` / `_rx`.
         ModuleKind::GenericInterfaceUsart => {
-            let native = native_forced
-                || matches!(&m.config, ModuleConfig::Usart(c) if c.api_style == ApiStyle::Native);
-            if native {
+            let ModuleConfig::Usart(c) = &m.config else {
+                return format!("_serial{n}{sfx}");
+            };
+            let f1_pair = ctx.f1_hal
+                && (c.api_style == ApiStyle::Native
+                    || (c.blocking_dma.any()
+                        && codegen::stm32::blocking_dma_channels(
+                            "stm32f1",
+                            dma_map::Bus::Usart,
+                            n,
+                        )
+                        .is_some()));
+            if ctx.native_forced || f1_pair {
                 format!("_tx{n}{sfx}, _rx{n}{sfx}")
+            } else if ctx.embassy
+                && ctx.is_async
+                && c.mode == UsartMode::Dma
+                && c.direction == UsartDirection::TxRx
+            {
+                format!("_serial{n}{sfx}_tx, _serial{n}{sfx}_rx")
             } else {
                 format!("_serial{n}{sfx}")
             }
         }
         // `_lpserial`, NOT `_serial`: a chip with both USART1 and LPUART1 would
-        // otherwise generate the same binding name twice.
-        ModuleKind::GenericInterfaceLpuart => format!("_lpserial{n}{sfx}"),
+        // otherwise generate the same binding name twice. The full-duplex DMA
+        // pair is split the USART's way.
+        ModuleKind::GenericInterfaceLpuart => match &m.config {
+            ModuleConfig::Lpuart(c)
+                if ctx.embassy
+                    && ctx.is_async
+                    && c.mode == UsartMode::Dma
+                    && c.direction == UsartDirection::TxRx =>
+            {
+                format!("_lpserial{n}{sfx}_tx, _lpserial{n}{sfx}_rx")
+            }
+            _ => format!("_lpserial{n}{sfx}"),
+        },
         ModuleKind::GenericInterfaceSpi => format!("_spi{n}{sfx}"),
         ModuleKind::GenericInterfaceI2c => format!("_i2c{n}{sfx}"),
         ModuleKind::GenericInterfaceI2s => format!("_i2s{n}{sfx}"),
@@ -1026,7 +1128,7 @@ fn draw_box(
     side: Side,
     connected: bool,
     color: egui::Color32,
-    native_forced: bool,
+    handles: &HandleCtx,
     // `Some(t)` (t in 0..1) while this module is pending deletion — its box
     // background pulses red so it's obvious on the diagram which one is being
     // removed. `None` = normal.
@@ -1168,7 +1270,7 @@ fn draw_box(
         painter.with_clip_rect(rect).text(
             handle_caption_pos(m, rect),
             egui::Align2::CENTER_CENTER,
-            handle_preview(m, native_forced),
+            handle_preview(m, handles),
             egui::FontId::proportional(HANDLE_SIZE * scale),
             SUB_COLOUR,
         );
@@ -2542,8 +2644,9 @@ pub fn draw_modules(
     }
 
     // ── 3. Draw boxes + wires; detect a header click to expand the list entry. ─
-    // Native runtime → the handle preview shows the split (Tx, Rx) for USART.
-    let native_forced = mcu.is_native();
+    // Which backend binds the handles: the Native runtime's split (Tx, Rx) for
+    // USART, and no caption at all for a module embassy writes no driver for.
+    let handles = HandleCtx::of(mcu);
     // While a remove-confirm is open, pulse the target module's box red so it's
     // obvious on the diagram which module is about to be deleted. Computed once
     // per frame; only the matching box uses it. Repaint keeps the pulse alive.
@@ -2666,7 +2769,7 @@ pub fn draw_modules(
             *side,
             *connected,
             module_color(m.kind, inst),
-            native_forced,
+            &handles,
             removing.then_some(blink),
             mcu.selected_module.as_deref() == Some(m.id.as_str()),
         );
@@ -3385,6 +3488,55 @@ fn baud_row(ui: &mut egui::Ui, baud: &mut u32, plan: &crate::panels::mcu_module:
     });
 }
 
+/// A combo's text for a stored choice: as it is when this runtime builds it,
+/// and saying so when it does not - the value is kept for the runtime that
+/// does, and the generator narrows it here.
+fn not_built_here(label: &str, built: bool) -> String {
+    if built {
+        label.to_owned()
+    } else {
+        format!("{label} (not built here)")
+    }
+}
+
+/// One Virtual Module's "Generate driver" switch, keyed like its notes by
+/// `(kind, instance)` (`Mcu::raw_modules`). The caller draws it only where it
+/// decides something: an embassy STM32 backend, and a module whose driver the
+/// staged runtime can build (`embassy_stm32::driver_generated`). The stored
+/// value is never cleared where the switch is hidden - it is shared by both
+/// runtimes.
+pub fn driver_switch(
+    ui: &mut egui::Ui,
+    raw: &mut std::collections::BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
+    key: crate::panels::mcu_module::modules::NotesKey,
+) {
+    let mut on = !raw.contains(&key);
+    let r = ui.checkbox(&mut on, "Generate driver").on_hover_text(
+        "On: pins/configs/ gets this peripheral's driver, and main.rs calls its `init` \
+         with the pads' bindings.\n\
+         Off: no driver. The pads stay the labelled raw bindings in main.rs, for your \
+         own code.\n\
+         A project saved before the Blocking runtime generated drivers opens with it \
+         off for every module its code already wires by hand.",
+    );
+    if r.changed() {
+        if on {
+            raw.remove(&key);
+        } else {
+            raw.insert(key);
+        }
+    }
+    if !on {
+        ui.label(
+            egui::RichText::new(
+                "no driver: the pads stay raw bindings in main.rs, for your own code",
+            )
+            .size(10.5)
+            .color(egui::Color32::from_gray(140)),
+        );
+    }
+}
+
 pub fn module_config_ui(
     ui: &mut egui::Ui,
     m: &mut VirtualModule,
@@ -3404,11 +3556,19 @@ pub fn module_config_ui(
     pin_funcs: &HashMap<usize, Vec<PinFunction>>,
     // Set when a function is picked from a pin button; the caller applies it.
     pin_fn_choice: &mut Option<PinEdit>,
-    // EMBASSY async. The ESP has an async runtime too, but none of its rows
-    // turn on it: `with_dma`, `UartTx::new` and `.with_cts()` are all on the
-    // blocking drivers, so what decides there is the FAMILY (`esp` below).
+    // The STAGED Async runtime, off an ESP. The ESP has an async runtime too,
+    // but none of its rows turn on it: `with_dma`, `UartTx::new` and
+    // `.with_cts()` are all on the blocking drivers, so what decides there is
+    // the FAMILY (`esp` below). Together with `family` it also says which HAL
+    // builds the drivers (`embassy` / `embassy_blocking` below): the rows BOTH
+    // embassy-stm32 runtimes build turn on those, the Async-only ones on this.
     is_async: bool,
     is_native: bool,
+    // Whether the STAGED runtime the rows follow is the applied one. A row may
+    // narrow the stored config to what a runtime builds only then: with
+    // another one staged, writing `m.config` regenerates the APPLIED project,
+    // before Apply, for a runtime it does not run on.
+    runtime_applied: bool,
     // The chip's family key — the blocking DMA transport is stm32f1xx-hal's,
     // so only the F1 backend can emit it.
     family: &str,
@@ -3503,6 +3663,18 @@ pub fn module_config_ui(
     // direction and flow exist on both its runtimes, and its Init API exists on
     // neither.
     let esp = crate::panels::mcu_module::codegen::family::is_esp(family);
+    // Which HAL builds this module's driver on the staged runtime, by the rule
+    // the generator itself follows (`family::embassy_drivers`): embassy-stm32
+    // on every STM32 on Async, and on every STM32 but the F1 on Blocking
+    // (Native and RTIC exist on the F1 alone). `embassy_blocking` is that
+    // second half - the StmEmbassy and WBA backends. The rows both embassy
+    // runtimes build turn on it as well as on `is_async`: data direction and
+    // flow, the SPI bit order, the PWM counter and output shapes. What only
+    // the Async runtime has - the USART transport and buffers, Async init, the
+    // DMA pickers, the I2C timeout - stays on `is_async`, and the F1's
+    // stm32f1xx-hal, ESP, RP and nRF keep their own gates.
+    let embassy = codegen::family::embassy_drivers(family, is_async);
+    let embassy_blocking = embassy && !is_async;
 
     // Portable (embedded-io/hal) vs native (concrete HAL) init — shown for the
     // bus modules (USART/SPI/I2C) that generate a `pins/configs/*.rs` init.
@@ -3526,6 +3698,22 @@ pub fn module_config_ui(
                  `Spi`, `I2c` - because that is what its own traits are implemented on. \
                  The Portable bridge is an STM32F1 choice.",
             );
+            ui.end_row();
+            return;
+        }
+        // Every other board whose generator reads no `api_style` (the RP and
+        // nRF parts): locked the same way, or the pick would sit staged with
+        // no Apply bar to commit it (`Mcu::style_dirty` counts it only where
+        // a generator reads it).
+        if !codegen::family::reads_api_style(family) {
+            out.field("Init API", docs::INIT_API_HAL);
+            ui.label("Init API");
+            let resp = ui.add_enabled_ui(false, |ui| {
+                egui::ComboBox::from_id_salt("api_style_hal")
+                    .selected_text("Native (HAL type)")
+                    .show_ui(ui, |_ui| {});
+            });
+            resp.response.on_hover_text(docs::INIT_API_HAL);
             ui.end_row();
             return;
         }
@@ -3630,6 +3818,29 @@ pub fn module_config_ui(
             "Locked by the DMA transport - `init` returns TxDma/RxDma (USART) or \
              SpiRxTxDma (SPI), which are stm32f1xx-hal's own types. There is no portable \
              bus to bridge them to; turn DMA off to choose again.",
+        );
+        ui.end_row();
+    };
+
+    // embassy-stm32 on the Blocking runtime: `init` hands back the standard
+    // value whatever the module stores, so the row is locked rather than a
+    // combo no emitter reads - and its hover no longer names stm32f1xx-hal.
+    // The stored `api_style` is left alone: the F1 reads it, and writing the
+    // staged one would mark the module changed.
+    let api_row_locked_embassy = |ui: &mut egui::Ui, out: &mut ConfigOut| {
+        out.field("Init API", docs::INIT_API_EMBASSY);
+        ui.label("Init API");
+        let resp = ui.add_enabled_ui(false, |ui| {
+            egui::ComboBox::from_id_salt("api_style_locked_embassy")
+                .selected_text("Portable (embedded-io/hal 1.0)")
+                .show_ui(ui, |_ui| {});
+        });
+        resp.response.on_hover_text(
+            "embassy-stm32's blocking drivers behind the standard traits. A UART hands back \
+             `SerialIo` (embedded-io Read + Write, half duplex included), `SerialRx` (Read) \
+             when it only receives, or embassy's own `UartTx` (Write) when it only \
+             transmits; an SPI an `embedded_hal::spi::SpiBus`, an I2C an \
+             `embedded_hal::i2c::I2c`. The Portable/Native choice belongs to stm32f1xx-hal.",
         );
         ui.end_row();
     };
@@ -3790,8 +4001,9 @@ pub fn module_config_ui(
 
     // What the BLOCKING stm32f1xx-hal cannot do, said out loud.
     //
-    // Direction, flow control, half duplex and swap/invert are all async-only
-    // rows above. On the F1 they are not "not implemented yet": `Pins<USART>` is
+    // Direction, flow control, half duplex and swap/invert are rows every
+    // embassy runtime draws (and the ESP its share of). On the F1's
+    // stm32f1xx-hal they are not "not implemented yet": `Pins<USART>` is
     // implemented ONLY for the (TX alternate, RX input) pair, `serial.rs` has no
     // hdsel / rtse / ctse at all, and the SWAP / TXINV / RXINV bits do not exist
     // in F1 silicon. Leaving the rows out silently makes a user who just used
@@ -3840,16 +4052,19 @@ pub fn module_config_ui(
         };
 
     // Data direction + hardware flow control. Both lists come from
-    // `UsartDirection::options_for` / `UsartFlow::options_for`, i.e. from what
-    // THIS FAMILY's backend has a CONSTRUCTOR for — never from what the silicon
+    // `UsartDirection::offered` / `UsartFlow::offered`, i.e. from what THIS
+    // FAMILY's backend has a CONSTRUCTOR for — never from what the silicon
     // could in principle do. The three backends differ a lot: embassy builds
     // every shape, the ESP builds a single direction and RTS/CTS, and the F1
-    // builds one TX+RX port and nothing else.
+    // builds one TX+RX port and nothing else. embassy's list is narrowed
+    // twice more: on Blocking it is the DMA transport's (the `new_blocking*`
+    // set, whatever transport the module stores), and a usart_v1/v2 chip
+    // (`line_extras` false) loses half duplex on RX and DE on either runtime.
     // `wired` says which of CTS/RTS the module actually has a pin for, so a
     // choice that needs one it hasn't got is called out instead of silently
     // generating code that won't build.
     let direction_row = |ui: &mut egui::Ui, out: &mut ConfigOut, cfg: &mut UsartModuleConfig| {
-        let opts = UsartDirection::options_for(cfg.mode, family);
+        let opts = UsartDirection::offered(cfg.mode, family, embassy_blocking, line_extras);
         // The locked form is a different fact, so it is a different
         // sentence — chosen HERE, by the branch that knows which one it
         // drew, and not re-derived from the family somewhere else.
@@ -3881,13 +4096,31 @@ pub fn module_config_ui(
                 docs::USART_DIRECTION_LOCKED
             });
         } else {
+            let before = cfg.direction;
             egui::ComboBox::from_id_salt("usart_dir")
-                .selected_text(cfg.direction.label())
+                .selected_text(not_built_here(
+                    cfg.direction.label(),
+                    opts.contains(&cfg.direction),
+                ))
                 .show_ui(ui, |ui| {
                     for d in opts {
-                        ui.selectable_value(&mut cfg.direction, *d, d.label());
+                        ui.selectable_value(&mut cfg.direction, d, d.label());
                     }
                 });
+            // A one-way UART picked on embassy Blocking, whose polled driver
+            // reads no transport: on Async the buffered transport has no half
+            // at all, so the pick takes the DMA one, which builds the same
+            // `UartTx` / `UartRx`. Written on the pick, never per frame.
+            if embassy_blocking
+                && cfg.direction != before
+                && matches!(
+                    cfg.direction,
+                    UsartDirection::TxOnly | UsartDirection::RxOnly
+                )
+                && cfg.mode == UsartMode::Buffered
+            {
+                cfg.mode = UsartMode::Dma;
+            }
         }
         ui.end_row();
         // Line-level extras. On an older USART the register bits do not exist —
@@ -3940,11 +4173,18 @@ pub fn module_config_ui(
         out.field("Hardware flow control", docs::USART_FLOW);
         ui.label("Hardware flow control");
         ui.vertical(|ui| {
+            let opts = UsartFlow::offered(
+                cfg.mode,
+                cfg.direction,
+                family,
+                embassy_blocking,
+                line_extras,
+            );
             egui::ComboBox::from_id_salt("usart_flow")
-                .selected_text(cfg.flow.label())
+                .selected_text(not_built_here(cfg.flow.label(), opts.contains(&cfg.flow)))
                 .show_ui(ui, |ui| {
-                    for f in UsartFlow::options_for(cfg.mode, cfg.direction, family) {
-                        ui.selectable_value(&mut cfg.flow, *f, f.label());
+                    for f in opts {
+                        ui.selectable_value(&mut cfg.flow, f, f.label());
                     }
                 });
             let (has_cts, has_rts) = wired;
@@ -3969,6 +4209,47 @@ pub fn module_config_ui(
             }
         });
         ui.end_row();
+    };
+
+    // A direction the backend cannot build, or a flow option the pair cannot,
+    // would otherwise sit there as a stale choice that generates nothing - so
+    // both snap back to the plain form, from the SAME lists the two rows
+    // offer. Direction first: it decides which flow options exist. The
+    // transport is never written, even where these lists ignore it: the Async
+    // runtime still reads it.
+    //
+    // What the CHIP cannot do goes on every runtime: a usart_v1/v2 builds
+    // neither half duplex on the RX pad nor DE, on either. What a RUNTIME
+    // cannot build goes only once it is the applied one (`runtime_applied`),
+    // and never on embassy Blocking, whose generator narrows the flow itself
+    // (`blocking_serial_flow`): the stored form is the Async runtime's, and
+    // the row says it is not built here instead.
+    let clamp_usart = |cfg: &mut UsartModuleConfig| {
+        if !line_extras && cfg.direction == UsartDirection::HalfDuplexOnRx {
+            cfg.direction = UsartDirection::TxRx;
+        }
+        if !line_extras && cfg.flow == UsartFlow::De {
+            cfg.flow = UsartFlow::None;
+        }
+        if embassy && (embassy_blocking || !runtime_applied) {
+            return;
+        }
+        if !UsartDirection::offered(cfg.mode, family, embassy_blocking, line_extras)
+            .contains(&cfg.direction)
+        {
+            cfg.direction = UsartDirection::TxRx;
+        }
+        if !UsartFlow::offered(
+            cfg.mode,
+            cfg.direction,
+            family,
+            embassy_blocking,
+            line_extras,
+        )
+        .contains(&cfg.flow)
+        {
+            cfg.flow = UsartFlow::None;
+        }
     };
 
     // Which DMA channels this peripheral gets. Automatic is right almost
@@ -4814,16 +5095,39 @@ pub fn module_config_ui(
                 ModuleConfig::Usart(cfg) | ModuleConfig::Lpuart(cfg) => {
                     out.field("Baud rate", docs::USART_BAUD);
                     ui.label("Baud rate");
-                    baud_row(ui, &mut cfg.baud_rate, &baud_chip.plan(cfg.instance));
+                    // By KIND as well as instance (`m_kind` is USART or LPUART
+                    // here): the two share numbers, and either one's
+                    // "Generate driver" can be off.
+                    baud_row(
+                        ui,
+                        &mut cfg.baud_rate,
+                        &baud_chip.plan_for(m_kind, cfg.instance),
+                    );
                     ui.end_row();
                     // Right after baud rate, because the two are read together:
                     // the buffer is only meaningful as "how many bytes at this
                     // speed". Async only - the blocking paths have no buffer -
                     // and hidden on a TX-only DMA link, which has none either.
+                    // embassy's Blocking UART is polled, so it has no buffer
+                    // whatever the transport, and says that instead: `skip`
+                    // keeps the first reason for a label, so the TX-only one
+                    // must not get there first.
                     let tx_only_dma =
                         cfg.mode == UsartMode::Dma && cfg.direction == UsartDirection::TxOnly;
-                    if tx_only_dma {
+                    if tx_only_dma && !embassy_blocking {
                         out.skip("RX/TX buffer", docs::SKIP_USART_BUF_TX_ONLY);
+                    }
+                    if embassy_blocking {
+                        // The label the reader knew on Async, as the nRF skip
+                        // picks it.
+                        out.skip(
+                            if cfg.mode == UsartMode::Dma {
+                                "RX DMA buffer"
+                            } else {
+                                "RX/TX buffer"
+                            },
+                            docs::SKIP_USART_BUF_BLOCKING,
+                        );
                     }
                     // `buf_len` reaches the RP backend in exactly one place —
                     // the BUFFERED branch, which allocates the two `StaticCell`
@@ -4927,9 +5231,12 @@ pub fn module_config_ui(
                             ui.selectable_value(&mut cfg.stop_bits, StopBits::Two, "2");
                         });
                     ui.end_row();
-                    // Blocking → editable Portable|Native; Native runtime → shown
-                    // locked on Native; async USART → hidden (always the
-                    // embedded-io-async BufferedUart bridge, no choice).
+                    // The Init API row, per backend: F1 Blocking → editable
+                    // Portable|Native, locked to the DMA handles while DMA is
+                    // on; F1 Native → locked Native; ESP → locked esp-hal;
+                    // embassy Blocking → locked Portable (`init` is always the
+                    // embedded-io value); Async → hidden (always the
+                    // embedded-io-async bridge, no choice).
                     if esp {
                         api_row(ui, out, &mut pending.0);
                         // Direction and flow control are NOT async concepts on
@@ -4939,16 +5246,7 @@ pub fn module_config_ui(
                         // async gate.
                         direction_row(ui, out, cfg);
                         flow_row(ui, out, cfg, wired_flow);
-                        if !UsartDirection::options_for(cfg.mode, family)
-                            .contains(&cfg.direction)
-                        {
-                            cfg.direction = UsartDirection::TxRx;
-                        }
-                        if !UsartFlow::options_for(cfg.mode, cfg.direction, family)
-                            .contains(&cfg.flow)
-                        {
-                            cfg.flow = UsartFlow::None;
-                        }
+                        clamp_usart(cfg);
                         // No transport row: esp-hal's UART DMA is UHCI, a
                         // different driver this generator does not write yet.
                         // Said rather than left blank — the SPI beside it has
@@ -4966,6 +5264,17 @@ pub fn module_config_ui(
                              module's DMA is unrelated and does work.",
                         );
                         ui.end_row();
+                    } else if embassy_blocking {
+                        // embassy-stm32's polled `new_blocking*` UART: one form
+                        // of transport, none of buffer, but every direction,
+                        // the line extras and the flow forms its constructors
+                        // take - offered from the DMA transport's lists, which
+                        // are those constructors, whatever `mode` holds.
+                        out.skip("Async transport", docs::SKIP_USART_TRANSPORT_BLOCKING);
+                        direction_row(ui, out, cfg);
+                        flow_row(ui, out, cfg, wired_flow);
+                        clamp_usart(cfg);
+                        api_row_locked_embassy(ui, out);
                     } else if is_native {
                         api_row_locked(ui, out);
                     } else if is_async {
@@ -4985,16 +5294,7 @@ pub fn module_config_ui(
                         // A direction the new transport cannot build, or a flow
                         // option the new pair cannot, would otherwise sit there
                         // as a stale choice that generates nothing.
-                        if !UsartDirection::options_for(cfg.mode, family)
-                            .contains(&cfg.direction)
-                        {
-                            cfg.direction = UsartDirection::TxRx;
-                        }
-                        if !UsartFlow::options_for(cfg.mode, cfg.direction, family)
-                            .contains(&cfg.flow)
-                        {
-                            cfg.flow = UsartFlow::None;
-                        }
+                        clamp_usart(cfg);
                         if crate::panels::mcu_module::codegen::rp::is_rp(family) {
                             // Under Buffered no channel is taken at all, so the
                             // note would describe something that is not
@@ -5096,13 +5396,34 @@ pub fn module_config_ui(
                             "CPOL/CPHA. The device on the other end states which it wants."
                         });
                     ui.end_row();
-                    // Async only: the STM32F1 HAL's SPI takes no bit-order
-                    // argument, so the field would be a control that does
+                    // Drawn where the generated code writes `bit_order`, by
+                    // BACKEND: embassy-stm32 on both runtimes (every STM32 but
+                    // the F1 on Blocking), and embassy-nrf - on Async, and on
+                    // the nRF52820/5340/54L's Blocking, which runs on it too.
+                    // Never on an RP: embassy-rp's `spi::Config` has no bit
+                    // order. stm32f1xx-hal, nrf-hal and esp-hal take none
+                    // either, so the field would be a control that does
                     // nothing there.
-                    if !is_async {
-                        out.skip("Bit order", docs::SKIP_SPI_BIT_ORDER);
+                    let spi_rp = crate::panels::mcu_module::codegen::rp::is_rp(family);
+                    let spi_nrf = crate::panels::mcu_module::codegen::nrf::is_nrf(family);
+                    let bit_order_live = if spi_rp {
+                        false
+                    } else if spi_nrf {
+                        is_async || crate::panels::mcu_module::codegen::nrf::blocking_on_embassy(family)
+                    } else {
+                        is_async || embassy_blocking
+                    };
+                    if !bit_order_live {
+                        out.skip(
+                            "Bit order",
+                            if spi_rp && is_async {
+                                docs::SKIP_SPI_BIT_ORDER_RP
+                            } else {
+                                docs::SKIP_SPI_BIT_ORDER
+                            },
+                        );
                     }
-                    if is_async {
+                    if bit_order_live {
                         out.field("Bit order", docs::SPI_BIT_ORDER);
                         ui.label("Bit order");
                         egui::ComboBox::from_id_salt("spibitorder")
@@ -5207,6 +5528,12 @@ pub fn module_config_ui(
                                 );
                             }
                         }
+                    } else if embassy_blocking {
+                        // No executor, so embassy-stm32's bus is always the
+                        // blocking one - and its `init` the embedded-hal 1.0
+                        // value, whatever the module stores.
+                        out.skip("Async init", docs::SKIP_ASYNC_INIT_BLOCKING);
+                        api_row_locked_embassy(ui, out);
                     } else if is_native {
                         api_row_locked(ui, out);
                     } else if let Some(chans) = codegen::stm32::blocking_dma_channels(
@@ -5237,6 +5564,11 @@ pub fn module_config_ui(
                     // so no row has to repeat the test.
                     let t_esp = family.starts_with("esp");
                     let t_rp = crate::panels::mcu_module::codegen::rp::is_rp(family);
+                    // The runtimes whose timer file is embassy's `pwm_config_file`
+                    // (`SimplePwm` / `ComplementaryPwm`): every STM32 on Async and
+                    // every STM32 but the F1 on Blocking - plus, on Async, the RP
+                    // and the nRF, which keep the rows they always drew.
+                    let embassy_pwm = is_async || embassy_blocking;
                     let per_family = |stm32: &'static str,
                                       esp_: &'static str,
                                       rp_: &'static str| {
@@ -5329,9 +5661,9 @@ pub fn module_config_ui(
                     }
                     // The counter belongs to the TIMER, like the frequency —
                     // one counter, one shape. embassy takes it in
-                    // `SimplePwm::new`; the note below says why the other
-                    // runtimes do not show it.
-                    if is_async {
+                    // `SimplePwm::new` on both of its runtimes; the note below
+                    // says why the F1's stm32f1xx-hal does not show it.
+                    if embassy_pwm {
                         out.field(
                             "Counter",
                             if t_rp {
@@ -5413,7 +5745,7 @@ pub fn module_config_ui(
                         }
                         ui.end_row();
 
-                        if is_async {
+                        if embassy_pwm {
                             // Edited on a COPY and written back only on a real
                             // change, so opening the panel does not fill the
                             // config with rows of defaults.
@@ -5479,13 +5811,15 @@ pub fn module_config_ui(
                     // not have, and kept advertising the action after all of
                     // them were wired.
                     // Dead time only matters once a pair exists, and only the
-                    // async backend can emit it — see the note further down.
+                    // embassy backends (Async, and Blocking on every STM32 but
+                    // the F1) emit it; the F1 Blocking HAL cannot - see the
+                    // note further down.
                     // `starts_with("CH")` matters: BKIN ends in an N too, and it
                     // is a fault input, not half of a pair.
                     let has_comp = wired
                         .iter()
                         .any(|s| s.starts_with("CH") && s.ends_with('N'));
-                    if has_comp && is_async {
+                    if has_comp && embassy_pwm {
                         if is_advanced_timer(cfg.instance) {
                             out.field("Dead time", docs::TIMER_DEAD_TIME);
                             ui.label("Dead time");
@@ -5524,7 +5858,7 @@ pub fn module_config_ui(
                             _ => None,
                         })
                         .collect();
-                    if !breaks.is_empty() && is_async && is_advanced_timer(cfg.instance) {
+                    if !breaks.is_empty() && embassy_pwm && is_advanced_timer(cfg.instance) {
                         for i in &breaks {
                             let before = cfg.break_of(*i);
                             let mut b = before;
@@ -5622,21 +5956,18 @@ pub fn module_config_ui(
                     // generated sent them to a runtime they did not need. The gate
                     // was written before the RP backend existed. The nRF is the
                     // same case: `NrfBackend::config_files` writes `pwm<n>.rs`.
-                    if !is_async
-                        && !family.starts_with("esp")
-                        && !crate::panels::mcu_module::codegen::rp::is_rp(family)
-                        && !crate::panels::mcu_module::codegen::nrf::is_nrf(family)
-                    {
+                    // And so is every STM32 but the F1: embassy Blocking writes
+                    // pwm<n>.rs for every timer, the one `time-driver-any` takes
+                    // on Async included, with the rows above. What is left is
+                    // the F1's stm32f1xx-hal (Blocking, Native, RTIC).
+                    if family == "stm32f1" && !is_async {
                         ui.label("");
-                        let why = if family == "stm32f1" {
-                            "counter mode, drive, polarity and PWM mode need the Async runtime — stm32f1xx-hal's `pwm_hz` cannot set them"
-                        } else {
-                            "this runtime emits no PWM code at all — only Async generates it (System tab)"
-                        };
                         ui.label(
-                            egui::RichText::new(why)
-                                .size(10.5)
-                                .color(egui::Color32::from_gray(140)),
+                            egui::RichText::new(
+                                "counter mode, drive, polarity and PWM mode need the Async runtime — stm32f1xx-hal's `pwm_hz` cannot set them",
+                            )
+                            .size(10.5)
+                            .color(egui::Color32::from_gray(140)),
                         );
                         ui.end_row();
                     }
@@ -5733,14 +6064,16 @@ pub fn module_config_ui(
                     });
                     ui.end_row();
 
+                    // By the backend, not the runtime: embassy-stm32 builds the
+                    // HSPI on Blocking too. Only a hand-made chip whose family
+                    // has no embassy driver reaches the other sentence.
                     ui.label("");
                     ui.label(
-                        egui::RichText::new(if is_async {
+                        egui::RichText::new(if embassy {
                             "the silicon carries IO0-IO15 and a second strobe, but embassy's \
                              driver stops at eight lines — the wider pads have no constructor"
                         } else {
-                            "only the Async runtime emits HSPI code — the blocking backends \
-                             generate GPIO and watchdogs only"
+                            "this backend emits no HSPI code — only embassy-stm32 generates it"
                         })
                         .size(10.5)
                         .color(egui::Color32::from_gray(140)),
@@ -5867,18 +6200,6 @@ pub fn module_config_ui(
                         );
                         ui.end_row();
                     }
-                    if !is_async {
-                        ui.label("");
-                        ui.label(
-                            egui::RichText::new(
-                                "only the Async runtime emits XSPI code — the blocking backends \
-                                 generate GPIO and watchdogs only",
-                            )
-                            .size(10.5)
-                            .color(egui::Color32::from_gray(140)),
-                        );
-                        ui.end_row();
-                    }
                     out.all_fields_documented();
                 }
                 // One OCTOSPI port. The width narrows the mode but does not
@@ -5983,18 +6304,6 @@ pub fn module_config_ui(
                             )
                             .size(10.5)
                             .color(egui::Color32::from_rgb(200, 140, 60)),
-                        );
-                        ui.end_row();
-                    }
-                    if !is_async {
-                        ui.label("");
-                        ui.label(
-                            egui::RichText::new(
-                                "only the Async runtime emits OCTOSPI code — the blocking \
-                                 backends generate GPIO and watchdogs only",
-                            )
-                            .size(10.5)
-                            .color(egui::Color32::from_gray(140)),
                         );
                         ui.end_row();
                     }
@@ -6176,17 +6485,6 @@ pub fn module_config_ui(
                             .color(egui::Color32::from_gray(140)),
                         );
                         ui.end_row();
-                    } else if !is_async {
-                        ui.label("");
-                        ui.label(
-                            egui::RichText::new(
-                                "only the Async runtime emits QUADSPI code — the blocking \
-                                 backends generate GPIO and watchdogs only",
-                            )
-                            .size(10.5)
-                            .color(egui::Color32::from_gray(140)),
-                        );
-                        ui.end_row();
                     }
                     out.all_fields_documented();
                 }
@@ -6263,15 +6561,45 @@ pub fn module_config_ui(
                         );
                         ui.end_row();
                     }
-                    if !is_async {
+                    // Why no SD-card code comes out, by the backend that would
+                    // build it: embassy-stm32 drives the controller only
+                    // asynchronously, so its Blocking runtime leaves the pads
+                    // raw (main.rs gives the same reason); the F1's SDIO has no
+                    // stm32f1xx-hal driver, and no DMA channel on embassy
+                    // either. An Async STM32 builds it - the width row above
+                    // already flags a bus it cannot - and any other family
+                    // reaches this arm only through hand-made pads.
+                    let stm32 = family.starts_with("stm32");
+                    let gap: Option<String> = if family == "stm32f1" && is_async {
+                        codegen::family::f1_async_module_gap(
+                            family,
+                            crate::panels::mcu_module::mcu::Runtime::Async,
+                            ModuleKind::GenericInterfaceSdmmc,
+                        )
+                        .map(str::to_owned)
+                    } else if family == "stm32f1" {
+                        Some(
+                            "stm32f1xx-hal has no SDIO driver, so no SD-card code is generated \
+                             — nor on Async, where embassy-stm32 gives the F1's SDIO no DMA \
+                             channel"
+                                .to_owned(),
+                        )
+                    } else if stm32 && !is_async {
+                        Some(format!(
+                            "only the Async runtime emits SD-card code: {}",
+                            codegen::embassy_stm32::SDMMC_BLOCKING_GAP
+                        ))
+                    } else if !stm32 {
+                        Some("no SD-card code is generated for this family".to_owned())
+                    } else {
+                        None
+                    };
+                    if let Some(gap) = gap {
                         ui.label("");
                         ui.label(
-                            egui::RichText::new(
-                                "only the Async runtime emits SD-card code — the blocking \
-                                 backends generate GPIO and watchdogs only",
-                            )
-                            .size(10.5)
-                            .color(egui::Color32::from_gray(140)),
+                            egui::RichText::new(gap)
+                                .size(10.5)
+                                .color(egui::Color32::from_gray(140)),
                         );
                         ui.end_row();
                     }
@@ -6497,22 +6825,29 @@ pub fn module_config_ui(
                         );
                         ui.end_row();
                     }
-                    if !is_async {
+                    // Only the F1 off Async has nothing to say the levels to:
+                    // embassy-stm32 builds the DAC on both runtimes (a module
+                    // whose "Generate driver" is off says so on its switch),
+                    // esp-hal builds it on both too, and the RP and nRF have
+                    // none.
+                    if family == "stm32f1" && !is_async {
                         ui.label("");
                         ui.label(
                             egui::RichText::new(
-                                "only the Async runtime emits DAC code today — the blocking backends generate GPIO and watchdogs only",
+                                "stm32f1xx-hal has no DAC driver: on Blocking, Native and RTIC the pads are only set to analog mode — the Async runtime (embassy-stm32) generates dac<n>.rs",
                             )
                             .size(10.5)
                             .color(egui::Color32::from_gray(140)),
                         );
                         ui.end_row();
+                    } else if esp {
+                        out.note(docs::DAC_ESP_BOTH_RUNTIMES);
                     }
                     out.all_fields_documented();
                 }
                 // One SPI block running as audio. Every setting here is a
                 // field of embassy's `i2s::Config`, plus the ring buffer the
-                // DMA owns — there is no blocking I2S to fall back on.
+                // DMA owns — embassy has no blocking I2S to fall back on.
                 ModuleConfig::I2s(cfg) => {
                     let is_esp =
                         crate::panels::mcu_module::codegen::family::is_esp(family);
@@ -6643,23 +6978,28 @@ pub fn module_config_ui(
                         }
                     }
 
-                    ui.label("");
-                    ui.label(
-                        egui::RichText::new(if is_async {
-                            format!(
-                                "runs on SPI{} — an SPI module on the same instance describes \
-                                 the same block, and only one of the two is built",
-                                cfg.instance
-                            )
-                        } else {
-                            "only the Async runtime emits I2S — embassy drives it from a DMA \
-                             ring buffer, and there is no blocking form"
-                                .to_owned()
-                        })
-                        .size(10.5)
-                        .color(egui::Color32::from_gray(140)),
-                    );
-                    ui.end_row();
+                    // Both sentences are embassy's. An ESP is never `is_async`
+                    // here and builds its I2S on either runtime, so neither one
+                    // is true of it.
+                    if is_async || !is_esp {
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(if is_async {
+                                format!(
+                                    "runs on SPI{} — an SPI module on the same instance describes \
+                                     the same block, and only one of the two is built",
+                                    cfg.instance
+                                )
+                            } else {
+                                "only the Async runtime emits I2S — embassy drives it from a DMA \
+                                 ring buffer, and there is no blocking form"
+                                    .to_owned()
+                            })
+                            .size(10.5)
+                            .color(egui::Color32::from_gray(140)),
+                        );
+                        ui.end_row();
+                    }
                     out.all_fields_documented();
                 }
                 ModuleConfig::I2c(cfg) => {
@@ -6692,6 +7032,13 @@ pub fn module_config_ui(
                     }
                     if is_async && nrf_i2c {
                         out.skip("Timeout", docs::SKIP_I2C_TIMEOUT_NRF);
+                    }
+                    // embassy-stm32 on Blocking builds the same driver without
+                    // embassy-time, so its `Config` has no timeout field. NOT a
+                    // bare `!is_async`: the ESP, the RP and nRF Blocking and the
+                    // F1's stm32f1xx-hal never had the row to lose.
+                    if embassy_blocking {
+                        out.skip("Timeout", docs::SKIP_I2C_TIMEOUT_BLOCKING);
                     }
                     if is_async && !rp_i2c && !nrf_i2c {
                         out.field("Timeout", docs::I2C_TIMEOUT);
@@ -6816,6 +7163,11 @@ pub fn module_config_ui(
                                 &mut cfg.dma_rx,
                             );
                         }
+                    } else if embassy_blocking {
+                        // The SPI's case: the blocking embedded-hal 1.0 bus,
+                        // whatever the module stores.
+                        out.skip("Async init", docs::SKIP_ASYNC_INIT_BLOCKING);
+                        api_row_locked_embassy(ui, out);
                     } else if is_native {
                         api_row_locked(ui, out);
                     } else {
@@ -7605,6 +7957,71 @@ mod tests {
         line_extras: bool,
         block_partner: Option<&str>,
     ) -> ConfigOut {
+        drive_module(
+            kind,
+            config,
+            family,
+            is_async,
+            is_native,
+            line_extras,
+            block_partner,
+            true,
+        )
+        .0
+    }
+
+    /// `drive_usart`, handing back the config as the frame left it: the
+    /// clamps write it, and `ConfigOut` never sees a combo's entries.
+    fn drive_usart_cfg(
+        family: &str,
+        is_async: bool,
+        line_extras: bool,
+        edit: impl FnOnce(&mut UsartModuleConfig),
+    ) -> (ConfigOut, UsartModuleConfig) {
+        drive_usart_staged(family, is_async, true, line_extras, edit)
+    }
+
+    /// `drive_usart_cfg` with `is_async` STAGED over the other runtime when
+    /// `runtime_applied` is false - the System tab card clicked, not applied.
+    fn drive_usart_staged(
+        family: &str,
+        is_async: bool,
+        runtime_applied: bool,
+        line_extras: bool,
+        edit: impl FnOnce(&mut UsartModuleConfig),
+    ) -> (ConfigOut, UsartModuleConfig) {
+        use crate::panels::mcu_module::modules::ModuleConfig;
+
+        let mut cfg = UsartModuleConfig::new(1);
+        edit(&mut cfg);
+        let (out, m) = drive_module(
+            ModuleKind::GenericInterfaceUsart,
+            ModuleConfig::Usart(cfg),
+            family,
+            is_async,
+            false,
+            line_extras,
+            None,
+            runtime_applied,
+        );
+        match m.config {
+            ModuleConfig::Usart(c) => (out, c),
+            _ => unreachable!("the USART arm keeps its config"),
+        }
+    }
+
+    /// The one harness under all of the above: the real panel for one module,
+    /// and the module as the frame left it.
+    fn drive_module(
+        kind: ModuleKind,
+        config: crate::panels::mcu_module::modules::ModuleConfig,
+        family: &str,
+        is_async: bool,
+        is_native: bool,
+        line_extras: bool,
+        block_partner: Option<&str>,
+        runtime_applied: bool,
+    ) -> (ConfigOut, crate::panels::mcu_module::modules::VirtualModule) {
         use crate::panels::mcu_module::modules::VirtualModule;
 
         let mut m = VirtualModule {
@@ -7632,6 +8049,7 @@ mod tests {
                 &mut choice,
                 is_async,
                 is_native,
+                runtime_applied,
                 family,
                 &mut pending,
                 None,
@@ -7649,7 +8067,7 @@ mod tests {
                 &mut super::super::i2c_devices::I2cIo::default(),
             );
         });
-        out
+        (out, m)
     }
 
     fn labels_of(out: &ConfigOut) -> Vec<&str> {
@@ -8165,6 +8583,266 @@ mod tests {
             assert!(drawn.iter().any(|l| l == "Timeout"), "{drawn:?}");
         }
 
+        /// ...and its Blocking runtime explains why it has none: the same
+        /// driver without embassy-time. Only there - the F1's stm32f1xx-hal
+        /// and the ESP never had the row to lose.
+        #[test]
+        fn a_blocking_embassy_stm32_explains_its_missing_i2c_timeout() {
+            for family in ["stm32g0", "stm32wba"] {
+                let (drawn, skipped) = i2c_labels(family, false);
+                assert!(!drawn.iter().any(|l| l == "Timeout"), "{family}: {drawn:?}");
+                assert!(
+                    skipped.iter().any(|l| l == "Timeout"),
+                    "{family}: {skipped:?}"
+                );
+            }
+            for family in ["stm32f1", "esp32c3"] {
+                let (_, skipped) = i2c_labels(family, false);
+                assert!(
+                    !skipped.iter().any(|l| l == "Timeout"),
+                    "{family}: {skipped:?}"
+                );
+            }
+        }
+
+        /// The SPI bit order is drawn wherever the generated code writes it -
+        /// embassy-stm32 on both runtimes, the WBA included - and explained
+        /// everywhere it does not.
+        #[test]
+        fn the_spi_bit_order_follows_the_backend() {
+            let spi = |family: &str, is_async: bool, is_native: bool| {
+                let out = drive(
+                    ModuleKind::GenericInterfaceSpi,
+                    ModuleKind::GenericInterfaceSpi.default_config(1),
+                    family,
+                    is_async,
+                    is_native,
+                    false,
+                );
+                let drawn = out
+                    .fields()
+                    .expect("the SPI arm marks itself documented")
+                    .iter()
+                    .find(|f| f.label == "Bit order")
+                    .map(|f| f.doc.clone());
+                let skipped = out
+                    .skipped_fields()
+                    .iter()
+                    .find(|f| f.label == "Bit order")
+                    .map(|f| f.doc.clone());
+                (drawn, skipped)
+            };
+            for (family, is_async) in [
+                ("stm32g0", false),
+                ("stm32wba", false),
+                ("stm32g0", true),
+                ("stm32f1", true),
+            ] {
+                let (drawn, skipped) = spi(family, is_async, false);
+                assert_eq!(
+                    drawn.as_deref(),
+                    Some(docs::SPI_BIT_ORDER),
+                    "{family} {is_async}"
+                );
+                assert_eq!(skipped, None, "{family} {is_async}");
+            }
+            for (family, is_native) in [
+                ("stm32f1", false),
+                ("stm32f1", true),
+                ("esp32c3", false),
+                ("rp2040", false),
+                ("nrf52833", false),
+            ] {
+                let (drawn, skipped) = spi(family, false, is_native);
+                assert_eq!(drawn, None, "{family} native={is_native}");
+                assert_eq!(
+                    skipped.as_deref(),
+                    Some(docs::SKIP_SPI_BIT_ORDER),
+                    "{family} native={is_native}"
+                );
+            }
+            // embassy-nrf writes it on Blocking too, on the part nrf-hal has
+            // no crate for; embassy-rp has no bit order at all.
+            let (drawn, _) = spi("nrf5340", false, false);
+            assert_eq!(drawn.as_deref(), Some(docs::SPI_BIT_ORDER));
+            let (drawn, skipped) = spi("rp2040", true, false);
+            assert_eq!(drawn, None);
+            assert_eq!(skipped.as_deref(), Some(docs::SKIP_SPI_BIT_ORDER_RP));
+        }
+
+        /// No RP or nRF generator reads the Init API, so their row is locked:
+        /// an editable one held a pick that no Apply bar would ever commit.
+        #[test]
+        fn a_board_whose_hal_reads_no_init_api_locks_it() {
+            let api = |family: &str| {
+                drive_usart(family, false, false, false, |_| {})
+                    .fields()
+                    .expect("the USART arm marks itself documented")
+                    .iter()
+                    .find(|f| f.label == "Init API")
+                    .map(|f| f.doc.clone())
+            };
+            for family in ["rp2040", "nrf52833"] {
+                assert_eq!(api(family).as_deref(), Some(docs::INIT_API_HAL), "{family}");
+            }
+            assert_eq!(api("stm32f1").as_deref(), Some(docs::INIT_API));
+        }
+
+        /// embassy-stm32's Blocking SPI and I2C are always the blocking
+        /// embedded-hal 1.0 bus: Async init is explained as absent, and the
+        /// Init API is locked in embassy's words, not left as the F1's combo.
+        #[test]
+        fn a_blocking_embassy_bus_locks_its_init_and_explains_async_init() {
+            for kind in [
+                ModuleKind::GenericInterfaceSpi,
+                ModuleKind::GenericInterfaceI2c,
+            ] {
+                for family in ["stm32g0", "stm32wba"] {
+                    let out = drive(kind, kind.default_config(1), family, false, false, false);
+                    let f = out.fields().expect("documented");
+                    assert!(
+                        f.iter().all(|f| f.label != "Async init"),
+                        "{kind:?} {family}"
+                    );
+                    let api = f
+                        .iter()
+                        .find(|f| f.label == "Init API")
+                        .expect("locked row");
+                    assert_eq!(api.doc, docs::INIT_API_EMBASSY, "{kind:?} {family}");
+                    let why = out
+                        .skipped_fields()
+                        .iter()
+                        .find(|f| f.label == "Async init")
+                        .expect("explained");
+                    assert_eq!(why.doc, docs::SKIP_ASYNC_INIT_BLOCKING);
+                }
+                // The F1 keeps its editable choice.
+                let f1 = drive(kind, kind.default_config(1), "stm32f1", false, false, false);
+                let api = f1
+                    .fields()
+                    .unwrap()
+                    .iter()
+                    .find(|f| f.label == "Init API")
+                    .map(|f| f.doc.clone());
+                assert_eq!(api.as_deref(), Some(docs::INIT_API), "{kind:?}");
+            }
+        }
+
+        /// A polled UART has no buffer and no transport, and says that rather
+        /// than the TX-only DMA link's reason - which still stands on Async.
+        #[test]
+        fn a_blocking_embassy_uart_explains_its_missing_buffer_and_transport() {
+            let tx_only = |c: &mut UsartModuleConfig| {
+                c.mode = UsartMode::Dma;
+                c.direction = UsartDirection::TxOnly;
+            };
+            let out = drive_usart("stm32g0", false, false, false, tx_only);
+            let why = |label: &str| {
+                out.skipped_fields()
+                    .iter()
+                    .find(|f| f.label == label)
+                    .map(|f| f.doc.clone())
+            };
+            assert_eq!(
+                why("RX DMA buffer").as_deref(),
+                Some(docs::SKIP_USART_BUF_BLOCKING)
+            );
+            assert_eq!(
+                why("Async transport").as_deref(),
+                Some(docs::SKIP_USART_TRANSPORT_BLOCKING)
+            );
+            assert!(
+                out.skipped_fields()
+                    .iter()
+                    .all(|f| f.doc != docs::SKIP_USART_BUF_TX_ONLY),
+                "{:?}",
+                out.skipped_fields()
+            );
+
+            let on_async = drive_usart("stm32g0", true, false, false, tx_only);
+            let tx = on_async
+                .skipped_fields()
+                .iter()
+                .find(|f| f.label == "RX/TX buffer")
+                .expect("the TX-only reason");
+            assert_eq!(tx.doc, docs::SKIP_USART_BUF_TX_ONLY);
+
+            // No other backend gains an embassy-Blocking reason.
+            let blocking_docs = [
+                docs::SKIP_USART_BUF_BLOCKING,
+                docs::SKIP_USART_TRANSPORT_BLOCKING,
+                docs::SKIP_ASYNC_INIT_BLOCKING,
+                docs::SKIP_I2C_TIMEOUT_BLOCKING,
+            ];
+            for (family, is_async, is_native) in [
+                ("stm32f1", false, false),
+                ("stm32f1", false, true),
+                ("esp32c3", false, false),
+                ("rp2040", false, false),
+                ("rp2040", true, false),
+                ("nrf52833", false, false),
+                ("nrf52833", true, false),
+            ] {
+                for kind in [
+                    ModuleKind::GenericInterfaceUsart,
+                    ModuleKind::GenericInterfaceSpi,
+                    ModuleKind::GenericInterfaceI2c,
+                ] {
+                    let out = drive(
+                        kind,
+                        kind.default_config(1),
+                        family,
+                        is_async,
+                        is_native,
+                        false,
+                    );
+                    for f in out.skipped_fields() {
+                        assert!(
+                            !blocking_docs.contains(&f.doc.as_ref()),
+                            "{kind:?} on {family} (async={is_async}, native={is_native}): {}",
+                            f.label
+                        );
+                    }
+                }
+            }
+        }
+
+        /// embassy's `SimplePwm` takes the counter and the channel shape on
+        /// both of its runtimes; stm32f1xx-hal's `pwm_hz` takes neither.
+        #[test]
+        fn the_pwm_counter_follows_the_backend() {
+            let counter = |family: &str, is_async: bool, is_native: bool| {
+                drive(
+                    ModuleKind::GenericInterfaceTimer,
+                    ModuleKind::GenericInterfaceTimer.default_config(1),
+                    family,
+                    is_async,
+                    is_native,
+                    false,
+                )
+                .fields()
+                .expect("the timer arm marks itself documented")
+                .iter()
+                .find(|f| f.label == "Counter")
+                .map(|f| f.doc.clone())
+            };
+            for (family, is_async) in [("stm32g0", false), ("stm32wba", false), ("stm32g0", true)] {
+                assert_eq!(
+                    counter(family, is_async, false).as_deref(),
+                    Some(docs::TIMER_COUNTING),
+                    "{family} async={is_async}"
+                );
+            }
+            for is_native in [false, true] {
+                assert_eq!(
+                    counter("stm32f1", false, is_native),
+                    None,
+                    "native={is_native}"
+                );
+            }
+            assert_eq!(counter("esp32c3", false, false), None);
+        }
+
         /// On an async nRF the UARTE has EasyDMA built in: no transport to
         /// pick, no ring to size and no channels, on either `mode` a project
         /// might carry. Direction and flow control stay, because the
@@ -8359,12 +9037,64 @@ mod tests {
         assert!(l.contains(&"Transfers"), "{l:?}");
         assert!(!l.contains(&"Async transport"), "{l:?}");
 
-        // A blocking STM32G0 has none of them: no F1 DMA table, no async rows.
+        // A blocking STM32G0 is embassy-stm32's polled UART: every direction,
+        // line and flow form its `new_blocking*` calls take, the Init API
+        // locked in embassy's words - and none of the Async runtime's
+        // transport or buffer rows, nor the F1's DMA table. Kept at the
+        // default Buffered, which Blocking never reads.
         let g0 = drive_usart("stm32g0", false, false, false, |_| {});
         let l = labels_of(&g0);
+        for want in ["Data direction", "Line", "Hardware flow control"] {
+            assert!(l.contains(&want), "{want}: {l:?}");
+        }
+        for gone in [
+            "Async transport",
+            "RX/TX buffer",
+            "RX DMA buffer",
+            "Transport",
+            "Transfers",
+            "DMA TX",
+        ] {
+            assert!(!l.contains(&gone), "{gone}: {l:?}");
+        }
+        let skipped: Vec<&str> = g0
+            .skipped_fields()
+            .iter()
+            .map(|f| f.label.as_str())
+            .collect();
+        for why in ["Async transport", "RX/TX buffer"] {
+            assert!(skipped.contains(&why), "{why}: {skipped:?}");
+        }
+        let doc_of = |out: &ConfigOut, label: &str| {
+            out.fields()
+                .unwrap()
+                .iter()
+                .find(|f| f.label == label)
+                .unwrap_or_else(|| panic!("{label} row"))
+                .doc
+                .clone()
+        };
+        assert_eq!(doc_of(&g0, "Init API"), docs::INIT_API_EMBASSY);
+        // The WBA is the other embassy Blocking backend, and draws the same.
+        let wba = drive_usart("stm32wba", false, false, true, |_| {});
+        assert!(labels_of(&wba).contains(&"Data direction"));
+        assert_eq!(doc_of(&wba, "Init API"), docs::INIT_API_EMBASSY);
+
+        // The F1 on Blocking is stm32f1xx-hal: its DMA table, the editable
+        // Init API, and the three serial rows explained as absent.
+        let f1 = drive_usart("stm32f1", false, false, false, |_| {});
+        let l = labels_of(&f1);
         assert!(!l.contains(&"Data direction"), "{l:?}");
-        assert!(!l.contains(&"Transfers"), "{l:?}");
-        assert!(l.contains(&"Init API"), "{l:?}");
+        assert!(l.contains(&"Transport"), "{l:?}");
+        for row in ["Data direction", "Line", "Hardware flow control"] {
+            let s = f1
+                .skipped_fields()
+                .iter()
+                .find(|s| s.label == row)
+                .unwrap_or_else(|| panic!("{row} is explained"));
+            assert_eq!(s.doc, docs::SKIP_F1_SERIAL);
+        }
+        assert_eq!(doc_of(&f1, "Init API"), docs::INIT_API);
 
         // The Native runtime locks the Init API, and says so in its own words.
         let native = drive_usart("stm32f1", false, true, false, |_| {});
@@ -8435,6 +9165,187 @@ mod tests {
             f.iter().find(|f| f.label == "Line").unwrap().doc,
             docs::USART_LINE_ABSENT
         );
+
+        // The same row, the same rule, on embassy's Blocking runtime.
+        for (extras, want) in [(true, docs::USART_LINE), (false, docs::USART_LINE_ABSENT)] {
+            let out = drive_usart("stm32g0", false, false, extras, |_| {});
+            let f = out.fields().unwrap();
+            assert_eq!(f.iter().find(|f| f.label == "Line").unwrap().doc, want);
+        }
+    }
+
+    /// The choices the embassy panel keeps, read back off the config - a
+    /// combo's entries never reach `ConfigOut`. On Blocking the lists are the
+    /// DMA transport's (the `new_blocking*` set) whatever the module stores,
+    /// and a usart_v1/v2 chip loses half duplex on RX and DE on either
+    /// runtime, as the generator refuses them.
+    #[test]
+    fn the_usart_choices_survive_only_where_they_are_built() {
+        use UsartDirection as D;
+        use UsartFlow as F;
+        fn stored(
+            mode: UsartMode,
+            d: UsartDirection,
+            f: UsartFlow,
+        ) -> impl FnOnce(&mut UsartModuleConfig) {
+            move |c| {
+                c.mode = mode;
+                c.direction = d;
+                c.flow = f;
+            }
+        }
+
+        // One-way halves with their flow pad: the polled UART builds both,
+        // though the buffered transport has neither on Async.
+        for (d, f) in [(D::TxOnly, F::Cts), (D::RxOnly, F::Rts)] {
+            let (_, c) = drive_usart_cfg("stm32g0", false, true, stored(UsartMode::Buffered, d, f));
+            assert_eq!(
+                (c.direction, c.flow),
+                (d, f),
+                "Blocking keeps {d:?} + {f:?}"
+            );
+            assert_eq!(
+                c.mode,
+                UsartMode::Buffered,
+                "the transport is never written by a frame"
+            );
+            let (_, c) = drive_usart_cfg("stm32g0", true, true, stored(UsartMode::Buffered, d, f));
+            assert_eq!(c.direction, D::TxRx, "Async Buffered has no {d:?}");
+            // ...but only once Async is APPLIED: staged over a Blocking
+            // project, the frame must not rewrite what Blocking builds.
+            let (_, c) = drive_usart_staged(
+                "stm32g0",
+                true,
+                false,
+                true,
+                stored(UsartMode::Buffered, d, f),
+            );
+            assert_eq!((c.direction, c.flow), (d, f), "staged Async keeps {d:?}");
+        }
+        // RTS alone on a full-duplex port is a buffered constructor, which no
+        // `new_blocking*` call takes - and the Async runtime's choice, which
+        // the Blocking panel keeps (the generator builds without it).
+        for runtime_applied in [true, false] {
+            let (_, c) = drive_usart_staged(
+                "stm32g0",
+                false,
+                runtime_applied,
+                true,
+                stored(UsartMode::Buffered, D::TxRx, F::Rts),
+            );
+            assert_eq!(c.flow, F::Rts, "applied={runtime_applied}");
+        }
+
+        for is_async in [false, true] {
+            for (extras, want_dir, want_flow) in
+                [(false, D::TxRx, F::None), (true, D::HalfDuplexOnRx, F::De)]
+            {
+                let (_, c) = drive_usart_cfg(
+                    "stm32g0",
+                    is_async,
+                    extras,
+                    stored(UsartMode::Dma, D::HalfDuplexOnRx, F::None),
+                );
+                assert_eq!(c.direction, want_dir, "async={is_async} extras={extras}");
+                let (_, c) = drive_usart_cfg(
+                    "stm32g0",
+                    is_async,
+                    extras,
+                    stored(UsartMode::Dma, D::TxRx, F::De),
+                );
+                assert_eq!(c.flow, want_flow, "async={is_async} extras={extras}");
+            }
+        }
+    }
+
+    /// The handle the box and the code search name is the one main.rs binds,
+    /// by the backend that binds it - and none where it binds none.
+    #[test]
+    fn the_handle_follows_the_backend_that_binds_it() {
+        use crate::panels::mcu_module::modules::VirtualModule;
+        let module = |kind: ModuleKind, config| VirtualModule {
+            id: "m_1".into(),
+            kind,
+            name: kind.short().to_owned(),
+            pos: (0.0, 0.0),
+            config,
+            connections: Vec::new(),
+        };
+        let usart = |edit: &dyn Fn(&mut UsartModuleConfig)| {
+            let mut c = UsartModuleConfig::new(1);
+            edit(&mut c);
+            module(ModuleKind::GenericInterfaceUsart, ModuleConfig::Usart(c))
+        };
+        let native = |c: &mut UsartModuleConfig| c.api_style = ApiStyle::Native;
+        let dma = |c: &mut UsartModuleConfig| c.mode = UsartMode::Dma;
+        let f1 = HandleCtx {
+            f1_hal: true,
+            ..Default::default()
+        };
+        let g0 = HandleCtx {
+            embassy: true,
+            ..Default::default()
+        };
+        let g0_async = HandleCtx {
+            embassy: true,
+            is_async: true,
+            ..Default::default()
+        };
+
+        // stm32f1xx-hal reads `api_style`, and hands DMA back as a pair too.
+        assert_eq!(handle_names(&usart(&native), &f1), ["_tx1", "_rx1"]);
+        assert_eq!(
+            handle_names(&usart(&|c| c.blocking_dma = BlockingDma::Both), &f1),
+            ["_tx1", "_rx1"]
+        );
+        assert_eq!(handle_names(&usart(&|_| {}), &f1), ["_serial1"]);
+        // The Native runtime forces the pair whatever the module says.
+        let forced = HandleCtx {
+            native_forced: true,
+            f1_hal: true,
+            ..Default::default()
+        };
+        assert_eq!(handle_names(&usart(&|_| {}), &forced), ["_tx1", "_rx1"]);
+        // embassy never reads `api_style`; its Async DMA full duplex is the
+        // one pair it binds.
+        assert_eq!(handle_names(&usart(&native), &g0), ["_serial1"]);
+        assert_eq!(handle_names(&usart(&native), &g0_async), ["_serial1"]);
+        assert_eq!(handle_names(&usart(&dma), &g0), ["_serial1"]);
+        assert_eq!(
+            handle_names(&usart(&dma), &g0_async),
+            ["_serial1_tx", "_serial1_rx"]
+        );
+
+        // No driver, no handle: a module with "Generate driver" off, and the
+        // three peripherals embassy drives only asynchronously, on Blocking.
+        let raw = HandleCtx {
+            embassy: true,
+            raw: [(ModuleKind::GenericInterfaceUsart, 1)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert!(handle_names(&usart(&|_| {}), &raw).is_empty());
+        let sai = module(
+            ModuleKind::GenericInterfaceSai,
+            ModuleKind::GenericInterfaceSai.default_config(1),
+        );
+        assert!(handle_names(&sai, &g0).is_empty());
+        assert_eq!(handle_names(&sai, &g0_async), ["_sai1a", "_sai1b"]);
+
+        // Read off the project: the F1 off Async ignores the switch, an
+        // embassy family keeps it.
+        let mut mcu = crate::panels::mcu_module::builtins::builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        mcu.raw_modules
+            .insert((ModuleKind::GenericInterfaceUsart, 1));
+        let ctx = HandleCtx::of(&mcu);
+        assert!(ctx.f1_hal && !ctx.embassy && ctx.raw.is_empty(), "{ctx:?}");
+        mcu.family = "stm32g0".into();
+        let ctx = HandleCtx::of(&mcu);
+        assert!(!ctx.f1_hal && ctx.embassy && !ctx.is_async, "{ctx:?}");
+        assert!(handle_names(&usart(&|_| {}), &ctx).is_empty());
     }
 
     /// Every row this panel draws with a plain label is documented in the same

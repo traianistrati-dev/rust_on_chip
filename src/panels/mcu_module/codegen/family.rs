@@ -98,6 +98,14 @@ pub trait FamilyBackend {
         Vec::new()
     }
 
+    /// The GPIOs a generated bus driver takes in main.rs - a Custom module
+    /// cannot be handed one as well (`Mcu::custom_module_inits`). Default:
+    /// none, for a backend whose drivers take no pad a Custom module could
+    /// name.
+    fn driver_pins(&self, _mcu: &Mcu) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The drive / pull modes this backend can generate for `func` — what the
     /// mode list under the selected function offers. The FIRST entry is the
     /// default, i.e. what a pin with `io_mode: None` generates.
@@ -674,34 +682,16 @@ impl FamilyBackend for WbaBackend {
     }
 
     fn fresh_main_rs(&self, mcu: &Mcu) -> String {
-        let all = pins_of(mcu);
         format!(
             "{header}{section}\n{tail}",
             header = wba::invariant_header(&mcu.name, &mcu.id),
-            section = wba::make_generated_section(
-                &mcu.name,
-                mux_chip(mcu),
-                &all,
-                &mcu.clock,
-                &mcu.watchdog_and_custom_inits(),
-                mcu.clock_manual,
-                &mcu.irq_vectors,
-            ),
+            section = wba_section(mcu),
             tail = USER_TAIL,
         )
     }
 
     fn update_main_rs(&self, mcu: &Mcu, existing: &str) -> String {
-        let all = pins_of(mcu);
-        let section = wba::make_generated_section(
-            &mcu.name,
-            mux_chip(mcu),
-            &all,
-            &mcu.clock,
-            &mcu.watchdog_and_custom_inits(),
-            mcu.clock_manual,
-            &mcu.irq_vectors,
-        );
+        let section = wba_section(mcu);
         let section = super::common::keep_manual_clock(existing, section, mcu.clock_manual);
         wba::splice_section(existing, &section, &mcu.name, &mcu.id)
     }
@@ -717,18 +707,82 @@ impl FamilyBackend for WbaBackend {
         blocking_exti_hooks(mcu)
     }
 
+    /// The generic embassy backend's: the bus drivers, then the watchdogs.
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
-        // Like the generic embassy backend: bus inits stay inline in
-        // main.rs, so `pins/configs/` here holds only the pin-less
-        // peripherals the Configuration tab owns.
-        super::watchdog_gen::config_files(
-            &mcu.watchdog,
-            &mcu.family,
-            crate::panels::mcu_module::watchdog::wdg_part(mcu),
-            mcu.runtime,
-        )
+        blocking_config_files(mcu)
     }
-    // No per-peripheral config files yet — bus init is documented inline (v1).
+
+    fn driver_pins(&self, mcu: &Mcu) -> Vec<String> {
+        stm32_periphs(mcu, embassy_stm32::PeriphMode::Blocking).consumed_pins
+    }
+}
+
+/// The WBA's generated section: [`blocking_section`] with the WBA's own clock
+/// block (`wba::make_generated_section`).
+fn wba_section(mcu: &Mcu) -> String {
+    let all = pins_of(mcu);
+    let periphs = stm32_periphs(mcu, embassy_stm32::PeriphMode::Blocking);
+    wba::make_generated_section(
+        &mcu.name,
+        mux_chip(mcu),
+        &embassy_common::unbound_by_drivers(&all, &periphs.consumed_pins),
+        &mcu.clock,
+        &periphs.init_calls,
+        &mcu.watchdog_and_custom_inits(),
+        mcu.clock_manual,
+        &mcu.irq_vectors,
+    )
+}
+
+/// The generated section of an embassy Blocking project: the pin bindings,
+/// then the bus drivers' `init` calls that are handed them.
+fn blocking_section(mcu: &Mcu, clock: &str) -> String {
+    let all = pins_of(mcu);
+    let periphs = stm32_periphs(mcu, embassy_stm32::PeriphMode::Blocking);
+    embassy_common::make_generated_section(
+        &mcu.name,
+        &embassy_common::unbound_by_drivers(&all, &periphs.consumed_pins),
+        clock,
+        &periphs.init_calls,
+        &mcu.watchdog_and_custom_inits(),
+        &mcu.irq_vectors,
+    )
+}
+
+/// `src/pins/configs/` of an embassy Blocking project: one file per bus driver
+/// main.rs initialises, then the watchdogs the Configuration tab owns.
+fn blocking_config_files(mcu: &Mcu) -> Vec<(String, String)> {
+    let mut files = stm32_periphs(mcu, embassy_stm32::PeriphMode::Blocking).config_files;
+    files.extend(super::watchdog_gen::config_files(
+        &mcu.watchdog,
+        &mcu.family,
+        crate::panels::mcu_module::watchdog::wdg_part(mcu),
+        mcu.runtime,
+    ));
+    files
+}
+
+/// Whether any generator for `family` reads a module's Init API
+/// (`api_style`): only stm32f1xx-hal's, so only on the F1. The module panel
+/// draws the Portable | Native choice only here, and the Apply bar counts a
+/// staged one only here - one rule, so the two cannot disagree.
+pub fn reads_api_style(family: &str) -> bool {
+    family == "stm32f1"
+}
+
+/// Whether `family` on `is_async`'s runtime generates its bus drivers through
+/// [`embassy_stm32::peripherals`] - every STM32 on Async, every one but the F1
+/// on Blocking - and so whether a module's "Generate driver" switch decides
+/// anything (`Mcu::raw_modules`).
+pub fn embassy_drivers(family: &str, is_async: bool) -> bool {
+    family.starts_with("stm32") && (is_async || family != "stm32f1")
+}
+
+/// Whether `mcu` generates for embassy-stm32 on the Blocking runtime: every
+/// STM32 but the F1 (stm32f1xx-hal), off Async - the two backends that run
+/// [`embassy_stm32::peripherals`] in [`embassy_stm32::PeriphMode::Blocking`].
+pub fn embassy_blocking(mcu: &Mcu) -> bool {
+    !mcu.is_async() && mcu.family.starts_with("stm32") && mcu.family != "stm32f1"
 }
 
 /// The hooks of an embassy Blocking project (generic STM32 and WBA): the
@@ -741,11 +795,16 @@ fn blocking_exti_hooks(mcu: &Mcu) -> Vec<EdgeHook> {
 
 // ── Generic STM32 (embassy-stm32, blocking) ─────────────────────────────────
 // Covers every STM32 family embassy supports that has no dedicated backend
-// (all but `stm32f1`, which uses stm32f1xx-hal, and `stm32wba`, which adds RCC
-// clock mapping). The GPIO codegen is uniform across families — see
-// `embassy_common`; the clock is left at embassy's reset default (per-family
-// RCC graphs are a later step). This is what turns the many STM32 chips the
-// pin-data XML importer adds from data-only into buildable projects.
+// (all but `stm32f1`, which uses stm32f1xx-hal, and `stm32wba`, whose clock
+// block is its own). The GPIO codegen is uniform across families — see
+// `embassy_common`; the clock block is the Clock tab's recipe
+// (`stm32_clock_block`). The bus drivers come from the pass the Async runtime
+// runs too, `embassy_stm32::peripherals` in `PeriphMode::Blocking` (shared
+// with `WbaBackend`): it honours each module's "Generate driver" switch
+// (`Mcu::raw_modules`) and leaves SDMMC, SAI, I2S and COMP, which embassy
+// drives only asynchronously, as a NOT-initialised note in main.rs. This is
+// what turns the many STM32 chips the pin-data XML importer adds from
+// data-only into buildable projects.
 struct StmEmbassyBackend;
 
 impl FamilyBackend for StmEmbassyBackend {
@@ -783,33 +842,19 @@ impl FamilyBackend for StmEmbassyBackend {
     }
 
     fn fresh_main_rs(&self, mcu: &Mcu) -> String {
-        let all = pins_of(mcu);
         format!(
             "{header}{section}\n{tail}",
             header = embassy_common::invariant_header(&mcu.name, &mcu.id),
             // The RCC block is selected by FAMILY (data), not by sniffing the
             // graph's shape — `rcc::rcc_recipe` maps f4/wba (and any future
             // family) to its ReadSpec + descriptor; others get the reset default.
-            section = embassy_common::make_generated_section(
-                &mcu.name,
-                &all,
-                &stm32_clock_block(mcu),
-                &mcu.watchdog_and_custom_inits(),
-                &mcu.irq_vectors,
-            ),
+            section = blocking_section(mcu, &stm32_clock_block(mcu)),
             tail = USER_TAIL,
         )
     }
 
     fn update_main_rs(&self, mcu: &Mcu, existing: &str) -> String {
-        let all = pins_of(mcu);
-        let section = embassy_common::make_generated_section(
-            &mcu.name,
-            &all,
-            &stm32_clock_block(mcu),
-            &mcu.watchdog_and_custom_inits(),
-            &mcu.irq_vectors,
-        );
+        let section = blocking_section(mcu, &stm32_clock_block(mcu));
         let section = keep_stm32_clock(mcu, existing, section);
         embassy_common::splice_section(existing, &section, &mcu.name, &mcu.id)
     }
@@ -825,23 +870,25 @@ impl FamilyBackend for StmEmbassyBackend {
         blocking_exti_hooks(mcu)
     }
 
+    /// The bus drivers main.rs initialises - the Async runtime's templates,
+    /// on embassy's blocking constructors - then the watchdogs.
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
-        // Only the watchdogs: this backend keeps every bus init inline in
-        // main.rs, so `pins/configs/` exists here purely for the tab-driven,
-        // pin-less peripherals.
-        super::watchdog_gen::config_files(
-            &mcu.watchdog,
-            &mcu.family,
-            crate::panels::mcu_module::watchdog::wdg_part(mcu),
-            mcu.runtime,
-        )
+        blocking_config_files(mcu)
+    }
+
+    fn driver_pins(&self, mcu: &Mcu) -> Vec<String> {
+        stm32_periphs(mcu, embassy_stm32::PeriphMode::Blocking).consumed_pins
     }
 }
 // ── Async STM32 (embassy-stm32 + embassy-executor) ──────────────────────────
 // The [`Runtime::Async`] counterpart of [`StmEmbassyBackend`]: the SAME
-// embassy-stm32 GPIO codegen, but the entry point is `#[embassy_executor::main]
-// async fn main(Spawner)` driven by the executor instead of `#[entry] fn main()
-// -> !`. Selected by [`backend_for_runtime`] — never listed in [`BACKENDS`],
+// embassy-stm32 GPIO codegen and the same driver pass in `PeriphMode::Async`.
+// What differs is the entry point, `#[embassy_executor::main] async fn
+// main(Spawner)` driven by the executor instead of `#[entry] fn main() -> !`,
+// the one `Irqs` binding with the DMA and buffered drivers it serves, the
+// EXTI inputs as awaited tasks, and the drivers only Async writes (SDMMC,
+// SAI, I2S, COMP), less the timer embassy-time takes. Selected by
+// [`backend_for_runtime`] — never listed in [`BACKENDS`],
 // since it is chosen by runtime, not family. Handles every STM32 family,
 // `stm32f1` included: on Blocking, Native and RTIC the F1 is on stm32f1xx-hal,
 // and on Async it swaps that crate for the embassy-stm32 the others use (its
@@ -895,6 +942,10 @@ impl FamilyBackend for AsyncEmbassyBackend {
         embassy_stm32::exti_hooks(&async_periphs(mcu).exti)
     }
 
+    fn driver_pins(&self, mcu: &Mcu) -> Vec<String> {
+        async_periphs(mcu).consumed_pins
+    }
+
     fn config_files(&self, mcu: &Mcu) -> Vec<(String, String)> {
         // Async bus peripherals: USART (BufferedUart → embedded-io-async), SPI +
         // I2C (blocking `embedded-hal` 1.0 or async-DMA `embedded-hal-async`, per
@@ -913,6 +964,11 @@ impl FamilyBackend for AsyncEmbassyBackend {
 
 /// The async peripherals (USART/SPI/I2C) derived from `mcu`'s modules + pins.
 fn async_periphs(mcu: &Mcu) -> embassy_stm32::AsyncPeriphs {
+    stm32_periphs(mcu, embassy_stm32::PeriphMode::Async)
+}
+
+/// The bus drivers `mcu`'s modules and pins describe, for `mode`'s runtime.
+fn stm32_periphs(mcu: &Mcu, mode: embassy_stm32::PeriphMode) -> embassy_stm32::AsyncPeriphs {
     let all = pins_of(mcu);
     let usart = modules::usart_configs(&mcu.modules);
     let spi = modules::spi_configs(&mcu.modules);
@@ -936,7 +992,9 @@ fn async_periphs(mcu: &Mcu) -> embassy_stm32::AsyncPeriphs {
                 .map(|inp| (*n, inp, comparator::wired_pin(mcu, *n, "INM")))
         })
         .collect();
-    embassy_stm32::async_peripherals(
+    embassy_stm32::peripherals(
+        mode,
+        &mcu.raw_modules,
         &mcu.family,
         embassy_stm32::ChipData {
             dma: mcu.dma.as_ref(),
@@ -964,6 +1022,27 @@ fn async_periphs(mcu: &Mcu) -> embassy_stm32::AsyncPeriphs {
         &xspi,
         &hspi,
     )
+}
+
+/// What `mcu`'s runtime leaves out that the other one generates, as `(name,
+/// why)` - the `runtime_gaps` of the driver pass that writes its main.rs: on
+/// embassy Blocking the SDMMC, SAI, I2S and COMP embassy drives only
+/// asynchronously, on Async the timer embassy-time takes. Empty where the
+/// drivers are not embassy's (the F1 off Async, ESP, RP, nRF).
+///
+/// The Apply preview of a runtime switch compares the two sides' lists, so a
+/// line there is exactly a note main.rs is about to gain.
+pub fn embassy_runtime_gaps(mcu: &Mcu) -> Vec<(String, &'static str)> {
+    let is_async = mcu.is_async();
+    if !embassy_drivers(&mcu.family, is_async) {
+        return Vec::new();
+    }
+    let mode = if is_async {
+        embassy_stm32::PeriphMode::Async
+    } else {
+        embassy_stm32::PeriphMode::Blocking
+    };
+    stm32_periphs(mcu, mode).runtime_gaps
 }
 
 /// The clock block of an embassy STM32 project: the Clock tab's recipe, and on
@@ -1140,15 +1219,10 @@ fn declares_shared_data(text: &str, depth: i32) -> bool {
 fn async_section(mcu: &Mcu) -> String {
     let all = pins_of(mcu);
     let periphs = async_periphs(mcu);
-    // Pins a bus driver moves into its peripheral must NOT also be bound raw.
-    // Compared on `gpio()`, not `name`: that list holds the singletons the
-    // drivers took, and on a package pin with two bonded pads the singleton is
-    // whichever GPIO the chosen function belongs to.
-    let gpio_pins: Vec<&Pin> = all
-        .iter()
-        .copied()
-        .filter(|p| !periphs.consumed_pins.iter().any(|c| c == p.gpio()))
-        .collect();
+    // A pad a driver takes keeps its labelled `let` line, and the driver is
+    // handed the variable: that line is how the pin comes back on reopen. Only
+    // a pad that does not bind raw is left out, and the driver takes `p.PXn`.
+    let gpio_pins = embassy_common::unbound_by_drivers(&all, &periphs.consumed_pins);
     let mut clock = stm32_clock_block(mcu);
     // PA15, PB3 and PB4 stay the JTAG port on an F1 unless released - and a
     // project that wires one compiles either way, with a pad that does nothing.
@@ -1356,14 +1430,15 @@ pub fn async_stack_name(family: &str) -> &'static str {
     }
 }
 
-/// What the System tab's Async card "Details" pane says for one family: the
-/// `(label, body)` rows and the code example under them.
+/// What a System-tab runtime card's "Details" pane says for one family: the
+/// `(label, body)` rows and the code example under them. The Async card's
+/// comes from [`async_details`], the Blocking card's from [`blocking_details`].
 ///
 /// Every body is ONE string literal, never a `\`-continuation: the
 /// continuation keeps the source indentation, and this text is read by more
 /// than the panel's word splitter. `async_details_rows_have_no_double_space`
-/// holds it.
-pub struct AsyncDetails {
+/// and `blocking_details_rows_have_no_double_space` hold it.
+pub struct RuntimeDetails {
     pub rows: &'static [(&'static str, &'static str)],
     pub example: &'static str,
 }
@@ -1380,13 +1455,13 @@ pub struct AsyncDetails {
 /// is always `BufferedUart` (a transport row chooses) and that DMA channels
 /// are a `TODO` for the user (the generator hands them out). The micro:bit got
 /// the same text and matches none of it: EasyDMA, no channels, no choice.
-pub fn async_details(family: &str) -> AsyncDetails {
+pub fn async_details(family: &str) -> RuntimeDetails {
     if async_is_esp(family) {
         ESP_ASYNC_DETAILS
     } else if async_is_rp(family) {
         RP_ASYNC_DETAILS
     } else if async_is_nrf(family) {
-        AsyncDetails {
+        RuntimeDetails {
             example: nrf_async_example(family),
             ..NRF_ASYNC_DETAILS
         }
@@ -1395,15 +1470,43 @@ pub fn async_details(family: &str) -> AsyncDetails {
     }
 }
 
+/// The Blocking pane for `family`. Keyed with [`embassy_drivers`], the
+/// predicate the generator itself follows: every STM32 but the F1 (the WBA
+/// included) runs embassy-stm32 on Blocking and gets
+/// [`BLOCKING_EMBASSY_DETAILS`].
+///
+/// It exists because the panel had one pane, written for the F1's
+/// stm32f1xx-hal, and showed it to every chip: an F4 read that Apply writes
+/// `src/pins/io.rs`, that each bus has a Portable | Native Init API and that
+/// Cargo.toml gets the embedded-hal-0-2 bridge, none of which its generator
+/// does. The ESP, RP and nRF parts build on their HAL's own types, the
+/// `hal_direct` families of `manifest_sync`: [`BLOCKING_HAL_DIRECT_DETAILS`].
+pub fn blocking_details(family: &str) -> RuntimeDetails {
+    if embassy_drivers(family, false) {
+        BLOCKING_EMBASSY_DETAILS
+    } else if family == "stm32f1" {
+        BLOCKING_F1_DETAILS
+    } else {
+        BLOCKING_HAL_DIRECT_DETAILS
+    }
+}
+
 /// Each row is a claim about `embassy_stm32/` and `project_gen.rs`; the USART
 /// and DMA rows say what the module rows offer today (a Buffered | DMA
 /// transport, channels from the family's table with a per-module picker), not
 /// what they offered when the pane was first written.
-const STM32_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
+///
+/// Every STM32 but the F1 generates its drivers on Blocking too, from the
+/// same pass (`embassy_stm32::peripherals`), so the rows say what Async
+/// changes about those files rather than that the files are Async's: the
+/// buffered/DMA forms, the timer embassy-time takes and the SDMMC, SAI, I2S
+/// and COMP drivers only Async writes ([`BLOCKING_EMBASSY_DETAILS`] is the
+/// other side).
+const STM32_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
     rows: &[
         (
             "On Apply:",
-            "Regenerates main.rs with the embassy entry + Spawner, rewrites every src/pins/configs/*.rs to the async init, toggles the embassy Cargo.toml deps, then builds.",
+            "Regenerates main.rs with the embassy entry + Spawner and rewrites src/pins/configs/*.rs to the async init: on an F1 the stm32f1xx-hal files, on any other STM32 the embassy Blocking ones (a USART gets its Buffered or DMA transport, an SPI or I2C its Async-DMA mode), plus the SDMMC, SAI, I2S and COMP files only Async generates. Toggles the embassy Cargo.toml deps, then builds.",
         ),
         (
             "Entry:",
@@ -1415,7 +1518,7 @@ const STM32_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "SPI / I2C:",
-            "Each module gets a Blocking (embedded-hal 1.0) or Async-DMA (embedded-hal-async) selector on the Pins tab; the Portable/Native Init API is not used under Async.",
+            "Each module gets a Blocking (embedded-hal 1.0) or Async-DMA (embedded-hal-async) selector on the Pins tab. The Portable/Native Init API is stm32f1xx-hal's, read only on an F1 off Async; embassy-stm32 never reads it, on Async or on Blocking.",
         ),
         (
             "DMA:",
@@ -1423,16 +1526,21 @@ const STM32_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
         (
             "Cargo.toml:",
-            "Adds embassy-executor 0.9 + embassy-time and toggles time-driver-any on embassy-stm32; on an F1 it first swaps stm32f1xx-hal for embassy-stm32. An async USART adds embedded-io-async + static_cell; SPI/I2C add embedded-hal (Blocking) or embedded-hal-async (Async-DMA). Leaving Async removes them again.",
+            "Adds embassy-executor 0.9 + embassy-time and toggles time-driver-any on embassy-stm32; on an F1 it first swaps stm32f1xx-hal for embassy-stm32. An async USART or LPUART adds embedded-io-async + static_cell, and a SAI or I2S static_cell for its ring buffer; SPI/I2C add embedded-hal 1.0, plus embedded-hal-async for an Async-DMA module. Leaving Async drops embassy-executor, embassy-time, time-driver-any, embedded-io-async, static_cell and embedded-hal-async. Back on Blocking, every STM32 but the F1 keeps embedded-hal 1.0 while an SPI/I2C driver is generated and gets embedded-io 0.7 for a USART/LPUART one (nothing for a module whose Generate driver switch is off); the F1 swaps back to stm32f1xx-hal with its own bridge crates.",
+        ),
+        (
+            "vs Blocking:",
+            "embassy-time takes one of the chip's timers (TIM4 on an F103C8), and a PWM wired to it is not generated: main.rs says so and its pads stay bound raw. Blocking runs no embassy-time and drives PWM on every timer. On every STM32 but the F1, SDMMC, SAI and I2S (which embassy drives only asynchronously) and COMP (whose interrupt binding Blocking does not write) are the other way round: Blocking leaves their pads raw with a NOT initialised comment in main.rs.",
         ),
         (
             "Applies to:",
-            "Every STM32. The F1 is on stm32f1xx-hal on every other runtime, so for it Async is also a HAL swap: USB, CAN and SDIO are not generated there, and embassy-time takes one timer (TIM4 on an F103C8) that PWM can no longer use. The Pico boards, the nRF parts and the ESP parts have panes of their own.",
+            "Every STM32. The F1 is on stm32f1xx-hal on every other runtime, so for it Async is also a HAL swap: USB, CAN and SDIO are not generated there. The Pico boards, the nRF parts and the ESP parts have panes of their own.",
         ),
     ],
     // `Irqs` last: the config file takes the binding rather than declaring
-    // its own, since a vector may only be bound once in the program.
-    example: "let mut _serial1 = pins::configs::usart1::init(p.USART1, p.PA10, p.PA9, Irqs);\n_serial1.write_all(b\"hi\").await.ok();",
+    // its own, since a vector may only be bound once in the program. The pads
+    // are their labelled bindings, as main.rs hands them over.
+    example: "let mut _serial1 = pins::configs::usart1::init(p.USART1, pa10_usart1_rx, pa9_usart1_tx, Irqs);\n_serial1.write_all(b\"hi\").await.ok();",
 };
 
 /// Each row is a claim about `rp.rs`: no bus config files (`config_files`
@@ -1440,7 +1548,7 @@ const STM32_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
 /// row, SPI on two channels with its init locked, I2C on interrupts, channels
 /// handed out in order by `async_bus_lines`, and the manifest lines from
 /// `AsyncFlavor::Rp`, `needs_async_usart` and `ensure_cyw43_deps`.
-const RP_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
+const RP_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
     rows: &[
         (
             "On Apply:",
@@ -1481,7 +1589,7 @@ const RP_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
 /// `Twim` on EasyDMA with the module rows skipped (`SKIP_USART_TRANSPORT_NRF`,
 /// `SKIP_ASYNC_INIT_NRF`), the shared TWISPI blocks, an armed input as a task,
 /// and the manifest lines from `AsyncFlavor::Nrf` and `needs_static_cell`.
-const NRF_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
+const NRF_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
     rows: &[
         (
             "On Apply:",
@@ -1547,7 +1655,7 @@ fn nrf_async_example(family: &str) -> &'static str {
 
 /// Moved from the panel as it was, apart from the last row, which named
 /// embassy-stm32 as THE other async path when there are three.
-const ESP_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
+const ESP_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
     rows: &[
         (
             "On Apply:",
@@ -1579,6 +1687,127 @@ const ESP_ASYNC_DETAILS: AsyncDetails = AsyncDetails {
         ),
     ],
     example: "let timg0 = TimerGroup::new(peripherals.TIMG0);\nesp_rtos::start(timg0.timer0, sw_int.software_interrupt0);\n// then: embassy_time::Timer::after_millis(500).await;",
+};
+
+/// The Blocking pane as the System tab drew it for every chip, moved from the
+/// panel with its text unchanged but for the `nb` clause (`manifest_sync`
+/// adds it for any USART, a Portable SPI or a CAN, not for Native modules
+/// only). Each row is a claim about the F1's stm32f1xx-hal backend.
+const BLOCKING_F1_DETAILS: RuntimeDetails = RuntimeDetails {
+    rows: &[
+        (
+            "On Apply:",
+            "Regenerates main.rs with the #[entry] entry, rewrites every src/pins/configs/*.rs to the portable init, (re)writes src/pins/io.rs, and reconciles Cargo.toml — then triggers a build.",
+        ),
+        (
+            "Entry:",
+            "#[cortex_m_rt::entry] fn main() -> ! — classic bare-metal, runs forever.",
+        ),
+        (
+            "Drivers:",
+            "Each USART/SPI/I2C initializes in src/pins/configs/*.rs and is exposed through STANDARD portable traits — embedded-io (serial) + embedded-hal 1.0 (SpiBus / I2c / OutputPin). App code generic over those traits ports across chips/HALs unchanged.",
+        ),
+        (
+            "Virtual modules:",
+            "Each USART/SPI/I2C module keeps its Init API: Portable | Native (HAL type) selector on the Pins tab. Portable = the trait wrapper (its .0 still hands back the raw HAL object); Native = the concrete HAL type for that one module only. SPI/I2C are always blocking here.",
+        ),
+        (
+            "GPIO / io.rs:",
+            "GPIO API = Portable (System tab) -> src/pins/io.rs wraps the pins as DigitalOut / DigitalIn + a Delay over embedded-hal 1.0. GPIO API = Native -> raw HAL pins and io.rs is not emitted.",
+        ),
+        (
+            "Cargo.toml:",
+            "Adds embedded-io (serial) + embedded-hal 1.0 (SPI/I2C/GPIO) + the embedded-hal-0-2 bridge alias; nb is added for any USART, a Portable SPI or a CAN. The embassy-* async crates are removed.",
+        ),
+        (
+            "Applies to:",
+            "The STM32F1, on stm32f1xx-hal. Every other family has a pane of its own.",
+        ),
+    ],
+    example: "let mut _serial1 = pins::configs::usart1::init(...);\nfn app<S: embedded_io::Read + embedded_io::Write>(s: &mut S) { /* portable */ }",
+};
+
+/// The ESP, RP and nRF parts: each builds on its own HAL's types, so none of
+/// the F1's bridge vocabulary applies, and the claims here are only the ones
+/// all three share. `manifest_sync` adds them no bridge crate (`hal_direct`).
+const BLOCKING_HAL_DIRECT_DETAILS: RuntimeDetails = RuntimeDetails {
+    rows: &[
+        (
+            "On Apply:",
+            "Regenerates main.rs on this board's own HAL (named above), every bus on the HAL's own driver type, with no Init API choice and no GPIO bridge file. Reconciles Cargo.toml, then builds.",
+        ),
+        (
+            "Entry:",
+            "The HAL's blocking entry - #[esp_hal::main] on an ESP, rp-hal's entry on a Pico, #[entry] on an nRF - into fn main() -> !, which runs forever with no executor.",
+        ),
+        (
+            "Drivers:",
+            "Each bus is the HAL's own driver, from esp-hal, rp-hal or nrf-hal (embassy-nrf on the nRF parts nrf-hal has no crate for), and implements the embedded-hal / embedded-io traits itself.",
+        ),
+        (
+            "Cargo.toml:",
+            "The board's HAL line, and none of the F1's bridge crates (embedded-io, embedded-hal-0-2, nb). The embassy async crates (embassy-executor, embassy-time) are removed.",
+        ),
+        (
+            "Applies to:",
+            "The ESP, RP and nRF parts. The STM32s have panes of their own.",
+        ),
+    ],
+    example: "loop { /* your code, on the HAL's own driver types */ }",
+};
+
+/// Each row is a claim about `embassy_stm32::peripherals` in
+/// [`PeriphMode::Blocking`](embassy_stm32::PeriphMode::Blocking), its
+/// templates and `manifest_sync`'s `embassy_blocking` crates. The example is
+/// the init `blocking_usart_emits_config_file_and_init_call` asserts.
+///
+/// None of the F1 pane's vocabulary on purpose - no io.rs, no Portable |
+/// Native, no bridge crate: `the_embassy_blocking_pane_says_nothing_of_the_f1`
+/// holds it.
+const BLOCKING_EMBASSY_DETAILS: RuntimeDetails = RuntimeDetails {
+    rows: &[
+        (
+            "On Apply:",
+            "Regenerates main.rs and writes one src/pins/configs/*.rs per USART/LPUART, SPI, I2C, PWM timer, DAC and QSPI/OCTOSPI/XSPI/HSPI module whose Generate driver switch is on. Every pad keeps its labelled let binding, and the driver's init is handed that variable. Reconciles Cargo.toml, then builds.",
+        ),
+        (
+            "Entry:",
+            "#[cortex_m_rt::entry] fn main() -> ! — classic bare-metal, runs forever. embassy-stm32 is this family's HAL, used synchronously: embassy_stm32::init brings the clocks up, and there is no executor and no .await.",
+        ),
+        (
+            "USART:",
+            "TX+RX or half duplex: a SerialIo, an embedded-io Read + Write whose .0 is embassy's Uart<'d, Blocking>. TX-only: UartTx (embedded-io Write); RX-only: a SerialRx (Read) over UartRx. Reads poll the data register, so a byte that arrives while your code is busy is lost. The Buffered/DMA transport is the Async runtime's and is ignored. Flow control: TX+RX None, CTS/RTS or DE; TX-only None or CTS; RX-only None or RTS. DE and half duplex on the RX pad are refused on a usart_v1/v2 chip, and main.rs says so.",
+        ),
+        (
+            "SPI / I2C:",
+            "Always the blocking embedded-hal 1.0 bus: init returns impl SpiBus<u8> (with no MISO wired, embassy's transmit-only Spi<'d, Blocking, Master>) or impl I2c. The Async-DMA mode is ignored, and so is the I2C timeout: it needs embassy-time, which Blocking does not link.",
+        ),
+        (
+            "Other drivers:",
+            "PWM on every timer, the one embassy-time takes on Async included, as embassy's SimplePwm (ComplementaryPwm with complementary outputs); DAC, QSPI, OCTOSPI, XSPI and HSPI as embassy's Blocking-mode drivers.",
+        ),
+        (
+            "Not on Blocking:",
+            "SDMMC, SAI and I2S: embassy drives them only asynchronously. COMP: embassy's Comp::new takes an interrupt binding, which this runtime does not write. main.rs gets a NOT initialised comment saying why where each init would be, their pads stay bound raw, and the Async runtime generates them.",
+        ),
+        (
+            "Virtual modules:",
+            "There is no Init API to choose: a driver's type follows from the module's direction, and the Pins tab's Init API is not read on this family. Turning a module's Generate driver switch off leaves its pads as labelled raw bindings for your own code, with a comment in main.rs.",
+        ),
+        (
+            "GPIO:",
+            "Output and Input bind straight to embassy-stm32, with no wrapper file. An input armed with an edge becomes an ExtiInput parked for its vector's #[interrupt], which calls your on_<pad>_in_edge hook.",
+        ),
+        (
+            "Cargo.toml:",
+            "Adds embedded-io 0.7 while a USART/LPUART driver file is generated and embedded-hal 1.0 while an SPI or I2C one is; a module whose Generate driver switch is off adds nothing, and GPIO and the other drivers need no trait crate. embassy-stm32 stays (it is the HAL) without its time-driver-any feature; embassy-executor, embassy-time, embedded-io-async, embedded-hal-async and static_cell are removed.",
+        ),
+        (
+            "Applies to:",
+            "Every STM32 but the F1, the STM32WBA included. The F1's Blocking runtime is another HAL, with a pane of its own.",
+        ),
+    ],
+    example: "let mut _serial1 = pins::configs::usart1::init(p.USART1, pa10_usart1_rx, pa9_usart1_tx);\n_serial1.write_all(b\"hi\").ok();",
 };
 
 /// Whether an RTIC project can be generated for `family`.
@@ -1613,9 +1842,12 @@ pub fn rtic_supported(family: &str) -> bool {
 
 /// Whether a Native runtime is meaningful for `family` — i.e. the backend has
 /// concrete-HAL (Portable/Native) peripheral templates. Only `stm32f1`
-/// (stm32f1xx-hal) does; other STM32 families run on embassy-stm32 whose blocking
-/// bindings are already concrete (no separate Native form), and ESP has its own
-/// scheme. Drives the System-tab card's enabled state + the codegen forcing.
+/// (stm32f1xx-hal) does. The other STM32 families run on embassy-stm32, for
+/// which no concrete-type template set is written: on Blocking a USART comes
+/// back wrapped (`SerialIo` / `SerialRx`, the embassy type public as `.0`),
+/// SPI and I2C as embedded-hal 1.0 `impl` values, everything else as embassy's
+/// own type. ESP has its own scheme. Drives the System-tab card's enabled
+/// state + the codegen forcing.
 pub fn native_supported(family: &str) -> bool {
     family == "stm32f1"
 }
@@ -1668,9 +1900,12 @@ pub fn gpio_bridge_supported(family: &str) -> bool {
 /// available. Phrased for the System tab, next to the card it explains.
 ///
 /// The distinction Native draws — concrete HAL types instead of the portable
-/// bridges — only exists where the bridges do. On an embassy family the blocking
-/// types are ALREADY concrete, so Native would emit byte-for-byte what Blocking
-/// emits: not a missing feature, a choice with no object.
+/// bridges — exists as templates for stm32f1xx-hal only. On the ESP, RP and
+/// nRF parts Blocking already binds the HAL's own types, so there it is a
+/// choice with no object. On an embassy STM32 it is unwritten work: Blocking's
+/// USART, SPI and I2C drivers hand back embedded-io / embedded-hal 1.0 values
+/// (the USART's with the embassy type as `.0`), and the way to a concrete
+/// type today is the editable `init`, or the module's "Generate driver" off.
 pub fn native_unavailable_reason(family: &str) -> Option<String> {
     if native_supported(family) {
         return None;
@@ -1681,8 +1916,7 @@ pub fn native_unavailable_reason(family: &str) -> Option<String> {
         )
     } else if family.starts_with("stm32") {
         format!(
-            "`{family}` runs on embassy-stm32, whose blocking types are already concrete — \
-             Blocking generates exactly that code, so Native would be identical to it."
+            "`{family}` runs on embassy-stm32, and Native (concrete-type) templates exist for the STM32F1's stm32f1xx-hal only. On Blocking most drivers already return embassy's own types: a TX+RX or half-duplex UART comes back as SerialIo with embassy's Uart as .0, an RX-only one as SerialRx with UartRx as .0, a TX-only one as embassy's UartTx itself; SPI with MISO and I2C as embedded-hal 1.0 impl values, a MISO-less SPI as embassy's Spi itself. For the concrete type, change init's return type below GENERATED END (kept on regeneration), or switch the module's \"Generate driver\" off to keep its pads raw."
         )
     } else {
         // The Pico and nRF backends bind GPIO straight to their HAL's own
@@ -1698,9 +1932,8 @@ pub fn native_unavailable_reason(family: &str) -> Option<String> {
 
 /// Why **RTIC** is unavailable on `family`, or `None` when it is available.
 ///
-/// Unlike Native, this one IS missing work rather than a category error: RTIC 2
-/// runs on any Cortex-M, so an F2/F4/H5 would be eligible. What is F1-specific is
-/// the generated code.
+/// Missing work rather than a category error: RTIC 2 runs on any Cortex-M, so
+/// an F2/F4/H5 would be eligible. What is F1-specific is the generated code.
 pub fn rtic_unavailable_reason(family: &str) -> Option<String> {
     if rtic_supported(family) {
         return None;
@@ -1974,14 +2207,26 @@ mod blocking_note_tests {
         assert!(native_unavailable_reason("stm32f1").is_none());
         assert!(rtic_unavailable_reason("stm32f1").is_none());
 
-        for family in ["stm32f2", "stm32f4", "stm32h5"] {
+        for family in ["stm32f2", "stm32f4", "stm32h5", "stm32wba"] {
             let native =
                 native_unavailable_reason(family).expect("greyed means it must explain itself");
-            // Native is a category error: it would generate the same code.
+            // Native is unwritten templates here, not the same code: Blocking
+            // hands SPI and I2C back as embedded-hal traits and a UART wrapped,
+            // so the reason names the way to a concrete type instead.
             assert!(native.contains(family), "name the chip's family: {native}");
             assert!(
-                native.contains("identical") || native.contains("already concrete"),
-                "say it would be the same code, not that it is missing: {native}"
+                native.contains("embassy-stm32")
+                    && native.contains("stm32f1xx-hal")
+                    && native.contains("Generate driver"),
+                "name the HAL, the one with templates and the way out: {native}"
+            );
+            assert!(
+                !native.contains("identical") && !native.contains("already concrete"),
+                "Blocking's SPI/I2C are not concrete types: {native}"
+            );
+            assert!(
+                !native.contains("  "),
+                "a joined continuation left a gap: {native}"
             );
 
             let rtic =
@@ -2113,6 +2358,146 @@ mod blocking_note_tests {
     fn async_details_rows_have_no_double_space() {
         for (family, _) in ASYNC_FAMILIES {
             for line in pane_text(family).lines() {
+                assert!(!line.contains("  "), "{family}: {line:?}");
+            }
+        }
+    }
+
+    /// Which Blocking pane a family is shown.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Pane {
+        F1,
+        Embassy,
+        HalDirect,
+    }
+
+    /// One chip per Blocking backend, and its pane.
+    const BLOCKING_FAMILIES: &[(&str, Pane)] = &[
+        ("stm32f1", Pane::F1),
+        ("stm32f4", Pane::Embassy),
+        ("stm32h5", Pane::Embassy),
+        ("stm32wba", Pane::Embassy),
+        ("rp2040", Pane::HalDirect),
+        ("rp235x", Pane::HalDirect),
+        ("nrf52833", Pane::HalDirect),
+        ("nrf5340", Pane::HalDirect),
+        ("esp32c3", Pane::HalDirect),
+    ];
+
+    fn blocking_pane_text(family: &str) -> String {
+        let d = super::blocking_details(family);
+        let mut s: String = d
+            .rows
+            .iter()
+            .map(|(label, body)| format!("{label} {body}\n"))
+            .collect();
+        s.push_str(d.example);
+        s
+    }
+
+    /// The pane follows the generator's own predicate: embassy-stm32's on
+    /// every STM32 its Blocking drivers come from, the F1's stm32f1xx-hal
+    /// pane on the F1, and the HAL-direct one where `manifest_sync` adds no
+    /// bridge crate - which says nothing of the F1's io.rs or Init API.
+    #[test]
+    fn the_blocking_pane_is_the_familys_own() {
+        for (family, pane) in BLOCKING_FAMILIES {
+            let rows = blocking_pane_text(family);
+            let embassy = *pane == Pane::Embassy;
+            assert_eq!(
+                super::embassy_drivers(family, false),
+                embassy,
+                "{family}: the table disagrees with the generator"
+            );
+            assert_eq!(rows.contains("embassy-stm32"), embassy, "{family}: {rows}");
+            assert_eq!(
+                rows.contains("src/pins/io.rs"),
+                *pane == Pane::F1,
+                "{family}: {rows}"
+            );
+            if *pane == Pane::HalDirect {
+                for f1_only in ["Portable", "pins::configs", "stm32f1xx-hal"] {
+                    assert!(!rows.contains(f1_only), "{family} says {f1_only:?}: {rows}");
+                }
+            }
+        }
+    }
+
+    /// The bug this exists for: an F4 read the F1's flow under its Blocking
+    /// card - an io.rs, a Portable | Native choice, the bridge crates - none of
+    /// which its generator writes. The embassy pane has none of those words,
+    /// and its example is the init main.rs really has.
+    #[test]
+    fn the_embassy_blocking_pane_says_nothing_of_the_f1() {
+        let rows = blocking_pane_text("stm32f4");
+        for f1_only in [
+            "io.rs",
+            "Portable",
+            "Native",
+            "embedded-hal-0-2",
+            "stm32f1xx-hal",
+            // ...nor the Async pane's.
+            "Irqs",
+        ] {
+            assert!(!rows.contains(f1_only), "says {f1_only:?}: {rows}");
+        }
+        let words = rows
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            .collect::<Vec<_>>();
+        assert!(!words.contains(&"nb"), "names nb: {rows}");
+        for driver in [
+            "SerialIo",
+            "UartTx",
+            "SerialRx",
+            "SpiBus",
+            "I2c",
+            "PWM",
+            "DAC",
+            "QSPI",
+            "OCTOSPI",
+            "XSPI",
+            "HSPI",
+            "SDMMC",
+            "SAI",
+            "I2S",
+            "COMP",
+            "Generate driver",
+            "embedded-io 0.7",
+            "embedded-hal 1.0",
+        ] {
+            assert!(rows.contains(driver), "no {driver}: {rows}");
+        }
+        let example = super::blocking_details("stm32f4").example;
+        assert_eq!(
+            example.lines().next(),
+            Some(
+                "let mut _serial1 = pins::configs::usart1::init(p.USART1, pa10_usart1_rx, pa9_usart1_tx);"
+            )
+        );
+        assert!(!example.contains(".await"), "{example}");
+    }
+
+    /// The Blocking panes read like the Async ones: the same spine of labels.
+    #[test]
+    fn every_blocking_pane_has_the_same_spine_of_labels() {
+        for (family, _) in BLOCKING_FAMILIES {
+            let labels: Vec<&str> = super::blocking_details(family)
+                .rows
+                .iter()
+                .map(|(l, _)| *l)
+                .collect();
+            assert_eq!(labels.first(), Some(&"On Apply:"), "{family}: {labels:?}");
+            assert_eq!(labels.get(1), Some(&"Entry:"), "{family}: {labels:?}");
+            assert!(labels.contains(&"Cargo.toml:"), "{family}: {labels:?}");
+            assert_eq!(labels.last(), Some(&"Applies to:"), "{family}: {labels:?}");
+        }
+    }
+
+    /// The same scar as the Async panes': every body is one literal.
+    #[test]
+    fn blocking_details_rows_have_no_double_space() {
+        for (family, _) in BLOCKING_FAMILIES {
+            for line in blocking_pane_text(family).lines() {
                 assert!(!line.contains("  "), "{family}: {line:?}");
             }
         }
@@ -3351,6 +3736,20 @@ mod tests {
                 Runtime::Async,
                 None,
             ),
+            // embassy-stm32 on Blocking: the `usart_blocking*` / `spi_blocking`
+            // / `i2c_blocking` examples, generic backend and WBA.
+            (
+                "stm32f4 blocking",
+                stm32("stm32f4", "stm32f411re"),
+                Runtime::Blocking,
+                None,
+            ),
+            (
+                "stm32wba blocking",
+                stm32("stm32wba", "stm32wba55cgux"),
+                Runtime::Blocking,
+                None,
+            ),
             ("esp blocking", c3(), Runtime::Blocking, None),
             ("esp async", c3(), Runtime::Async, None),
             ("esp blocking, spi slave", c3(), Runtime::Blocking, None),
@@ -3436,6 +3835,16 @@ mod tests {
                     "{what}: {names:?}"
                 );
             }
+            // embassy-stm32 writes all three bus files on either runtime, so
+            // each one's example is checked below rather than skipped.
+            if what.starts_with("stm32") && !what.starts_with("stm32f1") {
+                for bus in ["usart", "spi", "i2c"] {
+                    assert!(
+                        names.iter().any(|n| n.starts_with(bus)),
+                        "{what}: no {bus} file: {names:?}"
+                    );
+                }
+            }
 
             for (name, body) in &files {
                 assert!(
@@ -3468,9 +3877,10 @@ mod tests {
     /// forgotten in the other is a family silently unguarded, which is how the
     /// original hole - one emitter written, four not - lasted as long as it did.
     ///
-    /// Generic STM32 embassy blocking and WBA are deliberately absent. They emit
-    /// no I2C constructor anywhere in the tree, so there is no bus for an address
-    /// to belong to; that is a gap in those backends, not in this test.
+    /// The generic STM32 embassy Blocking backend and the WBA build their I2C
+    /// bus too (`I2c::new_blocking` in `i2c{n}/mod.rs`, plus the device
+    /// files), so both are listed. A module whose "Generate driver" switch is
+    /// off (`Mcu::raw_modules`) builds no bus; these fixtures leave it on.
     fn i2c_bus_cases() -> Vec<(&'static str, Mcu, Runtime)> {
         let by_id = |id: &str| {
             crate::panels::mcu_module::builtins::builtin_definitions()
@@ -3496,6 +3906,16 @@ mod tests {
                 "stm32f4 async",
                 stm32("stm32f4", "stm32f411re"),
                 Runtime::Async,
+            ),
+            (
+                "stm32f4 blocking",
+                stm32("stm32f4", "stm32f411re"),
+                Runtime::Blocking,
+            ),
+            (
+                "stm32wba blocking",
+                stm32("stm32wba", "stm32wba55cg"),
+                Runtime::Blocking,
             ),
             (
                 "esp32c3 blocking",
@@ -4811,10 +5231,77 @@ mod tests {
         }
     }
 
+    /// The Blocking backend builds the drivers too, on embassy's blocking
+    /// constructors: a polled UART handed its pads' bindings - which still read
+    /// back - and its `usart1.rs` written beside the watchdogs.
+    #[test]
+    fn blocking_usart_emits_config_file_and_init_call() {
+        use crate::panels::mcu_module::mcu::Runtime;
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+
+        let mut def = crate::panels::mcu_module::builtins::builtin_for("stm32f103c8t6")
+            .expect("built-in F103");
+        def.id = "stm32f411re".into();
+        def.display_name = "STM32F411RETx".into();
+        def.family = "stm32f4".into();
+        def.project.pkg_name = "stm32f411re".into();
+        def.project.target = "thumbv7em-none-eabihf".into();
+        def.project.probe_chip = "STM32F411RETx".into();
+        def.project.hal_dep =
+            crate::panels::mcu_module::stm32_pin_data::hal_dep_for_name("stm32f4", "STM32F411RETx");
+        def.clock = crate::panels::mcu_module::mcu_def::ClockDef::None;
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Blocking;
+        for (name, f) in [
+            ("PA9", PinFunction::UsartTx(1)),
+            ("PA10", PinFunction::UsartRx(1)),
+        ] {
+            let n = mcu
+                .iter_all_pins()
+                .find(|p| p.name == name)
+                .map(|p| p.number)
+                .expect("the pad");
+            mcu.apply_pin_function(n, f);
+        }
+
+        let code = mcu.fresh_main_rs();
+        assert!(code.contains("#[entry]"), "{code}");
+        assert!(
+            code.contains("let pa9_usart1_tx = p.PA9; // USART1  TX"),
+            "{code}"
+        );
+        assert!(
+            code.contains(
+                "let mut _serial1 = pins::configs::usart1::init(p.USART1, pa10_usart1_rx, pa9_usart1_tx);"
+            ),
+            "{code}"
+        );
+        assert!(!code.contains("Irqs"), "{code}");
+        let parsed = crate::panels::mcu_module::codegen::parse_main_rs(&code);
+        assert!(
+            parsed.contains(&("PA9".into(), PinFunction::UsartTx(1))),
+            "{parsed:?}"
+        );
+        assert!(
+            parsed.contains(&("PA10".into(), PinFunction::UsartRx(1))),
+            "{parsed:?}"
+        );
+
+        let cfgs = mcu.config_files();
+        let usart1 = &cfgs
+            .iter()
+            .find(|(n, _)| n == "usart1.rs")
+            .expect("usart1.rs config file")
+            .1;
+        assert!(
+            usart1.contains("Uart::new_blocking(usart, rx, tx, get_config())"),
+            "{usart1}"
+        );
+    }
+
     /// An async USART (both TX+RX wired) emits a `usart{n}.rs` config file with
-    /// the embassy `BufferedUart` → embedded-io-async bridge, a call into it from
-    /// `main.rs`, and does NOT also bind the TX/RX pins raw (they're moved into
-    /// the driver).
+    /// the embassy `BufferedUart` → embedded-io-async bridge, and a call into it
+    /// from `main.rs` that is handed the pads' bindings.
     #[test]
     fn async_usart_emits_config_file_and_init_call() {
         use crate::panels::mcu_module::mcu::Runtime;
@@ -4842,15 +5329,34 @@ mod tests {
         mcu.apply_pin_function(tx, PinFunction::UsartTx(1));
         mcu.apply_pin_function(rx, PinFunction::UsartRx(1));
 
-        // main.rs: calls into the config module, no raw binding for the USART pins.
+        // main.rs: each USART pad keeps its labelled binding, and the config
+        // module's init is handed that variable - the line is how the pin
+        // comes back when the project reopens.
         let code = mcu.fresh_main_rs();
+        let var = |n: usize| {
+            let p = mcu.find_pin(n).expect("the wired pin");
+            crate::panels::mcu_module::codegen::common::pin_binding(
+                &p.gpio().to_ascii_lowercase(),
+                &p.selected_function,
+                &p.custom_label,
+            )
+        };
+        let (tx_var, rx_var) = (var(tx), var(rx));
         assert!(
-            code.contains("pins::configs::usart1::init(p.USART1,"),
+            code.contains(&format!(
+                "pins::configs::usart1::init(p.USART1, {rx_var}, {tx_var}, Irqs)"
+            )),
             "USART init call missing:\n{code}"
         );
         assert!(
-            !code.contains("usart1_tx = p."),
-            "USART TX pin must not be bound raw:\n{code}"
+            code.contains(&format!("let {tx_var} = p.")),
+            "the TX pad lost its binding:\n{code}"
+        );
+        let parsed = crate::panels::mcu_module::codegen::parse_main_rs(&code);
+        assert!(
+            parsed.iter().any(|(_, f)| *f == PinFunction::UsartTx(1))
+                && parsed.iter().any(|(_, f)| *f == PinFunction::UsartRx(1)),
+            "the USART pads do not read back: {parsed:?}"
         );
 
         // The config file is the async BufferedUart bridge.
@@ -6581,6 +7087,38 @@ mod config_template_switch_tests {
                     Runtime::Rtic,
                 ],
             ),
+            // embassy-stm32 on both runtimes (`definition`). TIM2 is generated
+            // on both; TIM4 is the timer embassy-time takes, so its file exists
+            // on Blocking only - the one file-set difference between the two.
+            (
+                "stm32f411re",
+                vec![
+                    ("PA9", PinFunction::UsartTx(1)),
+                    ("PA10", PinFunction::UsartRx(1)),
+                    ("PA5", PinFunction::SpiSck(1)),
+                    ("PA6", PinFunction::SpiMiso(1)),
+                    ("PA7", PinFunction::SpiMosi(1)),
+                    ("PB6", PinFunction::I2cScl(1)),
+                    ("PB7", PinFunction::I2cSda(1)),
+                    ("PA2", pwm(2, 3)),
+                    ("PB8", pwm(4, 3)),
+                    ("PC13", PinFunction::GpioOutput),
+                ],
+                vec![Runtime::Blocking, Runtime::Async],
+            ),
+            // ...and the WBA's own Blocking backend, same driver pass.
+            (
+                "stm32wba55cg",
+                vec![
+                    ("PA9", PinFunction::UsartTx(1)),
+                    ("PA10", PinFunction::UsartRx(1)),
+                    ("PB6", PinFunction::I2cScl(1)),
+                    ("PB7", PinFunction::I2cSda(1)),
+                    ("PA2", pwm(2, 3)),
+                    ("PB8", pwm(4, 3)),
+                ],
+                vec![Runtime::Blocking, Runtime::Async],
+            ),
             (
                 "esp32c3",
                 vec![
@@ -6615,10 +7153,23 @@ mod config_template_switch_tests {
         ]
     }
 
+    /// The bundled definition `id`, or for an STM32 that is not bundled the
+    /// F103's pads under that part's family - the `stm32` fixture of the
+    /// codegen tests, which is all the config files need.
+    fn definition(id: &str) -> crate::panels::mcu_module::mcu_def::McuDefinition {
+        let family = match id {
+            "stm32f411re" => "stm32f4",
+            "stm32wba55cg" => "stm32wba",
+            _ => return builtin_for(id).unwrap_or_else(|| panic!("built-in {id}")),
+        };
+        let mut def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        def.id = id.into();
+        def.family = family.into();
+        def
+    }
+
     fn wired(id: &str, wiring: &[(&str, PinFunction)], runtime: Runtime) -> Mcu {
-        let mut mcu = builtin_for(id)
-            .unwrap_or_else(|| panic!("built-in {id}"))
-            .build_mcu();
+        let mut mcu = definition(id).build_mcu();
         mcu.runtime = runtime;
         mcu.pending_runtime = runtime;
         for (name, func) in wiring {
@@ -6683,6 +7234,38 @@ mod config_template_switch_tests {
             }
         }
         out
+    }
+
+    /// The embassy cases switch the file SET, not only the files' text: the
+    /// timer embassy-time takes has its PWM file on Blocking only, while TIM2
+    /// and the buses are written on both runtimes.
+    #[test]
+    fn the_embassy_cases_move_the_time_driver_timers_file() {
+        for (id, wiring, _) in cases()
+            .into_iter()
+            .filter(|(id, _, _)| matches!(*id, "stm32f411re" | "stm32wba55cg"))
+        {
+            let names = |rt: Runtime| -> Vec<String> {
+                wired(id, &wiring, rt)
+                    .config_files()
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect()
+            };
+            let (blocking, on_async) = (names(Runtime::Blocking), names(Runtime::Async));
+            assert!(
+                blocking.iter().any(|n| n == "pwm4.rs"),
+                "{id}: {blocking:?}"
+            );
+            assert!(
+                !on_async.iter().any(|n| n == "pwm4.rs"),
+                "{id}: {on_async:?}"
+            );
+            for both in ["pwm2.rs", "usart1.rs"] {
+                assert!(blocking.iter().any(|n| n == both), "{id}: {blocking:?}");
+                assert!(on_async.iter().any(|n| n == both), "{id}: {on_async:?}");
+            }
+        }
     }
 
     #[test]

@@ -16,10 +16,8 @@ use super::*;
 pub(super) const ASYNC_USART_TMPL: &str =
     include_str!("../templates/embassy_stm32/usart_buffered.rs.tmpl");
 
-/// The USART peripheral instances that have BOTH a TX and an RX pin configured —
-/// the ones an async `BufferedUart` (bidirectional) can be built for. Returns
-/// `(instance, tx_pin_name, rx_pin_name)` sorted by instance. A one-sided UART
-/// (only TX or only RX) is skipped in v1: `BufferedUart::new` needs both.
+/// The USART instances with at least one pad wired, sorted by instance, each
+/// with whichever of its TX/RX/CTS/RTS pads are (see [`serial_wires`]).
 pub(super) fn usart_wires(pins: &[&Pin]) -> Vec<SerialWire> {
     serial_wires(
         pins,
@@ -52,8 +50,14 @@ pub(super) struct SerialWire {
     pub(super) rts: Option<String>,
 }
 
-/// Shared body of [`usart_wires`] / [`lpuart_wires`]: the instances of one
-/// serial peripheral that have BOTH halves wired, as `(instance, tx, rx)`.
+/// Shared body of [`usart_wires`] / [`lpuart_wires`]: every instance of one
+/// serial peripheral with at least one of its pads wired - TX, RX or a flow
+/// pad - and the pads it has, sorted by instance.
+///
+/// Nothing is filtered here. Whether an instance is built is decided in
+/// [`peripherals`] by the module's direction, which says which pads are
+/// REQUIRED: both for full duplex, the one pad of a half duplex, and one side
+/// for a one-way UART (on DMA on Async, whatever the transport on Blocking).
 pub(super) fn serial_wires(
     pins: &[&Pin],
     tx_of: fn(u8) -> PinFunction,
@@ -189,56 +193,9 @@ pub(super) fn serial_shape(peri_ty: &str, cfg: Option<&UsartModuleConfig>) -> Se
     let transport = cfg.map(|c| c.mode).unwrap_or_default();
     let direction = cfg.map(|c| c.direction).unwrap_or_default();
     let flow = cfg.map(|c| c.flow).unwrap_or_default();
-    let readback = if cfg.is_some_and(|c| c.half_duplex_readback) {
-        "HalfDuplexReadback::Readback"
-    } else {
-        "HalfDuplexReadback::NoReadback"
-    };
-    let pin_param = |name: &str, tr: &str| {
-        format!(
-            "    {name}: Peri<'d, impl {tr}<peripherals::{peri_ty}>>,
-"
-        )
-    };
-    // The data pads, in the order every constructor declares them: rx before tx
-    // for the two-pad forms, and the single pad on its own for half duplex.
-    let mut pins = String::new();
-    if direction.needs_rx() {
-        pins.push_str(&pin_param("rx", "RxPin"));
-    }
-    if direction.needs_tx() {
-        pins.push_str(&pin_param("tx", "TxPin"));
-    }
-    let (mut params, mut uses) = (String::new(), String::new());
-    let mut pin_traits: Vec<&str> = Vec::new();
-    // RTS and DE are the same pad; the trait differs, so the parameter is named
-    // after the ROLE the constructor gives it.
-    if flow.needs_rts() {
-        let (name, tr) = if flow == UsartFlow::De {
-            ("de", "DePin")
-        } else {
-            ("rts", "RtsPin")
-        };
-        params.push_str(&pin_param(name, tr));
-        pin_traits.push(tr);
-    }
-    if flow.needs_cts() {
-        params.push_str(&pin_param("cts", "CtsPin"));
-        pin_traits.push("CtsPin");
-    }
-    if direction.is_half_duplex() {
-        pin_traits.push("HalfDuplexReadback");
-    }
-    if !pin_traits.is_empty() {
-        pin_traits.sort_unstable();
-        uses = format!(
-            "use embassy_stm32::usart::{{{}}};
-",
-            pin_traits.join(", ")
-        );
-    }
-
-    let ctor = match (transport, direction, flow) {
+    let readback = serial_readback(cfg);
+    let mut shape = serial_pads(peri_ty, cfg, false);
+    shape.ctor = match (transport, direction, flow) {
         // ── Half duplex: one pad, both directions, no flow pads ─────────────
         (UsartMode::Buffered, UsartDirection::HalfDuplexOnTx, _) => format!(
             "BufferedUart::new_half_duplex(usart, tx, irqs, tx_buf, rx_buf, get_config(), {readback})"
@@ -298,11 +255,130 @@ pub(super) fn serial_shape(peri_ty: &str, cfg: Option<&UsartModuleConfig>) -> Se
             "UartRx::new(usart, rx, rx_dma, irqs, get_config())".to_owned()
         }
     };
+    shape
+}
+
+/// [`serial_shape`] on the Blocking runtime: embassy's `new_blocking*` calls,
+/// which take no interrupt binding, no buffer and no channel. Their flow forms
+/// are the DMA `Uart`'s - `UsartFlow::options(UsartMode::Dma, …)` - and
+/// [`blocking_serial_flow`] narrows any other choice to none before this.
+pub(super) fn serial_shape_blocking(peri_ty: &str, cfg: Option<&UsartModuleConfig>) -> SerialShape {
+    let direction = cfg.map(|c| c.direction).unwrap_or_default();
+    let flow = cfg.map(|c| c.flow).unwrap_or_default();
+    let readback = serial_readback(cfg);
+    // The two-way template names no pad trait itself: half duplex takes one
+    // of the two, and importing both would leave one unused.
+    let two_way = !matches!(direction, UsartDirection::TxOnly | UsartDirection::RxOnly);
+    let mut shape = serial_pads(peri_ty, cfg, two_way);
+    shape.ctor = match (direction, flow) {
+        (UsartDirection::HalfDuplexOnTx, _) => {
+            format!("Uart::new_blocking_half_duplex(usart, tx, get_config(), {readback})")
+        }
+        (UsartDirection::HalfDuplexOnRx, _) => {
+            format!("Uart::new_blocking_half_duplex_on_rx(usart, rx, get_config(), {readback})")
+        }
+        (UsartDirection::TxRx, UsartFlow::CtsRts) => {
+            "Uart::new_blocking_with_rtscts(usart, rx, tx, rts, cts, get_config())".to_owned()
+        }
+        (UsartDirection::TxRx, UsartFlow::De) => {
+            "Uart::new_blocking_with_de(usart, rx, tx, de, get_config())".to_owned()
+        }
+        (UsartDirection::TxRx, _) => "Uart::new_blocking(usart, rx, tx, get_config())".to_owned(),
+        (UsartDirection::TxOnly, UsartFlow::Cts) => {
+            "UartTx::new_blocking_with_cts(usart, tx, cts, get_config())".to_owned()
+        }
+        (UsartDirection::TxOnly, _) => "UartTx::new_blocking(usart, tx, get_config())".to_owned(),
+        (UsartDirection::RxOnly, UsartFlow::Rts) => {
+            "UartRx::new_blocking_with_rts(usart, rx, rts, get_config())".to_owned()
+        }
+        (UsartDirection::RxOnly, _) => "UartRx::new_blocking(usart, rx, get_config())".to_owned(),
+    };
+    shape
+}
+
+/// The flow control a Blocking serial is built with: the module's, when one of
+/// the `new_blocking*` calls takes it, and none otherwise - the pads of a
+/// choice no call takes stay bound raw instead of becoming `init` parameters
+/// nothing reads.
+pub(super) fn blocking_serial_flow(direction: UsartDirection, flow: UsartFlow) -> UsartFlow {
+    if UsartFlow::options(UsartMode::Dma, direction).contains(&flow) {
+        flow
+    } else {
+        UsartFlow::None
+    }
+}
+
+/// The readback argument of the half-duplex constructors.
+fn serial_readback(cfg: Option<&UsartModuleConfig>) -> &'static str {
+    if cfg.is_some_and(|c| c.half_duplex_readback) {
+        "HalfDuplexReadback::Readback"
+    } else {
+        "HalfDuplexReadback::NoReadback"
+    }
+}
+
+/// Everything of a [`SerialShape`] but the constructor: the pad parameters
+/// and the `use` their traits need, the same on both runtimes. `data_traits`
+/// puts the data pads' `RxPin` / `TxPin` in that `use` too, for a template
+/// that does not import them itself.
+fn serial_pads(peri_ty: &str, cfg: Option<&UsartModuleConfig>, data_traits: bool) -> SerialShape {
+    let direction = cfg.map(|c| c.direction).unwrap_or_default();
+    let flow = cfg.map(|c| c.flow).unwrap_or_default();
+    let pin_param = |name: &str, tr: &str| {
+        format!(
+            "    {name}: Peri<'d, impl {tr}<peripherals::{peri_ty}>>,
+"
+        )
+    };
+    // The data pads, in the order every constructor declares them: rx before tx
+    // for the two-pad forms, and the single pad on its own for half duplex.
+    let mut pins = String::new();
+    if direction.needs_rx() {
+        pins.push_str(&pin_param("rx", "RxPin"));
+    }
+    if direction.needs_tx() {
+        pins.push_str(&pin_param("tx", "TxPin"));
+    }
+    let (mut params, mut uses) = (String::new(), String::new());
+    let mut pin_traits: Vec<&str> = Vec::new();
+    if data_traits && direction.needs_rx() {
+        pin_traits.push("RxPin");
+    }
+    if data_traits && direction.needs_tx() {
+        pin_traits.push("TxPin");
+    }
+    // RTS and DE are the same pad; the trait differs, so the parameter is named
+    // after the ROLE the constructor gives it.
+    if flow.needs_rts() {
+        let (name, tr) = if flow == UsartFlow::De {
+            ("de", "DePin")
+        } else {
+            ("rts", "RtsPin")
+        };
+        params.push_str(&pin_param(name, tr));
+        pin_traits.push(tr);
+    }
+    if flow.needs_cts() {
+        params.push_str(&pin_param("cts", "CtsPin"));
+        pin_traits.push("CtsPin");
+    }
+    if direction.is_half_duplex() {
+        pin_traits.push("HalfDuplexReadback");
+    }
+    if !pin_traits.is_empty() {
+        pin_traits.sort_unstable();
+        uses = format!(
+            "use embassy_stm32::usart::{{{}}};
+",
+            pin_traits.join(", ")
+        );
+    }
+
     SerialShape {
         uses,
         pins,
         flow_params: params,
-        ctor,
+        ctor: String::new(),
     }
 }
 
@@ -395,6 +471,63 @@ pub fn serial_config_file(
     // Whether this CHIP's USART has the swap/invert bits at all.
     line_extras: bool,
 ) -> String {
+    let direction = cfg.map(|c| c.direction).unwrap_or_default();
+    let template = match (cfg.map(|c| c.mode).unwrap_or_default(), direction) {
+        (UsartMode::Dma, UsartDirection::TxOnly) => ASYNC_USART_TMPL_DMA_TX,
+        (UsartMode::Dma, UsartDirection::RxOnly) => ASYNC_USART_TMPL_DMA_RX,
+        // Half duplex returns a FULL `Uart` / `BufferedUart` — one pad, both
+        // directions — so it reuses the two-way templates; only the pin
+        // parameters and the constructor differ, and `serial_shape` owns both.
+        (UsartMode::Dma, _) => ASYNC_USART_TMPL_DMA,
+        (UsartMode::Buffered, _) => ASYNC_USART_TMPL,
+    };
+    let shape = serial_shape(&format!("{peri}{n}"), cfg);
+    render_serial(template, &shape, peri, n, cfg, irq, line_extras)
+}
+
+/// `configs/usart{n}.rs` on the Blocking runtime: a polled UART, whatever the
+/// module's transport says - the buffer and the DMA are the Async runtime's.
+/// Full and half duplex hand back an `embedded-io` Read + Write, a one-way UART
+/// its half.
+pub(super) const BLOCKING_USART_TMPL: &str =
+    include_str!("../templates/embassy_stm32/usart_blocking.rs.tmpl");
+
+/// [`BLOCKING_USART_TMPL`] for a transmitter: embassy's `UartTx`, which
+/// implements `embedded_io::Write` itself.
+pub(super) const BLOCKING_USART_TMPL_TX: &str =
+    include_str!("../templates/embassy_stm32/usart_blocking_tx.rs.tmpl");
+
+/// [`BLOCKING_USART_TMPL`] for a receiver: `UartRx` behind the `embedded-io`
+/// `Read` embassy gives it none of.
+pub(super) const BLOCKING_USART_TMPL_RX: &str =
+    include_str!("../templates/embassy_stm32/usart_blocking_rx.rs.tmpl");
+
+/// [`serial_config_file`] for the Blocking runtime.
+pub fn serial_config_file_blocking(
+    peri: &str,
+    n: u8,
+    cfg: Option<&UsartModuleConfig>,
+    line_extras: bool,
+) -> String {
+    let template = match cfg.map(|c| c.direction).unwrap_or_default() {
+        UsartDirection::TxOnly => BLOCKING_USART_TMPL_TX,
+        UsartDirection::RxOnly => BLOCKING_USART_TMPL_RX,
+        _ => BLOCKING_USART_TMPL,
+    };
+    let shape = serial_shape_blocking(&format!("{peri}{n}"), cfg);
+    render_serial(template, &shape, peri, n, cfg, "", line_extras)
+}
+
+/// One serial template filled with the module's settings and `shape`.
+fn render_serial(
+    template: &str,
+    shape: &SerialShape,
+    peri: &str,
+    n: u8,
+    cfg: Option<&UsartModuleConfig>,
+    irq: &str,
+    line_extras: bool,
+) -> String {
     let baud = cfg.map(|c| c.baud_rate).unwrap_or(115_200);
     // Clamped, not trusted: a 0-byte `StaticCell<[u8; 0]>` compiles and then
     // never delivers a byte, which reads as a dead link rather than as a
@@ -416,18 +549,6 @@ pub fn serial_config_file(
         .filter(|s| !s.is_empty())
         .map(|s| format!("_{s}"))
         .unwrap_or_default();
-    let direction = cfg.map(|c| c.direction).unwrap_or_default();
-    let template = match (cfg.map(|c| c.mode).unwrap_or_default(), direction) {
-        (UsartMode::Dma, UsartDirection::TxOnly) => ASYNC_USART_TMPL_DMA_TX,
-        (UsartMode::Dma, UsartDirection::RxOnly) => ASYNC_USART_TMPL_DMA_RX,
-        // Half duplex returns a FULL `Uart` / `BufferedUart` — one pad, both
-        // directions — so it reuses the two-way templates; only the pin
-        // parameters and the constructor differ, and `serial_shape` owns both.
-        (UsartMode::Dma, _) => ASYNC_USART_TMPL_DMA,
-        (UsartMode::Buffered, _) => ASYNC_USART_TMPL,
-    };
-    let peri_ty = format!("{peri}{n}");
-    let shape = serial_shape(&peri_ty, cfg);
     let (extra_consts, extra_config) = serial_line_extras(cfg, line_extras);
     tmpl::render(
         template,
@@ -1119,8 +1240,9 @@ mod lpuart_tests {
         );
         assert!(!body.contains("USART1"), "{body}");
         assert!(
-            out.init_calls
-                .contains("pins::configs::lpuart1::init(p.LPUART1, p.PA3, p.PA2, Irqs)"),
+            out.init_calls.contains(
+                "pins::configs::lpuart1::init(p.LPUART1, pa3_lpuart1_rx, pa2_lpuart1_tx, Irqs)"
+            ),
             "{}",
             out.init_calls
         );
@@ -1308,7 +1430,7 @@ mod flow_and_direction_tests {
         let out = run(&pins, cfg);
         assert!(
             out.init_calls
-                .contains("init(p.USART1, p.PA10, p.PA9, p.PA12, p.PA11, Irqs)"),
+                .contains("init(p.USART1, pa10_usart1_rx, pa9_usart1_tx, pa12_usart1_rts, pa11_usart1_cts, Irqs)"),
             "rx, tx, rts, cts — the order `new_with_rtscts` declares: {}",
             out.init_calls
         );
@@ -1340,7 +1462,7 @@ mod flow_and_direction_tests {
         assert!(!body.contains("rtscts"), "{body}");
         assert!(
             out.init_calls
-                .contains("init(p.USART1, p.PA10, p.PA9, Irqs)"),
+                .contains("init(p.USART1, pa10_usart1_rx, pa9_usart1_tx, Irqs)"),
             "{}",
             out.init_calls
         );
@@ -1404,7 +1526,8 @@ mod flow_and_direction_tests {
             "{body}"
         );
         assert!(
-            out.init_calls.contains("init(p.USART1, p.PA9, Irqs)"),
+            out.init_calls
+                .contains("init(p.USART1, pa9_usart1_tx, Irqs)"),
             "{}",
             out.init_calls
         );
@@ -1537,7 +1660,8 @@ mod flow_and_direction_tests {
         );
         assert!(body.contains("-> RingBufferedUartRx<'d>"), "{body}");
         assert!(
-            out.init_calls.contains("init(p.USART1, p.PA10, p."),
+            out.init_calls
+                .contains("init(p.USART1, pa10_usart1_rx, p.DMA"),
             "{}",
             out.init_calls
         );

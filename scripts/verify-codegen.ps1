@@ -667,10 +667,35 @@ $ALL_CASES = @(
     # EXTI0_1/2_3/4_15 on the G0B1, a vector per line on the WBA55 (its own
     # backend). Each row also refuses a pad for a line clash, and arms two
     # lines of one vector where the part has one. Linked.
-    @{ n = "imported G431 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "both"; EIDE_EXTI_SHARED = "1" }; q = $true; p = $CUBE_DB; fam = "import"; lk = $true }
-    @{ n = "imported G0B1 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "rising"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32G0B1R(B-C-E)Tx.xml" }; q = $false; p = "$CUBE_MX\STM32G0B1R(B-C-E)Tx.xml"; fam = "import"; lk = $true }
-    @{ n = "imported WBA55 Blocking EXTI"; t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "falling"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32WBA55CGUx.xml" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
-    @{ n = "imported F411 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "both"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32F411R(C-E)Tx.xml" }; q = $false; p = "$CUBE_MX\STM32F411R(C-E)Tx.xml"; fam = "import"; lk = $true }
+    #
+    # They wire every bus as well, so since phase 3 they build the Blocking
+    # DRIVERS too - and EIDE_EXPECT_CONFIGS fails a row whose drivers all fell
+    # away, which would otherwise pass by compiling the GPIO alone. (On the
+    # F411 the armed pads are PB7-PB9, which leaves I2C1 no pad.)
+    @{ n = "imported G431 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "both"; EIDE_EXTI_SHARED = "1"; EIDE_EXPECT_CONFIGS = "usart1.rs,spi1.rs,i2c1/mod.rs" }; q = $true; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported G0B1 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "rising"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32G0B1R(B-C-E)Tx.xml"; EIDE_EXPECT_CONFIGS = "usart1.rs,spi1.rs,i2c1/mod.rs" }; q = $false; p = "$CUBE_MX\STM32G0B1R(B-C-E)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported WBA55 Blocking EXTI"; t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "falling"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32WBA55CGUx.xml"; EIDE_EXPECT_CONFIGS = "usart1.rs,spi1.rs,i2c1/mod.rs" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported F411 Blocking EXTI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_EXTI = "both"; EIDE_EXTI_SHARED = "1"; EIDE_CHIP_XML = "STM32F411R(C-E)Tx.xml"; EIDE_EXPECT_CONFIGS = "usart1.rs,spi1.rs,pwm1.rs" }; q = $false; p = "$CUBE_MX\STM32F411R(C-E)Tx.xml"; fam = "import"; lk = $true }
+    # The bus drivers on the Blocking runtime (phase 3): embassy's new_blocking*
+    # constructors from the Async templates, a polled UART behind embedded-io.
+    # What the EXTI rows above do not build: the one-way and single-wire UARTs
+    # and a transmit-only SPI, a usart_v3 part with a shared vector (G071) and
+    # a usart_v2 one (F217), and the four memory controllers. SDMMC and SAI are
+    # async-only, so the U575 and G431 rows wire one for its written refusal.
+    # Linked.
+    @{ n = "imported G431 Blocking UART tx"; t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_USART_DIR = "tx"; EIDE_SPI_TXONLY = "1"; EIDE_SAI = "1"; EIDE_EXPECT_CONFIGS = "usart1.rs,spi1.rs" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported G431 Blocking UART rx"; t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_USART_DIR = "rx"; EIDE_LPUART_HALF = "1"; EIDE_EXPECT_CONFIGS = "usart1.rs,lpuart1.rs" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported G071 Blocking";       t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32G071R(6-8-B)Tx.xml"; EIDE_USART_N = "3"; EIDE_EXPECT_CONFIGS = "usart3.rs,spi1.rs,i2c1/mod.rs" }; q = $false; p = "$CUBE_MX\STM32G071R(6-8-B)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported F217 Blocking";       t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32F217Z(E-G)Tx.xml"; EIDE_EXPECT_CONFIGS = "usart1.rs,spi1.rs,i2c1/mod.rs" }; q = $false; p = "$CUBE_MX\STM32F217Z(E-G)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported L476 Blocking QSPI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32L476R(C-E-G)Tx.xml"; EIDE_QSPI = "1"; EIDE_EXPECT_CONFIGS = "qspi.rs" }; q = $false; p = "$CUBE_MX\STM32L476R(C-E-G)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported F767 Blocking QSPI2"; t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32F767ZITx.xml"; EIDE_QSPI = "dual"; EIDE_EXPECT_CONFIGS = "qspi.rs" }; q = $false; p = "$CUBE_MX\STM32F767ZITx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported U575 Blocking OSPI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32U575ZITxQ.xml"; EIDE_OSPI = "8"; EIDE_OSPI_DQS = "1"; EIDE_SDMMC = "4"; EIDE_EXPECT_CONFIGS = "ospi1.rs" }; q = $false; p = "$CUBE_MX\STM32U575ZITxQ.xml"; fam = "import"; lk = $true }
+    @{ n = "imported H7S3 Blocking XSPI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32H7S3Z8Tx.xml"; EIDE_XSPI = "8"; EIDE_XSPI_DQS = "1"; EIDE_EXPECT_CONFIGS = "xspi1.rs" }; q = $false; p = "$CUBE_MX\STM32H7S3Z8Tx.xml"; fam = "import"; lk = $true }
+    # A project from before the drivers whose own code wires USART1 by hand
+    # (EIDE_BLK_UPGRADE): opened, that module starts with "Generate driver" off,
+    # and the project builds with the user's code in it.
+    @{ n = "imported G431 Blocking upgrade"; t = "emit_imported_dma_project"; e = @{ EIDE_RUNTIME = "blocking"; EIDE_BLK_UPGRADE = "used"; EIDE_EXPECT_CONFIGS = "spi1.rs,i2c1/mod.rs" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported U599 Blocking HSPI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32U599NJHxQ.xml"; EIDE_HSPI = "8"; EIDE_HSPI_DQS = "1"; EIDE_EXPECT_CONFIGS = "hspi1.rs" }; q = $false; p = "$CUBE_MX\STM32U599NJHxQ.xml"; fam = "import"; lk = $true }
 
     # STM32N6 — the first family whose clock block does not come from the
     # descriptor model. Cortex-M55 on a v8-M Main triple, a chip feature derived
@@ -708,6 +733,11 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CHIP_XML", "EIDE_EXPECT_FEATURE", "EIDE_IMPORT_SKIP", "EIDE_IMPORT_WDG",
            # The Blocking EXTI rows: the runtime and the edge knobs.
            "EIDE_RUNTIME", "EIDE_EXTI", "EIDE_EXTI_SHARED",
+           # The Blocking driver rows: what each must generate, and the shapes.
+           "EIDE_EXPECT_CONFIGS", "EIDE_USART_DIR", "EIDE_LPUART_HALF", "EIDE_USART_N",
+           "EIDE_QSPI", "EIDE_OSPI", "EIDE_OSPI_DQS", "EIDE_XSPI", "EIDE_XSPI_DQS",
+           "EIDE_HSPI", "EIDE_HSPI_DQS", "EIDE_SDMMC", "EIDE_SDMMC_UNIT", "EIDE_SAI",
+           "EIDE_PIN_SPI_TX", "EIDE_BLK_UPGRADE",
            # Not ours, but set by the Thread rows - never left for the next case.
            "CMAKE")
 

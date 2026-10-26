@@ -440,7 +440,7 @@ pub fn instances(mcu: &crate::panels::mcu_module::mcu::Mcu) -> Vec<u8> {
 }
 
 /// `("COMP5_INP", "INP") -> Some(5)`; `None` for anything else.
-fn instance_of_signal(signal: &str, suffix: &str) -> Option<u8> {
+pub(crate) fn instance_of_signal(signal: &str, suffix: &str) -> Option<u8> {
     let rest = signal.strip_prefix("COMP")?;
     let (num, tail) = rest.split_at(rest.find('_')?);
     (tail == format!("_{suffix}"))

@@ -21,10 +21,11 @@ pub(super) fn dac_wires(pins: &[&Pin]) -> Vec<(u8, Vec<(u8, String)>)> {
     by_dac.into_iter().collect()
 }
 
-/// `src/pins/configs/dac{N}.rs`: embassy's blocking DAC over DAC{N}.
-pub(super) const ASYNC_DAC_TMPL: &str = include_str!("../templates/embassy_stm32/dac.rs.tmpl");
+/// `src/pins/configs/dac{N}.rs`: embassy's blocking DAC over DAC{N}, the same
+/// file on both runtimes.
+pub(super) const DAC_TMPL: &str = include_str!("../templates/embassy_stm32/dac.rs.tmpl");
 
-/// Render [`ASYNC_DAC_TMPL`] for DAC `n` with the channels `chans`.
+/// Render [`DAC_TMPL`] for DAC `n` with the channels `chans`.
 pub fn dac_config_file(
     n: u8,
     cfg: &DacModuleConfig,
@@ -87,7 +88,7 @@ pub fn dac_config_file(
     }
 
     tmpl::render(
-        ASYNC_DAC_TMPL,
+        DAC_TMPL,
         &[
             ("{START_CONSTS}", &start_consts),
             ("{USE}", &use_line),
@@ -169,8 +170,9 @@ mod dac_tests {
         );
         assert!(body.contains("-> Dac<'d, Blocking>"), "{body}");
         assert!(
-            out.init_calls
-                .contains("let mut _dac1 = pins::configs::dac1::init(p.DAC1, p.PA4, p.PA5);"),
+            out.init_calls.contains(
+                "let mut _dac1 = pins::configs::dac1::init(p.DAC1, pa4_dac1_out1, pa5_dac1_out2);"
+            ),
             "{}",
             out.init_calls
         );

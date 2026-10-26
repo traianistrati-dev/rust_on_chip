@@ -3561,6 +3561,10 @@ impl AppIde {
         // generated project until something else happened to bump the hash.
         hash_debug(&mut hasher, &mcu.watchdog);
 
+        // The "Generate driver" switches: one off takes a driver out of
+        // pins/configs/ and its init out of main.rs.
+        mcu.raw_modules.hash(&mut hasher);
+
         // Comparators, for exactly the same reason and from the same tab.
         // `family.rs` passes `settings: &mcu.comp` into the emitter, and the
         // value round-trips through `@comp` in mcu.config — so it is persisted
@@ -3825,7 +3829,6 @@ impl AppIde {
             Some(m) => {
                 let pin = m.pin_goto.take();
                 let module = m.module_goto.take();
-                let native_forced = m.is_native();
                 match (pin, module) {
                     (Some(n), _) => vec![n],
                     (None, Some(id)) => m
@@ -3833,10 +3836,13 @@ impl AppIde {
                         .iter()
                         .find(|md| md.id == id)
                         .map(|md| {
+                            // Read only on a click: which backend binds the
+                            // handles, and whether it binds any for `md`.
+                            let handles =
+                                crate::panels::mcu_module::mcu::gui::modules::HandleCtx::of(m);
                             goto_handles =
                                 crate::panels::mcu_module::mcu::gui::modules::handle_names(
-                                    md,
-                                    native_forced,
+                                    md, &handles,
                                 );
                             let mut v: Vec<usize> =
                                 md.connections.iter().map(|c| c.mcu_pin).collect();

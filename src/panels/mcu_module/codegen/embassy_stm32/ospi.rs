@@ -228,7 +228,7 @@ mod ospi_tests {
         assert!(body.contains("new_blocking_quadspi("), "{body}");
         assert!(!body.contains("DQSPin"), "{body}");
         assert_eq!(
-            out.init_calls.matches(", p.").count(),
+            out.init_calls.matches("_ospi_p1_").count(),
             6,
             "clock, four lines, chip select — no strobe: {}",
             out.init_calls

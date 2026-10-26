@@ -1760,6 +1760,14 @@ pub enum StopBits {
 }
 
 /// Which init API a Virtual Module's generated `pins/configs/*.rs` exposes.
+///
+/// Read only by the stm32f1xx-hal emitters: the STM32F1 on the Blocking and
+/// RTIC runtimes, with the Native runtime forcing [`ApiStyle::Native`] on every
+/// module. Every other backend that writes a bus file ignores it -
+/// embassy-stm32 (every STM32 on Async, every STM32 but the F1 on Blocking)
+/// always hands back its own embedded-io / embedded-hal 1.0 value, and
+/// esp-hal, embassy-rp and the nRF HALs their own types. The stored value is
+/// kept as it is everywhere, so an F1 project round-trips.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ApiStyle {
     /// `init` returns a STANDARD `embedded-io` / `embedded-hal` 1.0 value, so
@@ -1772,10 +1780,19 @@ pub enum ApiStyle {
     Native,
 }
 
-/// For the **async** (embassy) runtime, how a SPI/I2C module's generated init
-/// drives the bus. (Ignored on the blocking runtime, where [`ApiStyle`] applies
-/// instead.) embassy's async SPI/I2C REQUIRE DMA channels, which the IDE doesn't
-/// model — so async-DMA leaves a `TODO` in `main.rs` for the user to fill.
+/// How a SPI/I2C module's generated init drives the bus.
+///
+/// Read by the embassy-stm32 ASYNC runtime (every STM32, the F1 on Async
+/// included): `Blocking` is `new_blocking` behind embedded-hal 1.0, `AsyncDma`
+/// the DMA `new` behind embedded-hal-async, with its channels allocated or
+/// pinned. An ESP SPI reads it on BOTH runtimes, as CPU vs esp-hal's
+/// `with_dma` (the "Transfers" row). It is ignored by:
+///
+/// - embassy-stm32 on Blocking (every STM32 but the F1, the WBA included),
+///   whose SPI/I2C file is always the blocking embedded-hal 1.0 bus;
+/// - the F1's stm32f1xx-hal on Blocking/Native/RTIC, where [`ApiStyle`] and
+///   `blocking_dma` decide;
+/// - an ESP I2C, the RP and the nRF.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AsyncBusMode {
     /// `init` uses embassy's `new_blocking` and returns `impl embedded_hal::…`
@@ -1900,6 +1917,9 @@ impl UsartDirection {
     ///   see the note on `f1_usart_needs_both_pads`.
     /// - **ESP** has `UartTx::new` and `UartRx::new`, so a single direction is
     ///   real there — but esp-hal has no single-wire mode at all.
+    ///
+    /// It knows the family and nothing else: the CHIP's USART version and the
+    /// Blocking runtime's transport narrow it further, in [`Self::offered`].
     pub fn options_for(transport: UsartMode, family: &str) -> &'static [UsartDirection] {
         use crate::panels::mcu_module::codegen::family as fam;
         if family == "stm32f1" {
@@ -1947,6 +1967,39 @@ impl UsartDirection {
                 UsartDirection::HalfDuplexOnRx,
             ],
         }
+    }
+
+    /// The directions the module panel OFFERS: [`Self::options_for`], on the
+    /// transport the backend really builds, minus what this chip's USART
+    /// cannot do. The panel draws and clamps from this one list.
+    ///
+    /// - `embassy_blocking`: embassy-stm32's polled UART (every STM32 but the
+    ///   F1, off Async). It never reads the module's transport, and its
+    ///   `new_blocking*` constructors are the DMA transport's one-way and
+    ///   half-duplex set, so the list is [`UsartMode::Dma`]'s whatever
+    ///   `transport` holds. A caller clamping to it must not write the
+    ///   transport back: the Async runtime still reads it.
+    /// - `line_extras` false (`usart_has_swap_invert`): a usart_v1/v2 block
+    ///   cannot swap TX and RX, so embassy compiles no `new_half_duplex_on_rx`
+    ///   on either runtime and the generator refuses the choice. The F1, ESP,
+    ///   RP and nRF lists never hold it, so this only narrows an embassy
+    ///   STM32's.
+    pub fn offered(
+        transport: UsartMode,
+        family: &str,
+        embassy_blocking: bool,
+        line_extras: bool,
+    ) -> Vec<UsartDirection> {
+        let transport = if embassy_blocking {
+            UsartMode::Dma
+        } else {
+            transport
+        };
+        Self::options_for(transport, family)
+            .iter()
+            .copied()
+            .filter(|d| line_extras || *d != Self::HalfDuplexOnRx)
+            .collect()
     }
 }
 
@@ -2011,6 +2064,11 @@ impl UsartFlow {
     ///   reach them.
     /// - **ESP**: RTS and CTS, through `.with_rts()`/`.with_cts()` and the
     ///   `HwFlowControl` config. No RS485 driver-enable.
+    ///
+    /// The STM32 fall-through is embassy's constructor list for the newest
+    /// USART: a usart_v1/v2 chip has no DE pad, and the Blocking runtime builds
+    /// the DMA transport's forms whatever the module stores - both are
+    /// [`Self::offered`]'s to apply.
     pub fn options_for(
         transport: UsartMode,
         direction: UsartDirection,
@@ -2078,6 +2136,35 @@ impl UsartFlow {
             // Unreachable: the half-duplex directions returned above.
             (UsartMode::Dma, _) => &[UsartFlow::None],
         }
+    }
+
+    /// The flow control the module panel OFFERS for `direction`: the same two
+    /// narrowings as [`UsartDirection::offered`], applied to
+    /// [`Self::options_for`].
+    ///
+    /// - `embassy_blocking`: the [`UsartMode::Dma`] list, which is what the
+    ///   generator's `blocking_serial_flow` keeps - the forms a
+    ///   `new_blocking*` call takes.
+    /// - `line_extras` false: a usart_v1/v2 block has no driver-enable pad, so
+    ///   embassy compiles no `new_with_de` and the generator leaves DE off.
+    ///   CTS and RTS stay.
+    pub fn offered(
+        transport: UsartMode,
+        direction: UsartDirection,
+        family: &str,
+        embassy_blocking: bool,
+        line_extras: bool,
+    ) -> Vec<UsartFlow> {
+        let transport = if embassy_blocking {
+            UsartMode::Dma
+        } else {
+            transport
+        };
+        Self::options_for(transport, direction, family)
+            .iter()
+            .copied()
+            .filter(|f| line_extras || *f != Self::De)
+            .collect()
     }
 }
 
@@ -2222,7 +2309,9 @@ pub struct UsartModuleConfig {
     #[serde(default)]
     pub custom_label: String,
     /// Portable (embedded-io) vs native (concrete HAL) init. `#[serde(default)]`
-    /// → old configs load as `Portable`.
+    /// → old configs load as `Portable`. stm32f1xx-hal only (see [`ApiStyle`]):
+    /// F1 Blocking/RTIC, forced Native on Native; ignored on embassy-stm32
+    /// (both runtimes), ESP, RP and nRF.
     #[serde(default)]
     pub api_style: ApiStyle,
     /// Which halves to build (CubeMX's "Data Direction"). Default `TxRx`, which
@@ -2369,10 +2458,15 @@ pub struct SpiModuleConfig {
     #[serde(default)]
     pub custom_label: String,
     /// Portable (embedded-hal 1.0 `SpiBus`) vs native (`Spi<…>`) init.
+    /// stm32f1xx-hal only (see [`ApiStyle`]): F1 Blocking/RTIC, forced Native
+    /// on Native; ignored on embassy-stm32 (both runtimes), ESP, RP and nRF.
     #[serde(default)]
     pub api_style: ApiStyle,
-    /// Async runtime only: blocking vs async-DMA embassy init. Ignored on the
-    /// blocking runtime (`api_style` applies there).
+    /// Blocking vs DMA init. Read on the embassy-stm32 Async runtime, and on an
+    /// ESP on both runtimes (CPU vs `with_dma`). Ignored on embassy-stm32
+    /// Blocking, where the bus is always the blocking embedded-hal 1.0 one, on
+    /// the F1's stm32f1xx-hal runtimes (`api_style` / `blocking_dma` apply
+    /// there) and on RP/nRF.
     #[serde(default)]
     pub async_mode: AsyncBusMode,
     /// DMA channels chosen BY HAND, empty = let the IDE allocate (the normal
@@ -2406,7 +2500,13 @@ pub struct SpiModuleConfig {
     /// and getting it wrong gives bit-reversed data rather than silence, which
     /// is why it is worth a field instead of a comment.
     ///
-    /// Async runtime only: the STM32F1 HAL takes no bit-order argument.
+    /// Honoured wherever an embassy SPI driver is generated: embassy-stm32
+    /// (every STM32 on Async, every non-F1 STM32 on Blocking, the WBA
+    /// included) and embassy-nrf (Async, and Blocking on the
+    /// nRF52820/5340/54L, which have no nrf-hal crate). Ignored by
+    /// stm32f1xx-hal (the F1 on Blocking/Native/RTIC), nrf-hal, esp-hal and
+    /// embassy-rp, and by a module whose "Generate driver" switch is off (its
+    /// pads stay raw bindings).
     #[serde(default)]
     pub bit_order: SpiBitOrder,
 }
@@ -2670,10 +2770,18 @@ pub struct I2cModuleConfig {
     #[serde(default)]
     pub custom_label: String,
     /// Portable (embedded-hal 1.0 `I2c`) vs native (`BlockingI2c<…>`) init.
+    /// stm32f1xx-hal only (see [`ApiStyle`]): F1 Blocking/RTIC, forced Native
+    /// on Native; ignored on embassy-stm32 (both runtimes), ESP, RP and nRF.
     #[serde(default)]
     pub api_style: ApiStyle,
-    /// Async runtime only: blocking vs async-DMA embassy init. Ignored on the
-    /// blocking runtime (`api_style` applies there).
+    /// embassy-stm32 Async runtime only: `new_blocking` vs DMA init. Ignored
+    /// everywhere else:
+    ///
+    /// - on embassy-stm32 Blocking the bus is always the blocking
+    ///   embedded-hal 1.0 one;
+    /// - on the F1's stm32f1xx-hal Blocking/RTIC `api_style` applies (forced
+    ///   Native on Native);
+    /// - ESP, RP and nRF do not read it.
     #[serde(default)]
     pub async_mode: AsyncBusMode,
     /// DMA channels chosen BY HAND, empty = let the IDE allocate (the normal
@@ -6110,6 +6218,139 @@ mod pcnt_tests {
         assert_eq!(c.filter, 0, "no filter until asked for");
         // The counter is signed 16-bit, and the limits must fit in it.
         assert!(c.low_limit > i16::MIN && c.high_limit == i16::MAX);
+    }
+}
+
+#[cfg(test)]
+mod usart_offered_tests {
+    use super::{UsartDirection as D, UsartFlow as F, UsartMode as M};
+
+    const EVERY_DIRECTION: [D; 5] = [
+        D::TxRx,
+        D::TxOnly,
+        D::RxOnly,
+        D::HalfDuplexOnTx,
+        D::HalfDuplexOnRx,
+    ];
+
+    /// The backends whose lists no runtime or chip flag moves: stm32f1xx-hal's
+    /// one TX+RX port, esp-hal's halves, and the pair on the RP and the nRF.
+    #[test]
+    fn the_hal_lists_do_not_move() {
+        for t in [M::Buffered, M::Dma] {
+            for extras in [false, true] {
+                assert_eq!(D::offered(t, "stm32f1", false, extras), [D::TxRx]);
+                assert_eq!(F::offered(t, D::TxRx, "stm32f1", false, extras), [F::None]);
+                assert_eq!(
+                    D::offered(t, "esp32c3", false, extras),
+                    [D::TxRx, D::TxOnly, D::RxOnly]
+                );
+                assert_eq!(
+                    F::offered(t, D::TxRx, "esp32c3", false, extras),
+                    [F::None, F::Cts, F::Rts, F::CtsRts]
+                );
+                assert_eq!(
+                    F::offered(t, D::TxOnly, "esp32c3", false, extras),
+                    [F::None, F::Rts]
+                );
+                assert_eq!(
+                    F::offered(t, D::RxOnly, "esp32c3", false, extras),
+                    [F::None, F::Cts]
+                );
+                assert_eq!(D::offered(t, "rp2040", false, extras), [D::TxRx]);
+                assert_eq!(F::offered(t, D::TxRx, "rp2040", false, extras), [F::None]);
+                assert_eq!(D::offered(t, "nrf52833", false, extras), [D::TxRx]);
+                assert_eq!(
+                    F::offered(t, D::TxRx, "nrf52833", false, extras),
+                    [F::None, F::CtsRts]
+                );
+            }
+        }
+    }
+
+    /// embassy-stm32 on the newest USART: every shape on DMA, and on Async the
+    /// buffered transport still has no one-way half.
+    #[test]
+    fn a_usart_v3_offers_every_embassy_shape() {
+        assert_eq!(D::offered(M::Dma, "stm32g0", false, true), EVERY_DIRECTION);
+        assert_eq!(
+            F::offered(M::Dma, D::TxRx, "stm32g0", false, true),
+            [F::None, F::CtsRts, F::De]
+        );
+        let buffered = D::offered(M::Buffered, "stm32g0", false, true);
+        assert!(!buffered.contains(&D::TxOnly) && !buffered.contains(&D::RxOnly));
+        assert!(buffered.contains(&D::HalfDuplexOnRx));
+    }
+
+    /// A usart_v1/v2 block cannot swap TX and RX and has no DE pad, so neither
+    /// is offered for any stored transport, on either runtime - while half
+    /// duplex on TX and CTS/RTS stay.
+    #[test]
+    fn a_usart_v2_loses_half_duplex_on_rx_and_de() {
+        for embassy_blocking in [false, true] {
+            for t in [M::Buffered, M::Dma] {
+                let dirs = D::offered(t, "stm32f4", embassy_blocking, false);
+                assert!(
+                    !dirs.contains(&D::HalfDuplexOnRx),
+                    "{t:?} {embassy_blocking}"
+                );
+                assert!(
+                    dirs.contains(&D::HalfDuplexOnTx),
+                    "{t:?} {embassy_blocking}"
+                );
+                for d in EVERY_DIRECTION {
+                    let flows = F::offered(t, d, "stm32f4", embassy_blocking, false);
+                    assert!(!flows.contains(&F::De), "{t:?} {d:?} {embassy_blocking}");
+                }
+                assert!(
+                    F::offered(t, D::TxRx, "stm32f4", embassy_blocking, false).contains(&F::CtsRts)
+                );
+            }
+        }
+    }
+
+    /// The Blocking runtime's lists are the DMA transport's, whatever the
+    /// module stores - here the default, Buffered.
+    #[test]
+    fn embassy_blocking_offers_the_new_blocking_set() {
+        assert_eq!(
+            D::offered(M::Buffered, "stm32g0", true, true),
+            EVERY_DIRECTION
+        );
+        for (d, want) in [
+            (D::TxRx, &[F::None, F::CtsRts, F::De][..]),
+            (D::TxOnly, &[F::None, F::Cts]),
+            (D::RxOnly, &[F::None, F::Rts]),
+            (D::HalfDuplexOnTx, &[F::None]),
+            (D::HalfDuplexOnRx, &[F::None]),
+        ] {
+            assert_eq!(
+                F::offered(M::Buffered, d, "stm32g0", true, true),
+                want,
+                "{d:?}"
+            );
+        }
+    }
+
+    /// Tied to the generator rather than to literals: every pair the Blocking
+    /// panel offers is one `blocking_serial_flow` keeps as it is (it keeps a
+    /// flow exactly when `UsartFlow::options(Dma, d)` lists it), and on a
+    /// usart_v1/v2 chip none is one `embassy_stm32::peripherals` refuses (half
+    /// duplex on RX, DE).
+    #[test]
+    fn every_blocking_choice_is_one_the_generator_builds() {
+        for extras in [false, true] {
+            for t in [M::Buffered, M::Dma] {
+                for d in D::offered(t, "stm32g4", true, extras) {
+                    for f in F::offered(t, d, "stm32g4", true, extras) {
+                        assert!(F::options(M::Dma, d).contains(&f), "{d:?} {f:?}");
+                        if !extras {
+                            assert!(d != D::HalfDuplexOnRx && f != F::De, "{d:?} {f:?}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -1,0 +1,48 @@
+// <<< GENERATED>>>
+// Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
+pub const BAUDRATE: u32 = {BAUD};
+pub const DATA_BITS: u8 = {DATA}; // 7, 8, 9
+pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
+pub const STOP_BITS: u8 = {STOP}; // 1, 2
+{EXTRA_CONSTS}// <<< GENERATED END >>>
+
+// Everything below is editable — your changes are preserved on regeneration.
+//
+// TRANSMIT ONLY: the RX pad is free for something else. `init` returns
+// embassy's blocking `UartTx`, which implements `embedded_io::Write`.
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::usart::{Config, DataBits, Parity, StopBits, TxPin, UartTx};
+use embassy_stm32::{peripherals, Peri};
+{FLOW_USE}
+
+fn get_config() -> Config {
+    let mut config = Config::default();
+    config.baudrate = BAUDRATE;
+    config.data_bits = match DATA_BITS {
+        7 => DataBits::DataBits7,
+        9 => DataBits::DataBits9,
+        _ => DataBits::DataBits8,
+    };
+    config.parity = match PARITY {
+        'O' => Parity::ParityOdd,
+        'E' => Parity::ParityEven,
+        _ => Parity::ParityNone,
+    };
+    config.stop_bits = match STOP_BITS {
+        2 => StopBits::STOP2,
+        _ => StopBits::STOP1,
+    };
+{EXTRA_CONFIG}    config
+}
+
+/// Initialise {PERI} as a blocking, transmit-only UART.
+pub fn init<'d>(
+    usart: Peri<'d, peripherals::{PERI}>,
+    tx: Peri<'d, impl TxPin<peripherals::{PERI}>>,
+{FLOW_PARAMS}) -> UartTx<'d, Blocking> {
+    {CTOR}.unwrap()
+}
+
+// ── Using {PERI} ──
+//     use embedded_io::Write;
+//     {HANDLE}.write_all(b"hello\r\n").ok();

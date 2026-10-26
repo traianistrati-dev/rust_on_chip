@@ -158,6 +158,12 @@ impl AppIde {
                 .as_deref()
                 .map(mcu_config::parse_iot)
                 .unwrap_or_default();
+            // And the "Generate driver" switches: a module switched off in the
+            // last project must not stay off in this one.
+            mcu.raw_modules = cfg
+                .as_deref()
+                .and_then(mcu_config::parse_drivers)
+                .unwrap_or_default();
         }
 
         // ── Restore pin state from mcu.config and src/main.rs ────────────────
@@ -210,7 +216,13 @@ impl AppIde {
                 if let Some(mcu) = &mut self.mcu {
                     match &saved {
                         SavedPins::ByNumber(pins) => mcu.apply_saved_pins_by_number(pins),
-                        SavedPins::ByName(pins) => mcu.apply_saved_pins(pins),
+                        SavedPins::ByName(pins) => {
+                            mcu.apply_saved_pins(pins);
+                            // An Async STM32 project from before phase 3
+                            // bound no pad a driver took: its init calls
+                            // are where those pads are named.
+                            mcu.recover_driver_pins(&codegen::parse_driver_inits(&source));
+                        }
                     }
                     // Restore the per-pin user labels (the `_<label>` suffix on a
                     // binding) — after apply_saved_pins, which would clear them.
@@ -222,6 +234,17 @@ impl AppIde {
                     // recovered-from-main.rs labels it always had.
                     if let Some(cfg) = &cfg_text {
                         mcu.apply_config_pin_labels(cfg);
+                    }
+                    // A project saved before the switch existed: the modules
+                    // its own code wires by hand stay raw. Here, once the pads
+                    // and their labels - which name the bindings it looks
+                    // for - are back.
+                    if cfg_text
+                        .as_deref()
+                        .and_then(mcu_config::parse_drivers)
+                        .is_none()
+                    {
+                        mcu.raw_modules = mcu.modules_used_by_hand(&source);
                     }
                     // Rebuild generated_code from the restored pin state while
                     // keeping the user's loop body from the existing file.

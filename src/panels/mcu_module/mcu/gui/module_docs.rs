@@ -169,8 +169,10 @@ impl ConfigOut {
 pub const ALL_DOCS: &[(&str, &str)] = &[
     ("INIT_API", INIT_API),
     ("INIT_API_ESP", INIT_API_ESP),
+    ("INIT_API_HAL", INIT_API_HAL),
     ("INIT_API_NATIVE", INIT_API_NATIVE),
     ("INIT_API_DMA", INIT_API_DMA),
+    ("INIT_API_EMBASSY", INIT_API_EMBASSY),
     ("BLOCKING_TRANSPORT", BLOCKING_TRANSPORT),
     ("DMA_CHANNEL", DMA_CHANNEL),
     ("ASYNC_INIT", ASYNC_INIT),
@@ -286,7 +288,6 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("DAC_START", DAC_START),
     ("DAC_START_ESP", DAC_START_ESP),
     ("DAC_NOTE_MORE_CHANNELS", DAC_NOTE_MORE_CHANNELS),
-    ("DAC_NOTE_BLOCKING", DAC_NOTE_BLOCKING),
     ("DAC_ESP_BOTH_RUNTIMES", DAC_ESP_BOTH_RUNTIMES),
     ("CUSTOM_STRUCT", CUSTOM_STRUCT),
     ("CUSTOM_PINS", CUSTOM_PINS),
@@ -334,7 +335,15 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("SKIP_USART_TRANSPORT_NRF", SKIP_USART_TRANSPORT_NRF),
     ("SKIP_ASYNC_INIT_NRF", SKIP_ASYNC_INIT_NRF),
     ("SKIP_I2C_TIMEOUT_NRF", SKIP_I2C_TIMEOUT_NRF),
+    (
+        "SKIP_USART_TRANSPORT_BLOCKING",
+        SKIP_USART_TRANSPORT_BLOCKING,
+    ),
+    ("SKIP_USART_BUF_BLOCKING", SKIP_USART_BUF_BLOCKING),
+    ("SKIP_ASYNC_INIT_BLOCKING", SKIP_ASYNC_INIT_BLOCKING),
+    ("SKIP_I2C_TIMEOUT_BLOCKING", SKIP_I2C_TIMEOUT_BLOCKING),
     ("SKIP_SPI_BIT_ORDER", SKIP_SPI_BIT_ORDER),
+    ("SKIP_SPI_BIT_ORDER_RP", SKIP_SPI_BIT_ORDER_RP),
     ("SKIP_SPI_ROLE", SKIP_SPI_ROLE),
     ("SKIP_TOUCH_SLEEP", SKIP_TOUCH_SLEEP),
     ("SKIP_CAN_MODE", SKIP_CAN_MODE),
@@ -541,9 +550,9 @@ pub const ROSTER: &[KindRoster] = &[
     (
         "QSPI",
         &[
-            ("Address", Some(QSPI_ADDRESS)),
+            ("Address", None),
             ("Flash size", Some(QSPI_FLASH_SIZE)),
-            ("Wiring", Some(QSPI_WIRING_INCOMPLETE)),
+            ("Wiring", None),
         ],
     ),
     (
@@ -634,6 +643,10 @@ pub const INIT_API_ESP: &str = "Fixed on an ESP: every esp-hal driver is the con
                                 because that is what esp-hal implements its traits on. The \
                                 Portable bridge is an STM32F1 choice.";
 
+pub const INIT_API_HAL: &str = "Fixed on this board: its HAL hands back its own driver \
+                                types, which implement the standard traits themselves. The \
+                                Portable bridge is an STM32F1 choice.";
+
 pub const INIT_API_NATIVE: &str = "Fixed by the Native runtime, which uses the concrete HAL type \
                                    for every peripheral. Change it on the System tab to choose \
                                    per module again.";
@@ -641,6 +654,12 @@ pub const INIT_API_NATIVE: &str = "Fixed by the Native runtime, which uses the c
 pub const INIT_API_DMA: &str = "Fixed by the DMA transport: stm32f1xx-hal's DMA handles are its \
                                 own types, and there is no portable bus to bridge them to. Turn \
                                 DMA off and the choice comes back.";
+
+pub const INIT_API_EMBASSY: &str = "Fixed on embassy-stm32: `init` always hands back a standard \
+                                    value - an embedded-io Read/Write wrapper for a UART, \
+                                    embassy's own `UartTx` for a transmit-only one, and an \
+                                    embedded-hal 1.0 bus for SPI and I2C. The Portable/Native \
+                                    choice belongs to stm32f1xx-hal.";
 
 pub const BLOCKING_TRANSPORT: &str = "Which HALF of the bus the DMA moves, on the blocking F1 \
                                       HAL. Directions and not channels, because stm32f1xx-hal \
@@ -1241,11 +1260,6 @@ pub const DAC_NOTE_MORE_CHANNELS: &str = "This block has an output nothing has w
                                           row for it appears here - the pad is fixed in silicon, \
                                           so there is nothing to choose but whether to use it.";
 
-pub const DAC_NOTE_BLOCKING: &str = "Nothing is generated for this module on the Blocking or \
-                                     Native runtimes - those backends write GPIO and watchdogs \
-                                     only. Switch the runtime on the System tab and the DAC is \
-                                     brought up and set to the levels above.";
-
 pub const DAC_ESP_BOTH_RUNTIMES: &str = "On an ESP this module is generated whichever runtime \
                                          you pick. The DAC has no async surface at all - writing \
                                          a level is one register store - so Blocking and Async \
@@ -1494,10 +1508,42 @@ pub const SKIP_I2C_TIMEOUT_NRF: &str = "embassy-nrf's TWIM `Config` has no timeo
                                         stretched clock waits until it is dropped: wrap the call \
                                         in `embassy_time::with_timeout` to bound it.";
 
-pub const SKIP_SPI_BIT_ORDER: &str = "Only the async path can set it: stm32f1xx-hal's blocking \
-                                      SPI takes no bit-order argument, so the row would be a \
-                                      control that changes nothing. Every device this backend \
-                                      builds sends MSB first.";
+pub const SKIP_USART_TRANSPORT_BLOCKING: &str = "Nothing to choose on the Blocking runtime: \
+                                                 embassy-stm32's polled `new_blocking*` UART \
+                                                 moves every byte with the CPU and takes no \
+                                                 interrupt and no DMA channel. The transport and \
+                                                 channels saved for the module are kept, and \
+                                                 used again on the Async runtime.";
+
+pub const SKIP_USART_BUF_BLOCKING: &str = "No buffer to size on the Blocking runtime. Reading \
+                                           polls the data register, so a byte that arrives \
+                                           while the code is busy elsewhere is lost - there is \
+                                           no ring behind it. The size saved for the module is \
+                                           kept for the Async runtime, which buffers.";
+
+pub const SKIP_ASYNC_INIT_BLOCKING: &str = "One form on the Blocking runtime: with no executor \
+                                            the bus is always embassy-stm32's blocking \
+                                            embedded-hal 1.0 one, and no DMA channel is taken. A \
+                                            stored Async-DMA choice is kept but not used; switch \
+                                            the Runtime to Async on the System tab for the DMA \
+                                            form.";
+
+pub const SKIP_I2C_TIMEOUT_BLOCKING: &str = "embassy-stm32's I2C has a timeout only with \
+                                             embassy-time, which the Blocking runtime does not \
+                                             link, so the row had nothing to pass it to. A \
+                                             transfer that hangs on a stretched clock hangs for \
+                                             good; a value saved on the Async runtime is kept, \
+                                             and the generated config file says it is not \
+                                             applied.";
+
+pub const SKIP_SPI_BIT_ORDER_RP: &str = "embassy-rp's SPI config has only the frequency, \
+                                         phase and polarity, so the row would change nothing: \
+                                         the PL022 always sends MSB first.";
+
+pub const SKIP_SPI_BIT_ORDER: &str = "This backend's generated SPI code writes no bit order, so \
+                                      the row would be a control that changes nothing: every \
+                                      device it builds sends MSB first, which is what nearly \
+                                      every device expects.";
 
 pub const SKIP_SPI_ROLE: &str = "Master only on this chip. An esp-hal slave can only work \
                                  through DMA, and an STM32 slave is work this IDE has not done \

@@ -48,6 +48,7 @@ const IOT_HEADER: &str = "@iot";
 const LABELS_HEADER: &str = "@labels";
 const PINS_HEADER: &str = "@pins";
 const NOTES_HEADER: &str = "@modulenotes";
+const DRIVERS_HEADER: &str = "@drivers";
 
 /// The `@autobuild` section text (or "" for the default `Check`) — appended by
 /// `Mcu::mcu_config_text` after [`serialize`]. Kept separate so `serialize`'s
@@ -995,7 +996,10 @@ pub fn saved_pins(cfg_text: Option<&str>, source: &str) -> Option<SavedPins> {
         return Some(SavedPins::ByNumber(by_number));
     }
     let by_name = crate::panels::mcu_module::codegen::parse_main_rs(source);
-    (!by_name.is_empty()).then_some(SavedPins::ByName(by_name))
+    // An old Async STM32 project whose every pad went to a driver names them
+    // in its init calls alone (`codegen::parse_driver_inits`) - still pins.
+    let in_inits = !crate::panels::mcu_module::codegen::parse_driver_inits(source).is_empty();
+    (!by_name.is_empty() || in_inits).then_some(SavedPins::ByName(by_name))
 }
 
 // The Structure tab's `@structure_layout` / `@structure_view` sections used to
@@ -1159,6 +1163,43 @@ pub fn notes_section(
         s.push('\n');
     }
     s
+}
+
+/// Write `@drivers`: the header, then one `raw <kind> <instance>` line per
+/// module whose "Generate driver" switch is off. The header goes in with no
+/// line under it too - its presence is what `parse_drivers` reports.
+pub fn drivers_section(
+    raw: &std::collections::BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
+) -> String {
+    let mut s = format!("{DRIVERS_HEADER}\n");
+    for (kind, instance) in raw {
+        if let Ok(kind) = ron::to_string(kind) {
+            s.push_str(&format!("raw {kind} {instance}\n"));
+        }
+    }
+    s
+}
+
+/// Read `@drivers` back: `None` when the section is missing - a project saved
+/// before the switch existed - and the modules kept raw otherwise. A line that
+/// does not parse is skipped, so its module generates.
+pub fn parse_drivers(
+    text: &str,
+) -> Option<std::collections::BTreeSet<crate::panels::mcu_module::modules::NotesKey>> {
+    let body = section_body(text, DRIVERS_HEADER)?;
+    Some(
+        body.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                if words.next()? != "raw" {
+                    return None;
+                }
+                let kind = ron::from_str(words.next()?).ok()?;
+                let instance = words.next()?.parse().ok()?;
+                Some((kind, instance))
+            })
+            .collect(),
+    )
 }
 
 /// Read `@modulenotes` back. A line that does not parse is skipped - it and

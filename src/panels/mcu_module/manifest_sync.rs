@@ -107,6 +107,15 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
     // it while each built its manifest by hand.
     let is_rp = super::codegen::rp::is_rp(&m.family);
     let hal_direct = is_esp || is_nrf || is_rp;
+    // embassy-stm32 on the Blocking runtime (every STM32 but the F1): its
+    // drivers speak the standard traits themselves - `embedded-io` 0.7 for a
+    // UART, embedded-hal 1.0 for SPI and I2C - so the generated FILES decide,
+    // never a module's API style, and none of the F1 bridges' crates
+    // (embedded-hal-0-2, nb) apply. Every one of them used to be added for a
+    // USART module here, before the backend generated any driver.
+    let embassy_blocking = super::codegen::family::embassy_blocking(m);
+    let embassy_io = embassy_blocking && (has_cfg("usart") || has_cfg("lpuart"));
+    let embassy_eh = embassy_blocking && (has_cfg("spi") || has_cfg("i2c"));
     let needs_can = !is_async && !hal_direct && has_cfg("can");
     // Trait crates only for PORTABLE modules on the Blocking path.
     let (mut needs_usart, mut needs_spi, mut needs_i2c) = (false, false, false);
@@ -118,8 +127,13 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
     // stm32f1xx-hal `Tx`/`Rx` are nb-based (`nb::block!(rx.read())`).
     // (Async USART uses embedded-io-async → no nb.)
     let mut any_usart_blocking = false;
-    if !hal_direct {
+    if !hal_direct && !embassy_blocking {
         for md in &m.modules {
+            // A module whose "Generate driver" is off has no file, and so no
+            // crate - as on embassy Blocking, where the files decide.
+            if is_async && m.raw_modules.contains(&(md.kind, md.instance())) {
+                continue;
+            }
             if is_async {
                 let mode = match &md.config {
                     ModuleConfig::Spi(c) => Some(c.async_mode),
@@ -175,7 +189,7 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
     // referenced, at versions the ESP bus cannot even use.
     //
     // Not on an nRF either: its USB is not this stack (see below).
-    let needs_usb = !is_async && !is_esp_family && !is_nrf && both_usb_pads;
+    let needs_usb = !is_async && !is_esp_family && !is_nrf && !embassy_blocking && both_usb_pads;
     // The nRF's: nrf-hal's `Usbd` is a usb-device 0.3 bus (the ESP OTG
     // versions), embassy-nrf's driver runs under embassy-usb. One
     // decision, shared with the harness - see `nrf::usb_stack`.
@@ -197,14 +211,16 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
         Some((cfg, tc)) => project_gen::refresh_hal_dependency(&current.cargo_toml, cfg, tc),
         None => current.cargo_toml.clone(),
     };
-    let new_toml = project_gen::ensure_peripheral_deps(
+    let eh_bridge = needs_spi || needs_i2c || needs_gpio;
+    let new_toml = project_gen::ensure_peripheral_crates(
         &base_toml,
-        needs_can,
-        needs_usart,
-        needs_spi,
-        needs_i2c,
-        needs_gpio,
-        needs_nb,
+        project_gen::PeripheralCrates {
+            can: needs_can,
+            io: needs_usart || embassy_io,
+            eh02: needs_usart || eh_bridge,
+            eh1: eh_bridge || embassy_eh,
+            nb: needs_nb,
+        },
         &sources,
     );
     let new_toml = project_gen::ensure_usb_deps(&new_toml, needs_usb, &sources);
@@ -222,7 +238,7 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
     // blocking case, or the blocking GPIO (io.rs) / SPI / I2C `embedded-hal`
     // that `ensure_peripheral_deps` just added would be stripped right back
     // out here (and a user's manual `embedded-hal` line with it).
-    let needs_eh_total = needs_eh || needs_spi || needs_i2c || needs_gpio;
+    let needs_eh_total = needs_eh || eh_bridge || embassy_eh;
     // Which async stack: embassy-stm32, or esp-rtos on the ESP32-C3.
     // Same crate names, different versions — see `AsyncFlavor`. The chip
     // feature (`esp32c3`) comes from the same `ProjectDef` the base
@@ -237,12 +253,24 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
     // Pico with a `BufferedUart` in main.rs would ask for `static_cell`
     // against a manifest that never got the line. A Pico W hides it,
     // since the radio adds that crate for its own reasons.
-    let needs_async_usart = is_async && has_cfg("usart") || super::codegen::rp::needs_async_usart(m);
-    let new_toml = project_gen::ensure_async_deps(
+    //
+    // An LPUART is the same `BufferedUart` - and an LPUART-only project used
+    // to get neither crate.
+    let needs_async_usart = is_async && (has_cfg("usart") || has_cfg("lpuart"))
+        || super::codegen::rp::needs_async_usart(m);
+    // SAI and I2S keep their DMA ring buffer in a `StaticCell` too.
+    let stm32_ring_buffer =
+        is_async && m.family.starts_with("stm32") && (has_cfg("sai") || has_cfg("i2s"));
+    // `static_cell` for the async USART AND the SAI/I2S ring buffers: one
+    // need for both of the crate's managers (`ensure_task_priority_deps`
+    // below), or the first would strip the line the second puts back, moving
+    // it on every sync.
+    let new_toml = project_gen::ensure_async_deps_with(
         &new_toml,
         is_async,
         async_flavor,
         needs_async_usart,
+        needs_async_usart || stm32_ring_buffer,
         needs_eh_total,
         needs_eh_async,
         &sources,
@@ -268,6 +296,7 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
     let new_toml = project_gen::ensure_task_priority_deps(
         &new_toml,
         needs_async_usart
+            || stm32_ring_buffer
             || inp.main_rs.contains("InterruptExecutor")
             || super::codegen::nrf::needs_static_cell(m),
         &sources,
@@ -458,6 +487,66 @@ mod tests {
             }
         }
         assert!(checked > 10, "only {checked} chip/runtime pairs checked");
+    }
+
+    /// embassy-stm32 on Blocking speaks the standard traits itself: a UART
+    /// file wants `embedded-io`, a SPI or I2C file embedded-hal 1.0, and
+    /// nothing wants the F1 bridges' `embedded-hal-0-2` or `nb` - which a USART
+    /// module used to add here before any driver was generated - nor
+    /// `usb-device`, which has no template on embassy.
+    #[test]
+    fn embassy_blocking_gets_the_trait_crates_its_files_name() {
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+        let mut def = crate::panels::mcu_module::builtins::builtin_for("stm32f103c8t6")
+            .expect("built-in F103");
+        def.id = "stm32f411re".into();
+        def.display_name = "STM32F411RETx".into();
+        def.family = "stm32f4".into();
+        def.project.pkg_name = "stm32f411re".into();
+        def.project.target = "thumbv7em-none-eabihf".into();
+        def.project.probe_chip = "STM32F411RETx".into();
+        def.project.hal_dep =
+            crate::panels::mcu_module::stm32_pin_data::hal_dep_for_name("stm32f4", "STM32F411RETx");
+        def.clock = crate::panels::mcu_module::mcu_def::ClockDef::None;
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+        for (name, f) in [
+            ("PA9", PinFunction::UsartTx(1)),
+            ("PA10", PinFunction::UsartRx(1)),
+            ("PA5", PinFunction::SpiSck(1)),
+            ("PA7", PinFunction::SpiMosi(1)),
+            ("PA6", PinFunction::SpiMiso(1)),
+            ("PA11", PinFunction::UsbDm),
+            ("PA12", PinFunction::UsbDp),
+        ] {
+            let n = mcu
+                .iter_all_pins()
+                .find(|p| p.name == name)
+                .map(|p| p.number)
+                .unwrap_or_else(|| panic!("no {name}"));
+            mcu.apply_pin_function(n, f);
+        }
+        let files = project_files(&def, &mcu, &mcu.fresh_main_rs());
+        let toml = &files.cargo_toml;
+        let dep = |name: &str| {
+            toml.lines().any(|l| {
+                l.trim_start()
+                    .strip_prefix(name)
+                    .is_some_and(|r| r.trim_start().starts_with('='))
+            })
+        };
+        assert!(dep("embedded-io"), "the UART's crate:\n{toml}");
+        assert!(dep("embedded-hal"), "the SPI's crate:\n{toml}");
+        for gone in ["embedded-hal-0-2", "nb", "usb-device", "usbd-serial"] {
+            assert!(!dep(gone), "{gone}:\n{toml}");
+        }
+        let mut again = files.clone();
+        sync_files(&mut again, &def, &mcu);
+        assert!(
+            Manifests::of(&files) == Manifests::of(&again),
+            "a second sync moved it"
+        );
     }
 
     /// A board whose generated code speaks its HAL directly gets none of the

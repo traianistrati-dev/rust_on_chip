@@ -3705,3 +3705,154 @@ mod comp_blocking_tests {
         }
     }
 }
+
+/// A USART shape only the F1's Async runtime builds, seen from the runtimes
+/// that do not: stm32f1xx-hal builds the pair, and says what it keeps.
+#[cfg(test)]
+mod f1_usart_runtime_tests {
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::modules::{ModuleConfig, UsartDirection, UsartFlow, UsartMode};
+    use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+
+    /// The built-in F103 with USART1 on PA9/PA10, its module set to TX only
+    /// with CTS on DMA, on `runtime`.
+    fn f103(runtime: Runtime) -> Mcu {
+        let mut mcu = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        mcu.runtime = runtime;
+        mcu.pending_runtime = runtime;
+        for (name, f) in [
+            ("PA9", PinFunction::UsartTx(1)),
+            ("PA10", PinFunction::UsartRx(1)),
+        ] {
+            let n = mcu
+                .iter_all_pins()
+                .find(|p| p.name == name)
+                .map(|p| p.number)
+                .expect(name);
+            mcu.apply_pin_function(n, f);
+        }
+        mcu.reconcile_modules();
+        for m in &mut mcu.modules {
+            if let ModuleConfig::Usart(c) = &mut m.config {
+                c.mode = UsartMode::Dma;
+                c.direction = UsartDirection::TxOnly;
+                c.flow = UsartFlow::Cts;
+            }
+        }
+        mcu
+    }
+
+    /// Blocking builds the pair from both pads, and main.rs names the choice
+    /// it keeps for Async; the module still holds it.
+    #[test]
+    fn stm32f1xx_hal_names_the_shape_it_keeps_for_async() {
+        let mcu = f103(Runtime::Blocking);
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains("// USART1: Transmit only + CTS only is the Async runtime's choice"),
+            "{main}"
+        );
+        assert!(
+            main.contains("pins::configs::usart1::init(dp.USART1"),
+            "{main}"
+        );
+        // The pair, on Async, is not named at all.
+        let mut pair = f103(Runtime::Blocking);
+        for m in &mut pair.modules {
+            if let ModuleConfig::Usart(c) = &mut m.config {
+                c.direction = UsartDirection::TxRx;
+                c.flow = UsartFlow::None;
+            }
+        }
+        assert!(!pair.fresh_main_rs().contains("Async runtime's choice"));
+    }
+
+    /// The Apply list of a switch off Async says it before main.rs does.
+    #[test]
+    fn leaving_async_lists_the_shape_stm32f1xx_hal_does_not_build() {
+        let mut mcu = f103(Runtime::Async);
+        mcu.pending_runtime = Runtime::Blocking;
+        let list = mcu.apply_change_list();
+        assert!(
+            list.iter().any(|l| l.starts_with("! ")
+                && l.contains("Transmit only + CTS only is not built on stm32f1xx-hal")),
+            "{list:#?}"
+        );
+        assert!(
+            list.iter()
+                .any(|l| l.contains("is built there as the TX+RX pair")),
+            "{list:#?}"
+        );
+        // ...and the way back says nothing of it: Async builds it.
+        let mut back = f103(Runtime::Blocking);
+        back.pending_runtime = Runtime::Async;
+        assert!(
+            !back
+                .apply_change_list()
+                .iter()
+                .any(|l| l.contains("not built on stm32f1xx-hal"))
+        );
+        // With the pad the one-way shape does not need left off, the HAL
+        // builds nothing at all, and the list says that instead.
+        let mut one_pad = f103(Runtime::Async);
+        let pa10 = one_pad
+            .iter_all_pins()
+            .find(|p| p.name == "PA10")
+            .map(|p| p.number)
+            .expect("PA10");
+        if let Some(p) = one_pad.find_pin_mut(pa10) {
+            p.selected_function = PinFunction::GpioOutput;
+        }
+        one_pad.reconcile_modules();
+        one_pad.pending_runtime = Runtime::Blocking;
+        let list = one_pad.apply_change_list();
+        assert!(
+            list.iter()
+                .any(|l| l.contains("is not initialised there: its RX pad is not wired")),
+            "{list:#?}"
+        );
+    }
+
+    /// The Board tab draws what the firmware builds: on stm32f1xx-hal the
+    /// pair, whatever shape the module keeps for Async.
+    #[test]
+    fn the_board_draws_the_pair_stm32f1xx_hal_builds() {
+        use crate::panels::board::snapshot::ChipView;
+        let usart = |view: &ChipView| {
+            view.modules
+                .iter()
+                .find_map(|m| match &m.config {
+                    ModuleConfig::Usart(c) => Some((c.direction, c.flow)),
+                    _ => None,
+                })
+                .expect("the USART")
+        };
+        let blocking = ChipView::from_mcu("f103", "STM32F103C8", &f103(Runtime::Blocking));
+        assert_eq!(usart(&blocking), (UsartDirection::TxRx, UsartFlow::None));
+        let on_async = ChipView::from_mcu("f103", "STM32F103C8", &f103(Runtime::Async));
+        assert_eq!(usart(&on_async), (UsartDirection::TxOnly, UsartFlow::Cts));
+    }
+
+    /// On Async the same module is built as it says: one channel, one pad and
+    /// its CTS.
+    #[test]
+    fn the_async_runtime_builds_it() {
+        let mut mcu = f103(Runtime::Async);
+        let pa11 = mcu
+            .iter_all_pins()
+            .find(|p| p.name == "PA11")
+            .map(|p| p.number)
+            .expect("PA11");
+        mcu.apply_pin_function(pa11, PinFunction::UsartCts(1));
+        mcu.reconcile_modules();
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains("pins::configs::usart1::init(p.USART1, pa9_usart1_tx, pa11_usart1_cts, p.DMA1_CH4, Irqs);"),
+            "{main}"
+        );
+        assert!(!main.contains("Async runtime's choice"), "{main}");
+    }
+}

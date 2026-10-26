@@ -56,6 +56,57 @@ pub(super) fn with_afio_remap(body: &str) -> String {
         .replace("pub fn init<'d>(", "pub fn init<'d, A>(")
 }
 
+/// The AFIO remap values USART{n}'s pad `pad` is listed under on an STM32F1 -
+/// the `USARTn_REMAP` field values of RM0008 9.3.8, as stm32-metapac's `afio`
+/// lists carry them for every F1 part - or `None` for a pad of a USART that
+/// does not remap (UART4/5) or that this table has no row for.
+///
+/// Every USART pad belongs to its own remap set but four: USART1's CTS/RTS/CK
+/// (PA11/PA12/PA8) and USART3's CTS/RTS (PB13/PB14) stay put in two sets. So
+/// a TX or RX pad decides the set, and embassy's remap parameter `A` is
+/// inferred from it.
+pub(super) fn f1_usart_remaps(n: u8, pad: &str) -> Option<&'static [u8]> {
+    Some(match (n, pad) {
+        (1, "PA9" | "PA10") => &[0],
+        (1, "PB6" | "PB7") => &[1],
+        (1, "PA8" | "PA11" | "PA12") => &[0, 1],
+        (2, "PA0" | "PA1" | "PA2" | "PA3" | "PA4") => &[0],
+        (2, "PD3" | "PD4" | "PD5" | "PD6" | "PD7") => &[1],
+        (3, "PB10" | "PB11" | "PB12") => &[0],
+        (3, "PC10" | "PC11" | "PC12") => &[1],
+        (3, "PB13" | "PB14") => &[0, 1],
+        (3, "PD8" | "PD9" | "PD10" | "PD11" | "PD12") => &[3],
+        _ => return None,
+    })
+}
+
+/// The pads of `pads` (GPIO names) from two different remap sets of
+/// USART{n}, as `(pad, pad)`, or `None` when one set holds them all. A USART's
+/// pads move together on the F1, so a pair from two sets has no `A` that both
+/// implement (E0277) - and wiring a CTS pad by hand on a 100-pin part can pick
+/// the other set's.
+pub(super) fn f1_usart_remap_clash<'p>(n: u8, pads: &[&'p str]) -> Option<(&'p str, &'p str)> {
+    let mut common: Vec<u8> = vec![0, 1, 2, 3];
+    let mut seen: Vec<(&'p str, &'static [u8])> = Vec::new();
+    for &pad in pads {
+        let Some(sets) = f1_usart_remaps(n, pad) else {
+            continue;
+        };
+        common.retain(|v| sets.contains(v));
+        if common.is_empty() {
+            // Name the earlier pad that shares no set with this one.
+            let other = seen
+                .iter()
+                .find(|(_, s)| !s.iter().any(|v| sets.contains(v)))
+                .or(seen.first())
+                .map_or(pad, |(p, _)| *p);
+            return Some((other, pad));
+        }
+        seen.push((pad, sets));
+    }
+    None
+}
+
 /// embassy's AFIO remap type for one of stm32f1xx-hal's timer remap
 /// type-states - the rows [`super::super::stm32::pwm_remap`] picks from. The numbers
 /// are the TIMx_REMAP field values: TIM1 has no partial row here because its

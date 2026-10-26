@@ -579,9 +579,28 @@ pub fn peripherals(
             let flow = cfg.map(|c| c.flow).unwrap_or_default();
             // The direction decides which pins are REQUIRED — a TX-only UART is
             // complete without an RX pad. A half the direction needs but the
-            // canvas has not wired yet is simply not ready to generate.
+            // canvas has not wired yet is not ready to generate, and main.rs
+            // says so where the init would be, as the F1's stm32f1xx-hal does.
             let (tx, rx) = (w.tx.as_deref(), w.rx.as_deref());
-            if (dir.needs_tx() && tx.is_none()) || (dir.needs_rx() && rx.is_none()) {
+            let missing = match (
+                dir.needs_tx() && tx.is_none(),
+                dir.needs_rx() && rx.is_none(),
+            ) {
+                (true, true) => Some(("TX and RX pads are", "them")),
+                (true, false) => Some(("TX pad is", "it")),
+                (false, true) => Some(("RX pad is", "it")),
+                (false, false) => None,
+            };
+            if let Some((missing, it)) = missing {
+                calls.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!(
+                        "{peri}{n} is NOT initialised: its {missing} not wired, and its direction \
+                         ({}) needs {it}. Assign {it} on the canvas, or pick another direction \
+                         on its module.",
+                        dir.label()
+                    ),
+                    "    ",
+                ));
                 continue;
             }
             // The buffered transport has no half: embassy builds only
@@ -633,6 +652,73 @@ pub fn peripherals(
                 (false, false) => flow,
                 _ => UsartFlow::None,
             };
+            // On Async too, only the flow forms a constructor takes: the
+            // transport's for this direction, as the panel offers them (the
+            // F1's usart_v1 list included). A stale pick - a transport or
+            // direction changed on a runtime that was only staged - keeps its
+            // wired pads bound raw rather than making them `init` parameters
+            // nothing reads, and says so.
+            let transport = cfg.map(|c| c.mode).unwrap_or_default();
+            let flow = if blocking
+                || UsartFlow::options_for(transport, dir, family, true).contains(&flow)
+            {
+                flow
+            } else {
+                let why = if family == "stm32f1"
+                    && transport == UsartMode::Buffered
+                    && flow == UsartFlow::Rts
+                {
+                    "embassy's buffered RTS-only form configures the pad as an input, which \
+                     on the F1 (gpio_v1) the USART never drives. Pick CTS/RTS, or a DMA \
+                     receive-only UART, the one form that takes RTS on its own here"
+                        .to_owned()
+                } else {
+                    format!(
+                        "embassy has no constructor that takes it with this direction ({}) on \
+                         the {} transport",
+                        dir.label(),
+                        match transport {
+                            UsartMode::Buffered => "buffered",
+                            UsartMode::Dma => "DMA",
+                        }
+                    )
+                };
+                calls.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!(
+                        "{peri}{n}'s flow control ({}) is left off: {why}. Its pads stay bound \
+                         raw above.",
+                        flow.label()
+                    ),
+                    "    ",
+                ));
+                UsartFlow::None
+            };
+            // The F1 moves a USART's pads as a group (AFIO): pads from two
+            // remap sets have no remap parameter in common, which is E0277 in
+            // `init`. Said here rather than left to the compiler - a CTS pad
+            // wired by hand on a 100-pin part can land in the other set.
+            if family == "stm32f1" && peri == "USART" {
+                let used: Vec<&str> = [
+                    rx.filter(|_| dir.needs_rx()),
+                    tx.filter(|_| dir.needs_tx()),
+                    w.rts.as_deref().filter(|_| flow.needs_rts()),
+                    w.cts.as_deref().filter(|_| flow.needs_cts()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if let Some((a, b)) = f1_usart_remap_clash(n, &used) {
+                    calls.push_str(&crate::panels::mcu_module::errata::comment(
+                        &format!(
+                            "{peri}{n} is NOT initialised: {a} and {b} are in different AFIO \
+                             remap sets, and the F1 moves a USART's pads as a group. Wire them \
+                             all from one set."
+                        ),
+                        "    ",
+                    ));
+                    continue;
+                }
+            }
             let mut cfg_owned;
             let cfg = match cfg {
                 Some(c) if c.flow != flow => {
@@ -699,7 +785,9 @@ pub fn peripherals(
                 );
                 calls.push_str(&note);
                 // Full duplex hands back a PAIR (the halves have different
-                // types); one-way hands back the single half.
+                // types); one-way hands back the single half. Half duplex
+                // returns the pair too, bound whole as `{handle}` - the name it
+                // always had, which the user's code below may hold.
                 let bind = if dir == UsartDirection::TxRx {
                     format!("let (mut {handle}_tx, mut {handle}_rx)")
                 } else {
@@ -1526,7 +1614,7 @@ pub fn peripherals(
             chip.irq_vectors,
             &comp_binds,
             &extra_binds,
-            calls.contains("DMA_TX_TODO"),
+            has_dma_todo(&calls),
         )
     } else {
         String::new()
@@ -2606,5 +2694,367 @@ mod blocking_tests {
         let out = run_comps(PeriphMode::Blocking, &[1, 2], &[1, 2].into());
         assert!(out.dma_irqs.is_empty(), "{}", out.dma_irqs);
         assert!(!out.init_calls.contains("hand `"), "{}", out.init_calls);
+    }
+}
+
+/// The F1's USART on Async: embassy on a usart_v1, every shape it builds
+/// there, with the AFIO remap on every pad and the forms it cannot build said
+/// in main.rs.
+#[cfg(test)]
+mod f1_async_usart_tests {
+    use super::*;
+    use crate::panels::mcu_module::pins::logic::pin::Pin;
+
+    fn mk(name: &str, f: PinFunction) -> Pin {
+        let mut p = Pin::new(1, name);
+        p.available_functions = vec![f.clone()];
+        p.selected_function = f;
+        p
+    }
+
+    /// USART1 on its default pads, CTS and RTS included.
+    fn usart1_pads() -> Vec<Pin> {
+        vec![
+            mk("PA9", PinFunction::UsartTx(1)),
+            mk("PA10", PinFunction::UsartRx(1)),
+            mk("PA11", PinFunction::UsartCts(1)),
+            mk("PA12", PinFunction::UsartRts(1)),
+        ]
+    }
+
+    /// The F1 on Async, its built-in DMA table, `cfg` for USART`n`.
+    fn run(pins: &[Pin], n: u8, cfg: UsartModuleConfig) -> AsyncPeriphs {
+        let refs: Vec<&Pin> = pins.iter().collect();
+        let usart: BTreeMap<u8, UsartModuleConfig> = [(n, cfg)].into();
+        async_peripherals(
+            "stm32f1",
+            ChipData {
+                dma: None,
+                irq_vectors: &[],
+                usart_ip: None,
+                sdmmc_ip: None,
+            },
+            CompInputs {
+                settings: &Default::default(),
+                instances: &[],
+                pins: &[],
+                raw: &Default::default(),
+            },
+            &refs,
+            &usart,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    fn cfg(mode: UsartMode, direction: UsartDirection, flow: UsartFlow) -> UsartModuleConfig {
+        UsartModuleConfig {
+            mode,
+            direction,
+            flow,
+            ..UsartModuleConfig::new(1)
+        }
+    }
+
+    fn file<'a>(out: &'a AsyncPeriphs, name: &str) -> &'a str {
+        out.config_files
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.as_str())
+            .unwrap_or_else(|| panic!("no {name}: {:?}", out.config_files))
+    }
+
+    /// The one-way halves with their flow pad, on one DMA channel each, every
+    /// pad bound with the remap parameter - and the pad the half does not use
+    /// left to its binding.
+    #[test]
+    fn the_one_way_halves_build_with_the_remap() {
+        let out = run(
+            &usart1_pads(),
+            1,
+            cfg(UsartMode::Dma, UsartDirection::TxOnly, UsartFlow::Cts),
+        );
+        assert!(
+            out.init_calls.contains(
+                "let mut _serial1 = pins::configs::usart1::init(p.USART1, pa9_usart1_tx, pa11_usart1_cts, p.DMA1_CH4, Irqs);"
+            ),
+            "{}",
+            out.init_calls
+        );
+        let f = file(&out, "usart1.rs");
+        for want in [
+            "pub fn init<'d, A, TxD: TxDma<peripherals::USART1>>(",
+            "tx: Peri<'d, impl TxPin<peripherals::USART1, A>>,",
+            "cts: Peri<'d, impl CtsPin<peripherals::USART1, A>>,",
+            "UartTx::new_with_cts(usart, tx, cts, tx_dma, irqs, get_config()).unwrap()",
+            "blocking_flush()",
+        ] {
+            assert!(f.contains(want), "{want}:\n{f}");
+        }
+        assert!(!out.consumed_pins.contains(&"PA10".to_owned()));
+
+        let out = run(
+            &usart1_pads(),
+            1,
+            cfg(UsartMode::Dma, UsartDirection::RxOnly, UsartFlow::Rts),
+        );
+        assert!(
+            out.init_calls.contains(
+                "pins::configs::usart1::init(p.USART1, pa10_usart1_rx, pa12_usart1_rts, p.DMA1_CH5, Irqs);"
+            ),
+            "{}",
+            out.init_calls
+        );
+        let f = file(&out, "usart1.rs");
+        assert!(
+            f.contains("UartRx::new_with_rts(usart, rx, rts, rx_dma, irqs, get_config())"),
+            "{f}"
+        );
+        assert!(f.contains("impl RtsPin<peripherals::USART1, A>"), "{f}");
+    }
+
+    /// Full duplex with CTS/RTS on both transports.
+    #[test]
+    fn cts_and_rts_build_on_both_transports() {
+        for (mode, ctor) in [
+            (
+                UsartMode::Dma,
+                "Uart::new_with_rtscts(usart, rx, tx, rts, cts, tx_dma, rx_dma, irqs, get_config())",
+            ),
+            (
+                UsartMode::Buffered,
+                "BufferedUart::new_with_rtscts(usart, rx, tx, rts, cts, irqs, tx_buf, rx_buf, get_config())",
+            ),
+        ] {
+            let out = run(
+                &usart1_pads(),
+                1,
+                cfg(mode, UsartDirection::TxRx, UsartFlow::CtsRts),
+            );
+            let f = file(&out, "usart1.rs");
+            assert!(f.contains(ctor), "{mode:?}:\n{f}");
+            assert!(f.contains("impl CtsPin<peripherals::USART1, A>"), "{f}");
+            for pad in ["PA9", "PA10", "PA11", "PA12"] {
+                assert!(out.consumed_pins.contains(&pad.to_owned()), "{pad}");
+            }
+        }
+    }
+
+    /// A single wire on the TX pad: the pair handed back on DMA and bound
+    /// whole, under the name it always had, its pad open-drain, the RX trait
+    /// not imported, and the flush the ring-buffered reader needs said where
+    /// the file shows how to use it.
+    #[test]
+    fn a_single_wire_on_tx_is_the_pair_on_an_open_drain_pad() {
+        let out = run(
+            &usart1_pads(),
+            1,
+            cfg(
+                UsartMode::Dma,
+                UsartDirection::HalfDuplexOnTx,
+                UsartFlow::None,
+            ),
+        );
+        assert!(
+            out.init_calls.contains(
+                "let mut _serial1 = pins::configs::usart1::init(p.USART1, pa9_usart1_tx, p.DMA1_CH4, p.DMA1_CH5, Irqs);"
+            ),
+            "{}",
+            out.init_calls
+        );
+        let f = file(&out, "usart1.rs");
+        for want in [
+            "Uart::new_half_duplex(usart, tx, tx_dma, rx_dma, irqs, get_config(), HalfDuplexReadback::NoReadback)",
+            "config.tx_config = embassy_stm32::usart::OutputConfig::OpenDrain;",
+            "`tx.flush().await` after writing, before reading",
+            "//     let (mut tx, mut rx) = _serial1;\n",
+            "//     _serial1.0.blocking_write(",
+        ] {
+            assert!(f.contains(want), "{want}:\n{f}");
+        }
+        let uses = f
+            .lines()
+            .find(|l| l.starts_with("use embassy_stm32::usart::{Config"))
+            .expect("the usart use line");
+        assert!(!uses.contains("RxPin") && uses.contains("TxPin"), "{uses}");
+
+        // Buffered, the same pad and the same open drain.
+        let out = run(
+            &usart1_pads(),
+            1,
+            cfg(
+                UsartMode::Buffered,
+                UsartDirection::HalfDuplexOnTx,
+                UsartFlow::None,
+            ),
+        );
+        let f = file(&out, "usart1.rs");
+        assert!(
+            f.contains("BufferedUart::new_half_duplex(usart, tx, irqs"),
+            "{f}"
+        );
+        assert!(f.contains("OutputConfig::OpenDrain"), "{f}");
+        assert!(!f.contains("RxPin"), "{f}");
+    }
+
+    /// What embassy cannot build on a usart_v1 / gpio_v1 is left off in
+    /// writing: RTS on its own on the buffered transport (its pad would be a
+    /// floating input), DE, and the single wire on the RX pad.
+    #[test]
+    fn what_a_usart_v1_cannot_build_is_said_not_emitted() {
+        let out = run(
+            &usart1_pads(),
+            1,
+            cfg(UsartMode::Buffered, UsartDirection::TxRx, UsartFlow::Rts),
+        );
+        let notes = out.init_calls.replace("\n    // ", " ");
+        assert!(
+            notes.contains("USART1's flow control (RTS only) is left off"),
+            "{}",
+            out.init_calls
+        );
+        assert!(notes.contains("(gpio_v1)"), "{notes}");
+        assert!(!out.consumed_pins.contains(&"PA12".to_owned()));
+        assert!(
+            file(&out, "usart1.rs").contains("BufferedUart::new(usart, rx, tx, tx_buf, rx_buf")
+        );
+
+        let out = run(
+            &usart1_pads(),
+            1,
+            cfg(UsartMode::Dma, UsartDirection::TxRx, UsartFlow::De),
+        );
+        assert!(
+            out.init_calls
+                .contains("USART1's driver enable is left off"),
+            "{}",
+            out.init_calls
+        );
+        let out = run(
+            &usart1_pads(),
+            1,
+            cfg(
+                UsartMode::Dma,
+                UsartDirection::HalfDuplexOnRx,
+                UsartFlow::None,
+            ),
+        );
+        assert!(
+            out.init_calls
+                .contains("USART1 is NOT initialised: half duplex on the RX pad"),
+            "{}",
+            out.init_calls
+        );
+    }
+
+    /// A direction whose pad is not wired builds nothing, and main.rs says so
+    /// - on any family, where it used to be skipped in silence.
+    #[test]
+    fn a_missing_pad_is_said_where_the_init_would_be() {
+        let pads = [mk("PA9", PinFunction::UsartTx(1))];
+        let out = run(
+            &pads,
+            1,
+            cfg(UsartMode::Buffered, UsartDirection::TxRx, UsartFlow::None),
+        );
+        let notes = out.init_calls.replace("\n    // ", " ");
+        assert!(
+            notes.contains(
+                "USART1 is NOT initialised: its RX pad is not wired, and its direction (Receive and transmit) needs it."
+            ),
+            "{notes}"
+        );
+        assert!(out.config_files.is_empty());
+        // TX only builds from the same pad.
+        let out = run(
+            &pads,
+            1,
+            cfg(UsartMode::Dma, UsartDirection::TxOnly, UsartFlow::None),
+        );
+        assert!(
+            out.init_calls.contains("usart1::init("),
+            "{}",
+            out.init_calls
+        );
+    }
+
+    /// Pads from two AFIO remap sets cannot share the remap parameter: the
+    /// F1 USART is refused in writing rather than left to E0277. CTS/RTS that
+    /// stay put in both sets go with either.
+    #[test]
+    fn pads_from_two_remap_sets_are_refused() {
+        let pads = [
+            mk("PA2", PinFunction::UsartTx(2)),
+            mk("PA3", PinFunction::UsartRx(2)),
+            mk("PD3", PinFunction::UsartCts(2)),
+            mk("PD4", PinFunction::UsartRts(2)),
+        ];
+        let usart2 = UsartModuleConfig {
+            instance: 2,
+            ..cfg(UsartMode::Dma, UsartDirection::TxRx, UsartFlow::CtsRts)
+        };
+        let out = run(&pads, 2, usart2.clone());
+        let notes = out.init_calls.replace("\n    // ", " ");
+        assert!(
+            notes.contains(
+                "USART2 is NOT initialised: PA3 and PD4 are in different AFIO remap sets"
+            ),
+            "{notes}"
+        );
+        assert!(out.config_files.is_empty());
+        // Without flow control the pair alone is one set.
+        let out = run(
+            &pads,
+            2,
+            UsartModuleConfig {
+                flow: UsartFlow::None,
+                ..usart2
+            },
+        );
+        assert!(
+            out.init_calls.contains("usart2::init("),
+            "{}",
+            out.init_calls
+        );
+
+        assert_eq!(
+            f1_usart_remap_clash(1, &["PB6", "PB7", "PA12", "PA11"]),
+            None
+        );
+        assert_eq!(
+            f1_usart_remap_clash(3, &["PC11", "PC10", "PB14", "PB13"]),
+            None
+        );
+        assert_eq!(
+            f1_usart_remap_clash(3, &["PB11", "PC10"]),
+            Some(("PB11", "PC10"))
+        );
+        assert_eq!(
+            f1_usart_remap_clash(3, &["PB13", "PD8"]),
+            Some(("PB13", "PD8"))
+        );
+        // UART4/5 do not remap.
+        assert_eq!(f1_usart_remap_clash(4, &["PC10", "PC11"]), None);
+    }
+
+    /// A one-way UART whose channel cannot be resolved gets the ONE
+    /// placeholder its `init` takes, and the head that asks for it.
+    #[test]
+    fn a_one_way_dma_todo_names_its_one_channel() {
+        assert_eq!(dma_todo((true, false)), "p.DMA_TX_TODO, Irqs");
+        assert_eq!(dma_todo((false, true)), "p.DMA_RX_TODO, Irqs");
+        assert_eq!(dma_todo((true, true)), DMA_TODO);
+        assert!(has_dma_todo("init(p.USART1, rx, p.DMA_RX_TODO, Irqs)"));
+        assert!(!has_dma_todo("init(p.USART1, rx, p.DMA1_CH5, Irqs)"));
     }
 }

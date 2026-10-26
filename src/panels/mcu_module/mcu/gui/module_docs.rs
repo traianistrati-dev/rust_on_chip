@@ -328,6 +328,7 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("TIMER_BREAK_INPUT", TIMER_BREAK_INPUT),
     ("TIMER_AUTO_OUTPUT_ENABLE", TIMER_AUTO_OUTPUT_ENABLE),
     ("SKIP_F1_SERIAL", SKIP_F1_SERIAL),
+    ("SKIP_F1_LINE", SKIP_F1_LINE),
     ("SKIP_USART_BUF_TX_ONLY", SKIP_USART_BUF_TX_ONLY),
     ("SKIP_USART_BUF_RP_DMA", SKIP_USART_BUF_RP_DMA),
     ("SKIP_I2C_TIMEOUT_RP", SKIP_I2C_TIMEOUT_RP),
@@ -1464,9 +1465,14 @@ pub const TIMER_AUTO_OUTPUT_ENABLE: &str = "What happens once the fault line rel
 // ── Reasons a row is NOT offered here ─────────────────────────────────────────
 
 pub const SKIP_F1_SERIAL: &str = "stm32f1xx-hal builds a Serial only from the TX+RX pair, so it \
-                                  has no flow control, no half duplex and no one-way UART - and \
-                                  the F1's USART has no swap or invert bits either. The rows are \
-                                  absent because the HAL has nothing to pass them to.";
+                                  has no flow control, no half duplex and no one-way UART. The \
+                                  row is absent because the HAL has nothing to pass it to. The \
+                                  Async runtime builds them on embassy-stm32, and a choice made \
+                                  there is kept for it: this runtime builds the pair.";
+
+pub const SKIP_F1_LINE: &str = "The F1's USART has no swap or invert bits, on any runtime: the \
+                                SWAP, TXINV and RXINV fields do not exist in its registers, so \
+                                there is nothing to set.";
 
 pub const SKIP_USART_BUF_TX_ONLY: &str = "A TX-only DMA link has no buffer at all: the \
                                           controller sends straight from the slice you hand it, \

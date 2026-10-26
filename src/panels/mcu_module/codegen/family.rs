@@ -1520,7 +1520,7 @@ const STM32_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "USART:",
-            "BufferedUart on an interrupt ring (no DMA channel), or UartTx + RingBufferedUartRx on two DMA channels; the module's Async transport row chooses. Both expose embedded-io-async.",
+            "BufferedUart on an interrupt ring (no DMA channel), or UartTx + RingBufferedUartRx on two DMA channels; the module's Async transport row chooses. Both expose embedded-io-async. A one-way UART is a DMA one on one channel; a single wire (half duplex) gets its pad open-drain, for a line with a pull-up. A usart_v1/v2 chip (the F1 among them) has no driver enable and no single wire on the RX pad, and on the F1 RTS on its own comes only with a DMA receive-only UART.",
         ),
         (
             "SPI / I2C:",
@@ -1536,7 +1536,7 @@ const STM32_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "vs Blocking:",
-            "embassy-time takes one of the chip's timers (TIM4 on an F103C8), and a PWM wired to it is not generated: main.rs says so and its pads stay bound raw. Blocking runs no embassy-time and drives PWM on every timer. On every STM32 but the F1, SDMMC, SAI and I2S, which embassy drives only asynchronously, are the other way round: Blocking leaves their pads raw with a NOT initialised comment in main.rs. COMP is built on both, but only here can its wait_for_* edges be awaited.",
+            "embassy-time takes one of the chip's timers (TIM4 on an F103C8), and a PWM wired to it is not generated: main.rs says so and its pads stay bound raw. Blocking runs no embassy-time and drives PWM on every timer. On every STM32 but the F1, SDMMC, SAI and I2S, which embassy drives only asynchronously, are the other way round: Blocking leaves their pads raw with a NOT initialised comment in main.rs. COMP is built on both, but only here can its wait_for_* edges be awaited. On the F1, a one-way, single-wire or CTS/RTS USART is built on this runtime only: stm32f1xx-hal builds the TX+RX pair.",
         ),
         (
             "Applies to:",
@@ -1711,7 +1711,7 @@ const BLOCKING_F1_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "Drivers:",
-            "Each USART/SPI/I2C initializes in src/pins/configs/*.rs and is exposed through STANDARD portable traits — embedded-io (serial) + embedded-hal 1.0 (SpiBus / I2c / OutputPin). App code generic over those traits ports across chips/HALs unchanged.",
+            "Each USART/SPI/I2C initializes in src/pins/configs/*.rs and is exposed through STANDARD portable traits — embedded-io (serial) + embedded-hal 1.0 (SpiBus / I2c / OutputPin). App code generic over those traits ports across chips/HALs unchanged. A USART (USART1-3) is always the TX+RX pair: a one-way, single-wire or CTS/RTS module set on the Async runtime is kept for it, built here as the pair (or not at all with a pad missing), and main.rs names it.",
         ),
         (
             "Virtual modules:",
@@ -5425,7 +5425,7 @@ mod tests {
             "I2C call"
         );
         assert!(
-            !code.contains("DMA_TX_TODO"),
+            !code.contains("DMA_TX_TODO") && !code.contains("DMA_RX_TODO"),
             "blocking calls carry no DMA TODO"
         );
         let cfgs = mcu.config_files();
@@ -5471,7 +5471,7 @@ mod tests {
 {code}"
         );
         assert!(
-            !code.contains("DMA_TX_TODO"),
+            !code.contains("DMA_TX_TODO") && !code.contains("DMA_RX_TODO"),
             "no TODO left on F4:
 {code}"
         );
@@ -6919,19 +6919,25 @@ mod tests {
     #[test]
     fn usart_modes_are_offered_only_where_they_can_be_built() {
         use crate::panels::mcu_module::modules::{UsartDirection, UsartFlow, UsartMode};
-        // The F1 has one shape: `serial::Pins` is implemented for the (TX, RX)
-        // PAIR alone, and the HAL has no flow control at all.
+        // The F1 on stm32f1xx-hal has one shape: `serial::Pins` is implemented
+        // for the (TX, RX) PAIR alone, and the HAL has no flow control at all.
         assert_eq!(
-            UsartDirection::options_for(UsartMode::Buffered, "stm32f1"),
+            UsartDirection::options_for(UsartMode::Buffered, "stm32f1", false),
             &[UsartDirection::TxRx]
         );
         assert_eq!(
-            UsartFlow::options_for(UsartMode::Buffered, UsartDirection::TxRx, "stm32f1"),
+            UsartFlow::options_for(UsartMode::Buffered, UsartDirection::TxRx, "stm32f1", false),
             &[UsartFlow::None]
         );
+        // On Async it is embassy on a usart_v1: one-way and the TX-pad single
+        // wire, never the RX-pad one.
+        let f1 = UsartDirection::options_for(UsartMode::Dma, "stm32f1", true);
+        assert!(f1.contains(&UsartDirection::TxOnly), "{f1:?}");
+        assert!(f1.contains(&UsartDirection::HalfDuplexOnTx), "{f1:?}");
+        assert!(!f1.contains(&UsartDirection::HalfDuplexOnRx), "{f1:?}");
 
         // The ESP has both single directions and RTS/CTS — but no single wire.
-        let esp = UsartDirection::options_for(UsartMode::Buffered, "esp32c6");
+        let esp = UsartDirection::options_for(UsartMode::Buffered, "esp32c6", false);
         assert!(esp.contains(&UsartDirection::TxOnly));
         assert!(esp.contains(&UsartDirection::RxOnly));
         assert!(
@@ -6939,17 +6945,17 @@ mod tests {
             "no single wire: {esp:?}"
         );
         assert!(
-            UsartFlow::options_for(UsartMode::Buffered, UsartDirection::TxRx, "esp32c6")
+            UsartFlow::options_for(UsartMode::Buffered, UsartDirection::TxRx, "esp32c6", false)
                 .contains(&UsartFlow::CtsRts)
         );
         // …and never the RS485 driver-enable, which esp-hal does not expose.
         assert!(
-            !UsartFlow::options_for(UsartMode::Buffered, UsartDirection::TxRx, "esp32c6")
+            !UsartFlow::options_for(UsartMode::Buffered, UsartDirection::TxRx, "esp32c6", false)
                 .contains(&UsartFlow::De)
         );
 
         // embassy keeps every shape it always had.
-        let emb = UsartDirection::options_for(UsartMode::Dma, "stm32f4");
+        let emb = UsartDirection::options_for(UsartMode::Dma, "stm32f4", true);
         assert!(emb.iter().any(|d| d.is_half_duplex()), "{emb:?}");
     }
 

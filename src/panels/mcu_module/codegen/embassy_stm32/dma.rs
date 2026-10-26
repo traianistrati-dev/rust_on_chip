@@ -14,8 +14,25 @@ pub(super) fn is_dma(mode: AsyncBusMode) -> bool {
 ///
 /// `Irqs` is the LAST argument: embassy 0.6 makes the caller bind the DMA
 /// channels' interrupts, and only this file knows which channels those are (see
-/// `dma_irqs_block`).
+/// `dma_irqs_block`). A one-way UART's `init` takes ONE channel, so it gets
+/// that half of the placeholder alone (`dma_todo`).
 pub(super) const DMA_TODO: &str = "p.DMA_TX_TODO, p.DMA_RX_TODO, Irqs";
+
+/// [`DMA_TODO`] for the halves `wants` names: the arguments the `init` has, so
+/// filling in the placeholders gives a call that compiles.
+pub(super) fn dma_todo(wants: (bool, bool)) -> String {
+    match wants {
+        (true, false) => "p.DMA_TX_TODO, Irqs".to_owned(),
+        (false, true) => "p.DMA_RX_TODO, Irqs".to_owned(),
+        _ => DMA_TODO.to_owned(),
+    }
+}
+
+/// Whether some `init` in `calls` was left with a channel placeholder - either
+/// half of one.
+pub(super) fn has_dma_todo(calls: &str) -> bool {
+    calls.contains("DMA_TX_TODO") || calls.contains("DMA_RX_TODO")
+}
 
 /// The DMA arguments for one peripheral: real channels when the family has a
 /// table (see [`dma_map`]), the `TODO` placeholder otherwise.
@@ -83,7 +100,7 @@ pub(super) fn dma_args(
             ));
             note.push_str("    //   and bind their interrupts in the `Irqs` block above.\n");
         }
-        return (DMA_TODO.to_owned(), note);
+        return (dma_todo(wants), note);
     };
     // Kept as a PAIR, not a finished line: two channels can share one
     // interrupt (STM32G0's `DMA1_Channel2_3`), and `bind_interrupts!` wants

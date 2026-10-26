@@ -643,6 +643,15 @@ pub(super) fn gen_parts(
             continue;
         }
         header!();
+        // A direction or flow control chosen on the Async runtime, where
+        // embassy-stm32 builds it: kept in the module for that runtime, and
+        // named here, since this HAL builds the pair whatever it says.
+        if let Some(stored) = usart.get(&n).and_then(|c| c.beyond_the_pair()) {
+            fn_calls.push_str(&format!(
+                "    // USART{n}: {stored} is the Async runtime's choice - stm32f1xx-hal builds\n    \
+                 // the TX+RX pair and nothing else, and the module keeps it for Async.\n"
+            ));
+        }
         // Unlike SPI, this HAL has NO placeholder for a missing serial pad:
         // `serial::Pins<USART>` is implemented for the (TX alternate, RX input)
         // PAIR and for nothing else, so a one-way UART cannot be built at all.

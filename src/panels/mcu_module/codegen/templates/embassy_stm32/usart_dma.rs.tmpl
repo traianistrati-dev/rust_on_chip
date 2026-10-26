@@ -75,7 +75,7 @@ pub fn init<'d, TxD: TxDma<peripherals::{PERI}>, RxD: RxDma<peripherals::{PERI}>
 //
 //     use embedded_io_async::{Read, Write};
 //
-//     let (mut tx, mut rx) = ({HANDLE}_tx, {HANDLE}_rx);
+//     let (mut tx, mut rx) = {PAIR};
 //     tx.write_all(b"hello\r\n").await.ok();
 //
 //     let mut buf = [0u8; 32];
@@ -87,9 +87,10 @@ pub fn init<'d, TxD: TxDma<peripherals::{PERI}>, RxD: RxDma<peripherals::{PERI}>
 // interrupt, and it yields to the executor, so a handful of bytes can leave
 // sooner this way.
 //
-//     {HANDLE}_tx.blocking_write(b"hi\r\n").ok();
+//     {TX_HALF}.blocking_write(b"hi\r\n").ok();
 //
 // It does NOT free the channel: embassy takes both when it builds a
 // bidirectional UART, and this handle keeps its TX one either way. To spend one
 // channel instead of two, set the module's Data Direction to RX only (or TX
 // only) — that builds half a UART, and half a UART takes half the channels.
+{HALF_DUPLEX_USAGE}

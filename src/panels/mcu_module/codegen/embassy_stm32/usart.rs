@@ -482,8 +482,66 @@ pub fn serial_config_file(
         (UsartMode::Buffered, _) => ASYNC_USART_TMPL,
     };
     let shape = serial_shape(&format!("{peri}{n}"), cfg);
-    render_serial(template, &shape, peri, n, cfg, irq, line_extras)
+    let body = render_serial(template, &shape, peri, n, cfg, irq, line_extras);
+    // The two-way templates import both data-pad traits, and half duplex takes
+    // one pad: the other would be an `unused_imports` warning in the user's
+    // project. Only here, so a full-duplex file stays as it always was.
+    match direction {
+        UsartDirection::HalfDuplexOnTx => without_usart_use(&body, "RxPin"),
+        UsartDirection::HalfDuplexOnRx => without_usart_use(&body, "TxPin"),
+        _ => body,
+    }
 }
+
+/// `body` with `item` taken out of its `use embassy_stm32::usart::{..}` list,
+/// the list then written on one line. Unchanged when the list or the item is
+/// not there.
+fn without_usart_use(body: &str, item: &str) -> String {
+    const HEAD: &str = "use embassy_stm32::usart::{";
+    let Some(at) = body.find(HEAD) else {
+        return body.to_owned();
+    };
+    let start = at + HEAD.len();
+    let Some(len) = body[start..].find("};") else {
+        return body.to_owned();
+    };
+    let items: Vec<&str> = body[start..start + len]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&item) {
+        return body.to_owned();
+    }
+    let kept: Vec<&str> = items.into_iter().filter(|s| *s != item).collect();
+    format!(
+        "{}{HEAD}{}}};{}",
+        &body[..at],
+        kept.join(", "),
+        &body[start + len + 2..]
+    )
+}
+
+/// The `get_config` lines a single-wire UART needs: its pad open-drain. The
+/// USART releases the line between frames - ST's manuals ask for the TX pad
+/// as an open-drain alternate function with a pull-up on the line - and
+/// embassy leaves `tx_config` at its push-pull default, which would drive
+/// against every other talker. Plain `OpenDrain`: the F1's gpio_v1 has no
+/// `OpenDrainPullUp`, and a bus wants an external pull-up anyway.
+const HALF_DUPLEX_OPEN_DRAIN: &str =
+    "    // Single wire: the pad is released between frames, so it is open-drain, and
+    // the line needs a pull-up (an external one: a bus has other talkers).
+    config.tx_config = embassy_stm32::usart::OutputConfig::OpenDrain;
+";
+
+/// The DMA template's closing note on a single wire: the ring-buffered
+/// receiver turns the transmitter off without waiting for it.
+const HALF_DUPLEX_DMA_USAGE: &str = "//
+// ── Single wire ──
+// One pad carries both directions, and a read turns the transmitter off
+// without waiting for it: `tx.flush().await` after writing, before reading, or
+// the last byte is cut off the wire.
+";
 
 /// `configs/usart{n}.rs` on the Blocking runtime: a polled UART, whatever the
 /// module's transport says - the buffer and the DMA are the Async runtime's.
@@ -549,10 +607,32 @@ fn render_serial(
         .filter(|s| !s.is_empty())
         .map(|s| format!("_{s}"))
         .unwrap_or_default();
-    let (extra_consts, extra_config) = serial_line_extras(cfg, line_extras);
+    let (extra_consts, mut extra_config) = serial_line_extras(cfg, line_extras);
+    let half_duplex = cfg.is_some_and(|c| c.direction.is_half_duplex());
+    if half_duplex {
+        extra_config.push_str(HALF_DUPLEX_OPEN_DRAIN);
+    }
+    // main.rs binds a full-duplex DMA pair as `{HANDLE}_tx, {HANDLE}_rx`, and
+    // a half-duplex one - the same pair - whole, as `{HANDLE}`, the name it
+    // has always had there. Filled first: both name the handle.
+    let (pair, tx_half) = if half_duplex {
+        ("{HANDLE}", "{HANDLE}.0")
+    } else {
+        ("({HANDLE}_tx, {HANDLE}_rx)", "{HANDLE}_tx")
+    };
     tmpl::render(
         template,
         &[
+            ("{PAIR}", pair),
+            ("{TX_HALF}", tx_half),
+            (
+                "{HALF_DUPLEX_USAGE}",
+                if half_duplex {
+                    HALF_DUPLEX_DMA_USAGE
+                } else {
+                    ""
+                },
+            ),
             ("{EXTRA_CONSTS}", &extra_consts),
             ("{EXTRA_CONFIG}", &extra_config),
             ("{FLOW_USE}", shape.uses.trim_end()),
@@ -879,7 +959,7 @@ mod usart_mode_tests {
             &Default::default(),
         );
         assert!(
-            !out.init_calls.contains("DMA_TX_TODO"),
+            !has_dma_todo(&out.init_calls),
             "the LPUART pinned a real channel, so nothing should fall to a TODO:
 {}",
             out.init_calls

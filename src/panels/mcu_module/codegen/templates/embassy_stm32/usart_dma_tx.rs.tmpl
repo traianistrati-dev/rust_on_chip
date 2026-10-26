@@ -50,3 +50,7 @@ pub fn init<'d, TxD: TxDma<peripherals::{PERI}>>(
 // ── Using {PERI} ──
 //     use embedded_io_async::Write;
 //     {HANDLE}.write_all(b"hello\r\n").await.ok();
+//
+// To wait until the last byte has left the pad, `{HANDLE}.blocking_flush()`.
+// Not `flush().await`: it waits on the USART interrupt, which embassy turns on
+// for a whole Uart and never for a UartTx built on its own.

@@ -2066,6 +2066,37 @@ impl Mcu {
                         ));
                     }
                 }
+            } else {
+                // The other way: a USART shape only embassy builds. The module
+                // keeps it - going back to Async builds it again - but
+                // stm32f1xx-hal builds the TX+RX pair whatever it says: from
+                // both pads, nothing with one missing, nothing past USART3.
+                use crate::panels::mcu_module::modules::{ModuleConfig, ModuleSignal};
+                for m in &self.modules {
+                    let ModuleConfig::Usart(c) = &m.config else {
+                        continue;
+                    };
+                    let Some(stored) = c.beyond_the_pair() else {
+                        continue;
+                    };
+                    let has = |s| m.connections.iter().any(|w| w.signal == s);
+                    let built = if m.instance() > 3 {
+                        "is not generated there at all (it builds USART1-3)".to_owned()
+                    } else if !(has(ModuleSignal::Tx) && has(ModuleSignal::Rx)) {
+                        let missing = if has(ModuleSignal::Tx) { "RX" } else { "TX" };
+                        format!(
+                            "is not initialised there: its {missing} pad is not wired, and it \
+                             builds a Serial only from the TX+RX pair"
+                        )
+                    } else {
+                        "is built there as the TX+RX pair".to_owned()
+                    };
+                    out.push(format!(
+                        "! {}: {stored} is not built on stm32f1xx-hal - the USART {built}. The \
+                         module keeps it for the Async runtime",
+                        m.name
+                    ));
+                }
             }
         }
         // What the staged runtime's driver pass leaves out that this one

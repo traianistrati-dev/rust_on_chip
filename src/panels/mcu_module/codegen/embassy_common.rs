@@ -1607,6 +1607,10 @@ mod emit_for_manual_compile {
     ///   remapped (the default is their unremapped pads plus TIM4 on PB8, which
     ///   the time driver owns, so that timer must come out as a note);
     /// * `EIDE_F1_ASYNC_DMA=1` - USART1, SPI1 and I2C1 all on DMA;
+    /// * `EIDE_F1_ASYNC_UART=tx|rx|half|flow` - USART3 in a shape only this
+    ///   runtime builds on the F1: TX only with CTS, RX only with RTS (both on
+    ///   DMA), a single wire on the TX pad (DMA, readback), or full duplex
+    ///   with CTS/RTS on the buffered transport;
     /// * `EIDE_F1_SWITCH=back` - also writes the project switched BACK to
     ///   Blocking, to `eide_f1_check_async_back`.
     ///
@@ -1679,6 +1683,34 @@ mod emit_for_manual_compile {
                 ),
             ]);
         }
+        // USART3 on its free pads (PB10/PB11, CTS PB13, RTS PB14), wired for
+        // the shape alone - a one-way UART has no other data pad. Its fixed
+        // DMA channels (DMA1_CH2/CH3) are SPI1's, hence not with the DMA knob.
+        let uart3 = std::env::var("EIDE_F1_ASYNC_UART").ok();
+        if let Some(shape) = uart3.as_deref() {
+            assert!(
+                !dma,
+                "USART3's DMA1_CH2/CH3 are SPI1's: not with EIDE_F1_ASYNC_DMA"
+            );
+            wiring.extend(match shape {
+                "tx" => vec![
+                    ("PB10", PinFunction::UsartTx(3)),
+                    ("PB13", PinFunction::UsartCts(3)),
+                ],
+                "rx" => vec![
+                    ("PB11", PinFunction::UsartRx(3)),
+                    ("PB14", PinFunction::UsartRts(3)),
+                ],
+                "half" => vec![("PB10", PinFunction::UsartTx(3))],
+                "flow" => vec![
+                    ("PB10", PinFunction::UsartTx(3)),
+                    ("PB11", PinFunction::UsartRx(3)),
+                    ("PB13", PinFunction::UsartCts(3)),
+                    ("PB14", PinFunction::UsartRts(3)),
+                ],
+                other => panic!("EIDE_F1_ASYNC_UART={other}: tx, rx, half or flow"),
+            });
+        }
         for (name, func) in wiring {
             let num = mcu
                 .iter_all_pins()
@@ -1700,6 +1732,18 @@ mod emit_for_manual_compile {
         mcu.reconcile_modules();
         for m in &mut mcu.modules {
             match &mut m.config {
+                ModuleConfig::Usart(c) if c.instance == 3 => {
+                    use crate::panels::mcu_module::modules::{UsartDirection as D, UsartFlow as F};
+                    (c.mode, c.direction, c.flow) = match uart3.as_deref() {
+                        Some("tx") => (UsartMode::Dma, D::TxOnly, F::Cts),
+                        Some("rx") => (UsartMode::Dma, D::RxOnly, F::Rts),
+                        Some("half") => {
+                            c.half_duplex_readback = true;
+                            (UsartMode::Dma, D::HalfDuplexOnTx, F::None)
+                        }
+                        _ => (UsartMode::Buffered, D::TxRx, F::CtsRts),
+                    };
+                }
                 ModuleConfig::Usart(c) if dma => c.mode = UsartMode::Dma,
                 ModuleConfig::Spi(c) if dma => c.async_mode = AsyncBusMode::AsyncDma,
                 ModuleConfig::I2c(c) if dma => c.async_mode = AsyncBusMode::AsyncDma,
@@ -1732,6 +1776,26 @@ mod emit_for_manual_compile {
         assert!(main_rs.contains("CAN is NOT initialised"), "{main_rs}");
         if !remap {
             assert!(main_rs.contains("TIM4 is NOT initialised"), "{main_rs}");
+        }
+        if let Some(shape) = uart3.as_deref() {
+            assert!(
+                main_rs.contains("let mut _serial3 = pins::configs::usart3::init(p.USART3"),
+                "USART3 ({shape}) not built:\n{main_rs}"
+            );
+            let usart3 = mcu
+                .config_files()
+                .into_iter()
+                .find(|(n, _)| n == "usart3.rs")
+                .expect("usart3.rs")
+                .1;
+            let ctor = match shape {
+                "tx" => "UartTx::new_with_cts(",
+                "rx" => "UartRx::new_with_rts(",
+                "half" => "Uart::new_half_duplex(",
+                _ => "BufferedUart::new_with_rtscts(",
+            };
+            assert!(usart3.contains(ctor), "{ctor}:\n{usart3}");
+            println!("USART3 ({shape}): {ctor}..)");
         }
 
         let project = build_cfg(&def, Some(&mcu));
@@ -3555,7 +3619,7 @@ mod emit_for_manual_compile {
             assert!(main_rs.contains("wired by hand"), "{main_rs}");
         }
         assert!(
-            !main_rs.contains("DMA_TX_TODO"),
+            !main_rs.contains("DMA_TX_TODO") && !main_rs.contains("DMA_RX_TODO"),
             "a muxed chip should need no TODO:\n{main_rs}"
         );
         // A Blocking EXTI row that armed nothing would pass by building GPIO.

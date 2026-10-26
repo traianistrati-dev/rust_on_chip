@@ -3995,28 +3995,43 @@ pub fn module_config_ui(
         ui.end_row();
     };
 
-    // What the BLOCKING stm32f1xx-hal cannot do, said out loud.
+    // What stm32f1xx-hal - the F1 on Blocking, Native and RTIC - cannot do,
+    // said out loud.
     //
     // Direction, flow control, half duplex and swap/invert are rows every
-    // embassy runtime draws (and the ESP its share of). On the F1's
-    // stm32f1xx-hal they are not "not implemented yet": `Pins<USART>` is
-    // implemented ONLY for the (TX alternate, RX input) pair, `serial.rs` has no
-    // hdsel / rtse / ctse at all, and the SWAP / TXINV / RXINV bits do not exist
-    // in F1 silicon. Leaving the rows out silently makes a user who just used
-    // them on a G0 project hunt for them; this says why.
-    let f1_serial_note = |ui: &mut egui::Ui, out: &mut ConfigOut| {
-        for row in ["Data direction", "Line", "Hardware flow control"] {
+    // embassy runtime draws (and the ESP its share of), the F1's own Async
+    // runtime included. On stm32f1xx-hal they are not "not implemented yet":
+    // `Pins<USART>` is implemented ONLY for the (TX alternate, RX input) pair
+    // and `serial.rs` has no hdsel / rtse / ctse at all. The SWAP / TXINV /
+    // RXINV bits do not exist in F1 silicon, which is a different reason, so
+    // the Line row has its own. Leaving the rows out silently makes a user who
+    // just used them on Async hunt for them; this says why, and names a choice
+    // stored there, which this runtime keeps but does not build.
+    let f1_serial_note = |ui: &mut egui::Ui, out: &mut ConfigOut, cfg: &UsartModuleConfig| {
+        for row in ["Data direction", "Hardware flow control"] {
             out.skip(row, docs::SKIP_F1_SERIAL);
         }
+        out.skip("Line", docs::SKIP_F1_LINE);
         ui.label("");
         ui.label(
             egui::RichText::new(
-                "stm32f1xx-hal has no flow control, half duplex or one-way UART (its Serial takes the TX+RX pair), and the F1 USART has no swap/invert bits",
+                "stm32f1xx-hal has no flow control, half duplex or one-way UART (its Serial takes the TX+RX pair; the Async runtime builds them), and the F1 USART has no swap/invert bits",
             )
             .size(10.5)
             .color(egui::Color32::from_gray(140)),
         );
         ui.end_row();
+        if let Some(stored) = cfg.beyond_the_pair() {
+            ui.label("");
+            ui.label(
+                egui::RichText::new(format!(
+                    "{stored} (set on Async) is kept for that runtime and not built here"
+                ))
+                .size(10.5)
+                .color(egui::Color32::from_rgb(220, 160, 70)),
+            );
+            ui.end_row();
+        }
     };
 
     // Half a USART — or half an I2C — generates NOTHING on the F1: both HALs
@@ -4049,10 +4064,12 @@ pub fn module_config_ui(
 
     // Data direction + hardware flow control. Both lists come from
     // `UsartDirection::offered` / `UsartFlow::offered`, i.e. from what THIS
-    // FAMILY's backend has a CONSTRUCTOR for — never from what the silicon
-    // could in principle do. The three backends differ a lot: embassy builds
-    // every shape, the ESP builds a single direction and RTS/CTS, and the F1
-    // builds one TX+RX port and nothing else. embassy's list is narrowed
+    // FAMILY's backend has a CONSTRUCTOR for on the STAGED runtime — never
+    // from what the silicon could in principle do. The backends differ a lot:
+    // embassy builds every shape, the ESP builds a single direction and
+    // RTS/CTS, the F1 on Async is embassy on a usart_v1 (no DE, no half duplex
+    // on RX, no buffered RTS-only), and stm32f1xx-hal - the F1 off Async -
+    // builds one TX+RX port and draws neither row. embassy's list is narrowed
     // twice more: on Blocking it is the DMA transport's (the `new_blocking*`
     // set, whatever transport the module stores), and a usart_v1/v2 chip
     // (`line_extras` false) loses half duplex on RX and DE on either runtime.
@@ -4060,7 +4077,7 @@ pub fn module_config_ui(
     // choice that needs one it hasn't got is called out instead of silently
     // generating code that won't build.
     let direction_row = |ui: &mut egui::Ui, out: &mut ConfigOut, cfg: &mut UsartModuleConfig| {
-        let opts = UsartDirection::offered(cfg.mode, family, embassy_blocking, line_extras);
+        let opts = UsartDirection::offered(cfg.mode, family, is_async, line_extras);
         // The locked form is a different fact, so it is a different
         // sentence — chosen HERE, by the branch that knows which one it
         // drew, and not re-derived from the family somewhere else.
@@ -4119,6 +4136,31 @@ pub fn module_config_ui(
             }
         }
         ui.end_row();
+        // A direction whose pad the canvas does not have builds nothing on
+        // embassy: main.rs says so where the init would be, and this says so
+        // first, the way the flow row does for its pads.
+        let (has_tx, has_rx) = wired_serial;
+        let missing = match (
+            cfg.direction.needs_tx() && !has_tx,
+            cfg.direction.needs_rx() && !has_rx,
+        ) {
+            (true, true) => "the TX and RX pads",
+            (true, false) => "the TX pad",
+            (false, true) => "the RX pad",
+            (false, false) => "",
+        };
+        if embassy && !missing.is_empty() {
+            ui.label("");
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} needs {missing}, so it is not initialised - assign it on the canvas",
+                    cfg.direction.label()
+                ))
+                .size(10.5)
+                .color(egui::Color32::from_rgb(220, 160, 70)),
+            );
+            ui.end_row();
+        }
         // Line-level extras. On an older USART the register bits do not exist —
         // and neither do embassy's `Config` fields — so the row says that
         // instead of offering a switch that cannot be generated.
@@ -4169,13 +4211,7 @@ pub fn module_config_ui(
         out.field("Hardware flow control", docs::USART_FLOW);
         ui.label("Hardware flow control");
         ui.vertical(|ui| {
-            let opts = UsartFlow::offered(
-                cfg.mode,
-                cfg.direction,
-                family,
-                embassy_blocking,
-                line_extras,
-            );
+            let opts = UsartFlow::offered(cfg.mode, cfg.direction, family, is_async, line_extras);
             egui::ComboBox::from_id_salt("usart_flow")
                 .selected_text(not_built_here(cfg.flow.label(), opts.contains(&cfg.flow)))
                 .show_ui(ui, |ui| {
@@ -4230,19 +4266,13 @@ pub fn module_config_ui(
         if embassy && (embassy_blocking || !runtime_applied) {
             return;
         }
-        if !UsartDirection::offered(cfg.mode, family, embassy_blocking, line_extras)
+        if !UsartDirection::offered(cfg.mode, family, is_async, line_extras)
             .contains(&cfg.direction)
         {
             cfg.direction = UsartDirection::TxRx;
         }
-        if !UsartFlow::offered(
-            cfg.mode,
-            cfg.direction,
-            family,
-            embassy_blocking,
-            line_extras,
-        )
-        .contains(&cfg.flow)
+        if !UsartFlow::offered(cfg.mode, cfg.direction, family, is_async, line_extras)
+            .contains(&cfg.flow)
         {
             cfg.flow = UsartFlow::None;
         }
@@ -5272,6 +5302,9 @@ pub fn module_config_ui(
                         clamp_usart(cfg);
                         api_row_locked_embassy(ui, out);
                     } else if is_native {
+                        // Native is stm32f1xx-hal too: the same rows absent, for
+                        // the same reasons.
+                        f1_serial_note(ui, out, cfg);
                         api_row_locked(ui, out);
                     } else if is_async {
                         // The API style is fixed on async (embedded-io-async
@@ -5307,7 +5340,7 @@ pub fn module_config_ui(
                     } else if let Some(chans) =
                         codegen::stm32::blocking_dma_channels(family, uart_bus, cfg.instance)
                     {
-                        f1_serial_note(ui, out);
+                        f1_serial_note(ui, out, cfg);
                         f1_half_bus_note(
                             ui,
                             "USART",
@@ -9077,23 +9110,31 @@ mod tests {
         assert_eq!(doc_of(&wba, "Init API"), docs::INIT_API_EMBASSY);
 
         // The F1 on Blocking is stm32f1xx-hal: its DMA table, the editable
-        // Init API, and the three serial rows explained as absent.
+        // Init API, and the three serial rows explained as absent - direction
+        // and flow for the HAL (the Async runtime builds them), the Line row
+        // for the silicon. Native is the same HAL, and explains the same.
         let f1 = drive_usart("stm32f1", false, false, false, |_| {});
-        let l = labels_of(&f1);
-        assert!(!l.contains(&"Data direction"), "{l:?}");
-        assert!(l.contains(&"Transport"), "{l:?}");
-        for row in ["Data direction", "Line", "Hardware flow control"] {
-            let s = f1
-                .skipped_fields()
-                .iter()
-                .find(|s| s.label == row)
-                .unwrap_or_else(|| panic!("{row} is explained"));
-            assert_eq!(s.doc, docs::SKIP_F1_SERIAL);
+        let native = drive_usart("stm32f1", false, true, false, |_| {});
+        for out in [&f1, &native] {
+            let l = labels_of(out);
+            assert!(!l.contains(&"Data direction"), "{l:?}");
+            for (row, doc) in [
+                ("Data direction", docs::SKIP_F1_SERIAL),
+                ("Hardware flow control", docs::SKIP_F1_SERIAL),
+                ("Line", docs::SKIP_F1_LINE),
+            ] {
+                let s = out
+                    .skipped_fields()
+                    .iter()
+                    .find(|s| s.label == row)
+                    .unwrap_or_else(|| panic!("{row} is explained"));
+                assert_eq!(s.doc, doc, "{row}");
+            }
         }
+        assert!(labels_of(&f1).contains(&"Transport"));
         assert_eq!(doc_of(&f1, "Init API"), docs::INIT_API);
 
         // The Native runtime locks the Init API, and says so in its own words.
-        let native = drive_usart("stm32f1", false, true, false, |_| {});
         let f = native.fields().unwrap();
         let api = f
             .iter()
@@ -9167,6 +9208,79 @@ mod tests {
             let out = drive_usart("stm32g0", false, false, extras, |_| {});
             let f = out.fields().unwrap();
             assert_eq!(f.iter().find(|f| f.label == "Line").unwrap().doc, want);
+        }
+    }
+
+    /// The F1 on Async is embassy on a usart_v1, so its panel keeps the
+    /// one-way, CTS/RTS and TX-pad single-wire shapes - and snaps back the
+    /// ones embassy cannot build there, the vendor data's swap bits or not.
+    /// Staged over a Blocking project, or applied on stm32f1xx-hal, the frame
+    /// touches nothing: the choice is the Async runtime's.
+    #[test]
+    fn the_f1_usart_choices_follow_the_runtime_that_builds_them() {
+        use UsartDirection as D;
+        use UsartFlow as F;
+        use UsartMode as M;
+        fn stored(mode: M, d: D, f: F) -> impl FnOnce(&mut UsartModuleConfig) {
+            move |c| {
+                c.mode = mode;
+                c.direction = d;
+                c.flow = f;
+            }
+        }
+        let doc_of = |out: &ConfigOut, label: &str| {
+            out.fields()
+                .unwrap()
+                .iter()
+                .find(|f| f.label == label)
+                .unwrap_or_else(|| panic!("{label} row"))
+                .doc
+                .clone()
+        };
+        for (mode, d, f) in [
+            (M::Dma, D::TxOnly, F::Cts),
+            (M::Dma, D::RxOnly, F::Rts),
+            (M::Dma, D::TxRx, F::CtsRts),
+            (M::Dma, D::HalfDuplexOnTx, F::None),
+            (M::Buffered, D::TxRx, F::CtsRts),
+            (M::Buffered, D::HalfDuplexOnTx, F::None),
+        ] {
+            let (out, c) = drive_usart_cfg("stm32f1", true, false, stored(mode, d, f));
+            assert_eq!((c.direction, c.flow), (d, f), "{mode:?} {d:?} {f:?}");
+            assert_eq!(doc_of(&out, "Data direction"), docs::USART_DIRECTION);
+        }
+        for extras in [false, true] {
+            for (mode, d, f, want) in [
+                // No buffered half, and no RTS a gpio_v1 pad would carry.
+                (M::Buffered, D::TxOnly, F::None, (D::TxRx, F::None)),
+                (M::Buffered, D::TxRx, F::Rts, (D::TxRx, F::None)),
+                // A usart_v1: no swap, no DE.
+                (M::Dma, D::HalfDuplexOnRx, F::None, (D::TxRx, F::None)),
+                (M::Dma, D::TxRx, F::De, (D::TxRx, F::None)),
+            ] {
+                let (_, c) = drive_usart_cfg("stm32f1", true, extras, stored(mode, d, f));
+                assert_eq!((c.direction, c.flow), want, "{mode:?} {d:?} {f:?} {extras}");
+            }
+        }
+        // Staged Async over a Blocking project, and Blocking itself: kept.
+        let (_, c) = drive_usart_staged(
+            "stm32f1",
+            true,
+            false,
+            false,
+            stored(M::Buffered, D::TxOnly, F::Rts),
+        );
+        assert_eq!((c.direction, c.flow), (D::TxOnly, F::Rts));
+        for runtime_applied in [true, false] {
+            let (out, c) = drive_usart_staged(
+                "stm32f1",
+                false,
+                runtime_applied,
+                false,
+                stored(M::Dma, D::TxOnly, F::Cts),
+            );
+            assert_eq!((c.direction, c.flow), (D::TxOnly, F::Cts));
+            assert!(!labels_of(&out).contains(&"Data direction"));
         }
     }
 

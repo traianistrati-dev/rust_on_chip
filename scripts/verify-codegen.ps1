@@ -301,6 +301,16 @@ $ALL_CASES = @(
     @{ n = "F1 Async, default pads";       t = "emit_f1_async_project";  e = @{};                       q = $true; fam = "f1"; lk = $true }
     @{ n = "F1 Async, remapped, all DMA";  t = "emit_f1_async_project";  e = @{ EIDE_F1_ASYNC_REMAP = "1"; EIDE_F1_ASYNC_DMA = "1" }; q = $true; fam = "f1"; lk = $true }
     @{ n = "F1 Async -> Blocking switch";  t = "emit_f1_async_project";  e = @{ EIDE_F1_SWITCH = "back" }; q = $false; fam = "f1" }
+    # The USART shapes only embassy builds on the F1 (usart_v1, AFIO remap on
+    # every pad), on USART3's free pads: TX only + CTS and RX only + RTS on one
+    # DMA channel each, a single wire on the TX pad (open-drain, the pair
+    # handed back), and CTS/RTS on the buffered transport. Linked. The tx row
+    # also switches back to stm32f1xx-hal, which builds no half a USART: its
+    # TX and CTS pads stay bound and unused there (w).
+    @{ n = "F1 Async UART tx+CTS, back";   t = "emit_f1_async_project";  e = @{ EIDE_F1_ASYNC_UART = "tx"; EIDE_F1_SWITCH = "back" }; q = $false; fam = "f1"; lk = $true; w = 3 }
+    @{ n = "F1 Async UART rx+RTS";         t = "emit_f1_async_project";  e = @{ EIDE_F1_ASYNC_UART = "rx" }; q = $false; fam = "f1"; lk = $true }
+    @{ n = "F1 Async UART single wire";    t = "emit_f1_async_project";  e = @{ EIDE_F1_ASYNC_UART = "half" }; q = $false; fam = "f1"; lk = $true }
+    @{ n = "F1 Async UART CTS/RTS";        t = "emit_f1_async_project";  e = @{ EIDE_F1_ASYNC_UART = "flow" }; q = $true; fam = "f1"; lk = $true }
     # Both RTIC rows carry the Configuration tab's IWDG (on unless
     # EIDE_F1_WDG=0): RTIC never called it, and its handle has to leave
     # `#[init]` as a Local. The second wires NO pin - the "select pins"
@@ -739,7 +749,7 @@ $ALL_CASES = @(
 # read it, and a stale value there would pick the wrong runtime just as quietly.
 $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
-           "EIDE_F1_SWITCH", "EIDE_F1_WDG", "EIDE_F1_NOPINS", "EIDE_F1_IRQ",
+           "EIDE_F1_SWITCH", "EIDE_F1_WDG", "EIDE_F1_NOPINS", "EIDE_F1_IRQ", "EIDE_F1_ASYNC_UART",
            "EIDE_F1_IRQ_SHARED", "EIDE_F1_ADC", "EIDE_COMP_UPGRADE", "EIDE_COMP_RUNTIME",
            "EIDE_COMP_XML", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",

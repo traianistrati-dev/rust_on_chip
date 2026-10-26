@@ -100,7 +100,7 @@ impl ChipView {
     /// The frame of a chip held as an `Mcu` - the open one, or one just
     /// rebuilt from its files.
     pub fn from_mcu(dir: &str, chip: &str, mcu: &Mcu) -> Self {
-        Self::from_parts(
+        let mut view = Self::from_parts(
             dir,
             chip,
             Some(mcu.runtime),
@@ -115,7 +115,20 @@ impl ChipView {
                     )
                 })
             },
-        )
+        );
+        // stm32f1xx-hal - the F1 off Async - builds a USART as the TX+RX pair
+        // whatever its module stores: a one-way, single-wire or CTS/RTS shape
+        // is the Async runtime's, kept for it. The wires are the firmware's.
+        if mcu.family == "stm32f1" && !mcu.is_async() {
+            use crate::panels::mcu_module::modules::{UsartDirection, UsartFlow};
+            for item in &mut view.modules {
+                if let ModuleConfig::Usart(c) = &mut item.config {
+                    c.direction = UsartDirection::TxRx;
+                    c.flow = UsartFlow::None;
+                }
+            }
+        }
+        view
     }
 
     /// Build the frame from a chip's parts. `pad` names pin `n` and says what

@@ -420,7 +420,7 @@ impl ModuleKind {
 
 /// Map an assigned pin function to the module `(kind, instance, signal)` it
 /// implies — the inverse of [`ModuleSignal::pin_function`]. `None` for functions
-/// that don't belong to a module (GPIO, ADC, timer, USART CTS/RTS/CK, …).
+/// that don't belong to a module (GPIO, ADC, USART CK, …).
 pub fn module_signal_of(func: &PinFunction) -> Option<(ModuleKind, u8, ModuleSignal)> {
     use ModuleKind::*;
     use ModuleSignal::*;
@@ -1830,6 +1830,13 @@ pub enum UsartMode {
     Dma,
 }
 
+/// Whether `family` on `is_async`'s runtime builds embassy-stm32's polled UART
+/// - `family::embassy_blocking` for a whole `Mcu` - whose `new_blocking*` calls
+/// are the DMA transport's forms whatever transport the module stores.
+fn polled_embassy(family: &str, is_async: bool) -> bool {
+    !is_async && crate::panels::mcu_module::codegen::family::embassy_drivers(family, false)
+}
+
 /// Which halves of a USART are built — CubeMX calls it "Data Direction".
 ///
 /// It is not cosmetic: a one-way UART frees the other pin. Which options are
@@ -1901,29 +1908,46 @@ impl UsartDirection {
         }
     }
 
-    /// The directions `transport` can actually build.
+    /// The directions this FAMILY's generator can build on `is_async`'s
+    /// runtime, for `transport`.
     ///
-    /// The buffered driver has NO half of its own — `BufferedUartTx` and
-    /// `BufferedUartRx` exist only as the result of `BufferedUart::split()`, so
-    /// both pins are consumed either way and "TX only" would be a lie. On DMA,
-    /// `UartTx::new` / `UartRx::new` are real constructors that take one pin.
-    /// The directions this FAMILY's generator can build.
+    /// The fall-through lists are embassy's ([`Self::options`]). The other
+    /// backends are narrower and were silently dropping what they could not
+    /// build:
     ///
-    /// The lists below are embassy's. The other two backends are narrower and
-    /// were silently dropping what they could not build:
-    ///
-    /// - **STM32F1** has one shape. `serial::Pins` is implemented for the
-    ///   `(TX, RX)` PAIR alone, so there is no half of a port to construct —
-    ///   see the note on `f1_usart_needs_both_pads`.
+    /// - **STM32F1 off Async** (stm32f1xx-hal on Blocking, Native and RTIC) has
+    ///   one shape. `serial::Pins` is implemented for the `(TX, RX)` PAIR alone,
+    ///   so there is no half of a port to construct - main.rs says so where a
+    ///   pad is missing.
+    /// - **STM32F1 on Async** is embassy-stm32 on a usart_v1: every shape but
+    ///   half duplex on the RX pad, whose `new_half_duplex_on_rx` needs the
+    ///   swap bit (`cfg(not(any(usart_v1, usart_v2)))`). Stripped here rather
+    ///   than through `line_extras`, because the F1 is a usart_v1 whatever its
+    ///   vendor data says.
     /// - **ESP** has `UartTx::new` and `UartRx::new`, so a single direction is
-    ///   real there — but esp-hal has no single-wire mode at all.
+    ///   real there - but esp-hal has no single-wire mode at all.
     ///
-    /// It knows the family and nothing else: the CHIP's USART version and the
-    /// Blocking runtime's transport narrow it further, in [`Self::offered`].
-    pub fn options_for(transport: UsartMode, family: &str) -> &'static [UsartDirection] {
+    /// The CHIP's USART version and the Blocking runtime's transport narrow it
+    /// further, in [`Self::offered`].
+    pub fn options_for(
+        transport: UsartMode,
+        family: &str,
+        is_async: bool,
+    ) -> &'static [UsartDirection] {
         use crate::panels::mcu_module::codegen::family as fam;
         if family == "stm32f1" {
-            return &[UsartDirection::TxRx];
+            if !is_async {
+                return &[UsartDirection::TxRx];
+            }
+            return match transport {
+                UsartMode::Buffered => &[UsartDirection::TxRx, UsartDirection::HalfDuplexOnTx],
+                UsartMode::Dma => &[
+                    UsartDirection::TxRx,
+                    UsartDirection::TxOnly,
+                    UsartDirection::RxOnly,
+                    UsartDirection::HalfDuplexOnTx,
+                ],
+            };
         }
         if fam::is_esp(family) {
             return &[
@@ -1950,6 +1974,13 @@ impl UsartDirection {
         Self::options(transport)
     }
 
+    /// The directions embassy-stm32 can build on `transport`, on the newest
+    /// USART.
+    ///
+    /// The buffered driver has NO half of its own - `BufferedUartTx` and
+    /// `BufferedUartRx` exist only as the result of `BufferedUart::split()`, so
+    /// both pins are consumed either way and "TX only" would be a lie. On DMA,
+    /// `UartTx::new` / `UartRx::new` are real constructors that take one pin.
     pub fn options(transport: UsartMode) -> &'static [UsartDirection] {
         match transport {
             // Half duplex IS available buffered — it is `BufferedUart` with one
@@ -1969,13 +2000,14 @@ impl UsartDirection {
         }
     }
 
-    /// The directions the module panel OFFERS: [`Self::options_for`], on the
+    /// The directions the module panel OFFERS on `is_async`'s runtime (the
+    /// STAGED one, which the rows follow): [`Self::options_for`], on the
     /// transport the backend really builds, minus what this chip's USART
     /// cannot do. The panel draws and clamps from this one list.
     ///
-    /// - `embassy_blocking`: embassy-stm32's polled UART (every STM32 but the
-    ///   F1, off Async). It never reads the module's transport, and its
-    ///   `new_blocking*` constructors are the DMA transport's one-way and
+    /// - embassy-stm32's polled UART (every STM32 but the F1, off Async,
+    ///   `family::embassy_blocking`) never reads the module's transport, and
+    ///   its `new_blocking*` constructors are the DMA transport's one-way and
     ///   half-duplex set, so the list is [`UsartMode::Dma`]'s whatever
     ///   `transport` holds. A caller clamping to it must not write the
     ///   transport back: the Async runtime still reads it.
@@ -1987,15 +2019,15 @@ impl UsartDirection {
     pub fn offered(
         transport: UsartMode,
         family: &str,
-        embassy_blocking: bool,
+        is_async: bool,
         line_extras: bool,
     ) -> Vec<UsartDirection> {
-        let transport = if embassy_blocking {
+        let transport = if polled_embassy(family, is_async) {
             UsartMode::Dma
         } else {
             transport
         };
-        Self::options_for(transport, family)
+        Self::options_for(transport, family, is_async)
             .iter()
             .copied()
             .filter(|d| line_extras || *d != Self::HalfDuplexOnRx)
@@ -2050,18 +2082,20 @@ impl UsartFlow {
         matches!(self, Self::Rts | Self::CtsRts | Self::De)
     }
 
-    /// What embassy can build for this `(transport, direction)` pair — the
-    /// constructor list, not the hardware's.
+    /// The flow control this FAMILY's generator can build on `is_async`'s
+    /// runtime, for the `(transport, direction)` pair.
     ///
-    /// The irregularity is embassy's: `BufferedUart` has `new_with_rts` but no
-    /// `new_with_cts`, while the DMA `Uart` has neither on its own and offers
-    /// CTS-only / RTS-only through the one-way `UartTx` / `UartRx` instead.
-    /// Offering a combination with no constructor would be a UI that lies.
-    /// The flow control this FAMILY's generator can build.
-    ///
-    /// - **STM32F1**: none. `stm32f1xx-hal`'s serial module has no RTS, no CTS
-    ///   and no driver-enable — the pads exist on the chip and the HAL does not
-    ///   reach them.
+    /// - **STM32F1 off Async**: none. `stm32f1xx-hal`'s serial module has no
+    ///   RTS, no CTS and no driver-enable - the pads exist on the chip and the
+    ///   HAL does not reach them.
+    /// - **STM32F1 on Async**: embassy's list on a usart_v1, less two forms.
+    ///   No DE: `new_with_de` is `cfg(not(any(usart_v1, usart_v2)))`, and the
+    ///   ungated `BufferedUart::new_with_rts_as_de` sets no DEM bit there, so it
+    ///   drives nothing. No RTS on its own on the buffered transport:
+    ///   `BufferedUart::new_with_rts` configures the pad as an INPUT, which on
+    ///   the F1's gpio_v1 is a floating pin the USART never reaches - it
+    ///   compiles, and the line is dead. CTS/RTS together, and RTS-only on a
+    ///   DMA receiver, configure it as the output it is.
     /// - **ESP**: RTS and CTS, through `.with_rts()`/`.with_cts()` and the
     ///   `HwFlowControl` config. No RS485 driver-enable.
     ///
@@ -2073,10 +2107,18 @@ impl UsartFlow {
         transport: UsartMode,
         direction: UsartDirection,
         family: &str,
+        is_async: bool,
     ) -> &'static [UsartFlow] {
         use crate::panels::mcu_module::codegen::family as fam;
         if family == "stm32f1" {
-            return &[UsartFlow::None];
+            if !is_async || direction.is_half_duplex() {
+                return &[UsartFlow::None];
+            }
+            return match (transport, direction) {
+                (UsartMode::Dma, UsartDirection::TxOnly) => &[UsartFlow::None, UsartFlow::Cts],
+                (UsartMode::Dma, UsartDirection::RxOnly) => &[UsartFlow::None, UsartFlow::Rts],
+                _ => &[UsartFlow::None, UsartFlow::CtsRts],
+            };
         }
         if fam::is_esp(family) {
             return if direction == UsartDirection::TxRx {
@@ -2116,6 +2158,13 @@ impl UsartFlow {
         Self::options(transport, direction)
     }
 
+    /// What embassy can build for this `(transport, direction)` pair on the
+    /// newest USART - the constructor list, not the hardware's.
+    ///
+    /// The irregularity is embassy's: `BufferedUart` has `new_with_rts` but no
+    /// `new_with_cts`, while the DMA `Uart` has neither on its own and offers
+    /// CTS-only / RTS-only through the one-way `UartTx` / `UartRx` instead.
+    /// Offering a combination with no constructor would be a UI that lies.
     pub fn options(transport: UsartMode, direction: UsartDirection) -> &'static [UsartFlow] {
         // No half-duplex constructor takes a flow pad — one wire, no side band.
         if direction.is_half_duplex() {
@@ -2138,11 +2187,11 @@ impl UsartFlow {
         }
     }
 
-    /// The flow control the module panel OFFERS for `direction`: the same two
-    /// narrowings as [`UsartDirection::offered`], applied to
-    /// [`Self::options_for`].
+    /// The flow control the module panel OFFERS for `direction` on `is_async`'s
+    /// (staged) runtime: the same two narrowings as
+    /// [`UsartDirection::offered`], applied to [`Self::options_for`].
     ///
-    /// - `embassy_blocking`: the [`UsartMode::Dma`] list, which is what the
+    /// - embassy Blocking: the [`UsartMode::Dma`] list, which is what the
     ///   generator's `blocking_serial_flow` keeps - the forms a
     ///   `new_blocking*` call takes.
     /// - `line_extras` false: a usart_v1/v2 block has no driver-enable pad, so
@@ -2152,15 +2201,15 @@ impl UsartFlow {
         transport: UsartMode,
         direction: UsartDirection,
         family: &str,
-        embassy_blocking: bool,
+        is_async: bool,
         line_extras: bool,
     ) -> Vec<UsartFlow> {
-        let transport = if embassy_blocking {
+        let transport = if polled_embassy(family, is_async) {
             UsartMode::Dma
         } else {
             transport
         };
-        Self::options_for(transport, direction, family)
+        Self::options_for(transport, direction, family, is_async)
             .iter()
             .copied()
             .filter(|f| line_extras || *f != Self::De)
@@ -2393,6 +2442,21 @@ fn default_usart_buf() -> u32 {
 }
 
 impl UsartModuleConfig {
+    /// The direction and flow control this module stores beyond the plain
+    /// TX+RX pair, as one label (`Transmit only + CTS only`), or `None` for the
+    /// pair. stm32f1xx-hal builds nothing else, so the F1 off Async names this
+    /// as kept for the Async runtime - in main.rs, the panel and the Apply list.
+    pub fn beyond_the_pair(&self) -> Option<String> {
+        let parts: Vec<&str> = [
+            (self.direction != UsartDirection::TxRx).then(|| self.direction.label()),
+            (self.flow != UsartFlow::None).then(|| self.flow.label()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" + "))
+    }
+
     /// Sensible defaults (115200 8N1) for the given USART instance.
     pub fn new(instance: u8) -> Self {
         Self {
@@ -6233,37 +6297,84 @@ mod usart_offered_tests {
         D::HalfDuplexOnRx,
     ];
 
-    /// The backends whose lists no runtime or chip flag moves: stm32f1xx-hal's
-    /// one TX+RX port, esp-hal's halves, and the pair on the RP and the nRF.
+    /// The backends whose lists no runtime or chip flag moves: esp-hal's
+    /// halves and the pair on the RP and the nRF - and stm32f1xx-hal's one
+    /// TX+RX port, which is the F1 OFF Async (see the next test for on).
     #[test]
     fn the_hal_lists_do_not_move() {
         for t in [M::Buffered, M::Dma] {
             for extras in [false, true] {
                 assert_eq!(D::offered(t, "stm32f1", false, extras), [D::TxRx]);
                 assert_eq!(F::offered(t, D::TxRx, "stm32f1", false, extras), [F::None]);
+                for is_async in [false, true] {
+                    assert_eq!(
+                        D::offered(t, "esp32c3", is_async, extras),
+                        [D::TxRx, D::TxOnly, D::RxOnly]
+                    );
+                    assert_eq!(
+                        F::offered(t, D::TxRx, "esp32c3", is_async, extras),
+                        [F::None, F::Cts, F::Rts, F::CtsRts]
+                    );
+                    assert_eq!(
+                        F::offered(t, D::TxOnly, "esp32c3", is_async, extras),
+                        [F::None, F::Rts]
+                    );
+                    assert_eq!(
+                        F::offered(t, D::RxOnly, "esp32c3", is_async, extras),
+                        [F::None, F::Cts]
+                    );
+                    assert_eq!(D::offered(t, "rp2040", is_async, extras), [D::TxRx]);
+                    assert_eq!(
+                        F::offered(t, D::TxRx, "rp2040", is_async, extras),
+                        [F::None]
+                    );
+                    assert_eq!(D::offered(t, "nrf52833", is_async, extras), [D::TxRx]);
+                    assert_eq!(
+                        F::offered(t, D::TxRx, "nrf52833", is_async, extras),
+                        [F::None, F::CtsRts]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The F1 on Async is embassy-stm32 on a usart_v1: one-way on DMA and the
+    /// single wire on the TX pad, never on the RX pad or with DE - whatever
+    /// the vendor data says about swap bits, since the F1 has none - and no
+    /// RTS on its own on the buffered transport, whose pad would float.
+    #[test]
+    fn an_f1_on_async_offers_the_usart_v1_shapes() {
+        for extras in [false, true] {
+            assert_eq!(
+                D::offered(M::Buffered, "stm32f1", true, extras),
+                [D::TxRx, D::HalfDuplexOnTx]
+            );
+            assert_eq!(
+                D::offered(M::Dma, "stm32f1", true, extras),
+                [D::TxRx, D::TxOnly, D::RxOnly, D::HalfDuplexOnTx]
+            );
+            for (t, d, want) in [
+                (M::Buffered, D::TxRx, &[F::None, F::CtsRts][..]),
+                (M::Buffered, D::HalfDuplexOnTx, &[F::None]),
+                (M::Dma, D::TxRx, &[F::None, F::CtsRts]),
+                (M::Dma, D::TxOnly, &[F::None, F::Cts]),
+                (M::Dma, D::RxOnly, &[F::None, F::Rts]),
+                (M::Dma, D::HalfDuplexOnTx, &[F::None]),
+            ] {
                 assert_eq!(
-                    D::offered(t, "esp32c3", false, extras),
-                    [D::TxRx, D::TxOnly, D::RxOnly]
+                    F::offered(t, d, "stm32f1", true, extras),
+                    want,
+                    "{t:?} {d:?}"
                 );
-                assert_eq!(
-                    F::offered(t, D::TxRx, "esp32c3", false, extras),
-                    [F::None, F::Cts, F::Rts, F::CtsRts]
-                );
-                assert_eq!(
-                    F::offered(t, D::TxOnly, "esp32c3", false, extras),
-                    [F::None, F::Rts]
-                );
-                assert_eq!(
-                    F::offered(t, D::RxOnly, "esp32c3", false, extras),
-                    [F::None, F::Cts]
-                );
-                assert_eq!(D::offered(t, "rp2040", false, extras), [D::TxRx]);
-                assert_eq!(F::offered(t, D::TxRx, "rp2040", false, extras), [F::None]);
-                assert_eq!(D::offered(t, "nrf52833", false, extras), [D::TxRx]);
-                assert_eq!(
-                    F::offered(t, D::TxRx, "nrf52833", false, extras),
-                    [F::None, F::CtsRts]
-                );
+            }
+            // Every pair offered is an embassy constructor.
+            for t in [M::Buffered, M::Dma] {
+                for d in D::offered(t, "stm32f1", true, extras) {
+                    assert!(D::options(t).contains(&d), "{t:?} {d:?}");
+                    for f in F::offered(t, d, "stm32f1", true, extras) {
+                        assert!(F::options(t, d).contains(&f), "{t:?} {d:?} {f:?}");
+                    }
+                }
             }
         }
     }
@@ -6272,12 +6383,12 @@ mod usart_offered_tests {
     /// buffered transport still has no one-way half.
     #[test]
     fn a_usart_v3_offers_every_embassy_shape() {
-        assert_eq!(D::offered(M::Dma, "stm32g0", false, true), EVERY_DIRECTION);
+        assert_eq!(D::offered(M::Dma, "stm32g0", true, true), EVERY_DIRECTION);
         assert_eq!(
-            F::offered(M::Dma, D::TxRx, "stm32g0", false, true),
+            F::offered(M::Dma, D::TxRx, "stm32g0", true, true),
             [F::None, F::CtsRts, F::De]
         );
-        let buffered = D::offered(M::Buffered, "stm32g0", false, true);
+        let buffered = D::offered(M::Buffered, "stm32g0", true, true);
         assert!(!buffered.contains(&D::TxOnly) && !buffered.contains(&D::RxOnly));
         assert!(buffered.contains(&D::HalfDuplexOnRx));
     }
@@ -6287,24 +6398,16 @@ mod usart_offered_tests {
     /// duplex on TX and CTS/RTS stay.
     #[test]
     fn a_usart_v2_loses_half_duplex_on_rx_and_de() {
-        for embassy_blocking in [false, true] {
+        for is_async in [false, true] {
             for t in [M::Buffered, M::Dma] {
-                let dirs = D::offered(t, "stm32f4", embassy_blocking, false);
-                assert!(
-                    !dirs.contains(&D::HalfDuplexOnRx),
-                    "{t:?} {embassy_blocking}"
-                );
-                assert!(
-                    dirs.contains(&D::HalfDuplexOnTx),
-                    "{t:?} {embassy_blocking}"
-                );
+                let dirs = D::offered(t, "stm32f4", is_async, false);
+                assert!(!dirs.contains(&D::HalfDuplexOnRx), "{t:?} {is_async}");
+                assert!(dirs.contains(&D::HalfDuplexOnTx), "{t:?} {is_async}");
                 for d in EVERY_DIRECTION {
-                    let flows = F::offered(t, d, "stm32f4", embassy_blocking, false);
-                    assert!(!flows.contains(&F::De), "{t:?} {d:?} {embassy_blocking}");
+                    let flows = F::offered(t, d, "stm32f4", is_async, false);
+                    assert!(!flows.contains(&F::De), "{t:?} {d:?} {is_async}");
                 }
-                assert!(
-                    F::offered(t, D::TxRx, "stm32f4", embassy_blocking, false).contains(&F::CtsRts)
-                );
+                assert!(F::offered(t, D::TxRx, "stm32f4", is_async, false).contains(&F::CtsRts));
             }
         }
     }
@@ -6314,7 +6417,7 @@ mod usart_offered_tests {
     #[test]
     fn embassy_blocking_offers_the_new_blocking_set() {
         assert_eq!(
-            D::offered(M::Buffered, "stm32g0", true, true),
+            D::offered(M::Buffered, "stm32g0", false, true),
             EVERY_DIRECTION
         );
         for (d, want) in [
@@ -6325,7 +6428,7 @@ mod usart_offered_tests {
             (D::HalfDuplexOnRx, &[F::None]),
         ] {
             assert_eq!(
-                F::offered(M::Buffered, d, "stm32g0", true, true),
+                F::offered(M::Buffered, d, "stm32g0", false, true),
                 want,
                 "{d:?}"
             );
@@ -6341,8 +6444,8 @@ mod usart_offered_tests {
     fn every_blocking_choice_is_one_the_generator_builds() {
         for extras in [false, true] {
             for t in [M::Buffered, M::Dma] {
-                for d in D::offered(t, "stm32g4", true, extras) {
-                    for f in F::offered(t, d, "stm32g4", true, extras) {
+                for d in D::offered(t, "stm32g4", false, extras) {
+                    for f in F::offered(t, d, "stm32g4", false, extras) {
                         assert!(F::options(M::Dma, d).contains(&f), "{d:?} {f:?}");
                         if !extras {
                             assert!(d != D::HalfDuplexOnRx && f != F::De, "{d:?} {f:?}");
@@ -6351,6 +6454,21 @@ mod usart_offered_tests {
                 }
             }
         }
+    }
+
+    /// What the F1 off Async names as kept for Async: the stored direction and
+    /// flow, and nothing for the pair.
+    #[test]
+    fn beyond_the_pair_names_what_stm32f1xx_hal_does_not_build() {
+        let mut c = super::UsartModuleConfig::new(1);
+        assert_eq!(c.beyond_the_pair(), None);
+        c.direction = D::TxOnly;
+        assert_eq!(c.beyond_the_pair().as_deref(), Some("Transmit only"));
+        c.flow = F::Cts;
+        assert_eq!(
+            c.beyond_the_pair().as_deref(),
+            Some("Transmit only + CTS only")
+        );
     }
 }
 

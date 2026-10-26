@@ -35,7 +35,7 @@ pub fn is_rp(family: &str) -> bool {
 }
 
 /// `rp2040_hal` / `rp235x_hal` — the crate name as it is written in Rust.
-fn hal_crate(family: &str) -> &'static str {
+pub(crate) fn hal_crate(family: &str) -> &'static str {
     if family == "rp2040" {
         "rp2040_hal"
     } else {

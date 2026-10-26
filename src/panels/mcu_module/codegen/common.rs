@@ -3016,6 +3016,45 @@ mod tests {
             .copied()
     }
 
+    /// The entry the System tab's Blocking card and the Apply list name is
+    /// the one every built-in's main.rs opens with, on Blocking and on Native
+    /// (which shares it): `#[entry]` on the STM32s, `#[esp_hal::main]` on an
+    /// ESP, the HAL's re-export on a Pico, cortex-m-rt's path on an nRF. The
+    /// card said `#[entry]` for all of them.
+    #[test]
+    fn blocking_entry_is_what_every_backend_writes() {
+        use crate::panels::mcu_module::builtins::builtin_definitions;
+        use crate::panels::mcu_module::codegen::family::blocking_entry_attr;
+        use crate::panels::mcu_module::mcu::model::Runtime;
+
+        let mut seen = std::collections::BTreeSet::new();
+        for d in builtin_definitions() {
+            for rt in [Runtime::Blocking, Runtime::Native] {
+                let mut mcu = d.build_mcu();
+                mcu.runtime = rt;
+                if rt == Runtime::Native && !mcu.is_native() {
+                    continue;
+                }
+                let code = mcu.fresh_main_rs();
+                let Some(attr) = entry_attribute_of(&code) else {
+                    continue;
+                };
+                assert_eq!(attr, blocking_entry_attr(&d.family), "{} / {rt:?}", d.id);
+                seen.insert(attr.to_owned());
+            }
+        }
+        // Every spelling, so the loop met each backend.
+        for want in [
+            "#[entry]",
+            "#[esp_hal::main]",
+            "#[rp2040_hal::entry]",
+            "#[rp235x_hal::entry]",
+            "#[cortex_m_rt::entry]",
+        ] {
+            assert!(seen.contains(want), "{want}: {seen:?}");
+        }
+    }
+
     /// The helper above, on the one shape no built-in produces.
     #[test]
     fn the_entry_is_found_past_an_allow_between_it_and_main() {

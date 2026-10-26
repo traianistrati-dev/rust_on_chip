@@ -1744,7 +1744,7 @@ const BLOCKING_HAL_DIRECT_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "Entry:",
-            "The HAL's blocking entry - #[esp_hal::main] on an ESP, rp-hal's entry on a Pico, #[entry] on an nRF - into fn main() -> !, which runs forever with no executor.",
+            "The HAL's blocking entry - #[esp_hal::main] on an ESP, #[rp2040_hal::entry] or #[rp235x_hal::entry] on a Pico, #[cortex_m_rt::entry] on an nRF - into fn main() -> !, which runs forever with no executor.",
         ),
         (
             "Drivers:",
@@ -1870,6 +1870,13 @@ pub fn native_supported(family: &str) -> bool {
 /// `#[entry] fn main() -> !` with no executor and no `.await`; embassy-stm32 is
 /// simply that family's HAL, and it is a perfectly ordinary blocking one.
 pub fn blocking_hal_note(family: &str) -> &'static str {
+    if super::rp::is_rp(family) {
+        return if family == "rp2040" {
+            "rp2040-hal  ·  blocking drivers"
+        } else {
+            "rp235x-hal  ·  blocking drivers"
+        };
+    }
     if family == "stm32f1" {
         "stm32f1xx-hal  ·  portable blocking drivers (embedded-io / \
          embedded-hal 1.0); per-module Native opt-in"
@@ -1892,6 +1899,31 @@ pub fn blocking_hal_note(family: &str) -> &'static str {
     } else {
         "the family's HAL, blocking"
     }
+}
+
+/// The attribute `main.rs` opens `fn main() -> !` with on the Blocking (and
+/// Native) runtime on `family`: cortex-m-rt's on every STM32 (`#[entry]`,
+/// imported by the header) and nRF (`#[cortex_m_rt::entry]`, by path), the
+/// HAL's own re-export on a Pico (`#[rp2040_hal::entry]`), and esp-hal's on
+/// an ESP (`#[esp_hal::main]`). Each backend writes its own (`stm32.rs`,
+/// `embassy_common`, `nrf.rs`, `rp.rs`, `codegen_esp`), and
+/// `blocking_entry_is_what_every_backend_writes` holds this to them.
+pub fn blocking_entry_attr(family: &str) -> String {
+    if is_esp(family) {
+        "#[esp_hal::main]".to_owned()
+    } else if super::rp::is_rp(family) {
+        format!("#[{}::entry]", super::rp::hal_crate(family))
+    } else if super::nrf::is_nrf(family) {
+        "#[cortex_m_rt::entry]".to_owned()
+    } else {
+        "#[entry]".to_owned()
+    }
+}
+
+/// [`blocking_entry_attr`] with the `fn` it opens, as the System tab's card
+/// and the Apply list name the entry.
+pub fn blocking_entry(family: &str) -> String {
+    format!("{} fn main() -> !", blocking_entry_attr(family))
 }
 
 /// Does this family have the `pins/configs/io.rs` GPIO bridge (the Portable /

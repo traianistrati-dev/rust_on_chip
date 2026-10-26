@@ -1972,8 +1972,9 @@ impl Mcu {
             .map(|l| format!("• {l}"))
             .collect();
 
-        // 2. Entry-point change. Blocking and Native share `#[entry] fn main()
-        //    -> !`; Async and RTIC each write their own.
+        // 2. Entry-point change. Blocking and Native share the family's
+        //    blocking entry (`family::blocking_entry`); Async and RTIC each
+        //    write their own.
         {
             use super::model::Runtime;
             use crate::panels::mcu_module::codegen::family;
@@ -1981,18 +1982,16 @@ impl Mcu {
             // the blocking entry is esp-hal's, not cortex-m-rt's.
             let esp = family::async_is_esp(&self.family);
             let entry_of = |rt: Runtime| match rt {
-                Runtime::Async if family::async_supported(&self.family) => {
-                    if esp {
-                        "#[esp_rtos::main] async fn main(Spawner)"
-                    } else {
-                        "#[embassy_executor::main] async fn main(Spawner)"
-                    }
+                Runtime::Async if family::async_supported(&self.family) => if esp {
+                    "#[esp_rtos::main] async fn main(Spawner)"
+                } else {
+                    "#[embassy_executor::main] async fn main(Spawner)"
                 }
+                .to_owned(),
                 Runtime::Rtic if family::rtic_supported(&self.family) => {
-                    "#[rtic::app] (init/idle, tasks bound to IRQs)"
+                    "#[rtic::app] (init/idle, tasks bound to IRQs)".to_owned()
                 }
-                _ if esp => "#[esp_hal::main] fn main() -> !",
-                _ => "#[entry] fn main() -> !",
+                _ => family::blocking_entry(&self.family),
             };
             let (was, will) = (entry_of(self.runtime), entry_of(self.pending_runtime));
             if was != will {

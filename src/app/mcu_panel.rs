@@ -4082,13 +4082,16 @@ fn runtime_card(
 //
 // The two-space "  ·  " between a subtitle's parts is deliberate.
 
-/// The Blocking card's subtitle names the HAL this CHIP will use — see
-/// `family::blocking_hal_note`. A fixed sentence described the F1 path only,
-/// which made embassy-stm32 appearing in a Blocking project on any other STM32
-/// look like the choice had been ignored.
+/// The Blocking card's subtitle names the entry and the HAL this CHIP will
+/// use — see `family::blocking_entry` and `family::blocking_hal_note`. A fixed
+/// sentence described the F1 path only, which made embassy-stm32 appearing in
+/// a Blocking project on any other STM32 look like the choice had been
+/// ignored - and `#[entry]` on an ESP or a Pico, whose main.rs opens with
+/// another attribute.
 fn blocking_subtitle(family: &str) -> String {
     format!(
-        "#[entry] fn main() -> !  ·  {}",
+        "{}  ·  {}",
+        family::blocking_entry(family),
         family::blocking_hal_note(family)
     )
 }

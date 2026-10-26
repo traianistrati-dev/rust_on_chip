@@ -3500,16 +3500,12 @@ fn not_built_here(label: &str, built: bool) -> String {
 }
 
 /// One Virtual Module's "Generate driver" switch, keyed like its notes by
-/// `(kind, instance)` (`Mcu::raw_modules`). The caller draws it only where it
-/// decides something: an embassy STM32 backend, and a module whose driver the
-/// staged runtime can build (`embassy_stm32::driver_generated`). The stored
-/// value is never cleared where the switch is hidden - it is shared by both
-/// runtimes.
-pub fn driver_switch(
-    ui: &mut egui::Ui,
-    raw: &mut std::collections::BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
-    key: crate::panels::mcu_module::modules::NotesKey,
-) {
+/// `(kind, instance)` (`Mcu::raw_modules`) - or a comparator card's, by
+/// instance (`Mcu::raw_comps`). The caller draws it only where it decides
+/// something: an embassy STM32 backend, and a module whose driver the staged
+/// runtime can build (`embassy_stm32::driver_generated`). The stored value is
+/// never cleared where the switch is hidden - it is shared by both runtimes.
+pub fn driver_switch<K: Ord>(ui: &mut egui::Ui, raw: &mut std::collections::BTreeSet<K>, key: K) {
     let mut on = !raw.contains(&key);
     let r = ui.checkbox(&mut on, "Generate driver").on_hover_text(
         "On: pins/configs/ gets this peripheral's driver, and main.rs calls its `init` \
@@ -3517,7 +3513,7 @@ pub fn driver_switch(
          Off: no driver. The pads stay the labelled raw bindings in main.rs, for your \
          own code.\n\
          A project saved before the Blocking runtime generated drivers opens with it \
-         off for every module its code already wires by hand.",
+         off for every peripheral its code already wires by hand.",
     );
     if r.changed() {
         if on {

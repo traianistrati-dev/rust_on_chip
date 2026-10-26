@@ -3564,6 +3564,7 @@ impl AppIde {
         // The "Generate driver" switches: one off takes a driver out of
         // pins/configs/ and its init out of main.rs.
         mcu.raw_modules.hash(&mut hasher);
+        mcu.raw_comps.hash(&mut hasher);
 
         // Comparators, for exactly the same reason and from the same tab.
         // `family.rs` passes `settings: &mcu.comp` into the emitter, and the

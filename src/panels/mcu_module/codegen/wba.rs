@@ -22,10 +22,12 @@
 //! and the driver is handed that variable. A pad bound as GPIO/Flex is handed
 //! as `p.PXn` and its binding left out. Every remaining line round-trips
 //! through [`super::parse_main_rs`], so the Pins canvas restores on reopen.
-//! Pads of modules with no driver (ADC, ...) stay raw bindings. SAI/I2S/SDMMC/COMP,
-//! which embassy drives only asynchronously, and any module whose
-//! "Generate driver" switch is off (`Mcu::raw_modules`), get a
-//! "NOT initialised" comment in main.rs and keep their pads raw.
+//! The comparators get their `comp{n}.rs` too, and main.rs the
+//! `bind_interrupts!` their `Comp::new` takes. Pads of modules with no driver
+//! (ADC, ...) stay raw bindings. SAI/I2S/SDMMC, which embassy drives only
+//! asynchronously, and any module or comparator whose "Generate driver" switch
+//! is off (`Mcu::raw_modules`, `Mcu::raw_comps`), get a "NOT initialised"
+//! comment in main.rs and keep their pads raw.
 
 use super::super::clock::model::ClockConfig;
 use super::embassy_common;
@@ -53,6 +55,8 @@ pub fn make_generated_section(
     manual: bool,
     // The chip's interrupt vectors, for the armed inputs' handlers.
     vectors: &[String],
+    // The comparators' `bind_interrupts!` - see the shared builder.
+    irqs: &str,
 ) -> String {
     embassy_common::make_generated_section(
         mcu_name,
@@ -61,6 +65,7 @@ pub fn make_generated_section(
         periph_calls,
         custom_inits,
         vectors,
+        irqs,
     )
 }
 
@@ -105,6 +110,7 @@ mod tests {
             "",
             false,
             &[],
+            "",
         );
 
         // Shape: gpio imports (both kinds), embassy init, one line per pin.
@@ -149,6 +155,7 @@ mod tests {
             "",
             false,
             &[],
+            "",
         );
         assert!(
             section.contains("let pc13_in = Input::new(p.PC13, Pull::Up); // GPIO Input"),
@@ -168,6 +175,7 @@ mod tests {
             "",
             false,
             &[],
+            "",
         );
         assert!(!section.contains("use embassy_stm32::gpio"));
         assert!(section.contains("No pins configured yet"));
@@ -190,6 +198,7 @@ mod tests {
             "",
             false,
             &[],
+            "",
         );
         assert!(!wba55.contains("init(Default::default())"), "{wba55}");
         assert!(wba55.contains("Sai1sel::HSI"), "{wba55}");
@@ -219,6 +228,7 @@ mod tests {
             "",
             false,
             &[],
+            "",
         );
         for needle in [
             "config.rcc.hse = Some(rcc::Hse { prescaler: rcc::HsePrescaler::DIV1 });",
@@ -240,8 +250,17 @@ mod tests {
         let mut gc2 = gc.clone();
         gc2.graph.node_mut("sw").unwrap().state =
             crate::panels::mcu_module::clock::graph::NodeState::Index(1);
-        let s2 =
-            make_generated_section("WBA", "", &[], &ClockConfig::Graph(gc2), "", "", false, &[]);
+        let s2 = make_generated_section(
+            "WBA",
+            "",
+            &[],
+            &ClockConfig::Graph(gc2),
+            "",
+            "",
+            false,
+            &[],
+            "",
+        );
         assert!(s2.contains("config.rcc.sys = rcc::Sysclk::HSE;"));
         assert!(!s2.contains("config.rcc.pll1"));
         assert!(s2.contains("VoltageScale::RANGE1"));
@@ -264,6 +283,7 @@ mod tests {
             "",
             false,
             &[],
+            "",
         );
         assert!(!s3.contains("Default::default()"), "{s3}");
         assert!(s3.contains("config.rcc.mux.rngsel = rcc::mux::Rngsel::HSI; // embassy's default, LSE, is not running"), "{s3}");
@@ -277,6 +297,7 @@ mod tests {
             "",
             false,
             &[],
+            "",
         );
         assert!(
             s3.contains("config.rcc.mux.sai1sel = rcc::mux::Sai1sel::HSI;"),
@@ -291,7 +312,7 @@ mod tests {
         let v1 = format!(
             "{}{}\n{USER_TAIL}",
             invariant_header("X", "x"),
-            make_generated_section("X", "", &[], &ClockConfig::None, "", "", false, &[])
+            make_generated_section("X", "", &[], &ClockConfig::None, "", "", false, &[], "")
         );
         let edited = v1.replace(
             "// Your main loop code here.",
@@ -300,7 +321,7 @@ mod tests {
         let pb5 = pin("PB5", PinFunction::GpioOutput);
         let v2 = splice_section(
             &edited,
-            &make_generated_section("X", "", &[&pb5], &ClockConfig::None, "", "", false, &[]),
+            &make_generated_section("X", "", &[&pb5], &ClockConfig::None, "", "", false, &[], ""),
             "X",
             "x",
         );

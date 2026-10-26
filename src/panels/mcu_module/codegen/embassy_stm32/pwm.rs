@@ -565,6 +565,7 @@ mod pwm_tests {
                 settings: &Default::default(),
                 instances: &[],
                 pins: &[],
+                raw: &Default::default(),
             },
             &refs,
             &Default::default(),

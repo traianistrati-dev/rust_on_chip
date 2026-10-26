@@ -11,7 +11,8 @@
 //! handed as `p.PXn`, and [`unbound_by_drivers`] leaves its binding out), and a
 //! "NOT initialised" note where a driver is refused, async-only or switched
 //! off. Last are the Configuration tab's and the Custom modules' inits. The
-//! per-chip parts arrive as strings: the clock block and the driver lines.
+//! per-chip parts arrive as strings: the clock block, the driver lines and the
+//! comparators' `bind_interrupts!` (above `#[entry]`, with the EXTI handlers).
 //!
 //! Used by the STM32WBA backend and the generic STM32 backend. Both render the
 //! Clock tab's RCC block (`rcc::graph_clock_block_*`), and fall back to
@@ -181,6 +182,10 @@ pub fn make_generated_section(
     // handler only on a line one of them serves; none - a chip imported without
     // vendor data - and every armed input is refused, in writing.
     vectors: &[String],
+    // The `bind_interrupts!` the drivers' inits take (`AsyncPeriphs::dma_irqs`:
+    // the comparators' on this runtime), "" when none. An item, so above the
+    // entry with the EXTI handlers.
+    irqs: &str,
 ) -> String {
     // The Async plan, so both runtimes refuse the same pads for the same
     // reasons: a line already taken, or no vector for it.
@@ -212,7 +217,7 @@ pub fn make_generated_section(
          {body}\
          {GEN_END}\n",
         // Statics and handlers are items: above the entry, not inside it.
-        items = super::embassy_stm32::exti_blocking_items(&exti),
+        items = format!("{irqs}{}", super::embassy_stm32::exti_blocking_items(&exti)),
     )
 }
 
@@ -940,6 +945,11 @@ mod emit_for_manual_compile {
     /// different `Irqs` keys — `COMP1_2_3` and `COMP4_5_6` on this part, where
     /// a G431 would use plain `COMP4`. Only a compiler can confirm any of that.
     ///
+    /// `EIDE_COMP_XML` picks another part (a U5 or WBA: COMP1 and COMP2 on one
+    /// `COMP` vector), `EIDE_COMP_RUNTIME=blocking` the Blocking runtime, and
+    /// `EIDE_COMP_UPGRADE=hand` (with it) an old Blocking project whose own
+    /// code wires COMP1 - see the branch below.
+    ///
     /// ```text
     /// cargo test --bin rust_on_chip emit_comp_project -- --ignored --nocapture
     /// cd %TEMP%\eide_comp_check && cargo check --target thumbv7em-none-eabihf
@@ -986,7 +996,15 @@ mod emit_for_manual_compile {
         def.sdmmc_ip = stm32_pin_data::sdmmc_ip_version(&xml);
 
         let mut mcu = def.build_mcu();
-        mcu.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
+        // `EIDE_COMP_RUNTIME=blocking`: the same two comparators under
+        // `#[entry]`, bound by the Blocking runtime's own `bind_interrupts!`.
+        let blocking = std::env::var("EIDE_COMP_RUNTIME").as_deref() == Ok("blocking");
+        mcu.runtime = if blocking {
+            crate::panels::mcu_module::mcu::model::Runtime::Blocking
+        } else {
+            crate::panels::mcu_module::mcu::model::Runtime::Async
+        };
+        mcu.pending_runtime = mcu.runtime;
         let instances = comparator::instances(&mcu);
         let generation = comparator::Generation::of(&def.family)
             .unwrap_or_else(|| panic!("{} has no comparator driver", def.family));
@@ -1048,12 +1066,99 @@ mod emit_for_manual_compile {
             },
         );
 
-        let main_rs = mcu.fresh_main_rs();
+        // `EIDE_COMP_UPGRADE=hand` (Blocking): a project from before the
+        // Blocking runtime built comparators, whose own code wires COMP{a}
+        // from its raw pad and binds its vector itself, the way embassy's
+        // examples do it: a `use` of `bind_interrupts` and `peripherals` and a
+        // `struct Irqs` below `main`. Opened, COMP{a} - and every comparator on
+        // its vector - must start with "Generate driver" off, and the project
+        // build with that code next to whatever is still generated: COMP{b}
+        // on a G474, where the two are on different vectors; nothing on a
+        // U5/WBA, where both share `COMP`.
+        let by_hand = std::env::var("EIDE_COMP_UPGRADE").as_deref() == Ok("hand");
+        let vector = |n: u8| {
+            crate::panels::mcu_module::codegen::embassy_stm32::comp_irq(
+                &mcu.irq_vectors,
+                n,
+                &instances,
+            )
+        };
+        let shared = vector(a) == vector(b);
+        let main_rs = if by_hand {
+            assert!(blocking, "EIDE_COMP_UPGRADE=hand is a Blocking project");
+            let inp = mcu
+                .iter_all_pins()
+                .find(|p| p.selected_function == PinFunction::Other(format!("COMP{a}_INP")))
+                .map(super::binding_var)
+                .unwrap_or_else(|| panic!("COMP{a}_INP is not wired"));
+            let va = vector(a);
+            // The pads bound raw, as every Blocking project bound them then.
+            mcu.raw_comps.insert(a);
+            mcu.raw_comps.insert(b);
+            let old = mcu.fresh_main_rs();
+            mcu.raw_comps.clear();
+            let end = old.find(super::GEN_END).expect("the block") + super::GEN_END.len();
+            let hand = format!(
+                "\n    let mut wired_by_hand = embassy_stm32::comp::Comp::new(\n        \
+                 p.COMP{a}, {inp}, Irqs, embassy_stm32::comp::Config::default());\n    \
+                 wired_by_hand.enable();\n    \
+                 let _level = wired_by_hand.output_level();\n"
+            );
+            let items = format!(
+                "\nuse embassy_stm32::{{bind_interrupts, peripherals}};\n\n\
+                 bind_interrupts!(struct Irqs {{\n    \
+                 {va} => embassy_stm32::comp::InterruptHandler<peripherals::COMP{a}>;\n\
+                 }});\n"
+            );
+            let old = format!("{}{hand}{}{items}", &old[..end], &old[end..]);
+            // What the open path does with a config that has no comparator
+            // marker in `@drivers`.
+            mcu.raw_comps = mcu.comparators_used_by_hand(&old);
+            assert!(
+                mcu.raw_comps.contains(&a) && mcu.raw_comps.contains(&b) == shared,
+                "COMP{a} wired by hand, COMP{b} {}: {:?}",
+                if shared { "on its vector" } else { "not" },
+                mcu.raw_comps
+            );
+            mcu.update_main_rs(&old)
+        } else {
+            mcu.fresh_main_rs()
+        };
         // Whatever the vectors are called on this part, both comparators must
         // be initialised AND bound. Derived, not hardcoded: a G474 uses
         // `COMP1_2_3` and `COMP4_5_6`, a U5 puts both on one vector named
-        // `COMP`, and the point is that the emitter agrees with the chip.
-        for n in [a, b] {
+        // `COMP`, and the point is that the emitter agrees with the chip. The
+        // hand-wired one is the user's, bound by their own struct.
+        let generated: &[u8] = match (by_hand, shared) {
+            (false, _) => &[a, b],
+            (true, false) => &[b],
+            (true, true) => &[],
+        };
+        if blocking && !generated.is_empty() {
+            let bind = main_rs.find("bind_interrupts!(struct CompIrqs {");
+            let entry = main_rs.find("#[entry]");
+            assert!(
+                matches!((bind, entry), (Some(i), Some(e)) if i < e),
+                "Blocking binds above #[entry]:\n{main_rs}"
+            );
+        }
+        if by_hand {
+            assert!(
+                !main_rs.contains(&format!("pins::configs::comp{a}::init(")),
+                "{main_rs}"
+            );
+            assert!(main_rs.contains("wired_by_hand.enable();"), "{main_rs}");
+            assert!(
+                main_rs.contains("bind_interrupts!(struct Irqs {"),
+                "{main_rs}"
+            );
+        }
+        let peri = if blocking {
+            "embassy_stm32::peripherals::"
+        } else {
+            "peripherals::"
+        };
+        for &n in generated {
             assert!(
                 main_rs.contains(&format!("pins::configs::comp{n}::init(p.COMP{n},")),
                 "COMP{n} not initialised:
@@ -1061,7 +1166,7 @@ mod emit_for_manual_compile {
             );
             assert!(
                 main_rs.contains(&format!(
-                    "embassy_stm32::comp::InterruptHandler<peripherals::COMP{n}>"
+                    "embassy_stm32::comp::InterruptHandler<{peri}COMP{n}>"
                 )),
                 "COMP{n} not bound:
 {main_rs}"

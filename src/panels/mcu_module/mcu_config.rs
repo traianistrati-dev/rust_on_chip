@@ -1166,10 +1166,14 @@ pub fn notes_section(
 }
 
 /// Write `@drivers`: the header, then one `raw <kind> <instance>` line per
-/// module whose "Generate driver" switch is off. The header goes in with no
-/// line under it too - its presence is what `parse_drivers` reports.
+/// module whose "Generate driver" switch is off, then - on a chip with a
+/// comparator driver (`comps`) - the [`COMPS_MARKER`] line and one
+/// `raw comp <instance>` per comparator whose card has it off. The header goes
+/// in with no line under it too - its presence is what `parse_drivers` reports.
 pub fn drivers_section(
     raw: &std::collections::BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
+    comps: bool,
+    raw_comps: &std::collections::BTreeSet<u8>,
 ) -> String {
     let mut s = format!("{DRIVERS_HEADER}\n");
     for (kind, instance) in raw {
@@ -1177,7 +1181,45 @@ pub fn drivers_section(
             s.push_str(&format!("raw {kind} {instance}\n"));
         }
     }
+    if comps || !raw_comps.is_empty() {
+        s.push_str(&format!("{COMPS_MARKER}\n"));
+    }
+    for n in raw_comps {
+        s.push_str(&format!("raw {RAW_COMP_WORD} {n}\n"));
+    }
     s
+}
+
+/// The `@drivers` line that says the comparators' switches were saved here.
+///
+/// A marker of their own, not the section's presence: the IDE that first
+/// wrote `@drivers` still refused comparators on the Blocking runtime, so a
+/// project it saved can hold code that wires one by hand - and has the section
+/// all the same. `parse_drivers` skips the line, as that IDE did.
+const COMPS_MARKER: &str = "comparators";
+
+/// The word a comparator's `@drivers` line names instead of a module kind -
+/// lower case, so no `ModuleKind` ever reads as it (and `parse_drivers` skips
+/// the line, as an IDE from before this did).
+const RAW_COMP_WORD: &str = "comp";
+
+/// The comparators `@drivers` keeps raw (`raw comp <n>`), or `None` when the
+/// section has no [`COMPS_MARKER`] - a project saved before the Blocking
+/// runtime built comparators, whose code the open path scans
+/// (`Mcu::comparators_used_by_hand`).
+pub fn parse_raw_comps(text: &str) -> Option<std::collections::BTreeSet<u8>> {
+    let body = section_body(text, DRIVERS_HEADER)?;
+    body.lines().any(|l| l.trim() == COMPS_MARKER).then(|| {
+        body.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                if words.next()? != "raw" || words.next()? != RAW_COMP_WORD {
+                    return None;
+                }
+                words.next()?.parse().ok()
+            })
+            .collect()
+    })
 }
 
 /// Read `@drivers` back: `None` when the section is missing - a project saved

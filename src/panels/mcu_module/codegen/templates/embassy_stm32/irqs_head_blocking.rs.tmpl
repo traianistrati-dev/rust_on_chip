@@ -1,0 +1,5 @@
+// The comparators' interrupt binding: embassy's `Comp::new` takes one on every
+// runtime. Its handler serves the async edge waits, which nothing calls here.
+// Spelled out in full and named for them alone, so it never meets an `Irqs` or
+// a `use` of your own.
+embassy_stm32::bind_interrupts!(struct {STRUCT} {

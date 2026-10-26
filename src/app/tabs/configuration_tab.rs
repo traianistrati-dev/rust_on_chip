@@ -195,7 +195,15 @@ impl AppIde {
                 ui.add_space(12.0);
             }
 
-            comp_cards(ui, &mut mcu.comp, &comps, comp_gen, &family, is_async);
+            comp_cards(
+                ui,
+                &mut mcu.comp,
+                &mut mcu.raw_comps,
+                &comps,
+                comp_gen,
+                &family,
+                is_async,
+            );
             ui.add_space(12.0);
 
             if show_adc {
@@ -1861,9 +1869,16 @@ fn adc_card(
 ///   absent from `comp::Config` entirely.
 /// * **External Output** — `COMP{n}_OUT` is an ordinary pin function on the
 ///   Pins tab; `Comp::new` takes no output pin.
+///
+/// Built on both runtimes: `Comp::new` and `output_level()` are plain calls,
+/// and the interrupt binding the constructor takes is written on Blocking too.
+/// Only the edge waits are async, which the Blocking line under the heading
+/// says. Each card switched on has its "Generate driver" switch (`raw`,
+/// `Mcu::raw_comps`).
 fn comp_cards(
     ui: &mut egui::Ui,
     settings: &mut CompSettings,
+    raw: &mut std::collections::BTreeSet<u8>,
     comps: &[(u8, Option<String>, Option<String>)],
     generation: Option<comparator::Generation>,
     family: &str,
@@ -1895,26 +1910,28 @@ fn comp_cards(
         );
         return;
     };
-    if !is_async {
-        ui.label(
-            egui::RichText::new(format!(
-                "{}  `Comp::new` takes an interrupt binding, so comparators are generated on \
-                 the Async runtime only. Switch it in the System tab.",
-                ph::WARNING
-            ))
-            .size(11.0)
-            .color(egui::Color32::from_rgb(235, 150, 90)),
-        );
-        return;
-    }
     ui.label(dim(
         "The [+] input is a pin: configure COMPn_INP on the Pins tab. Everything below \
          is a register with no pin of its own.",
     ));
+    if !is_async {
+        ui.label(dim(
+            "Blocking: read the result with `output_level()`. The edge waits \
+             (`wait_for_rising_edge()` and the others) are async - the Async runtime has them.",
+        ));
+    }
     ui.add_space(6.0);
 
     for (n, inp, inm) in comps {
-        comp_card(ui, settings, *n, inp.as_deref(), inm.as_deref(), generation);
+        comp_card(
+            ui,
+            settings,
+            raw,
+            *n,
+            inp.as_deref(),
+            inm.as_deref(),
+            generation,
+        );
         ui.add_space(6.0);
     }
 }
@@ -1923,6 +1940,7 @@ fn comp_cards(
 fn comp_card(
     ui: &mut egui::Ui,
     settings: &mut CompSettings,
+    raw: &mut std::collections::BTreeSet<u8>,
     n: u8,
     inp: Option<&str>,
     inm: Option<&str>,
@@ -1959,6 +1977,9 @@ fn comp_card(
         let Some(cfg) = settings.get_mut(&n) else {
             return;
         };
+        // Kept per instance even while the card is off, like a module's: a
+        // card switched back on finds its old choice.
+        crate::panels::mcu_module::mcu::gui::modules::driver_switch(ui, raw, n);
         ui.add_space(4.0);
         egui::Grid::new(format!("comp{n}_grid"))
             .num_columns(2)
@@ -2305,5 +2326,104 @@ mod tests {
         // The F1 is excluded for a real reason: its channels are fixed in the
         // HAL's types, so there is nothing to import.
         assert!(!dma_note(None, "stm32f1", true).contains("STM32Cube"));
+    }
+}
+
+/// The comparator cards, drawn: on Blocking as on Async, each card switched
+/// on with its "Generate driver" switch.
+#[cfg(test)]
+mod comp_card_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn frame(
+        ctx: &egui::Context,
+        pass: u64,
+        events: Vec<egui::Event>,
+        settings: &mut CompSettings,
+        raw: &mut BTreeSet<u8>,
+        is_async: bool,
+    ) -> egui::FullOutput {
+        let comps = [(1u8, Some("PA1".to_owned()), None), (2u8, None, None)];
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 900.0),
+            )),
+            time: Some(pass as f64 / 30.0),
+            predicted_dt: 1.0 / 30.0,
+            events,
+            ..Default::default()
+        };
+        crate::headless::run_ui(ctx, input, |ui| {
+            comp_cards(
+                ui,
+                settings,
+                raw,
+                &comps,
+                Some(comparator::Generation::V2),
+                "stm32g4",
+                is_async,
+            );
+        })
+    }
+
+    fn painted(out: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        fn walk(s: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match s {
+                egui::Shape::Text(t) if t.galley.text().contains(needle) => {
+                    Some(t.visual_bounding_rect())
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|c| walk(&c.shape, needle))
+    }
+
+    fn click(at: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    /// Blocking builds the comparators now: the cards are there, not the old
+    /// "Async only" refusal, with a line saying what this runtime can read.
+    /// The switch belongs to COMP1, the one card switched on, and a click
+    /// keeps COMP1 raw - nothing else.
+    #[test]
+    fn the_cards_show_on_blocking_and_the_switch_keeps_one_comparator_raw() {
+        let ctx = egui::Context::default();
+        let mut settings = CompSettings::new();
+        settings.insert(1, CompConfig::default());
+        let mut raw = BTreeSet::new();
+        let mut out = frame(&ctx, 0, vec![], &mut settings, &mut raw, false);
+        for pass in 1..3 {
+            out = frame(&ctx, pass, vec![], &mut settings, &mut raw, false);
+        }
+        assert!(painted(&out, "COMP1").is_some());
+        assert!(painted(&out, "Hysteresis").is_some(), "COMP1's settings");
+        assert!(painted(&out, "Blocking: read the result").is_some());
+        assert!(painted(&out, "Async runtime only").is_none());
+        let at = painted(&out, "Generate driver")
+            .expect("COMP1's switch")
+            .center();
+        frame(&ctx, 3, click(at, true), &mut settings, &mut raw, false);
+        frame(&ctx, 4, click(at, false), &mut settings, &mut raw, false);
+        assert_eq!(raw, [1].into());
+        assert!(settings.contains_key(&1), "the card keeps its settings");
+        let out = frame(&ctx, 5, vec![], &mut settings, &mut raw, false);
+        assert!(painted(&out, "no driver: the pads stay raw").is_some());
+
+        // On Async: the same cards, without the Blocking line.
+        let out = frame(&ctx, 6, vec![], &mut settings, &mut raw, true);
+        assert!(painted(&out, "Generate driver").is_some());
+        assert!(painted(&out, "Blocking: read the result").is_none());
     }
 }

@@ -182,6 +182,7 @@ impl Mcu {
             groups: Vec::new(),
             module_notes: std::collections::BTreeMap::new(),
             raw_modules: std::collections::BTreeSet::new(),
+            raw_comps: std::collections::BTreeSet::new(),
             watchdog: Default::default(),
             comp: Default::default(),
             adc: Default::default(),
@@ -1637,8 +1638,8 @@ impl Mcu {
         // for a switch turned off, which its Async runtime reads.
         //
         // And only where a later scan could find something: a project with no
-        // module a driver exists for round-trips byte for byte, as it did
-        // before the switch.
+        // module a driver exists for, and no comparator switched on, round-trips
+        // byte for byte, as it did before the switch.
         let driver_module = self.modules.iter().any(|m| {
             !m.kind.is_custom()
                 && !crate::panels::mcu_module::codegen::embassy_stm32::driver_singletons(
@@ -1647,13 +1648,24 @@ impl Mcu {
                 )
                 .is_empty()
         });
+        // A chip with a comparator driver also marks its comparators' switches
+        // as saved (`mcu_config::parse_raw_comps`): the first IDE to write
+        // `@drivers` still refused them on Blocking.
+        let comps = crate::panels::mcu_module::comparator::Generation::of(&self.family).is_some();
+        let comp_driver = comps && !self.comp.is_empty();
         if self.family.starts_with("stm32")
-            && (!self.raw_modules.is_empty() || (self.family != "stm32f1" && driver_module))
+            && (!self.raw_modules.is_empty()
+                || !self.raw_comps.is_empty()
+                || (self.family != "stm32f1" && (driver_module || comp_driver)))
         {
             if !s.is_empty() {
                 s.push('\n');
             }
-            s.push_str(&mcu_config::drivers_section(&self.raw_modules));
+            s.push_str(&mcu_config::drivers_section(
+                &self.raw_modules,
+                comps,
+                &self.raw_comps,
+            ));
         }
         // Virtual Module notes (`@modulenotes`). Written here like any other
         // section, but NOT codegen input - see `Mcu::module_notes`.
@@ -1779,6 +1791,7 @@ impl Mcu {
         // generate - unless its code wires one by hand, which the open path
         // asks once main.rs is read (`Mcu::modules_used_by_hand`).
         self.raw_modules = mcu_config::parse_drivers(text).unwrap_or_default();
+        self.raw_comps = mcu_config::parse_raw_comps(text).unwrap_or_default();
         self.comp = mcu_config::parse_comp(text);
         self.adc = mcu_config::parse_adc(text);
         self.flash_store = mcu_config::parse_flashstore(text);
@@ -2056,7 +2069,7 @@ impl Mcu {
             }
         }
         // What the staged runtime's driver pass leaves out that this one
-        // generates: SDMMC, SAI, I2S and COMP going to embassy Blocking, the
+        // generates: SDMMC, SAI and I2S going to embassy Blocking, the
         // timer embassy-time takes going to Async. Read off the same pass that
         // writes main.rs's note, so the two cannot disagree; a gap this side
         // already has is not news.

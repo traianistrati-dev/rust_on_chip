@@ -4,9 +4,9 @@ use super::*;
 
 /// Everything the comparator pass needs, as one argument.
 ///
-/// Three values that only ever travel together — and `async_peripherals` had
-/// nine parameters with them spread out, which is where a caller starts passing
-/// them in the wrong order.
+/// Values that only ever travel together — and `async_peripherals` had nine
+/// parameters with them spread out, which is where a caller starts passing them
+/// in the wrong order.
 pub struct CompInputs<'a> {
     /// The instances the Configuration tab switched on, with their settings.
     pub settings: &'a comparator::CompSettings,
@@ -15,23 +15,114 @@ pub struct CompInputs<'a> {
     pub instances: &'a [u8],
     /// `(instance, INP pin, INM pin)` for the ones whose pins are wired.
     pub pins: &'a [(u8, String, Option<String>)],
+    /// The instances whose card has "Generate driver" off (`Mcu::raw_comps`):
+    /// no driver, the pads left to the user's own code.
+    pub raw: &'a BTreeSet<u8>,
 }
 
-/// One comparator, on the Async runtime. STM32G4 only — see
+/// One comparator, on either runtime. STM32G4, U5 and WBA only — see
 /// [`crate::panels::mcu_module::comparator`] for why.
 ///
 /// `{INM_PARAM}` / `{INM_ARG}` are empty unless the inverting input is a PIN:
 /// embassy has two constructors, and the one that takes an `inm` ignores
 /// `config.inverting_input` entirely. Emitting the pin argument and the config
 /// field together would show a choice the driver then drops.
+///
+/// `{INTRO}` / `{USAGE}` are the runtime's: the edge waits are `async fn`s, so
+/// the Blocking text reads `output_level()` only. Both runtimes take the
+/// interrupt binding - `Comp::new` asks for it either way.
 pub(super) const COMP_TMPL: &str = include_str!("../templates/embassy_stm32/comp.rs.tmpl");
+
+/// The Async runtime's `{INTRO}` - the text the file had before the token.
+const COMP_ASYNC_INTRO: &str =
+    "// `init` returns embassy's `Comp`, already enabled. The comparator then runs on
+// its own: no CPU involvement until you ask, either by polling `output_level()`
+// or by awaiting an edge.
+";
+
+/// ...and its `{USAGE}`, after the `output_level()` example both share.
+const COMP_ASYNC_USAGE: &str = "//
+//     // Or wait for the input to cross the threshold. WHICH edge you wait for
+//     // is chosen here, not in the config: embassy arms EXTI per call, so
+//     // there is no \"trigger mode\" field to set.
+//     {HANDLE}.wait_for_rising_edge().await;
+//     {HANDLE}.wait_for_falling_edge().await;
+//     {HANDLE}.wait_for_any_edge().await;
+";
+
+/// The Blocking runtime's `{INTRO}`: no executor, so nothing awaits an edge.
+const COMP_BLOCKING_INTRO: &str =
+    "// `init` returns embassy's `Comp`, already enabled. The comparator then runs on
+// its own: no CPU involvement until you read `output_level()`.
+";
+
+/// ...and its `{USAGE}`. `Irqs` is main.rs's all the same: `Comp::new` takes
+/// the binding on both runtimes, and its handler serves only the edge waits.
+const COMP_BLOCKING_USAGE: &str = "//
+//     // Or poll it in your loop until the input crosses the threshold:
+//     while !{HANDLE}.output_level() {}
+//
+// The edge waits (`wait_for_rising_edge()` and the others) are `async fn`s:
+// they need the Async runtime. Here nothing arms the comparator's EXTI line,
+// so the interrupt handler main.rs binds never runs.
+";
+
+/// [`comp_config_file`] for `mode`'s runtime.
+pub(super) fn comp_config_file_for(
+    mode: PeriphMode,
+    n: u8,
+    cfg: &comparator::CompConfig,
+    g: comparator::Generation,
+) -> String {
+    let (intro, usage) = match mode {
+        PeriphMode::Async => (COMP_ASYNC_INTRO, COMP_ASYNC_USAGE),
+        PeriphMode::Blocking => (COMP_BLOCKING_INTRO, COMP_BLOCKING_USAGE),
+    };
+    render_comp(n, cfg, g, intro, usage)
+}
+
+/// The `main.rs` note for a comparator whose card has "Generate driver" off.
+///
+/// `shared` is `(vector, struct)` when a comparator that IS built binds the
+/// same vector - a G4's `COMP1_2_3`, the U5's single `COMP`. The user's own
+/// `Comp::new` cannot bind it a second time (two handlers of one name do not
+/// link), so the generated struct carries this one's handler too, and the note
+/// says to pass it.
+pub(super) fn raw_comp_note(n: u8, shared: Option<(&str, &str)>) -> String {
+    let mut note = format!(
+        "    // COMP{n} is NOT initialised: its card's \"Generate driver\" is off (Configuration
+    // tab), so its pads stay bound raw above, for your own code.
+"
+    );
+    if let Some((vector, irqs)) = shared {
+        note.push_str(&crate::panels::mcu_module::errata::comment(
+            &format!(
+                "Its vector {vector} is bound above for another comparator, with COMP{n}'s \
+                 handler in it: hand `{irqs}` to your own `Comp::new` rather than binding \
+                 {vector} again, which would not link."
+            ),
+            "    ",
+        ));
+    }
+    note
+}
 
 /// `get_config()`, below the block: the numbers mapped back. One per
 /// generation, so a Configuration-tab edit never changes it.
 pub(super) const COMP_GET_CONFIG_TMPL: &str =
     include_str!("../templates/embassy_stm32/comp_get_config.rs.tmpl");
 
-/// Render [`COMP_TMPL`] for one instance.
+/// [`COMP_TMPL`] for one instance, on the Async runtime.
+#[cfg(test)]
+pub(super) fn comp_config_file(
+    n: u8,
+    cfg: &comparator::CompConfig,
+    g: comparator::Generation,
+) -> String {
+    comp_config_file_for(PeriphMode::Async, n, cfg, g)
+}
+
+/// Render [`COMP_TMPL`] for one instance, with the runtime's text.
 ///
 /// The block holds plain numbers - places in the `comparator` lists, see
 /// [`comparator::Hysteresis::index`] - and [`comp_get_config`] below it maps
@@ -42,10 +133,12 @@ pub(super) const COMP_GET_CONFIG_TMPL: &str =
 /// exists on both generations, but `configure_raw` computes it under
 /// `#[cfg(comp_u5)]` alone — a number in a G4 project would be a setting that
 /// changes nothing, which is worse than leaving it out.
-pub(super) fn comp_config_file(
+fn render_comp(
     n: u8,
     cfg: &comparator::CompConfig,
     g: comparator::Generation,
+    intro: &str,
+    usage: &str,
 ) -> String {
     use comparator::{BlankingSource, Hysteresis, InvertingInput, OutputPolarity, PowerMode};
     let (ctor, inm_param, inm_arg) = if cfg.inverting_input.needs_pin() {
@@ -70,6 +163,9 @@ pub(super) fn comp_config_file(
     tmpl::render(
         COMP_TMPL,
         &[
+            // First: both name the handle and the instance, filled below.
+            ("{INTRO}", intro),
+            ("{USAGE}", usage),
             // A level from the other generation is not one of `g`'s options:
             // `index` gives 0, none - the belt for a `@comp` line hand-edited
             // or carried over from another chip. The card offers only `g`'s.
@@ -197,7 +293,7 @@ fn comp_get_config(g: comparator::Generation) -> String {
 /// [`nvic::vector_for_within`]. Falls back to `COMP{n}` when the chip carries
 /// no vector list, which at least fails loudly rather than silently binding the
 /// wrong one.
-pub(super) fn comp_irq(irqs: &[String], n: u8, existing: &[u8]) -> String {
+pub(crate) fn comp_irq(irqs: &[String], n: u8, existing: &[u8]) -> String {
     nvic::vector_for_within(irqs, "COMP", n, existing)
         .map(str::to_owned)
         .unwrap_or_else(|| format!("COMP{n}"))
@@ -496,6 +592,7 @@ mod comp_tests {
                     settings: set,
                     instances: &[1, 2, 3],
                     pins,
+                    raw: &Default::default(),
                 },
                 &refs,
                 &Default::default(),

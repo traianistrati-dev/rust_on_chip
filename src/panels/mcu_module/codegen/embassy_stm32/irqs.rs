@@ -9,6 +9,45 @@ pub(super) const IRQS_HEAD: &str = include_str!("../templates/embassy_stm32/irqs
 pub(super) const IRQS_HEAD_DMA_TODO: &str =
     include_str!("../templates/embassy_stm32/irqs_head_dma_todo.rs.tmpl");
 
+/// The head of the Blocking runtime's block, which binds the comparators alone.
+pub(super) const IRQS_HEAD_BLOCKING: &str =
+    include_str!("../templates/embassy_stm32/irqs_head_blocking.rs.tmpl");
+
+/// The struct the Blocking runtime binds the comparators in. Not `Irqs`:
+/// before the comparators, this runtime bound nothing, so a Blocking project's
+/// own code may hold an `Irqs` of its own (for an RNG, a USB) - and a `use` of
+/// `bind_interrupts` or `peripherals`, which is why the block names neither.
+pub(crate) const BLOCKING_COMP_IRQS: &str = "CompIrqs";
+
+/// The Blocking runtime's `bind_interrupts!`: `(vector, instance)` per
+/// comparator, grouped one key per vector as [`dma_irqs_block`] groups them -
+/// a G4's `COMP1_2_3` or a U5's `COMP` carries several - with every path
+/// spelled out from `embassy_stm32`.
+pub(super) fn blocking_comp_irqs_block(comp_binds: &[(String, u8)]) -> String {
+    let mut by_irq: Vec<(&str, Vec<u8>)> = Vec::new();
+    for (vector, n) in comp_binds {
+        match by_irq.iter_mut().find(|(v, _)| *v == vector.as_str()) {
+            Some((_, ns)) if !ns.contains(n) => ns.push(*n),
+            Some(_) => {}
+            None => by_irq.push((vector.as_str(), vec![*n])),
+        }
+    }
+    let mut b = tmpl::render(IRQS_HEAD_BLOCKING, &[("{STRUCT}", BLOCKING_COMP_IRQS)]);
+    for (vector, ns) in by_irq {
+        let handlers: Vec<String> = ns
+            .iter()
+            .map(|n| {
+                format!(
+                    "embassy_stm32::comp::InterruptHandler<embassy_stm32::peripherals::COMP{n}>"
+                )
+            })
+            .collect();
+        b.push_str(&format!("    {vector} => {};\n", handlers.join(", ")));
+    }
+    b.push_str("});\n\n");
+    b
+}
+
 /// The `bind_interrupts!` block `main.rs` needs when any bus runs on DMA.
 ///
 /// It has to live here rather than in each `configs/*.rs`, because embassy takes

@@ -3,8 +3,8 @@
 //!
 //! [`peripherals`] builds the bus drivers in either [`PeriphMode`], leaving out
 //! the modules whose "Generate driver" switch is off (`raw`): USART/LPUART,
-//! SPI, I2C, PWM, DAC and QSPI/OCTOSPI/XSPI/HSPI on both runtimes, SDMMC, SAI,
-//! I2S and COMP on Async only. [`super::family::AsyncEmbassyBackend`] runs it on
+//! SPI, I2C, PWM, DAC, QSPI/OCTOSPI/XSPI/HSPI and COMP on both runtimes, SDMMC,
+//! SAI and I2S on Async only. [`super::family::AsyncEmbassyBackend`] runs it on
 //! Async (every STM32, the F1 included), and the generic STM32 and WBA backends
 //! (`StmEmbassyBackend`, `WbaBackend`) on Blocking (every STM32 but the F1).
 //! The EXTI plan ([`exti_plan`], [`exti_blocking_hooks`]) serves the Blocking
@@ -223,7 +223,8 @@ fn label_sfx(label: &str) -> String {
 /// take, the main.rs init lines (with the NOT-initialised notes), and the
 /// `src/pins/configs/*.rs` bodies - one pass over USART/LPUART, SPI, I2C, PWM,
 /// DAC, QSPI/OCTOSPI/XSPI/HSPI, SDMMC, SAI, I2S and COMP. On Blocking,
-/// `any_async_dma` is false and `dma_irqs`, `dma_uses` and `exti` are empty.
+/// `any_async_dma` is false, `dma_uses` and `exti` are empty, and `dma_irqs`
+/// binds the comparators alone.
 pub struct AsyncPeriphs {
     /// Pin names moved into a driver → excluded from the raw GPIO bindings.
     pub consumed_pins: Vec<String>,
@@ -233,8 +234,9 @@ pub struct AsyncPeriphs {
     pub config_files: Vec<(String, String)>,
     /// True if any SPI/I2C uses async-DMA (drives the `embedded-hal-async` dep).
     pub any_async_dma: bool,
-    /// The module-level `bind_interrupts!` the DMA inits need, or "" when no bus
-    /// runs on DMA. Emitted OUTSIDE `async fn main` - see [`dma_irqs_block`].
+    /// The module-level `bind_interrupts!` the inits need, or "" when nothing
+    /// binds an interrupt. Emitted OUTSIDE `main` - see [`dma_irqs_block`]. On
+    /// Blocking only the comparators bind one.
     pub dma_irqs: String,
     /// True if any SPI/I2C exists at all (drives the `embedded-hal` 1.0 dep).
     pub any_spi_i2c: bool,
@@ -279,8 +281,9 @@ pub enum PeriphMode {
     /// in one `Irqs`, inputs awaited on their EXTI line.
     Async,
     /// `#[entry] fn main() -> !` on embassy-stm32: the `new_blocking*` drivers,
-    /// which bind no interrupt and take no channel. A peripheral embassy drives
-    /// only asynchronously (SAI, I2S, SDMMC, COMP) is NOT initialised, and
+    /// which bind no interrupt and take no channel - the comparators excepted,
+    /// whose `Comp::new` takes a binding on both runtimes. A peripheral embassy
+    /// drives only asynchronously (SAI, I2S, SDMMC) is NOT initialised, and
     /// main.rs says why where its init would be.
     Blocking,
 }
@@ -371,11 +374,6 @@ pub const SAI_BLOCKING_GAP: &str =
     "embassy drives SAI only through a DMA ring buffer, read and written with `.await`.";
 pub const I2S_BLOCKING_GAP: &str =
     "embassy has no blocking I2S - it streams through a DMA ring buffer, written with `.await`.";
-/// Not async, COMP: `Comp::new` and `output_level()` are plain calls, but the
-/// constructor takes an interrupt binding, and the Blocking runtime writes no
-/// `Irqs` block.
-pub const COMP_BLOCKING_GAP: &str = "embassy's Comp::new takes an interrupt binding, and the \
-     Blocking runtime writes no Irqs block (only its wait_for_* edge calls are async).";
 /// ...and why the timer embassy-time takes gets none on Async.
 pub const TIME_DRIVER_GAP: &str = "embassy-time runs on it: the \"time-driver-any\" feature \
      takes it on this chip, so `Peripherals` has no field for it. Move the PWM to another timer.";
@@ -1456,16 +1454,34 @@ pub fn peripherals(
     // half-wired - the card says so.
     let mut comp_binds: Vec<(String, u8)> = Vec::new();
     if let Some(generation) = comparator::Generation::of(family) {
-        for (n, cfg) in comp.settings {
-            let Some((_, inp, inm)) = comp.pins.iter().find(|(i, _, _)| i == n) else {
-                continue;
-            };
-            if cfg.inverting_input.needs_pin() && inm.is_none() {
-                continue;
-            }
-            if blocking {
-                calls.push_str(&async_only_note(&format!("COMP{n}"), COMP_BLOCKING_GAP));
-                runtime_gaps.push((format!("COMP{n}"), COMP_BLOCKING_GAP));
+        // What `init` is handed: the one `Irqs` on Async, the comparators' own
+        // struct on Blocking (see `BLOCKING_COMP_IRQS`).
+        let irqs_struct = if blocking { BLOCKING_COMP_IRQS } else { "Irqs" };
+        let vector = |n: u8| comp_irq(chip.irq_vectors, n, comp.instances);
+        let ready: Vec<_> = comp
+            .settings
+            .iter()
+            .filter_map(|(n, cfg)| {
+                let (_, inp, inm) = comp.pins.iter().find(|(i, _, _)| i == n)?;
+                (!cfg.inverting_input.needs_pin() || inm.is_some()).then_some((*n, cfg, inp, inm))
+            })
+            .collect();
+        // The vectors the built ones bind, known before the loop: a comparator
+        // kept raw on one of them cannot bind it again in the user's code (it
+        // would not link), so its handler rides in the same entry.
+        let built: Vec<String> = ready
+            .iter()
+            .filter(|(n, ..)| !comp.raw.contains(n))
+            .map(|(n, ..)| vector(*n))
+            .collect();
+        for (n, cfg, inp, inm) in ready {
+            if comp.raw.contains(&n) {
+                let v = vector(n);
+                let shared = built.contains(&v);
+                calls.push_str(&raw_comp_note(n, shared.then_some((&v, irqs_struct))));
+                if shared {
+                    comp_binds.push((v, n));
+                }
                 continue;
             }
             consumed.push(inp.clone());
@@ -1476,18 +1492,29 @@ pub fn peripherals(
                 }
                 _ => String::new(),
             };
-            comp_binds.push((comp_irq(chip.irq_vectors, *n, comp.instances), *n));
+            comp_binds.push((vector(n), n));
             calls.push_str(&format!(
-                "    let mut _comp{n} = pins::configs::comp{n}::init(p.COMP{n}{}{inm_arg}, Irqs);\n",
+                "    let mut _comp{n} = pins::configs::comp{n}::init(p.COMP{n}{}{inm_arg}, {irqs_struct});\n",
                 arg(inp)
             ));
-            files.push((format!("comp{n}.rs"), comp_config_file(*n, cfg, generation)));
+            files.push((
+                format!("comp{n}.rs"),
+                comp_config_file_for(mode, n, cfg, generation),
+            ));
         }
     }
 
     // The struct is needed as soon as ANYTHING binds an interrupt, which is no
-    // longer only the DMA path.
-    let dma_irqs = if any_async_dma
+    // longer only the DMA path. On Blocking that is the comparators alone:
+    // `Comp::new` takes a binding there too, and nothing else on this runtime
+    // binds one.
+    let dma_irqs = if blocking {
+        if comp_binds.is_empty() {
+            String::new()
+        } else {
+            blocking_comp_irqs_block(&comp_binds)
+        }
+    } else if any_async_dma
         || !comp_binds.is_empty()
         || !serial_instances.is_empty()
         || !extra_binds.is_empty()
@@ -1756,6 +1783,7 @@ mod f1_async_tests {
                 settings: &Default::default(),
                 instances: &[],
                 pins: &[],
+                raw: &Default::default(),
             },
             &refs,
             &Default::default(),
@@ -2003,6 +2031,7 @@ mod blocking_tests {
                 settings: &Default::default(),
                 instances: &[],
                 pins: &[],
+                raw: &Default::default(),
             },
             &refs,
             &m.usart,
@@ -2380,5 +2409,202 @@ mod blocking_tests {
             let out = run(PeriphMode::Blocking, V4, &uart_pins(), &buffered);
             assert!(out.init_calls.contains("usart1::init("), "{dir:?}");
         }
+    }
+
+    /// COMP1 on a G4, its [+] pad wired, through the pass on `mode`'s
+    /// runtime with `raw` as the cards' switches.
+    fn run_comp(mode: PeriphMode, raw: &BTreeSet<u8>) -> AsyncPeriphs {
+        run_comps(mode, &[1], raw)
+    }
+
+    /// The cards `on` of a G431's COMP1..4 (PA1..PA4), every [+] pad wired:
+    /// COMP1..3 share `COMP1_2_3`, COMP4 has `COMP4` to itself.
+    fn run_comps(mode: PeriphMode, on: &[u8], raw: &BTreeSet<u8>) -> AsyncPeriphs {
+        let pins: Vec<Pin> = (1..=4u8)
+            .map(|n| {
+                mk(
+                    &format!("PA{n}"),
+                    PinFunction::Other(format!("COMP{n}_INP")),
+                )
+            })
+            .collect();
+        let refs: Vec<&Pin> = pins.iter().collect();
+        let mut settings = comparator::CompSettings::new();
+        for n in on {
+            settings.insert(*n, comparator::CompConfig::default());
+        }
+        let wired: Vec<(u8, String, Option<String>)> =
+            (1..=4u8).map(|n| (n, format!("PA{n}"), None)).collect();
+        let irqs = vec!["COMP1_2_3".to_owned(), "COMP4".to_owned()];
+        peripherals(
+            mode,
+            &BTreeSet::new(),
+            "stm32g4",
+            ChipData {
+                dma: None,
+                irq_vectors: &irqs,
+                usart_ip: Some(V4),
+                sdmmc_ip: None,
+            },
+            CompInputs {
+                settings: &settings,
+                instances: &[1, 2, 3, 4],
+                pins: &wired,
+                raw,
+            },
+            &refs,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    /// A comparator is built on Blocking as on Async: `Comp::new` is a plain
+    /// call, and the interrupt binding it takes is written here too - the one
+    /// thing this runtime binds, in a struct of its own, every path spelled
+    /// out, so no `Irqs` or `use` of an older Blocking project's own meets
+    /// it. Its file reads the level: the edge waits are `async fn`s, so the
+    /// Blocking text does not offer them.
+    #[test]
+    fn a_comparator_is_built_on_blocking_with_its_own_binding() {
+        let out = run_comp(PeriphMode::Blocking, &BTreeSet::new());
+        assert!(
+            out.init_calls.contains(
+                "    let mut _comp1 = pins::configs::comp1::init(p.COMP1, pa1_comp1_inp, CompIrqs);\n"
+            ),
+            "{}",
+            out.init_calls
+        );
+        assert!(
+            out.dma_irqs
+                .contains("embassy_stm32::bind_interrupts!(struct CompIrqs {\n"),
+            "{}",
+            out.dma_irqs
+        );
+        assert!(
+            out.dma_irqs.contains(
+                "    COMP1_2_3 => embassy_stm32::comp::InterruptHandler<embassy_stm32::peripherals::COMP1>;\n"
+            ),
+            "{}",
+            out.dma_irqs
+        );
+        assert!(!out.dma_irqs.contains("use "), "{}", out.dma_irqs);
+        // Blocking's own head: nothing here is DMA-backed.
+        assert!(!out.dma_irqs.contains("DMA"), "{}", out.dma_irqs);
+        assert!(out.runtime_gaps.is_empty(), "{:?}", out.runtime_gaps);
+        assert!(!out.any_async_dma);
+        assert_eq!(out.consumed_pins, ["PA1"]);
+
+        let body = file(&out, "comp1.rs");
+        assert!(
+            body.contains("let mut comp = Comp::new(comp, inp, irqs, get_config());"),
+            "{body}"
+        );
+        assert!(body.contains("while !_comp1.output_level() {}"), "{body}");
+        assert!(!body.contains(".await"), "{body}");
+        assert!(!body.contains("awaiting"), "{body}");
+
+        // Async keeps its text, the awaited edges included...
+        let out = run_comp(PeriphMode::Async, &BTreeSet::new());
+        let async_body = file(&out, "comp1.rs");
+        assert!(
+            async_body.contains("//     _comp1.wait_for_rising_edge().await;\n"),
+            "{async_body}"
+        );
+        assert!(
+            async_body.contains("or by awaiting an edge.\nuse embassy_stm32::comp::"),
+            "{async_body}"
+        );
+        // ...and the block is the same numbers on both: a runtime switch
+        // moves only the editable half's text.
+        let block = |f: &str| f[..f.find("// <<< GENERATED END >>>").unwrap()].to_owned();
+        assert_eq!(block(body), block(async_body));
+        assert!(
+            out.dma_irqs
+                .contains("// Interrupt bindings for the DMA-backed peripherals below."),
+            "Async's head is unchanged: {}",
+            out.dma_irqs
+        );
+    }
+
+    /// A card with "Generate driver" off builds nothing on either runtime:
+    /// no file, no binding, the pads left to the user - and main.rs says so.
+    #[test]
+    fn a_comparator_kept_raw_generates_nothing() {
+        let raw: BTreeSet<u8> = [1].into();
+        for mode in [PeriphMode::Async, PeriphMode::Blocking] {
+            let out = run_comp(mode, &raw);
+            assert!(
+                out.init_calls
+                    .contains("COMP1 is NOT initialised: its card's \"Generate driver\" is off"),
+                "{mode:?}: {}",
+                out.init_calls
+            );
+            assert!(out.config_files.is_empty(), "{mode:?}");
+            assert!(out.consumed_pins.is_empty(), "{mode:?}");
+            assert!(out.dma_irqs.is_empty(), "{mode:?}: {}", out.dma_irqs);
+        }
+    }
+
+    /// A comparator kept raw on a vector a built one binds - COMP2 beside
+    /// COMP1 on `COMP1_2_3` - cannot bind it in the user's code again: two
+    /// handlers of one name do not link. So its handler goes in the same
+    /// entry, and the note says to hand that struct to `Comp::new`. One on a
+    /// vector of its own (COMP4) is left to the user entirely.
+    #[test]
+    fn a_raw_comparator_on_a_shared_vector_rides_in_the_built_ones_binding() {
+        for (mode, irqs, struct_) in [
+            (
+                PeriphMode::Blocking,
+                "embassy_stm32::peripherals::",
+                "CompIrqs",
+            ),
+            (PeriphMode::Async, "peripherals::", "Irqs"),
+        ] {
+            let out = run_comps(mode, &[1, 2, 4], &[2, 4].into());
+            assert!(
+                out.dma_irqs.contains(&format!(
+                    "    COMP1_2_3 => embassy_stm32::comp::InterruptHandler<{irqs}COMP1>, \
+                     embassy_stm32::comp::InterruptHandler<{irqs}COMP2>;\n"
+                )),
+                "{mode:?}: {}",
+                out.dma_irqs
+            );
+            assert!(
+                !out.dma_irqs.contains("COMP4"),
+                "{mode:?}: {}",
+                out.dma_irqs
+            );
+            // The note is wrapped; read it as one line.
+            let notes = out.init_calls.replace("\n    // ", " ");
+            assert!(
+                notes.contains(&format!("hand `{struct_}` to your own `Comp::new`")),
+                "{mode:?}: {}",
+                out.init_calls
+            );
+            assert!(notes.contains("COMP4 is NOT initialised"), "{mode:?}");
+            assert_eq!(
+                notes.matches("hand `").count(),
+                1,
+                "COMP4's vector is its own: {}",
+                out.init_calls
+            );
+            assert_eq!(out.consumed_pins, ["PA1"], "{mode:?}");
+            assert_eq!(out.config_files.len(), 1, "{mode:?}");
+        }
+        // Nothing built on the vector: nothing bound, on either runtime.
+        let out = run_comps(PeriphMode::Blocking, &[1, 2], &[1, 2].into());
+        assert!(out.dma_irqs.is_empty(), "{}", out.dma_irqs);
+        assert!(!out.init_calls.contains("hand `"), "{}", out.init_calls);
     }
 }

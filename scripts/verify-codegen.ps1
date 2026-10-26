@@ -638,6 +638,23 @@ $ALL_CASES = @(
     @{ n = "imported chip, comparators";   t = "emit_comp_project";          e = @{}; q = $true; p = $CUBE_DB; fam = "import" }
     # An older comp file with the user's lines, upgraded by the app's sync.
     @{ n = "imported chip, comp upgraded";  t = "emit_comp_project";          e = @{ EIDE_COMP_UPGRADE = "edited" }; q = $false; p = $CUBE_DB; fam = "import" }
+    # Comparators on the Blocking runtime: the same comp files, and a
+    # bind_interrupts! of Blocking's own above #[entry] - G474 (COMP1_2_3 and
+    # COMP4_5_6), G431 (COMP4 on a vector of its own), U575 and WBA55 (COMP1
+    # and COMP2 grouped on one `COMP`), and the U575 on Async, the comp_u5
+    # generation no row compiled before. The hand row is a project from
+    # before: its own code wires COMP1 and binds COMP1_2_3 itself; opened,
+    # COMP1 starts with "Generate driver" off and COMP4 is generated beside it.
+    # Linked, so a vector bound twice fails here.
+    @{ n = "imported chip, comp Blocking";  t = "emit_comp_project";          e = @{ EIDE_COMP_RUNTIME = "blocking" }; q = $true; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported chip, comp by hand";   t = "emit_comp_project";          e = @{ EIDE_COMP_RUNTIME = "blocking"; EIDE_COMP_UPGRADE = "hand" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
+    @{ n = "imported G431 comp Blocking";   t = "emit_comp_project";          e = @{ EIDE_COMP_RUNTIME = "blocking"; EIDE_COMP_XML = "STM32G431R(6-8-B)Tx.xml" }; q = $false; p = "$CUBE_MX\STM32G431R(6-8-B)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported U575 comparators";     t = "emit_comp_project";          e = @{ EIDE_COMP_XML = "STM32U575ZITxQ.xml" }; q = $false; p = "$CUBE_MX\STM32U575ZITxQ.xml"; fam = "import" }
+    @{ n = "imported U575 comp Blocking";   t = "emit_comp_project";          e = @{ EIDE_COMP_RUNTIME = "blocking"; EIDE_COMP_XML = "STM32U575ZITxQ.xml" }; q = $false; p = "$CUBE_MX\STM32U575ZITxQ.xml"; fam = "import"; lk = $true }
+    # The same old project where COMP1 and COMP2 share `COMP`: wiring COMP1 by
+    # hand binds COMP2's vector too, so both stay raw and nothing is bound.
+    @{ n = "imported U575 comp by hand";    t = "emit_comp_project";          e = @{ EIDE_COMP_RUNTIME = "blocking"; EIDE_COMP_UPGRADE = "hand"; EIDE_COMP_XML = "STM32U575ZITxQ.xml" }; q = $false; p = "$CUBE_MX\STM32U575ZITxQ.xml"; fam = "import"; lk = $true }
+    @{ n = "imported WBA55 comp Blocking";  t = "emit_comp_project";          e = @{ EIDE_COMP_RUNTIME = "blocking"; EIDE_COMP_XML = "STM32WBA55CGUx.xml" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
 
     # STM32L1 sells two dies under one part number: `...TxA` is embassy's `-a`,
     # `...TxX` its `-x`, and either part also compiles on the bare die's
@@ -723,7 +740,8 @@ $ALL_CASES = @(
 $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_CAN_HALF", "EIDE_USB", "EIDE_F1_ASYNC_REMAP", "EIDE_F1_ASYNC_DMA",
            "EIDE_F1_SWITCH", "EIDE_F1_WDG", "EIDE_F1_NOPINS", "EIDE_F1_IRQ",
-           "EIDE_F1_IRQ_SHARED", "EIDE_F1_ADC", "EIDE_COMP_UPGRADE", "ESP_ASYNC_RUNTIME",
+           "EIDE_F1_IRQ_SHARED", "EIDE_F1_ADC", "EIDE_COMP_UPGRADE", "EIDE_COMP_RUNTIME",
+           "EIDE_COMP_XML", "ESP_ASYNC_RUNTIME",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",

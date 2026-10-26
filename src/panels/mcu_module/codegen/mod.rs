@@ -63,6 +63,45 @@ fn generic_param_name(pin_name: &str) -> String {
     s
 }
 
+/// Whether `code` names the singleton `name` as `p.USART1`, a whole word - not
+/// a bare `USART1`, which is the PAC's register block of the same name, not
+/// this peripheral.
+fn names_singleton(code: &str, name: &str) -> bool {
+    code.match_indices(&format!("p.{name}")).any(|(at, hit)| {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let before = code[..at].chars().next_back().is_none_or(|c| !ident(c));
+        let after = code[at + hit.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !ident(c));
+        before && after
+    })
+}
+
+/// Whether `code` BINDS the interrupt `vector`: names it as a
+/// `bind_interrupts!` key (`COMP1_2_3 => ..`) or defines its handler
+/// (`fn COMP1_2_3(`). A mention anywhere else - `interrupt::COMP1_2_3` for a
+/// priority, the G431's `peripherals::COMP4` beside its vector `COMP4` - binds
+/// nothing.
+fn binds_vector(code: &str, vector: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(vector).any(|(at, hit)| {
+        let before = &code[..at];
+        let after = &code[at + hit.len()..];
+        if before.chars().next_back().is_some_and(ident) || after.chars().next().is_some_and(ident)
+        {
+            return false;
+        }
+        let key = after.trim_start().starts_with("=>");
+        let handler = before
+            .trim_end()
+            .strip_suffix("fn")
+            .is_some_and(|b| b.chars().next_back().is_none_or(|c| !ident(c)))
+            && before.ends_with(char::is_whitespace);
+        key || handler
+    })
+}
+
 // ── Public API on Mcu ─────────────────────────────────────────────────────────
 
 impl Mcu {
@@ -502,19 +541,7 @@ impl Mcu {
             return used;
         };
         let code = common::code_only(&main_rs[end + GEN_END.len()..]);
-        // `p.USART1`, not a bare `USART1`: a register block of the same name
-        // from the PAC is not this peripheral's singleton.
-        let names_peripheral = |name: &str| {
-            code.match_indices(&format!("p.{name}")).any(|(at, hit)| {
-                let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-                let before = code[..at].chars().next_back().is_none_or(|c| !ident(c));
-                let after = code[at + hit.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| !ident(c));
-                before && after
-            })
-        };
+        let names_peripheral = |name: &str| names_singleton(&code, name);
         for m in self.modules.iter().filter(|m| !m.kind.is_custom()) {
             let n = m.instance();
             let singletons = embassy_stm32::driver_singletons(m.kind, n);
@@ -551,6 +578,66 @@ impl Mcu {
                 }
             }
         }
+        used
+    }
+
+    /// [`Self::modules_used_by_hand`] for the comparators, asked at the same
+    /// moment: the instances the text below main.rs's generated block wires
+    /// itself, by the binding of a `COMP{n}_INP`/`_INM` pad (`pa1_comp1_inp`)
+    /// or by `p.COMP{n}`. Those start with their card's "Generate driver" off
+    /// (`Mcu::raw_comps`).
+    ///
+    /// Before the Blocking runtime generated comparators, its main.rs said
+    /// COMP{n} was NOT initialised and left the pads raw, so code that reaches
+    /// one by hand is normal there. Every instance the chip has is asked, not
+    /// only the cards switched on: one switched on later must not take pads
+    /// the user's code already moves.
+    ///
+    /// So is every instance on the interrupt VECTOR of one: a comparator
+    /// wired by hand binds its vector itself (`Comp::new` takes the binding),
+    /// in this file or another, and the G4's `COMP1_2_3` or the U5's single
+    /// `COMP` serves its neighbours too - a generated `bind_interrupts!` for
+    /// one of them would define that handler a second time. And every one
+    /// whose vector this code binds (`COMP1_2_3 =>`, `fn COMP1_2_3(`) for any
+    /// other reason. Only a BINDING counts: the G431's vector is called
+    /// `COMP4`, the same word as `peripherals::COMP4`.
+    ///
+    /// On Async the comparators whose card is on were always generated, so
+    /// the old code cannot be wiring them: those are never kept raw.
+    pub fn comparators_used_by_hand(&self, main_rs: &str) -> std::collections::BTreeSet<u8> {
+        use crate::panels::mcu_module::comparator;
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+        let mut used = std::collections::BTreeSet::new();
+        if comparator::Generation::of(&self.family).is_none() {
+            return used;
+        }
+        let Some(end) = main_rs.find(GEN_END) else {
+            return used;
+        };
+        let code = common::code_only(&main_rs[end + GEN_END.len()..]);
+        let instances = comparator::instances(self);
+        let vector = |n: u8| embassy_stm32::comp_irq(&self.irq_vectors, n, &instances);
+        for &n in &instances {
+            let by_pad = self.iter_all_pins().any(|p| {
+                matches!(&p.selected_function, PinFunction::Other(sig)
+                    if ["INP", "INM"].iter().any(|s| comparator::instance_of_signal(sig, s) == Some(n)))
+                    && common::has_ident(&code, &embassy_common::binding_var(p))
+            });
+            if by_pad
+                || names_singleton(&code, &format!("COMP{n}"))
+                || binds_vector(&code, &vector(n))
+            {
+                used.insert(n);
+            }
+        }
+        // Before and after the neighbours: a comparator Async generated says
+        // nothing of its vector, which the generated `Irqs` binds.
+        let generated = |n: &u8| self.is_async() && self.comp.contains_key(n);
+        used.retain(|n| !generated(n));
+        // Its neighbours on the vector it binds.
+        let bound: Vec<String> = used.iter().map(|n| vector(*n)).collect();
+        used.extend(instances.iter().filter(|m| bound.contains(&vector(**m))));
+        used.retain(|n| !generated(n));
         used
     }
 
@@ -2166,7 +2253,7 @@ mod tests {
 ";
 
         // Blocking embassy (non-F1 STM32).
-        let blocking = embassy_common::make_generated_section("X", &pins, "", "", line, &[]);
+        let blocking = embassy_common::make_generated_section("X", &pins, "", "", line, &[], "");
         assert!(
             blocking.contains(line),
             "embassy blocking:
@@ -3356,5 +3443,265 @@ mod upgrade_edge_tests {
             ("PA10", PinFunction::UsartRx(1)),
         ]);
         assert!(mcu.mcu_config_text().contains("@drivers"));
+    }
+}
+
+/// The comparators on the Blocking runtime: the section that binds them, the
+/// card's "Generate driver" switch in `@drivers`, and the old project whose
+/// own code reached one by hand.
+#[cfg(test)]
+mod comp_blocking_tests {
+    use super::binds_vector;
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::comparator::CompConfig;
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::mcu_config;
+    use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+    use std::collections::BTreeSet;
+
+    fn comp1_inp() -> PinFunction {
+        PinFunction::Other("COMP1_INP".into())
+    }
+
+    /// A G474 on `runtime` with COMP1's [+] on PA1 and its card switched on.
+    /// Its pads offer COMP1..4: COMP1..3 share `COMP1_2_3`, COMP4 is on
+    /// `COMP4_5_6`.
+    fn g4(runtime: Runtime) -> Mcu {
+        let mut def = builtin_for("stm32f103c8t6").expect("built-in F103");
+        def.id = "stm32g474rb".into();
+        def.display_name = "STM32G474RBTx".into();
+        def.family = "stm32g4".into();
+        def.irq_vectors = vec!["COMP1_2_3".into(), "COMP4_5_6".into()];
+        let mut mcu = def.build_mcu();
+        mcu.runtime = runtime;
+        mcu.pending_runtime = runtime;
+        // The chip's instances are what its pads offer.
+        for n in 1..=4u8 {
+            let pad = format!("PA{n}");
+            let at = mcu
+                .iter_all_pins()
+                .find(|p| p.name == pad)
+                .map(|p| p.number)
+                .expect("the pad");
+            if let Some(p) = mcu.find_pin_mut(at) {
+                p.available_functions
+                    .push(PinFunction::Other(format!("COMP{n}_INP")));
+            }
+        }
+        let pa1 = mcu
+            .iter_all_pins()
+            .find(|p| p.name == "PA1")
+            .map(|p| p.number)
+            .expect("PA1");
+        mcu.apply_pin_function(pa1, comp1_inp());
+        mcu.comp.insert(1, CompConfig::default());
+        mcu
+    }
+
+    /// The binding is an item: above `#[entry]`, once, spelled out in full
+    /// under a name of its own - and `init` is handed it with the pad's
+    /// binding.
+    #[test]
+    fn a_blocking_main_rs_binds_the_comparator_above_the_entry() {
+        let mcu = g4(Runtime::Blocking);
+        let main = mcu.fresh_main_rs();
+        let bind = main
+            .find("embassy_stm32::bind_interrupts!(struct CompIrqs {")
+            .expect("the binding");
+        let entry = main.find("#[entry]").expect("the entry");
+        assert!(bind < entry, "{main}");
+        assert_eq!(main.matches("bind_interrupts!").count(), 1, "{main}");
+        // No name an older Blocking project's own code could hold.
+        assert!(
+            !main.contains("use embassy_stm32::{bind_interrupts"),
+            "{main}"
+        );
+        assert!(!main.contains("struct Irqs"), "{main}");
+        assert!(
+            main.contains(
+                "COMP1_2_3 => embassy_stm32::comp::InterruptHandler<embassy_stm32::peripherals::COMP1>;"
+            ),
+            "{main}"
+        );
+        assert!(
+            main.contains("let pa1_comp1_inp = p.PA1;"),
+            "the pad keeps its binding: {main}"
+        );
+        assert!(
+            main.contains("pins::configs::comp1::init(p.COMP1, pa1_comp1_inp, CompIrqs);"),
+            "{main}"
+        );
+        assert!(
+            mcu.config_files().iter().any(|(n, _)| n == "comp1.rs"),
+            "{:?}",
+            mcu.config_files()
+        );
+        // The pass that writes main.rs reports nothing left out for the
+        // Apply preview of a runtime switch.
+        assert!(crate::panels::mcu_module::codegen::family::embassy_runtime_gaps(&mcu).is_empty());
+
+        // Nothing switched on: no binding at all.
+        let mut bare = g4(Runtime::Blocking);
+        bare.comp.clear();
+        assert!(!bare.fresh_main_rs().contains("bind_interrupts!"));
+    }
+
+    /// The card's switch goes in `@drivers` as `raw comp <n>` under a marker
+    /// of the comparators' own, which reads back - and which `parse_drivers`,
+    /// the modules' reader, skips. The marker, not the section, says the
+    /// switches were saved: the IDE that first wrote `@drivers` still refused
+    /// comparators on Blocking.
+    #[test]
+    fn the_comparator_switch_round_trips_through_drivers() {
+        let mut mcu = g4(Runtime::Blocking);
+        let text = mcu.mcu_config_text();
+        assert!(text.contains("@drivers\ncomparators\n"), "{text}");
+        assert_eq!(mcu_config::parse_raw_comps(&text), Some(BTreeSet::new()));
+        mcu.raw_comps.insert(1);
+        let text = mcu.mcu_config_text();
+        assert!(
+            text.contains("@drivers\ncomparators\nraw comp 1\n"),
+            "{text}"
+        );
+        assert_eq!(mcu_config::parse_drivers(&text), Some(BTreeSet::new()));
+
+        let mut back = g4(Runtime::Blocking);
+        back.apply_mcu_config(&text);
+        assert_eq!(back.raw_comps, [1].into());
+
+        // What that IDE wrote: the section, without the marker - so the
+        // comparators were never saved, and the open path asks the code.
+        for older in ["@drivers\n", "@drivers\nraw GenericInterfaceUsart 1\n"] {
+            assert_eq!(mcu_config::parse_raw_comps(older), None, "{older}");
+        }
+
+        // No comparator on, and nothing a driver exists for: no section.
+        let mut none = g4(Runtime::Blocking);
+        none.comp.clear();
+        assert!(!none.mcu_config_text().contains("@drivers"));
+    }
+
+    /// Before the Blocking runtime built comparators, its main.rs left COMP1's
+    /// pad raw with a note, and code below the block could wire it itself -
+    /// binding its vector too, which COMP2 and COMP3 share. Opened, all three
+    /// start with their switch off, so the project still compiles; COMP4, on
+    /// its own vector, does not. Code that only uses a generated handle,
+    /// mentions a vector without binding it, or names one in a comment, is
+    /// not wiring by hand.
+    #[test]
+    fn a_comparator_an_old_blocking_project_wires_by_hand_stays_raw() {
+        let mut mcu = g4(Runtime::Blocking);
+        // The old shape: the pad bound raw, no init.
+        mcu.raw_comps.insert(1);
+        let old_main = mcu.fresh_main_rs();
+        assert!(!old_main.contains("comp1::init("), "{old_main}");
+        mcu.raw_comps.clear();
+        let with = |code: &str| format!("{old_main}{code}");
+        let on_its_vector: BTreeSet<u8> = [1, 2, 3].into();
+
+        let by_hand =
+            with("    let comp = Comp::new(p.COMP1, pa1_comp1_inp, MyIrqs, Config::default());\n");
+        assert_eq!(mcu.comparators_used_by_hand(&by_hand), on_its_vector);
+        let by_pad = with("    let pad = pa1_comp1_inp;\n");
+        assert_eq!(mcu.comparators_used_by_hand(&by_pad), on_its_vector);
+        // A vector the code binds itself is every comparator's on it, named
+        // or not.
+        for binds in [
+            "bind_interrupts!(struct MyIrqs {\n    COMP1_2_3 => comp::InterruptHandler<peripherals::COMP1>;\n});\n",
+            "#[interrupt]\nfn COMP1_2_3() {}\n",
+        ] {
+            assert_eq!(
+                mcu.comparators_used_by_hand(&with(binds)),
+                on_its_vector,
+                "{binds}"
+            );
+        }
+        assert_eq!(
+            mcu.comparators_used_by_hand(&with("    let c = p.COMP4;\n")),
+            [4].into()
+        );
+        for not_use in [
+            "    let level = _comp1.output_level();\n",
+            "    // p.COMP1 and pa1_comp1_inp, in a comment\n",
+            "    let other = p.COMP12;\n",
+            "    interrupt::COMP1_2_3.set_priority(Priority::P3);\n",
+            "    let held: Option<Comp<'static, peripherals::COMP4>> = None;\n",
+        ] {
+            assert!(
+                mcu.comparators_used_by_hand(&with(not_use)).is_empty(),
+                "{not_use}"
+            );
+        }
+
+        // Kept raw, the regenerated block leaves the user's code its pad.
+        mcu.raw_comps = mcu.comparators_used_by_hand(&by_hand);
+        let now = mcu.update_main_rs(&by_hand);
+        assert!(!now.contains("comp1::init("), "{now}");
+        assert!(!now.contains("bind_interrupts!"), "{now}");
+        assert!(now.contains("let pa1_comp1_inp = p.PA1;"), "{now}");
+        assert!(
+            now.contains("Comp::new(p.COMP1, pa1_comp1_inp, MyIrqs"),
+            "{now}"
+        );
+
+        // A family with no comparator driver has nothing to keep raw.
+        let mut f4 = g4(Runtime::Blocking);
+        f4.family = "stm32f4".into();
+        assert!(f4.comparators_used_by_hand(&by_hand).is_empty());
+    }
+
+    /// On Async a comparator whose card is on was always generated, so the
+    /// old code cannot be wiring it: the scan never keeps one raw there, and
+    /// a neighbour on its vector is not inferred from it - the generated
+    /// `Irqs` already binds that vector. One whose card is off still counts.
+    #[test]
+    fn an_async_project_never_loses_a_comparator_it_generated() {
+        let mut mcu = g4(Runtime::Async);
+        let main = mcu.fresh_main_rs();
+        assert!(main.contains("comp1::init("), "{main}");
+        let with = |code: &str| format!("{main}{code}");
+        for code in [
+            "    _spawner.spawn(watch(_comp1)).unwrap();\n",
+            "    let c: Option<Comp<'static, peripherals::COMP1>> = None;\n",
+            "    let pad = pa1_comp1_inp;\n",
+        ] {
+            assert!(
+                mcu.comparators_used_by_hand(&with(code)).is_empty(),
+                "{code}"
+            );
+        }
+        assert_eq!(
+            mcu.comparators_used_by_hand(&with("    let c = p.COMP4;\n")),
+            [4].into()
+        );
+        mcu.comp.insert(4, CompConfig::default());
+        assert!(
+            mcu.comparators_used_by_hand(&with("    let c = p.COMP4;\n"))
+                .is_empty()
+        );
+    }
+
+    /// Only a binding position counts as binding a vector.
+    #[test]
+    fn a_vector_is_bound_only_as_a_key_or_a_handler() {
+        for yes in [
+            "COMP4 => X;",
+            "COMP4=>X",
+            "fn COMP4() {}",
+            "unsafe fn  COMP4()",
+        ] {
+            assert!(binds_vector(yes, "COMP4"), "{yes}");
+        }
+        for no in [
+            "peripherals::COMP4",
+            "Comp<'static, COMP4>",
+            "COMP45 => X",
+            "XCOMP4 => X",
+            "interrupt::COMP4.pend()",
+            "letfn COMP4()",
+            "fnCOMP4()",
+        ] {
+            assert!(!binds_vector(no, "COMP4"), "{no}");
+        }
     }
 }

@@ -731,11 +731,13 @@ fn wba_section(mcu: &Mcu) -> String {
         &mcu.watchdog_and_custom_inits(),
         mcu.clock_manual,
         &mcu.irq_vectors,
+        &periphs.dma_irqs,
     )
 }
 
 /// The generated section of an embassy Blocking project: the pin bindings,
-/// then the bus drivers' `init` calls that are handed them.
+/// then the bus drivers' `init` calls that are handed them, and above the
+/// entry the `bind_interrupts!` the comparators' take.
 fn blocking_section(mcu: &Mcu, clock: &str) -> String {
     let all = pins_of(mcu);
     let periphs = stm32_periphs(mcu, embassy_stm32::PeriphMode::Blocking);
@@ -746,6 +748,7 @@ fn blocking_section(mcu: &Mcu, clock: &str) -> String {
         &periphs.init_calls,
         &mcu.watchdog_and_custom_inits(),
         &mcu.irq_vectors,
+        &periphs.dma_irqs,
     )
 }
 
@@ -801,8 +804,10 @@ fn blocking_exti_hooks(mcu: &Mcu) -> Vec<EdgeHook> {
 // (`stm32_clock_block`). The bus drivers come from the pass the Async runtime
 // runs too, `embassy_stm32::peripherals` in `PeriphMode::Blocking` (shared
 // with `WbaBackend`): it honours each module's "Generate driver" switch
-// (`Mcu::raw_modules`) and leaves SDMMC, SAI, I2S and COMP, which embassy
-// drives only asynchronously, as a NOT-initialised note in main.rs. This is
+// (`Mcu::raw_modules`, and `Mcu::raw_comps` for the comparators, whose
+// `bind_interrupts!` it writes above `#[entry]`) and leaves SDMMC, SAI and
+// I2S, which embassy drives only asynchronously, as a NOT-initialised note in
+// main.rs. This is
 // what turns the many STM32 chips the pin-data XML importer adds from
 // data-only into buildable projects.
 struct StmEmbassyBackend;
@@ -887,7 +892,7 @@ impl FamilyBackend for StmEmbassyBackend {
 // main(Spawner)` driven by the executor instead of `#[entry] fn main() -> !`,
 // the one `Irqs` binding with the DMA and buffered drivers it serves, the
 // EXTI inputs as awaited tasks, and the drivers only Async writes (SDMMC,
-// SAI, I2S, COMP), less the timer embassy-time takes. Selected by
+// SAI, I2S), less the timer embassy-time takes. Selected by
 // [`backend_for_runtime`] — never listed in [`BACKENDS`],
 // since it is chosen by runtime, not family. Handles every STM32 family,
 // `stm32f1` included: on Blocking, Native and RTIC the F1 is on stm32f1xx-hal,
@@ -1006,6 +1011,7 @@ fn stm32_periphs(mcu: &Mcu, mode: embassy_stm32::PeriphMode) -> embassy_stm32::A
             settings: &mcu.comp,
             instances: &comp_instances,
             pins: &comp_pins,
+            raw: &mcu.raw_comps,
         },
         &all,
         &usart,
@@ -1026,7 +1032,7 @@ fn stm32_periphs(mcu: &Mcu, mode: embassy_stm32::PeriphMode) -> embassy_stm32::A
 
 /// What `mcu`'s runtime leaves out that the other one generates, as `(name,
 /// why)` - the `runtime_gaps` of the driver pass that writes its main.rs: on
-/// embassy Blocking the SDMMC, SAI, I2S and COMP embassy drives only
+/// embassy Blocking the SDMMC, SAI and I2S embassy drives only
 /// asynchronously, on Async the timer embassy-time takes. Empty where the
 /// drivers are not embassy's (the F1 off Async, ESP, RP, nRF).
 ///
@@ -1499,14 +1505,14 @@ pub fn blocking_details(family: &str) -> RuntimeDetails {
 /// Every STM32 but the F1 generates its drivers on Blocking too, from the
 /// same pass (`embassy_stm32::peripherals`), so the rows say what Async
 /// changes about those files rather than that the files are Async's: the
-/// buffered/DMA forms, the timer embassy-time takes and the SDMMC, SAI, I2S
-/// and COMP drivers only Async writes ([`BLOCKING_EMBASSY_DETAILS`] is the
-/// other side).
+/// buffered/DMA forms, the timer embassy-time takes, the SDMMC, SAI and I2S
+/// drivers only Async writes and the comparator edges only Async awaits
+/// ([`BLOCKING_EMBASSY_DETAILS`] is the other side).
 const STM32_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
     rows: &[
         (
             "On Apply:",
-            "Regenerates main.rs with the embassy entry + Spawner and rewrites src/pins/configs/*.rs to the async init: on an F1 the stm32f1xx-hal files, on any other STM32 the embassy Blocking ones (a USART gets its Buffered or DMA transport, an SPI or I2C its Async-DMA mode), plus the SDMMC, SAI, I2S and COMP files only Async generates. Toggles the embassy Cargo.toml deps, then builds.",
+            "Regenerates main.rs with the embassy entry + Spawner and rewrites src/pins/configs/*.rs to the async init: on an F1 the stm32f1xx-hal files, on any other STM32 the embassy Blocking ones (a USART gets its Buffered or DMA transport, an SPI or I2C its Async-DMA mode), plus the SDMMC, SAI and I2S files only Async generates. Toggles the embassy Cargo.toml deps, then builds.",
         ),
         (
             "Entry:",
@@ -1530,7 +1536,7 @@ const STM32_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "vs Blocking:",
-            "embassy-time takes one of the chip's timers (TIM4 on an F103C8), and a PWM wired to it is not generated: main.rs says so and its pads stay bound raw. Blocking runs no embassy-time and drives PWM on every timer. On every STM32 but the F1, SDMMC, SAI and I2S (which embassy drives only asynchronously) and COMP (whose interrupt binding Blocking does not write) are the other way round: Blocking leaves their pads raw with a NOT initialised comment in main.rs.",
+            "embassy-time takes one of the chip's timers (TIM4 on an F103C8), and a PWM wired to it is not generated: main.rs says so and its pads stay bound raw. Blocking runs no embassy-time and drives PWM on every timer. On every STM32 but the F1, SDMMC, SAI and I2S, which embassy drives only asynchronously, are the other way round: Blocking leaves their pads raw with a NOT initialised comment in main.rs. COMP is built on both, but only here can its wait_for_* edges be awaited.",
         ),
         (
             "Applies to:",
@@ -1768,7 +1774,7 @@ const BLOCKING_EMBASSY_DETAILS: RuntimeDetails = RuntimeDetails {
     rows: &[
         (
             "On Apply:",
-            "Regenerates main.rs and writes one src/pins/configs/*.rs per USART/LPUART, SPI, I2C, PWM timer, DAC and QSPI/OCTOSPI/XSPI/HSPI module whose Generate driver switch is on. Every pad keeps its labelled let binding, and the driver's init is handed that variable. Reconciles Cargo.toml, then builds.",
+            "Regenerates main.rs and writes one src/pins/configs/*.rs per USART/LPUART, SPI, I2C, PWM timer, DAC and QSPI/OCTOSPI/XSPI/HSPI module whose Generate driver switch is on, and per comparator card switched on in the Configuration tab whose Generate driver switch is on and whose COMPn_INP pad is wired. Every pad keeps its labelled let binding, and the driver's init is handed that variable. Reconciles Cargo.toml, then builds.",
         ),
         (
             "Entry:",
@@ -1784,15 +1790,15 @@ const BLOCKING_EMBASSY_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "Other drivers:",
-            "PWM on every timer, the one embassy-time takes on Async included, as embassy's SimplePwm (ComplementaryPwm with complementary outputs); DAC, QSPI, OCTOSPI, XSPI and HSPI as embassy's Blocking-mode drivers.",
+            "PWM on every timer, the one embassy-time takes on Async included, as embassy's SimplePwm (ComplementaryPwm with complementary outputs); DAC, QSPI, OCTOSPI, XSPI and HSPI as embassy's Blocking-mode drivers. COMP (G4, U5, WBA) as embassy's Comp, read with output_level(): its constructor takes an interrupt binding, so main.rs gets a bind_interrupts! above #[entry], whose handler serves only the async edge waits.",
         ),
         (
             "Not on Blocking:",
-            "SDMMC, SAI and I2S: embassy drives them only asynchronously. COMP: embassy's Comp::new takes an interrupt binding, which this runtime does not write. main.rs gets a NOT initialised comment saying why where each init would be, their pads stay bound raw, and the Async runtime generates them.",
+            "SDMMC, SAI and I2S: embassy drives them only asynchronously. main.rs gets a NOT initialised comment saying why where each init would be, their pads stay bound raw, and the Async runtime generates them. A comparator's wait_for_* edges are async too: poll output_level() instead.",
         ),
         (
             "Virtual modules:",
-            "There is no Init API to choose: a driver's type follows from the module's direction, and the Pins tab's Init API is not read on this family. Turning a module's Generate driver switch off leaves its pads as labelled raw bindings for your own code, with a comment in main.rs.",
+            "There is no Init API to choose: a driver's type follows from the module's direction, and the Pins tab's Init API is not read on this family. Turning a module's Generate driver switch off leaves its pads as labelled raw bindings for your own code, with a comment in main.rs; each comparator card in the Configuration tab has the same switch.",
         ),
         (
             "GPIO:",

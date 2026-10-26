@@ -26,9 +26,10 @@ pub const PIN_SPACING: f32 = 3.0;
 ///   - **Every other STM32** (`StmEmbassyBackend`, `WbaBackend`): embassy-stm32
 ///     used synchronously - polled USART/LPUART and blocking SPI, I2C, PWM,
 ///     DAC and QSPI/OCTOSPI/XSPI/HSPI drivers, which speak embedded-io /
-///     embedded-hal 1.0 themselves. No Native opt-in; SDMMC, SAI, I2S and COMP
-///     are generated on Async only; each module has a "Generate driver" switch
-///     ([`Mcu::raw_modules`]).
+///     embedded-hal 1.0 themselves, and the comparators, read by polling. No
+///     Native opt-in; SDMMC, SAI and I2S are generated on Async only; each
+///     module and comparator has a "Generate driver" switch
+///     ([`Mcu::raw_modules`], [`Mcu::raw_comps`]).
 ///   - **ESP / RP / nRF**: their HAL's own types, bound directly.
 /// - [`Runtime::Native`]: also bare-metal `#[entry] fn main()`, but the
 ///   peripherals expose the CONCRETE HAL types (`Serial`/`Spi`/`BlockingI2c` on
@@ -497,6 +498,15 @@ pub struct Mcu {
     /// Persisted in `mcu.config` `@drivers`. CODEGEN input, so it feeds
     /// `calculate_mcu_state_hash`.
     pub raw_modules: std::collections::BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
+    /// The same switch for the comparators, by instance: a card in the
+    /// Configuration tab rather than a Virtual Module, so not keyed by a
+    /// `ModuleKind`. Off, `COMP{n}` gets no `comp{n}.rs` and its pads stay raw
+    /// bindings; a project saved before the Blocking runtime generated
+    /// comparators starts with it off for each one its own code wires by hand
+    /// (`Mcu::comparators_used_by_hand`).
+    ///
+    /// Persisted in `@drivers` too (`raw comp <n>`). CODEGEN input.
+    pub raw_comps: std::collections::BTreeSet<u8>,
     /// IWDG / WWDG settings from the Configuration tab. Not a `VirtualModule`:
     /// those live on the Pins canvas and own pins, and a watchdog has none.
     /// Persisted in `mcu.config` `@watchdog`; feeds `calculate_mcu_state_hash`

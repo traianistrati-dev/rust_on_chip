@@ -164,6 +164,10 @@ impl AppIde {
                 .as_deref()
                 .and_then(mcu_config::parse_drivers)
                 .unwrap_or_default();
+            mcu.raw_comps = cfg
+                .as_deref()
+                .and_then(mcu_config::parse_raw_comps)
+                .unwrap_or_default();
         }
 
         // ── Restore pin state from mcu.config and src/main.rs ────────────────
@@ -245,6 +249,17 @@ impl AppIde {
                         .is_none()
                     {
                         mcu.raw_modules = mcu.modules_used_by_hand(&source);
+                    }
+                    // The comparators on their own marker: the IDE that first
+                    // wrote `@drivers` still refused them on Blocking, so a
+                    // project it saved has the section and may still wire one
+                    // by hand.
+                    if cfg_text
+                        .as_deref()
+                        .and_then(mcu_config::parse_raw_comps)
+                        .is_none()
+                    {
+                        mcu.raw_comps = mcu.comparators_used_by_hand(&source);
                     }
                     // Rebuild generated_code from the restored pin state while
                     // keeping the user's loop body from the existing file.

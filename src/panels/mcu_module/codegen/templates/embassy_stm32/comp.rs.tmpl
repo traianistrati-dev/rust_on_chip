@@ -13,10 +13,7 @@ pub const BLANKING_SOURCE: u8 = {BLANK_N};
 
 // Everything below is editable - your changes are preserved on regeneration.
 //
-// `init` returns embassy's `Comp`, already enabled. The comparator then runs on
-// its own: no CPU involvement until you ask, either by polling `output_level()`
-// or by awaiting an edge.
-use embassy_stm32::comp::{Comp, InputPlusPin, Instance, InterruptHandler};{INM_USE}
+{INTRO}use embassy_stm32::comp::{Comp, InputPlusPin, Instance, InterruptHandler};{INM_USE}
 use embassy_stm32::gpio::Pin;
 use embassy_stm32::interrupt::typelevel::Binding;
 use embassy_stm32::{peripherals, Peri};
@@ -46,10 +43,4 @@ pub fn init<'d>(
 //
 //     // Read the current result - no waiting.
 //     let above = {HANDLE}.output_level();
-//
-//     // Or wait for the input to cross the threshold. WHICH edge you wait for
-//     // is chosen here, not in the config: embassy arms EXTI per call, so
-//     // there is no "trigger mode" field to set.
-//     {HANDLE}.wait_for_rising_edge().await;
-//     {HANDLE}.wait_for_falling_edge().await;
-//     {HANDLE}.wait_for_any_edge().await;
+{USAGE}

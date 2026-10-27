@@ -487,6 +487,13 @@ $ALL_CASES = @(
     # 1 us tick main.rs starts is compiled at each HAL's width (u8 / u16).
     @{ n = "Raspberry Pi Pico x4";         t = "emit_rp_project";            e = @{};                       q = $true; fam = "rp"; lk = $true }
 
+    # The same four boards with every bus rp-hal builds from half its pads: a
+    # transmit-only UART0 (GP1 unwired), a receive-only UART1 and a transmit-
+    # only SPI1 (no MISO). The `OptionTNone` half of `uart::Pins` and the
+    # `(MOSI, SCK)` pinout are trait impls - reading rp-hal says they exist,
+    # only the compiler says the generated types land on them.
+    @{ n = "Raspberry Pi Pico one-way x4"; t = "emit_rp_project";            e = @{ EIDE_RP_ONEWAY = "1" }; q = $true; fam = "rp"; lk = $true }
+
     # The micro:bit on nrf52833-hal, TWO projects: every peripheral wired on the
     # default branches, and a second on the other ones (crystal HFCLK,
     # synthesized LFCLK, open-drain, pull-down, CTS/RTS, SCK-only SPI in mode 3,
@@ -563,6 +570,15 @@ $ALL_CASES = @(
     # wrote, so the harness now writes what `config_files` returns instead of
     # an empty `configs/mod.rs`.
     @{ n = "Raspberry Pi Pico async x3";   t = "emit_rp_async_project";      e = @{};                       q = $true; fam = "rp"; lk = $true }
+
+    # The three projects again with the one-way shapes: UART0 transmit-only
+    # (UartTx on DMA, on the two buffered projects too - this backend builds no
+    # buffered transmit half: embassy-rp's BufferedUartTx unmasks receive
+    # interrupts nothing empties), UART1 receive-only on each project's transport
+    # (BufferedUartRx twice, UartRx once) and SPI1 transmit-only
+    # (Spi::new_txonly). Each constructor takes its interrupt binding at a
+    # DIFFERENT argument position, which is what this row is for.
+    @{ n = "Raspberry Pi Pico async one-way x3"; t = "emit_rp_async_project"; e = @{ EIDE_RP_ONEWAY = "1" }; q = $true; fam = "rp"; lk = $true }
 
 
     # The two W boards, whose on-board LED is not on the chip at all - it is
@@ -773,7 +789,7 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
-           "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD",
+           "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD", "EIDE_RP_ONEWAY",
            # The imported-chip rows. EIDE_CHIP_XML is read by the N6 harness too,
            # so a value left over from an L151 row would make the N6 row convert an L1.
            "EIDE_CHIP_XML", "EIDE_EXPECT_FEATURE", "EIDE_IMPORT_SKIP", "EIDE_IMPORT_WDG",

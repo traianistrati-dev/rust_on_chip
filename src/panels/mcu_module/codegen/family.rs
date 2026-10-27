@@ -1591,11 +1591,11 @@ const RP_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "USART:",
-            "BufferedUart on an interrupt ring (no DMA channel; the only RP uart type with embedded-io-async), or Uart on two DMA channels with one transfer per read and only the 32-byte FIFO between reads; the module's Async transport row chooses.",
+            "BufferedUart on an interrupt ring (no DMA channel; the only RP uart type with embedded-io-async), or Uart on two DMA channels with one transfer per read and only the 32-byte FIFO between reads; the module's Async transport row chooses. Its Data direction row builds a one-way UART too: UartRx on one DMA channel or BufferedUartRx on one ring, and UartTx on one DMA channel on either setting - never a buffered transmit half, whose receive interrupts nothing would empty.",
         ),
         (
             "SPI / I2C:",
-            "SPI is always async on two DMA channels (the Init selector is shown locked). I2C is interrupt driven and takes no channel, so it has no transport row.",
+            "SPI is always async on two DMA channels (the Init selector is shown locked) - one, Spi::new_txonly, when no MISO is wired; read and transfer panic on that bus, write is the call. I2C is interrupt driven and takes no channel, so it has no transport row.",
         ),
         (
             "DMA:",
@@ -1603,7 +1603,7 @@ const RP_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "Cargo.toml:",
-            "The embassy-rp line is the board's own (rp2040 or rp235xa, with its time-driver feature); adds embassy-executor 0.10 (platform-cortex-m) + embassy-time. A BufferedUart adds embedded-io-async + static_cell. Leaving Async removes them again. On a Pico W, taking the on-board LED adds cyw43 + cyw43-pio + static_cell: the LED hangs off the radio, whose driver is async only, so a Blocking project gets a comment instead.",
+            "The embassy-rp line is the board's own (rp2040 or rp235xa, with its time-driver feature); adds embassy-executor 0.10 (platform-cortex-m) + embassy-time. A BufferedUart or BufferedUartRx adds embedded-io-async + static_cell. Leaving Async removes them again. On a Pico W, taking the on-board LED adds cyw43 + cyw43-pio + static_cell: the LED hangs off the radio, whose driver is async only, so a Blocking project gets a comment instead.",
         ),
         (
             "Applies to:",

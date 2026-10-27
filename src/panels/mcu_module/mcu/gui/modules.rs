@@ -3691,14 +3691,23 @@ pub fn module_config_ui(
     // stm32f1xx-hal, ESP, RP and nRF keep their own gates.
     let embassy = codegen::family::embassy_drivers(family, is_async);
     let embassy_blocking = embassy && !is_async;
+    // The RP backend, on either runtime: rp-hal off Async, embassy-rp on it.
+    // Its USART direction is the module's, as on embassy-stm32.
+    let rp_family = crate::panels::mcu_module::codegen::rp::is_rp(family);
     // The transport the staged runtime really builds for a USART: the stored
     // one, except on embassy's Async runtime for a UART with no DMA request,
     // where the buffered one is all there is. A DMA pick stored there - under a
     // runtime only staged, so not clamped yet - must not decide which
-    // directions and flow forms the rows below offer.
+    // directions and flow forms the rows below offer. And on an RP's Async
+    // runtime, a transmit-only UART is the DMA `UartTx` whatever is stored -
+    // embassy-rp's `BufferedUartTx` enables the receiver and unmasks its
+    // interrupts with no ring to empty them, so this backend builds none - by
+    // the generator's own function, never written back.
     let usart_transport = |cfg: &UsartModuleConfig| {
         if embassy && is_async && serial_lacks_dma(cfg.instance) {
             UsartMode::Buffered
+        } else if rp_family && is_async {
+            crate::panels::mcu_module::codegen::rp::async_uart_transport(cfg)
         } else {
             cfg.mode
         }
@@ -3998,17 +4007,35 @@ pub fn module_config_ui(
     // the row is locked on it with the reason, the way the direction row locks
     // - and a DMA pick still stored (a runtime only staged) is named as one
     // that is not built.
+    //
+    // `rp_tx_only` is an RP transmit-only UART, the DMA `UartTx` on either
+    // setting (`rp::async_uart_transport`): locked on what is built, with the
+    // reason, and the stored pick left alone for when it receives again.
     let usart_mode_row = |ui: &mut egui::Ui,
                           out: &mut ConfigOut,
                           mode: &mut UsartMode,
                           family: &str,
-                          no_dma: bool| {
+                          no_dma: bool,
+                          rp_tx_only: bool| {
         let rp = crate::panels::mcu_module::codegen::rp::is_rp(family);
         let dma_text = if rp {
             "DMA (one transfer per read)"
         } else {
             "DMA (ring buffer)"
         };
+        if rp_tx_only {
+            out.field("Async transport", docs::USART_ASYNC_TRANSPORT_RP_TX_ONLY);
+            ui.label("Async transport");
+            ui.add_enabled_ui(false, |ui| {
+                egui::ComboBox::from_id_salt("usart_mode_locked")
+                    .selected_text(dma_text)
+                    .show_ui(ui, |_ui| {});
+            })
+            .response
+            .on_hover_text(docs::USART_ASYNC_TRANSPORT_RP_TX_ONLY);
+            ui.end_row();
+            return;
+        }
         if no_dma {
             out.field("Async transport", docs::USART_ASYNC_TRANSPORT_NO_DMA);
             ui.label("Async transport");
@@ -4025,7 +4052,14 @@ pub fn module_config_ui(
             ui.end_row();
             return;
         }
-        out.field("Async transport", docs::USART_ASYNC_TRANSPORT);
+        out.field(
+            "Async transport",
+            if rp {
+                docs::USART_ASYNC_TRANSPORT_RP
+            } else {
+                docs::USART_ASYNC_TRANSPORT
+            },
+        );
         ui.label("Async transport");
         egui::ComboBox::from_id_salt("usart_mode")
             .selected_text(match mode {
@@ -4035,13 +4069,13 @@ pub fn module_config_ui(
             .show_ui(ui, |ui| {
                 ui.selectable_value(mode, UsartMode::Buffered, "Buffered (interrupt)")
                     .on_hover_text(if rp {
-                        "embassy-rp BufferedUart - one interrupt per byte into two software rings. Takes NO DMA channel, and it is the only RP uart type implementing embedded-io-async Read: the DMA Uart implements no embedded-io trait at all. Each ring is the RX/TX buffer size set above."
+                        "embassy-rp BufferedUart - one interrupt per byte into a software ring per direction (BufferedUartRx, one ring, for Receive only; a Transmit only UART is the DMA UartTx on either setting). Takes NO DMA channel, and it is the only RP uart type implementing embedded-io-async: the DMA Uart and its halves implement no embedded-io trait at all. Each ring is the RX/TX buffer size set above."
                     } else {
                         "embassy BufferedUart -> embedded-io-async Read + Write, one interrupt per byte into a software ring buffer. Needs no DMA channel, so it compiles out of the box."
                     });
                 ui.selectable_value(mode, UsartMode::Dma, dma_text)
                     .on_hover_text(if rp {
-                        "embassy-rp Uart::new - the peripheral talks to DMA directly and takes TWO channels, one per direction. There is no RingBufferedUartRx on this chip, so reception does not continue between your reads: what arrives in the gap is held only by the 32-byte hardware FIFO. This type implements no embedded-io trait, only inherent async read/write."
+                        "embassy-rp Uart::new - the peripheral talks to DMA directly and takes one channel per direction it uses (UartTx or UartRx for a one-way UART takes one). There is no RingBufferedUartRx on this chip, so reception does not continue between your reads: what arrives in the gap is held only by the 32-byte hardware FIFO. These types implement no embedded-io trait, only inherent async read/write."
                     } else {
                         "UartTx + RingBufferedUartRx -> the same embedded-io-async traits, but the peripheral talks to DMA directly and RX keeps filling a circular buffer between your reads, so bytes are not dropped in the gaps. Takes TWO channels on a bidirectional UART - embassy's constructor requires both. To spend one, set Data Direction to RX only or TX only; to keep both directions but send from the CPU, the generated file shows `blocking_write` on the same handle."
                     });
@@ -4137,9 +4171,7 @@ pub fn module_config_ui(
         // drew, and not re-derived from the family somewhere else. ONE
         // choice, read by the pane and the hover alike, so a backend cannot
         // reach one and not the other.
-        let locked = if crate::panels::mcu_module::codegen::rp::is_rp(family) {
-            docs::USART_DIRECTION_LOCKED_RP
-        } else if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
+        let locked = if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
             docs::USART_DIRECTION_LOCKED_NRF
         } else {
             docs::USART_DIRECTION_LOCKED
@@ -4194,8 +4226,8 @@ pub fn module_config_ui(
         }
         ui.end_row();
         // A direction whose pad the canvas does not have builds nothing on
-        // embassy: main.rs says so where the init would be, and this says so
-        // first, the way the flow row does for its pads.
+        // embassy or on the RP: main.rs says so where the init would be, and
+        // this says so first, the way the flow row does for its pads.
         let (has_tx, has_rx) = wired_serial;
         let missing = match (
             cfg.direction.needs_tx() && !has_tx,
@@ -4206,7 +4238,7 @@ pub fn module_config_ui(
             (false, true) => "the RX pad",
             (false, false) => "",
         };
-        if embassy && !missing.is_empty() {
+        if (embassy || rp_family) && !missing.is_empty() {
             ui.label("");
             ui.label(
                 egui::RichText::new(format!(
@@ -4221,6 +4253,13 @@ pub fn module_config_ui(
         // Line-level extras. On an older USART the register bits do not exist —
         // and neither do embassy's `Config` fields — so the row says that
         // instead of offering a switch that cannot be generated.
+        //
+        // Not on an RP, whose reason is a different one: the PL011 has no swap,
+        // and the inversion embassy-rp's `Config` does carry is not written.
+        if rp_family {
+            out.skip("Line", docs::SKIP_USART_LINE_RP);
+            return;
+        }
         out.field(
             "Line",
             if line_extras {
@@ -5211,7 +5250,10 @@ pub fn module_config_ui(
                     // must not get there first.
                     let tx_only_dma = usart_transport(cfg) == UsartMode::Dma
                         && cfg.direction == UsartDirection::TxOnly;
-                    if tx_only_dma && !embassy_blocking {
+                    // An RP on DMA has no ring on any shape, which is the RP
+                    // DMA skip's reason below - not this one's, whose "give it
+                    // a receiving half" brings no row back on that transport.
+                    if tx_only_dma && !embassy_blocking && !rp_family {
                         out.skip("RX/TX buffer", docs::SKIP_USART_BUF_TX_ONLY);
                     }
                     if embassy_blocking {
@@ -5232,10 +5274,20 @@ pub fn module_config_ui(
                     // has no ring at all, so the row sized a buffer that was
                     // never allocated while its own hover promised a circular
                     // one that stops bytes being lost.
+                    // Async only: rp-hal's Blocking UART reads neither field.
+                    // The transport BUILT, which for a transmit-only UART is
+                    // DMA whatever is stored.
                     let rp = crate::panels::mcu_module::codegen::rp::is_rp(family);
-                    let rp_dma = rp && cfg.mode == UsartMode::Dma;
+                    let rp_dma = rp && is_async && usart_transport(cfg) == UsartMode::Dma;
                     if rp_dma {
-                        out.skip("RX DMA buffer", docs::SKIP_USART_BUF_RP_DMA);
+                        out.skip(
+                            "RX DMA buffer",
+                            if cfg.direction == UsartDirection::TxOnly {
+                                docs::SKIP_USART_BUF_RP_TX_ONLY
+                            } else {
+                                docs::SKIP_USART_BUF_RP_DMA
+                            },
+                        );
                     }
                     // embassy-nrf's `Uarte` has no ring on either transport,
                     // and the nRF backend reads neither `mode` nor `buf_len`.
@@ -5252,6 +5304,9 @@ pub fn module_config_ui(
                     }
                     if is_async && !tx_only_dma && !rp_dma && !nrf {
                         let dma = usart_transport(cfg) == UsartMode::Dma;
+                        // An RP receive-only UART on the buffered transport is
+                        // `BufferedUartRx`: ONE ring, the receive one.
+                        let one_ring = rp && !dma && cfg.direction == UsartDirection::RxOnly;
                         // The label AND the sentence both turn on the transport
                         // — the field means two different things, and the pane
                         // has to explain the one the reader is looking at.
@@ -5259,6 +5314,8 @@ pub fn module_config_ui(
                             if dma { "RX DMA buffer" } else { "RX/TX buffer" },
                             if dma {
                                 docs::USART_BUF_DMA
+                            } else if one_ring {
+                                docs::USART_BUF_BUFFERED_ONE_WAY
                             } else {
                                 docs::USART_BUF_BUFFERED
                             },
@@ -5286,6 +5343,8 @@ pub fn module_config_ui(
                         .response
                         .on_hover_text(if dma {
                             "The circular buffer the DMA controller fills on its own. Reception never stops, so this only has to cover the longest GAP between your reads - overrun it and the OLDEST bytes are dropped, silently."
+                        } else if one_ring {
+                            "Size of the one software ring a receive-only UART allocates. The CPU copies byte by byte on each interrupt, so this has to cover what arrives between your reads."
                         } else {
                             "Size of both software ring buffers, TX and RX. The CPU copies byte by byte on each interrupt, so this has to cover what arrives between your reads."
                         });
@@ -5390,6 +5449,14 @@ pub fn module_config_ui(
                         flow_row(ui, out, cfg, wired_flow);
                         clamp_usart(cfg);
                         api_row_locked_embassy(ui, out);
+                    } else if rp_family && !is_async {
+                        // rp-hal builds the pair or either half (`uart::Pins`
+                        // with the other `OptionTNone`), so the direction is the
+                        // module's here too - and no flow form, no transport.
+                        direction_row(ui, out, cfg);
+                        flow_row(ui, out, cfg, wired_flow);
+                        clamp_usart(cfg);
+                        api_row(ui, out, &mut pending.0);
                     } else if is_native {
                         // Native is stm32f1xx-hal too: the same rows absent, for
                         // the same reasons.
@@ -5403,7 +5470,8 @@ pub fn module_config_ui(
                             out.skip("Async transport", docs::SKIP_USART_TRANSPORT_NRF);
                         } else {
                             let no_dma = serial_lacks_dma(cfg.instance);
-                            usart_mode_row(ui, out, &mut cfg.mode, family, no_dma);
+                            let rp_tx_only = rp_family && cfg.direction == UsartDirection::TxOnly;
+                            usart_mode_row(ui, out, &mut cfg.mode, family, no_dma, rp_tx_only);
                         }
                         // The transport decides which directions exist, and the
                         // pair decides which flow options do — so this order is
@@ -5419,7 +5487,7 @@ pub fn module_config_ui(
                             // note would describe something that is not
                             // happening - and the DMA card agrees, because
                             // `async_bus_lines` reserves nothing for that bus.
-                            if cfg.mode == UsartMode::Dma {
+                            if usart_transport(cfg) == UsartMode::Dma {
                                 out.note(RP_DMA_NOTE);
                             }
                         } else if usart_transport(cfg) == UsartMode::Dma && !nrf {
@@ -9417,8 +9485,9 @@ mod tests {
 
     /// The locked Data direction row says the backend's own reason, in the
     /// pane and on the hover alike: an nRF has no transport to switch and
-    /// embassy-nrf has the halves, an RP's embassy-rp has them too. Neither is
-    /// the old embassy-stm32 sentence ("switch the transport to DMA").
+    /// embassy-nrf has the halves. Neither text is the old embassy-stm32
+    /// sentence ("switch the transport to DMA"). An RP is not locked at all
+    /// any more: it builds one-way UARTs.
     #[test]
     fn a_locked_direction_names_its_own_backend() {
         let doc_of = |out: &ConfigOut| {
@@ -9432,18 +9501,145 @@ mod tests {
         };
         let nrf = drive_usart("nrf52833", true, false, false, |_| {});
         assert_eq!(doc_of(&nrf), docs::USART_DIRECTION_LOCKED_NRF);
-        let rp = drive_usart("rp2040", true, false, false, |_| {});
-        assert_eq!(doc_of(&rp), docs::USART_DIRECTION_LOCKED_RP);
+        for (is_async, is_native) in [(true, false), (false, false)] {
+            let rp = drive_usart("rp2040", is_async, is_native, false, |_| {});
+            assert_eq!(doc_of(&rp), docs::USART_DIRECTION, "Async {is_async}");
+        }
         for doc in [
             docs::USART_DIRECTION_LOCKED,
             docs::USART_DIRECTION_LOCKED_NRF,
-            docs::USART_DIRECTION_LOCKED_RP,
         ] {
             assert!(!doc.contains("transport to DMA"), "{doc}");
         }
         // An STM32 is never down to one direction: half duplex is offered.
         let g0 = drive_usart("stm32g0", true, false, false, |_| {});
         assert_eq!(doc_of(&g0), docs::USART_DIRECTION);
+    }
+
+    /// A Pico builds one-way UARTs: the Data direction row is drawn on
+    /// Blocking too now, and offers Transmit only / Receive only on both
+    /// runtimes and either transport. A transmit-only UART on Async is the
+    /// DMA `UartTx` whatever is stored - embassy-rp's `BufferedUartTx` would
+    /// unmask receive interrupts nothing empties, so this backend builds no
+    /// buffered transmit half - its transport row is locked on DMA with that
+    /// reason, and the
+    /// buffer row says why there is none. The Line row says the RP's own
+    /// reason, and a receive-only buffered UART's buffer is the one ring.
+    #[test]
+    fn a_pico_keeps_its_one_way_uart_on_both_runtimes() {
+        use UsartDirection as D;
+        let doc_of = |out: &ConfigOut, label: &str| {
+            out.fields()
+                .unwrap()
+                .iter()
+                .find(|f| f.label == label)
+                .map(|f| f.doc.clone())
+        };
+        let skipped = |out: &ConfigOut, label: &str| {
+            out.skipped_fields()
+                .iter()
+                .find(|f| f.label == label)
+                .map(|f| f.doc.clone())
+        };
+        for (is_async, mode, dir) in [
+            (false, UsartMode::Buffered, D::TxOnly),
+            (false, UsartMode::Buffered, D::RxOnly),
+            (false, UsartMode::Dma, D::TxOnly),
+            (true, UsartMode::Dma, D::TxOnly),
+            (true, UsartMode::Buffered, D::TxOnly),
+            (true, UsartMode::Dma, D::RxOnly),
+            (true, UsartMode::Buffered, D::RxOnly),
+        ] {
+            let (out, c) = drive_usart_cfg("rp2040", is_async, false, |c| {
+                c.mode = mode;
+                c.direction = dir;
+            });
+            let at = format!("Async {is_async} {mode:?} {dir:?}");
+            // Neither field is ever written: the transport BUILT is derived.
+            assert_eq!((c.direction, c.mode), (dir, mode), "{at}");
+            assert_eq!(
+                doc_of(&out, "Data direction").as_deref(),
+                Some(docs::USART_DIRECTION),
+                "{at}"
+            );
+            assert_eq!(
+                skipped(&out, "Line").as_deref(),
+                Some(docs::SKIP_USART_LINE_RP),
+                "{at}"
+            );
+            assert!(doc_of(&out, "Line").is_none());
+            let tx_only = dir == D::TxOnly;
+            assert_eq!(
+                doc_of(&out, "Async transport").as_deref(),
+                is_async.then_some(if tx_only {
+                    docs::USART_ASYNC_TRANSPORT_RP_TX_ONLY
+                } else {
+                    docs::USART_ASYNC_TRANSPORT_RP
+                }),
+                "{at}"
+            );
+            // embassy-rp's DMA reason, on the runtime that builds embassy-rp
+            // only - rp-hal reads neither the transport nor the buffer - and
+            // for the transport built: a transmit-only UART's on either
+            // setting, with the reason that sends nobody to the buffered one.
+            let built_dma = mode == UsartMode::Dma || tx_only;
+            assert_eq!(
+                skipped(&out, "RX DMA buffer").as_deref(),
+                (is_async && built_dma).then_some(if tx_only {
+                    docs::SKIP_USART_BUF_RP_TX_ONLY
+                } else {
+                    docs::SKIP_USART_BUF_RP_DMA
+                }),
+                "{at}"
+            );
+            assert!(skipped(&out, "RX/TX buffer").is_none(), "{at}");
+            // The DMA note, for the channel the DMA card shows taken.
+            assert_eq!(
+                out.notes().iter().any(|n| n == RP_DMA_NOTE),
+                is_async && built_dma,
+                "{at}"
+            );
+        }
+        // The receive-only ring.
+        let (out, _) = drive_usart_cfg("rp2040", true, false, |c| {
+            c.mode = UsartMode::Buffered;
+            c.direction = D::RxOnly;
+        });
+        assert_eq!(
+            doc_of(&out, "RX/TX buffer").as_deref(),
+            Some(docs::USART_BUF_BUFFERED_ONE_WAY)
+        );
+    }
+
+    /// Trying Transmit only and going back changes nothing stored on a Pico:
+    /// on any runtime, applied or staged, a transmit-only UART keeps the
+    /// transport the user picked - Async builds it on DMA by
+    /// `rp::async_uart_transport`, without writing that down. A DMA written
+    /// for it would outlive the pick, and on an RP turn a later pair from
+    /// `BufferedUart` (embedded-io-async) into the DMA `Uart` (none).
+    #[test]
+    fn a_pico_never_writes_the_transport_of_a_transmit_only_uart() {
+        use UsartDirection as D;
+        let stored = |mode| {
+            move |c: &mut UsartModuleConfig| {
+                c.mode = mode;
+                c.direction = D::TxOnly;
+            }
+        };
+        for family in ["rp2040", "rp235x"] {
+            for mode in [UsartMode::Buffered, UsartMode::Dma] {
+                for (is_async, applied) in
+                    [(false, true), (true, true), (false, false), (true, false)]
+                {
+                    let (_, c) = drive_usart_staged(family, is_async, applied, false, stored(mode));
+                    assert_eq!(
+                        (c.direction, c.mode),
+                        (D::TxOnly, mode),
+                        "{family} Async {is_async} applied {applied}"
+                    );
+                }
+            }
+        }
     }
 
     /// 9 data bits with parity has no frame on any STM32: a stored pair is

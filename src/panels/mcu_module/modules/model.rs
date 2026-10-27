@@ -1926,6 +1926,8 @@ impl UsartDirection {
     ///   vendor data says.
     /// - **ESP** has `UartTx::new` and `UartRx::new`, so a single direction is
     ///   real there - but esp-hal has no single-wire mode at all.
+    /// - **RP** builds one-way UARTs on both runtimes and either transport, and
+    ///   no single wire (see the arm).
     ///
     /// The CHIP's USART version and the Blocking runtime's transport narrow it
     /// further, in [`Self::offered`].
@@ -1956,15 +1958,19 @@ impl UsartDirection {
                 UsartDirection::RxOnly,
             ];
         }
-        // RP: the fall-through list was embassy-stm32's and offered HALF DUPLEX,
-        // which embassy-rp does not have in any form - no `hdsel`, no
-        // `new_half_duplex`, nothing in `Config`. embassy-rp does have real
-        // one-way constructors (`BufferedUartTx::new` / `UartTx::<Async>::new`),
-        // so the missing directions are a gap in THIS backend rather than in the
-        // chip - but the panel offers what the backend builds, and today that is
-        // the pair. `async_bus_lines` refuses a half-wired UART outright.
+        // RP: never half duplex - the PL011 has no single-wire mode, and neither
+        // rp-hal nor embassy-rp has a `new_half_duplex`. One-way is real on both
+        // runtimes and on either transport: rp-hal's `uart::Pins` with the other
+        // half `OptionTNone` on Blocking; on Async embassy-rp's `BufferedUartRx`
+        // or `UartRx` (DMA), and `UartTx` (DMA) for a transmit-only UART on
+        // EITHER transport - `BufferedUartTx` would unmask receive interrupts
+        // nothing empties (`rp::async_uart_transport`).
         if crate::panels::mcu_module::codegen::rp::is_rp(family) {
-            return &[UsartDirection::TxRx];
+            return &[
+                UsartDirection::TxRx,
+                UsartDirection::TxOnly,
+                UsartDirection::RxOnly,
+            ];
         }
         // nRF: the panel draws this row on Async only, where embassy-nrf has
         // one-way `UarteTx` / `UarteRx` - but `async_bus_lines` writes the
@@ -2141,14 +2147,12 @@ impl UsartFlow {
                 }
             };
         }
-        // RP: on the BIDIRECTIONAL port - the only shape this backend emits -
-        // embassy-rp has exactly one flow form, `new_with_rtscts`, which takes
-        // both pads together. RTS-only and CTS-only do exist, but only on the
-        // split halves (`BufferedUartRx::new_with_rts`,
-        // `BufferedUartTx::new_with_cts`), which this backend does not build
-        // either; RS485 driver-enable exists nowhere in the crate. So the row
-        // offers nothing rather than three options that all generate the same
-        // code.
+        // RP: this backend writes no flow control on any shape. embassy-rp's
+        // pair has `new_with_rtscts`, its buffered halves `new_with_rts` /
+        // `new_with_cts`, its DMA halves none; rp-hal's `uart::Pins` carries
+        // the pads too - none of them generated yet, and RS485 driver-enable
+        // exists in neither crate. So the row offers nothing rather than options
+        // that all generate the same code.
         if crate::panels::mcu_module::codegen::rp::is_rp(family) {
             return &[UsartFlow::None];
         }
@@ -2424,9 +2428,10 @@ pub struct UsartModuleConfig {
     /// It means two different things depending on [`mode`](Self::mode), which
     /// is why the label in the UI changes with it:
     ///
-    /// * **Buffered** - the size of BOTH software ring buffers, TX and RX. The
-    ///   CPU copies byte by byte on each interrupt, so this has to cover what
-    ///   the peripheral produces between your reads.
+    /// * **Buffered** - the size of BOTH software ring buffers, TX and RX (of
+    ///   the one receive ring on an RP's receive-only UART). The CPU copies byte
+    ///   by byte on each interrupt, so this has to cover what the peripheral
+    ///   produces between your reads.
     /// * **DMA** - the circular buffer the controller fills on its own. It only
     ///   has to cover the longest GAP between your reads; reception never
     ///   stops, and overrunning it drops the oldest bytes silently.
@@ -6324,9 +6329,52 @@ mod usart_offered_tests {
         D::HalfDuplexOnRx,
     ];
 
+    /// The RP: one-way on both runtimes and either transport, never a single
+    /// wire. A transmit-only UART on the Async BUFFERED transport is offered
+    /// too: it is the DMA `UartTx` whatever is stored, because `BufferedUartTx`
+    /// would leave the receive interrupts it unmasks with no ring to empty
+    /// them - the transport the backend builds, not the one the list reads.
+    /// No flow form on any shape.
+    #[test]
+    fn the_rp_offers_one_way_on_every_transport() {
+        use crate::panels::mcu_module::codegen::rp::async_uart_transport;
+        use crate::panels::mcu_module::modules::UsartModuleConfig;
+        for extras in [false, true] {
+            for (family, is_async, t) in [
+                ("rp2040", false, M::Buffered),
+                ("rp2040", false, M::Dma),
+                ("rp2040", true, M::Buffered),
+                ("rp235x", true, M::Dma),
+            ] {
+                assert_eq!(
+                    D::offered(t, family, is_async, extras),
+                    [D::TxRx, D::TxOnly, D::RxOnly],
+                    "{family} Async {is_async} {t:?}"
+                );
+            }
+            for d in [D::TxRx, D::TxOnly, D::RxOnly] {
+                for is_async in [false, true] {
+                    assert_eq!(F::offered(M::Dma, d, "rp2040", is_async, extras), [F::None]);
+                }
+            }
+        }
+        // Built on: the stored transport, except the transmit-only half.
+        for (d, t, built) in [
+            (D::TxOnly, M::Buffered, M::Dma),
+            (D::TxOnly, M::Dma, M::Dma),
+            (D::RxOnly, M::Buffered, M::Buffered),
+            (D::TxRx, M::Buffered, M::Buffered),
+            (D::TxRx, M::Dma, M::Dma),
+        ] {
+            let mut c = UsartModuleConfig::new(0);
+            (c.direction, c.mode) = (d, t);
+            assert_eq!(async_uart_transport(&c), built, "{d:?} {t:?}");
+        }
+    }
+
     /// The backends whose lists no runtime or chip flag moves: esp-hal's
-    /// halves and the pair on the RP and the nRF - and stm32f1xx-hal's one
-    /// TX+RX port, which is the F1 OFF Async (see the next test for on).
+    /// halves and the pair on the nRF - and stm32f1xx-hal's one TX+RX port,
+    /// which is the F1 OFF Async (see the next test for on).
     #[test]
     fn the_hal_lists_do_not_move() {
         for t in [M::Buffered, M::Dma] {
@@ -6349,11 +6397,6 @@ mod usart_offered_tests {
                     assert_eq!(
                         F::offered(t, D::RxOnly, "esp32c3", is_async, extras),
                         [F::None, F::Cts]
-                    );
-                    assert_eq!(D::offered(t, "rp2040", is_async, extras), [D::TxRx]);
-                    assert_eq!(
-                        F::offered(t, D::TxRx, "rp2040", is_async, extras),
-                        [F::None]
                     );
                     assert_eq!(D::offered(t, "nrf52833", is_async, extras), [D::TxRx]);
                     assert_eq!(

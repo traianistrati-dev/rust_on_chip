@@ -236,15 +236,36 @@ fn signal_name(f: &PinFunction) -> Option<String> {
 /// why.
 ///
 /// The generator does not choose between them: it takes the lowest so the output
-/// is stable, and names both so the person who wired them can decide.
+/// is stable, and names both so the person who wired them can decide. Only for
+/// a role `bus_lines` configures, though: a bus it does not build, or a UART
+/// half its module's direction leaves out, configures neither pad - main.rs
+/// says why there (the NOT-initialised note, `uart_unused_note`), and "Only
+/// GP0 is configured" would contradict it.
 fn ambiguity_notes(mcu: &Mcu) -> String {
+    let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
+    let (uart, spi, i2c) = (uart_pins(mcu), spi_pins(mcu), i2c_pins(mcu));
+    // `bus_lines`'s own gates, read the same way.
+    let both = |pins: &[(u8, &'static str, u8)], i: u8, a: &str, b: &str| {
+        role_of(pins, i, a).is_some() && role_of(pins, i, b).is_some()
+    };
+    let configured = |f: &PinFunction| match f {
+        PinFunction::UsartTx(i) => uart_pads(&uart, &ucfgs, *i).is_ok_and(|(tx, _)| tx.is_some()),
+        PinFunction::UsartRx(i) => uart_pads(&uart, &ucfgs, *i).is_ok_and(|(_, rx)| rx.is_some()),
+        PinFunction::SpiSck(i) | PinFunction::SpiMosi(i) | PinFunction::SpiMiso(i) => {
+            both(&spi, *i, "sck", "mosi")
+        }
+        PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => both(&i2c, *i, "sda", "scl"),
+        _ => true,
+    };
     let mut by_signal: std::collections::BTreeMap<String, Vec<u8>> =
         std::collections::BTreeMap::new();
     for p in mcu.iter_all_pins().filter(|p| !p.reserved) {
         let (Some(n), Some(sig)) = (gpio_index(&p.name), signal_name(&p.selected_function)) else {
             continue;
         };
-        by_signal.entry(sig).or_default().push(n);
+        if configured(&p.selected_function) {
+            by_signal.entry(sig).or_default().push(n);
+        }
     }
     let mut o = String::new();
     for (sig, mut pads) in by_signal {
@@ -292,52 +313,55 @@ fn i2c_pins(mcu: &Mcu) -> Vec<(u8, &'static str, u8)> {
 
 /// UART, SPI and I2C, in that order.
 ///
-/// Each is emitted only when every pad its `init` takes is wired: the UART's
-/// TX+RX pair, the SPI's (MOSI, MISO, SCK), the I2C's SDA+SCL. rp-hal itself
-/// needs the I2C pair and, for SPI, MOSI and SCK - every `ValidSpiPinout` is
-/// `(Tx, Sck)` or wider, none receive-only or clockless. The rest is this
-/// backend's: rp-hal's UART builds from TX or RX alone
-/// (`uart::Pins::default().tx(..)`, the other left `OptionTNone`) and its SPI
-/// transmit-only from `(MOSI, SCK)`, forms not generated yet. The notes below
-/// say which of the two a missing pad is.
+/// Each is emitted when the pads its `init` takes are wired. The UART takes the
+/// ones its module's direction needs (`uart_pads`): the pair, or TX or RX alone
+/// - rp-hal's `uart::Pins::default().tx(..)`, the other half `OptionTNone`. The
+/// SPI takes MOSI and SCK, and MISO when it is wired: without it, rp-hal's
+/// transmit-only `(MOSI, SCK)` bus. rp-hal builds no SPI without MOSI or SCK -
+/// every `ValidSpiPinout` is `(Tx, Sck)` or wider - nor an I2C without both
+/// lines, which is what those notes say.
 fn bus_lines(mcu: &Mcu, _hal: &str) -> String {
     let mut o = ambiguity_notes(mcu);
 
     let uart = uart_pins(mcu);
+    let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
     for i in instances(&uart) {
-        let (Some(tx), Some(rx)) = (role_of(&uart, i, "tx"), role_of(&uart, i, "rx")) else {
-            o.push_str(&format!(
-                "    // UART{i}: only one of TX/RX is wired, and this backend builds the UART from\n    // the pair - rp-hal's `uart::Pins` takes TX or RX alone, but that form is not\n    // generated yet. Wire the other pad on the Pins canvas.\n"
-            ));
-            continue;
+        let (tx, rx) = match uart_pads(&uart, &ucfgs, i) {
+            Ok(pads) => pads,
+            Err(why) => {
+                o.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!("UART{i} is NOT initialised: {why}"),
+                    "    ",
+                ));
+                continue;
+            }
         };
+        // In `init`'s order, tx then rx - the one pad of a one-way UART alone.
+        let pads: String = [tx, rx]
+            .into_iter()
+            .flatten()
+            .map(|g| format!("        pins.gpio{g},\n"))
+            .collect();
         o.push_str(&format!(
-            "    let uart{i} = pins::configs::uart{i}::init(\n        pac.UART{i},\n        pins.gpio{tx},\n        pins.gpio{rx},\n        &mut pac.RESETS,\n        clocks.peripheral_clock.freq(),\n    );\n    let _ = &uart{i};\n"
+            "    let uart{i} = pins::configs::uart{i}::init(\n        pac.UART{i},\n{pads}        &mut pac.RESETS,\n        clocks.peripheral_clock.freq(),\n    );\n    let _ = &uart{i};\n"
         ));
+        o.push_str(&uart_unused_note(&uart, &ucfgs, i));
     }
 
     let spi = spi_pins(mcu);
     for i in instances(&spi) {
-        let (Some(sck), Some(mosi), Some(miso)) = (
-            role_of(&spi, i, "sck"),
-            role_of(&spi, i, "mosi"),
-            role_of(&spi, i, "miso"),
-        ) else {
-            // Only MISO missing is this backend's gap; MOSI or SCK is rp-hal's.
-            let tx_only = role_of(&spi, i, "sck").is_some() && role_of(&spi, i, "mosi").is_some();
-            o.push_str(&if tx_only {
-                format!(
-                    "    // SPI{i}: MISO is not wired, and this backend builds the bus from (MOSI, MISO,\n    // SCK) together - rp-hal's transmit-only `(MOSI, SCK)` bus is not generated yet.\n    // Wire MISO on the Pins canvas.\n"
-                )
-            } else {
-                format!(
-                    "    // SPI{i}: rp-hal builds every SPI from at least MOSI and SCK - it has no\n    // receive-only or clockless form - so wire the missing one on the Pins canvas.\n"
-                )
-            });
+        let (Some(sck), Some(mosi)) = (role_of(&spi, i, "sck"), role_of(&spi, i, "mosi")) else {
+            o.push_str(&format!(
+                "    // SPI{i}: rp-hal builds every SPI from at least MOSI and SCK - it has no\n    // receive-only or clockless form - so wire the missing one on the Pins canvas.\n"
+            ));
             continue;
         };
+        // MISO is the optional one: without it, the transmit-only bus.
+        let miso = role_of(&spi, i, "miso")
+            .map(|g| format!("        pins.gpio{g},\n"))
+            .unwrap_or_default();
         o.push_str(&format!(
-            "    let spi{i} = pins::configs::spi{i}::init(\n        pac.SPI{i},\n        pins.gpio{mosi},\n        pins.gpio{miso},\n        pins.gpio{sck},\n        &mut pac.RESETS,\n        clocks.peripheral_clock.freq(),\n    );\n    let _ = &spi{i};\n"
+            "    let spi{i} = pins::configs::spi{i}::init(\n        pac.SPI{i},\n        pins.gpio{mosi},\n{miso}        pins.gpio{sck},\n        &mut pac.RESETS,\n        clocks.peripheral_clock.freq(),\n    );\n    let _ = &spi{i};\n"
         ));
     }
 
@@ -643,7 +667,113 @@ fn uart_is_buffered(
     i: u8,
 ) -> bool {
     use crate::panels::mcu_module::modules::UsartMode;
-    cfgs.get(&i).is_none_or(|c| c.mode == UsartMode::Buffered)
+    cfgs.get(&i)
+        .is_none_or(|c| async_uart_transport(c) == UsartMode::Buffered)
+}
+
+/// The transport embassy-rp builds a UART on: its module's, except for a
+/// transmit-only one, which is the DMA `UartTx` on either. embassy-rp's
+/// `BufferedUartTx` still runs `Uart::init`, which enables the receiver, and
+/// `init_buffers` unmasks the receive interrupts - with no receive ring for its
+/// handler to empty them into. The DMA half unmasks none.
+///
+/// Derived, never written back: the stored pick is the user's and waits for the
+/// UART to receive again, so trying Transmit only and going back changes
+/// nothing - on an RP the two transports build different types (`BufferedUart`
+/// implements embedded-io-async, the DMA `Uart` does not). The module panel
+/// shows the transport through this same function.
+pub fn async_uart_transport(
+    cfg: &crate::panels::mcu_module::modules::UsartModuleConfig,
+) -> crate::panels::mcu_module::modules::UsartMode {
+    use crate::panels::mcu_module::modules::{UsartDirection, UsartMode};
+    if cfg.direction == UsartDirection::TxOnly {
+        UsartMode::Dma
+    } else {
+        cfg.mode
+    }
+}
+
+/// The pads a UART's direction takes - `(tx, rx)`, the half it leaves out
+/// `None` - or, when its module asks for a shape the wired pads cannot make,
+/// why not: the sentence main.rs says instead of an `init`.
+///
+/// The direction is the MODULE's (`UsartModuleConfig::direction`), as on the
+/// STM32: a pad the direction needs and the canvas lacks builds nothing, a pad
+/// wired but not used is left alone. ONE reading, shared by both runtimes'
+/// main.rs, the Blocking config files and the Async manifest gate, so none of
+/// them builds a shape another refuses.
+fn uart_pads(
+    uart: &[(u8, &'static str, u8)],
+    cfgs: &std::collections::BTreeMap<u8, crate::panels::mcu_module::modules::UsartModuleConfig>,
+    i: u8,
+) -> Result<(Option<u8>, Option<u8>), String> {
+    use crate::panels::mcu_module::modules::UsartDirection as D;
+    let dir = cfgs.get(&i).map(|c| c.direction).unwrap_or_default();
+    // Never offered on an RP - a project re-targeted from an STM32 can carry it.
+    if dir.is_half_duplex() {
+        return Err(format!(
+            "its direction ({}) is a single wire, and the PL011 has no half-duplex mode - \
+             neither rp-hal nor embassy-rp builds one. Pick another direction on its module.",
+            dir.label()
+        ));
+    }
+    let (tx, rx) = (role_of(uart, i, "tx"), role_of(uart, i, "rx"));
+    let (missing, it) = match (
+        dir.needs_tx() && tx.is_none(),
+        dir.needs_rx() && rx.is_none(),
+    ) {
+        (true, true) => ("TX and RX pads are", "them"),
+        (true, false) => ("TX pad is", "it"),
+        (false, true) => ("RX pad is", "it"),
+        (false, false) => {
+            return Ok((tx.filter(|_| dir.needs_tx()), rx.filter(|_| dir.needs_rx())));
+        }
+    };
+    // A pair with one pad wired: the one-way UART that pad makes is one pick
+    // away, so say which - on either runtime and transport, all of which offer
+    // both halves (`UsartDirection::options_for`).
+    let or = match (dir, tx, rx) {
+        (D::TxRx, Some(_), None) => ", or set its direction to Transmit only on its module",
+        (D::TxRx, None, Some(_)) => ", or set its direction to Receive only on its module",
+        _ => "",
+    };
+    Err(format!(
+        "its {missing} not wired, and its direction ({}) needs {it}. Assign {it} on the Pins \
+         canvas{or}.",
+        dir.label()
+    ))
+}
+
+/// main.rs's line for each half a UART's direction leaves alone: its pads
+/// wired on the canvas - every one, two pads can carry one signal - and handed
+/// to no `init`. Said, so the reader does not go looking.
+fn uart_unused_note(
+    uart: &[(u8, &'static str, u8)],
+    cfgs: &std::collections::BTreeMap<u8, crate::panels::mcu_module::modules::UsartModuleConfig>,
+    i: u8,
+) -> String {
+    let dir = cfgs.get(&i).map(|c| c.direction).unwrap_or_default();
+    [("tx", "TX", dir.needs_tx()), ("rx", "RX", dir.needs_rx())]
+        .into_iter()
+        .filter(|(_, _, used)| !used)
+        .filter_map(|(role, name, _)| {
+            let pads: Vec<String> = uart
+                .iter()
+                .filter(|(inst, r, _)| *inst == i && *r == role)
+                .map(|(_, _, g)| format!("GP{g}"))
+                .collect();
+            let sentence = match pads.as_slice() {
+                [] => return None,
+                [one] => format!("UART{i}'s {name} pad ({one}) is wired, but its direction ({}) does not use it.", dir.label()),
+                many => format!(
+                    "UART{i}'s {name} pads ({}) are wired, but its direction ({}) does not use them.",
+                    many.join(" and "),
+                    dir.label()
+                ),
+            };
+            Some(crate::panels::mcu_module::errata::comment(&sentence, "    "))
+        })
+        .collect()
 }
 
 /// Whether this project needs `static_cell` and `embedded-io-async` in its
@@ -666,10 +796,11 @@ pub fn needs_async_usart(mcu: &Mcu) -> bool {
     }
     let uart = uart_pins(mcu);
     let cfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
+    // Every buffered UART `async_bus_lines` builds has a receive ring - the
+    // pair, or the receive-only half. A transmit-only one is the DMA `UartTx`
+    // whatever its module stores, and builds no ring.
     instances(&uart).into_iter().any(|i| {
-        role_of(&uart, i, "tx").is_some()
-            && role_of(&uart, i, "rx").is_some()
-            && uart_is_buffered(&cfgs, i)
+        uart_is_buffered(&cfgs, i) && matches!(uart_pads(&uart, &cfgs, i), Ok((_, Some(_))))
     })
 }
 
@@ -793,33 +924,101 @@ fn bus_config_file(
 
     match kind {
         "uart" => {
-            let tx = pads.iter().find(|(r, _)| *r == "tx").unwrap().1;
-            let rx = pads.iter().find(|(r, _)| *r == "rx").unwrap().1;
-            o.push_str(&format!(
-                "\n/// The concrete type `init` hands back, so it can be a struct field.\npub type Handle = {hal}::uart::UartPeripheral<\n    {hal}::uart::Enabled,\n    {hal}::pac::UART{n},\n    ({}, {}),\n>;\n\n",
-                gpio(tx), gpio(rx)
-            ));
-            o.push_str(&format!(
-                "/// UART{n} on GP{tx} (TX) and GP{rx} (RX), at BAUDRATE.\npub fn init(\n    uart: {hal}::pac::UART{n},\n    tx: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{tx}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    rx: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{rx}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    resets: &mut {hal}::pac::RESETS,\n    peri_freq: {hal}::fugit::HertzU32,\n) -> Handle {{\n"
-            ));
-            o.push_str(&format!(
-                "    {hal}::uart::UartPeripheral::new(uart, (tx.into_function(), rx.into_function()), resets)\n        .enable(\n            {hal}::uart::UartConfig::new(\n                {hal}::fugit::HertzU32::Hz(BAUDRATE),\n                DATA_BITS,\n                PARITY,\n                STOP_BITS,\n            ),\n            peri_freq,\n        )\n        .unwrap()\n}}\n"
-            ));
+            let tx = pads.iter().find(|(r, _)| *r == "tx").map(|p| p.1);
+            let rx = pads.iter().find(|(r, _)| *r == "rx").map(|p| p.1);
+            let enable = format!(
+                "        .enable(\n            {hal}::uart::UartConfig::new(\n                {hal}::fugit::HertzU32::Hz(BAUDRATE),\n                DATA_BITS,\n                PARITY,\n                STOP_BITS,\n            ),\n            peri_freq,\n        )\n        .unwrap()\n}}\n"
+            );
+            match (tx, rx) {
+                (Some(tx), Some(rx)) => {
+                    o.push_str(&format!(
+                        "\n/// The concrete type `init` hands back, so it can be a struct field.\npub type Handle = {hal}::uart::UartPeripheral<\n    {hal}::uart::Enabled,\n    {hal}::pac::UART{n},\n    ({}, {}),\n>;\n\n",
+                        gpio(tx), gpio(rx)
+                    ));
+                    o.push_str(&format!(
+                        "/// UART{n} on GP{tx} (TX) and GP{rx} (RX), at BAUDRATE.\npub fn init(\n    uart: {hal}::pac::UART{n},\n    tx: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{tx}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    rx: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{rx}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    resets: &mut {hal}::pac::RESETS,\n    peri_freq: {hal}::fugit::HertzU32,\n) -> Handle {{\n"
+                    ));
+                    o.push_str(&format!(
+                        "    {hal}::uart::UartPeripheral::new(uart, (tx.into_function(), rx.into_function()), resets)\n{enable}"
+                    ));
+                }
+                // One-way: rp-hal has no 1-tuple pinout, so `uart::Pins` with
+                // the other half `OptionTNone` - `enable` then clears TXE or
+                // RXE for it. Every method stays on the handle either way.
+                (tx, rx) => {
+                    let Some((pin, role)) = tx.map(|g| (g, "tx")).or(rx.map(|g| (g, "rx"))) else {
+                        return o;
+                    };
+                    let some = format!("{hal}::typelevel::OptionTSome<{}>", gpio(pin));
+                    let none = format!("{hal}::typelevel::OptionTNone");
+                    let (t, r) = if role == "tx" {
+                        (some.as_str(), none.as_str())
+                    } else {
+                        (none.as_str(), some.as_str())
+                    };
+                    o.push_str(&format!(
+                        "\n/// The concrete type `init` hands back, so it can be a struct field.\npub type Handle = {hal}::uart::UartPeripheral<\n    {hal}::uart::Enabled,\n    {hal}::pac::UART{n},\n    {hal}::uart::Pins<{t}, {r}, {none}, {none}>,\n>;\n\n"
+                    ));
+                    let doc = if role == "tx" {
+                        format!(
+                            "/// UART{n} on GP{pin} (TX), TRANSMIT ONLY, at BAUDRATE. `enable` switches the\n/// receiver off, but the handle keeps the read methods: a read never returns.\n"
+                        )
+                    } else {
+                        format!(
+                            "/// UART{n} on GP{pin} (RX), RECEIVE ONLY, at BAUDRATE. `enable` switches the\n/// transmitter off, but the handle keeps the write methods: once the FIFO is\n/// full, a write never returns.\n"
+                        )
+                    };
+                    o.push_str(&format!(
+                        "{doc}pub fn init(\n    uart: {hal}::pac::UART{n},\n    {role}: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{pin}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    resets: &mut {hal}::pac::RESETS,\n    peri_freq: {hal}::fugit::HertzU32,\n) -> Handle {{\n"
+                    ));
+                    o.push_str(&format!(
+                        "    {hal}::uart::UartPeripheral::new(uart, {hal}::uart::Pins::default().{role}({role}.into_function()), resets)\n{enable}"
+                    ));
+                }
+            }
         }
         "spi" => {
-            let sck = pads.iter().find(|(r, _)| *r == "sck").unwrap().1;
-            let mosi = pads.iter().find(|(r, _)| *r == "mosi").unwrap().1;
-            let miso = pads.iter().find(|(r, _)| *r == "miso").unwrap().1;
-            o.push_str(&format!(
-                "\n/// The concrete type `init` hands back.\npub type Handle = {hal}::spi::Spi<\n    {hal}::spi::Enabled,\n    {hal}::pac::SPI{n},\n    ({}, {}, {}),\n    8,\n>;\n\n",
-                gpio(mosi), gpio(miso), gpio(sck)
-            ));
-            o.push_str(&format!(
-                "/// SPI{n}: SCK GP{sck}, TX GP{mosi}, RX GP{miso}, the three this `init` takes.\n/// rp-hal also builds a transmit-only bus from `(MOSI, SCK)`, which this\n/// backend does not generate yet.\npub fn init(\n    spi: {hal}::pac::SPI{n},\n    mosi: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{mosi}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    miso: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{miso}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    sck: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{sck}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    resets: &mut {hal}::pac::RESETS,\n    peri_freq: {hal}::fugit::HertzU32,\n) -> Handle {{\n"
-            ));
-            o.push_str(&format!(
-                "    {hal}::spi::Spi::<_, _, _, 8>::new(\n        spi,\n        (mosi.into_function(), miso.into_function(), sck.into_function()),\n    )\n    .init(\n        resets,\n        peri_freq,\n        {hal}::fugit::HertzU32::Hz(SPI_HZ),\n        embedded_hal::spi::MODE_0,\n    )\n}}\n"
-            ));
+            let sck = pads.iter().find(|(r, _)| *r == "sck").map_or(0, |p| p.1);
+            let mosi = pads.iter().find(|(r, _)| *r == "mosi").map_or(0, |p| p.1);
+            let miso = pads.iter().find(|(r, _)| *r == "miso").map(|p| p.1);
+            let pin = |role: &str, n: u8| {
+                format!(
+                    "    {role}: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{n}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n"
+                )
+            };
+            let init = format!(
+                "    .init(\n        resets,\n        peri_freq,\n        {hal}::fugit::HertzU32::Hz(SPI_HZ),\n        embedded_hal::spi::MODE_0,\n    )\n}}\n"
+            );
+            match miso {
+                Some(miso) => {
+                    o.push_str(&format!(
+                        "\n/// The concrete type `init` hands back.\npub type Handle = {hal}::spi::Spi<\n    {hal}::spi::Enabled,\n    {hal}::pac::SPI{n},\n    ({}, {}, {}),\n    8,\n>;\n\n",
+                        gpio(mosi), gpio(miso), gpio(sck)
+                    ));
+                    o.push_str(&format!(
+                        "/// SPI{n}: SCK GP{sck}, TX GP{mosi}, RX GP{miso}. With MISO unwired the IDE\n/// writes rp-hal's transmit-only `(MOSI, SCK)` bus instead.\npub fn init(\n    spi: {hal}::pac::SPI{n},\n{}{}{}    resets: &mut {hal}::pac::RESETS,\n    peri_freq: {hal}::fugit::HertzU32,\n) -> Handle {{\n",
+                        pin("mosi", mosi), pin("miso", miso), pin("sck", sck)
+                    ));
+                    o.push_str(&format!(
+                        "    {hal}::spi::Spi::<_, _, _, 8>::new(\n        spi,\n        (mosi.into_function(), miso.into_function(), sck.into_function()),\n    )\n{init}"
+                    ));
+                }
+                // rp-hal's `(Tx, Sck)` pinout. Its read and transfer methods
+                // are implemented for every pinout, so they compile here too.
+                None => {
+                    o.push_str(&format!(
+                        "\n/// The concrete type `init` hands back.\npub type Handle = {hal}::spi::Spi<\n    {hal}::spi::Enabled,\n    {hal}::pac::SPI{n},\n    ({}, {}),\n    8,\n>;\n\n",
+                        gpio(mosi), gpio(sck)
+                    ));
+                    o.push_str(&format!(
+                        "/// SPI{n}, TRANSMIT ONLY: SCK GP{sck}, TX GP{mosi}, no MISO wired - rp-hal's\n/// `(MOSI, SCK)` bus. `read` and `transfer` still compile on the handle and\n/// return whatever the unconnected input shifts in: write only.\npub fn init(\n    spi: {hal}::pac::SPI{n},\n{}{}    resets: &mut {hal}::pac::RESETS,\n    peri_freq: {hal}::fugit::HertzU32,\n) -> Handle {{\n",
+                        pin("mosi", mosi), pin("sck", sck)
+                    ));
+                    o.push_str(&format!(
+                        "    {hal}::spi::Spi::<_, _, _, 8>::new(\n        spi,\n        (mosi.into_function(), sck.into_function()),\n    )\n{init}"
+                    ));
+                }
+            }
         }
         _ => {
             let sda = pads.iter().find(|(r, _)| *r == "sda").unwrap().1;
@@ -1036,9 +1235,10 @@ impl FamilyBackend for RpBackend {
             })
             .collect();
 
-        // The three buses that own their peripheral. Only fully wired ones get a
-        // file: `init` names every pad in its signature, so half a bus has no
-        // signature to write.
+        // The three buses that own their peripheral. A file for each `bus_lines`
+        // builds, taking the same pads: `init` names every pad it takes in its
+        // signature, so the two must agree or main.rs calls an `init` that is
+        // not there.
         let hal = hal_crate(&mcu.family);
         // The USART modules, so each uart file can carry its own wire frame.
         let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
@@ -1050,11 +1250,25 @@ impl FamilyBackend for RpBackend {
             ("i2c", &["sda", "scl"][..], i2c_pins(mcu)),
         ] {
             for i in instances(&pins) {
-                let pads: Vec<(&str, u8)> = roles
+                let wired: Vec<(&str, u8)> = roles
                     .iter()
                     .filter_map(|r| role_of(&pins, i, r).map(|n| (*r, n)))
                     .collect();
-                if pads.len() == roles.len() {
+                let pads: Option<Vec<(&str, u8)>> = match kind {
+                    // The direction's pads (`uart_pads`), a one-way UART's one.
+                    "uart" => uart_pads(&pins, &ucfgs, i).ok().map(|(tx, rx)| {
+                        [("tx", tx), ("rx", rx)]
+                            .into_iter()
+                            .filter_map(|(r, g)| g.map(|g| (r, g)))
+                            .collect()
+                    }),
+                    // MOSI and SCK, MISO when it is there.
+                    "spi" => (role_of(&pins, i, "sck").is_some()
+                        && role_of(&pins, i, "mosi").is_some())
+                    .then_some(wired),
+                    _ => (wired.len() == roles.len()).then_some(wired),
+                };
+                if let Some(pads) = pads {
                     let frame = (kind == "uart").then(|| ucfgs.get(&i)).flatten();
                     // Only the I2C bus is a folder - its devices each get a
                     // file beside its `mod.rs`.
@@ -1325,6 +1539,11 @@ mod emit_for_manual_compile {
     #[test]
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_rp_project() {
+        // `EIDE_RP_ONEWAY=1`: every bus rp-hal builds from half its pads. UART0
+        // transmit-only on GP0 (GP1 unwired), UART1 receive-only on GP9, and
+        // SPI1 transmit-only on GP10/GP11 with no MISO - the `OptionTNone`
+        // halves and the `(MOSI, SCK)` pinout only a compiler can vouch for.
+        let oneway = std::env::var("EIDE_RP_ONEWAY").is_ok();
         for (id, dir_name) in [
             ("rp2040_pico", "eide_rp2040_check"),
             ("rp2350_pico2", "eide_rp2350_check"),
@@ -1347,7 +1566,10 @@ mod emit_for_manual_compile {
                 match p.name.as_str() {
                     n if n.starts_with("GP25") => p.selected_function = PinFunction::GpioOutput,
                     "GP0" => p.selected_function = PinFunction::UsartTx(0),
-                    "GP1" => p.selected_function = PinFunction::UsartRx(0),
+                    "GP1" if !oneway => p.selected_function = PinFunction::UsartRx(0),
+                    "GP9" if oneway => p.selected_function = PinFunction::UsartRx(1),
+                    "GP10" if oneway => p.selected_function = PinFunction::SpiSck(1),
+                    "GP11" if oneway => p.selected_function = PinFunction::SpiMosi(1),
                     "GP4" => p.selected_function = PinFunction::I2cSda(0),
                     "GP5" => p.selected_function = PinFunction::I2cScl(0),
                     "GP18" => p.selected_function = PinFunction::SpiSck(0),
@@ -1375,10 +1597,23 @@ mod emit_for_manual_compile {
             // accident on the module's default of zero.
             mcu.reconcile_modules();
             for m in &mut mcu.modules {
-                if let crate::panels::mcu_module::modules::ModuleConfig::Timer(c) = &mut m.config {
-                    c.freq_hz = 20_000;
-                    c.set_duty_x100(1, 750);
-                    c.set_duty_x100(2, 1_000);
+                use crate::panels::mcu_module::modules::{ModuleConfig, UsartDirection};
+                match &mut m.config {
+                    ModuleConfig::Timer(c) => {
+                        c.freq_hz = 20_000;
+                        c.set_duty_x100(1, 750);
+                        c.set_duty_x100(2, 1_000);
+                    }
+                    // The direction its one pad allows - the reconciler leaves
+                    // the pair, which builds nothing from a single pad.
+                    ModuleConfig::Usart(c) if oneway => {
+                        c.direction = if c.instance == 0 {
+                            UsartDirection::TxOnly
+                        } else {
+                            UsartDirection::RxOnly
+                        }
+                    }
+                    _ => {}
                 }
             }
             // The watchdog at the LAST period its driver accepts, so the
@@ -1395,6 +1630,18 @@ mod emit_for_manual_compile {
                 main_rs.contains("pins::configs::watchdog::init(&mut watchdog);"),
                 "{id}: no watchdog in main.rs:\n{main_rs}"
             );
+            // A half that came out as a NOT-initialised note would compile
+            // too, and prove nothing.
+            for want in oneway
+                .then_some(["uart0", "uart1", "spi1"])
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    main_rs.contains(&format!("let {want} = pins::configs::{want}::init(")),
+                    "{id}: no {want} in main.rs:\n{main_rs}"
+                );
+            }
             let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             // `sync_pin_files` keeps `src/pins/mod.rs` in a real project, and the
             // generated header declares `pub mod pins;` — so the harness has to
@@ -3696,32 +3943,62 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
     let uart = uart_pins(mcu);
     let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
     for i in instances(&uart) {
-        let (Some(tx), Some(rx)) = (role_of(&uart, i, "tx"), role_of(&uart, i, "rx")) else {
-            // The halves of the transport the module picked: the buffered ones
-            // take no DMA channel, the others do.
-            let halves = if uart_is_buffered(&ucfgs, i) {
-                "BufferedUartTx / BufferedUartRx"
-            } else {
-                "UartTx / UartRx"
-            };
-            o.push_str(&format!(
-                "    // UART{i}: only one of TX/RX is wired, and this backend builds the UART from\n    // the pair - embassy-rp's one-way {halves} are not generated yet.\n    // Wire the other pad on the Pins canvas.\n"
-            ));
-            continue;
+        let (tx, rx) = match uart_pads(&uart, &ucfgs, i) {
+            Ok(pads) => pads,
+            Err(why) => {
+                o.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!("UART{i} is NOT initialised: {why}"),
+                    "    ",
+                ));
+                continue;
+            }
         };
+        // A transmit-only UART is never buffered (`async_uart_transport`).
+        let buffered = uart_is_buffered(&ucfgs, i);
         let hz = bus_speed(mcu, "uart", i);
         let (bits, parity, stop) = async_frame(ucfgs.get(&i));
         o.push_str(&format!(
             "    let mut ucfg{i} = embassy_rp::uart::Config::default();\n    // From the Virtual Module, not a default: a bus at the wrong speed\n    // is met as garbage on the wire, never as a message - and neither is one\n    // at the wrong frame. All four used to be left on embassy's defaults, so\n    // the three frame combos in the panel changed nothing here.\n    ucfg{i}.baudrate = {hz};\n    ucfg{i}.data_bits = {bits};\n    ucfg{i}.parity = {parity};\n    ucfg{i}.stop_bits = {stop};\n"
         ));
-        // The binding NAME is the same on both transports, and so is the
-        // keep-alive: user code below GEN_END refers to `uart{i}` and must not
-        // notice which one was built.
-        if uart_is_buffered(&ucfgs, i) {
+        // The binding NAME is the same on both transports and every shape, and
+        // so is the keep-alive: user code below GEN_END refers to `uart{i}` and
+        // must not notice which one was built.
+        let len = ucfgs.get(&i).map_or(256, |c| c.buf_len.clamp(16, 65_536));
+        if let (true, None, Some(rx)) = (buffered, tx, rx) {
+            // One ring: `BufferedUartRx::new` takes only the receive buffer -
+            // and, unlike `BufferedUart::new`, the binding BEFORE the pad.
+            o.push_str(&format!(
+                "    // Receive only: `BufferedUartRx` moves bytes on the UART interrupt into\n    // this one software ring - no DMA channel - and reads through\n    // embedded-io-async `Read`. `'static` through `StaticCell`.\n    static UART{i}_RX_BUF: static_cell::StaticCell<[u8; {len}]> = static_cell::StaticCell::new();\n    let uart{i} = embassy_rp::uart::BufferedUartRx::new(\n        p.UART{i},\n        Irqs,\n        p.PIN_{rx},\n        UART{i}_RX_BUF.init([0; {len}]),\n        ucfg{i},\n    );\n    let _ = &uart{i};\n"
+            ));
+            irqs.push(format!(
+                "    UART{i}_IRQ => embassy_rp::uart::BufferedInterruptHandler<embassy_rp::peripherals::UART{i}>;"
+            ));
+        } else if let (false, Some(tx), None) = (buffered, tx, rx) {
+            // ONE channel, and the DMA handler is its only binding: `UartTx`
+            // never touches the UART interrupt. Channel BEFORE `Irqs` here.
+            let ch = dma;
+            dma += 1;
+            take(ch, &format!("UART{i} TX"), &mut uses);
+            o.push_str(&format!(
+                "    // Transmit only: `UartTx` on one DMA channel - `write(..).await`, its own\n    // method; it implements no embedded-io-async trait.\n    let uart{i} = embassy_rp::uart::UartTx::new(\n        p.UART{i},\n        p.PIN_{tx},\n        p.DMA_CH{ch},\n        Irqs,\n        ucfg{i},\n    );\n    let _ = &uart{i};\n"
+            ));
+        } else if let (false, None, Some(rx)) = (buffered, tx, rx) {
+            // ONE channel; `Irqs` BEFORE it, and binding the UART interrupt too.
+            let ch = dma;
+            dma += 1;
+            take(ch, &format!("UART{i} RX"), &mut uses);
+            o.push_str(&format!(
+                "    // Receive only: `UartRx` on one DMA channel - `read(..).await`, its own\n    // method; it implements no embedded-io-async trait.\n    let uart{i} = embassy_rp::uart::UartRx::new(\n        p.UART{i},\n        p.PIN_{rx},\n        Irqs,\n        p.DMA_CH{ch},\n        ucfg{i},\n    );\n    let _ = &uart{i};\n"
+            ));
+            irqs.push(format!(
+                "    UART{i}_IRQ => embassy_rp::uart::InterruptHandler<embassy_rp::peripherals::UART{i}>;"
+            ));
+        } else if let (Some(tx), Some(rx)) = (tx, rx)
+            && buffered
+        {
             // No channel is taken here, so nothing is reported to the DMA card
             // and every later peripheral keeps the number it would have had
             // without this bus.
-            let len = ucfgs.get(&i).map_or(256, |c| c.buf_len.clamp(16, 65_536));
             o.push_str(&format!(
                 "    // `BufferedUart` moves bytes on the UART interrupt into these two\n    // software rings - no DMA channel at all. They must be `'static`, which\n    // is what `StaticCell` buys: one runtime check instead of `static mut`.\n    static UART{i}_TX_BUF: static_cell::StaticCell<[u8; {len}]> = static_cell::StaticCell::new();\n    static UART{i}_RX_BUF: static_cell::StaticCell<[u8; {len}]> = static_cell::StaticCell::new();\n"
             ));
@@ -3738,7 +4015,7 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
             irqs.push(format!(
                 "    UART{i}_IRQ => embassy_rp::uart::BufferedInterruptHandler<embassy_rp::peripherals::UART{i}>;"
             ));
-        } else {
+        } else if let (Some(tx), Some(rx)) = (tx, rx) {
             let (tdma, rdma) = (dma, dma + 1);
             dma += 2;
             take(tdma, &format!("UART{i} TX"), &mut uses);
@@ -3750,38 +4027,32 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
                 "    UART{i}_IRQ => embassy_rp::uart::InterruptHandler<embassy_rp::peripherals::UART{i}>;"
             ));
         }
+        o.push_str(&uart_unused_note(&uart, &ucfgs, i));
     }
 
     let spi = spi_pins(mcu);
     for i in instances(&spi) {
-        let (Some(sck), Some(mosi), Some(miso)) = (
-            role_of(&spi, i, "sck"),
-            role_of(&spi, i, "mosi"),
-            role_of(&spi, i, "miso"),
-        ) else {
+        // SCK and MOSI, and MISO when it is wired: without it, the
+        // transmit-only bus, as on the STM32 - pad-driven, no setting.
+        let (Some(sck), Some(mosi)) = (role_of(&spi, i, "sck"), role_of(&spi, i, "mosi")) else {
             // The embassy-rp form that WOULD fit what is wired, by the pad
             // that is missing - this backend's gap; with two pads missing no
             // single form is worth naming.
             let has = |r| role_of(&spi, i, r).is_some();
             let why = match (has("sck"), has("mosi"), has("miso")) {
-                (true, true, false) => {
-                    "MISO is not wired, and this backend builds the bus from SCK, MOSI and MISO \
-                     together - embassy-rp's transmit-only Spi::new_txonly is not generated yet. \
-                     Wire MISO on the Pins canvas."
-                }
                 (true, false, true) => {
-                    "MOSI is not wired, and this backend builds the bus from SCK, MOSI and MISO \
-                     together - embassy-rp's receive-only Spi::new_rxonly is not generated yet. \
-                     Wire MOSI on the Pins canvas."
+                    "MOSI is not wired, and this backend builds every bus from at least SCK and \
+                     MOSI - embassy-rp's receive-only Spi::new_rxonly is not generated yet. Wire \
+                     MOSI on the Pins canvas."
                 }
                 (false, true, _) => {
-                    "SCK is not wired, and this backend builds the bus from SCK, MOSI and MISO \
-                     together - embassy-rp's clockless Spi::new_txonly_nosck (MOSI alone, \
-                     transmit only) is not generated yet. Wire SCK on the Pins canvas."
+                    "SCK is not wired, and this backend builds every bus from at least SCK and \
+                     MOSI - embassy-rp's clockless Spi::new_txonly_nosck (MOSI alone, transmit \
+                     only) is not generated yet. Wire SCK on the Pins canvas."
                 }
                 _ => {
-                    "this backend builds the bus from SCK, MOSI and MISO together - wire the \
-                     missing pads on the Pins canvas."
+                    "this backend builds every bus from at least SCK and MOSI (MISO only to \
+                     receive) - wire whichever of the two is missing on the Pins canvas."
                 }
             };
             o.push_str(&crate::panels::mcu_module::errata::comment(
@@ -3790,14 +4061,28 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
             ));
             continue;
         };
+        let config = |o: &mut String| {
+            let hz = bus_speed(mcu, "spi", i);
+            o.push_str(&format!(
+                "    let mut ucfg{i} = embassy_rp::spi::Config::default();\n    // From the Virtual Module, not a default: a bus at the wrong speed\n    // is met as garbage on the wire, never as a message.\n    ucfg{i}.frequency = {hz};\n"
+            ));
+        };
+        let Some(miso) = role_of(&spi, i, "miso") else {
+            // ONE channel, channel then `Irqs`, as for the pair.
+            let ch = dma;
+            dma += 1;
+            take(ch, &format!("SPI{i} TX"), &mut uses);
+            config(&mut o);
+            o.push_str(&format!(
+                "    // Transmit only (no MISO wired): one DMA channel. `write` is the call -\n    // `read` and `transfer` on this bus panic, there is no receive channel.\n    let spi{i} = embassy_rp::spi::Spi::new_txonly(\n        p.SPI{i},\n        p.PIN_{sck},\n        p.PIN_{mosi},\n        p.DMA_CH{ch},\n        Irqs,\n        ucfg{i},\n    );\n    let _ = &spi{i};\n"
+            ));
+            continue;
+        };
         let (tdma, rdma) = (dma, dma + 1);
         dma += 2;
         take(tdma, &format!("SPI{i} TX"), &mut uses);
         take(rdma, &format!("SPI{i} RX"), &mut uses);
-        let hz = bus_speed(mcu, "spi", i);
-        o.push_str(&format!(
-            "    let mut ucfg{i} = embassy_rp::spi::Config::default();\n    // From the Virtual Module, not a default: a bus at the wrong speed\n    // is met as garbage on the wire, never as a message.\n    ucfg{i}.frequency = {hz};\n"
-        ));
+        config(&mut o);
         o.push_str(&format!(
             "    let spi{i} = embassy_rp::spi::Spi::new(\n        p.SPI{i},\n        p.PIN_{sck},\n        p.PIN_{mosi},\n        p.PIN_{miso},\n        p.DMA_CH{tdma},\n        p.DMA_CH{rdma},\n        Irqs,\n        ucfg{i},\n    );\n    let _ = &spi{i};\n"
         ));
@@ -5343,6 +5628,18 @@ mod emit_async_for_manual_compile {
         // names `static_cell::StaticCell` in main.rs, and the plain Pico is the
         // only board where a missing manifest line shows: on a W the radio adds
         // that crate for its own reasons and hides the mistake.
+        //
+        // `EIDE_RP_ONEWAY=1` wires the one-way shapes instead: UART0
+        // transmit-only on GP0, UART1 receive-only on GP9, both on the
+        // project's own transport, and SPI1 transmit-only on GP10/GP11 with no
+        // MISO. UART0 is the DMA `UartTx` on BOTH transports - this backend
+        // builds no buffered transmit half (embassy-rp's `BufferedUartTx`
+        // unmasks receive interrupts nothing empties) - so the two buffered
+        // projects prove
+        // a stored Buffered does not reach it. Over the three projects that is
+        // every one-way constructor this backend writes: UartTx,
+        // BufferedUartRx, UartRx and Spi::new_txonly.
+        let oneway = std::env::var("EIDE_RP_ONEWAY").is_ok();
         for (id, dir_name, mode) in [
             (
                 "rp2040_pico",
@@ -5370,7 +5667,10 @@ mod emit_async_for_manual_compile {
                 match p.name.as_str() {
                     n if n.starts_with("GP25") => p.selected_function = PinFunction::GpioOutput,
                     "GP0" => p.selected_function = PinFunction::UsartTx(0),
-                    "GP1" => p.selected_function = PinFunction::UsartRx(0),
+                    "GP1" if !oneway => p.selected_function = PinFunction::UsartRx(0),
+                    "GP9" if oneway => p.selected_function = PinFunction::UsartRx(1),
+                    "GP10" if oneway => p.selected_function = PinFunction::SpiSck(1),
+                    "GP11" if oneway => p.selected_function = PinFunction::SpiMosi(1),
                     "GP4" => p.selected_function = PinFunction::I2cSda(0),
                     "GP5" => p.selected_function = PinFunction::I2cScl(0),
                     "GP18" => p.selected_function = PinFunction::SpiSck(0),
@@ -5402,8 +5702,16 @@ mod emit_async_for_manual_compile {
             // than what a user would have.
             mcu.reconcile_modules();
             for m in &mut mcu.modules {
+                use crate::panels::mcu_module::modules::UsartDirection;
                 if let crate::panels::mcu_module::modules::ModuleConfig::Usart(c) = &mut m.config {
                     c.mode = mode;
+                    if oneway {
+                        c.direction = if c.instance == 0 {
+                            UsartDirection::TxOnly
+                        } else {
+                            UsartDirection::RxOnly
+                        };
+                    }
                 }
             }
             // The watchdog at embassy-rp's own ceiling for this chip - twice
@@ -5420,6 +5728,22 @@ mod emit_async_for_manual_compile {
                 main_rs.contains("pins::configs::watchdog::init(p.WATCHDOG);"),
                 "{id}: no watchdog in main.rs:\n{main_rs}"
             );
+            if oneway {
+                let rx = match mode {
+                    crate::panels::mcu_module::modules::UsartMode::Buffered => "BufferedUartRx",
+                    _ => "UartRx",
+                };
+                for want in [
+                    "let uart0 = embassy_rp::uart::UartTx::new(".to_string(),
+                    format!("let uart1 = embassy_rp::uart::{rx}::new("),
+                    "let spi1 = embassy_rp::spi::Spi::new_txonly(".to_string(),
+                ] {
+                    assert!(
+                        main_rs.contains(&want),
+                        "{id}: no `{want}` in main.rs:\n{main_rs}"
+                    );
+                }
+            }
             // The chip names a DIFFERENT HAL crate on async; this is where that
             // choice becomes a Cargo.toml.
             // Through `manifest_sync`, the SAME build config and manifest the app
@@ -6019,14 +6343,26 @@ mod flash_store_rp {
 }
 
 #[cfg(test)]
-mod half_bus_notes {
+mod one_way_buses {
     use crate::panels::mcu_module::builtins;
     use crate::panels::mcu_module::mcu::model::Runtime;
-    use crate::panels::mcu_module::modules::{ModuleConfig, UsartMode};
+    use crate::panels::mcu_module::modules::{ModuleConfig, UsartDirection, UsartMode};
     use crate::panels::mcu_module::pins::PinFunction;
 
-    /// A Pico with `wired` on its pads, on `runtime`.
-    fn pico(runtime: Runtime, wired: &[(&str, PinFunction)]) -> super::Mcu {
+    const TX: (&str, PinFunction) = ("GP0", PinFunction::UsartTx(0));
+    const RX: (&str, PinFunction) = ("GP1", PinFunction::UsartRx(0));
+    const SCK: (&str, PinFunction) = ("GP18", PinFunction::SpiSck(0));
+    const MOSI: (&str, PinFunction) = ("GP19", PinFunction::SpiMosi(0));
+    const MISO: (&str, PinFunction) = ("GP16", PinFunction::SpiMiso(0));
+
+    /// A Pico with `wired` on its pads, on `runtime`, its UART0 module set to
+    /// `dir` on `mode`.
+    fn pico(
+        runtime: Runtime,
+        wired: &[(&str, PinFunction)],
+        dir: UsartDirection,
+        mode: UsartMode,
+    ) -> super::Mcu {
         let mut mcu = builtins::builtin_definitions()
             .into_iter()
             .find(|d| d.id == "rp2040_pico")
@@ -6039,81 +6375,347 @@ mod half_bus_notes {
             }
         }
         mcu.reconcile_modules();
+        for m in &mut mcu.modules {
+            if let ModuleConfig::Usart(c) = &mut m.config {
+                c.direction = dir;
+                c.mode = mode;
+            }
+        }
         mcu
     }
 
     /// main.rs's comments, as the one sentence each is.
-    fn said(mcu: &super::Mcu) -> String {
-        mcu.fresh_main_rs()
-            .lines()
+    fn said(main: &str) -> String {
+        main.lines()
             .map(|l| l.trim().trim_start_matches("//").trim())
             .collect::<Vec<_>>()
             .join(" ")
     }
 
-    /// Half a bus builds nothing, and main.rs says whose limit that is. This
-    /// backend's where the HAL has the form - rp-hal's `uart::Pins` with TX
-    /// alone and its `(MOSI, SCK)` SPI; embassy-rp's one-way UART halves of the
-    /// module's transport and `Spi::new_txonly` / `new_rxonly`. The HAL's
-    /// where it has none: an rp-hal SPI without MOSI or SCK.
+    fn file(mcu: &super::Mcu, name: &str) -> Option<String> {
+        mcu.config_files()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, body)| body)
+    }
+
+    /// rp-hal: a one-way UART is `uart::Pins` with the other half
+    /// `OptionTNone` - main.rs passes the one pad, the file takes it - and a
+    /// pad the direction leaves out is named, not passed.
     #[test]
-    fn a_half_bus_names_whose_limit_it_is() {
-        let no_miso = [
-            ("GP0", PinFunction::UsartTx(0)),
-            ("GP18", PinFunction::SpiSck(0)),
-            ("GP19", PinFunction::SpiMosi(0)),
-        ];
-        let no_mosi = [
-            ("GP18", PinFunction::SpiSck(0)),
-            ("GP16", PinFunction::SpiMiso(0)),
-        ];
-        for runtime in [Runtime::Blocking, Runtime::Async] {
-            let text = said(&pico(runtime, &no_miso));
+    fn rp_hal_builds_either_half_of_a_uart() {
+        use UsartDirection as D;
+        for (dir, wired, pad, role, some_first) in [
+            (D::TxOnly, vec![TX], "pins.gpio0", "tx", true),
+            (D::RxOnly, vec![RX], "pins.gpio1", "rx", false),
+            (D::TxOnly, vec![TX, RX], "pins.gpio0", "tx", true),
+        ] {
+            let mcu = pico(Runtime::Blocking, &wired, dir, UsartMode::Buffered);
+            let main = mcu.fresh_main_rs();
             assert!(
-                text.contains("UART0: only one of TX/RX is wired, and this backend builds the UART from the pair"),
-                "{runtime:?}: {text}"
+                main.contains(&format!(
+                    "    let uart0 = pins::configs::uart0::init(\n        pac.UART0,\n        {pad},\n        &mut pac.RESETS,"
+                )),
+                "{dir:?}:\n{main}"
             );
+            let body = file(&mcu, "uart0.rs").expect("uart0.rs");
             assert!(
-                text.contains("SPI0: MISO is not wired, and this backend builds the bus from"),
-                "{runtime:?}: {text}"
+                body.contains(&format!(
+                    "rp2040_hal::uart::Pins::default().{role}({role}.into_function())"
+                )),
+                "{body}"
             );
-            // No I2C is wired, so none of the old HAL-blaming sentences may
-            // appear at all.
-            for false_claim in ["the constructor takes", "taken together", "NoPin"] {
+            let some = "rp2040_hal::typelevel::OptionTSome<";
+            let pins = body
+                .split("rp2040_hal::uart::Pins<")
+                .nth(1)
+                .expect("a Pins handle");
+            assert_eq!(pins.starts_with(some), some_first, "{body}");
+            assert!(body.contains("pub const PARITY:"), "{body}");
+            if wired.len() == 2 {
                 assert!(
-                    !text.contains(false_claim),
-                    "{runtime:?}: {false_claim}: {text}"
+                    said(&main).contains(
+                        "UART0's RX pad (GP1) is wired, but its direction (Transmit only) does not use it."
+                    ),
+                    "{main}"
                 );
-            }
-            let (uart_hal, spi_hal, no_mosi_says) = match runtime {
-                // The module's default transport is Buffered.
-                Runtime::Async => (
-                    "embassy-rp's one-way BufferedUartTx / BufferedUartRx",
-                    "embassy-rp's transmit-only Spi::new_txonly",
-                    "embassy-rp's receive-only Spi::new_rxonly",
-                ),
-                _ => (
-                    "rp-hal's `uart::Pins` takes TX or RX alone",
-                    "rp-hal's transmit-only `(MOSI, SCK)` bus",
-                    "rp-hal builds every SPI from at least MOSI and SCK",
-                ),
-            };
-            assert!(text.contains(uart_hal), "{runtime:?}: {text}");
-            assert!(text.contains(spi_hal), "{runtime:?}: {text}");
-            let text = said(&pico(runtime, &no_mosi));
-            assert!(text.contains(no_mosi_says), "{runtime:?}: {text}");
-        }
-        // On the DMA transport, the DMA halves.
-        let mut mcu = pico(Runtime::Async, &no_miso);
-        for m in &mut mcu.modules {
-            if let ModuleConfig::Usart(c) = &mut m.config {
-                c.mode = UsartMode::Dma;
+                assert!(!main.contains("pins.gpio1,"), "{main}");
             }
         }
-        let text = said(&mcu);
+        // The pair is the pair, byte for byte as before.
+        let mcu = pico(Runtime::Blocking, &[TX, RX], D::TxRx, UsartMode::Buffered);
+        let body = file(&mcu, "uart0.rs").expect("uart0.rs");
         assert!(
-            text.contains("embassy-rp's one-way UartTx / UartRx"),
+            body.contains("(tx.into_function(), rx.into_function())"),
+            "{body}"
+        );
+        assert!(!body.contains("typelevel"), "{body}");
+    }
+
+    /// A direction whose pad is missing builds nothing on either runtime -
+    /// and the pair with one pad names the one-way pick that would build. No
+    /// file, so no `init` main.rs could call without one.
+    #[test]
+    fn a_direction_without_its_pad_builds_nothing() {
+        use UsartDirection as D;
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mcu = pico(runtime, &[TX], D::TxRx, UsartMode::Dma);
+            let text = said(&mcu.fresh_main_rs());
+            assert!(
+                text.contains(
+                    "UART0 is NOT initialised: its RX pad is not wired, and its direction (Receive and transmit) needs it. Assign it on the Pins canvas, or set its direction to Transmit only on its module."
+                ),
+                "{runtime:?}: {text}"
+            );
+            assert!(!text.contains("let uart0"), "{runtime:?}: {text}");
+            assert!(file(&mcu, "uart0.rs").is_none());
+            let mcu = pico(runtime, &[TX], D::HalfDuplexOnTx, UsartMode::Dma);
+            let text = said(&mcu.fresh_main_rs());
+            assert!(
+                text.contains("the PL011 has no half-duplex mode"),
+                "{runtime:?}: {text}"
+            );
+        }
+        // ...and on the default transport too, which offers both halves: the
+        // one pick the note names is there on either runtime.
+        for (runtime, wired, want) in [
+            (
+                Runtime::Async,
+                TX,
+                "or set its direction to Transmit only on its module.",
+            ),
+            (
+                Runtime::Blocking,
+                TX,
+                "or set its direction to Transmit only on its module.",
+            ),
+            (
+                Runtime::Async,
+                RX,
+                "or set its direction to Receive only on its module.",
+            ),
+        ] {
+            let mcu = pico(runtime, &[wired], D::TxRx, UsartMode::Buffered);
+            let text = said(&mcu.fresh_main_rs());
+            assert!(text.contains(want), "{runtime:?}: {text}");
+        }
+    }
+
+    /// Two pads on the half a direction leaves out: neither is configured, so
+    /// the duplicate note ("Only GP1 is configured") is not written - the
+    /// unused-pad note names both instead. The half it uses keeps that note,
+    /// and a bus that is not built at all gets only its NOT-initialised one.
+    #[test]
+    fn an_unused_half_on_two_pads_is_not_called_configured() {
+        use UsartDirection as D;
+        let rx2 = ("GP17", PinFunction::UsartRx(0));
+        let mcu = pico(
+            Runtime::Blocking,
+            &[TX, RX, rx2],
+            D::TxOnly,
+            UsartMode::Buffered,
+        );
+        let text = said(&mcu.fresh_main_rs());
+        assert!(!text.contains("UART0 RX is wired to"), "{text}");
+        assert!(
+            text.contains(
+                "UART0's RX pads (GP1 and GP17) are wired, but its direction (Transmit only) does not use them."
+            ),
             "{text}"
         );
+        const TX2: (&str, PinFunction) = ("GP16", PinFunction::UsartTx(0));
+        let mcu = pico(
+            Runtime::Blocking,
+            &[TX, TX2],
+            D::TxOnly,
+            UsartMode::Buffered,
+        );
+        let text = said(&mcu.fresh_main_rs());
+        assert!(
+            text.contains("UART0 TX is wired to GP0 and GP16. Only GP0 is configured"),
+            "{text}"
+        );
+        // The pair with no RX pad, and half duplex: no UART at all.
+        for dir in [D::TxRx, D::HalfDuplexOnTx] {
+            let mcu = pico(Runtime::Blocking, &[TX, TX2], dir, UsartMode::Buffered);
+            let text = said(&mcu.fresh_main_rs());
+            assert!(text.contains("UART0 is NOT initialised"), "{dir:?}: {text}");
+            assert!(!text.contains("is configured"), "{dir:?}: {text}");
+        }
+        // SCK on two pads and no MOSI: no SPI either.
+        let sck2 = ("GP2", PinFunction::SpiSck(0));
+        let mcu = pico(
+            Runtime::Blocking,
+            &[SCK, sck2],
+            D::TxRx,
+            UsartMode::Buffered,
+        );
+        let text = said(&mcu.fresh_main_rs());
+        assert!(
+            text.contains("rp-hal builds every SPI from at least MOSI and SCK"),
+            "{text}"
+        );
+        assert!(!text.contains("is configured"), "{text}");
+    }
+
+    /// rp-hal's `(MOSI, SCK)` bus: without MISO the SPI is transmit-only -
+    /// pad-driven, as on the STM32. Without MOSI or SCK there is no rp-hal
+    /// pinout at all, and the note says the HAL's limit.
+    #[test]
+    fn rp_hal_builds_a_transmit_only_spi() {
+        let mcu = pico(
+            Runtime::Blocking,
+            &[SCK, MOSI],
+            UsartDirection::TxRx,
+            UsartMode::Buffered,
+        );
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "    let spi0 = pins::configs::spi0::init(\n        pac.SPI0,\n        pins.gpio19,\n        pins.gpio18,\n        &mut pac.RESETS,"
+            ),
+            "{main}"
+        );
+        let body = file(&mcu, "spi0.rs").expect("spi0.rs");
+        assert!(
+            body.contains("(mosi.into_function(), sck.into_function())"),
+            "{body}"
+        );
+        assert!(body.contains("TRANSMIT ONLY"), "{body}");
+        let mcu = pico(
+            Runtime::Blocking,
+            &[SCK, MISO],
+            UsartDirection::TxRx,
+            UsartMode::Buffered,
+        );
+        assert!(
+            said(&mcu.fresh_main_rs())
+                .contains("rp-hal builds every SPI from at least MOSI and SCK")
+        );
+        assert!(file(&mcu, "spi0.rs").is_none());
+    }
+
+    /// embassy-rp on DMA: each half on ONE channel, in its own constructor's
+    /// argument order - `UartTx` (pin, channel, Irqs) needs no UART interrupt,
+    /// `UartRx` (pin, Irqs, channel) binds it. The DMA card reports the one.
+    #[test]
+    fn embassy_rp_builds_either_dma_half() {
+        use UsartDirection as D;
+        let mcu = pico(Runtime::Async, &[TX], D::TxOnly, UsartMode::Dma);
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "let uart0 = embassy_rp::uart::UartTx::new(\n        p.UART0,\n        p.PIN_0,\n        p.DMA_CH0,\n        Irqs,\n        ucfg0,\n    );"
+            ),
+            "{main}"
+        );
+        assert!(!main.contains("UART0_IRQ"), "{main}");
+        let uses = super::dma_uses(&mcu);
+        assert_eq!(uses.len(), 1, "{uses:?}");
+        assert_eq!(uses[0].user, "UART0 TX");
+
+        let mcu = pico(Runtime::Async, &[RX], D::RxOnly, UsartMode::Dma);
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "let uart0 = embassy_rp::uart::UartRx::new(\n        p.UART0,\n        p.PIN_1,\n        Irqs,\n        p.DMA_CH0,\n        ucfg0,\n    );"
+            ),
+            "{main}"
+        );
+        assert!(
+            main.contains(
+                "UART0_IRQ => embassy_rp::uart::InterruptHandler<embassy_rp::peripherals::UART0>;"
+            ),
+            "{main}"
+        );
+        assert_eq!(super::dma_uses(&mcu).len(), 1);
+        assert!(!super::needs_async_usart(&mcu));
+    }
+
+    /// embassy-rp buffered: the receive half on ONE ring (`Irqs` before the
+    /// pad), which needs the manifest's static_cell - and no transmit half:
+    /// `BufferedUartTx` unmasks receive interrupts nothing empties, so a
+    /// transmit-only UART stored as buffered is the DMA `UartTx` all the same,
+    /// with its stored transport left as the user picked it.
+    #[test]
+    fn embassy_rp_builds_a_buffered_receive_half_only() {
+        use UsartDirection as D;
+        let mcu = pico(Runtime::Async, &[RX], D::RxOnly, UsartMode::Buffered);
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "let uart0 = embassy_rp::uart::BufferedUartRx::new(\n        p.UART0,\n        Irqs,\n        p.PIN_1,\n        UART0_RX_BUF.init([0; 256]),\n        ucfg0,\n    );"
+            ),
+            "{main}"
+        );
+        assert_eq!(main.matches("StaticCell::new()").count(), 1, "{main}");
+        assert!(main.contains("BufferedInterruptHandler<embassy_rp::peripherals::UART0>"));
+        assert!(super::dma_uses(&mcu).is_empty());
+        assert!(super::needs_async_usart(&mcu));
+
+        let mcu = pico(Runtime::Async, &[TX], D::TxOnly, UsartMode::Buffered);
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "let uart0 = embassy_rp::uart::UartTx::new(\n        p.UART0,\n        p.PIN_0,\n        p.DMA_CH0,\n        Irqs,\n        ucfg0,\n    );"
+            ),
+            "{main}"
+        );
+        assert!(!main.contains("StaticCell"), "{main}");
+        assert!(!main.contains("UART0_IRQ"), "{main}");
+        assert!(!super::needs_async_usart(&mcu));
+        assert_eq!(super::dma_uses(&mcu).len(), 1);
+        let stored = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
+        assert_eq!(stored[&0].mode, UsartMode::Buffered);
+    }
+
+    /// embassy-rp `Spi::new_txonly` without MISO: one channel, then `Irqs`,
+    /// the only channel the DMA interrupt names. Without MOSI the note names
+    /// `new_rxonly`, which this backend does not write.
+    #[test]
+    fn embassy_rp_builds_a_transmit_only_spi() {
+        let mcu = pico(
+            Runtime::Async,
+            &[SCK, MOSI],
+            UsartDirection::TxRx,
+            UsartMode::Buffered,
+        );
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "let spi0 = embassy_rp::spi::Spi::new_txonly(\n        p.SPI0,\n        p.PIN_18,\n        p.PIN_19,\n        p.DMA_CH0,\n        Irqs,\n        ucfg0,\n    );"
+            ),
+            "{main}"
+        );
+        assert!(
+            main.contains("embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>")
+        );
+        assert!(!main.contains("DMA_CH1"), "{main}");
+        let uses = super::dma_uses(&mcu);
+        assert_eq!(uses.len(), 1, "{uses:?}");
+        assert_eq!(uses[0].user, "SPI0 TX");
+        // Without MOSI: the form that would fit, and the rule this backend
+        // keeps now - SCK and MOSI, not all three.
+        for (wired, want) in [
+            (
+                &[SCK, MISO][..],
+                "SPI0: MOSI is not wired, and this backend builds every bus from at least SCK and MOSI - embassy-rp's receive-only Spi::new_rxonly is not generated yet.",
+            ),
+            (
+                &[SCK][..],
+                "SPI0: this backend builds every bus from at least SCK and MOSI (MISO only to receive)",
+            ),
+        ] {
+            let mcu = pico(
+                Runtime::Async,
+                wired,
+                UsartDirection::TxRx,
+                UsartMode::Buffered,
+            );
+            let text = said(&mcu.fresh_main_rs());
+            assert!(text.contains(want), "{text}");
+            assert!(!text.contains("MOSI and MISO together"), "{text}");
+            assert!(!text.contains("let spi0"), "{text}");
+        }
     }
 }

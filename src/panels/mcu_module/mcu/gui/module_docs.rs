@@ -331,6 +331,8 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("SKIP_F1_LINE", SKIP_F1_LINE),
     ("SKIP_USART_BUF_TX_ONLY", SKIP_USART_BUF_TX_ONLY),
     ("SKIP_USART_BUF_RP_DMA", SKIP_USART_BUF_RP_DMA),
+    ("SKIP_USART_BUF_RP_TX_ONLY", SKIP_USART_BUF_RP_TX_ONLY),
+    ("SKIP_USART_LINE_RP", SKIP_USART_LINE_RP),
     ("SKIP_I2C_TIMEOUT_RP", SKIP_I2C_TIMEOUT_RP),
     ("SKIP_USART_BUF_NRF", SKIP_USART_BUF_NRF),
     ("SKIP_USART_TRANSPORT_NRF", SKIP_USART_TRANSPORT_NRF),
@@ -361,14 +363,19 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("USART_PARITY", USART_PARITY),
     ("USART_STOP_BITS", USART_STOP_BITS),
     ("USART_BUF_BUFFERED", USART_BUF_BUFFERED),
+    ("USART_BUF_BUFFERED_ONE_WAY", USART_BUF_BUFFERED_ONE_WAY),
     ("USART_BUF_DMA", USART_BUF_DMA),
     ("USART_ASYNC_TRANSPORT", USART_ASYNC_TRANSPORT),
+    ("USART_ASYNC_TRANSPORT_RP", USART_ASYNC_TRANSPORT_RP),
     ("USART_ASYNC_TRANSPORT_NO_DMA", USART_ASYNC_TRANSPORT_NO_DMA),
+    (
+        "USART_ASYNC_TRANSPORT_RP_TX_ONLY",
+        USART_ASYNC_TRANSPORT_RP_TX_ONLY,
+    ),
     ("USART_TRANSFERS_ESP", USART_TRANSFERS_ESP),
     ("USART_DIRECTION", USART_DIRECTION),
     ("USART_DIRECTION_LOCKED", USART_DIRECTION_LOCKED),
     ("USART_DIRECTION_LOCKED_NRF", USART_DIRECTION_LOCKED_NRF),
-    ("USART_DIRECTION_LOCKED_RP", USART_DIRECTION_LOCKED_RP),
     ("USART_LINE", USART_LINE),
     ("USART_LINE_ABSENT", USART_LINE_ABSENT),
     ("USART_FLOW", USART_FLOW),
@@ -1481,12 +1488,29 @@ pub const SKIP_USART_BUF_TX_ONLY: &str = "A TX-only DMA link has no buffer at al
                                           so there is nothing to size. Give the link a receiving \
                                           half and the row comes back.";
 
+/// The Line row on an RP, either runtime: a reason of its own, not the STM32
+/// usart_v1/v2 one ([`USART_LINE_ABSENT`] names embassy-stm32's `Config`).
+pub const SKIP_USART_LINE_RP: &str = "Nothing to set on a Pico. The PL011 has no TX/RX swap, \
+                                      and the line inversion embassy-rp's Config does carry \
+                                      (invert_tx, invert_rx) - or the pad override rp-hal \
+                                      leaves to you - is not written by this backend.";
+
 pub const SKIP_USART_BUF_RP_DMA: &str = "Only the buffered transport has a buffer on this chip. \
                                          embassy-rp's DMA `Uart` reads straight into the slice \
                                          you pass `read`, with no ring behind it - there is \
                                          nothing to size, and the row used to size a buffer that \
                                          was never allocated. Switch the transport to buffered \
                                          and it comes back.";
+
+/// The same row on an RP transmit-only UART, where [`SKIP_USART_BUF_RP_DMA`]'s
+/// way back leads nowhere: on the buffered setting it is still the DMA `UartTx`.
+pub const SKIP_USART_BUF_RP_TX_ONLY: &str = "A transmit-only UART is embassy-rp's DMA `UartTx` \
+                                             on this chip: it sends straight from the slice you \
+                                             pass `write`, receives nothing, and has no ring - \
+                                             there is nothing to size. The buffered transport \
+                                             builds no transmit half here, so the row comes back \
+                                             only with a receiving half on the buffered \
+                                             transport.";
 
 pub const SKIP_I2C_TIMEOUT_RP: &str = "embassy-rp's I2C takes no timeout. Its `Config` carries \
                                        the frequency alone, and a transfer that hangs on a \
@@ -1630,6 +1654,14 @@ pub const USART_BUF_BUFFERED: &str = "Size of BOTH software ring buffers, TX and
                                       copies byte by byte on each interrupt, so this has to cover \
                                       what arrives between your reads.";
 
+/// The same row on an RP receive-only UART: embassy-rp's `BufferedUartRx`
+/// takes the receive buffer alone.
+pub const USART_BUF_BUFFERED_ONE_WAY: &str = "Size of the one software ring a receive-only UART \
+                                              allocates - embassy-rp's BufferedUartRx takes no \
+                                              transmit buffer. The CPU copies byte by byte on \
+                                              each interrupt, so this has to cover what arrives \
+                                              between your reads.";
+
 pub const USART_BUF_DMA: &str = "The circular buffer the DMA controller fills on its own. \
                                  Reception never stops, so this only has to cover the longest GAP \
                                  between your reads - overrun it and the OLDEST bytes are dropped, \
@@ -1640,6 +1672,15 @@ pub const USART_ASYNC_TRANSPORT: &str = "Who moves the bytes. Buffered costs one
                                          the peripheral straight to the controller and keeps \
                                          receiving between your reads, at the price of channels.";
 
+/// The same row on an RP, whose DMA does NOT keep receiving: embassy-rp has no
+/// ring type, `UartRx<Async>::read` starts one transfer per call.
+pub const USART_ASYNC_TRANSPORT_RP: &str = "Who moves the bytes. Buffered costs one interrupt \
+                                            per byte and no DMA channel, and is the only RP uart \
+                                            type with embedded-io-async; DMA hands each read or \
+                                            write to the controller as one transfer, one channel \
+                                            per direction used - between two reads, only the \
+                                            32-byte FIFO holds what arrives.";
+
 /// The same row on a UART the chip routes no DMA request to - UART5 on the
 /// F101/F103/F105/F107 and every F3 (`dma_map::lacks_request`). Locked rather
 /// than hidden, like the direction row: the reason is the useful part.
@@ -1649,6 +1690,18 @@ pub const USART_ASYNC_TRANSPORT_NO_DMA: &str = "Buffered, and no choice: this ch
                                                 so embassy's DMA UART cannot be built for it. \
                                                 The one-way directions need that transport, so \
                                                 they are not offered either.";
+
+/// The transport row on an RP transmit-only UART, locked on what is built
+/// (`rp::async_uart_transport`).
+pub const USART_ASYNC_TRANSPORT_RP_TX_ONLY: &str = "DMA, and no choice while the UART only \
+                                                    transmits: embassy-rp's buffered transmit \
+                                                    half still enables the receiver and unmasks \
+                                                    its interrupts, with no ring for them to \
+                                                    empty into, so a Transmit only UART is the \
+                                                    DMA UartTx on one channel - `write(..).await`, \
+                                                    no embedded-io trait. The setting you stored \
+                                                    is kept as it is, for when the UART receives \
+                                                    again.";
 
 pub const USART_TRANSFERS_ESP: &str = "Fixed on an ESP: esp-hal moves UART bytes over DMA through \
                                        UHCI, a driver of its own this generator does not write \
@@ -1663,7 +1716,8 @@ pub const USART_DIRECTION: &str = "Which halves to build. A one-way link frees t
 /// buffered transport ("switch the transport to DMA for a one-way UART"), but
 /// every STM32 runtime that DRAWS the row offers half duplex, so it is never
 /// locked there (the F1 off Async has a one-entry list, and draws no row:
-/// `f1_serial_note` skips it). The RP and then the nRF were what read it.
+/// `f1_serial_note` skips it). The RP and then the nRF were what read it; both
+/// have a sentence of their own now, and the RP is no longer locked at all.
 pub const USART_DIRECTION_LOCKED: &str = "Both halves, and no choice: this backend builds the \
                                           UART from its TX+RX pair only, so a UART with a single \
                                           pad wired generates nothing.";
@@ -1686,22 +1740,6 @@ pub const USART_DIRECTION_LOCKED_NRF: &str = "Both halves, and no choice yet. em
                                               nothing. A gap in the generator, not in the chip. \
                                               It builds embassy-nrf's Uarte only, so there is no \
                                               transport to pick either.";
-
-/// The same row on an RP, where embassy-rp has the one-way forms too.
-///
-/// embassy-rp has real standalone constructors on both transports -
-/// `BufferedUartTx::new` / `BufferedUartRx::new` (uart/buffered.rs:344, :195)
-/// and `UartTx::<Async>::new` / `UartRx::<Async>::new` (uart/mod.rs:251, :403),
-/// the DMA ones taking a single channel. So the pair is not the chip's limit and
-/// switching transport unlocks nothing: `async_bus_lines` skips a UART with only
-/// one pad wired, on either transport.
-pub const USART_DIRECTION_LOCKED_RP: &str = "Both halves, and no choice yet. embassy-rp does \
-                                             have one-way constructors on both transports - \
-                                             BufferedUartTx / BufferedUartRx and UartTx / \
-                                             UartRx, the DMA pair taking one channel each - but \
-                                             this backend emits only the bidirectional form, so \
-                                             a UART with a single pad wired generates nothing. A \
-                                             gap in the generator, not in the chip.";
 
 pub const USART_LINE: &str = "Pad-level fixes done inside the peripheral, so a crossed cable or an \
                               inverting transceiver needs no rework: swap RX with TX, or invert \

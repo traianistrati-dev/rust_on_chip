@@ -168,7 +168,12 @@ of the definition.
 | **Raspberry Pi Pico 2 W** | RP2350 | Cortex-M33 ×2 | 150 MHz | `thumbv8m.main-none-eabihf` |
 | **tinyVision pico2-ice** | RP2350B + iCE40UP5K FPGA | Cortex-M33 ×2 | 150 MHz | `thumbv8m.main-none-eabihf` |
 
-Blocking builds on `rp2040-hal` / `rp235x-hal`; async on `embassy-rp`.
+Blocking builds on `rp2040-hal` / `rp235x-hal`; async on `embassy-rp`. A UART can
+be one-way on both - its module's Data direction picks Transmit only or Receive
+only (on Async, a transmit-only UART is built on DMA whatever the transport
+setting) - and an SPI with
+no MISO wired is built transmit-only, rp-hal's `(MOSI, SCK)` bus or embassy-rp's
+`Spi::new_txonly`.
 
 > **The pico2-ice carries an FPGA.** Set its CRESET pad to GPIO Output and the
 > generated firmware, on either runtime, loads `fpga/top.bin` into the

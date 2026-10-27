@@ -292,9 +292,14 @@ fn i2c_pins(mcu: &Mcu) -> Vec<(u8, &'static str, u8)> {
 
 /// UART, SPI and I2C, in that order.
 ///
-/// Each is emitted only when BOTH of its required pads are wired. rp-hal's
-/// constructors take the pins by value in a fixed order and there is no
-/// `NoPin` — so half a bus is not a smaller bus here, it is a type error.
+/// Each is emitted only when every pad its `init` takes is wired: the UART's
+/// TX+RX pair, the SPI's (MOSI, MISO, SCK), the I2C's SDA+SCL. rp-hal itself
+/// needs the I2C pair and, for SPI, MOSI and SCK - every `ValidSpiPinout` is
+/// `(Tx, Sck)` or wider, none receive-only or clockless. The rest is this
+/// backend's: rp-hal's UART builds from TX or RX alone
+/// (`uart::Pins::default().tx(..)`, the other left `OptionTNone`) and its SPI
+/// transmit-only from `(MOSI, SCK)`, forms not generated yet. The notes below
+/// say which of the two a missing pad is.
 fn bus_lines(mcu: &Mcu, _hal: &str) -> String {
     let mut o = ambiguity_notes(mcu);
 
@@ -302,7 +307,7 @@ fn bus_lines(mcu: &Mcu, _hal: &str) -> String {
     for i in instances(&uart) {
         let (Some(tx), Some(rx)) = (role_of(&uart, i, "tx"), role_of(&uart, i, "rx")) else {
             o.push_str(&format!(
-                "    // UART{i}: only one of TX/RX is wired, and the constructor takes the\n    // pair. Wire the other pad on the Pins canvas.\n"
+                "    // UART{i}: only one of TX/RX is wired, and this backend builds the UART from\n    // the pair - rp-hal's `uart::Pins` takes TX or RX alone, but that form is not\n    // generated yet. Wire the other pad on the Pins canvas.\n"
             ));
             continue;
         };
@@ -318,9 +323,17 @@ fn bus_lines(mcu: &Mcu, _hal: &str) -> String {
             role_of(&spi, i, "mosi"),
             role_of(&spi, i, "miso"),
         ) else {
-            o.push_str(&format!(
-                "    // SPI{i}: the constructor takes (MOSI, MISO, SCK) together, so all\n    // three pads have to be wired before anything can be built.\n"
-            ));
+            // Only MISO missing is this backend's gap; MOSI or SCK is rp-hal's.
+            let tx_only = role_of(&spi, i, "sck").is_some() && role_of(&spi, i, "mosi").is_some();
+            o.push_str(&if tx_only {
+                format!(
+                    "    // SPI{i}: MISO is not wired, and this backend builds the bus from (MOSI, MISO,\n    // SCK) together - rp-hal's transmit-only `(MOSI, SCK)` bus is not generated yet.\n    // Wire MISO on the Pins canvas.\n"
+                )
+            } else {
+                format!(
+                    "    // SPI{i}: rp-hal builds every SPI from at least MOSI and SCK - it has no\n    // receive-only or clockless form - so wire the missing one on the Pins canvas.\n"
+                )
+            });
             continue;
         };
         o.push_str(&format!(
@@ -802,7 +815,7 @@ fn bus_config_file(
                 gpio(mosi), gpio(miso), gpio(sck)
             ));
             o.push_str(&format!(
-                "/// SPI{n}: SCK GP{sck}, TX GP{mosi}, RX GP{miso}. `Spi::new` takes the three\n/// together and there is no `NoPin`, so a half-wired bus cannot be built.\npub fn init(\n    spi: {hal}::pac::SPI{n},\n    mosi: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{mosi}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    miso: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{miso}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    sck: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{sck}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    resets: &mut {hal}::pac::RESETS,\n    peri_freq: {hal}::fugit::HertzU32,\n) -> Handle {{\n"
+                "/// SPI{n}: SCK GP{sck}, TX GP{mosi}, RX GP{miso}, the three this `init` takes.\n/// rp-hal also builds a transmit-only bus from `(MOSI, SCK)`, which this\n/// backend does not generate yet.\npub fn init(\n    spi: {hal}::pac::SPI{n},\n    mosi: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{mosi}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    miso: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{miso}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    sck: {hal}::gpio::Pin<{hal}::gpio::bank0::Gpio{sck}, {hal}::gpio::FunctionNull, {hal}::gpio::PullDown>,\n    resets: &mut {hal}::pac::RESETS,\n    peri_freq: {hal}::fugit::HertzU32,\n) -> Handle {{\n"
             ));
             o.push_str(&format!(
                 "    {hal}::spi::Spi::<_, _, _, 8>::new(\n        spi,\n        (mosi.into_function(), miso.into_function(), sck.into_function()),\n    )\n    .init(\n        resets,\n        peri_freq,\n        {hal}::fugit::HertzU32::Hz(SPI_HZ),\n        embedded_hal::spi::MODE_0,\n    )\n}}\n"
@@ -3684,7 +3697,16 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
     let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
     for i in instances(&uart) {
         let (Some(tx), Some(rx)) = (role_of(&uart, i, "tx"), role_of(&uart, i, "rx")) else {
-            o.push_str(&format!("    // UART{i}: TX and RX are taken together.\n"));
+            // The halves of the transport the module picked: the buffered ones
+            // take no DMA channel, the others do.
+            let halves = if uart_is_buffered(&ucfgs, i) {
+                "BufferedUartTx / BufferedUartRx"
+            } else {
+                "UartTx / UartRx"
+            };
+            o.push_str(&format!(
+                "    // UART{i}: only one of TX/RX is wired, and this backend builds the UART from\n    // the pair - embassy-rp's one-way {halves} are not generated yet.\n    // Wire the other pad on the Pins canvas.\n"
+            ));
             continue;
         };
         let hz = bus_speed(mcu, "uart", i);
@@ -3737,8 +3759,34 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
             role_of(&spi, i, "mosi"),
             role_of(&spi, i, "miso"),
         ) else {
-            o.push_str(&format!(
-                "    // SPI{i}: all three pads are taken together.\n"
+            // The embassy-rp form that WOULD fit what is wired, by the pad
+            // that is missing - this backend's gap; with two pads missing no
+            // single form is worth naming.
+            let has = |r| role_of(&spi, i, r).is_some();
+            let why = match (has("sck"), has("mosi"), has("miso")) {
+                (true, true, false) => {
+                    "MISO is not wired, and this backend builds the bus from SCK, MOSI and MISO \
+                     together - embassy-rp's transmit-only Spi::new_txonly is not generated yet. \
+                     Wire MISO on the Pins canvas."
+                }
+                (true, false, true) => {
+                    "MOSI is not wired, and this backend builds the bus from SCK, MOSI and MISO \
+                     together - embassy-rp's receive-only Spi::new_rxonly is not generated yet. \
+                     Wire MOSI on the Pins canvas."
+                }
+                (false, true, _) => {
+                    "SCK is not wired, and this backend builds the bus from SCK, MOSI and MISO \
+                     together - embassy-rp's clockless Spi::new_txonly_nosck (MOSI alone, \
+                     transmit only) is not generated yet. Wire SCK on the Pins canvas."
+                }
+                _ => {
+                    "this backend builds the bus from SCK, MOSI and MISO together - wire the \
+                     missing pads on the Pins canvas."
+                }
+            };
+            o.push_str(&crate::panels::mcu_module::errata::comment(
+                &format!("SPI{i}: {why}"),
+                "    ",
             ));
             continue;
         };
@@ -5966,6 +6014,106 @@ mod flash_store_rp {
         assert!(
             back.contains(&format!("{TAIL_SEED}{ASYNC_USER_TAIL}")),
             "{back}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod half_bus_notes {
+    use crate::panels::mcu_module::builtins;
+    use crate::panels::mcu_module::mcu::model::Runtime;
+    use crate::panels::mcu_module::modules::{ModuleConfig, UsartMode};
+    use crate::panels::mcu_module::pins::PinFunction;
+
+    /// A Pico with `wired` on its pads, on `runtime`.
+    fn pico(runtime: Runtime, wired: &[(&str, PinFunction)]) -> super::Mcu {
+        let mut mcu = builtins::builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == "rp2040_pico")
+            .expect("built-in Pico")
+            .build_mcu();
+        mcu.runtime = runtime;
+        for p in mcu.iter_all_pins_mut() {
+            if let Some((_, f)) = wired.iter().find(|(name, _)| p.name == *name) {
+                p.selected_function = f.clone();
+            }
+        }
+        mcu.reconcile_modules();
+        mcu
+    }
+
+    /// main.rs's comments, as the one sentence each is.
+    fn said(mcu: &super::Mcu) -> String {
+        mcu.fresh_main_rs()
+            .lines()
+            .map(|l| l.trim().trim_start_matches("//").trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Half a bus builds nothing, and main.rs says whose limit that is. This
+    /// backend's where the HAL has the form - rp-hal's `uart::Pins` with TX
+    /// alone and its `(MOSI, SCK)` SPI; embassy-rp's one-way UART halves of the
+    /// module's transport and `Spi::new_txonly` / `new_rxonly`. The HAL's
+    /// where it has none: an rp-hal SPI without MOSI or SCK.
+    #[test]
+    fn a_half_bus_names_whose_limit_it_is() {
+        let no_miso = [
+            ("GP0", PinFunction::UsartTx(0)),
+            ("GP18", PinFunction::SpiSck(0)),
+            ("GP19", PinFunction::SpiMosi(0)),
+        ];
+        let no_mosi = [
+            ("GP18", PinFunction::SpiSck(0)),
+            ("GP16", PinFunction::SpiMiso(0)),
+        ];
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let text = said(&pico(runtime, &no_miso));
+            assert!(
+                text.contains("UART0: only one of TX/RX is wired, and this backend builds the UART from the pair"),
+                "{runtime:?}: {text}"
+            );
+            assert!(
+                text.contains("SPI0: MISO is not wired, and this backend builds the bus from"),
+                "{runtime:?}: {text}"
+            );
+            // No I2C is wired, so none of the old HAL-blaming sentences may
+            // appear at all.
+            for false_claim in ["the constructor takes", "taken together", "NoPin"] {
+                assert!(
+                    !text.contains(false_claim),
+                    "{runtime:?}: {false_claim}: {text}"
+                );
+            }
+            let (uart_hal, spi_hal, no_mosi_says) = match runtime {
+                // The module's default transport is Buffered.
+                Runtime::Async => (
+                    "embassy-rp's one-way BufferedUartTx / BufferedUartRx",
+                    "embassy-rp's transmit-only Spi::new_txonly",
+                    "embassy-rp's receive-only Spi::new_rxonly",
+                ),
+                _ => (
+                    "rp-hal's `uart::Pins` takes TX or RX alone",
+                    "rp-hal's transmit-only `(MOSI, SCK)` bus",
+                    "rp-hal builds every SPI from at least MOSI and SCK",
+                ),
+            };
+            assert!(text.contains(uart_hal), "{runtime:?}: {text}");
+            assert!(text.contains(spi_hal), "{runtime:?}: {text}");
+            let text = said(&pico(runtime, &no_mosi));
+            assert!(text.contains(no_mosi_says), "{runtime:?}: {text}");
+        }
+        // On the DMA transport, the DMA halves.
+        let mut mcu = pico(Runtime::Async, &no_miso);
+        for m in &mut mcu.modules {
+            if let ModuleConfig::Usart(c) = &mut m.config {
+                c.mode = UsartMode::Dma;
+            }
+        }
+        let text = said(&mcu);
+        assert!(
+            text.contains("embassy-rp's one-way UartTx / UartRx"),
+            "{text}"
         );
     }
 }

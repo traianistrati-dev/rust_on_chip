@@ -4122,6 +4122,47 @@ pub fn module_config_ui(
         }
     };
 
+    // The same note on an nRF's nrf-hal Blocking runtime, for the direction
+    // alone: its flow is the pads' (`nrf::uarte_flow`), which the flow row
+    // shows locked. A one-way pick is kept for Async, where embassy-nrf builds
+    // it; a single wire, which only a re-targeted project can carry, is built
+    // nowhere.
+    let nrf_hal_serial_note = |ui: &mut egui::Ui, out: &mut ConfigOut, cfg: &UsartModuleConfig| {
+        out.skip("Data direction", docs::SKIP_USART_DIRECTION_NRF_HAL);
+        // `direction_row` says this on the other nRF runtimes; the fact is the
+        // UARTE's, whatever the HAL.
+        out.skip("Line", docs::SKIP_USART_LINE_NRF);
+        ui.label("");
+        ui.label(
+            egui::RichText::new(
+                "nrf-hal builds the UARTE from its TXD+RXD pair (the Async runtime builds one-way UARTEs)",
+            )
+            .size(10.5)
+            .color(egui::Color32::from_gray(140)),
+        );
+        ui.end_row();
+        let kept = match cfg.direction {
+            UsartDirection::TxRx => None,
+            UsartDirection::TxOnly | UsartDirection::RxOnly => Some(format!(
+                "{} (set on Async) is kept for that runtime and not built here",
+                cfg.direction.label()
+            )),
+            d => Some(format!(
+                "{} is a single wire, which the UARTE has no mode for - this runtime builds the pair or nothing",
+                d.label()
+            )),
+        };
+        if let Some(kept) = kept {
+            ui.label("");
+            ui.label(
+                egui::RichText::new(kept)
+                    .size(10.5)
+                    .color(egui::Color32::from_rgb(220, 160, 70)),
+            );
+            ui.end_row();
+        }
+    };
+
     // Half a USART — or half an I2C — generates NOTHING on the F1: both HALs
     // take the PAIR (`serial::Pins`, `i2c::Pins`) and have no placeholder for
     // the pad that is missing. main.rs says so where the init would have gone;
@@ -4167,15 +4208,11 @@ pub fn module_config_ui(
     let direction_row = |ui: &mut egui::Ui, out: &mut ConfigOut, cfg: &mut UsartModuleConfig| {
         let opts = UsartDirection::offered(usart_transport(cfg), family, is_async, line_extras);
         // The locked form is a different fact, so it is a different
-        // sentence — chosen HERE, by the branch that knows which one it
-        // drew, and not re-derived from the family somewhere else. ONE
-        // choice, read by the pane and the hover alike, so a backend cannot
-        // reach one and not the other.
-        let locked = if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
-            docs::USART_DIRECTION_LOCKED_NRF
-        } else {
-            docs::USART_DIRECTION_LOCKED
-        };
+        // sentence — ONE, read by the pane and the hover alike, so a backend
+        // cannot reach one and not the other. No backend that draws this row
+        // is down to the pair any more: the nRF draws it only where
+        // embassy-nrf builds the halves.
+        let locked = docs::USART_DIRECTION_LOCKED;
         out.field(
             "Data direction",
             if opts.len() > 1 {
@@ -4226,8 +4263,9 @@ pub fn module_config_ui(
         }
         ui.end_row();
         // A direction whose pad the canvas does not have builds nothing on
-        // embassy or on the RP: main.rs says so where the init would be, and
-        // this says so first, the way the flow row does for its pads.
+        // embassy, the RP or the nRF: main.rs says so where the init would be,
+        // and this says so first, the way the flow row does for its pads.
+        let nrf_family = crate::panels::mcu_module::codegen::nrf::is_nrf(family);
         let (has_tx, has_rx) = wired_serial;
         let missing = match (
             cfg.direction.needs_tx() && !has_tx,
@@ -4238,7 +4276,7 @@ pub fn module_config_ui(
             (false, true) => "the RX pad",
             (false, false) => "",
         };
-        if (embassy || rp_family) && !missing.is_empty() {
+        if (embassy || rp_family || nrf_family) && !missing.is_empty() {
             ui.label("");
             ui.label(
                 egui::RichText::new(format!(
@@ -4258,6 +4296,13 @@ pub fn module_config_ui(
         // and the inversion embassy-rp's `Config` does carry is not written.
         if rp_family {
             out.skip("Line", docs::SKIP_USART_LINE_RP);
+            return;
+        }
+        // Nor on an nRF, whose reason is a third one: the UARTE swaps and
+        // inverts nothing, and a crossed cable is two picks on the canvas
+        // wherever the part lets a role move (not on the 54L15's SERIAL00).
+        if nrf_family {
+            out.skip("Line", docs::SKIP_USART_LINE_NRF);
             return;
         }
         out.field(
@@ -4304,6 +4349,32 @@ pub fn module_config_ui(
                     out: &mut ConfigOut,
                     cfg: &mut UsartModuleConfig,
                     wired: (bool, bool)| {
+        // On an nRF the flow control is the WIRED pads', on every runtime and
+        // HAL (`nrf::uarte_flow`): no nRF generator reads `flow`, so a choice
+        // here would change nothing. Shown, locked, as main.rs builds it -
+        // nrf-hal's Blocking builds the pair whatever the direction says.
+        if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
+            let nrf_hal =
+                !is_async && !crate::panels::mcu_module::codegen::nrf::blocking_on_embassy(family);
+            let dir = if nrf_hal {
+                UsartDirection::TxRx
+            } else {
+                cfg.direction
+            };
+            let (has_cts, has_rts) = wired;
+            let built = crate::panels::mcu_module::codegen::nrf::uarte_flow(dir, has_cts, has_rts);
+            out.field("Hardware flow control", docs::USART_FLOW_NRF);
+            ui.label("Hardware flow control");
+            ui.add_enabled_ui(false, |ui| {
+                egui::ComboBox::from_id_salt("usart_flow_nrf")
+                    .selected_text(built.label())
+                    .show_ui(ui, |_ui| {});
+            })
+            .response
+            .on_hover_text(docs::USART_FLOW_NRF);
+            ui.end_row();
+            return;
+        }
         out.field("Hardware flow control", docs::USART_FLOW);
         ui.label("Hardware flow control");
         ui.vertical(|ui| {
@@ -4381,8 +4452,12 @@ pub fn module_config_ui(
         {
             cfg.direction = UsartDirection::TxRx;
         }
-        if !UsartFlow::offered(cfg.mode, cfg.direction, family, is_async, line_extras)
-            .contains(&cfg.flow)
+        // Never on an nRF: its flow is the pads' (`nrf::uarte_flow`), the
+        // stored field is read by no nRF generator, and folding it on a
+        // one-way pick wrote "Disable" over a UARTE main.rs builds with CTS.
+        if !crate::panels::mcu_module::codegen::nrf::is_nrf(family)
+            && !UsartFlow::offered(cfg.mode, cfg.direction, family, is_async, line_extras)
+                .contains(&cfg.flow)
         {
             cfg.flow = UsartFlow::None;
         }
@@ -5253,7 +5328,10 @@ pub fn module_config_ui(
                     // An RP on DMA has no ring on any shape, which is the RP
                     // DMA skip's reason below - not this one's, whose "give it
                     // a receiving half" brings no row back on that transport.
-                    if tx_only_dma && !embassy_blocking && !rp_family {
+                    // Nor an nRF, whose UARTE has no ring on any shape either,
+                    // and whose skip below says so whatever `mode` holds.
+                    let nrf = crate::panels::mcu_module::codegen::nrf::is_nrf(family);
+                    if tx_only_dma && !embassy_blocking && !rp_family && !nrf {
                         out.skip("RX/TX buffer", docs::SKIP_USART_BUF_TX_ONLY);
                     }
                     if embassy_blocking {
@@ -5289,10 +5367,10 @@ pub fn module_config_ui(
                             },
                         );
                     }
-                    // embassy-nrf's `Uarte` has no ring on either transport,
-                    // and the nRF backend reads neither `mode` nor `buf_len`.
-                    let nrf = crate::panels::mcu_module::codegen::nrf::is_nrf(family);
-                    if is_async && nrf && !tx_only_dma {
+                    // embassy-nrf's `Uarte` and its halves have no ring on
+                    // either transport, and the nRF backend reads neither
+                    // `mode` nor `buf_len`.
+                    if is_async && nrf {
                         out.skip(
                             if cfg.mode == UsartMode::Dma {
                                 "RX DMA buffer"
@@ -5456,6 +5534,47 @@ pub fn module_config_ui(
                         direction_row(ui, out, cfg);
                         flow_row(ui, out, cfg, wired_flow);
                         clamp_usart(cfg);
+                        api_row(ui, out, &mut pending.0);
+                    } else if nrf && !is_async {
+                        // The nRF's Blocking runtime is two HALs. On the 52820,
+                        // 5340 and 54L15 (`blocking_on_embassy`) it is
+                        // embassy-nrf without an executor, which builds the
+                        // halves as Async does - so
+                        // the direction is the module's here too. Not clamped:
+                        // its list is Async's for the same part. nrf-hal's
+                        // `uarte::Pins` takes the pair, so there the row says
+                        // why it is absent, and names a one-way pick kept for
+                        // Async the way the F1 does.
+                        if crate::panels::mcu_module::codegen::nrf::blocking_on_embassy(family) {
+                            direction_row(ui, out, cfg);
+                        } else {
+                            nrf_hal_serial_note(ui, out, cfg);
+                            f1_half_bus_note(
+                                ui,
+                                "UARTE",
+                                ("TX", "RX"),
+                                "nrf-hal's uarte::Pins takes the TXD+RXD pair",
+                                wired_serial,
+                            );
+                            // Neither pad - a module kept for its flow pads
+                            // alone - which the note above, written for half a
+                            // pair, leaves silent; main.rs says it too.
+                            if wired_serial == (false, false) {
+                                ui.label("");
+                                ui.label(
+                                    egui::RichText::new(
+                                        "TX and RX are not wired, so this UARTE is not \
+                                         initialised at all — nrf-hal's uarte::Pins takes the \
+                                         TXD+RXD pair. Assign both pads on the canvas.",
+                                    )
+                                    .size(10.5)
+                                    .color(egui::Color32::from_rgb(220, 160, 70)),
+                                );
+                                ui.end_row();
+                            }
+                        }
+                        // The pads' flow, as main.rs builds it, on both HALs.
+                        flow_row(ui, out, cfg, wired_flow);
                         api_row(ui, out, &mut pending.0);
                     } else if is_native {
                         // Native is stm32f1xx-hal too: the same rows absent, for
@@ -9483,11 +9602,10 @@ mod tests {
         }
     }
 
-    /// The locked Data direction row says the backend's own reason, in the
-    /// pane and on the hover alike: an nRF has no transport to switch and
-    /// embassy-nrf has the halves. Neither text is the old embassy-stm32
-    /// sentence ("switch the transport to DMA"). An RP is not locked at all
-    /// any more: it builds one-way UARTs.
+    /// No Data direction row any backend draws is locked any more: the RP and
+    /// the nRF build one-way UARTs on every runtime that draws the row, and an
+    /// STM32 is never down to one direction. The generic locked sentence is not
+    /// the old embassy-stm32 one ("switch the transport to DMA").
     #[test]
     fn a_locked_direction_names_its_own_backend() {
         let doc_of = |out: &ConfigOut| {
@@ -9499,21 +9617,125 @@ mod tests {
                 .doc
                 .clone()
         };
-        let nrf = drive_usart("nrf52833", true, false, false, |_| {});
-        assert_eq!(doc_of(&nrf), docs::USART_DIRECTION_LOCKED_NRF);
-        for (is_async, is_native) in [(true, false), (false, false)] {
-            let rp = drive_usart("rp2040", is_async, is_native, false, |_| {});
-            assert_eq!(doc_of(&rp), docs::USART_DIRECTION, "Async {is_async}");
-        }
-        for doc in [
-            docs::USART_DIRECTION_LOCKED,
-            docs::USART_DIRECTION_LOCKED_NRF,
+        for (family, is_async) in [
+            ("nrf52833", true),
+            ("nrf52820", false),
+            ("rp2040", true),
+            ("rp2040", false),
+            ("stm32g0", true),
         ] {
-            assert!(!doc.contains("transport to DMA"), "{doc}");
+            let out = drive_usart(family, is_async, false, false, |_| {});
+            assert_eq!(
+                doc_of(&out),
+                docs::USART_DIRECTION,
+                "{family} Async {is_async}"
+            );
         }
-        // An STM32 is never down to one direction: half duplex is offered.
-        let g0 = drive_usart("stm32g0", true, false, false, |_| {});
-        assert_eq!(doc_of(&g0), docs::USART_DIRECTION);
+        assert!(
+            !docs::USART_DIRECTION_LOCKED.contains("transport to DMA"),
+            "{}",
+            docs::USART_DIRECTION_LOCKED
+        );
+    }
+
+    /// An nRF draws the Data direction row wherever embassy-nrf builds the
+    /// UARTE - Async on every part, Blocking on the 52820, 5340 and 54L15 -
+    /// offering one-way there and never writing what is stored. On nrf-hal's
+    /// Blocking the row is a skip with its own reason, and the stored pick is
+    /// kept untouched for Async. The Line row is the nRF's own skip, the
+    /// buffer skip is the nRF's whatever the (unread) transport holds, and the
+    /// flow row shows the pads' flow on every runtime, writing nothing.
+    #[test]
+    fn an_nrf_offers_one_way_where_embassy_nrf_builds_it() {
+        use UsartDirection as D;
+        let doc_of = |out: &ConfigOut, label: &str| {
+            out.fields()
+                .unwrap()
+                .iter()
+                .find(|f| f.label == label)
+                .map(|f| f.doc.clone())
+        };
+        let skipped = |out: &ConfigOut, label: &str| {
+            out.skipped_fields()
+                .iter()
+                .find(|f| f.label == label)
+                .map(|f| f.doc.clone())
+        };
+        for (family, is_async, embassy) in [
+            ("nrf52833", true, true),
+            ("nrf52840", true, true),
+            ("nrf5340", true, true),
+            ("nrf52820", false, true),
+            ("nrf5340", false, true),
+            ("nrf54l15", false, true),
+            ("nrf52833", false, false),
+            ("nrf52840", false, false),
+        ] {
+            for dir in [D::TxRx, D::TxOnly, D::RxOnly] {
+                for mode in [UsartMode::Buffered, UsartMode::Dma] {
+                    let at = format!("{family} Async {is_async} {dir:?} {mode:?}");
+                    let (out, c) = drive_usart_cfg(family, is_async, false, |c| {
+                        c.direction = dir;
+                        c.mode = mode;
+                        c.flow = UsartFlow::CtsRts;
+                    });
+                    // Nothing the nRF stores is folded on either HAL - not
+                    // the flow either, which no nRF generator reads: a
+                    // one-way pick used to fold it to Disable.
+                    assert_eq!(
+                        (c.direction, c.mode, c.flow),
+                        (dir, mode, UsartFlow::CtsRts),
+                        "{at}"
+                    );
+                    // The flow row is the pads' (`nrf::uarte_flow`), locked,
+                    // on every runtime and HAL.
+                    assert_eq!(
+                        doc_of(&out, "Hardware flow control").as_deref(),
+                        Some(docs::USART_FLOW_NRF),
+                        "{at}"
+                    );
+                    if embassy {
+                        assert_eq!(
+                            doc_of(&out, "Data direction").as_deref(),
+                            Some(docs::USART_DIRECTION),
+                            "{at}"
+                        );
+                        assert!(skipped(&out, "Data direction").is_none(), "{at}");
+                    } else {
+                        assert!(doc_of(&out, "Data direction").is_none(), "{at}");
+                        assert_eq!(
+                            skipped(&out, "Data direction").as_deref(),
+                            Some(docs::SKIP_USART_DIRECTION_NRF_HAL),
+                            "{at}"
+                        );
+                    }
+                    // The UARTE's fact, on both HALs.
+                    assert_eq!(
+                        skipped(&out, "Line").as_deref(),
+                        Some(docs::SKIP_USART_LINE_NRF),
+                        "{at}"
+                    );
+                    assert!(doc_of(&out, "Line").is_none(), "{at}");
+                    if is_async {
+                        let label = if mode == UsartMode::Dma {
+                            "RX DMA buffer"
+                        } else {
+                            "RX/TX buffer"
+                        };
+                        assert_eq!(
+                            skipped(&out, label).as_deref(),
+                            Some(docs::SKIP_USART_BUF_NRF),
+                            "{at}"
+                        );
+                        assert_eq!(
+                            skipped(&out, "Async transport").as_deref(),
+                            Some(docs::SKIP_USART_TRANSPORT_NRF),
+                            "{at}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A Pico builds one-way UARTs: the Data direction row is drawn on

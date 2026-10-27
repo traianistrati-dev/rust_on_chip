@@ -512,6 +512,14 @@ $ALL_CASES = @(
     # the two runtimes share, and Cargo.toml has its HAL crate swapped.
     @{ n = "BBC micro:bit v2 async x2";    t = "emit_nrf_async_project";     e = @{};                       q = $true; fam = "nrf" }
 
+    # The two projects again with UARTE0 one-way, each half on the flow pad it
+    # takes: transmit-only with CTS (UarteTx::new_with_rtscts) and receive-only
+    # with RTS (UarteRx::new_with_rtscts). The halves take the binding BEFORE
+    # their pin and the pair after its pins - argument orders only the
+    # compiler checks. Reached through the runtime switch, so nrf-hal's pair
+    # with the kept direction is emitted on the way.
+    @{ n = "BBC micro:bit v2 async one-way x2"; t = "emit_nrf_async_project"; e = @{ EIDE_NRF_ONEWAY = "1" }; q = $true; fam = "nrf" }
+
     # The IoT tab's Bluetooth on the SoftDevice Controller (nrf-sdc 0.4 under
     # nrf-mpsl, trouble-host 0.8): the 52840 DK, the 52832 DK (64 KiB RAM) and
     # the micro:bit with every async peripheral bound, so every vector is moved
@@ -549,6 +557,13 @@ $ALL_CASES = @(
     # costs ~70 s warm, and the micro:bit rows alone told the hook nothing
     # about the other eight parts.
     @{ n = "nRF52 + nRF5340 + nRF54L15 x14"; t = "emit_nrf_family_projects"; e = @{};                     q = $true; fam = "nrf" }
+
+    # The fourteen again with the console UARTE one-way: transmit-only on
+    # Blocking - UarteTx on the 52820, 5340 and 54L15, whose Blocking is
+    # embassy-nrf, and nrf-hal's pair with the pick named as kept for Async on
+    # the rest - and receive-only (UarteRx) on every Async part, the SERIALn
+    # and SERIAL30 blocks included.
+    @{ n = "nRF52 + nRF5340 + nRF54L15 one-way x14"; t = "emit_nrf_family_projects"; e = @{ EIDE_NRF_ONEWAY = "1" }; q = $true; fam = "nrf" }
 
     # The same two boards on embassy-rp, which is a DIFFERENT HAL crate, not a
     # feature of the first one. Every bus is wired, because that is where the
@@ -789,7 +804,7 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PWM", "EIDE_ESP_RUNTIME", "EIDE_ESP_IRQ", "EIDE_ESP_CHIP",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
-           "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD", "EIDE_RP_ONEWAY",
+           "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD", "EIDE_RP_ONEWAY", "EIDE_NRF_ONEWAY",
            # The imported-chip rows. EIDE_CHIP_XML is read by the N6 harness too,
            # so a value left over from an L151 row would make the N6 row convert an L1.
            "EIDE_CHIP_XML", "EIDE_EXPECT_FEATURE", "EIDE_IMPORT_SKIP", "EIDE_IMPORT_WDG",

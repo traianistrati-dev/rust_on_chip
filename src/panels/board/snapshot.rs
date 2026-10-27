@@ -128,6 +128,22 @@ impl ChipView {
                 }
             }
         }
+        // nrf-hal - an nRF's Blocking runtime everywhere but the 52820, 5340
+        // and 54L15 - builds a UARTE as the TXD+RXD pair whatever its module
+        // stores (`nrf::uarte_pads`): a one-way pick is kept for Async. Its
+        // flow is the wired pads', which the frame reads already.
+        {
+            use crate::panels::mcu_module::codegen::nrf;
+            if nrf::is_nrf(&mcu.family) && !mcu.is_async() && !nrf::blocking_on_embassy(&mcu.family)
+            {
+                use crate::panels::mcu_module::modules::UsartDirection;
+                for item in &mut view.modules {
+                    if let ModuleConfig::Usart(c) = &mut item.config {
+                        c.direction = UsartDirection::TxRx;
+                    }
+                }
+            }
+        }
         view
     }
 

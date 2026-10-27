@@ -336,6 +336,9 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("SKIP_I2C_TIMEOUT_RP", SKIP_I2C_TIMEOUT_RP),
     ("SKIP_USART_BUF_NRF", SKIP_USART_BUF_NRF),
     ("SKIP_USART_TRANSPORT_NRF", SKIP_USART_TRANSPORT_NRF),
+    ("SKIP_USART_LINE_NRF", SKIP_USART_LINE_NRF),
+    ("USART_FLOW_NRF", USART_FLOW_NRF),
+    ("SKIP_USART_DIRECTION_NRF_HAL", SKIP_USART_DIRECTION_NRF_HAL),
     ("SKIP_ASYNC_INIT_NRF", SKIP_ASYNC_INIT_NRF),
     ("SKIP_I2C_TIMEOUT_NRF", SKIP_I2C_TIMEOUT_NRF),
     (
@@ -375,7 +378,6 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("USART_TRANSFERS_ESP", USART_TRANSFERS_ESP),
     ("USART_DIRECTION", USART_DIRECTION),
     ("USART_DIRECTION_LOCKED", USART_DIRECTION_LOCKED),
-    ("USART_DIRECTION_LOCKED_NRF", USART_DIRECTION_LOCKED_NRF),
     ("USART_LINE", USART_LINE),
     ("USART_LINE_ABSENT", USART_LINE_ABSENT),
     ("USART_FLOW", USART_FLOW),
@@ -1518,16 +1520,60 @@ pub const SKIP_I2C_TIMEOUT_RP: &str = "embassy-rp's I2C takes no timeout. Its `C
                                        nothing to pass it to. On an STM32 the timeout is part of \
                                        embassy-stm32's own `Config`.";
 
-pub const SKIP_USART_BUF_NRF: &str = "No buffer to size on an nRF. embassy-nrf's `Uarte` reads \
-                                      straight into the slice you pass `read`, through EasyDMA, \
-                                      with no ring behind it. Its `BufferedUarte`, which keeps \
-                                      receiving between reads, needs a TIMER and PPI channels and \
-                                      is not what this backend builds.";
+pub const SKIP_USART_BUF_NRF: &str = "No buffer to size on an nRF. embassy-nrf's `Uarte` - and \
+                                      its one-way `UarteTx` and `UarteRx` - move bytes by \
+                                      EasyDMA with no ring behind them: `read` fills the slice \
+                                      you pass it and `write` sends the one you pass it, each in \
+                                      ONE transfer of at most the part's EasyDMA length (255 \
+                                      bytes on the nRF52832, 1023 on the nRF52810, 16383 or more \
+                                      on the rest) - a longer slice returns BufferTooLong. A \
+                                      slice in flash, such as a `b\"...\"` constant, is first \
+                                      copied through a stack buffer (255 to 1024 bytes by part), \
+                                      and a longer one panics: write a long one in pieces. Its \
+                                      `BufferedUarte`, which \
+                                      keeps receiving between reads, needs a TIMER and PPI \
+                                      channels and is not what this backend builds.";
 
 pub const SKIP_USART_TRANSPORT_NRF: &str = "Nothing to choose on an nRF: the UARTE moves bytes by \
                                             EasyDMA, which is part of the peripheral, so there is \
                                             no DMA channel to take or give back. This backend \
-                                            builds embassy-nrf's async `Uarte`.";
+                                            builds embassy-nrf's async `Uarte`, or `UarteTx` / \
+                                            `UarteRx` for a one-way UARTE.";
+
+/// The Line row on an nRF, on every runtime and HAL: neither of the other two
+/// reasons ([`USART_LINE_ABSENT`] names embassy-stm32's `Config`,
+/// [`SKIP_USART_LINE_RP`] the PL011). embassy-nrf's `uarte::Config` is
+/// `parity` and `baudrate`, nothing else, and nrf-hal's `Uarte::new` takes
+/// the same two. The 54L15's pin rules are `nrf::nrf54_pin_rule`: each SERIAL
+/// reaches its own port, SERIAL00 fixed P2 pins per role.
+pub const SKIP_USART_LINE_NRF: &str = "Nothing to set on an nRF: the UARTE has no TX/RX swap \
+                                       and inverts neither line - the HAL configures only its \
+                                       parity and baud rate (embassy-nrf's Config, nrf-hal's \
+                                       Uarte::new). On the nRF52 and nRF5340 any \
+                                       pin carries any UARTE role (the PSEL registers hold pin \
+                                       numbers), so a crossed cable is two picks on the Pins \
+                                       canvas. On the nRF54L15 a role moves only within its \
+                                       SERIAL block's own port, and SERIAL00's P2 pins are fixed \
+                                       per role, so a crossed cable there may need rework.";
+
+/// The flow row on an nRF, on every runtime: `nrf::uarte_flow`, shown locked.
+pub const USART_FLOW_NRF: &str = "Set by the pads, not here. On an nRF main.rs takes flow \
+                                  control from the CTS and RTS pads wired on the Pins canvas: a \
+                                  transmit-only UARTE paces on CTS, a receive-only one on RTS, \
+                                  and the pair takes the two together or neither (embassy-nrf \
+                                  refuses one alone; nrf-hal turns hardware flow control on only \
+                                  with both). Wire or unassign the pad to change it.";
+
+/// The Data direction row on an nRF's Blocking runtime where nrf-hal builds
+/// it - every part but the 52820, the 5340 and the 54L15, whose Blocking is
+/// embassy-nrf and draws the row (`nrf::blocking_on_embassy`).
+pub const SKIP_USART_DIRECTION_NRF_HAL: &str = "The pair, and no choice on this runtime. nrf-hal's \
+                                                `uarte::Pins` takes TXD and RXD outright, so a \
+                                                UARTE with one of them wired generates nothing \
+                                                here. The Async runtime builds one-way UARTEs on \
+                                                embassy-nrf (`UarteTx`, `UarteRx`), and a \
+                                                direction picked there is kept for it: this \
+                                                runtime builds the pair.";
 
 pub const SKIP_ASYNC_INIT_NRF: &str = "One form on an nRF. embassy-nrf's SPIM and TWIM are async \
                                        drivers that move bytes by EasyDMA, which is part of each \
@@ -1717,29 +1763,12 @@ pub const USART_DIRECTION: &str = "Which halves to build. A one-way link frees t
 /// every STM32 runtime that DRAWS the row offers half duplex, so it is never
 /// locked there (the F1 off Async has a one-entry list, and draws no row:
 /// `f1_serial_note` skips it). The RP and then the nRF were what read it; both
-/// have a sentence of their own now, and the RP is no longer locked at all.
+/// build one-way UARTs now, and neither is locked: the nRF draws the row only
+/// where embassy-nrf builds the halves (`nrf_hal_serial_note` skips it on
+/// nrf-hal). Kept for a backend that reaches a one-entry list.
 pub const USART_DIRECTION_LOCKED: &str = "Both halves, and no choice: this backend builds the \
                                           UART from its TX+RX pair only, so a UART with a single \
                                           pad wired generates nothing.";
-
-/// The same row on an nRF, on every runtime that draws it (Async: the
-/// embassy-nrf backend).
-///
-/// embassy-nrf 0.11 has one-way UARTEs - `UarteTx::new` / `UarteRx::new`
-/// (uarte.rs:402, :587), and a `new_with_rtscts` on each that takes the one
-/// flow pad its half uses - but `async_bus_lines` writes only the pair's
-/// constructors (`Uarte::new`, `Uarte::new_with_rtscts`) and skips a UARTE
-/// with one pad. No transport row because this backend builds `uarte::Uarte`
-/// alone - embassy-nrf's `BufferedUarte`, halves and all, is not generated
-/// either - and no DMA channel because EasyDMA is part of the UARTE.
-pub const USART_DIRECTION_LOCKED_NRF: &str = "Both halves, and no choice yet. embassy-nrf does \
-                                              have one-way UARTEs - UarteTx and UarteRx, each \
-                                              with flow control on the one pad its half uses - \
-                                              but this backend builds the UARTE from its TX+RX \
-                                              pair, so one with a single pad wired generates \
-                                              nothing. A gap in the generator, not in the chip. \
-                                              It builds embassy-nrf's Uarte only, so there is no \
-                                              transport to pick either.";
 
 pub const USART_LINE: &str = "Pad-level fixes done inside the peripheral, so a crossed cable or an \
                               inverting transceiver needs no rework: swap RX with TX, or invert \

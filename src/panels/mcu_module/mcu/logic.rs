@@ -2114,6 +2114,66 @@ impl Mcu {
                 }
             }
         }
+        // The same trip on an nRF whose Blocking runtime is nrf-hal: a one-way
+        // UARTE is embassy-nrf's, and nrf-hal's `uarte::Pins` builds the
+        // TXD+RXD pair whatever the module says (`nrf::uarte_pads`) - from
+        // both pads, nothing with one missing. Named by its direction, not by
+        // `beyond_the_pair`: the stored flow is read by no nRF generator. The
+        // flow BUILT is the pads' (`nrf::uarte_flow`), and it changes with the
+        // shape - a half paced on its one pad becomes a pair without any - so
+        // that is said when it does.
+        if crate::panels::mcu_module::codegen::nrf::is_nrf(&self.family)
+            && self.is_async()
+            && !self.pending_is_async()
+            && !crate::panels::mcu_module::codegen::nrf::blocking_on_embassy(&self.family)
+        {
+            use crate::panels::mcu_module::modules::{
+                ModuleConfig, ModuleSignal, UsartDirection, UsartFlow,
+            };
+            for m in &self.modules {
+                let ModuleConfig::Usart(c) = &m.config else {
+                    continue;
+                };
+                if !matches!(c.direction, UsartDirection::TxOnly | UsartDirection::RxOnly) {
+                    continue;
+                }
+                let has = |s| m.connections.iter().any(|w| w.signal == s);
+                let (cts, rts) = (has(ModuleSignal::Cts), has(ModuleSignal::Rts));
+                let paced =
+                    crate::panels::mcu_module::codegen::nrf::uarte_flow(c.direction, cts, rts);
+                let pair = crate::panels::mcu_module::codegen::nrf::uarte_flow(
+                    UsartDirection::TxRx,
+                    cts,
+                    rts,
+                );
+                let lost_flow = format!(
+                    "is built there as the TXD+RXD pair, without the {} flow control the Async half \
+                     paces on - nrf-hal turns it on only with CTS and RTS both",
+                    if cts { "CTS" } else { "RTS" }
+                );
+                let built = match (has(ModuleSignal::Tx), has(ModuleSignal::Rx)) {
+                    (true, true) if paced != UsartFlow::None && pair == UsartFlow::None => {
+                        lost_flow.as_str()
+                    }
+                    (true, true) => "is built there as the TXD+RXD pair",
+                    (true, false) => {
+                        "is not initialised there: its RXD pad is not wired, and nrf-hal's \
+                         uarte::Pins takes the pair"
+                    }
+                    (false, true) => {
+                        "is not initialised there: its TXD pad is not wired, and nrf-hal's \
+                         uarte::Pins takes the pair"
+                    }
+                    (false, false) => "is not initialised there: neither TXD nor RXD is wired",
+                };
+                out.push(format!(
+                    "! {}: {} is not built on nrf-hal - the UARTE {built}. The module keeps it \
+                     for the Async runtime",
+                    m.name,
+                    c.direction.label()
+                ));
+            }
+        }
         // What the staged runtime's driver pass leaves out that this one
         // generates: SDMMC, SAI and I2S going to embassy Blocking, the
         // timer embassy-time takes going to Async. Read off the same pass that

@@ -1972,13 +1972,24 @@ impl UsartDirection {
                 UsartDirection::RxOnly,
             ];
         }
-        // nRF: the panel draws this row on Async only, where embassy-nrf has
-        // one-way `UarteTx` / `UarteRx` - but `async_bus_lines` writes the
-        // pair's `Uarte` constructors and skips a half-wired UARTE, so the pair
-        // is this backend's gap, not the HAL's. (nrf-hal's `uarte::Pins`, on
-        // Blocking, does take both outright.)
+        // nRF: embassy-nrf builds the pair and either half - `UarteTx::new` /
+        // `UarteRx::new` - on Async, and on Blocking on the 52820, 5340 and
+        // 54L15 (`nrf::blocking_on_embassy`). nrf-hal's `uarte::Pins`
+        // takes TXD and RXD outright, so the rest of Blocking builds the pair,
+        // and the panel draws no row there. Never half duplex: the UARTE has
+        // no single-wire mode.
         if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
-            return &[UsartDirection::TxRx];
+            return if is_async
+                || crate::panels::mcu_module::codegen::nrf::blocking_on_embassy(family)
+            {
+                &[
+                    UsartDirection::TxRx,
+                    UsartDirection::TxOnly,
+                    UsartDirection::RxOnly,
+                ]
+            } else {
+                &[UsartDirection::TxRx]
+            };
         }
         Self::options(transport)
     }
@@ -2156,11 +2167,20 @@ impl UsartFlow {
         if crate::panels::mcu_module::codegen::rp::is_rp(family) {
             return &[UsartFlow::None];
         }
-        // nRF: `uarte::Pins` carries `cts` and `rts` as options, and the HAL
-        // turns HWFC on only when it has BOTH - so the pair is the one flow
-        // form that changes anything. No driver-enable in the UARTE.
+        // nRF: on the pair, CTS+RTS - nrf-hal turns HWFC on only when it has
+        // BOTH, and embassy-nrf's `Uarte::new_with_rtscts` takes both or
+        // panics. A one-way UARTE has the one pad its half uses:
+        // `UarteTx::new_with_rtscts` takes CTS, `UarteRx::new_with_rtscts`
+        // RTS. No driver-enable in the UARTE. The forms each shape takes,
+        // not a choice: main.rs builds the one the WIRED pads make
+        // (`nrf::uarte_flow`), the panel shows that one locked, and the clamp
+        // never folds an nRF's stored flow against this list.
         if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
-            return &[UsartFlow::None, UsartFlow::CtsRts];
+            return match direction {
+                UsartDirection::TxOnly => &[UsartFlow::None, UsartFlow::Cts],
+                UsartDirection::RxOnly => &[UsartFlow::None, UsartFlow::Rts],
+                _ => &[UsartFlow::None, UsartFlow::CtsRts],
+            };
         }
         Self::options(transport, direction)
     }
@@ -6373,8 +6393,9 @@ mod usart_offered_tests {
     }
 
     /// The backends whose lists no runtime or chip flag moves: esp-hal's
-    /// halves and the pair on the nRF - and stm32f1xx-hal's one TX+RX port,
-    /// which is the F1 OFF Async (see the next test for on).
+    /// halves - and stm32f1xx-hal's one TX+RX port, which is the F1 OFF Async
+    /// (`an_f1_on_async_offers_the_usart_v1_shapes` for on). The nRF's turns
+    /// on its HAL: `an_nrf_offers_one_way_where_embassy_nrf_builds_it`.
     #[test]
     fn the_hal_lists_do_not_move() {
         for t in [M::Buffered, M::Dma] {
@@ -6398,10 +6419,54 @@ mod usart_offered_tests {
                         F::offered(t, D::RxOnly, "esp32c3", is_async, extras),
                         [F::None, F::Cts]
                     );
-                    assert_eq!(D::offered(t, "nrf52833", is_async, extras), [D::TxRx]);
+                }
+            }
+        }
+    }
+
+    /// An nRF offers one-way where embassy-nrf builds the UARTE - Async on
+    /// every part, Blocking on the 52820, 5340 and 54L15 - and the
+    /// pair on nrf-hal, whose `uarte::Pins` takes TXD and RXD outright. Never
+    /// half duplex, whatever the transport (which the nRF reads nowhere) or the
+    /// line flag. The flow list follows the half: CTS paces a transmitter, RTS
+    /// a receiver, and the pair takes the two together.
+    #[test]
+    fn an_nrf_offers_one_way_where_embassy_nrf_builds_it() {
+        let one_way = [D::TxRx, D::TxOnly, D::RxOnly];
+        for t in [M::Buffered, M::Dma] {
+            for extras in [false, true] {
+                for (family, is_async, want) in [
+                    ("nrf52833", true, &one_way[..]),
+                    ("nrf52833", false, &[D::TxRx][..]),
+                    ("nrf52840", false, &[D::TxRx][..]),
+                    ("nrf52820", true, &one_way[..]),
+                    ("nrf52820", false, &one_way[..]),
+                    ("nrf5340", false, &one_way[..]),
+                    ("nrf54l15", false, &one_way[..]),
+                ] {
+                    if !is_async {
+                        assert_eq!(
+                            crate::panels::mcu_module::codegen::nrf::blocking_on_embassy(family),
+                            want.len() > 1,
+                            "{family}"
+                        );
+                    }
                     assert_eq!(
-                        F::offered(t, D::TxRx, "nrf52833", is_async, extras),
+                        D::offered(t, family, is_async, extras),
+                        want,
+                        "{family} {is_async}"
+                    );
+                    assert_eq!(
+                        F::offered(t, D::TxRx, family, is_async, extras),
                         [F::None, F::CtsRts]
+                    );
+                    assert_eq!(
+                        F::offered(t, D::TxOnly, family, is_async, extras),
+                        [F::None, F::Cts]
+                    );
+                    assert_eq!(
+                        F::offered(t, D::RxOnly, family, is_async, extras),
+                        [F::None, F::Rts]
                     );
                 }
             }

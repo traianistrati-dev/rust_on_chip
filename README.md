@@ -217,7 +217,12 @@ lands where accessories expect them. Three consequences worth knowing:
   `src/pins/configs/{uarte,spim,twim}N.rs`; on Async the config sits beside the
   constructor, with the interrupt each driver needs bound in `main.rs`. SPIM0/1
   share their peripheral IDs with TWIM0/1, so SPI is offered on SPIM2 and I2C
-  on TWIM0/1.
+  on TWIM0/1. A UARTE can be **one-way** wherever embassy-nrf builds it (Async,
+  and Blocking on the nRF52820, nRF5340 and nRF54L15): set Transmit only or
+  Receive only on its module and `main.rs` builds `UarteTx` or `UarteRx`, with
+  CTS or RTS when that half's flow pad is wired. nrf-hal's `uarte::Pins` takes
+  TXD and RXD both, so Blocking on nrf-hal builds the pair and keeps the
+  direction for Async.
 - **PWM is four blocks of four channels**, any pad. The Peripherals tab picks
   the block and channel, and the generated code carries the frequency, the
   prescaler the frequency needs, and a duty per channel. Async also honors the

@@ -1532,8 +1532,35 @@ mod tests {
     #[test]
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_nrf_family_projects() {
+        // `EIDE_NRF_ONEWAY`: the console UARTE one-way on every case -
+        // transmit-only on Blocking, receive-only on Async - so `UarteTx` is
+        // compiled on the three parts whose Blocking is embassy-nrf (thumbv7em
+        // and both thumbv8m.main cores) and `UarteRx` on every Async part,
+        // while nrf-hal's Blocking builds the pair and names the kept pick.
+        let oneway = std::env::var("EIDE_NRF_ONEWAY").is_ok();
         for case in &CASES {
-            let (def, mcu) = wired(case);
+            let (def, mut mcu) = wired(case);
+            if oneway {
+                use crate::panels::mcu_module::modules::{ModuleConfig, UsartDirection};
+                let dir = if case.runtime == Runtime::Blocking {
+                    UsartDirection::TxOnly
+                } else {
+                    UsartDirection::RxOnly
+                };
+                for m in &mut mcu.modules {
+                    if let ModuleConfig::Usart(c) = &mut m.config {
+                        c.direction = dir;
+                    }
+                }
+                let main = mcu.fresh_main_rs();
+                let embassy = mcu.is_async() || super::super::nrf::blocking_on_embassy(&mcu.family);
+                let want = match (embassy, dir) {
+                    (false, _) => "is the Async runtime's choice",
+                    (true, UsartDirection::TxOnly) => "embassy_nrf::uarte::UarteTx::new(",
+                    (true, _) => "embassy_nrf::uarte::UarteRx::new(",
+                };
+                assert!(main.contains(want), "{}: {main}", case.dir);
+            }
             let main_rs = mcu.fresh_main_rs();
             // USB crates, the async runtime, `static_cell`: the manifest the
             // app writes - see `manifest_sync`.

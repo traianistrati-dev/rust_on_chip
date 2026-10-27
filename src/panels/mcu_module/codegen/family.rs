@@ -1616,8 +1616,9 @@ const RP_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
     example: "let mut uart0 = embassy_rp::uart::BufferedUart::new(p.UART0, p.PIN_0, p.PIN_1, Irqs, tx_buf, rx_buf, ucfg0);\nuart0.write_all(b\"hi\").await.ok();",
 };
 
-/// Each row is a claim about `nrf.rs`: no bus config files, `Uarte` / `Spim` /
-/// `Twim` on EasyDMA with the module rows skipped (`SKIP_USART_TRANSPORT_NRF`,
+/// Each row is a claim about `nrf.rs`: no bus config files, `Uarte` (or a
+/// one-way half, `uarte_pads`) / `Spim` / `Twim` on EasyDMA with the module
+/// rows skipped (`SKIP_USART_TRANSPORT_NRF`,
 /// `SKIP_ASYNC_INIT_NRF`), the shared TWISPI blocks, an armed input as a task,
 /// and the manifest lines from `AsyncFlavor::Nrf` and `needs_static_cell`.
 const NRF_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
@@ -1632,7 +1633,7 @@ const NRF_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "USART:",
-            "Always Uarte: the UARTE moves bytes by EasyDMA, which is part of the peripheral, so there is no transport to choose and no channel to take.",
+            "Uarte, or UarteTx / UarteRx for a one-way UARTE (the module's Data direction), each half with the one flow pad it uses - CTS for the transmitter, RTS for the receiver. The UARTE moves bytes by EasyDMA, which is part of the peripheral, so there is no transport to choose and no channel to take.",
         ),
         (
             "SPI / I2C:",

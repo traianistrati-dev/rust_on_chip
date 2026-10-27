@@ -1041,6 +1041,211 @@ fn uart_pins(mcu: &Mcu) -> Vec<(u8, &'static str, (u8, u8))> {
     })
 }
 
+/// Whether this project's buses are embassy-nrf's: on Async everywhere, and on
+/// Blocking for a part this backend builds no nrf-hal for: the 52820, 5340
+/// and 54L15 (`blocking_on_embassy`).
+fn on_embassy(mcu: &Mcu) -> bool {
+    mcu.is_async() || blocking_on_embassy(&mcu.family)
+}
+
+/// The pads one UARTE is built from, each `None` where its shape leaves it
+/// out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UartePads {
+    txd: Option<(u8, u8)>,
+    rxd: Option<(u8, u8)>,
+    cts: Option<(u8, u8)>,
+    rts: Option<(u8, u8)>,
+}
+
+/// The flow control a UARTE of direction `dir` is built with, from the flow
+/// pads wired (`has_cts`, `has_rts`) - never from the module's `flow` field,
+/// which no nRF generator reads. A half takes the ONE pad it uses: CTS paces a
+/// transmitter (`UarteTx::new_with_rtscts`), RTS a receiver
+/// (`UarteRx::new_with_rtscts`). The pair takes CTS+RTS together or neither:
+/// embassy-nrf's `Uarte::new_inner` panics on one alone, and nrf-hal, which
+/// connects a lone pad, turns HWFC on only with both. A single wire is built
+/// nowhere, so it has none.
+///
+/// ONE answer for main.rs (`uarte_pads`) and the module panel's flow row,
+/// which shows it instead of offering a choice nothing would read.
+pub fn uarte_flow(
+    dir: crate::panels::mcu_module::modules::UsartDirection,
+    has_cts: bool,
+    has_rts: bool,
+) -> crate::panels::mcu_module::modules::UsartFlow {
+    use crate::panels::mcu_module::modules::{UsartDirection as D, UsartFlow as F};
+    match dir {
+        D::TxOnly if has_cts => F::Cts,
+        D::RxOnly if has_rts => F::Rts,
+        D::TxRx if has_cts && has_rts => F::CtsRts,
+        _ => F::None,
+    }
+}
+
+/// The pads a UARTE's shape takes - or, when its module asks for one the
+/// wired pads cannot make, why not: the sentence main.rs says instead of a
+/// constructor.
+///
+/// On embassy-nrf (`embassy`) the direction is the MODULE's, as on the STM32
+/// and the RP: the pair, or a one-way `UarteTx::new` / `UarteRx::new`. Each
+/// half has a `new_with_rtscts` that takes the ONE flow pad it uses - CTS
+/// paces the transmitter, RTS the receiver - while the pair takes CTS+RTS or
+/// neither (`Uarte::new_inner` panics on one alone), so a lone flow pad
+/// beside a pair is left out. A pad the direction needs and the canvas lacks
+/// builds nothing; a pad it does not use is left alone (`uarte_unused_note`).
+///
+/// nrf-hal's `uarte::Pins` takes TXD and RXD outright, so there the pair is
+/// built whatever the direction says - the module keeps it for the runtime
+/// that builds it (`uarte_kept_direction_note`) - and each flow pad as wired:
+/// the HAL connects either, and turns HWFC on only with both.
+///
+/// ONE reading, shared by both backends' main.rs and `ambiguity_notes`, so a
+/// note never calls a pad configured that no constructor takes.
+fn uarte_pads(
+    uart: &[(u8, &'static str, (u8, u8))],
+    cfgs: &std::collections::BTreeMap<u8, UsartModuleConfig>,
+    i: u8,
+    embassy: bool,
+) -> Result<UartePads, String> {
+    use crate::panels::mcu_module::modules::UsartDirection as D;
+    let wired = |role| role_of(uart, i, role);
+    let (txd, rxd, cts, rts) = (wired("txd"), wired("rxd"), wired("cts"), wired("rts"));
+    if !embassy {
+        return match (txd, rxd) {
+            (Some(_), Some(_)) => Ok(UartePads { txd, rxd, cts, rts }),
+            // Listed for a flow pad alone.
+            (None, None) => Err(
+                "neither TXD nor RXD is wired, and the constructor takes the pair. Wire both \
+                 on the Pins canvas."
+                    .to_owned(),
+            ),
+            _ => Err(
+                "only one of TXD/RXD is wired, and the constructor takes the pair. Wire the \
+                 other pad on the Pins canvas."
+                    .to_owned(),
+            ),
+        };
+    }
+    let dir = cfgs.get(&i).map(|c| c.direction).unwrap_or_default();
+    // Never offered on an nRF - a project re-targeted from an STM32 can carry
+    // it.
+    if dir.is_half_duplex() {
+        return Err(format!(
+            "its direction ({}) is a single wire, and the UARTE has no half-duplex mode - \
+             embassy-nrf builds none. Pick another direction on its module.",
+            dir.label()
+        ));
+    }
+    let (missing, it) = match (
+        dir.needs_tx() && txd.is_none(),
+        dir.needs_rx() && rxd.is_none(),
+    ) {
+        (true, true) => ("TXD and RXD pads are", "them"),
+        (true, false) => ("TXD pad is", "it"),
+        (false, true) => ("RXD pad is", "it"),
+        (false, false) => {
+            let flow = uarte_flow(dir, cts.is_some(), rts.is_some());
+            return Ok(UartePads {
+                txd: txd.filter(|_| dir.needs_tx()),
+                rxd: rxd.filter(|_| dir.needs_rx()),
+                cts: cts.filter(|_| flow.needs_cts()),
+                rts: rts.filter(|_| flow.needs_rts()),
+            });
+        }
+    };
+    // A pair with one pad wired: the one-way UARTE that pad makes is one pick
+    // away on every runtime embassy-nrf builds (`UsartDirection::options_for`).
+    let or = match (dir, txd, rxd) {
+        (D::TxRx, Some(_), None) => ", or set its direction to Transmit only on its module",
+        (D::TxRx, None, Some(_)) => ", or set its direction to Receive only on its module",
+        _ => "",
+    };
+    Err(format!(
+        "its {missing} not wired, and its direction ({}) needs {it}. Assign {it} on the Pins \
+         canvas{or}.",
+        dir.label()
+    ))
+}
+
+/// main.rs's line for each pad a one-way UARTE's direction leaves alone - the
+/// other half's data pad and its flow pad, every one wired, since two pads can
+/// carry one signal - handed to no constructor. Said, so the reader does not
+/// go looking. embassy-nrf only: nrf-hal builds the pair.
+fn uarte_unused_note(
+    uart: &[(u8, &'static str, (u8, u8))],
+    cfgs: &std::collections::BTreeMap<u8, UsartModuleConfig>,
+    i: u8,
+) -> String {
+    let dir = cfgs.get(&i).map(|c| c.direction).unwrap_or_default();
+    [
+        ("txd", "TXD", dir.needs_tx()),
+        ("cts", "CTS", dir.needs_tx()),
+        ("rxd", "RXD", dir.needs_rx()),
+        ("rts", "RTS", dir.needs_rx()),
+    ]
+    .into_iter()
+    .filter(|(_, _, used)| !used)
+    .filter_map(|(role, name, _)| {
+        let pads: Vec<String> = uart
+            .iter()
+            .filter(|(inst, r, _)| *inst == i && *r == role)
+            .map(|(_, _, pp)| label(*pp))
+            .collect();
+        let sentence = match pads.as_slice() {
+            [] => return None,
+            [one] => format!(
+                "UARTE{i}'s {name} pad ({one}) is wired, but its direction ({}) does not use it.",
+                dir.label()
+            ),
+            many => format!(
+                "UARTE{i}'s {name} pads ({}) are wired, but its direction ({}) does not use them.",
+                many.join(" and "),
+                dir.label()
+            ),
+        };
+        Some(crate::panels::mcu_module::errata::comment(
+            &sentence, "    ",
+        ))
+    })
+    .collect()
+}
+
+/// main.rs's line, on nrf-hal, for a UARTE whose module asks for more than
+/// the pair: nrf-hal builds the pair whatever the direction says
+/// (`uarte_pads`), and the module keeps a one-way pick for the runtime that
+/// builds it - the way the F1 off Async names what stm32f1xx-hal leaves out.
+///
+/// Said as the HAL's rule - the pair or nothing - because it comes BEFORE
+/// `uarte_pads` answers: a half-wired UARTE gets this line and then the one
+/// saying which pad is missing, and "this runtime builds the pair" would be
+/// false above a main.rs that builds none. No pick is suggested: nrf-hal's
+/// panel draws no direction row (`nrf_hal_serial_note`).
+fn uarte_kept_direction_note(
+    cfgs: &std::collections::BTreeMap<u8, UsartModuleConfig>,
+    i: u8,
+) -> String {
+    use crate::panels::mcu_module::modules::UsartDirection as D;
+    let Some(dir) = cfgs.get(&i).map(|c| c.direction) else {
+        return String::new();
+    };
+    let sentence = match dir {
+        D::TxRx => return String::new(),
+        D::TxOnly | D::RxOnly => format!(
+            "UARTE{i}: {} is the Async runtime's choice - nrf-hal's uarte::Pins takes TXD and \
+             RXD both, so this runtime builds the pair or nothing, and the module keeps the \
+             direction for Async.",
+            dir.label()
+        ),
+        _ => format!(
+            "UARTE{i}: its direction ({}) is a single wire, and the UARTE has no half-duplex \
+             mode - this runtime builds the TXD+RXD pair or nothing, whatever the module says.",
+            dir.label()
+        ),
+    };
+    crate::panels::mcu_module::errata::comment(&sentence, "    ")
+}
+
 fn spi_pins(mcu: &Mcu) -> Vec<(u8, &'static str, (u8, u8))> {
     bus_pins(mcu, "spim", |f| match f {
         PinFunction::SpiSck(i) => Some((*i, "sck")),
@@ -1081,14 +1286,83 @@ fn signal_name(f: &PinFunction) -> Option<String> {
 
 /// Say so when two pads claim one signal; the lowest pin is the one
 /// configured, and the note names the rest.
+///
+/// Only for a role main.rs configures, though: a bus it does not build, a
+/// UARTE half its module's direction leaves out, or a lone flow pad beside an
+/// embassy-nrf pair configures neither pad - main.rs says why there (the NOT
+/// initialised note, `uarte_unused_note`, the CTS+RTS note, the shared-block
+/// note), and "Only P0.02 is configured" would contradict it.
 fn ambiguity_notes(mcu: &Mcu) -> String {
+    let embassy = on_embassy(mcu);
+    let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
+    let (uart, spi, i2c) = (uart_pins(mcu), spi_pins(mcu), i2c_pins(mcu));
+    // The bus loops' own gates, read the same way: a UARTE by `uarte_pads`, a
+    // SPIM by its clock (and, on embassy-nrf, a data line beside it), a TWIM
+    // by the pair.
+    let uarte = |i: u8| uarte_pads(&uart, &ucfgs, i, embassy).ok();
+    let spim = |i: u8| {
+        role_of(&spi, i, "sck").is_some()
+            && (!embassy
+                || role_of(&spi, i, "mosi").is_some()
+                || role_of(&spi, i, "miso").is_some())
+    };
+    let twim = |i: u8| role_of(&i2c, i, "sda").is_some() && role_of(&i2c, i, "scl").is_some();
+    // And, on embassy-nrf, its block order: `async_bus_lines` builds every
+    // UARTE it can, then each SPIM and TWIM whose serial block is still free
+    // (`clash`), so a bus whose block went to an earlier one is built by
+    // nobody. nrf-hal builds both buses of a shared block
+    // (`shared_block_partner`), so the gates above are its whole rule.
+    let mut taken: Vec<String> = Vec::new();
+    let mut lost: Vec<(&str, u8)> = Vec::new();
+    if embassy {
+        for i in instances(&uart).into_iter().filter(|i| uarte(*i).is_some()) {
+            taken.push(serial_block(&mcu.family, "uarte", i).0);
+        }
+        for (kind, insts) in [
+            (
+                "spim",
+                instances(&spi)
+                    .into_iter()
+                    .filter(|i| spim(*i))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "twim",
+                instances(&i2c).into_iter().filter(|i| twim(*i)).collect(),
+            ),
+        ] {
+            for i in insts {
+                let peri = serial_block(&mcu.family, kind, i).0;
+                if taken.contains(&peri) {
+                    lost.push((kind, i));
+                } else {
+                    taken.push(peri);
+                }
+            }
+        }
+    }
+    let configured = |f: &PinFunction| match f {
+        PinFunction::UsartTx(i) => uarte(*i).is_some_and(|p| p.txd.is_some()),
+        PinFunction::UsartRx(i) => uarte(*i).is_some_and(|p| p.rxd.is_some()),
+        PinFunction::UsartCts(i) => uarte(*i).is_some_and(|p| p.cts.is_some()),
+        PinFunction::UsartRts(i) => uarte(*i).is_some_and(|p| p.rts.is_some()),
+        PinFunction::SpiSck(i) | PinFunction::SpiMosi(i) | PinFunction::SpiMiso(i) => {
+            spim(*i) && !lost.contains(&("spim", *i))
+        }
+        PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => {
+            twim(*i) && !lost.contains(&("twim", *i))
+        }
+        _ => true,
+    };
     let mut by_signal: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
         std::collections::BTreeMap::new();
     for p in mcu.iter_all_pins().filter(|p| !p.reserved) {
         let (Some(pp), Some(sig)) = (nrf_pin(&p.name), signal_name(&p.selected_function)) else {
             continue;
         };
-        by_signal.entry(sig).or_default().push(pp);
+        if configured(&p.selected_function) {
+            by_signal.entry(sig).or_default().push(pp);
+        }
     }
     let mut o = String::new();
     for (sig, mut pads) in by_signal {
@@ -1141,15 +1415,37 @@ fn bus_lines(mcu: &Mcu, hal: &str) -> String {
     o.push_str(&missing_block_notes(mcu));
 
     let uart = uart_pins(mcu);
+    let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
     for i in instances(&uart) {
-        let (Some(txd), Some(rxd)) = (role_of(&uart, i, "txd"), role_of(&uart, i, "rxd")) else {
-            o.push_str(&format!(
-                "    // UARTE{i}: only one of TXD/RXD is wired, and the constructor takes the\n    // pair. Wire the other pad on the Pins canvas.\n"
-            ));
+        o.push_str(&uarte_kept_direction_note(&ucfgs, i));
+        let pads = match uarte_pads(&uart, &ucfgs, i, false) {
+            Ok(pads) => pads,
+            Err(why) => {
+                o.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!("UARTE{i}: {why}"),
+                    "    ",
+                ));
+                continue;
+            }
+        };
+        // nrf-hal's pair always has both (`uarte_pads`).
+        let (Some(txd), Some(rxd)) = (pads.txd, pads.rxd) else {
             continue;
         };
-        let cts = role_of(&uart, i, "cts").map(in_arg);
-        let rts = role_of(&uart, i, "rts").map(|pp| out_arg(hal, pp, "High"));
+        // A lone flow pad is connected but paces nothing: nrf-hal sets HWFC
+        // from the pair (`uarte_flow`), the way embassy-nrf's note says too.
+        if pads.cts.is_some() != pads.rts.is_some() {
+            o.push_str(&crate::panels::mcu_module::errata::comment(
+                &format!(
+                    "UARTE{i}: only {} is wired. nrf-hal turns hardware flow control on only \
+                     with CTS and RTS both, so this port runs without it.",
+                    if pads.cts.is_some() { "CTS" } else { "RTS" }
+                ),
+                "    ",
+            ));
+        }
+        let cts = pads.cts.map(in_arg);
+        let rts = pads.rts.map(|pp| out_arg(hal, pp, "High"));
         o.push_str(&format!(
             "    let uarte{i} = pins::configs::uarte{i}::init(\n        p.UARTE{i},\n        {},\n        {},\n        {},\n        {},\n    );\n    let _ = &uarte{i};\n",
             out_arg(hal, txd, "High"),
@@ -2173,16 +2469,19 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     let uart = uart_pins(mcu);
     let ucfgs = modules::usart_configs(&mcu.modules);
     for i in instances(&uart) {
-        // embassy-nrf HAS the halves (`UarteTx::new` / `UarteRx::new`); this
-        // backend writes only the pair's constructors (`Uarte::new`,
-        // `Uarte::new_with_rtscts`), which is what the note must say - not that
-        // the HAL cannot.
-        let (Some(txd), Some(rxd)) = (role_of(&uart, i, "txd"), role_of(&uart, i, "rxd")) else {
-            o.push_str(&format!(
-                "    // UARTE{i}: only one of TXD/RXD is wired, and this backend builds the UARTE\n    // from the pair - embassy-nrf's one-way UarteTx / UarteRx are not generated\n    // yet. Wire the other pad on the Pins canvas.\n"
-            ));
-            continue;
+        // The module's direction picks the shape (`uarte_pads`): the pair, or
+        // embassy-nrf's one-way `UarteTx` / `UarteRx`.
+        let pads = match uarte_pads(&uart, &ucfgs, i, true) {
+            Ok(pads) => pads,
+            Err(why) => {
+                o.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!("UARTE{i} is NOT initialised: {why}"),
+                    "    ",
+                ));
+                continue;
+            }
         };
+        o.push_str(&uarte_unused_note(&uart, &ucfgs, i));
         let (peri, irq) = serial_block(&mcu.family, "uarte", i);
         let var = format!("uarte{i}");
         let hz = bus_speed(mcu, "uarte", i);
@@ -2212,30 +2511,83 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         if c.data_bits != 8 || c.stop_bits != StopBits::One {
             o.push_str("    // The UARTE frames 8 data bits and 1 stop bit; the module's other\n    // setting is not reachable through the HAL.\n");
         }
-        let ctor = match (role_of(&uart, i, "cts"), role_of(&uart, i, "rts")) {
-            (Some(cts), Some(rts)) => format!(
-                "new_with_rtscts(\n        p.{peri},\n        p.{}, // RXD\n        p.{}, // TXD\n        p.{}, // CTS\n        p.{}, // RTS\n        Irqs,\n        {var}_cfg,\n    )",
-                periph(rxd),
-                periph(txd),
-                periph(cts),
-                periph(rts)
+        // The two halves take the binding BEFORE their pin, the pair after its
+        // pins - embassy-nrf's own argument orders.
+        let (ty, ctor) = match pads {
+            UartePads {
+                txd: Some(txd),
+                rxd: Some(rxd),
+                cts,
+                rts,
+            } => (
+                "Uarte",
+                match (cts, rts) {
+                    (Some(cts), Some(rts)) => format!(
+                        "new_with_rtscts(\n        p.{peri},\n        p.{}, // RXD\n        p.{}, // TXD\n        p.{}, // CTS\n        p.{}, // RTS\n        Irqs,\n        {var}_cfg,\n    )",
+                        periph(rxd),
+                        periph(txd),
+                        periph(cts),
+                        periph(rts)
+                    ),
+                    _ => {
+                        // `uarte_pads` keeps a flow pad on the pair only with
+                        // its partner; a lone one is still on the canvas.
+                        let (cts, rts) = (role_of(&uart, i, "cts"), role_of(&uart, i, "rts"));
+                        if cts.is_some() || rts.is_some() {
+                            o.push_str(&format!(
+                                "    // UARTE{i}: only {} is wired. embassy-nrf takes flow control as the\n    // CTS+RTS pair, so this port is built without it.\n",
+                                if cts.is_some() { "CTS" } else { "RTS" }
+                            ));
+                        }
+                        format!(
+                            "new(\n        p.{peri},\n        p.{}, // RXD\n        p.{}, // TXD\n        Irqs,\n        {var}_cfg,\n    )",
+                            periph(rxd),
+                            periph(txd)
+                        )
+                    }
+                },
             ),
-            (cts, rts) => {
-                if cts.is_some() || rts.is_some() {
-                    o.push_str(&format!(
-                        "    // UARTE{i}: only {} is wired. embassy-nrf takes flow control as the\n    // CTS+RTS pair, so this port is built without it.\n",
-                        if cts.is_some() { "CTS" } else { "RTS" }
-                    ));
-                }
-                format!(
-                    "new(\n        p.{peri},\n        p.{}, // RXD\n        p.{}, // TXD\n        Irqs,\n        {var}_cfg,\n    )",
-                    periph(rxd),
-                    periph(txd)
-                )
-            }
+            UartePads {
+                txd: Some(txd),
+                cts,
+                ..
+            } => (
+                "UarteTx",
+                match cts {
+                    Some(cts) => format!(
+                        "new_with_rtscts(\n        p.{peri},\n        Irqs,\n        p.{}, // TXD\n        p.{}, // CTS\n        {var}_cfg,\n    )",
+                        periph(txd),
+                        periph(cts)
+                    ),
+                    None => format!(
+                        "new(\n        p.{peri},\n        Irqs,\n        p.{}, // TXD\n        {var}_cfg,\n    )",
+                        periph(txd)
+                    ),
+                },
+            ),
+            UartePads {
+                rxd: Some(rxd),
+                rts,
+                ..
+            } => (
+                "UarteRx",
+                match rts {
+                    Some(rts) => format!(
+                        "new_with_rtscts(\n        p.{peri},\n        Irqs,\n        p.{}, // RXD\n        p.{}, // RTS\n        {var}_cfg,\n    )",
+                        periph(rxd),
+                        periph(rts)
+                    ),
+                    None => format!(
+                        "new(\n        p.{peri},\n        Irqs,\n        p.{}, // RXD\n        {var}_cfg,\n    )",
+                        periph(rxd)
+                    ),
+                },
+            ),
+            // `uarte_pads` never answers Ok with neither data pad.
+            UartePads { .. } => continue,
         };
         o.push_str(&format!(
-            "{ALLOW}    let mut {var} = embassy_nrf::uarte::Uarte::{ctor};\n"
+            "{ALLOW}    let mut {var} = embassy_nrf::uarte::{ty}::{ctor};\n"
         ));
         irqs.push(format!(
             "    {irq} => embassy_nrf::uarte::InterruptHandler<embassy_nrf::peripherals::{peri}>;"
@@ -3384,9 +3736,9 @@ mod blocking_codegen {
 
     /// Half a UARTE says WHO takes the pair, by HAL, not by runtime. nrf-hal's
     /// `uarte::Pins` does, so its note (Blocking on a part nrf-hal has a crate
-    /// for) blames the constructor; embassy-nrf has `UarteTx` / `UarteRx`, so
-    /// its note (Async everywhere, and Blocking on the 52820, 5340 and 54L15)
-    /// names this backend's gap.
+    /// for) blames the constructor; embassy-nrf builds `UarteTx` / `UarteRx`,
+    /// so its note (Async everywhere, and Blocking on the 52820, 5340 and
+    /// 54L15) names the missing pad and the one-way pick it makes.
     #[test]
     fn a_half_wired_uarte_names_whose_limit_it_is() {
         let mut mcu = microbit(&[("P0.06", PinFunction::UsartTx(0))]);
@@ -3396,12 +3748,10 @@ mod blocking_codegen {
                 .contains("// UARTE0: only one of TXD/RXD is wired, and the constructor takes the"),
             "{blocking}"
         );
+        let embassy_note = "// UARTE0 is NOT initialised: its RXD pad is not wired";
         mcu.runtime = crate::panels::mcu_module::mcu::Runtime::Async;
         let on_async = mcu.fresh_main_rs();
-        assert!(
-            on_async.contains("embassy-nrf's one-way UarteTx / UarteRx are not generated"),
-            "{on_async}"
-        );
+        assert!(on_async.contains(embassy_note), "{on_async}");
         assert!(
             !on_async.contains("the constructor takes the"),
             "{on_async}"
@@ -3412,7 +3762,7 @@ mod blocking_codegen {
         assert!(super::blocking_on_embassy(&mcu.family));
         let embassy_blocking = mcu.fresh_main_rs();
         assert!(
-            embassy_blocking.contains("embassy-nrf's one-way UarteTx / UarteRx are not generated"),
+            embassy_blocking.contains(embassy_note),
             "{embassy_blocking}"
         );
     }
@@ -4604,10 +4954,14 @@ mod async_codegen {
     #[test]
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_nrf_async_project() {
+        let oneway = std::env::var("EIDE_NRF_ONEWAY").is_ok();
         for (mut mcu, dir_name) in [
             (on_async(everything()), "eide_nrf52833_async_check"),
             (the_other_async_branches(), "eide_nrf52833_async_alt_check"),
         ] {
+            if oneway {
+                one_way(&mut mcu, dir_name == "eide_nrf52833_async_check");
+            }
             // The watchdog rides along, set BEFORE the blocking clone below, so
             // the runtime switch carries it the way a user's project would.
             mcu.watchdog.nrf =
@@ -4681,6 +5035,39 @@ mod async_codegen {
             println!("wrote {}", dir.display());
             println!("target: {}", def.project.target);
         }
+    }
+
+    /// `EIDE_NRF_ONEWAY`: UARTE0 one-way, each half on the flow pad it takes -
+    /// transmit-only with CTS (on P0.03, wired here) on the first project,
+    /// receive-only with RTS on the second, whose CTS stays on its pad unused.
+    /// The other data pad stays wired on both, so the unused note is built too.
+    fn one_way(mcu: &mut Mcu, first: bool) {
+        use crate::panels::mcu_module::modules::UsartDirection;
+        if first {
+            for p in mcu.iter_all_pins_mut() {
+                if p.name.starts_with("P0.03") {
+                    p.selected_function = PinFunction::UsartCts(0);
+                }
+            }
+            mcu.reconcile_modules();
+        }
+        for m in &mut mcu.modules {
+            if let ModuleConfig::Usart(c) = &mut m.config {
+                c.direction = if first {
+                    UsartDirection::TxOnly
+                } else {
+                    UsartDirection::RxOnly
+                };
+            }
+        }
+        let main = mcu.fresh_main_rs();
+        let want = if first {
+            "embassy_nrf::uarte::UarteTx::new_with_rtscts("
+        } else {
+            "embassy_nrf::uarte::UarteRx::new_with_rtscts("
+        };
+        assert!(main.contains(want), "{main}");
+        assert!(main.contains("is wired, but its direction"), "{main}");
     }
 }
 
@@ -5189,5 +5576,497 @@ mod shared_block {
             other.family = family.to_owned();
             assert_eq!(partners(&other, 0, true), (None, None), "{family}");
         }
+    }
+}
+
+#[cfg(test)]
+mod one_way_uartes {
+    use super::blocking_codegen::microbit;
+    use crate::panels::mcu_module::mcu::Mcu;
+    use crate::panels::mcu_module::mcu::model::Runtime;
+    use crate::panels::mcu_module::modules::{ModuleConfig, UsartDirection};
+    use crate::panels::mcu_module::pins::PinFunction;
+
+    const TXD: (&str, PinFunction) = ("P0.06", PinFunction::UsartTx(0));
+    const RXD: (&str, PinFunction) = ("P1.08", PinFunction::UsartRx(0));
+    const CTS: (&str, PinFunction) = ("P0.02", PinFunction::UsartCts(0));
+    const RTS: (&str, PinFunction) = ("P0.03", PinFunction::UsartRts(0));
+
+    /// The micro:bit with `wired` on its pads, on `runtime`, every UARTE
+    /// module set to `dir`.
+    fn board(runtime: Runtime, wired: &[(&str, PinFunction)], dir: UsartDirection) -> Mcu {
+        let mut mcu = microbit(wired);
+        mcu.runtime = runtime;
+        mcu.reconcile_modules();
+        for m in &mut mcu.modules {
+            if let ModuleConfig::Usart(c) = &mut m.config {
+                c.direction = dir;
+            }
+        }
+        mcu
+    }
+
+    /// main.rs as one line of prose, its `//` markers gone, so a sentence
+    /// reads whole wherever `errata::comment` wrapped it.
+    fn said(main: &str) -> String {
+        main.lines()
+            .map(|l| l.trim().trim_start_matches("//").trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// embassy-nrf builds either half from the one pad it takes, binding
+    /// BEFORE the pin, on Async and on a Blocking part that is embassy-nrf too
+    /// (`blocking_on_embassy`). The UARTE's vector is bound either way: both
+    /// halves take it.
+    #[test]
+    fn embassy_nrf_builds_either_half() {
+        for (runtime, family) in [
+            (Runtime::Async, "nrf52833"),
+            (Runtime::Blocking, "nrf52820"),
+        ] {
+            let mut tx = board(runtime, &[TXD], UsartDirection::TxOnly);
+            tx.family = family.into();
+            let main = tx.fresh_main_rs();
+            assert!(
+                main.contains("let mut uarte0 = embassy_nrf::uarte::UarteTx::new(\n        p.UARTE0,\n        Irqs,\n        p.P0_06, // TXD\n        uarte0_cfg,\n    );"),
+                "{family}: {main}"
+            );
+            assert!(
+                main.contains("    UARTE0 => embassy_nrf::uarte::InterruptHandler<embassy_nrf::peripherals::UARTE0>;"),
+                "{family}: {main}"
+            );
+            assert!(!main.contains("NOT initialised"), "{family}: {main}");
+
+            let mut rx = board(runtime, &[RXD], UsartDirection::RxOnly);
+            rx.family = family.into();
+            let main = rx.fresh_main_rs();
+            assert!(
+                main.contains("let mut uarte0 = embassy_nrf::uarte::UarteRx::new(\n        p.UARTE0,\n        Irqs,\n        p.P1_08, // RXD\n        uarte0_cfg,\n    );"),
+                "{family}: {main}"
+            );
+            assert!(main.contains("uarte0_cfg.baudrate = "), "{family}: {main}");
+        }
+    }
+
+    /// A half takes the ONE flow pad it uses - CTS paces the transmitter, RTS
+    /// the receiver - and every pad of the half it leaves out is named as
+    /// wired and unused. The pair still takes the two together.
+    #[test]
+    fn each_half_takes_its_own_flow_pad() {
+        let all = [TXD, RXD, CTS, RTS];
+        let main = board(Runtime::Async, &all, UsartDirection::TxOnly).fresh_main_rs();
+        assert!(
+            main.contains("embassy_nrf::uarte::UarteTx::new_with_rtscts(\n        p.UARTE0,\n        Irqs,\n        p.P0_06, // TXD\n        p.P0_02, // CTS\n        uarte0_cfg,\n    );"),
+            "{main}"
+        );
+        for line in [
+            "UARTE0's RXD pad (P1.08) is wired, but its direction (Transmit only) does not use it.",
+            "UARTE0's RTS pad (P0.03) is wired, but its direction (Transmit only) does not use it.",
+        ] {
+            assert!(said(&main).contains(line), "{line}\n{main}");
+        }
+        assert!(!main.contains("p.P1_08"), "{main}");
+        assert!(!main.contains("only CTS is wired"), "{main}");
+
+        let main = board(Runtime::Async, &all, UsartDirection::RxOnly).fresh_main_rs();
+        assert!(
+            main.contains("embassy_nrf::uarte::UarteRx::new_with_rtscts(\n        p.UARTE0,\n        Irqs,\n        p.P1_08, // RXD\n        p.P0_03, // RTS\n        uarte0_cfg,\n    );"),
+            "{main}"
+        );
+        for line in [
+            "UARTE0's TXD pad (P0.06) is wired, but its direction (Receive only) does not use it.",
+            "UARTE0's CTS pad (P0.02) is wired, but its direction (Receive only) does not use it.",
+        ] {
+            assert!(said(&main).contains(line), "{line}\n{main}");
+        }
+
+        let main = board(Runtime::Async, &all, UsartDirection::TxRx).fresh_main_rs();
+        assert!(
+            main.contains("embassy_nrf::uarte::Uarte::new_with_rtscts("),
+            "{main}"
+        );
+        assert!(!main.contains("does not use"), "{main}");
+        // A lone flow pad beside the pair is the old note; on the half that
+        // uses it, it goes in whole.
+        let main = board(Runtime::Async, &[TXD, RXD, CTS], UsartDirection::TxRx).fresh_main_rs();
+        assert!(main.contains("// UARTE0: only CTS is wired."), "{main}");
+        let main = board(Runtime::Async, &[TXD, RXD, CTS], UsartDirection::TxOnly).fresh_main_rs();
+        assert!(main.contains("UarteTx::new_with_rtscts("), "{main}");
+        assert!(!main.contains("only CTS is wired"), "{main}");
+    }
+
+    /// A direction whose pad is missing builds nothing and says which one, and
+    /// what to do: the one-way pick a single wired pad makes is offered on
+    /// every embassy-nrf runtime, so a pair with one pad names it. A single
+    /// wire is no UARTE shape at all.
+    #[test]
+    fn a_direction_without_its_pad_builds_nothing() {
+        let main = board(Runtime::Async, &[TXD], UsartDirection::TxRx).fresh_main_rs();
+        let pair_short = "UARTE0 is NOT initialised: its RXD pad is not wired, and its direction \
+                          (Receive and transmit) needs it. Assign it on the Pins canvas, or set its \
+                          direction to Transmit only on its module.";
+        assert!(said(&main).contains(pair_short), "{main}");
+        assert!(!main.contains("embassy_nrf::uarte::Uarte"), "{main}");
+        assert!(!main.contains("UARTE0 =>"), "{main}");
+
+        let main = board(Runtime::Async, &[RXD], UsartDirection::TxRx).fresh_main_rs();
+        assert!(
+            said(&main).contains("or set its direction to Receive only on its module."),
+            "{main}"
+        );
+
+        let main = board(Runtime::Async, &[RXD], UsartDirection::TxOnly).fresh_main_rs();
+        assert!(
+            said(&main).contains(
+                "UARTE0 is NOT initialised: its TXD pad is not wired, and its direction \
+                 (Transmit only) needs it. Assign it on the Pins canvas."
+            ),
+            "{main}"
+        );
+        assert!(!said(&main).contains("or set its direction"), "{main}");
+
+        for dir in [
+            UsartDirection::HalfDuplexOnTx,
+            UsartDirection::HalfDuplexOnRx,
+        ] {
+            let main = board(Runtime::Async, &[TXD, RXD], dir).fresh_main_rs();
+            let text = said(&main);
+            assert!(
+                text.contains("UARTE0 is NOT initialised: its direction"),
+                "{main}"
+            );
+            assert!(text.contains("the UARTE has no half-duplex mode"), "{main}");
+            assert!(!main.contains("embassy_nrf::uarte::Uarte"), "{main}");
+        }
+        // A Blocking part on embassy-nrf says it the same way.
+        let mut mcu = board(Runtime::Blocking, &[TXD], UsartDirection::TxRx);
+        mcu.family = "nrf52820".into();
+        assert!(said(&mcu.fresh_main_rs()).contains(pair_short));
+    }
+
+    /// nrf-hal's `uarte::Pins` takes the pair, so its Blocking runtime builds
+    /// it whatever the direction says - and names a one-way pick as kept for
+    /// Async, where embassy-nrf builds it. A half-wired UARTE is the old note.
+    #[test]
+    fn nrf_hal_builds_the_pair_and_keeps_the_direction() {
+        for dir in [UsartDirection::TxOnly, UsartDirection::RxOnly] {
+            let mcu = board(Runtime::Blocking, &[TXD, RXD], dir);
+            let main = mcu.fresh_main_rs();
+            assert!(
+                main.contains("let uarte0 = pins::configs::uarte0::init("),
+                "{main}"
+            );
+            assert!(
+                said(&main).contains(&format!(
+                    "UARTE0: {} is the Async runtime's choice - nrf-hal's uarte::Pins takes TXD \
+                     and RXD both, so this runtime builds the pair or nothing, and the module \
+                     keeps the direction for Async.",
+                    dir.label()
+                )),
+                "{main}"
+            );
+            assert!(
+                !main.contains("UarteTx") && !main.contains("UarteRx"),
+                "{main}"
+            );
+            let names: Vec<String> = mcu.config_files().into_iter().map(|(n, _)| n).collect();
+            assert!(names.iter().any(|n| n == "uarte0.rs"), "{names:?}");
+        }
+        let main = board(Runtime::Blocking, &[TXD, RXD], UsartDirection::TxRx).fresh_main_rs();
+        assert!(!main.contains("Async runtime's choice"), "{main}");
+        let main = board(
+            Runtime::Blocking,
+            &[TXD, RXD],
+            UsartDirection::HalfDuplexOnTx,
+        )
+        .fresh_main_rs();
+        assert!(
+            said(&main).contains(
+                "the UARTE has no half-duplex mode - this runtime builds the TXD+RXD pair or \
+                 nothing, whatever the module says."
+            ),
+            "{main}"
+        );
+        // nrf-hal's panel draws no direction row, so no pick is suggested.
+        assert!(!said(&main).contains("Pick another direction"), "{main}");
+        assert!(main.contains("pins::configs::uarte0::init("), "{main}");
+        // A lone flow pad beside nrf-hal's pair is connected but paces
+        // nothing, and main.rs says so as embassy-nrf's note does.
+        let main = board(Runtime::Blocking, &[TXD, RXD, CTS], UsartDirection::TxRx).fresh_main_rs();
+        assert!(
+            said(&main).contains(
+                "UARTE0: only CTS is wired. nrf-hal turns hardware flow control on only with CTS \
+                 and RTS both, so this port runs without it."
+            ),
+            "{main}"
+        );
+        assert!(
+            main.contains("Some(port0.p0_02.into_floating_input().degrade())"),
+            "{main}"
+        );
+        let main = board(
+            Runtime::Blocking,
+            &[TXD, RXD, CTS, RTS],
+            UsartDirection::TxRx,
+        )
+        .fresh_main_rs();
+        assert!(!main.contains("only CTS is wired"), "{main}");
+        // A UARTE listed for a flow pad alone has neither data pad.
+        let main = board(Runtime::Blocking, &[CTS], UsartDirection::TxRx).fresh_main_rs();
+        assert!(
+            said(&main).contains(
+                "UARTE0: neither TXD nor RXD is wired, and the constructor takes the pair. Wire \
+                 both on the Pins canvas."
+            ),
+            "{main}"
+        );
+
+        let mcu = board(Runtime::Blocking, &[TXD], UsartDirection::TxOnly);
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains("// UARTE0: only one of TXD/RXD is wired"),
+            "{main}"
+        );
+        assert!(said(&main).contains("Async runtime's choice"), "{main}");
+        assert!(!main.contains("::init("), "{main}");
+        assert!(mcu.config_files().is_empty());
+    }
+
+    /// "Only X is configured" is said of a role a constructor takes, and of
+    /// nothing else: not of the half a direction leaves out, not of a lone flow
+    /// pad beside an embassy-nrf pair (nrf-hal does connect one), and not of a
+    /// bus no constructor is written for.
+    #[test]
+    fn an_unused_pad_is_not_called_configured() {
+        const RXD2: (&str, PinFunction) = ("P0.09", PinFunction::UsartRx(0));
+        let main = board(Runtime::Async, &[TXD, RXD, RXD2], UsartDirection::TxOnly).fresh_main_rs();
+        assert!(!main.contains("is configured"), "{main}");
+        assert!(
+            said(&main).contains(
+                "UARTE0's RXD pads (P0.09 and P1.08) are wired, but its direction (Transmit \
+                 only) does not use them."
+            ),
+            "{main}"
+        );
+        let main = board(Runtime::Async, &[TXD, RXD, RXD2], UsartDirection::RxOnly).fresh_main_rs();
+        assert!(
+            main.contains("// UARTE0 RXD is wired to P0.09 and P1.08. Only P0.09 is configured:"),
+            "{main}"
+        );
+        assert!(main.contains("p.P0_09, // RXD"), "{main}");
+
+        // A lone CTS on two pads: left out of the embassy-nrf pair, handed to
+        // nrf-hal's.
+        const CTS2: (&str, PinFunction) = ("P0.09", PinFunction::UsartCts(0));
+        let wired = [TXD, RXD, CTS, CTS2];
+        let main = board(Runtime::Async, &wired, UsartDirection::TxRx).fresh_main_rs();
+        assert!(!main.contains("is configured"), "{main}");
+        let main = board(Runtime::Blocking, &wired, UsartDirection::TxRx).fresh_main_rs();
+        assert!(
+            main.contains("// UARTE0 CTS is wired to P0.02 and P0.09. Only P0.02 is configured:"),
+            "{main}"
+        );
+
+        // A refused UARTE and a SPIM with no data line on embassy-nrf build
+        // nothing, so neither pad of theirs is configured.
+        const TXD2: (&str, PinFunction) = ("P0.09", PinFunction::UsartTx(0));
+        let main = board(Runtime::Async, &[TXD, TXD2], UsartDirection::TxRx).fresh_main_rs();
+        assert!(main.contains("UARTE0 is NOT initialised"), "{main}");
+        assert!(!main.contains("is configured"), "{main}");
+        let sck = [
+            ("P0.17", PinFunction::SpiSck(2)),
+            ("P0.01", PinFunction::SpiSck(2)),
+        ];
+        let main = board(Runtime::Async, &sck, UsartDirection::TxRx).fresh_main_rs();
+        assert!(main.contains("// SPIM2: only SCK is wired."), "{main}");
+        assert!(!main.contains("is configured"), "{main}");
+        // nrf-hal builds a SCK-only SPIM, so there it IS configured.
+        let main = board(Runtime::Blocking, &sck, UsartDirection::TxRx).fresh_main_rs();
+        assert!(
+            main.contains("// SPIM2 SCK is wired to P0.01 and P0.17. Only P0.01 is configured:"),
+            "{main}"
+        );
+    }
+
+    /// Nor of a bus embassy-nrf drops because an earlier one took its serial
+    /// block (`clash`): TWIM0 beside SPIM0 on an nRF52's TWISPI0, and - new
+    /// with one-way UARTEs, which now take a block from a single pad - SPIM0
+    /// beside a transmit-only UARTE0 on the nRF5340's SERIAL0. nrf-hal builds
+    /// both buses of a shared block, so there the pad IS configured.
+    #[test]
+    fn a_bus_whose_block_is_taken_is_not_called_configured() {
+        let twisp = [
+            ("P0.17", PinFunction::SpiSck(0)),
+            ("P0.13", PinFunction::SpiMosi(0)),
+            ("P0.08", PinFunction::I2cScl(0)),
+            ("P0.16", PinFunction::I2cSda(0)),
+            ("P0.09", PinFunction::I2cSda(0)),
+        ];
+        let main = board(Runtime::Async, &twisp, UsartDirection::TxRx).fresh_main_rs();
+        assert!(
+            main.contains("// TWIM0 is not built: it is the same block as SPIM0"),
+            "{main}"
+        );
+        assert!(!main.contains("is configured"), "{main}");
+        let main = board(Runtime::Blocking, &twisp, UsartDirection::TxRx).fresh_main_rs();
+        assert!(
+            main.contains("// TWIM0 SDA is wired to P0.09 and P0.16. Only P0.09 is configured:"),
+            "{main}"
+        );
+
+        let serial0 = [
+            TXD,
+            ("P0.17", PinFunction::SpiSck(0)),
+            ("P0.01", PinFunction::SpiSck(0)),
+            ("P0.13", PinFunction::SpiMosi(0)),
+        ];
+        let mut mcu = board(Runtime::Async, &serial0, UsartDirection::TxOnly);
+        mcu.family = "nrf5340".into();
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains("embassy_nrf::uarte::UarteTx::new(\n        p.SERIAL0,"),
+            "{main}"
+        );
+        assert!(
+            main.contains("// SPIM0 is not built: it is the same block as UARTE0"),
+            "{main}"
+        );
+        assert!(!main.contains("is configured"), "{main}");
+        // With the UARTE refused, SPIM0 has the block, and its pad IS.
+        let mut mcu = board(Runtime::Async, &serial0, UsartDirection::TxRx);
+        mcu.family = "nrf5340".into();
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains("// SPIM0 SCK is wired to P0.01 and P0.17. Only P0.01 is configured:"),
+            "{main}"
+        );
+    }
+
+    /// Leaving Async for nrf-hal, the Apply list says what becomes of a one-way
+    /// pick it keeps - the pair from both pads, nothing from one - and the
+    /// Board tab draws the pair's wires, as main.rs builds them. Neither says a
+    /// word on the way back, nor where Blocking is embassy-nrf, which builds
+    /// the half.
+    #[test]
+    fn leaving_async_for_nrf_hal_names_the_kept_pick() {
+        use crate::panels::board::snapshot::ChipView;
+        let kept = |mcu: &Mcu| {
+            mcu.apply_change_list()
+                .into_iter()
+                .filter(|l| l.contains("is not built on nrf-hal"))
+                .collect::<Vec<_>>()
+        };
+        let mut mcu = board(Runtime::Async, &[TXD, RXD], UsartDirection::TxOnly);
+        mcu.pending_runtime = Runtime::Blocking;
+        let list = kept(&mcu);
+        assert!(
+            list.iter().any(|l| l.contains(
+                "Transmit only is not built on nrf-hal - the UARTE is built there as the TXD+RXD \
+                 pair. The module keeps it for the Async runtime"
+            )),
+            "{list:#?}"
+        );
+        let mut one_pad = board(Runtime::Async, &[RXD], UsartDirection::RxOnly);
+        one_pad.pending_runtime = Runtime::Blocking;
+        let list = kept(&one_pad);
+        assert!(
+            list.iter().any(|l| l.contains(
+                "Receive only is not built on nrf-hal - the UARTE is not initialised there: its \
+                 TXD pad is not wired"
+            )),
+            "{list:#?}"
+        );
+        // A half paced on its own flow pad becomes a pair with none.
+        for (dir, wired, pad) in [
+            (UsartDirection::TxOnly, [TXD, RXD, CTS], "CTS"),
+            (UsartDirection::RxOnly, [TXD, RXD, RTS], "RTS"),
+        ] {
+            let mut paced = board(Runtime::Async, &wired, dir);
+            paced.pending_runtime = Runtime::Blocking;
+            let list = kept(&paced);
+            assert!(
+                list.iter().any(|l| l.contains(&format!(
+                    "the UARTE is built there as the TXD+RXD pair, without the {pad} flow control \
+                     the Async half paces on - nrf-hal turns it on only with CTS and RTS both"
+                ))),
+                "{list:#?}"
+            );
+        }
+        // With both flow pads the pair keeps flow control, and says nothing of it.
+        let mut both = board(
+            Runtime::Async,
+            &[TXD, RXD, CTS, RTS],
+            UsartDirection::TxOnly,
+        );
+        both.pending_runtime = Runtime::Blocking;
+        let list = kept(&both);
+        assert!(
+            list.iter()
+                .any(|l| l.contains("is built there as the TXD+RXD pair. The module")),
+            "{list:#?}"
+        );
+        let mut pair = board(Runtime::Async, &[TXD, RXD], UsartDirection::TxRx);
+        pair.pending_runtime = Runtime::Blocking;
+        assert!(kept(&pair).is_empty());
+        let mut back = board(Runtime::Blocking, &[TXD, RXD], UsartDirection::TxOnly);
+        back.pending_runtime = Runtime::Async;
+        assert!(kept(&back).is_empty());
+        let mut on_embassy = board(Runtime::Async, &[TXD, RXD], UsartDirection::TxOnly);
+        on_embassy.family = "nrf52820".into();
+        on_embassy.pending_runtime = Runtime::Blocking;
+        assert!(kept(&on_embassy).is_empty());
+
+        let drawn = |mcu: &Mcu| {
+            ChipView::from_mcu("mb", "nRF52833", mcu)
+                .modules
+                .iter()
+                .find_map(|m| match &m.config {
+                    ModuleConfig::Usart(c) => Some(c.direction),
+                    _ => None,
+                })
+                .expect("the UARTE")
+        };
+        let blocking = board(Runtime::Blocking, &[TXD, RXD], UsartDirection::TxOnly);
+        assert_eq!(drawn(&blocking), UsartDirection::TxRx);
+        let on_async = board(Runtime::Async, &[TXD, RXD], UsartDirection::TxOnly);
+        assert_eq!(drawn(&on_async), UsartDirection::TxOnly);
+        let mut embassy_blocking = board(Runtime::Blocking, &[TXD, RXD], UsartDirection::RxOnly);
+        embassy_blocking.family = "nrf52820".into();
+        assert_eq!(drawn(&embassy_blocking), UsartDirection::RxOnly);
+    }
+
+    /// The flow is the wired pads', by direction: a half takes its own pad, the
+    /// pair both or neither, a single wire none - and main.rs builds exactly
+    /// that, whatever the module's (unread) `flow` field holds.
+    #[test]
+    fn the_wired_pads_decide_the_flow() {
+        use crate::panels::mcu_module::modules::UsartFlow as F;
+        use UsartDirection as D;
+        for (dir, cts, rts, want) in [
+            (D::TxRx, true, true, F::CtsRts),
+            (D::TxRx, true, false, F::None),
+            (D::TxRx, false, true, F::None),
+            (D::TxOnly, true, false, F::Cts),
+            (D::TxOnly, true, true, F::Cts),
+            (D::TxOnly, false, true, F::None),
+            (D::RxOnly, false, true, F::Rts),
+            (D::RxOnly, true, true, F::Rts),
+            (D::RxOnly, true, false, F::None),
+            (D::HalfDuplexOnTx, true, true, F::None),
+        ] {
+            assert_eq!(
+                super::uarte_flow(dir, cts, rts),
+                want,
+                "{dir:?} {cts} {rts}"
+            );
+        }
+        let mut mcu = board(Runtime::Async, &[TXD, RXD, CTS, RTS], D::TxOnly);
+        for m in &mut mcu.modules {
+            if let ModuleConfig::Usart(c) = &mut m.config {
+                c.flow = F::None;
+            }
+        }
+        assert!(mcu.fresh_main_rs().contains("UarteTx::new_with_rtscts("));
     }
 }

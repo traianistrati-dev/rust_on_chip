@@ -5301,6 +5301,13 @@ pub fn module_config_ui(
                     if !widths.contains(&cfg.data_bits) {
                         cfg.data_bits = widths[0];
                     }
+                    // Nine data bits leave no room for parity - no STM32 USART
+                    // frames ten bits (`UsartModuleConfig::frame_fits`) - so the
+                    // two rows answer each other: the latest pick wins, and the
+                    // other gives way. A pair stored with both (an old project,
+                    // a hand edit) is what loading folds it to, 8 + parity.
+                    cfg.migrate_word_length();
+                    let picked_bits = cfg.data_bits;
                     egui::ComboBox::from_id_salt("databits")
                         .selected_text(cfg.data_bits.to_string())
                         .show_ui(ui, |ui| {
@@ -5308,9 +5315,15 @@ pub fn module_config_ui(
                                 ui.selectable_value(&mut cfg.data_bits, *d, d.to_string());
                             }
                         });
+                    if cfg.data_bits != picked_bits
+                        && !UsartModuleConfig::frame_fits(cfg.data_bits, cfg.parity)
+                    {
+                        cfg.parity = Parity::None;
+                    }
                     ui.end_row();
                     out.field("Parity", docs::USART_PARITY);
                     ui.label("Parity");
+                    let picked_parity = cfg.parity;
                     egui::ComboBox::from_id_salt("parity")
                         .selected_text(parity_label(cfg.parity))
                         .show_ui(ui, |ui| {
@@ -5318,6 +5331,11 @@ pub fn module_config_ui(
                             ui.selectable_value(&mut cfg.parity, Parity::Even, "Even");
                             ui.selectable_value(&mut cfg.parity, Parity::Odd, "Odd");
                         });
+                    if cfg.parity != picked_parity
+                        && !UsartModuleConfig::frame_fits(cfg.data_bits, cfg.parity)
+                    {
+                        cfg.data_bits = 8;
+                    }
                     ui.end_row();
                     out.field("Stop bits", docs::USART_STOP_BITS);
                     ui.label("Stop bits");
@@ -9394,6 +9412,34 @@ mod tests {
             );
             assert_eq!((c.direction, c.flow), (D::TxOnly, F::Cts));
             assert!(!labels_of(&out).contains(&"Data direction"));
+        }
+    }
+
+    /// 9 data bits with parity has no frame on any STM32: a stored pair is
+    /// drawn - and kept - as the 8 + parity loading folds it to, on every
+    /// runtime, embassy's and stm32f1xx-hal's alike. The pairs that fit stay.
+    #[test]
+    fn nine_data_bits_with_parity_is_drawn_as_eight() {
+        let word = |data_bits: u8, parity: Parity| {
+            move |c: &mut UsartModuleConfig| {
+                c.data_bits = data_bits;
+                c.parity = parity;
+            }
+        };
+        for (family, is_async) in [("stm32g0", true), ("stm32g0", false), ("stm32f1", false)] {
+            for (stored, drawn) in [
+                ((9, Parity::Even), (8, Parity::Even)),
+                ((9, Parity::Odd), (8, Parity::Odd)),
+                ((9, Parity::None), (9, Parity::None)),
+                ((8, Parity::Odd), (8, Parity::Odd)),
+            ] {
+                let (_, c) = drive_usart_cfg(family, is_async, false, word(stored.0, stored.1));
+                assert_eq!(
+                    (c.data_bits, c.parity),
+                    drawn,
+                    "{family} {is_async} {stored:?}"
+                );
+            }
         }
     }
 

@@ -54,6 +54,7 @@ pub fn normalize(modules: &mut Vec<VirtualModule>) {
         match &mut m.config {
             ModuleConfig::Timer(cfg) => cfg.migrate_duty(),
             ModuleConfig::I2c(cfg) => cfg.sync_legacy_address(),
+            ModuleConfig::Usart(cfg) | ModuleConfig::Lpuart(cfg) => cfg.migrate_word_length(),
             _ => {}
         }
     }
@@ -320,6 +321,42 @@ mod tests {
         cfg.duty.insert(3, 75);
         cfg.migrate_duty();
         assert_eq!(cfg.duty_x100_of(3), 750, "7.5 % survives, not 75 %");
+    }
+
+    /// 9 data bits with parity has no frame on any STM32: loaded, a USART or
+    /// LPUART that stored it gets the 8 + parity stm32f1xx-hal really put on
+    /// the wire. 9 without parity, and 8 with it, load as they were.
+    #[test]
+    fn nine_bits_with_parity_loads_as_eight() {
+        use crate::panels::mcu_module::modules::Parity;
+        let with = |data_bits: u8, parity: Parity, lp: bool| {
+            let mut m = sample();
+            let mut cfg = UsartModuleConfig::new(1);
+            cfg.data_bits = data_bits;
+            cfg.parity = parity;
+            m.config = if lp {
+                ModuleConfig::Lpuart(cfg)
+            } else {
+                ModuleConfig::Usart(cfg)
+            };
+            m
+        };
+        let bits = |m: &VirtualModule| match &m.config {
+            ModuleConfig::Usart(c) | ModuleConfig::Lpuart(c) => (c.data_bits, c.parity),
+            _ => unreachable!(),
+        };
+        for lp in [false, true] {
+            for (stored, loaded) in [
+                ((9, Parity::Even), (8, Parity::Even)),
+                ((9, Parity::Odd), (8, Parity::Odd)),
+                ((9, Parity::None), (9, Parity::None)),
+                ((8, Parity::Even), (8, Parity::Even)),
+            ] {
+                let mut modules = vec![with(stored.0, stored.1, lp)];
+                normalize(&mut modules);
+                assert_eq!(bits(&modules[0]), loaded, "{stored:?} lpuart={lp}");
+            }
+        }
     }
 
     fn sample() -> VirtualModule {

@@ -1880,7 +1880,10 @@ fn is_comp_file(name: &str) -> bool {
 ///   itself - or the option's box would do nothing;
 /// - ESP PCNT and RMT, whose block named the filter / the carrier only while
 ///   it was on: the line the IDE wrote for it then becomes today's, with the
-///   `use` today's needs.
+///   `use` today's needs;
+/// - the F1's stm32f1xx-hal USART, whose block's `DATA_BITS` did not say that
+///   parity is not counted: the word-length chain the IDE wrote, which framed
+///   8 + parity as 7 data bits, becomes today's.
 ///
 /// An older untouched file comes out as the template byte for byte; one
 /// this version wrote is never touched - its old block already has the new
@@ -2144,8 +2147,9 @@ fn add_line_extras(out: &mut String, old: &str, body: &str) {
     out.replace_range(after + line_at(start)..after + line_at(config), &rebuilt);
 }
 
-/// A text an older ESP template wrote below the block, while its block named
-/// a setting only when it was on, and what today's writes instead.
+/// A text an older template wrote below the block - an ESP one while its block
+/// named a setting only when it was on, an F1 USART one that framed the word
+/// without the parity bit - and what today's writes instead.
 struct AlwaysNamed {
     /// Whether the OLD block, as written - comments too - lacks a mark only
     /// this version writes there: an older IDE spliced the block on its own
@@ -2164,7 +2168,7 @@ struct AlwaysNamed {
     import: Option<(&'static str, &'static str, &'static str)>,
 }
 
-const ALWAYS_NAMED: [AlwaysNamed; 4] = [
+const ALWAYS_NAMED: [AlwaysNamed; 5] = [
     // PCNT, filter off when the file was written: no line at all.
     AlwaysNamed {
         older: |old| !old.contains("0 = no filter"),
@@ -2207,7 +2211,56 @@ const ALWAYS_NAMED: [AlwaysNamed; 4] = [
             "use esp_hal::gpio::interconnect::",
         )),
     },
+    // stm32f1xx-hal, all three USART templates: the word length came from
+    // DATA_BITS alone, and that HAL's word COUNTS the parity bit - 8 + parity
+    // was 7 data bits on the wire. A kept file needs today's chain more than
+    // most: loading folds a stored 9 + parity, which that chain framed as 8E1,
+    // to 8 + parity, which it frames as 7E1.
+    //
+    // `older` reads the F1 block's own mark: the embassy blocks say "parity not
+    // counted" too, and one of them spliced over an F1 tail (a runtime switch)
+    // must not pass for a new F1 file. `unless` is the new chain's own text, not
+    // a name a user's helper could share.
+    AlwaysNamed {
+        older: |old| !old.contains(F1_WORD_MARK),
+        unless: Some("DATA_BITS + parity_bit"),
+        needs: None,
+        was: F1_WORD_WAS,
+        now: "    // stm32f1xx-hal's word length COUNTS the parity bit and DATA_BITS does\n    // not: 8 data bits with parity is its 9-bit word.\n    let parity_bit: u8 = if PARITY == 'N' { 0 } else { 1 };\n    if DATA_BITS + parity_bit >= 9 {\n        config = config.wordlength_9bits();\n    } else {\n        config = config.wordlength_8bits();\n    }\n",
+        import: None,
+    },
 ];
+
+/// What only the F1 USART block writes since its word length counts the
+/// parity bit - in the `DATA_BITS` comment.
+const F1_WORD_MARK: &str = "(stm32f1xx-hal's word counts it)";
+
+/// The F1 USART templates' word-length chain before that: DATA_BITS alone.
+const F1_WORD_WAS: &str = "    if DATA_BITS == 8 {\n        config = config.wordlength_8bits();\n    } else if DATA_BITS == 9 {\n        config = config.wordlength_9bits();\n    }\n";
+
+/// Whether `file` - an F1 USART config file after the sync's upgrade, `body`
+/// its template - still picks the word length the user's way while its block
+/// asks for parity: the chain was not the IDE's to rewrite (reworded, moved,
+/// a hand-written `match`), and stm32f1xx-hal frames the `DATA_BITS: u8 = 8`
+/// it now gets as 7 data bits + parity. A stored 9 + parity, folded to 8 on
+/// load, framed 8E1 there before. The sync says so instead of staying quiet.
+pub fn stale_word_length(file: &str, body: &str) -> bool {
+    use crate::project_tree::templates::block;
+    if !body.contains(F1_WORD_MARK) {
+        return false;
+    }
+    let Some((begin, after)) = block(file) else {
+        return false;
+    };
+    // The block is the IDE's, as written; the code below it is read without
+    // its comments and literals.
+    let generated = &file[begin..after];
+    let code = code_only(&file[after..]);
+    generated.contains("pub const PARITY: char = '")
+        && !generated.contains("pub const PARITY: char = 'N'")
+        && (code.contains("wordlength_8bits") || code.contains("wordlength_9bits"))
+        && !code.contains("DATA_BITS + parity_bit")
+}
 
 /// Each [`ALWAYS_NAMED`] old text below `out`'s block replaced by today's,
 /// where the OLD block (raw, see [`AlwaysNamed::older`]) shows the file is

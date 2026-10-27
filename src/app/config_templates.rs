@@ -42,9 +42,30 @@ impl AppIde {
         self.config_templates.offers = report.offered.iter().cloned().collect();
         // On disk now when there is a folder, so the notice can point at it.
         let saved = self.reconcile_config_templates();
-        if report.kept.is_empty() {
-            return;
+        if !report.kept.is_empty() {
+            self.announce_kept(report, saved, after_apply);
         }
+        // A kept file whose own code frames the line otherwise than its module
+        // says: in the notice after an Apply, else on the status line - after
+        // the kept files' line, which it outranks.
+        if let Some(first) = report.warnings.first() {
+            if after_apply {
+                self.config_templates
+                    .notice
+                    .get_or_insert_with(Vec::new)
+                    .extend(report.warnings.iter().cloned());
+            } else {
+                self.set_status_msg(match report.warnings.len() {
+                    1 => first.clone(),
+                    n => format!("{first} (and {} more config files)", n - 1),
+                });
+            }
+        }
+    }
+
+    /// The kept files of `report`: a notice after an Apply, a status line
+    /// otherwise. `saved`: the copies beside them are on disk.
+    fn announce_kept(&mut self, report: &ConfigSync, saved: bool, after_apply: bool) {
         let where_ = if saved {
             "beside it"
         } else {

@@ -2819,6 +2819,88 @@ mod blocking_dma_tests {
         );
     }
 
+    /// stm32f1xx-hal's `WordLength` COUNTS the parity bit ("Bits8: when
+    /// parity is enabled, a word has 7 data bits + 1 parity bit"), and the
+    /// panel's data bits do not. Every F1 template - Portable, Native, DMA -
+    /// picks the word from both, so 8 + parity is the 9-bit word it means: it
+    /// used to be `wordlength_8bits()`, seven data bits on the wire.
+    #[test]
+    fn the_word_length_counts_the_parity_bit() {
+        for (style, dma) in [
+            (ApiStyle::Portable, BlockingDma::Off),
+            (ApiStyle::Native, BlockingDma::Off),
+            (ApiStyle::Portable, BlockingDma::Both),
+        ] {
+            let cfg = UsartModuleConfig {
+                parity: crate::panels::mcu_module::modules::Parity::Even,
+                api_style: style,
+                blocking_dma: dma,
+                ..UsartModuleConfig::new(1)
+            };
+            let f = usart_config_file(1, Some(&cfg));
+            assert!(f.contains("pub const DATA_BITS: u8 = 8;"), "{f}");
+            assert!(f.contains("pub const PARITY: char = 'E';"), "{f}");
+            assert!(
+                f.contains("let parity_bit: u8 = if PARITY == 'N' { 0 } else { 1 };")
+                    && f.contains("if DATA_BITS + parity_bit >= 9 {"),
+                "{style:?} {dma:?}:\n{f}"
+            );
+            assert!(
+                !f.contains("if DATA_BITS == 8 {"),
+                "{style:?} {dma:?}:\n{f}"
+            );
+        }
+    }
+
+    /// A kept F1 usart file - edited below its block, or with no record - is
+    /// brought to the parity-aware chain by the sync's upgrade
+    /// (`common::upgraded_config`): loading folds a stored 9 + parity to
+    /// 8 + parity, which the old chain framed as 7E1 where 9 + parity had been
+    /// 8E1. An older untouched file comes out as the template byte for byte;
+    /// the user's own edits stay, and a chain the user rewrote is theirs.
+    #[test]
+    fn a_kept_f1_usart_file_gets_the_parity_aware_word_length() {
+        use super::super::common::upgraded_config;
+        const WAS: &str = "    if DATA_BITS == 8 {\n        config = config.wordlength_8bits();\n    } else if DATA_BITS == 9 {\n        config = config.wordlength_9bits();\n    }\n";
+        const NOW: &str = "    // stm32f1xx-hal's word length COUNTS the parity bit and DATA_BITS does\n    // not: 8 data bits with parity is its 9-bit word.\n    let parity_bit: u8 = if PARITY == 'N' { 0 } else { 1 };\n    if DATA_BITS + parity_bit >= 9 {\n        config = config.wordlength_9bits();\n    } else {\n        config = config.wordlength_8bits();\n    }\n";
+        const NEW_NOTE: &str =
+            "// 8, or 9 with PARITY 'N' - parity not counted (stm32f1xx-hal's word counts it)\n";
+        const OLD_NOTE: &str = "// 8, 9\n";
+        for (style, dma) in [
+            (ApiStyle::Portable, BlockingDma::Off),
+            (ApiStyle::Native, BlockingDma::Off),
+            (ApiStyle::Portable, BlockingDma::Both),
+        ] {
+            let cfg = UsartModuleConfig {
+                parity: crate::panels::mcu_module::modules::Parity::Even,
+                api_style: style,
+                blocking_dma: dma,
+                ..UsartModuleConfig::new(1)
+            };
+            let body = usart_config_file(1, Some(&cfg)).replace("\r\n", "\n");
+            assert_eq!(body.matches(NOW).count(), 1, "{style:?} {dma:?}:\n{body}");
+            // The file the previous template wrote, and it with today's block.
+            let old_tail = body.replace(NOW, WAS);
+            let old = old_tail.replace(NEW_NOTE, OLD_NOTE);
+            assert_eq!(
+                upgraded_config("usart1.rs", &old, &old_tail, &body),
+                Some(body.clone()),
+                "{style:?} {dma:?}"
+            );
+            // The user's own line below the block stays, the chain still goes.
+            let edited_old = old.replace(WAS, &format!("{WAS}    // mine\n"));
+            let edited = old_tail.replace(WAS, &format!("{WAS}    // mine\n"));
+            let up = upgraded_config("usart1.rs", &edited_old, &edited, &body).expect("upgraded");
+            assert!(up.contains(&format!("{NOW}    // mine\n")), "{up}");
+            // A chain the user rewrote is theirs; a file this version wrote is
+            // never touched.
+            let own = old_tail.replace(WAS, "    config = config.wordlength_9bits();\n");
+            let own_old = own.replace(NEW_NOTE, OLD_NOTE);
+            assert_eq!(upgraded_config("usart1.rs", &own_old, &own, &body), None);
+            assert_eq!(upgraded_config("usart1.rs", &body, &body, &body), None);
+        }
+    }
+
     /// `dma1::C4` is what `init` declares; `dma1.4` is what main.rs passes.
     #[test]
     fn the_type_and_the_value_are_spelled_differently() {

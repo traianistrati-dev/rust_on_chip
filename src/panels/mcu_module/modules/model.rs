@@ -2457,6 +2457,30 @@ impl UsartModuleConfig {
         (!parts.is_empty()).then(|| parts.join(" + "))
     }
 
+    /// Whether this word fits a frame: 9 data bits leave no room for a parity
+    /// bit, because no STM32 USART frames ten bits (the M bits pick a 7-, 8- or
+    /// 9-bit word, parity INCLUDED). embassy refuses the pair at `new`
+    /// (`ConfigError::DataParityNotSupported`, a panic at boot from the
+    /// generated `unwrap`), whatever the USART version.
+    pub fn frame_fits(data_bits: u8, parity: Parity) -> bool {
+        !(data_bits == 9 && parity != Parity::None)
+    }
+
+    /// Fold a stored 9 data bits WITH parity into 8 with parity, on load.
+    ///
+    /// The pair was never built as it reads ([`Self::frame_fits`]). On
+    /// stm32f1xx-hal - whose `WordLength` counts the parity bit - it put 8 data
+    /// bits and the parity bit on the wire, which is what 8 + parity writes now,
+    /// so the one project where it worked keeps its frame: a usart file that
+    /// follows the template gets today's word-length chain, and one the sync
+    /// keeps as the user's gets it through `common::upgraded_config`. On
+    /// embassy it panicked at boot. Idempotent.
+    pub fn migrate_word_length(&mut self) {
+        if !Self::frame_fits(self.data_bits, self.parity) {
+            self.data_bits = 8;
+        }
+    }
+
     /// Sensible defaults (115200 8N1) for the given USART instance.
     pub fn new(instance: u8) -> Self {
         Self {

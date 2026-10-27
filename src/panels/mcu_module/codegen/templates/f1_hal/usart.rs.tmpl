@@ -1,7 +1,7 @@
 // <<< GENERATED>>>
 // Peripheral config (from the Virtual Module) — auto-updated; edit in the module.
 pub const BAUDRATE: u32 = {BAUD};
-pub const DATA_BITS: u8 = {DATA}; // 8, 9
+pub const DATA_BITS: u8 = {DATA}; // 8, or 9 with PARITY 'N' - parity not counted (stm32f1xx-hal's word counts it)
 pub const PARITY: char = '{PARITY}'; // 'N' None, 'O' Odd, 'E' Even
 pub const STOP_BITS: u8 = {STOP}; // 1, 2
 // <<< GENERATED END >>>
@@ -26,10 +26,13 @@ use stm32f1xx_hal::{
 fn get_config() -> serial::Config {
     let mut config = Config::default().baudrate(BAUDRATE.bps());
 
-    if DATA_BITS == 8 {
-        config = config.wordlength_8bits();
-    } else if DATA_BITS == 9 {
+    // stm32f1xx-hal's word length COUNTS the parity bit and DATA_BITS does
+    // not: 8 data bits with parity is its 9-bit word.
+    let parity_bit: u8 = if PARITY == 'N' { 0 } else { 1 };
+    if DATA_BITS + parity_bit >= 9 {
         config = config.wordlength_9bits();
+    } else {
+        config = config.wordlength_8bits();
     }
 
     if PARITY == 'N' {

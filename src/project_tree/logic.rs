@@ -67,6 +67,9 @@ pub struct ConfigSync {
     /// `(path, template)` of every file with an offer pending, this sync's and
     /// earlier ones - the copies kept beside them.
     pub offered: Vec<(String, String)>,
+    /// Kept files whose own code now frames the line differently from what
+    /// the module says (`codegen::stale_word_length`): said, never fixed.
+    pub warnings: Vec<String>,
 }
 
 impl ConfigSync {
@@ -802,6 +805,15 @@ impl ProjectTreeState {
                                     stamp = fresh;
                                     offer = false;
                                 }
+                            }
+                            // An F1 USART whose own word-length code the upgrade
+                            // could not reach: with parity, stm32f1xx-hal frames
+                            // its 8 as 7 data bits. Said on every sync, whatever
+                            // the record holds - the offer stays the record's.
+                            if codegen::stale_word_length(&updated, body) {
+                                report.warnings.push(format!(
+                                    "{file_path}: its get_config picks the word length from DATA_BITS alone, so with parity stm32f1xx-hal frames 7 data bits. Reset it to the template, or count the parity bit (DATA_BITS + 1 == 9 -> wordlength_9bits)."
+                                ));
                             }
                             if *content != updated {
                                 *content = updated;
@@ -2211,6 +2223,61 @@ mod tests {
             .expect("usart1.rs")
             .1;
         *c = f(c);
+    }
+
+    /// An F1 USART file the sync keeps, whose word-length chain the upgrade
+    /// can rewrite (the IDE's text, an edit elsewhere): rewritten, nothing to
+    /// say. One the user reworded: kept, and the sync SAYS that its code now
+    /// frames 7 data bits with parity - a stored 9 + parity, folded to 8 on
+    /// load, was 8E1 under it. Without parity there is nothing to say.
+    #[test]
+    fn a_kept_f1_word_length_chain_is_rewritten_or_named() {
+        const WAS: &str = "    if DATA_BITS == 8 {\n        config = config.wordlength_8bits();\n    } else if DATA_BITS == 9 {\n        config = config.wordlength_9bits();\n    }\n";
+        const NOW: &str = "    // stm32f1xx-hal's word length COUNTS the parity bit and DATA_BITS does\n    // not: 8 data bits with parity is its 9-bit word.\n    let parity_bit: u8 = if PARITY == 'N' { 0 } else { 1 };\n    if DATA_BITS + parity_bit >= 9 {\n        config = config.wordlength_9bits();\n    } else {\n        config = config.wordlength_8bits();\n    }\n";
+        let file = |bits: u8, parity: char, new: bool| {
+            let note = if new {
+                "// 8, or 9 with PARITY 'N' - parity not counted (stm32f1xx-hal's word counts it)"
+            } else {
+                "// 8, 9"
+            };
+            format!(
+                "// <<< GENERATED>>>\npub const DATA_BITS: u8 = {bits}; {note}\npub const PARITY: char = '{parity}';\n// <<< GENERATED END >>>\n\nfn get_config() -> Config {{\n    let mut config = Config::default();\n{}    config\n}}\n",
+                if new { NOW } else { WAS }
+            )
+        };
+        for parity in ['E', 'N'] {
+            // The IDE's chain, an edit below it: the chain becomes today's.
+            let mut state = ProjectTreeState::new();
+            usart(&mut state, &file(9, parity, false));
+            edit_usart(&mut state, |c| format!("{c}// mine\n"));
+            let report = usart(&mut state, &file(8, parity, true));
+            let now = usart_text(&state).to_owned();
+            assert!(now.contains(NOW) && now.ends_with("// mine\n"), "{now}");
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+            // A chain the user reworded: theirs, and named while parity is on.
+            let mut state = ProjectTreeState::new();
+            usart(&mut state, &file(9, parity, false));
+            edit_usart(&mut state, |c| {
+                c.replace(
+                    "    if DATA_BITS == 8 {",
+                    "    if DATA_BITS == 8 { // eight",
+                )
+            });
+            let report = usart(&mut state, &file(8, parity, true));
+            assert!(usart_text(&state).contains("// eight"));
+            if parity == 'N' {
+                assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+            } else {
+                assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+                assert!(
+                    report.warnings[0].starts_with(USART)
+                        && report.warnings[0].contains("7 data bits"),
+                    "{:?}",
+                    report.warnings
+                );
+            }
+        }
     }
 
     /// An EDITED file keeps its text when its template changes: only the block

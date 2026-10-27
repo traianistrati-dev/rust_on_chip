@@ -1361,6 +1361,23 @@ pub(crate) fn embassy_publishes(feature: &str) -> bool {
         .is_ok()
 }
 
+/// Does embassy-stm32 [`EMBASSY_VERSION`] compile its `i2s` module for this
+/// chip feature? `None` for a feature it does not publish.
+///
+/// Not the same question as "does the silicon have I2S": embassy gates the
+/// module on the SPI block's register version in stm32-metapac
+/// ([`super::stm32_spi_i2s`]), and the STM32F303/F358/F398 and N6 parts list
+/// I2S pads in CubeMX while their SPI blocks carry no I2S registers there - so
+/// `embassy_stm32::i2s` does not exist for them and an `i2s{n}.rs` is E0432.
+pub(crate) fn embassy_has_i2s(feature: &str) -> Option<bool> {
+    // Published first: metapac also lists parts embassy has no feature for.
+    embassy_publishes(feature).then(|| {
+        super::stm32_spi_i2s::NO_I2S
+            .binary_search(&feature)
+            .is_err()
+    })
+}
+
 /// The embassy-stm32 chip feature for a concrete part: its part number
 /// (`STM32F411RETx` → `stm32f411re`), the die on the STM32L1 parts embassy
 /// publishes twice (`STM32L151C8TxA` → `stm32l151c8-a`), and the core suffix on
@@ -3009,6 +3026,23 @@ mod tests {
             assert!(!embassy_publishes(&f), "{name} -> {f}");
             assert!(!f.contains('x') || name.ends_with('x'), "{name} -> {f}");
         }
+        // Whether embassy has an `i2s` module: no on the parts the harvested
+        // table lists (an F303 or N6 lists I2S pads in CubeMX anyway), yes on
+        // any other published part, and no opinion on a name it does not
+        // publish (the WB0 parts are in metapac, not in embassy's features).
+        assert_eq!(embassy_has_i2s("stm32f303re"), Some(false));
+        assert_eq!(embassy_has_i2s("stm32n657x0"), Some(false));
+        assert_eq!(embassy_has_i2s("stm32f302re"), Some(true));
+        assert_eq!(embassy_has_i2s("stm32f411re"), Some(true));
+        assert_eq!(embassy_has_i2s("stm32f103re"), Some(true));
+        assert_eq!(embassy_has_i2s("stm32wb05kz"), None);
+        assert_eq!(embassy_has_i2s("stm32f4"), None);
+        // The table is sorted, or the binary search above lies.
+        let table = &super::super::stm32_spi_i2s::NO_I2S;
+        assert!(
+            table.windows(2).all(|w| w[0] < w[1]),
+            "NO_I2S is not sorted"
+        );
         // The die reaches the manifest on both dependency-line routes.
         let line = hal_dep_for("stm32l1", "STM32L151", "STM32L151C8TxA");
         assert_eq!(embassy_feature_in(&line), Some("stm32l151c8-a"), "{line}");

@@ -767,11 +767,14 @@ Where a runtime is greyed out, the tab **says why** rather than just refusing. O
 
 ### Tables harvested from the vendor crates
 
-Four STM32 tables are compiled into the IDE from the crates a generated project
+Five STM32 tables are compiled into the IDE from the crates a generated project
 builds against, as the local cargo registry holds them: the flash geometry
 (`stm32_flash_geometry.rs`), the memory map memory.x is written from
 (`stm32_memory_map.rs`), the chip features embassy-stm32 publishes
-(`stm32_embassy_features.rs`), and the clock mux selectors
+(`stm32_embassy_features.rs`), the parts embassy-stm32 compiles no `i2s`
+module for (`stm32_spi_i2s.rs` - the STM32F303, F358, F398 and N6 list I2S
+pads in CubeMX, but their metapac SPI blocks carry no I2S registers, so no
+I2S is generated there), and the clock mux selectors
 (`codegen/rcc_mux_data.rs`). Each has an ignored test that harvests the crate
 again and compares it with the committed file, byte for byte; with
 `EIDE_REGEN=1` the same test rewrites the file. A missing crate fails the test
@@ -791,7 +794,8 @@ $env:EIDE_REGEN = "1"   # then the same command rewrites the table
 ```
 
 The others are `the_flash_geometry_matches_metapac`,
-`the_embassy_feature_list_matches_the_registry` (same module) and
+`the_embassy_feature_list_matches_the_registry`,
+`the_i2s_chip_list_matches_metapac` (same module) and
 `panels::mcu_module::codegen::rcc_mux_harvest::the_rcc_mux_table_matches_metapac`.
 Two more go further and compile what the IDE writes against embassy-stm32, each
 in a folder you give it (a few GB of build output: keep it off the repo):

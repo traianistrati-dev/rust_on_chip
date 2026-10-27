@@ -126,6 +126,7 @@ mod i2s_tests {
         async_peripherals(
             "stm32g4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -152,6 +153,174 @@ mod i2s_tests {
             &Default::default(),
             &Default::default(),
         )
+    }
+
+    /// `run`'s wiring on `mode`'s runtime, for a chip whose `i2s` module
+    /// embassy does or does not compile.
+    fn run_chip(mode: PeriphMode, chip_i2s: bool, pins: &[Pin]) -> AsyncPeriphs {
+        let refs: Vec<&Pin> = pins.iter().collect();
+        peripherals(
+            mode,
+            &Default::default(),
+            "stm32f3",
+            ChipData {
+                i2s: chip_i2s,
+                dma: None,
+                irq_vectors: &[],
+                usart_ip: None,
+                sdmmc_ip: None,
+            },
+            CompInputs {
+                settings: &Default::default(),
+                instances: &[],
+                pins: &[],
+                raw: &Default::default(),
+            },
+            &refs,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    /// A chip embassy compiles no `i2s` module for (an STM32F303's CubeMX data
+    /// lists the I2S pads anyway): `i2s{n}.rs` would be E0432, so neither
+    /// runtime writes it - main.rs says why, the pads stay raw, no DMA channel is
+    /// taken, and it is no runtime gap, because the other runtime lacks it too.
+    #[test]
+    fn a_chip_without_an_i2s_module_generates_none() {
+        let said = |out: &AsyncPeriphs| {
+            out.init_calls
+                .lines()
+                .map(|l| l.trim().trim_start_matches("//").trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for mode in [PeriphMode::Async, PeriphMode::Blocking] {
+            let out = run_chip(mode, false, &three(2));
+            let text = said(&out);
+            assert!(
+                text.contains(&format!("I2S2 is NOT initialised: {I2S_CHIP_GAP}")),
+                "{mode:?}: {text}"
+            );
+            // The chip's reason, not the Blocking runtime's.
+            assert!(!text.contains("The Async runtime generates it"), "{text}");
+            assert!(out.config_files.is_empty(), "{:?}", out.config_files);
+            assert!(out.consumed_pins.is_empty(), "{:?}", out.consumed_pins);
+            assert!(out.dma_irqs.is_empty(), "{}", out.dma_irqs);
+            assert!(out.runtime_gaps.is_empty(), "{:?}", out.runtime_gaps);
+        }
+        // The same wiring where embassy has the module: built on Async.
+        let out = run_chip(PeriphMode::Async, true, &three(2));
+        assert_eq!(out.config_files[0].0, "i2s2.rs");
+        // ...and "Generate driver" decides nothing on the chip without it.
+        let generated = |i2s| {
+            driver_generated(
+                PeriphMode::Async,
+                "stm32f3",
+                ModuleKind::GenericInterfaceI2s,
+                2,
+                None,
+                i2s,
+            )
+        };
+        assert!(generated(true));
+        assert!(!generated(false));
+    }
+
+    /// A channel pinned on an I2S the chip cannot build is not reserved: on an
+    /// F303, I2S2 TX's DMA1_CH5 is USART1 RX's only channel, and the panel no
+    /// longer draws the picker that could clear the pin.
+    #[test]
+    fn a_refused_i2s_keeps_no_dma_channel_from_a_built_bus() {
+        use crate::panels::mcu_module::codegen::dma_data::DmaChannel;
+        use crate::panels::mcu_module::mcu_def::DmaDef;
+        use crate::panels::mcu_module::modules::{UsartMode, UsartModuleConfig};
+        let chan = |peri: &str, irq: &str| DmaChannel {
+            peri: peri.into(),
+            irq: irq.into(),
+        };
+        let f303 = DmaDef {
+            mux: false,
+            channels: vec![
+                chan("DMA1_CH4", "DMA1_CHANNEL4"),
+                chan("DMA1_CH5", "DMA1_CHANNEL5"),
+            ],
+            requests: vec![
+                ("USART1_TX".into(), vec!["DMA1_CH4".into()]),
+                ("USART1_RX".into(), vec!["DMA1_CH5".into()]),
+                ("SPI2_RX".into(), vec!["DMA1_CH4".into()]),
+                ("SPI2_TX".into(), vec!["DMA1_CH5".into()]),
+            ],
+        };
+        let mut pins = three(2);
+        pins.push(mk("PA9", PinFunction::UsartTx(1)));
+        pins.push(mk("PA10", PinFunction::UsartRx(1)));
+        let refs: Vec<&Pin> = pins.iter().collect();
+        let usart: BTreeMap<u8, UsartModuleConfig> = [(
+            1u8,
+            UsartModuleConfig {
+                mode: UsartMode::Dma,
+                ..UsartModuleConfig::new(1)
+            },
+        )]
+        .into();
+        let mut i2s_cfg = I2sModuleConfig::new(2);
+        i2s_cfg.dma_tx = "DMA1_CH5".into();
+        let i2s: BTreeMap<u8, I2sModuleConfig> = [(2u8, i2s_cfg)].into();
+        let out = peripherals(
+            PeriphMode::Async,
+            &Default::default(),
+            "stm32f3",
+            ChipData {
+                i2s: false,
+                dma: Some(&f303),
+                irq_vectors: &[],
+                usart_ip: None,
+                sdmmc_ip: None,
+            },
+            CompInputs {
+                settings: &Default::default(),
+                instances: &[],
+                pins: &[],
+                raw: &Default::default(),
+            },
+            &refs,
+            &usart,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &i2s,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(
+            out.init_calls.contains("p.DMA1_CH4, p.DMA1_CH5"),
+            "{}",
+            out.init_calls
+        );
+        assert!(!has_dma_todo(&out.init_calls), "{}", out.init_calls);
+        assert!(
+            out.init_calls.contains("I2S2 is NOT initialised"),
+            "{}",
+            out.init_calls
+        );
     }
 
     fn three(n: u8) -> Vec<Pin> {

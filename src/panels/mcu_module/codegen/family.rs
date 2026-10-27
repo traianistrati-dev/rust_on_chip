@@ -1006,6 +1006,7 @@ fn stm32_periphs(mcu: &Mcu, mode: embassy_stm32::PeriphMode) -> embassy_stm32::A
             irq_vectors: &mcu.irq_vectors,
             usart_ip: mcu.usart_ip.as_deref(),
             sdmmc_ip: mcu.sdmmc_ip.as_deref(),
+            i2s: embassy_i2s(mcu),
         },
         embassy_stm32::CompInputs {
             settings: &mcu.comp,
@@ -1098,6 +1099,30 @@ fn mux_chip(mcu: &Mcu) -> &str {
         .chain([mcu.id.as_str(), mcu.name.as_str()])
         .find(|n| super::rcc_mux::rcc_version(n).is_some())
         .unwrap_or(&mcu.id)
+}
+
+/// Whether embassy-stm32 compiles its `i2s` module for `mcu`'s part
+/// ([`stm32_pin_data::embassy_has_i2s`]). False only where the harvested table
+/// says so - the STM32F303/F358/F398 and N6 among the parts whose CubeMX data
+/// lists I2S pads - and true for a part it does not know, as before. The part
+/// is the dependency line's feature, then the id's, then the display name's
+/// (`STM32F303RET6` -> `stm32f303re`): the first embassy publishes.
+///
+/// [`stm32_pin_data::embassy_has_i2s`]: crate::panels::mcu_module::stm32_pin_data::embassy_has_i2s
+pub fn embassy_i2s(mcu: &Mcu) -> bool {
+    use crate::panels::mcu_module::stm32_pin_data::{embassy_chip_feature, embassy_has_i2s};
+    if !mcu.family.starts_with("stm32") {
+        return true;
+    }
+    mcu.hal_feature
+        .iter()
+        .cloned()
+        .chain([
+            embassy_chip_feature(&mcu.id),
+            embassy_chip_feature(&mcu.name),
+        ])
+        .find_map(|n| embassy_has_i2s(&n))
+        != Some(false)
 }
 
 /// The per-core chip feature of `mcu`, if it is a dual-core part.
@@ -1512,7 +1537,7 @@ const STM32_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
     rows: &[
         (
             "On Apply:",
-            "Regenerates main.rs with the embassy entry + Spawner and rewrites src/pins/configs/*.rs to the async init: on an F1 the stm32f1xx-hal files, on any other STM32 the embassy Blocking ones (a USART gets its Buffered or DMA transport, an SPI or I2C its Async-DMA mode), plus the SDMMC, SAI and I2S files only Async generates. Toggles the embassy Cargo.toml deps, then builds.",
+            "Regenerates main.rs with the embassy entry + Spawner and rewrites src/pins/configs/*.rs to the async init: on an F1 the stm32f1xx-hal files, on any other STM32 the embassy Blocking ones (a USART gets its Buffered or DMA transport, an SPI or I2C its Async-DMA mode), plus the SDMMC, SAI and I2S files only Async generates (no I2S on an STM32F303, F358, F398 or N6: embassy-stm32 compiles no i2s module there). Toggles the embassy Cargo.toml deps, then builds.",
         ),
         (
             "Entry:",
@@ -1536,7 +1561,7 @@ const STM32_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "vs Blocking:",
-            "embassy-time takes one of the chip's timers (TIM4 on an F103C8), and a PWM wired to it is not generated: main.rs says so and its pads stay bound raw. Blocking runs no embassy-time and drives PWM on every timer. On every STM32 but the F1, SDMMC, SAI and I2S, which embassy drives only asynchronously, are the other way round: Blocking leaves their pads raw with a NOT initialised comment in main.rs. COMP is built on both, but only here can its wait_for_* edges be awaited. On the F1, a one-way, single-wire or CTS/RTS USART is built on this runtime only: stm32f1xx-hal builds the TX+RX pair.",
+            "embassy-time takes one of the chip's timers (TIM4 on an F103C8), and a PWM wired to it is not generated: main.rs says so and its pads stay bound raw. Blocking runs no embassy-time and drives PWM on every timer. On every STM32 but the F1, SDMMC, SAI and I2S (I2S except on an STM32F303, F358, F398 or N6, which get it on neither), which embassy drives only asynchronously, are the other way round: Blocking leaves their pads raw with a NOT initialised comment in main.rs. COMP is built on both, but only here can its wait_for_* edges be awaited. On the F1, a one-way, single-wire or CTS/RTS USART is built on this runtime only: stm32f1xx-hal builds the TX+RX pair.",
         ),
         (
             "Applies to:",
@@ -1794,7 +1819,7 @@ const BLOCKING_EMBASSY_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "Not on Blocking:",
-            "SDMMC, SAI and I2S: embassy drives them only asynchronously. main.rs gets a NOT initialised comment saying why where each init would be, their pads stay bound raw, and the Async runtime generates them. A comparator's wait_for_* edges are async too: poll output_level() instead.",
+            "SDMMC, SAI and I2S: embassy drives them only asynchronously. main.rs gets a NOT initialised comment saying why where each init would be, their pads stay bound raw, and the Async runtime generates them - except I2S on an STM32F303, F358, F398 or N6, where embassy-stm32 compiles no i2s module, so main.rs says so on both runtimes. A comparator's wait_for_* edges are async too: poll output_level() instead.",
         ),
         (
             "Virtual modules:",
@@ -2696,6 +2721,47 @@ mod blocking_note_tests {
         );
     }
 
+    /// An I2S on a part embassy compiles no `i2s` module for stays in the
+    /// palette, disabled, with the reason - but only where the pads are there,
+    /// and a part that has the module offers it as before.
+    #[test]
+    fn the_palette_explains_an_i2s_without_a_driver() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::modules::ModuleKind;
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+
+        let mut mcu = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        mcu.family = "stm32f3".into();
+        let i2s = ModuleKind::GenericInterfaceI2s;
+        // No I2S pads: nothing to explain.
+        mcu.hal_feature = Some("stm32f303re".into());
+        assert!(!mcu.supports_module(i2s));
+        assert!(mcu.hardware_only_reason(i2s).is_none());
+        // The F303's I2S2 pads.
+        for (name, f) in [
+            ("PB13", PinFunction::I2sCk(2)),
+            ("PB12", PinFunction::I2sWs(2)),
+            ("PB15", PinFunction::I2sSd(2)),
+        ] {
+            let p = mcu
+                .iter_all_pins_mut()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("a {name} pad"));
+            p.available_functions.push(f);
+        }
+        assert!(!mcu.supports_module(i2s));
+        assert_eq!(
+            mcu.hardware_only_reason(i2s),
+            Some(super::super::embassy_stm32::I2S_CHIP_GAP)
+        );
+        // The F302 has the module: offered, nothing to explain.
+        mcu.hal_feature = Some("stm32f302re".into());
+        assert!(mcu.supports_module(i2s));
+        assert!(mcu.hardware_only_reason(i2s).is_none());
+    }
+
     /// USB follows what the BACKEND writes, not what the pins allow.
     #[test]
     fn usb_follows_the_backend_not_the_pins() {
@@ -2814,6 +2880,49 @@ mod dual_core_tests {
         // Nothing the table knows: the id, as before.
         mcu.name = "my board".into();
         assert_eq!(mux_chip(&mcu), "sensor_node");
+    }
+
+    /// Whether embassy has an `i2s` module for the part is asked of the part
+    /// being built - the line's chip, then the id's, then the name's, the first
+    /// embassy publishes winning - and only a part the harvested table knows is
+    /// without one says no. An F303's CubeMX data lists I2S pads; its metapac
+    /// SPI blocks have no I2S registers.
+    #[test]
+    fn the_i2s_module_is_looked_up_for_the_part_being_built() {
+        let mut mcu = mcu_for("audio_node", "my board", "stm32f3", Runtime::Async);
+        mcu.hal_feature = Some("stm32f303re".into());
+        assert!(!embassy_i2s(&mcu));
+        mcu.hal_feature = Some("stm32f302re".into());
+        assert!(embassy_i2s(&mcu));
+        // No line: the id's part, else the display name's.
+        mcu.hal_feature = None;
+        mcu.id = "stm32f303retx".into();
+        assert!(!embassy_i2s(&mcu));
+        mcu.id = "audio_node".into();
+        mcu.name = "STM32F303RET6".into();
+        assert!(!embassy_i2s(&mcu));
+        mcu.name = "STM32F373RCT6".into();
+        assert!(embassy_i2s(&mcu));
+        // Two published parts that disagree: the line beats the id and name...
+        mcu.hal_feature = Some("stm32f302re".into());
+        mcu.id = "stm32f303retx".into();
+        mcu.name = "STM32F303RET6".into();
+        assert!(embassy_i2s(&mcu));
+        mcu.hal_feature = Some("stm32f303re".into());
+        mcu.id = "stm32f302retx".into();
+        mcu.name = "STM32F302RET6".into();
+        assert!(!embassy_i2s(&mcu));
+        // ...and with no line, the id beats the name.
+        mcu.hal_feature = None;
+        mcu.name = "STM32F303RET6".into();
+        assert!(embassy_i2s(&mcu));
+        mcu.id = "audio_node".into();
+        // Nothing the table knows, or no STM32 at all: as before, built.
+        mcu.name = "my board".into();
+        assert!(embassy_i2s(&mcu));
+        mcu.family = "esp32".into();
+        mcu.hal_feature = Some("stm32f303re".into());
+        assert!(embassy_i2s(&mcu));
     }
 
     /// The line decides, not the names: a WL55 renamed to a board name keeps

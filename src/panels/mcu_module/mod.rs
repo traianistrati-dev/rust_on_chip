@@ -46,6 +46,7 @@ pub mod stm32_flash_geometry;
 mod stm32_harvest;
 pub mod stm32_memory_map;
 pub mod stm32_pin_data;
+pub mod stm32_spi_i2s;
 pub mod stm32_support;
 pub mod structure_config;
 pub mod tls_check;

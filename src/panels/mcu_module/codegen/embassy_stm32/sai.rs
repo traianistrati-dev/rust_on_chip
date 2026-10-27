@@ -225,6 +225,7 @@ mod sai_tests {
         async_peripherals(
             "stm32g4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),

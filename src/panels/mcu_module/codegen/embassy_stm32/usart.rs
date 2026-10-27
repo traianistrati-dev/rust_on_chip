@@ -828,6 +828,7 @@ mod usart_mode_tests {
         let out = async_peripherals(
             "stm32g4",
             ChipData {
+                i2s: true,
                 dma: Some(&chip),
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -934,6 +935,7 @@ mod usart_mode_tests {
         let out = async_peripherals(
             "stm32g0",
             ChipData {
+                i2s: true,
                 dma: Some(&chip),
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -1043,6 +1045,7 @@ mod usart_mode_tests {
         let out = async_peripherals(
             "stm32g4",
             ChipData {
+                i2s: true,
                 dma: Some(&chip),
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -1123,6 +1126,7 @@ mod usart_mode_tests {
         let out = async_peripherals(
             "stm32f4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -1169,6 +1173,7 @@ mod usart_mode_tests {
         let bare = async_peripherals(
             "stm32l4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -1219,6 +1224,7 @@ mod usart_mode_tests {
         let out = async_peripherals(
             "stm32f4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -1279,6 +1285,7 @@ mod lpuart_tests {
         async_peripherals(
             "stm32g0",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: irqs,
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -1351,6 +1358,7 @@ mod lpuart_tests {
         let out = async_peripherals(
             "stm32g0",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -1435,6 +1443,7 @@ mod flow_and_direction_tests {
         async_peripherals(
             "stm32f4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),
@@ -1703,6 +1712,7 @@ mod flow_and_direction_tests {
         let old = async_peripherals(
             "stm32f4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci2_v1_2_Cube"), // F411 — usart_v2

@@ -175,6 +175,7 @@ mod qspi_tests {
         async_peripherals(
             "stm32l4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some("sci3_v2_1_Cube"),

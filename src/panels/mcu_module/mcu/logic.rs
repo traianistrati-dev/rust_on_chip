@@ -255,6 +255,15 @@ impl Mcu {
                     autowire::any_wiring_static(self, &Default::default(), kind.signals().0)
                 })
             }
+            // An STM32F303, F358, F398 or N6 lists I2S pads in its CubeMX data,
+            // but embassy compiles no `i2s` module for it, on either runtime
+            // (`family::embassy_i2s`). Only where the pads ARE there.
+            ModuleKind::GenericInterfaceI2s
+                if !crate::panels::mcu_module::codegen::family::embassy_i2s(self) =>
+            {
+                autowire::any_wiring_static(self, &Default::default(), kind.signals().0)
+                    .then_some(crate::panels::mcu_module::codegen::embassy_stm32::I2S_CHIP_GAP)
+            }
             // The S2 and S3 carry the touch sensors — their pads are in
             // Espressif's own pin tables — but esp-hal builds `touch` only for
             // the original ESP32, and does not even expose `peripherals::TOUCH`
@@ -298,6 +307,13 @@ impl Mcu {
             kind,
         )
         .is_some()
+        {
+            return false;
+        }
+        // Nor for an I2S on a part embassy compiles no `i2s` module for - kept
+        // in the palette, disabled, the same way.
+        if kind == crate::panels::mcu_module::modules::ModuleKind::GenericInterfaceI2s
+            && !crate::panels::mcu_module::codegen::family::embassy_i2s(self)
         {
             return false;
         }

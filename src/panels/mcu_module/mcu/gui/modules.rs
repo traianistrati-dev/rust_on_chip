@@ -859,6 +859,10 @@ pub(crate) struct HandleCtx {
     /// The modules whose "Generate driver" is off (`Mcu::raw_modules`), only
     /// where that switch decides anything: on embassy.
     raw: BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
+    /// embassy compiles no `i2s` module for this chip (`!family::embassy_i2s`):
+    /// an F303, F358, F398 or N6 binds no I2S handle on either runtime.
+    /// Negative, so the derived `Default` still means a chip that has it.
+    no_i2s: bool,
 }
 
 impl HandleCtx {
@@ -877,16 +881,19 @@ impl HandleCtx {
             } else {
                 BTreeSet::new()
             },
+            no_i2s: embassy && !codegen::family::embassy_i2s(mcu),
         }
     }
 
     /// Whether main.rs binds no handle for `m` at all: embassy writes no
-    /// driver for a module whose "Generate driver" is off, nor on Blocking for
-    /// the three peripherals it drives only asynchronously.
+    /// driver for a module whose "Generate driver" is off, nor for an I2S on a
+    /// chip with no `i2s` module, nor on Blocking for the three peripherals it
+    /// drives only asynchronously.
     fn unbound(&self, m: &VirtualModule) -> bool {
         use ModuleKind as K;
         self.embassy
             && (self.raw.contains(&(m.kind, m.instance()))
+                || (self.no_i2s && m.kind == K::GenericInterfaceI2s)
                 || (!self.is_async
                     && matches!(
                         m.kind,
@@ -3578,6 +3585,10 @@ pub fn module_config_ui(
     // than derived here, because it is a fact about the CHIP and this function
     // only sees one module.
     line_extras: bool,
+    // Whether embassy-stm32 compiles an `i2s` module for this chip
+    // (`family::embassy_i2s`) - not on an F303, F358, F398 or N6, whose CubeMX
+    // data lists the I2S pads anyway. A chip fact, like `line_extras`.
+    chip_i2s: bool,
     // On an nRF, the peripheral sharing this module's block with it (`TWIM0`
     // under SPIM0, and the reverse), from `nrf::shared_block_partner`. A fact
     // about the OTHER modules, so it comes from the caller like `line_extras`.
@@ -7055,7 +7066,8 @@ pub fn module_config_ui(
                     );
                     ui.end_row();
 
-                    if is_async {
+                    // No channel to pick for a driver that is never built.
+                    if is_async && chip_i2s {
                         let inst = cfg.instance;
                         // Drawn by `dma_one`, which takes its label as an argument, so
                         // the row cannot document itself the way the others do.
@@ -7069,10 +7081,24 @@ pub fn module_config_ui(
                         }
                     }
 
+                    // A chip embassy compiles no `i2s` module for: nothing is
+                    // built on either runtime, and that outranks the two lines
+                    // below - main.rs carries the same sentence.
+                    if !chip_i2s {
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "not generated: {}",
+                                crate::panels::mcu_module::codegen::embassy_stm32::I2S_CHIP_GAP
+                            ))
+                            .size(10.5)
+                            .color(egui::Color32::from_rgb(220, 160, 70)),
+                        );
+                        ui.end_row();
                     // Both sentences are embassy's. An ESP is never `is_async`
                     // here and builds its I2S on either runtime, so neither one
                     // is true of it.
-                    if is_async || !is_esp {
+                    } else if is_async || !is_esp {
                         ui.label("");
                         ui.label(
                             egui::RichText::new(if is_async {
@@ -8058,6 +8084,7 @@ mod tests {
             block_partner,
             true,
             None,
+            true,
         )
         .0
     }
@@ -8108,6 +8135,7 @@ mod tests {
             None,
             runtime_applied,
             dma,
+            true,
         );
         match m.config {
             ModuleConfig::Usart(c) => (out, c),
@@ -8127,6 +8155,7 @@ mod tests {
         block_partner: Option<&str>,
         runtime_applied: bool,
         dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
+        chip_i2s: bool,
     ) -> (ConfigOut, crate::panels::mcu_module::modules::VirtualModule) {
         use crate::panels::mcu_module::modules::VirtualModule;
 
@@ -8160,6 +8189,7 @@ mod tests {
                 &mut pending,
                 dma,
                 line_extras,
+                chip_i2s,
                 block_partner,
                 &mut out,
                 &crate::panels::mcu_module::uart_baud::Chip::bare(
@@ -9367,6 +9397,35 @@ mod tests {
         }
     }
 
+    /// An I2S on a chip embassy compiles no `i2s` module for gets no DMA
+    /// picker on Async - there is no driver to hand a channel to - while the
+    /// same module on a chip that has it keeps one.
+    #[test]
+    fn an_i2s_without_a_driver_offers_no_dma_channel() {
+        for (chip_i2s, has_dma) in [(false, false), (true, true)] {
+            let (out, _) = drive_module(
+                ModuleKind::GenericInterfaceI2s,
+                ModuleKind::GenericInterfaceI2s.default_config(2),
+                "stm32f3",
+                true,
+                false,
+                false,
+                None,
+                true,
+                None,
+                chip_i2s,
+            );
+            let labels: Vec<&str> = out
+                .fields()
+                .expect("the I2S arm documents its rows")
+                .iter()
+                .map(|f| f.label.as_str())
+                .collect();
+            assert_eq!(labels.contains(&"DMA"), has_dma, "{chip_i2s}: {labels:?}");
+            assert!(labels.contains(&"Sample rate"), "{labels:?}");
+        }
+    }
+
     /// A UART the chip routes no DMA request to - UART5 on an F103 by its own
     /// table, on any F3 by the family fact: the Async transport row is locked on
     /// Buffered with its own sentence, the one-way directions that need DMA go
@@ -9623,6 +9682,18 @@ mod tests {
         );
         assert!(handle_names(&sai, &g0).is_empty());
         assert_eq!(handle_names(&sai, &g0_async), ["_sai1a", "_sai1b"]);
+        // An I2S on a chip with no `i2s` module binds nothing on Async either.
+        let i2s = module(
+            ModuleKind::GenericInterfaceI2s,
+            ModuleKind::GenericInterfaceI2s.default_config(2),
+        );
+        assert_eq!(handle_names(&i2s, &g0_async), ["_i2s2"]);
+        let f303_async = HandleCtx {
+            no_i2s: true,
+            ..g0_async.clone()
+        };
+        assert!(handle_names(&i2s, &f303_async).is_empty());
+        assert_eq!(handle_names(&sai, &f303_async), ["_sai1a", "_sai1b"]);
 
         // Read off the project: the F1 off Async ignores the switch, an
         // embassy family keeps it.
@@ -9637,6 +9708,12 @@ mod tests {
         let ctx = HandleCtx::of(&mcu);
         assert!(!ctx.f1_hal && ctx.embassy && !ctx.is_async, "{ctx:?}");
         assert!(handle_names(&usart(&|_| {}), &ctx).is_empty());
+        // ...and the part decides the I2S: the line names an F303.
+        mcu.family = "stm32f3".into();
+        mcu.hal_feature = Some("stm32f303re".into());
+        assert!(HandleCtx::of(&mcu).no_i2s);
+        mcu.hal_feature = Some("stm32f302re".into());
+        assert!(!HandleCtx::of(&mcu).no_i2s);
     }
 
     /// Every row this panel draws with a plain label is documented in the same

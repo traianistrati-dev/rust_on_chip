@@ -1610,6 +1610,11 @@ impl AppIde {
                                     crate::panels::mcu_module::stm32_pin_data::usart_has_swap_invert(
                                         mcu.usart_ip.as_deref(),
                                     );
+                                // Whether embassy compiles an `i2s` module for
+                                // this part at all - not on an F303, whose
+                                // CubeMX data lists the I2S pads anyway.
+                                let chip_i2s =
+                                    crate::panels::mcu_module::codegen::family::embassy_i2s(mcu);
                                 // Whether a "Generate driver" switch decides
                                 // anything here: embassy-stm32's drivers, on
                                 // the STAGED runtime the rows describe.
@@ -2079,7 +2084,7 @@ impl AppIde {
                                                         &mut pin_fn_choice, is_async, is_native,
                                                         runtime_applied,
                                                         &family, pending, chip_dma.as_ref(),
-                                                        usart_line_extras,
+                                                        usart_line_extras, chip_i2s,
                                                         block_partner.get(&m.id).map(String::as_str),
                                                         &mut my_out, &baud_chip, &mut i2c_io,
                                                     );
@@ -2097,6 +2102,7 @@ impl AppIde {
                                                         m.kind,
                                                         m.instance(),
                                                         time_driver,
+                                                        chip_i2s,
                                                     )
                                                 {
                                                     mod_gui::driver_switch(

@@ -272,6 +272,10 @@ pub struct ChipData<'a> {
     pub dma: Option<&'a crate::panels::mcu_module::mcu_def::DmaDef>,
     /// The chip's interrupt vector names; empty when it carries none.
     pub irq_vectors: &'a [String],
+    /// Whether embassy-stm32 compiles its `i2s` module for this chip -
+    /// `family::embassy_i2s`. False on the STM32F303/F358/F398 and N6, whose
+    /// CubeMX data lists I2S pads but whose SPI blocks carry no I2S registers.
+    pub i2s: bool,
 }
 
 /// Which runtime [`peripherals`] generates the bus drivers for.
@@ -374,6 +378,9 @@ pub const SAI_BLOCKING_GAP: &str =
     "embassy drives SAI only through a DMA ring buffer, read and written with `.await`.";
 pub const I2S_BLOCKING_GAP: &str =
     "embassy has no blocking I2S - it streams through a DMA ring buffer, written with `.await`.";
+/// Why no runtime builds I2S on a chip `ChipData::i2s` says is without it -
+/// main.rs's note and the module panel's line.
+pub const I2S_CHIP_GAP: &str = "embassy-stm32 has no I2S driver for this chip: none of its SPI blocks has I2S registers in stm32-metapac, so the `i2s` module is not compiled.";
 /// ...and why the timer embassy-time takes gets none on Async.
 pub const TIME_DRIVER_GAP: &str = "embassy-time runs on it: the \"time-driver-any\" feature \
      takes it on this chip, so `Peripherals` has no field for it. Move the PWM to another timer.";
@@ -381,7 +388,8 @@ pub const TIME_DRIVER_GAP: &str = "embassy-time runs on it: the \"time-driver-an
 /// Whether [`peripherals`] can build module `(kind, n)`'s driver at all on
 /// `mode`'s runtime - and so whether its "Generate driver" switch decides
 /// anything. Not on Blocking for the peripherals embassy drives only
-/// asynchronously, never for the F1's SDIO, and not on Async for the timer
+/// asynchronously, never for the F1's SDIO, never for an I2S on a chip with no
+/// `i2s` module (`i2s`, [`ChipData::i2s`]), and not on Async for the timer
 /// embassy-time takes (`time_driver`, from [`time_driver_timer_of`]).
 pub fn driver_generated(
     mode: PeriphMode,
@@ -389,9 +397,13 @@ pub fn driver_generated(
     kind: ModuleKind,
     n: u8,
     time_driver: Option<u8>,
+    i2s: bool,
 ) -> bool {
     use ModuleKind as K;
     if driver_singletons(kind, n).is_empty() {
+        return false;
+    }
+    if kind == K::GenericInterfaceI2s && !i2s {
         return false;
     }
     match (mode, kind) {
@@ -524,13 +536,22 @@ pub fn peripherals(
     // first took it and the LPUART fell through to `AlreadyTaken` and a clash
     // TODO. It is easy to miss because LPUART is its own map — the emission
     // loop below pairs it with USART deliberately for that reason.
+    //
+    // ...and NO map whose peripheral can never be built: an I2S on a chip with
+    // no `i2s` module (`ChipData::i2s`) takes nothing, so a channel pinned on it
+    // before - an F303's I2S2 TX on DMA1_CH5, USART1 RX's only channel - would
+    // starve a bus that IS built, behind a picker the panel no longer draws.
     for (tx, rx) in usart
         .values()
         .map(|c| (&c.dma_tx, &c.dma_rx))
         .chain(lpuart.values().map(|c| (&c.dma_tx, &c.dma_rx)))
         .chain(spi.values().map(|c| (&c.dma_tx, &c.dma_rx)))
         .chain(i2c.values().map(|c| (&c.dma_tx, &c.dma_rx)))
-        .chain(i2s.values().map(|c| (&c.dma_tx, &c.dma_rx)))
+        .chain(
+            i2s.values()
+                .filter(|_| chip.i2s)
+                .map(|c| (&c.dma_tx, &c.dma_rx)),
+        )
         .chain(sai.values().map(|c| (&c.dma_a, &c.dma_b)))
         .chain(sdmmc.values().map(|c| (&c.dma_tx, &c.dma_rx)))
     {
@@ -1439,6 +1460,18 @@ pub fn peripherals(
             .unwrap_or_else(|| I2sModuleConfig::new(n));
         let handle = format!("_i2s{n}{}", label_sfx(&cfg.custom_label));
 
+        // No `embassy_stm32::i2s` on this chip at all (`ChipData::i2s`): the
+        // config file would be E0432 on either runtime, so this reason comes
+        // before every other - and is no runtime gap, Async lacks it too.
+        if !chip.i2s {
+            calls.push_str(&crate::panels::mcu_module::errata::comment(
+                &format!(
+                    "I2S{n} is NOT initialised: {I2S_CHIP_GAP} Its pads stay bound raw above."
+                ),
+                "    ",
+            ));
+            continue;
+        }
         // I2S{n} and SPI{n} are the same silicon. Both wired means the user
         // described one block twice; SPI keeps it, because that is what the
         // block is unless told otherwise, and the audio side says so out loud
@@ -1910,6 +1943,7 @@ mod f1_async_tests {
         async_peripherals(
             family,
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors,
                 usart_ip: Some("sci2_v1_2_Cube"),
@@ -2161,6 +2195,7 @@ mod blocking_tests {
             &m.raw,
             "stm32g4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &[],
                 usart_ip: Some(usart_ip),
@@ -2580,6 +2615,7 @@ mod blocking_tests {
             &BTreeSet::new(),
             "stm32g4",
             ChipData {
+                i2s: true,
                 dma: None,
                 irq_vectors: &irqs,
                 usart_ip: Some(V4),
@@ -2791,6 +2827,7 @@ mod f1_async_usart_tests {
         async_peripherals(
             family,
             ChipData {
+                i2s: true,
                 dma,
                 irq_vectors: &[],
                 usart_ip: None,

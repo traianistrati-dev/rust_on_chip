@@ -214,6 +214,7 @@ mod spi_txonly_tests {
         let out = async_peripherals(
             "stm32g4",
             ChipData {
+                i2s: true,
                 dma: Some(&chip),
                 irq_vectors: &[],
                 usart_ip: None,

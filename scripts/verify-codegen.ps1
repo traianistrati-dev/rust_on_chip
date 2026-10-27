@@ -733,6 +733,13 @@ $ALL_CASES = @(
     @{ n = "imported F303RE UART5, no DMA"; t = "emit_imported_dma_project"; e = @{ EIDE_CHIP_XML = "STM32F303R(D-E)Tx.xml"; EIDE_USART_N = "5"; EIDE_IMPORT_SKIP = "I2s"; EIDE_EXPECT_MAIN = "UART5 is NOT initialised: this chip routes no DMA request" }; q = $false; p = "$CUBE_MX\STM32F303R(D-E)Tx.xml"; fam = "import"; lk = $true }
     @{ n = "imported F103RE UART4 DMA2";   t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "STM32F103R(C-D-E)Tx.xml"; EIDE_USART_N = "4"; EIDE_EXPECT_CONFIGS = "usart4.rs" }; q = $false; p = "$CUBE_MX\STM32F103R(C-D-E)Tx.xml"; fam = "import"; lk = $true }
     @{ n = "imported L476 LPUART DMA";     t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "STM32L476R(C-E-G)Tx.xml"; EIDE_LPUART_DMA = "1"; EIDE_EXPECT_CONFIGS = "lpuart1.rs" }; q = $false; p = "$CUBE_MX\STM32L476R(C-E-G)Tx.xml"; fam = "import"; lk = $true }
+    # An I2S on a part embassy-stm32 compiles no `i2s` module for: the F303's
+    # CubeMX data lists I2S2/3, its stm32-metapac SPI blocks carry no I2S
+    # registers (stm32_spi_i2s.rs). main.rs must refuse it in words - the
+    # i2s2.rs it used to get was E0432. The F302RE beside it has the module, and
+    # builds its I2S2 (UART4 on DMA2, clear of I2S2's DMA1 CH4/CH5). Linked.
+    @{ n = "imported F303RE I2S, no driver"; t = "emit_imported_dma_project"; e = @{ EIDE_CHIP_XML = "STM32F303R(D-E)Tx.xml"; EIDE_USART_N = "5"; EIDE_EXPECT_MAIN = "I2S2 is NOT initialised: embassy-stm32 has no I2S driver" }; q = $false; p = "$CUBE_MX\STM32F303R(D-E)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported F302RE I2S";          t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "STM32F302R(D-E)Tx.xml"; EIDE_USART_N = "4"; EIDE_EXPECT_CONFIGS = "i2s2.rs" }; q = $false; p = "$CUBE_MX\STM32F302R(D-E)Tx.xml"; fam = "import"; lk = $true }
     @{ n = "imported U599 Blocking HSPI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32U599NJHxQ.xml"; EIDE_HSPI = "8"; EIDE_HSPI_DQS = "1"; EIDE_EXPECT_CONFIGS = "hspi1.rs" }; q = $false; p = "$CUBE_MX\STM32U599NJHxQ.xml"; fam = "import"; lk = $true }
 
     # STM32N6 — the first family whose clock block does not come from the

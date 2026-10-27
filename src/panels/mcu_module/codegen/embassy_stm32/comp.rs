@@ -583,6 +583,7 @@ mod comp_tests {
             async_peripherals(
                 family,
                 ChipData {
+                    i2s: true,
                     dma: None,
                     irq_vectors: &irqs,
                     usart_ip: Some("sci3_v2_1_Cube"),

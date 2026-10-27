@@ -1966,8 +1966,11 @@ impl UsartDirection {
         if crate::panels::mcu_module::codegen::rp::is_rp(family) {
             return &[UsartDirection::TxRx];
         }
-        // nRF: `uarte::Pins` takes `txd` and `rxd` outright, with no `Option`,
-        // so the pair is the one shape nrf-hal's constructor builds.
+        // nRF: the panel draws this row on Async only, where embassy-nrf has
+        // one-way `UarteTx` / `UarteRx` - but `async_bus_lines` writes the
+        // pair's `Uarte` constructors and skips a half-wired UARTE, so the pair
+        // is this backend's gap, not the HAL's. (nrf-hal's `uarte::Pins`, on
+        // Blocking, does take both outright.)
         if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
             return &[UsartDirection::TxRx];
         }

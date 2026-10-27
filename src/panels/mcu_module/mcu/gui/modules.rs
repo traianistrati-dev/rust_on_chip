@@ -4134,18 +4134,22 @@ pub fn module_config_ui(
         let opts = UsartDirection::offered(usart_transport(cfg), family, is_async, line_extras);
         // The locked form is a different fact, so it is a different
         // sentence — chosen HERE, by the branch that knows which one it
-        // drew, and not re-derived from the family somewhere else.
+        // drew, and not re-derived from the family somewhere else. ONE
+        // choice, read by the pane and the hover alike, so a backend cannot
+        // reach one and not the other.
+        let locked = if crate::panels::mcu_module::codegen::rp::is_rp(family) {
+            docs::USART_DIRECTION_LOCKED_RP
+        } else if crate::panels::mcu_module::codegen::nrf::is_nrf(family) {
+            docs::USART_DIRECTION_LOCKED_NRF
+        } else {
+            docs::USART_DIRECTION_LOCKED
+        };
         out.field(
             "Data direction",
             if opts.len() > 1 {
                 docs::USART_DIRECTION
-            } else if crate::panels::mcu_module::codegen::rp::is_rp(family) {
-                // The same three-way choice the hover below makes. They read
-                // ONE const each, so a fourth form cannot reach one and not the
-                // other.
-                docs::USART_DIRECTION_LOCKED_RP
             } else {
-                docs::USART_DIRECTION_LOCKED
+                locked
             },
         );
         ui.label("Data direction");
@@ -4157,11 +4161,7 @@ pub fn module_config_ui(
                     .show_ui(ui, |_ui| {});
             })
             .response
-            .on_hover_text(if crate::panels::mcu_module::codegen::rp::is_rp(family) {
-                docs::USART_DIRECTION_LOCKED_RP
-            } else {
-                docs::USART_DIRECTION_LOCKED
-            });
+            .on_hover_text(locked);
         } else {
             let before = cfg.direction;
             egui::ComboBox::from_id_salt("usart_dir")
@@ -9413,6 +9413,37 @@ mod tests {
             assert_eq!((c.direction, c.flow), (D::TxOnly, F::Cts));
             assert!(!labels_of(&out).contains(&"Data direction"));
         }
+    }
+
+    /// The locked Data direction row says the backend's own reason, in the
+    /// pane and on the hover alike: an nRF has no transport to switch and
+    /// embassy-nrf has the halves, an RP's embassy-rp has them too. Neither is
+    /// the old embassy-stm32 sentence ("switch the transport to DMA").
+    #[test]
+    fn a_locked_direction_names_its_own_backend() {
+        let doc_of = |out: &ConfigOut| {
+            out.fields()
+                .unwrap()
+                .iter()
+                .find(|f| f.label == "Data direction")
+                .expect("a Data direction row")
+                .doc
+                .clone()
+        };
+        let nrf = drive_usart("nrf52833", true, false, false, |_| {});
+        assert_eq!(doc_of(&nrf), docs::USART_DIRECTION_LOCKED_NRF);
+        let rp = drive_usart("rp2040", true, false, false, |_| {});
+        assert_eq!(doc_of(&rp), docs::USART_DIRECTION_LOCKED_RP);
+        for doc in [
+            docs::USART_DIRECTION_LOCKED,
+            docs::USART_DIRECTION_LOCKED_NRF,
+            docs::USART_DIRECTION_LOCKED_RP,
+        ] {
+            assert!(!doc.contains("transport to DMA"), "{doc}");
+        }
+        // An STM32 is never down to one direction: half duplex is offered.
+        let g0 = drive_usart("stm32g0", true, false, false, |_| {});
+        assert_eq!(doc_of(&g0), docs::USART_DIRECTION);
     }
 
     /// 9 data bits with parity has no frame on any STM32: a stored pair is

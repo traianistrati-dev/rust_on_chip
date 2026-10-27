@@ -2173,9 +2173,13 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     let uart = uart_pins(mcu);
     let ucfgs = modules::usart_configs(&mcu.modules);
     for i in instances(&uart) {
+        // embassy-nrf HAS the halves (`UarteTx::new` / `UarteRx::new`); this
+        // backend writes only the pair's constructors (`Uarte::new`,
+        // `Uarte::new_with_rtscts`), which is what the note must say - not that
+        // the HAL cannot.
         let (Some(txd), Some(rxd)) = (role_of(&uart, i, "txd"), role_of(&uart, i, "rxd")) else {
             o.push_str(&format!(
-                "    // UARTE{i}: only one of TXD/RXD is wired, and the constructor takes the\n    // pair. Wire the other pad on the Pins canvas.\n"
+                "    // UARTE{i}: only one of TXD/RXD is wired, and this backend builds the UARTE\n    // from the pair - embassy-nrf's one-way UarteTx / UarteRx are not generated\n    // yet. Wire the other pad on the Pins canvas.\n"
             ));
             continue;
         };
@@ -3375,6 +3379,41 @@ mod blocking_codegen {
         assert_eq!(
             gpio_modes_for(&mcu, &PinFunction::GpioOutput).first(),
             Some(&GpioMode::for_output(None))
+        );
+    }
+
+    /// Half a UARTE says WHO takes the pair, by HAL, not by runtime. nrf-hal's
+    /// `uarte::Pins` does, so its note (Blocking on a part nrf-hal has a crate
+    /// for) blames the constructor; embassy-nrf has `UarteTx` / `UarteRx`, so
+    /// its note (Async everywhere, and Blocking on the 52820, 5340 and 54L15)
+    /// names this backend's gap.
+    #[test]
+    fn a_half_wired_uarte_names_whose_limit_it_is() {
+        let mut mcu = microbit(&[("P0.06", PinFunction::UsartTx(0))]);
+        let blocking = mcu.fresh_main_rs();
+        assert!(
+            blocking
+                .contains("// UARTE0: only one of TXD/RXD is wired, and the constructor takes the"),
+            "{blocking}"
+        );
+        mcu.runtime = crate::panels::mcu_module::mcu::Runtime::Async;
+        let on_async = mcu.fresh_main_rs();
+        assert!(
+            on_async.contains("embassy-nrf's one-way UarteTx / UarteRx are not generated"),
+            "{on_async}"
+        );
+        assert!(
+            !on_async.contains("the constructor takes the"),
+            "{on_async}"
+        );
+        // Blocking on a part nrf-hal has no crate for is embassy-nrf too.
+        mcu.family = "nrf52820".into();
+        mcu.runtime = crate::panels::mcu_module::mcu::Runtime::Blocking;
+        assert!(super::blocking_on_embassy(&mcu.family));
+        let embassy_blocking = mcu.fresh_main_rs();
+        assert!(
+            embassy_blocking.contains("embassy-nrf's one-way UarteTx / UarteRx are not generated"),
+            "{embassy_blocking}"
         );
     }
 

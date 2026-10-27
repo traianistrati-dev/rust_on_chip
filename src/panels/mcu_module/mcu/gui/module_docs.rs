@@ -367,6 +367,7 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("USART_TRANSFERS_ESP", USART_TRANSFERS_ESP),
     ("USART_DIRECTION", USART_DIRECTION),
     ("USART_DIRECTION_LOCKED", USART_DIRECTION_LOCKED),
+    ("USART_DIRECTION_LOCKED_NRF", USART_DIRECTION_LOCKED_NRF),
     ("USART_DIRECTION_LOCKED_RP", USART_DIRECTION_LOCKED_RP),
     ("USART_LINE", USART_LINE),
     ("USART_LINE_ABSENT", USART_LINE_ABSENT),
@@ -1658,13 +1659,35 @@ pub const USART_DIRECTION: &str = "Which halves to build. A one-way link frees t
                                    something else; the half-duplex modes put both directions on \
                                    ONE wire.";
 
-pub const USART_DIRECTION_LOCKED: &str = "Both halves, and no choice: embassy has no buffered \
-                                          TX-only or RX-only - `BufferedUartTx` and \
-                                          `BufferedUartRx` come only from splitting a \
-                                          `BufferedUart`, so both pads are used either way. \
-                                          Switch the transport to DMA for a one-way UART.";
+/// A backend with no sentence of its own. It used to explain embassy-stm32's
+/// buffered transport ("switch the transport to DMA for a one-way UART"), but
+/// every STM32 runtime that DRAWS the row offers half duplex, so it is never
+/// locked there (the F1 off Async has a one-entry list, and draws no row:
+/// `f1_serial_note` skips it). The RP and then the nRF were what read it.
+pub const USART_DIRECTION_LOCKED: &str = "Both halves, and no choice: this backend builds the \
+                                          UART from its TX+RX pair only, so a UART with a single \
+                                          pad wired generates nothing.";
 
-/// The same row on an RP, where BOTH halves of the sentence above are false.
+/// The same row on an nRF, on every runtime that draws it (Async: the
+/// embassy-nrf backend).
+///
+/// embassy-nrf 0.11 has one-way UARTEs - `UarteTx::new` / `UarteRx::new`
+/// (uarte.rs:402, :587), and a `new_with_rtscts` on each that takes the one
+/// flow pad its half uses - but `async_bus_lines` writes only the pair's
+/// constructors (`Uarte::new`, `Uarte::new_with_rtscts`) and skips a UARTE
+/// with one pad. No transport row because this backend builds `uarte::Uarte`
+/// alone - embassy-nrf's `BufferedUarte`, halves and all, is not generated
+/// either - and no DMA channel because EasyDMA is part of the UARTE.
+pub const USART_DIRECTION_LOCKED_NRF: &str = "Both halves, and no choice yet. embassy-nrf does \
+                                              have one-way UARTEs - UarteTx and UarteRx, each \
+                                              with flow control on the one pad its half uses - \
+                                              but this backend builds the UARTE from its TX+RX \
+                                              pair, so one with a single pad wired generates \
+                                              nothing. A gap in the generator, not in the chip. \
+                                              It builds embassy-nrf's Uarte only, so there is no \
+                                              transport to pick either.";
+
+/// The same row on an RP, where embassy-rp has the one-way forms too.
 ///
 /// embassy-rp has real standalone constructors on both transports -
 /// `BufferedUartTx::new` / `BufferedUartRx::new` (uart/buffered.rs:344, :195)

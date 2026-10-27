@@ -363,6 +363,7 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("USART_BUF_BUFFERED", USART_BUF_BUFFERED),
     ("USART_BUF_DMA", USART_BUF_DMA),
     ("USART_ASYNC_TRANSPORT", USART_ASYNC_TRANSPORT),
+    ("USART_ASYNC_TRANSPORT_NO_DMA", USART_ASYNC_TRANSPORT_NO_DMA),
     ("USART_TRANSFERS_ESP", USART_TRANSFERS_ESP),
     ("USART_DIRECTION", USART_DIRECTION),
     ("USART_DIRECTION_LOCKED", USART_DIRECTION_LOCKED),
@@ -599,7 +600,7 @@ pub const ROSTER: &[KindRoster] = &[
     (
         "USART",
         &[
-            ("Async transport", Some(USART_ASYNC_TRANSPORT)),
+            ("Async transport", None),
             ("Baud rate", Some(USART_BAUD)),
             ("Data bits", Some(USART_DATA_BITS)),
             ("Data direction", None),
@@ -1635,6 +1636,16 @@ pub const USART_ASYNC_TRANSPORT: &str = "Who moves the bytes. Buffered costs one
                                          byte and no DMA channel, so it always builds; DMA hands \
                                          the peripheral straight to the controller and keeps \
                                          receiving between your reads, at the price of channels.";
+
+/// The same row on a UART the chip routes no DMA request to - UART5 on the
+/// F101/F103/F105/F107 and every F3 (`dma_map::lacks_request`). Locked rather
+/// than hidden, like the direction row: the reason is the useful part.
+pub const USART_ASYNC_TRANSPORT_NO_DMA: &str = "Buffered, and no choice: this chip routes no DMA \
+                                                request to this UART (UART5 on the \
+                                                F101/F103/F105/F107 and on every F3 has none), \
+                                                so embassy's DMA UART cannot be built for it. \
+                                                The one-way directions need that transport, so \
+                                                they are not offered either.";
 
 pub const USART_TRANSFERS_ESP: &str = "Fixed on an ESP: esp-hal moves UART bytes over DMA through \
                                        UHCI, a driver of its own this generator does not write \

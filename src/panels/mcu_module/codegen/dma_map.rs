@@ -472,6 +472,46 @@ pub fn channels_for(
         .unwrap_or_default()
 }
 
+/// Serial instances with no DMA request on ANY part of a family, for the chips
+/// that carry no vendor data.
+///
+/// Measured over the whole STM32Cube database (2026-10-26) with the extraction
+/// [`DmaAllocator`] reads: on a fixed-mapping part, UART5 is the only USART or
+/// UART the request table names in neither direction - on every F101, F103,
+/// F105, F107, F302, F303, F358 and F398 that has it - and no instance is routed
+/// in one direction only. Muxed parts route every request.
+///
+/// The F1 is NOT here: its F100 value line routes UART5 to DMA2_CH1/CH4, so the
+/// family has no single answer, and an F1 without vendor data keeps the TODO.
+/// Every F3 table lacks it.
+const NO_REQUEST: &[(&str, Bus, u8)] = &[("stm32f3", Bus::Usart, 5)];
+
+/// Whether this chip is KNOWN to route no DMA request for `bus{instance}`'s
+/// `dir`, so no DMA transport can be built for it at all.
+///
+/// "Known" is the point, because an empty [`channels_for`] means two different
+/// things. A fixed-mapping vendor table that lists requests, but not this one,
+/// is the silicon saying no. A muxed chip routes any request, and a chip with no
+/// vendor data - or a table that parsed to nothing - has no opinion; neither of
+/// those is a no, so neither may take the DMA transport away.
+pub fn lacks_request(
+    dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
+    family: &str,
+    bus: Bus,
+    instance: u8,
+    dir: Dir,
+) -> bool {
+    match dma {
+        Some(chip) if chip.mux || chip.requests.is_empty() => false,
+        Some(chip) => !request_names(bus, instance, dir)
+            .iter()
+            .any(|r| chip.requests.iter().any(|(n, _)| n == r)),
+        None => NO_REQUEST
+            .iter()
+            .any(|(f, b, n)| *f == family && *b == bus && *n == instance),
+    }
+}
+
 /// What the vendor calls this request, best guess first.
 ///
 /// ST names a UART's request after the peripheral, and an instance that is a
@@ -490,6 +530,10 @@ fn request_names(bus: Bus, instance: u8, dir: Dir) -> Vec<String> {
             format!("USART{instance}_{d}"),
             format!("UART{instance}_{d}"),
         ],
+        // The STM32L4's fixed-mapping table names its single LPUART's request
+        // without the number, `LPUART_TX`, where every muxed part says
+        // `LPUART1_TX` - so an L4's LPUART1 got no channel and a DMA TODO.
+        Bus::Lpuart if instance == 1 => vec![format!("LPUART1_{d}"), format!("LPUART_{d}")],
         Bus::Lpuart => vec![format!("LPUART{instance}_{d}")],
         Bus::Spi => vec![format!("SPI{instance}_{d}")],
         Bus::I2c => vec![format!("I2C{instance}_{d}")],
@@ -647,6 +691,104 @@ mod tests {
                 .peri,
             "DMA1_CH2"
         );
+    }
+
+    /// "No DMA for this UART" is said only where something KNOWS it: a fixed
+    /// table that lists other requests, or the family fact for a chip with no
+    /// data. A muxed chip, an empty table and a family with no fact all keep
+    /// the DMA transport - an empty answer there is no opinion, not a no.
+    #[test]
+    fn only_a_known_absence_takes_the_dma_away() {
+        // An STM32F103RE's table: UART4 on DMA2, UART5 nowhere.
+        let f103re = DmaDef {
+            mux: false,
+            channels: vec![
+                chan("DMA2_CH3", "DMA2_CHANNEL3"),
+                chan("DMA2_CH5", "DMA2_CHANNEL4_5"),
+            ],
+            requests: vec![
+                ("UART4_TX".into(), vec!["DMA2_CH5".into()]),
+                ("UART4_RX".into(), vec!["DMA2_CH3".into()]),
+            ],
+        };
+        let lacks = |dma: Option<&DmaDef>, family: &str, n: u8| {
+            [Dir::Tx, Dir::Rx].map(|d| lacks_request(dma, family, Bus::Usart, n, d))
+        };
+        assert_eq!(lacks(Some(&f103re), "stm32f1", 5), [true, true]);
+        assert_eq!(lacks(Some(&f103re), "stm32f1", 4), [false, false]);
+        // An F100xE's table: the value line routes UART5 to DMA2.
+        let f100re = DmaDef {
+            mux: false,
+            channels: vec![
+                chan("DMA2_CH1", "DMA2_CHANNEL1"),
+                chan("DMA2_CH4", "DMA2_CHANNEL4_5"),
+            ],
+            requests: vec![
+                ("UART5_TX".into(), vec!["DMA2_CH1".into()]),
+                ("UART5_RX".into(), vec!["DMA2_CH4".into()]),
+            ],
+        };
+        assert_eq!(lacks(Some(&f100re), "stm32f1", 5), [false, false]);
+        // No vendor data: the family fact, which only the F3 has - the F1's two
+        // lines above disagree, so a data-less F1 has no opinion.
+        assert_eq!(lacks(None, "stm32f3", 5), [true, true]);
+        assert_eq!(lacks(None, "stm32f3", 4), [false, false]);
+        assert_eq!(lacks(None, "stm32f1", 5), [false, false]);
+        assert_eq!(lacks(None, "stm32f4", 5), [false, false]);
+        // Muxed: any channel carries any request, the table is empty by design.
+        let muxed = DmaDef {
+            mux: true,
+            channels: vec![chan("DMA1_CH1", "DMA1_CHANNEL1")],
+            requests: Vec::new(),
+        };
+        assert_eq!(lacks(Some(&muxed), "stm32g4", 5), [false, false]);
+        // A classic chip whose table predates the field, or parsed to nothing.
+        let empty = DmaDef {
+            requests: Vec::new(),
+            ..f103re.clone()
+        };
+        assert_eq!(lacks(Some(&empty), "stm32f1", 5), [false, false]);
+    }
+
+    /// The STM32L4's fixed table spells its one LPUART's request `LPUART_TX`,
+    /// with no number. Read as `LPUART1_TX` alone, an L4 LPUART1 had no channel
+    /// - a DMA TODO in main.rs, an empty picker, and now a DMA transport taken
+    /// away from a peripheral that has one.
+    #[test]
+    fn an_l4_lpuart_finds_its_unnumbered_request() {
+        let l476 = DmaDef {
+            mux: false,
+            channels: vec![
+                chan("DMA2_CH6", "DMA2_CHANNEL6"),
+                chan("DMA2_CH7", "DMA2_CHANNEL7"),
+            ],
+            requests: vec![
+                ("LPUART_TX".into(), vec!["DMA2_CH6".into()]),
+                ("LPUART_RX".into(), vec!["DMA2_CH7".into()]),
+            ],
+        };
+        assert_eq!(
+            channels_for(Some(&l476), Bus::Lpuart, 1, Dir::Tx),
+            vec!["DMA2_CH6".to_owned()]
+        );
+        let mut a = DmaAllocator::for_chip("stm32l4", Some(&l476));
+        assert_eq!(a.take(Bus::Lpuart, 1, Dir::Rx).unwrap().peri, "DMA2_CH7");
+        assert!(!lacks_request(
+            Some(&l476),
+            "stm32l4",
+            Bus::Lpuart,
+            1,
+            Dir::Tx
+        ));
+        // The unnumbered spelling belongs to instance 1: an LPUART2 does not
+        // borrow it.
+        assert!(lacks_request(
+            Some(&l476),
+            "stm32l4",
+            Bus::Lpuart,
+            2,
+            Dir::Tx
+        ));
     }
 
     /// A channel pinned by hand in a Virtual Module: honoured, and taken out

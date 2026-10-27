@@ -722,6 +722,17 @@ $ALL_CASES = @(
     # (EIDE_BLK_UPGRADE): opened, that module starts with "Generate driver" off,
     # and the project builds with the user's code in it.
     @{ n = "imported G431 Blocking upgrade"; t = "emit_imported_dma_project"; e = @{ EIDE_RUNTIME = "blocking"; EIDE_BLK_UPGRADE = "used"; EIDE_EXPECT_CONFIGS = "spi1.rs,i2c1/mod.rs" }; q = $false; p = $CUBE_DB; fam = "import"; lk = $true }
+    # A UART whose DMA request a fixed-mapping chip does not route: UART5 on the
+    # F101/F103/F105/F107 and every F3 (the F100 value line routes it to DMA2).
+    # The harness puts the USART on DMA, so main.rs must say why that
+    # UART is not built - the allocator's DMA TODO, which these rows used to get,
+    # has no answer and fails the emit. UART4 beside it is on DMA2 (a shared
+    # DMA2_CHANNEL4_5 vector on the F103RE), and the L476's LPUART1 request is
+    # spelled `LPUART_TX`, with no number. Linked.
+    @{ n = "imported F103RE UART5, no DMA"; t = "emit_imported_dma_project"; e = @{ EIDE_CHIP_XML = "STM32F103R(C-D-E)Tx.xml"; EIDE_USART_N = "5"; EIDE_EXPECT_MAIN = "UART5 is NOT initialised: this chip routes no DMA request" }; q = $false; p = "$CUBE_MX\STM32F103R(C-D-E)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported F303RE UART5, no DMA"; t = "emit_imported_dma_project"; e = @{ EIDE_CHIP_XML = "STM32F303R(D-E)Tx.xml"; EIDE_USART_N = "5"; EIDE_IMPORT_SKIP = "I2s"; EIDE_EXPECT_MAIN = "UART5 is NOT initialised: this chip routes no DMA request" }; q = $false; p = "$CUBE_MX\STM32F303R(D-E)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported F103RE UART4 DMA2";   t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "STM32F103R(C-D-E)Tx.xml"; EIDE_USART_N = "4"; EIDE_EXPECT_CONFIGS = "usart4.rs" }; q = $false; p = "$CUBE_MX\STM32F103R(C-D-E)Tx.xml"; fam = "import"; lk = $true }
+    @{ n = "imported L476 LPUART DMA";     t = "emit_imported_dma_project";  e = @{ EIDE_CHIP_XML = "STM32L476R(C-E-G)Tx.xml"; EIDE_LPUART_DMA = "1"; EIDE_EXPECT_CONFIGS = "lpuart1.rs" }; q = $false; p = "$CUBE_MX\STM32L476R(C-E-G)Tx.xml"; fam = "import"; lk = $true }
     @{ n = "imported U599 Blocking HSPI";  t = "emit_imported_dma_project";  e = @{ EIDE_RUNTIME = "blocking"; EIDE_CHIP_XML = "STM32U599NJHxQ.xml"; EIDE_HSPI = "8"; EIDE_HSPI_DQS = "1"; EIDE_EXPECT_CONFIGS = "hspi1.rs" }; q = $false; p = "$CUBE_MX\STM32U599NJHxQ.xml"; fam = "import"; lk = $true }
 
     # STM32N6 — the first family whose clock block does not come from the
@@ -765,7 +776,7 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_EXPECT_CONFIGS", "EIDE_USART_DIR", "EIDE_LPUART_HALF", "EIDE_USART_N",
            "EIDE_QSPI", "EIDE_OSPI", "EIDE_OSPI_DQS", "EIDE_XSPI", "EIDE_XSPI_DQS",
            "EIDE_HSPI", "EIDE_HSPI_DQS", "EIDE_SDMMC", "EIDE_SDMMC_UNIT", "EIDE_SAI",
-           "EIDE_PIN_SPI_TX", "EIDE_BLK_UPGRADE",
+           "EIDE_PIN_SPI_TX", "EIDE_BLK_UPGRADE", "EIDE_LPUART_DMA", "EIDE_EXPECT_MAIN",
            # Not ours, but set by the Thread rows - never left for the next case.
            "CMAKE")
 

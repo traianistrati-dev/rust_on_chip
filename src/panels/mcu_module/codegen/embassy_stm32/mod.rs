@@ -603,19 +603,68 @@ pub fn peripherals(
                 ));
                 continue;
             }
+            // The request this UART's DMA halves would need and the chip does not
+            // route - UART5 on the F101/F103/F105/F107 and every F3
+            // (`dma_map::lacks_request`). The
+            // allocator's TODO ("pass DMA channels valid for UART5") has no
+            // answer there, so main.rs names the real one instead.
+            let one_way = matches!(dir, UsartDirection::TxOnly | UsartDirection::RxOnly);
+            let no_request = {
+                let (tx, rx) = dir.dma_halves();
+                let lacks = |d| dma_map::lacks_request(chip.dma, family, bus, n, d);
+                match (tx && lacks(dma_map::Dir::Tx), rx && lacks(dma_map::Dir::Rx)) {
+                    (true, true) => Some(format!("{peri}{n}_TX or {peri}{n}_RX")),
+                    (true, false) => Some(format!("{peri}{n}_TX")),
+                    (false, true) => Some(format!("{peri}{n}_RX")),
+                    (false, false) => None,
+                }
+            };
+            let transport = cfg.map(|c| c.mode).unwrap_or_default();
+            // The panel offers only the buffered transport there; a DMA pick
+            // stored before, by hand, or under a runtime only staged arrives
+            // here anyway.
+            if !blocking
+                && transport == UsartMode::Dma
+                && let Some(req) = &no_request
+            {
+                let and_dir = if one_way {
+                    ", and its direction to receive and transmit - the buffered transport \
+                     has no one-way half"
+                } else {
+                    ""
+                };
+                calls.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!(
+                        "{peri}{n} is NOT initialised: this chip routes no DMA request to \
+                         {req}, so the DMA transport cannot carry it. Set the module's Async \
+                         transport to Buffered{and_dir}."
+                    ),
+                    "    ",
+                ));
+                continue;
+            }
             // The buffered transport has no half: embassy builds only
             // `BufferedUart::new*`, with both pads. A one-way choice made on
             // Blocking, which reads no transport, can arrive here with it.
-            if !blocking
-                && cfg.map(|c| c.mode).unwrap_or_default() == UsartMode::Buffered
-                && matches!(dir, UsartDirection::TxOnly | UsartDirection::RxOnly)
-            {
-                calls.push_str(&format!(
-                    "    // {peri}{n} is NOT initialised: the buffered transport has no one-way half -
+            if !blocking && transport == UsartMode::Buffered && one_way {
+                match &no_request {
+                    // And DMA, the transport that has one, is not there either.
+                    Some(req) => calls.push_str(&crate::panels::mcu_module::errata::comment(
+                        &format!(
+                            "{peri}{n} is NOT initialised: the buffered transport has no \
+                             one-way half - embassy's BufferedUart takes both pads - and this \
+                             chip routes no DMA request to {req} for the DMA one. Set the \
+                             module's direction to receive and transmit."
+                        ),
+                        "    ",
+                    )),
+                    None => calls.push_str(&format!(
+                        "    // {peri}{n} is NOT initialised: the buffered transport has no one-way half -
     // embassy's BufferedUart takes both pads. Set the module's Async transport to
     // DMA, or its direction to receive and transmit.
 "
-                ));
+                    )),
+                }
                 continue;
             }
             if dir == UsartDirection::HalfDuplexOnRx && !usart_v3 {
@@ -658,7 +707,6 @@ pub fn peripherals(
             // direction changed on a runtime that was only staged - keeps its
             // wired pads bound raw rather than making them `init` parameters
             // nothing reads, and says so.
-            let transport = cfg.map(|c| c.mode).unwrap_or_default();
             let flow = if blocking
                 || UsartFlow::options_for(transport, dir, family, true).contains(&flow)
             {
@@ -2053,6 +2101,9 @@ mod f1_async_tests {
         // And USART1..3 stay USARTs on the F1.
         assert_eq!(serial_word("USART", "stm32f1", &[], 3), "USART");
         assert_eq!(serial_word("LPUART", "stm32f1", &[], 4), "LPUART");
+        // The F3's are UARTs too: an F303 with no vector list wrote `p.USART5`.
+        assert_eq!(serial_word("USART", "stm32f3", &[], 5), "UART");
+        assert_eq!(serial_word("USART", "stm32f3", &[], 3), "USART");
     }
 
     /// An F1 carries no vector list, so the EXTI plan falls back to the F1's
@@ -2724,12 +2775,23 @@ mod f1_async_usart_tests {
 
     /// The F1 on Async, its built-in DMA table, `cfg` for USART`n`.
     fn run(pins: &[Pin], n: u8, cfg: UsartModuleConfig) -> AsyncPeriphs {
+        run_on("stm32f1", None, pins, n, cfg)
+    }
+
+    /// `run` on `family`, with `dma` as the chip's vendor DMA facts.
+    fn run_on(
+        family: &str,
+        dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
+        pins: &[Pin],
+        n: u8,
+        cfg: UsartModuleConfig,
+    ) -> AsyncPeriphs {
         let refs: Vec<&Pin> = pins.iter().collect();
         let usart: BTreeMap<u8, UsartModuleConfig> = [(n, cfg)].into();
         async_peripherals(
-            "stm32f1",
+            family,
             ChipData {
-                dma: None,
+                dma,
                 irq_vectors: &[],
                 usart_ip: None,
                 sdmmc_ip: None,
@@ -3045,6 +3107,122 @@ mod f1_async_usart_tests {
         );
         // UART4/5 do not remap.
         assert_eq!(f1_usart_remap_clash(4, &["PC10", "PC11"]), None);
+    }
+
+    /// UART5 has no DMA request on the F101/F103/F105/F107 (their own table)
+    /// or on any F3 (the family fact), so a DMA pick for it has no channel to
+    /// resolve: main.rs says what to change instead of the allocator's "pass DMA
+    /// channels valid for UART5", which has no answer - and the buffered UART it
+    /// offers instead is built. An F1 with no data has no opinion: the F100
+    /// value line routes UART5, so there the TODO stays.
+    #[test]
+    fn a_uart_with_no_dma_request_says_so_instead_of_a_todo() {
+        use crate::panels::mcu_module::codegen::dma_data::DmaChannel;
+        use crate::panels::mcu_module::mcu_def::DmaDef;
+        // The notes are wrapped comments: read them as the sentence they are.
+        let prose = |out: &AsyncPeriphs| {
+            out.init_calls
+                .lines()
+                .map(|l| l.trim().trim_start_matches("//").trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let pads = vec![
+            mk("PC12", PinFunction::UsartTx(5)),
+            mk("PD2", PinFunction::UsartRx(5)),
+        ];
+        // An STM32F103RE's table: UART4 on DMA2, UART5 nowhere.
+        let f103re = DmaDef {
+            mux: false,
+            channels: vec![
+                DmaChannel {
+                    peri: "DMA2_CH5".into(),
+                    irq: "DMA2_CHANNEL4_5".into(),
+                },
+                DmaChannel {
+                    peri: "DMA2_CH3".into(),
+                    irq: "DMA2_CHANNEL3".into(),
+                },
+            ],
+            requests: vec![
+                ("UART4_TX".into(), vec!["DMA2_CH5".into()]),
+                ("UART4_RX".into(), vec!["DMA2_CH3".into()]),
+            ],
+        };
+        for (family, dma) in [("stm32f1", Some(&f103re)), ("stm32f3", None)] {
+            let go = |mode, dir| run_on(family, dma, &pads, 5, cfg(mode, dir, UsartFlow::None));
+            let out = go(UsartMode::Dma, UsartDirection::TxRx);
+            let said = prose(&out);
+            assert!(
+                said.contains(
+                    "UART5 is NOT initialised: this chip routes no DMA request to UART5_TX or \
+                     UART5_RX, so the DMA transport cannot carry it. Set the module's Async \
+                     transport to Buffered."
+                ),
+                "{family}: {said}"
+            );
+            assert!(
+                !out.init_calls.contains("TODO(async DMA)"),
+                "{}",
+                out.init_calls
+            );
+            assert!(!has_dma_todo(&out.init_calls), "{}", out.init_calls);
+            assert!(out.config_files.iter().all(|(n, _)| n != "usart5.rs"));
+            // Its pads stay bound raw, as every other refused UART's.
+            assert!(!out.consumed_pins.contains(&"PC12".to_owned()));
+
+            // A one-way pick needs DMA AND the direction changed.
+            let said = prose(&go(UsartMode::Dma, UsartDirection::TxOnly));
+            assert!(
+                said.contains("no DMA request to UART5_TX, so"),
+                "{family}: {said}"
+            );
+            assert!(
+                said.contains("and its direction to receive and transmit"),
+                "{family}: {said}"
+            );
+            // The same direction on the buffered transport cannot be pointed at
+            // DMA.
+            let said = prose(&go(UsartMode::Buffered, UsartDirection::RxOnly));
+            assert!(
+                said.contains("no DMA request to UART5_RX for the DMA one"),
+                "{family}: {said}"
+            );
+            assert!(!said.contains("transport to DMA"), "{family}: {said}");
+
+            // Buffered, the transport the panel leaves it, builds - as the UART
+            // it is on both families, never `p.USART5`.
+            let out = go(UsartMode::Buffered, UsartDirection::TxRx);
+            assert!(
+                out.init_calls
+                    .contains("pins::configs::usart5::init(p.UART5, "),
+                "{family}: {}",
+                out.init_calls
+            );
+            assert!(
+                !out.init_calls.contains("NOT initialised"),
+                "{}",
+                out.init_calls
+            );
+            file(&out, "usart5.rs");
+        }
+
+        // No data on an F1: no opinion, so the allocator's TODO, not a refusal.
+        let out = run(
+            &pads,
+            5,
+            cfg(UsartMode::Dma, UsartDirection::TxRx, UsartFlow::None),
+        );
+        assert!(
+            !out.init_calls.contains("NOT initialised"),
+            "{}",
+            out.init_calls
+        );
+        assert!(
+            out.init_calls.contains("TODO(async DMA)"),
+            "{}",
+            out.init_calls
+        );
     }
 
     /// A one-way UART whose channel cannot be resolved gets the ONE

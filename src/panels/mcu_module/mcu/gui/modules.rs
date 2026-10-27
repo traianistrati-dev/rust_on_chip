@@ -3611,6 +3611,15 @@ pub fn module_config_ui(
     } else {
         dma_map::Bus::Usart
     };
+    // Whether the chip routes NO DMA request to this serial instance, in either
+    // direction - UART5 on the F101/F103/F105/F107 and every F3
+    // (`dma_map::lacks_request`). Its Async runtime then has one transport, the
+    // buffered one.
+    let serial_lacks_dma = |inst: u8| {
+        [dma_map::Dir::Tx, dma_map::Dir::Rx]
+            .into_iter()
+            .all(|d| dma_map::lacks_request(dma, family, uart_bus, inst, d))
+    };
     let m_id = m.id.clone();
     // Read alongside `is_custom`, for the same reason: the rows at the bottom
     // are drawn long after `m.config` is borrowed mutably.
@@ -3671,6 +3680,18 @@ pub fn module_config_ui(
     // stm32f1xx-hal, ESP, RP and nRF keep their own gates.
     let embassy = codegen::family::embassy_drivers(family, is_async);
     let embassy_blocking = embassy && !is_async;
+    // The transport the staged runtime really builds for a USART: the stored
+    // one, except on embassy's Async runtime for a UART with no DMA request,
+    // where the buffered one is all there is. A DMA pick stored there - under a
+    // runtime only staged, so not clamped yet - must not decide which
+    // directions and flow forms the rows below offer.
+    let usart_transport = |cfg: &UsartModuleConfig| {
+        if embassy && is_async && serial_lacks_dma(cfg.instance) {
+            UsartMode::Buffered
+        } else {
+            cfg.mode
+        }
+    };
 
     // Portable (embedded-io/hal) vs native (concrete HAL) init — shown for the
     // bus modules (USART/SPI/I2C) that generate a `pins/configs/*.rs` init.
@@ -3961,17 +3982,39 @@ pub fn module_config_ui(
     // reads the only thing holding bytes is the PL011's 32-byte FIFO. Naming
     // the STM32 mechanism on a Pico promised a protection the chip does not
     // give.
+    //
+    // `no_dma` is a UART the chip routes no DMA request to: one transport, so
+    // the row is locked on it with the reason, the way the direction row locks
+    // - and a DMA pick still stored (a runtime only staged) is named as one
+    // that is not built.
     let usart_mode_row = |ui: &mut egui::Ui,
                           out: &mut ConfigOut,
                           mode: &mut UsartMode,
-                          family: &str| {
-        out.field("Async transport", docs::USART_ASYNC_TRANSPORT);
+                          family: &str,
+                          no_dma: bool| {
         let rp = crate::panels::mcu_module::codegen::rp::is_rp(family);
         let dma_text = if rp {
             "DMA (one transfer per read)"
         } else {
             "DMA (ring buffer)"
         };
+        if no_dma {
+            out.field("Async transport", docs::USART_ASYNC_TRANSPORT_NO_DMA);
+            ui.label("Async transport");
+            ui.add_enabled_ui(false, |ui| {
+                egui::ComboBox::from_id_salt("usart_mode_locked")
+                    .selected_text(match mode {
+                        UsartMode::Buffered => "Buffered (interrupt)".to_owned(),
+                        UsartMode::Dma => not_built_here(dma_text, false),
+                    })
+                    .show_ui(ui, |_ui| {});
+            })
+            .response
+            .on_hover_text(docs::USART_ASYNC_TRANSPORT_NO_DMA);
+            ui.end_row();
+            return;
+        }
+        out.field("Async transport", docs::USART_ASYNC_TRANSPORT);
         ui.label("Async transport");
         egui::ComboBox::from_id_salt("usart_mode")
             .selected_text(match mode {
@@ -4077,7 +4120,7 @@ pub fn module_config_ui(
     // choice that needs one it hasn't got is called out instead of silently
     // generating code that won't build.
     let direction_row = |ui: &mut egui::Ui, out: &mut ConfigOut, cfg: &mut UsartModuleConfig| {
-        let opts = UsartDirection::offered(cfg.mode, family, is_async, line_extras);
+        let opts = UsartDirection::offered(usart_transport(cfg), family, is_async, line_extras);
         // The locked form is a different fact, so it is a different
         // sentence — chosen HERE, by the branch that knows which one it
         // drew, and not re-derived from the family somewhere else.
@@ -4123,7 +4166,9 @@ pub fn module_config_ui(
             // A one-way UART picked on embassy Blocking, whose polled driver
             // reads no transport: on Async the buffered transport has no half
             // at all, so the pick takes the DMA one, which builds the same
-            // `UartTx` / `UartRx`. Written on the pick, never per frame.
+            // `UartTx` / `UartRx`. Written on the pick, never per frame - and
+            // not for a UART with no DMA request, where that transport does not
+            // exist on Async either: main.rs there says why it is not built.
             if embassy_blocking
                 && cfg.direction != before
                 && matches!(
@@ -4131,6 +4176,7 @@ pub fn module_config_ui(
                     UsartDirection::TxOnly | UsartDirection::RxOnly
                 )
                 && cfg.mode == UsartMode::Buffered
+                && !serial_lacks_dma(cfg.instance)
             {
                 cfg.mode = UsartMode::Dma;
             }
@@ -4211,7 +4257,13 @@ pub fn module_config_ui(
         out.field("Hardware flow control", docs::USART_FLOW);
         ui.label("Hardware flow control");
         ui.vertical(|ui| {
-            let opts = UsartFlow::offered(cfg.mode, cfg.direction, family, is_async, line_extras);
+            let opts = UsartFlow::offered(
+                usart_transport(cfg),
+                cfg.direction,
+                family,
+                is_async,
+                line_extras,
+            );
             egui::ComboBox::from_id_salt("usart_flow")
                 .selected_text(not_built_here(cfg.flow.label(), opts.contains(&cfg.flow)))
                 .show_ui(ui, |ui| {
@@ -4247,8 +4299,9 @@ pub fn module_config_ui(
     // would otherwise sit there as a stale choice that generates nothing - so
     // both snap back to the plain form, from the SAME lists the two rows
     // offer. Direction first: it decides which flow options exist. The
-    // transport is never written, even where these lists ignore it: the Async
-    // runtime still reads it.
+    // transport is written in one case alone, a UART with no DMA request on
+    // embassy's Async runtime - never where these lists merely ignore it: the
+    // Async runtime still reads it.
     //
     // What the CHIP cannot do goes on every runtime: a usart_v1/v2 builds
     // neither half duplex on the RX pad nor DE, on either. What a RUNTIME
@@ -4265,6 +4318,13 @@ pub fn module_config_ui(
         }
         if embassy && (embassy_blocking || !runtime_applied) {
             return;
+        }
+        // The one transport write: embassy's Async runtime, applied, on a UART
+        // with no DMA request. The runtime that reads the transport is the one
+        // that cannot build DMA there, so the stored pick is stale for it - and
+        // left in place, main.rs would refuse a UART the row shows as buffered.
+        if embassy && cfg.mode != usart_transport(cfg) {
+            cfg.mode = usart_transport(cfg);
         }
         if !UsartDirection::offered(cfg.mode, family, is_async, line_extras)
             .contains(&cfg.direction)
@@ -5138,8 +5198,8 @@ pub fn module_config_ui(
                     // whatever the transport, and says that instead: `skip`
                     // keeps the first reason for a label, so the TX-only one
                     // must not get there first.
-                    let tx_only_dma =
-                        cfg.mode == UsartMode::Dma && cfg.direction == UsartDirection::TxOnly;
+                    let tx_only_dma = usart_transport(cfg) == UsartMode::Dma
+                        && cfg.direction == UsartDirection::TxOnly;
                     if tx_only_dma && !embassy_blocking {
                         out.skip("RX/TX buffer", docs::SKIP_USART_BUF_TX_ONLY);
                     }
@@ -5180,7 +5240,7 @@ pub fn module_config_ui(
                         );
                     }
                     if is_async && !tx_only_dma && !rp_dma && !nrf {
-                        let dma = cfg.mode == UsartMode::Dma;
+                        let dma = usart_transport(cfg) == UsartMode::Dma;
                         // The label AND the sentence both turn on the transport
                         // — the field means two different things, and the pane
                         // has to explain the one the reader is looking at.
@@ -5313,7 +5373,8 @@ pub fn module_config_ui(
                         if nrf {
                             out.skip("Async transport", docs::SKIP_USART_TRANSPORT_NRF);
                         } else {
-                            usart_mode_row(ui, out, &mut cfg.mode, family);
+                            let no_dma = serial_lacks_dma(cfg.instance);
+                            usart_mode_row(ui, out, &mut cfg.mode, family, no_dma);
                         }
                         // The transport decides which directions exist, and the
                         // pair decides which flow options do — so this order is
@@ -5332,8 +5393,9 @@ pub fn module_config_ui(
                             if cfg.mode == UsartMode::Dma {
                                 out.note(RP_DMA_NOTE);
                             }
-                        } else if cfg.mode == UsartMode::Dma && !nrf {
-                            // Never on an nRF: there are no channels to pick.
+                        } else if usart_transport(cfg) == UsartMode::Dma && !nrf {
+                            // Never on an nRF: there are no channels to pick -
+                            // nor for a UART the chip routes no request to.
                             let inst = cfg.instance;
                             dma_row(ui, out, uart_bus, inst, &mut cfg.dma_tx, &mut cfg.dma_rx);
                         }
@@ -7995,6 +8057,7 @@ mod tests {
             line_extras,
             block_partner,
             true,
+            None,
         )
         .0
     }
@@ -8019,6 +8082,18 @@ mod tests {
         line_extras: bool,
         edit: impl FnOnce(&mut UsartModuleConfig),
     ) -> (ConfigOut, UsartModuleConfig) {
+        drive_usart_on(family, is_async, runtime_applied, line_extras, None, edit)
+    }
+
+    /// `drive_usart_staged` on a chip carrying `dma`, its vendor DMA facts.
+    fn drive_usart_on(
+        family: &str,
+        is_async: bool,
+        runtime_applied: bool,
+        line_extras: bool,
+        dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
+        edit: impl FnOnce(&mut UsartModuleConfig),
+    ) -> (ConfigOut, UsartModuleConfig) {
         use crate::panels::mcu_module::modules::ModuleConfig;
 
         let mut cfg = UsartModuleConfig::new(1);
@@ -8032,6 +8107,7 @@ mod tests {
             line_extras,
             None,
             runtime_applied,
+            dma,
         );
         match m.config {
             ModuleConfig::Usart(c) => (out, c),
@@ -8050,6 +8126,7 @@ mod tests {
         line_extras: bool,
         block_partner: Option<&str>,
         runtime_applied: bool,
+        dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
     ) -> (ConfigOut, crate::panels::mcu_module::modules::VirtualModule) {
         use crate::panels::mcu_module::modules::VirtualModule;
 
@@ -8081,7 +8158,7 @@ mod tests {
                 runtime_applied,
                 family,
                 &mut pending,
-                None,
+                dma,
                 line_extras,
                 block_partner,
                 &mut out,
@@ -8295,6 +8372,12 @@ mod tests {
             ];
             out.push(ModuleConfig::I2c(c));
         }
+        // UART5, which no F3 routes a DMA request to (`every_cell` drives one):
+        // its Async transport row is the locked one, with a sentence of its own.
+        if let ModuleConfig::Usart(mut c) = kind.default_config(1) {
+            c.instance = 5;
+            out.push(ModuleConfig::Usart(c));
+        }
         out
     }
 
@@ -8306,7 +8389,7 @@ mod tests {
         let mut out = Vec::new();
         for kind in ModuleKind::ALL {
             for family in [
-                "stm32f1", "stm32g0", "esp32", "esp32c3", "rp2040", "nrf52833",
+                "stm32f1", "stm32f3", "stm32g0", "esp32", "esp32c3", "rp2040", "nrf52833",
             ] {
                 for (a, n) in [(false, false), (true, false), (false, true)] {
                     out.push((kind, family, a, n));
@@ -9281,6 +9364,104 @@ mod tests {
             );
             assert_eq!((c.direction, c.flow), (D::TxOnly, F::Cts));
             assert!(!labels_of(&out).contains(&"Data direction"));
+        }
+    }
+
+    /// A UART the chip routes no DMA request to - UART5 on an F103 by its own
+    /// table, on any F3 by the family fact: the Async transport row is locked on
+    /// Buffered with its own sentence, the one-way directions that need DMA go
+    /// with it, and no channel picker offers channels there are not. UART4
+    /// beside it, the F100 value line's UART5 and an F1 with no data at all keep
+    /// both transports.
+    #[test]
+    fn a_uart_with_no_dma_request_is_buffered_on_async() {
+        use crate::panels::mcu_module::codegen::dma_data::DmaChannel;
+        use crate::panels::mcu_module::mcu_def::DmaDef;
+        use UsartDirection as D;
+        use UsartMode as M;
+        let doc_of = |out: &ConfigOut, label: &str| {
+            out.fields()
+                .unwrap()
+                .iter()
+                .find(|f| f.label == label)
+                .unwrap_or_else(|| panic!("{label} row"))
+                .doc
+                .clone()
+        };
+        let uart = |n: u8, mode: M, d: D| {
+            move |c: &mut UsartModuleConfig| {
+                c.instance = n;
+                c.mode = mode;
+                c.direction = d;
+            }
+        };
+        let table = |rows: &[(&str, &str, &str)]| DmaDef {
+            mux: false,
+            channels: rows
+                .iter()
+                .map(|(_, ch, irq)| DmaChannel {
+                    peri: (*ch).into(),
+                    irq: (*irq).into(),
+                })
+                .collect(),
+            requests: rows
+                .iter()
+                .map(|(req, ch, _)| ((*req).into(), vec![(*ch).into()]))
+                .collect(),
+        };
+        // UART4 on DMA2, UART5 nowhere - as on an STM32F103RE.
+        let f103re = table(&[
+            ("UART4_TX", "DMA2_CH5", "DMA2_CHANNEL4_5"),
+            ("UART4_RX", "DMA2_CH3", "DMA2_CHANNEL3"),
+        ]);
+        // The value line: UART5 on DMA2 too.
+        let f100re = table(&[
+            ("UART5_TX", "DMA2_CH1", "DMA2_CHANNEL1"),
+            ("UART5_RX", "DMA2_CH4", "DMA2_CHANNEL4_5"),
+        ]);
+        for (family, dma) in [("stm32f1", Some(&f103re)), ("stm32f3", None)] {
+            // Applied: the stale DMA pick is the Async runtime's own, so it goes,
+            // and the direction is then clamped against the buffered list.
+            let (out, c) =
+                drive_usart_on(family, true, true, false, dma, uart(5, M::Dma, D::TxOnly));
+            assert_eq!((c.mode, c.direction), (M::Buffered, D::TxRx), "{family}");
+            assert_eq!(
+                doc_of(&out, "Async transport"),
+                docs::USART_ASYNC_TRANSPORT_NO_DMA,
+                "{family}"
+            );
+            let labels = labels_of(&out);
+            assert!(!labels.contains(&"DMA TX"), "{family}: {labels:?}");
+            assert!(labels.contains(&"RX/TX buffer"), "{family}: {labels:?}");
+
+            // Staged over the other runtime: nothing is written, and the rows
+            // still follow the transport Async would build.
+            let (out, c) =
+                drive_usart_on(family, true, false, false, dma, uart(5, M::Dma, D::TxOnly));
+            assert_eq!((c.mode, c.direction), (M::Dma, D::TxOnly), "{family}");
+            assert_eq!(
+                doc_of(&out, "Async transport"),
+                docs::USART_ASYNC_TRANSPORT_NO_DMA
+            );
+            assert!(!labels_of(&out).contains(&"DMA TX"));
+            assert!(!labels_of(&out).contains(&"RX DMA buffer"));
+        }
+        // Routed, or no opinion: untouched, with the DMA picker.
+        for (what, family, dma, n) in [
+            ("F103RE UART4", "stm32f1", Some(&f103re), 4),
+            ("F100RE UART5", "stm32f1", Some(&f100re), 5),
+            ("F1 with no data", "stm32f1", None, 5),
+            ("F4 with no data", "stm32f4", None, 5),
+        ] {
+            let (out, c) =
+                drive_usart_on(family, true, true, false, dma, uart(n, M::Dma, D::TxOnly));
+            assert_eq!((c.mode, c.direction), (M::Dma, D::TxOnly), "{what}");
+            assert_eq!(
+                doc_of(&out, "Async transport"),
+                docs::USART_ASYNC_TRANSPORT,
+                "{what}"
+            );
+            assert!(labels_of(&out).contains(&"DMA TX"), "{what}");
         }
     }
 

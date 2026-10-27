@@ -117,7 +117,9 @@ pub fn serial_handle(peri: &str, n: u8, sfx: &str) -> String {
 /// config module (`usart4.rs`) and embassy's driver - but not the singleton:
 /// an STM32F103RC has `p.UART4`, and `p.USART4` is E0609. Read from the vector
 /// list where the chip carries one (a G0's `USART3_4_LPUART1` keeps USART4 a
-/// USART); without one, only the F1's UART4/5 are known to be UARTs.
+/// USART); without one, only the F1's and the F3's UART4/5 are known to be
+/// UARTs - no part of either family names a USART4 or USART5 (CubeMX database,
+/// 2026-10-27).
 pub(super) fn serial_word(
     word: &'static str,
     family: &str,
@@ -128,7 +130,7 @@ pub(super) fn serial_word(
         return word;
     }
     let uart = if irqs.is_empty() {
-        family == "stm32f1" && n >= 4
+        matches!(family, "stm32f1" | "stm32f3") && n >= 4
     } else {
         nvic::vector_for(irqs, "USART", n).is_none() && nvic::vector_for(irqs, "UART", n).is_some()
     };

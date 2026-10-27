@@ -2944,6 +2944,8 @@ mod emit_for_manual_compile {
     /// `EIDE_EXPECT_CONFIGS` fails a row whose drivers all fell away, and
     /// `EIDE_BLK_UPGRADE=used` opens a project from before the Blocking drivers,
     /// whose hand-wired USART must come back with "Generate driver" off.
+    /// `EIDE_LPUART_DMA=1` puts the LPUART on DMA too, and `EIDE_EXPECT_MAIN`
+    /// names a line main.rs must carry - the refusal a row exists to prove.
     ///
     /// STM32G4 has no hand-written request table and never will need one: its
     /// controller is muxed, so any free channel serves any peripheral. Whether
@@ -3433,6 +3435,11 @@ mod emit_for_manual_compile {
                     } else {
                         c.flow = crate::panels::mcu_module::modules::UsartFlow::CtsRts;
                     }
+                    // `EIDE_LPUART_DMA=1` puts it on DMA instead - the request an
+                    // STM32L4 spells without its number (`LPUART_TX`).
+                    if std::env::var("EIDE_LPUART_DMA").is_ok() {
+                        c.mode = UsartMode::Dma;
+                    }
                 }
                 // A non-default frequency, duty and output shape, so the
                 // generated consts and the `low_level` calls are exercised
@@ -3622,6 +3629,15 @@ mod emit_for_manual_compile {
             !main_rs.contains("DMA_TX_TODO") && !main_rs.contains("DMA_RX_TODO"),
             "a muxed chip should need no TODO:\n{main_rs}"
         );
+        // `EIDE_EXPECT_MAIN=text` names a line main.rs must carry: a row whose
+        // point is a refusal (UART5 on DMA, which no F1 routes) would otherwise
+        // pass by compiling a project where the pads never got wired.
+        if let Ok(want) = std::env::var("EIDE_EXPECT_MAIN") {
+            assert!(
+                main_rs.contains(&want),
+                "main.rs lacks {want:?}:\n{main_rs}"
+            );
+        }
         // A Blocking EXTI row that armed nothing would pass by building GPIO.
         if mcu.runtime == crate::panels::mcu_module::mcu::model::Runtime::Blocking
             && std::env::var_os("EIDE_EXTI").is_some()

@@ -1295,63 +1295,26 @@ fn signal_name(f: &PinFunction) -> Option<String> {
 fn ambiguity_notes(mcu: &Mcu) -> String {
     let embassy = on_embassy(mcu);
     let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
-    let (uart, spi, i2c) = (uart_pins(mcu), spi_pins(mcu), i2c_pins(mcu));
-    // The bus loops' own gates, read the same way: a UARTE by `uarte_pads`, a
-    // SPIM by its clock (and, on embassy-nrf, a data line beside it), a TWIM
-    // by the pair.
+    let uart = uart_pins(mcu);
+    // The pads of a UARTE that is built, by `uarte_pads` (which half, which
+    // flow pad). Every other bus is configured whole when built - the bus
+    // loops' gates and embassy-nrf's block order, replayed by `block_claims`.
     let uarte = |i: u8| uarte_pads(&uart, &ucfgs, i, embassy).ok();
-    let spim = |i: u8| {
-        role_of(&spi, i, "sck").is_some()
-            && (!embassy
-                || role_of(&spi, i, "mosi").is_some()
-                || role_of(&spi, i, "miso").is_some())
+    let claims = block_claims(mcu, embassy);
+    let built = |kind: &str, i: u8| {
+        claims
+            .iter()
+            .any(|c| c.kind == kind && c.inst == i && c.built)
     };
-    let twim = |i: u8| role_of(&i2c, i, "sda").is_some() && role_of(&i2c, i, "scl").is_some();
-    // And, on embassy-nrf, its block order: `async_bus_lines` builds every
-    // UARTE it can, then each SPIM and TWIM whose serial block is still free
-    // (`clash`), so a bus whose block went to an earlier one is built by
-    // nobody. nrf-hal builds both buses of a shared block
-    // (`shared_block_partner`), so the gates above are its whole rule.
-    let mut taken: Vec<String> = Vec::new();
-    let mut lost: Vec<(&str, u8)> = Vec::new();
-    if embassy {
-        for i in instances(&uart).into_iter().filter(|i| uarte(*i).is_some()) {
-            taken.push(serial_block(&mcu.family, "uarte", i).0);
-        }
-        for (kind, insts) in [
-            (
-                "spim",
-                instances(&spi)
-                    .into_iter()
-                    .filter(|i| spim(*i))
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "twim",
-                instances(&i2c).into_iter().filter(|i| twim(*i)).collect(),
-            ),
-        ] {
-            for i in insts {
-                let peri = serial_block(&mcu.family, kind, i).0;
-                if taken.contains(&peri) {
-                    lost.push((kind, i));
-                } else {
-                    taken.push(peri);
-                }
-            }
-        }
-    }
     let configured = |f: &PinFunction| match f {
         PinFunction::UsartTx(i) => uarte(*i).is_some_and(|p| p.txd.is_some()),
         PinFunction::UsartRx(i) => uarte(*i).is_some_and(|p| p.rxd.is_some()),
         PinFunction::UsartCts(i) => uarte(*i).is_some_and(|p| p.cts.is_some()),
         PinFunction::UsartRts(i) => uarte(*i).is_some_and(|p| p.rts.is_some()),
         PinFunction::SpiSck(i) | PinFunction::SpiMosi(i) | PinFunction::SpiMiso(i) => {
-            spim(*i) && !lost.contains(&("spim", *i))
+            built("spim", *i)
         }
-        PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => {
-            twim(*i) && !lost.contains(&("twim", *i))
-        }
+        PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => built("twim", *i),
         _ => true,
     };
     let mut by_signal: std::collections::BTreeMap<String, Vec<(u8, u8)>> =
@@ -2431,11 +2394,12 @@ struct AsyncBuses {
     ///
     /// Not folded into `body`: that goes inside `async fn main`, and a const
     /// declared in a function body is private to it, which rustc then reports
-    /// as dead code until the user's own code happens to name it. And not
-    /// rebuilt by a second pass over the pins either, because which buses get
-    /// built here is not a property of the pins alone - `clash` drops a TWIM
-    /// whose block a SPIM already took - so the only place that knows is this
-    /// loop.
+    /// as dead code until the user's own code happens to name it. Written by
+    /// the TWIM loop beside the constructor it really emits: which buses get
+    /// built is not a property of the pins alone - `clash` drops a bus whose
+    /// block an earlier one took. `block_claims` replays the same gates and
+    /// block order for `ambiguity_notes` and `shared_block`, so a change to
+    /// these loops' gates or order is a change there too.
     items: String,
     /// Whether `body` names `static_cell` (a TWIM's RAM buffer, the USB
     /// stack's buffers).
@@ -2444,9 +2408,11 @@ struct AsyncBuses {
 
 /// UARTE, SPIM, TWIM, PWM and SAADC on embassy-nrf, in that order.
 ///
-/// Each block's peripheral is recorded as it is taken, because SPIMn and TWIMn
-/// (n < 2) are ONE block: a second constructor on it would not compile, so the
-/// second of the two gets a comment instead.
+/// Each block's peripheral is recorded as it is taken, because one block can
+/// be several kinds - a SPIM and a TWIM on an nRF52's TWISPIn (TWI0_SPI1 on
+/// the 52811), a UARTE, SPIM and TWIM on the nRF5340/54L15's SERIALn: a second
+/// constructor on it would not compile, so the first in UARTE, SPIM, TWIM order
+/// takes the block and every later one gets a comment instead (`clash`).
 fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     use crate::panels::mcu_module::modules::{
         self, Parity, PwmCounting, PwmMode, PwmOutput, PwmPolarity, SpiBitOrder, StopBits,
@@ -3167,70 +3133,180 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     (before, after, body)
 }
 
-/// The module that shares `me`'s serial block, as its peripheral name.
+/// One bus main.rs reaches past its pads, on its serial block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockClaim {
+    kind: &'static str,
+    inst: u8,
+    /// `serial_block`'s name for it: `TWISPI0`, `SERIAL0`, `UARTE0`.
+    block: String,
+    /// Whether main.rs writes its constructor.
+    built: bool,
+}
+
+/// Every UARTE, SPIM and TWIM main.rs reaches past its pad gate, in the order
+/// the bus loops take them - UARTEs, then SPIMs, then TWIMs, each by instance
+/// - with its serial block and whether a constructor is written for it.
 ///
-/// SPIMn and TWIMn (n < 2) are ONE block on the nRF52 - `serial_block` names
-/// it `TWISPIn` - and the chip runs one of them at a time. `async_bus_lines`
-/// builds the SPIM and leaves the TWIM a comment; `bus_lines` builds both,
-/// and the TWIM's `init`, second in `main.rs`, writes the block's shared
-/// ENABLE register over the SPIM's. Either way one bus is silently lost, so
-/// the modules panel asks this per module and says so on both. `Some("TWIM0")`
-/// for the SPI of such a pair, `Some("SPIM0")` for the I2C, `None` on any
-/// other chip, instance or kind.
+/// On embassy-nrf (`embassy`: `async_bus_lines`) the first claimant of a block
+/// is built and every later one is a comment (`clash`). nrf-hal (`bus_lines`)
+/// has no such check: every bus is built, and on a shared block the init that
+/// runs LAST writes its ENABLE register over the others'.
 ///
-/// Read off the PADS, and only for a pair the generator would really build
-/// on `is_async`'s runtime: each loop skips a half-wired bus before its clash
-/// check, so with one half short the other has the block to itself, and the
-/// panel's sentence about which one loses would be false. The tests hold this
-/// to `fresh_main_rs` for both runtimes.
-pub fn shared_block_partner(
+/// The gates are the loops' own: a UARTE by `uarte_pads`, a SPIM by its clock
+/// (and, on embassy-nrf, a data line beside it - embassy-nrf has no clock-only
+/// constructor, nrf-hal takes MOSI and MISO as `Option`s), a TWIM by the pair.
+/// ONE replay, read by `ambiguity_notes` (main.rs) and `shared_block` (the
+/// modules panel), so neither can name a bus the other calls lost.
+fn block_claims(mcu: &Mcu, embassy: bool) -> Vec<BlockClaim> {
+    let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
+    let (uart, spi, i2c) = (uart_pins(mcu), spi_pins(mcu), i2c_pins(mcu));
+    let spim = |i: u8| {
+        role_of(&spi, i, "sck").is_some()
+            && (!embassy
+                || role_of(&spi, i, "mosi").is_some()
+                || role_of(&spi, i, "miso").is_some())
+    };
+    let twim = |i: u8| role_of(&i2c, i, "sda").is_some() && role_of(&i2c, i, "scl").is_some();
+    let mut claims: Vec<BlockClaim> = Vec::new();
+    for (kind, insts) in [
+        (
+            "uarte",
+            instances(&uart)
+                .into_iter()
+                .filter(|i| uarte_pads(&uart, &ucfgs, *i, embassy).is_ok())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "spim",
+            instances(&spi).into_iter().filter(|i| spim(*i)).collect(),
+        ),
+        (
+            "twim",
+            instances(&i2c).into_iter().filter(|i| twim(*i)).collect(),
+        ),
+    ] {
+        for inst in insts {
+            let block = serial_block(&mcu.family, kind, inst).0;
+            // The UARTE loop takes no `clash` check: it runs first, and no two
+            // UARTEs share a block.
+            let built =
+                !embassy || kind == "uarte" || !claims.iter().any(|c| c.built && c.block == block);
+            claims.push(BlockClaim {
+                kind,
+                inst,
+                block,
+                built,
+            });
+        }
+    }
+    claims
+}
+
+/// A serial block more than one bus main.rs reaches is on, as the modules
+/// panel says it on each of them (`shared_block`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedBlock {
+    /// The block, as embassy-nrf names its `Peripherals` field: `TWISPI0`,
+    /// `TWI0_SPI1`, `SERIAL0`, `SERIAL20`.
+    pub block: String,
+    /// The part, as Nordic writes it: `nRF52833`.
+    pub part: &'static str,
+    /// The module asked about: `SPIM0`.
+    pub me: String,
+    /// Every bus on the block, `me` among them, in the order main.rs reaches
+    /// them: `UARTE0`, `SPIM0`, `TWIM0`.
+    pub buses: Vec<String>,
+    /// The one that ends up running the block: on embassy-nrf the first, the
+    /// others being comments; on nrf-hal the last, whose init runs last.
+    pub owner: String,
+    /// Whether the others are left out of main.rs (embassy-nrf) rather than
+    /// built and then switched off (nrf-hal).
+    pub embassy: bool,
+    /// The part's instances of `me`'s kind on a block no other kind shares -
+    /// the way out the panel names (`SPIM2`, `SPIM3`), empty where there is
+    /// none.
+    pub lonely: Vec<String>,
+}
+
+/// The serial block `me` shares with another bus main.rs reaches on
+/// `is_async`'s runtime, or `None`.
+///
+/// One nRF block can be several kinds of serial peripheral, and the chip runs
+/// one of them at a time: SPIMn and TWIMn (n < 2) on the nRF52 (`TWISPIn`;
+/// SPIM1 with TWIM0 on the 52811, and nothing on the 52805/52810, whose SPI0
+/// and TWI0 are separate), and UARTE, SPIM and TWIM n on the nRF5340
+/// (`SERIALn`) and the nRF54L15 (`SERIAL00/20/21/22/30`). On embassy-nrf the
+/// first of them in the bus loops' order takes the block and the others are
+/// comments; nrf-hal builds them all and the last init switches the others
+/// off. Either way buses are silently lost, so the modules panel asks this
+/// for each one and says so on all of them - the UARTE included, which on a
+/// SERIALn block is the one that wins.
+///
+/// Only for buses the generator would really reach (`block_claims`): a bus
+/// short of its pads leaves the block to the others, and a sentence about
+/// which one loses would be false. The tests hold this to `fresh_main_rs` for
+/// both runtimes.
+pub fn shared_block(
     mcu: &Mcu,
     me: &crate::panels::mcu_module::modules::VirtualModule,
     is_async: bool,
-) -> Option<String> {
+) -> Option<SharedBlock> {
     use crate::panels::mcu_module::modules::ModuleKind;
-    if !is_nrf(&mcu.family) {
-        return None;
-    }
-    let family = mcu.family.as_str();
-    let n = me.instance();
-    // The partner is the instance of the OTHER kind on the same block, and
-    // which one that is depends on the part: TWIM0 shares with SPIM1 on the
-    // 52811, and with nothing on the 52805/52810.
-    let (sn, tn) = match me.kind {
-        ModuleKind::GenericInterfaceSpi => {
-            let block = serial_block(family, "spim", n).0;
-            (
-                n,
-                (0..4).find(|&m| serial_block(family, "twim", m).0 == block)?,
-            )
-        }
-        ModuleKind::GenericInterfaceI2c => {
-            let block = serial_block(family, "twim", n).0;
-            (
-                (0..4).find(|&m| serial_block(family, "spim", m).0 == block)?,
-                n,
-            )
-        }
+    let c = chip(&mcu.family)?;
+    let kind = match me.kind {
+        ModuleKind::GenericInterfaceUsart => "uarte",
+        ModuleKind::GenericInterfaceSpi => "spim",
+        ModuleKind::GenericInterfaceI2c => "twim",
         _ => return None,
     };
-    let name = match me.kind {
-        ModuleKind::GenericInterfaceSpi => format!("TWIM{tn}"),
-        _ => format!("SPIM{sn}"),
+    let n = me.instance();
+    let embassy = is_async || blocking_on_embassy(&mcu.family);
+    let claims = block_claims(mcu, embassy);
+    let mine = claims.iter().find(|c| c.kind == kind && c.inst == n)?;
+    let on_it: Vec<&BlockClaim> = claims.iter().filter(|c| c.block == mine.block).collect();
+    if on_it.len() < 2 {
+        return None;
+    }
+    let name = |c: &BlockClaim| format!("{}{}", c.kind.to_ascii_uppercase(), c.inst);
+    let owner = if embassy {
+        on_it.iter().find(|c| c.built)
+    } else {
+        on_it.last()
+    }
+    .map(|c| name(c))?;
+    let of_kind = |k: &str| -> &'static [u8] {
+        match k {
+            "uarte" => c.uarte,
+            "spim" => c.spim,
+            _ => c.twim,
+        }
     };
-    // embassy-nrf has no clock-only constructor; on the part nrf-hal has no
-    // crate for, Blocking is embassy-nrf too.
-    let embassy = is_async || blocking_on_embassy(family);
-    // The same tests, in the same order, as the two SPIM loops: SCK first,
-    // then (embassy only) a data line, since nrf-hal takes MOSI and MISO as
-    // `Option`s.
-    let spi = spi_pins(mcu);
-    let spim = role_of(&spi, sn, "sck").is_some()
-        && (!embassy || role_of(&spi, sn, "mosi").is_some() || role_of(&spi, sn, "miso").is_some());
-    // Both TWIM loops take the pair or nothing.
-    let i2c = i2c_pins(mcu);
-    let twim = role_of(&i2c, tn, "scl").is_some() && role_of(&i2c, tn, "sda").is_some();
-    (spim && twim).then_some(name)
+    let lonely = of_kind(kind)
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let block = serial_block(&mcu.family, kind, i).0;
+            ["uarte", "spim", "twim"]
+                .into_iter()
+                .filter(|k| *k != kind)
+                .all(|k| {
+                    of_kind(k)
+                        .iter()
+                        .all(|&j| serial_block(&mcu.family, k, j).0 != block)
+                })
+        })
+        .map(|i| format!("{}{i}", kind.to_ascii_uppercase()))
+        .collect();
+    Some(SharedBlock {
+        block: mine.block.clone(),
+        part: c.part,
+        me: name(mine),
+        buses: on_it.iter().map(|c| name(c)).collect(),
+        owner,
+        embassy,
+        lonely,
+    })
 }
 
 /// The block on embassy-nrf: under the executor on Async, and under a plain
@@ -5426,9 +5502,11 @@ mod watchdog_nrf {
 #[cfg(test)]
 mod shared_block {
     use super::blocking_codegen::microbit;
-    use super::shared_block_partner;
+    use super::{SharedBlock, shared_block};
     use crate::panels::mcu_module::mcu::{Mcu, Runtime};
-    use crate::panels::mcu_module::modules::{ModuleKind, VirtualModule};
+    use crate::panels::mcu_module::modules::{
+        ModuleConfig, ModuleKind, UsartDirection, VirtualModule,
+    };
     use crate::panels::mcu_module::pins::PinFunction;
 
     fn module(kind: ModuleKind, n: u8) -> VirtualModule {
@@ -5442,12 +5520,17 @@ mod shared_block {
         }
     }
 
-    /// What the panel says about SPIM`n` and TWIM`n` on this wiring, asked
-    /// from both sides.
-    fn partners(mcu: &Mcu, n: u8, is_async: bool) -> (Option<String>, Option<String>) {
+    /// The buses the panel names on SPIM`n`'s and TWIM`n`'s block, asked from
+    /// both sides, with the one main.rs leaves running.
+    fn partners(
+        mcu: &Mcu,
+        n: u8,
+        is_async: bool,
+    ) -> (Option<(Vec<String>, String)>, Option<(Vec<String>, String)>) {
+        let ask = |kind| shared_block(mcu, &module(kind, n), is_async).map(|s| (s.buses, s.owner));
         (
-            shared_block_partner(mcu, &module(ModuleKind::GenericInterfaceSpi, n), is_async),
-            shared_block_partner(mcu, &module(ModuleKind::GenericInterfaceI2c, n), is_async),
+            ask(ModuleKind::GenericInterfaceSpi),
+            ask(ModuleKind::GenericInterfaceI2c),
         )
     }
 
@@ -5460,6 +5543,10 @@ mod shared_block {
         mcu
     }
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     const SCK: PinFunction = PinFunction::SpiSck(0);
     const MOSI: PinFunction = PinFunction::SpiMosi(0);
     const SCL: PinFunction = PinFunction::I2cScl(0);
@@ -5468,7 +5555,8 @@ mod shared_block {
     /// The panel names a pair exactly when `main.rs` loses a bus to it: the
     /// clash comment on Async, both inits on Blocking. Run over the wirings
     /// where the two runtimes' half-wired rules differ, so the sentence can
-    /// never point at a bus the generator actually built.
+    /// never point at a bus the generator actually built. The owner is the
+    /// SPIM on embassy-nrf (built first) and the TWIM on nrf-hal (init last).
     #[test]
     fn a_pair_is_named_exactly_when_main_rs_loses_a_bus() {
         let wirings: [&[(&str, PinFunction)]; 5] = [
@@ -5506,14 +5594,11 @@ mod shared_block {
                         && main.contains("pins::configs::twim0::init(")
                 };
                 assert_eq!(lost, want, "generator, async={is_async}, {wire:?}:\n{main}");
-                let named = if want {
-                    (Some("TWIM0".to_owned()), Some("SPIM0".to_owned()))
-                } else {
-                    (None, None)
-                };
+                let owner = if is_async { "SPIM0" } else { "TWIM0" };
+                let named = want.then(|| (names(&["SPIM0", "TWIM0"]), owner.to_owned()));
                 assert_eq!(
                     partners(&mcu, 0, is_async),
-                    named,
+                    (named.clone(), named),
                     "async={is_async}, {wire:?}"
                 );
             }
@@ -5530,15 +5615,14 @@ mod shared_block {
             ("P0.16", PinFunction::I2cSda(1)),
         ]);
         for is_async in [true, false] {
-            assert_eq!(
-                partners(&mcu, 1, is_async),
-                (Some("TWIM1".to_owned()), Some("SPIM1".to_owned()))
-            );
+            let (spi, i2c) = partners(&mcu, 1, is_async);
+            assert_eq!(spi, i2c);
+            assert_eq!(spi.expect("a pair").0, names(&["SPIM1", "TWIM1"]));
         }
     }
 
-    /// Different ids share nothing, SPIM2 has no TWIM twin, a UART is its own
-    /// block, and no chip but the nRF gets the note.
+    /// Different ids share nothing, SPIM2 has no TWIM twin, an nRF52's UARTE
+    /// is its own block, and no chip but the nRF gets the note.
     #[test]
     fn different_ids_other_kinds_and_other_chips_are_left_alone() {
         let crossed = microbit(&[
@@ -5559,13 +5643,15 @@ mod shared_block {
         assert_eq!(partners(&spim2, 2, true), (None, None));
 
         let full = microbit(&[
+            ("P0.06", PinFunction::UsartTx(0)),
+            ("P1.08", PinFunction::UsartRx(0)),
             ("P0.17", SCK),
             ("P0.13", MOSI),
             ("P0.08", SCL),
             ("P0.16", SDA),
         ]);
         let uart = module(ModuleKind::GenericInterfaceUsart, 0);
-        assert_eq!(shared_block_partner(&full, &uart, true), None);
+        assert_eq!(shared_block(&full, &uart, true), None);
         for family in ["stm32f1", "stm32g0", "esp32c3", "rp2040"] {
             let mut other = microbit(&[
                 ("P0.17", SCK),
@@ -5576,6 +5662,167 @@ mod shared_block {
             other.family = family.to_owned();
             assert_eq!(partners(&other, 0, true), (None, None), "{family}");
         }
+    }
+
+    /// The micro:bit's wiring on another part, its UARTE0 module set to `dir`.
+    fn part(family: &str, wire: &[(&str, PinFunction)], dir: UsartDirection) -> Mcu {
+        let mut mcu = microbit(wire);
+        mcu.family = family.to_owned();
+        mcu.reconcile_modules();
+        for m in &mut mcu.modules {
+            if let ModuleConfig::Usart(c) = &mut m.config {
+                c.direction = dir;
+            }
+        }
+        mcu
+    }
+
+    /// On an nRF5340, UARTE0, SPIM0 and TWIM0 are one SERIAL0, and the UARTE
+    /// takes it first on both runtimes (both are embassy-nrf there): the panel
+    /// says so on all three, the UARTE's own panel included, and main.rs
+    /// leaves the other two comments. A one-way UARTE takes the block from a
+    /// single pad; a refused one leaves it to the SPIM.
+    #[test]
+    fn a_uarte_takes_its_serial_block_first() {
+        let serial0 = [
+            ("P0.06", PinFunction::UsartTx(0)),
+            ("P1.08", PinFunction::UsartRx(0)),
+            ("P0.17", SCK),
+            ("P0.13", MOSI),
+            ("P0.08", SCL),
+            ("P0.16", SDA),
+        ];
+        let three = names(&["UARTE0", "SPIM0", "TWIM0"]);
+        for is_async in [true, false] {
+            let mcu = on(part("nrf5340", &serial0, UsartDirection::TxRx), is_async);
+            let main = mcu.fresh_main_rs();
+            for lost in ["SPIM0", "TWIM0"] {
+                assert!(
+                    main.contains(&format!(
+                        "// {lost} is not built: it is the same block as UARTE0 (SERIAL0)"
+                    )),
+                    "async={is_async}: {main}"
+                );
+            }
+            for kind in [
+                ModuleKind::GenericInterfaceUsart,
+                ModuleKind::GenericInterfaceSpi,
+                ModuleKind::GenericInterfaceI2c,
+            ] {
+                let s = shared_block(&mcu, &module(kind, 0), is_async)
+                    .unwrap_or_else(|| panic!("{kind:?} async={is_async}"));
+                assert_eq!(
+                    (
+                        s.block.as_str(),
+                        s.part,
+                        &s.buses,
+                        s.owner.as_str(),
+                        s.embassy
+                    ),
+                    ("SERIAL0", "nRF5340", &three, "UARTE0", true),
+                    "{kind:?} async={is_async}"
+                );
+                assert!(s.lonely.is_empty() || kind == ModuleKind::GenericInterfaceSpi);
+            }
+            // The SPIM's way out is SPIM4, which shares nothing.
+            let spi = shared_block(&mcu, &module(ModuleKind::GenericInterfaceSpi, 0), is_async);
+            assert_eq!(spi.unwrap().lonely, names(&["SPIM4"]));
+        }
+        // One pad and a one-way direction: the UARTE still takes the block.
+        let one_way = part(
+            "nrf5340",
+            &[
+                ("P0.06", PinFunction::UsartTx(0)),
+                ("P0.17", SCK),
+                ("P0.13", MOSI),
+            ],
+            UsartDirection::TxOnly,
+        );
+        let s = shared_block(&one_way, &module(ModuleKind::GenericInterfaceSpi, 0), true);
+        assert_eq!(
+            s.map(|s| (s.buses, s.owner)),
+            Some((names(&["UARTE0", "SPIM0"]), "UARTE0".to_owned()))
+        );
+        // The same pad on the pair is refused, and the SPIM has SERIAL0 alone.
+        let refused = part(
+            "nrf5340",
+            &[
+                ("P0.06", PinFunction::UsartTx(0)),
+                ("P0.17", SCK),
+                ("P0.13", MOSI),
+            ],
+            UsartDirection::TxRx,
+        );
+        assert!(
+            refused
+                .fresh_main_rs()
+                .contains("UARTE0 is NOT initialised")
+        );
+        assert_eq!(
+            shared_block(&refused, &module(ModuleKind::GenericInterfaceSpi, 0), true),
+            None
+        );
+    }
+
+    /// The nRF54L15's SERIAL00 is a UARTE and a SPIM (no TWIM00); the panel
+    /// names it, and nothing on the part is a block of its own.
+    #[test]
+    fn the_nrf54l15_shares_serial00() {
+        let mcu = part(
+            "nrf54l15",
+            &[
+                ("P0.06", PinFunction::UsartTx(0)),
+                ("P1.08", PinFunction::UsartRx(0)),
+                ("P0.17", SCK),
+                ("P0.13", MOSI),
+            ],
+            UsartDirection::TxRx,
+        );
+        let s: SharedBlock =
+            shared_block(&mcu, &module(ModuleKind::GenericInterfaceUsart, 0), false).unwrap();
+        assert_eq!(
+            (s.block.as_str(), s.part, s.owner.as_str(), s.embassy),
+            ("SERIAL00", "nRF54L15", "UARTE0", true)
+        );
+        assert!(s.lonely.is_empty(), "{:?}", s.lonely);
+        assert!(
+            mcu.fresh_main_rs()
+                .contains("// SPIM0 is not built: it is the same block as UARTE0 (SERIAL00)")
+        );
+    }
+
+    /// The 52820's Blocking runtime is embassy-nrf, so its TWISPI0 pair is the
+    /// Async reading - the TWIM is a comment, not built and switched off -
+    /// whatever `is_async` says. A SPIM on an nRF52 points at the SPIMs with
+    /// a block of their own.
+    #[test]
+    fn blocking_on_embassy_reads_like_async() {
+        let mut mcu = on(
+            microbit(&[
+                ("P0.17", SCK),
+                ("P0.13", MOSI),
+                ("P0.08", SCL),
+                ("P0.16", SDA),
+            ]),
+            false,
+        );
+        mcu.family = "nrf52820".into();
+        assert!(
+            mcu.fresh_main_rs()
+                .contains("// TWIM0 is not built: it is the same block as SPIM0")
+        );
+        let s = shared_block(&mcu, &module(ModuleKind::GenericInterfaceI2c, 0), false).unwrap();
+        assert_eq!((s.owner.as_str(), s.embassy), ("SPIM0", true));
+        let nrf52833 = microbit(&[
+            ("P0.17", SCK),
+            ("P0.13", MOSI),
+            ("P0.08", SCL),
+            ("P0.16", SDA),
+        ]);
+        let spi = shared_block(&nrf52833, &module(ModuleKind::GenericInterfaceSpi, 0), true);
+        assert_eq!(spi.unwrap().lonely, names(&["SPIM2", "SPIM3"]));
+        let i2c = shared_block(&nrf52833, &module(ModuleKind::GenericInterfaceI2c, 0), true);
+        assert!(i2c.unwrap().lonely.is_empty());
     }
 }
 

@@ -1641,7 +1641,7 @@ const NRF_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "Shared blocks:",
-            "Where the silicon has one block for several kinds, only the first of UARTE, SPIM, TWIM on it is built and the others get a comment. On an nRF52 such a block pairs a SPIM with a TWIM (TWISPI0/1; TWI0_SPI1 on the 52811), and the module panel flags the pair. On the nRF5340 UARTE, SPIM and TWIM n are all SERIALn (SPIM4 stands alone); on the nRF54L15 they are SERIAL00/20/21/22/30 (SERIAL00 has no TWIM), and the DK offers each only on its own power domain's port (SERIAL00 on P2, SERIAL20/21/22 on P1, SERIAL30 on P0); the generator flags any other pin.",
+            "Where the silicon has one block for several kinds, only the first of UARTE, SPIM, TWIM on it is built and the others get a comment; the module panel says so on every bus on the block, the UARTE that wins it included. On an nRF52 such a block pairs a SPIM with a TWIM (TWISPI0/1; TWI0_SPI1 on the 52811). On the nRF5340 UARTE, SPIM and TWIM n are all SERIALn (SPIM4 stands alone); on the nRF54L15 they are SERIAL00/20/21/22/30 (SERIAL00 has no TWIM), and the DK offers each only on its own power domain's port (SERIAL00 on P2, SERIAL20/21/22 on P1, SERIAL30 on P0); the generator flags any other pin.",
         ),
         (
             "Inputs:",

@@ -1641,21 +1641,25 @@ impl AppIde {
                                 } else {
                                     None
                                 };
-                                // Which nRF SPIM / TWIM modules share one
-                                // block, by module id, on the STAGED runtime
-                                // the rows below describe. Also read now: each
-                                // config panel sees one module, and the pair
-                                // is a fact about the pads of the others.
-                                let block_partner: std::collections::HashMap<String, String> =
-                                    mcu.modules
-                                        .iter()
-                                        .filter_map(|m| {
-                                            crate::panels::mcu_module::codegen::nrf::shared_block_partner(
-                                                mcu, m, is_async,
-                                            )
-                                            .map(|p| (m.id.clone(), p))
-                                        })
-                                        .collect();
+                                // Which nRF UARTE / SPIM / TWIM modules share
+                                // one serial block, by module id, on the STAGED
+                                // runtime the rows below describe. Also read
+                                // now: each config panel sees one module, and
+                                // the others on its block are a fact about
+                                // their pads.
+                                let shared_block: std::collections::HashMap<
+                                    String,
+                                    crate::panels::mcu_module::codegen::nrf::SharedBlock,
+                                > = mcu
+                                    .modules
+                                    .iter()
+                                    .filter_map(|m| {
+                                        crate::panels::mcu_module::codegen::nrf::shared_block(
+                                            mcu, m, is_async,
+                                        )
+                                        .map(|s| (m.id.clone(), s))
+                                    })
+                                    .collect();
                                 let mut local_pending: std::collections::BTreeMap<
                                     String,
                                     (ApiStyle, AsyncBusMode),
@@ -2085,7 +2089,7 @@ impl AppIde {
                                                         runtime_applied,
                                                         &family, pending, chip_dma.as_ref(),
                                                         usart_line_extras, chip_i2s,
-                                                        block_partner.get(&m.id).map(String::as_str),
+                                                        shared_block.get(&m.id),
                                                         &mut my_out, &baud_chip, &mut i2c_io,
                                                     );
                                                 });

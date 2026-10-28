@@ -325,15 +325,16 @@ fn rp_spi_init_locked(ui: &mut egui::Ui, out: &mut ConfigOut) {
     ui.end_row();
 }
 
-/// A SPIM and a TWIM on one nRF52 block: the row in the grid and the standing
-/// note, on whichever of the two is being drawn.
+/// Buses on one nRF serial block: the row in the grid and the standing note,
+/// on whichever of them is being drawn - a SPIM and a TWIM on an nRF52's
+/// TWISPIn, or a UARTE, SPIM and TWIM on an nRF5340/54L15 SERIALn.
 ///
-/// `partner` is the other module's peripheral (`TWIM0` under a SPI, `SPIM0`
-/// under an I2C), found by `nrf::shared_block_partner` in the caller: this
-/// panel sees one module, so the pair is a fact it has to be told, like
-/// `line_extras`. What `main.rs` does with the pair differs by runtime, and
-/// the sentence says which; both readings are the nRF backend's own
-/// (`async_bus_lines` skips the TWIM, `bus_lines` builds both).
+/// `shared` is found by `nrf::shared_block` in the caller: this panel sees one
+/// module, so the others on its block are a fact it has to be told, like
+/// `line_extras`. What `main.rs` does with them differs by HAL, and the
+/// sentence says which; both readings are the nRF backend's own
+/// (`async_bus_lines` builds the first and leaves the rest comments,
+/// `bus_lines` builds all of them).
 ///
 /// The grid gets the SHORT line, with the full sentence on hover and in the
 /// details pane: nothing in this grid wraps, and the full sentence was
@@ -341,12 +342,9 @@ fn rp_spi_init_locked(ui: &mut egui::Ui, out: &mut ConfigOut) {
 fn nrf_shared_block_row(
     ui: &mut egui::Ui,
     out: &mut ConfigOut,
-    me: &str,
-    partner: &str,
-    instance: u8,
-    is_async: bool,
+    shared: &crate::panels::mcu_module::codegen::nrf::SharedBlock,
 ) {
-    let (short, full) = nrf_shared_block_text(me, partner, instance, is_async);
+    let (short, full) = nrf_shared_block_text(shared);
     out.note(full.clone());
     ui.label("");
     ui.label(
@@ -359,37 +357,83 @@ fn nrf_shared_block_row(
 }
 
 /// `(grid line, full sentence)` for [`nrf_shared_block_row`]. Apart from the
-/// drawing so the tests can hold the grid line to a width and to the runtime.
+/// drawing so the tests can hold the grid line to a width and to the HAL.
 fn nrf_shared_block_text(
-    me: &str,
-    partner: &str,
-    instance: u8,
-    is_async: bool,
+    shared: &crate::panels::mcu_module::codegen::nrf::SharedBlock,
 ) -> (String, String) {
-    let (spim, twim) = if me.starts_with("SPIM") {
-        (me, partner)
-    } else {
-        (partner, me)
+    let and = |names: &[&str]| match names {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
     };
-    let lost = if is_async {
-        format!("{twim} is not built")
+    let me = shared.me.as_str();
+    let others: Vec<&str> = shared
+        .buses
+        .iter()
+        .map(String::as_str)
+        .filter(|b| *b != me)
+        .collect();
+    let losers: Vec<&str> = shared
+        .buses
+        .iter()
+        .map(String::as_str)
+        .filter(|b| *b != shared.owner)
+        .collect();
+    let (is, its) = if losers.len() == 1 {
+        ("is", "its init")
     } else {
-        format!("{spim} is switched off")
+        ("are", "their inits")
     };
-    let short = format!("Shares TWISPI{instance} with {partner}: {lost}");
-    let what = if is_async {
-        format!("main.rs builds {spim} and leaves {twim} a comment where its init would be")
+    let block = &shared.block;
+    let owner = &shared.owner;
+    let short = if shared.embassy {
+        format!(
+            "Shares {block} with {}: only {owner} is built",
+            and(&others)
+        )
     } else {
         format!(
-            "main.rs builds both, and {twim}'s init, which runs second, writes the block's \
-             ENABLE register and switches {spim} off"
+            "Shares {block} with {}: {} {is} switched off",
+            and(&others),
+            and(&losers)
         )
     };
+    let what = if shared.embassy {
+        format!(
+            "main.rs builds {owner} and leaves {} a comment where {its} would be - a block \
+             goes to a UARTE first, then a SPIM, then a TWIM",
+            and(&losers)
+        )
+    } else {
+        let (all, last) = if shared.buses.len() == 2 {
+            ("both".to_owned(), "second")
+        } else {
+            (format!("all {}", shared.buses.len()), "last")
+        };
+        format!(
+            "main.rs builds {all}, and {owner}'s init, which runs {last}, writes the block's \
+             ENABLE register and switches {} off",
+            and(&losers)
+        )
+    };
+    let on_it = if shared.buses.len() == 2 {
+        "Both modules are on it".to_owned()
+    } else {
+        format!("All {} modules are on it", shared.buses.len())
+    };
+    let lonely: Vec<&str> = shared.lonely.iter().map(String::as_str).collect();
+    let way_out = match lonely.as_slice() {
+        [] => String::new(),
+        [one] => format!("; {one} has a block of its own"),
+        many => format!("; {} have a block of their own", and(many)),
+    };
+    let all: Vec<&str> = std::iter::once(me).chain(others.iter().copied()).collect();
     let text = format!(
-        "{me} and {partner} are one hardware block on the nRF52 (embassy-nrf calls it \
-         TWISPI{instance}), and the chip runs one of them at a time. Both modules are on \
-         it: {what}. Move one bus to another instance on the Pins canvas; SPIM2 has no \
-         TWIM twin."
+        "{} are one hardware block on the {} (embassy-nrf calls it {block}), and the chip runs \
+         one of them at a time. {on_it}: {what}. Move one bus to an instance on another block \
+         on the Pins canvas{way_out}.",
+        and(&all),
+        shared.part
     );
     (short, text)
 }
@@ -3589,10 +3633,11 @@ pub fn module_config_ui(
     // (`family::embassy_i2s`) - not on an F303, F358, F398 or N6, whose CubeMX
     // data lists the I2S pads anyway. A chip fact, like `line_extras`.
     chip_i2s: bool,
-    // On an nRF, the peripheral sharing this module's block with it (`TWIM0`
-    // under SPIM0, and the reverse), from `nrf::shared_block_partner`. A fact
-    // about the OTHER modules, so it comes from the caller like `line_extras`.
-    block_partner: Option<&str>,
+    // On an nRF, the serial block this module shares with other buses main.rs
+    // reaches (SPIM0 and TWIM0 on TWISPI0; UARTE0, SPIM0 and TWIM0 on an
+    // nRF5340's SERIAL0), from `nrf::shared_block`. A fact about the OTHER
+    // modules, so it comes from the caller like `line_extras`.
+    shared_block: Option<&crate::panels::mcu_module::codegen::nrf::SharedBlock>,
     // Everything this module has to say that is NOT a control: the standing
     // remarks ("duty is taken in whole percent"), and what each row it draws
     // MEANS. Both are drawn by the details pane, not inside the config grid.
@@ -5304,6 +5349,11 @@ pub fn module_config_ui(
                 // LPUART reuses the USART settings struct, so it reuses this
                 // whole arm — only the DMA request table differs (`uart_bus`).
                 ModuleConfig::Usart(cfg) | ModuleConfig::Lpuart(cfg) => {
+                    // On an nRF5340/54L15 a UARTE is SERIALn, and it is the bus
+                    // that wins the block, so it says so too.
+                    if let Some(shared) = shared_block {
+                        nrf_shared_block_row(ui, out, shared);
+                    }
                     out.field("Baud rate", docs::USART_BAUD);
                     ui.label("Baud rate");
                     // By KIND as well as instance (`m_kind` is USART or LPUART
@@ -5642,9 +5692,8 @@ pub fn module_config_ui(
                     out.all_fields_documented();
                 }
                 ModuleConfig::Spi(cfg) => {
-                    if let Some(partner) = block_partner {
-                        let me = format!("SPIM{}", cfg.instance);
-                        nrf_shared_block_row(ui, out, &me, partner, cfg.instance, is_async);
+                    if let Some(shared) = shared_block {
+                        nrf_shared_block_row(ui, out, shared);
                     }
                     let roles = SpiRole::options(family);
                     if roles.len() == 1 {
@@ -7325,9 +7374,8 @@ pub fn module_config_ui(
                     out.all_fields_documented();
                 }
                 ModuleConfig::I2c(cfg) => {
-                    if let Some(partner) = block_partner {
-                        let me = format!("TWIM{}", cfg.instance);
-                        nrf_shared_block_row(ui, out, &me, partner, cfg.instance, is_async);
+                    if let Some(shared) = shared_block {
+                        nrf_shared_block_row(ui, out, shared);
                     }
                     out.field("Clock", docs::I2C_CLOCK);
                     ui.label("Clock");
@@ -8277,7 +8325,7 @@ mod tests {
         is_async: bool,
         is_native: bool,
         line_extras: bool,
-        block_partner: Option<&str>,
+        shared_block: Option<&crate::panels::mcu_module::codegen::nrf::SharedBlock>,
     ) -> ConfigOut {
         drive_module(
             kind,
@@ -8286,7 +8334,7 @@ mod tests {
             is_async,
             is_native,
             line_extras,
-            block_partner,
+            shared_block,
             true,
             None,
             true,
@@ -8357,7 +8405,7 @@ mod tests {
         is_async: bool,
         is_native: bool,
         line_extras: bool,
-        block_partner: Option<&str>,
+        shared_block: Option<&crate::panels::mcu_module::codegen::nrf::SharedBlock>,
         runtime_applied: bool,
         dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
         chip_i2s: bool,
@@ -8395,7 +8443,7 @@ mod tests {
                 dma,
                 line_extras,
                 chip_i2s,
-                block_partner,
+                shared_block,
                 &mut out,
                 &crate::panels::mcu_module::uart_baud::Chip::bare(
                     family,
@@ -9250,36 +9298,105 @@ mod tests {
             assert!(drawn.contains(&"Bit order"), "{drawn:?}");
         }
 
-        /// A SPIM and a TWIM on one nRF block: each of the two says so, in the
-        /// runtime's own terms, and the sentence reaches the details pane as
-        /// a note. Without a partner there is nothing to say.
+        /// Buses on one nRF serial block: each of them says so, in its HAL's
+        /// own terms, and the sentence reaches the details pane as a note -
+        /// the UARTE's panel too, on an nRF5340/54L15 SERIALn. Without a
+        /// shared block there is nothing to say.
         #[test]
         fn a_shared_nrf_block_is_called_out_on_both_modules() {
+            use crate::panels::mcu_module::codegen::nrf::SharedBlock;
+            let names = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+            let block = |me: &str,
+                         block: &str,
+                         part,
+                         buses: &[&str],
+                         owner: &str,
+                         embassy,
+                         lonely: &[&str]| {
+                SharedBlock {
+                    block: block.to_owned(),
+                    part,
+                    me: me.to_owned(),
+                    buses: names(buses),
+                    owner: owner.to_owned(),
+                    embassy,
+                    lonely: names(lonely),
+                }
+            };
             // The grid line: short enough for the config column (about 70
             // characters at this size before the panel's edge clips it), and
-            // naming the bus that loses on this runtime.
-            for (me, partner) in [("SPIM0", "TWIM0"), ("TWIM1", "SPIM1")] {
-                let n = &me[4..];
-                for is_async in [true, false] {
-                    let (short, full) = super::nrf_shared_block_text(
-                        me,
-                        partner,
-                        n.parse().expect("a digit"),
-                        is_async,
-                    );
-                    assert!(short.len() <= 60, "{} chars: {short}", short.len());
-                    assert!(
-                        short.starts_with(&format!("Shares TWISPI{n} with {partner}: ")),
-                        "{short}"
-                    );
-                    let lost = if is_async {
-                        format!("TWIM{n} is not built")
-                    } else {
-                        format!("SPIM{n} is switched off")
-                    };
-                    assert!(short.ends_with(&lost), "{short}");
-                    assert!(full.len() > short.len() && full.starts_with(me), "{full}");
-                }
+            // naming what this HAL does with the others.
+            for (shared, short_end) in [
+                (
+                    block(
+                        "SPIM0",
+                        "TWISPI0",
+                        "nRF52833",
+                        &["SPIM0", "TWIM0"],
+                        "SPIM0",
+                        true,
+                        &["SPIM2", "SPIM3"],
+                    ),
+                    "only SPIM0 is built",
+                ),
+                (
+                    block(
+                        "TWIM1",
+                        "TWISPI1",
+                        "nRF52833",
+                        &["SPIM1", "TWIM1"],
+                        "TWIM1",
+                        false,
+                        &[],
+                    ),
+                    "SPIM1 is switched off",
+                ),
+                (
+                    block(
+                        "UARTE0",
+                        "SERIAL0",
+                        "nRF5340",
+                        &["UARTE0", "SPIM0", "TWIM0"],
+                        "UARTE0",
+                        true,
+                        &[],
+                    ),
+                    "only UARTE0 is built",
+                ),
+                (
+                    block(
+                        "TWIM20",
+                        "SERIAL20",
+                        "nRF54L15",
+                        &["UARTE20", "SPIM20", "TWIM20"],
+                        "UARTE20",
+                        true,
+                        &[],
+                    ),
+                    "only UARTE20 is built",
+                ),
+            ] {
+                let (short, full) = super::nrf_shared_block_text(&shared);
+                assert!(short.len() <= 64, "{} chars: {short}", short.len());
+                assert!(
+                    short.starts_with(&format!("Shares {} with ", shared.block)),
+                    "{short}"
+                );
+                assert!(short.ends_with(short_end), "{short}");
+                assert!(!short.contains(&format!("with {}", shared.me)), "{short}");
+                assert!(
+                    full.len() > short.len() && full.starts_with(&shared.me),
+                    "{full}"
+                );
+                assert!(
+                    full.contains(&format!("on the {} (", shared.part)),
+                    "{full}"
+                );
+                // Never the nRF52-only wording on another part.
+                assert!(
+                    !full.contains("nRF52 (") && !full.contains("TWIM twin"),
+                    "{full}"
+                );
             }
 
             let spi = drive_beside(
@@ -9289,16 +9406,28 @@ mod tests {
                 true,
                 false,
                 false,
-                Some("TWIM0"),
+                Some(&block(
+                    "SPIM0",
+                    "TWISPI0",
+                    "nRF52833",
+                    &["SPIM0", "TWIM0"],
+                    "SPIM0",
+                    true,
+                    &["SPIM2", "SPIM3"],
+                )),
             );
             let note = spi
                 .notes()
                 .iter()
-                .find(|n| n.starts_with("SPIM0 and TWIM0 are one hardware block"))
+                .find(|n| n.starts_with("SPIM0 and TWIM0 are one hardware block on the nRF52833"))
                 .expect("the SPI names the block it shares");
             assert!(note.contains("TWISPI0"), "{note}");
             assert!(
-                note.contains("builds SPIM0 and leaves TWIM0 a comment"),
+                note.contains("builds SPIM0 and leaves TWIM0 a comment where its init would be"),
+                "{note}"
+            );
+            assert!(
+                note.contains("SPIM2 and SPIM3 have a block of their own"),
                 "{note}"
             );
 
@@ -9309,7 +9438,15 @@ mod tests {
                 false,
                 false,
                 false,
-                Some("SPIM1"),
+                Some(&block(
+                    "TWIM1",
+                    "TWISPI1",
+                    "nRF52833",
+                    &["SPIM1", "TWIM1"],
+                    "TWIM1",
+                    false,
+                    &[],
+                )),
             );
             let note = i2c
                 .notes()
@@ -9322,10 +9459,48 @@ mod tests {
                     && note.contains("switches SPIM1 off"),
                 "{note}"
             );
+            assert!(
+                !note.contains("of its own") && !note.contains("of their own"),
+                "{note}"
+            );
+
+            // The UARTE that takes an nRF5340's SERIAL0 says so on its panel.
+            let uart = drive_beside(
+                ModuleKind::GenericInterfaceUsart,
+                ModuleKind::GenericInterfaceUsart.default_config(0),
+                "nrf5340",
+                true,
+                false,
+                false,
+                Some(&block(
+                    "UARTE0",
+                    "SERIAL0",
+                    "nRF5340",
+                    &["UARTE0", "SPIM0", "TWIM0"],
+                    "UARTE0",
+                    true,
+                    &[],
+                )),
+            );
+            let note = uart
+                .notes()
+                .iter()
+                .find(|n| {
+                    n.starts_with(
+                        "UARTE0, SPIM0 and TWIM0 are one hardware block on the nRF5340 \
+                         (embassy-nrf calls it SERIAL0)",
+                    )
+                })
+                .expect("the UART names the block it shares");
+            assert!(
+                note.contains("All 3 modules are on it: main.rs builds UARTE0 and leaves SPIM0 and TWIM0 a comment where their inits would be"),
+                "{note}"
+            );
 
             for kind in [
                 ModuleKind::GenericInterfaceSpi,
                 ModuleKind::GenericInterfaceI2c,
+                ModuleKind::GenericInterfaceUsart,
             ] {
                 let alone = drive(kind, kind.default_config(0), "nrf52833", true, false, false);
                 assert!(

@@ -104,6 +104,18 @@ const BUS_HANDLES: &[(&str, &str, bool)] = &[
     ("_adc", "adc", true),
 ];
 
+/// The name RTIC binds `name` under: `_serial1_gps` becomes `serial1_gps`, by
+/// the same [`BUS_HANDLES`] rule [`promote_bus_handles`] rewrites main.rs
+/// with, or `None` for a handle it leaves alone (the Native `_tx1` / `_rx1`
+/// pair, which binds as a tuple). The module panel's captions read it, so a
+/// caption names the binding RTIC's main.rs really has.
+pub(crate) fn promoted_name(name: &str) -> Option<String> {
+    BUS_HANDLES.iter().find_map(|(pfx, _, numbered)| {
+        let tail = name.strip_prefix(pfx)?;
+        (!numbered || tail.starts_with(|c: char| c.is_ascii_digit())).then(|| name[1..].to_owned())
+    })
+}
+
 /// A config file as RTIC binds its handle. The files are Blocking's, whose
 /// examples call `_serial1.write_all(..)`; under RTIC [`promote_bus_handles`]
 /// drops the underscore - the handle is a resource now, not a value nobody

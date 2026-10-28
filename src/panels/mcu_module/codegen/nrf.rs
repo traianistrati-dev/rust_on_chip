@@ -5764,6 +5764,57 @@ mod shared_block {
         );
     }
 
+    /// A bus that loses its block on embassy-nrf has no handle in main.rs, so
+    /// the module panel names none - the caption and the goto follow the same
+    /// replay main.rs's `clash` does - while nrf-hal, which builds both buses
+    /// of a TWISPI pair, names both.
+    #[test]
+    fn a_bus_that_loses_its_block_has_no_handle() {
+        use crate::panels::mcu_module::mcu::gui::modules::{
+            HandleCtx, handle_names, unbound_handle_names,
+        };
+        let names = |mcu: &Mcu, kind: ModuleKind| {
+            let m = mcu
+                .modules
+                .iter()
+                .find(|m| m.kind == kind)
+                .expect("a module");
+            handle_names(m, &HandleCtx::of(mcu))
+        };
+        let serial0 = [
+            ("P0.06", PinFunction::UsartTx(0)),
+            ("P1.08", PinFunction::UsartRx(0)),
+            ("P0.17", SCK),
+            ("P0.13", MOSI),
+        ];
+        for is_async in [true, false] {
+            let mcu = on(part("nrf5340", &serial0, UsartDirection::TxRx), is_async);
+            assert_eq!(names(&mcu, ModuleKind::GenericInterfaceUsart), ["uarte0"]);
+            assert!(names(&mcu, ModuleKind::GenericInterfaceSpi).is_empty());
+            assert!(
+                unbound_handle_names(&mcu).is_empty(),
+                "{:?}",
+                unbound_handle_names(&mcu)
+            );
+        }
+        let twispi = [
+            ("P0.17", SCK),
+            ("P0.13", MOSI),
+            ("P0.08", SCL),
+            ("P0.16", SDA),
+        ];
+        let mcu = on(part("nrf52833", &twispi, UsartDirection::TxRx), true);
+        assert_eq!(names(&mcu, ModuleKind::GenericInterfaceSpi), ["spim0"]);
+        assert!(names(&mcu, ModuleKind::GenericInterfaceI2c).is_empty());
+        let mcu = on(part("nrf52833", &twispi, UsartDirection::TxRx), false);
+        assert_eq!(names(&mcu, ModuleKind::GenericInterfaceI2c), ["twim0"]);
+        assert!(
+            unbound_handle_names(&mcu).is_empty(),
+            "{:?}",
+            unbound_handle_names(&mcu)
+        );
+    }
+
     /// The nRF54L15's SERIAL00 is a UARTE and a SPIM (no TWIM00); the panel
     /// names it, and nothing on the part is a block of its own.
     #[test]

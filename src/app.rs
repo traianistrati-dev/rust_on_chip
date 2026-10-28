@@ -3436,21 +3436,6 @@ impl AppIde {
     /// Pins that resolve to a DIFFERENT file than the first hit are dropped: the
     /// editor shows one file, and a band the user can't see is worse than one
     /// missing line. In practice every pin of a module binds in main.rs anyway.
-    /// Does `line` CREATE the binding `name` (`let name =` / `let mut name =`)?
-    ///
-    /// Not `line.contains(name)`: `_pwm0` is a prefix of `_pwm0_power_led`, and
-    /// the handle is mentioned again wherever it is used, so a substring test
-    /// would light the wrong line - or several.
-    fn line_binds(line: &str, name: &str) -> bool {
-        let t = line.trim_start();
-        let Some(rest) = t.strip_prefix("let ") else {
-            return false;
-        };
-        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
-        rest.strip_prefix(name)
-            .is_some_and(|after| after.trim_start().starts_with('='))
-    }
-
     fn goto_pins_in_code(&mut self, pins: &[usize], handles: &[String], now: f64) {
         let mut hits: Vec<(ProjectFileId, usize)> =
             pins.iter().filter_map(|n| self.locate_pin(*n)).collect();
@@ -3459,10 +3444,8 @@ impl AppIde {
         // call, read in the user's code below the markers - cannot be mistaken
         // for the line that creates it.
         for h in handles {
-            if let Some(line) = self
-                .generated_code
-                .lines()
-                .position(|l| Self::line_binds(l, h))
+            if let Some(line) =
+                crate::panels::mcu_module::mcu::gui::modules::handle_line(&self.generated_code, h)
             {
                 hits.push((ProjectFileId::MainRs, line + 1));
             }
@@ -6193,18 +6176,15 @@ mod rename_apply_tests {
 
 #[cfg(test)]
 mod module_handle_highlight {
-    use super::AppIde;
+    use crate::panels::mcu_module::mcu::gui::modules::binds;
 
     /// The line the user pointed at: the module's own binding.
     #[test]
     fn it_finds_the_line_that_creates_the_handle() {
         let line = "    let mut _pwm0_power_led = pins::configs::pwm0::init(&ledc, &t, g);";
-        assert!(AppIde::line_binds(line, "_pwm0_power_led"));
+        assert!(binds(line, "_pwm0_power_led"));
         // …and without `mut`, which most handles are.
-        assert!(AppIde::line_binds(
-            "let _spi1 = configs::spi1::init(p);",
-            "_spi1"
-        ));
+        assert!(binds("let _spi1 = configs::spi1::init(p);", "_spi1"));
     }
 
     /// A PREFIX must not match.
@@ -6214,7 +6194,7 @@ mod module_handle_highlight {
     #[test]
     fn a_prefix_is_not_the_binding() {
         let line = "    let mut _pwm0_power_led = configs::pwm0::init(&ledc);";
-        assert!(!AppIde::line_binds(line, "_pwm0"));
+        assert!(!binds(line, "_pwm0"));
     }
 
     /// A USE of the handle is not its creation.
@@ -6229,21 +6209,44 @@ mod module_handle_highlight {
             "    let d = _pwm0_power_led.duty();",
             "    foo(&_pwm0_power_led);",
         ] {
-            assert!(!AppIde::line_binds(line, "_pwm0_power_led"), "{line}");
+            assert!(!binds(line, "_pwm0_power_led"), "{line}");
         }
+    }
+
+    /// A split handle binds inside a tuple pattern - stm32f1xx-hal's Native
+    /// pair, embassy's DMA halves - as a whole element, never a prefix of one,
+    /// and a tuple that is only USED is no binding.
+    #[test]
+    fn a_tuple_element_is_the_binding() {
+        let native =
+            "    let (mut _tx1, mut _rx1) = pins::configs::usart1::init(p.USART1, tx, rx);";
+        assert!(binds(native, "_tx1") && binds(native, "_rx1"));
+        assert!(!binds(native, "_tx"));
+        let dma = "    let (mut _serial2_tx, mut _serial2_rx) = _serial2.split();";
+        assert!(binds(dma, "_serial2_rx"));
+        assert!(!binds(dma, "_serial2"));
+        assert!(!binds("    foo((_tx1, _rx1));", "_tx1"));
+    }
+
+    /// A field path no `let` creates - rp-hal's `pwm_slices.pwm1` - lands on
+    /// the first line that names it whole, not on a longer slice's.
+    #[test]
+    fn a_field_path_lands_on_the_line_that_hands_it_over() {
+        use crate::panels::mcu_module::mcu::gui::modules::handle_line;
+        let main = "    let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);\n\
+                    \x20   pins::configs::pwm10::init(&mut pwm_slices.pwm10, pins.gpio20);\n\
+                    \x20   pins::configs::pwm1::init(&mut pwm_slices.pwm1, pins.gpio2);\n";
+        assert_eq!(handle_line(main, "pwm_slices.pwm1"), Some(2));
+        assert_eq!(handle_line(main, "pwm_slices.pwm10"), Some(1));
+        assert_eq!(handle_line(main, "pwm_slices"), Some(0));
+        assert_eq!(handle_line(main, "pwm_slices.pwm2"), None);
     }
 
     /// `let` must be the statement, not a word inside one.
     #[test]
     fn only_a_real_let_counts() {
-        assert!(!AppIde::line_binds(
-            "// let _pwm0_power_led = …",
-            "_pwm0_power_led"
-        ));
-        assert!(!AppIde::line_binds(
-            "    outlet _pwm0_power_led = 1;",
-            "_pwm0_power_led"
-        ));
+        assert!(!binds("// let _pwm0_power_led = …", "_pwm0_power_led"));
+        assert!(!binds("    outlet _pwm0_power_led = 1;", "_pwm0_power_led"));
     }
 }
 

@@ -883,6 +883,18 @@ pub fn module_title(m: &VirtualModule) -> String {
     }
 }
 
+/// Which vendor's generator writes main.rs - each names its handles its own
+/// way: `_serial1` on an STM32, `uart0` on an RP, `uarte0` on an nRF, `_uart0`
+/// on an ESP.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum HandleVendor {
+    #[default]
+    Stm32,
+    Rp,
+    Nrf,
+    Esp,
+}
+
 /// What a module's handle names depend on beyond the module itself: which
 /// backend writes main.rs, on the APPLIED runtime - the caption names what the
 /// generated code binds now.
@@ -891,6 +903,8 @@ pub fn module_title(m: &VirtualModule) -> String {
 /// while `mcu.modules` is borrowed.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HandleCtx {
+    /// Whose generator binds the handles.
+    vendor: HandleVendor,
     /// The Native runtime: every USART is the split `(Tx, Rx)` pair, whatever
     /// its `api_style`.
     native_forced: bool,
@@ -907,13 +921,43 @@ pub(crate) struct HandleCtx {
     /// an F303, F358, F398 or N6 binds no I2S handle on either runtime.
     /// Negative, so the derived `Default` still means a chip that has it.
     no_i2s: bool,
+    /// An ESP's two USB controllers (`codegen_esp::has_usb_otg`,
+    /// `has_usb_serial_jtag`): which one main.rs builds decides the handles.
+    esp_usb_otg: bool,
+    esp_usb_jtag: bool,
+    /// The family, for what is decided per chip at generation time - the USB
+    /// role an ESP really builds (`family::esp_usb_configs`), the modules the
+    /// F1's Async runtime does not generate (`family::f1_async_module_gap`).
+    family: String,
+    /// The APPLIED runtime, for that gap.
+    runtime: crate::panels::mcu_module::mcu::Runtime,
+    /// The RTIC runtime, whose main.rs drops the leading underscore of every
+    /// bus handle it promotes to a resource (`rtic::promoted_name`).
+    rtic: bool,
+    /// An nRF whose Blocking runtime is nrf-hal (not `nrf::blocking_on_embassy`):
+    /// the one that builds a USB device off Async.
+    nrf_hal: bool,
+    /// The nRF buses that lose their serial block on embassy-nrf - main.rs
+    /// writes them as a comment, from the same replay the panel's shared-block
+    /// note reads (`nrf::shared_block`).
+    nrf_lost: BTreeSet<crate::panels::mcu_module::modules::NotesKey>,
 }
 
 impl HandleCtx {
     pub(crate) fn of(mcu: &Mcu) -> Self {
         let is_async = mcu.is_async();
         let embassy = codegen::family::embassy_drivers(&mcu.family, is_async);
+        let vendor = if codegen::rp::is_rp(&mcu.family) {
+            HandleVendor::Rp
+        } else if codegen::nrf::is_nrf(&mcu.family) {
+            HandleVendor::Nrf
+        } else if codegen::family::is_esp(&mcu.family) {
+            HandleVendor::Esp
+        } else {
+            HandleVendor::Stm32
+        };
         Self {
+            vendor,
             native_forced: mcu.is_native(),
             // `is_async` rather than the stored runtime, so an Async that is
             // inert on this family still reads as the HAL that runs.
@@ -926,6 +970,24 @@ impl HandleCtx {
                 BTreeSet::new()
             },
             no_i2s: embassy && !codegen::family::embassy_i2s(mcu),
+            esp_usb_otg: crate::panels::mcu_module::codegen_esp::has_usb_otg(&mcu.family),
+            esp_usb_jtag: crate::panels::mcu_module::codegen_esp::has_usb_serial_jtag(&mcu.family),
+            family: mcu.family.clone(),
+            runtime: mcu.runtime,
+            rtic: mcu.is_rtic(),
+            nrf_hal: !codegen::nrf::blocking_on_embassy(&mcu.family),
+            nrf_lost: if vendor == HandleVendor::Nrf {
+                mcu.modules
+                    .iter()
+                    .filter(|m| {
+                        codegen::nrf::shared_block(mcu, m, is_async)
+                            .is_some_and(|s| s.embassy && s.owner != s.me)
+                    })
+                    .map(|m| (m.kind, m.instance()))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            },
         }
     }
 
@@ -935,6 +997,16 @@ impl HandleCtx {
     /// drives only asynchronously.
     fn unbound(&self, m: &VirtualModule) -> bool {
         use ModuleKind as K;
+        // The F1's USB, CAN and SDIO on Async: kept on the canvas, written as a
+        // NOT-initialised comment. Its SDIO on every other runtime too:
+        // stm32f1xx-hal has no SDIO driver. And an nRF bus whose serial block
+        // an earlier one took.
+        if codegen::family::f1_async_module_gap(&self.family, self.runtime, m.kind).is_some()
+            || (self.family == "stm32f1" && m.kind == K::GenericInterfaceSdmmc)
+            || self.nrf_lost.contains(&(m.kind, m.instance()))
+        {
+            return true;
+        }
         self.embassy
             && (self.raw.contains(&(m.kind, m.instance()))
                 || (self.no_i2s && m.kind == K::GenericInterfaceI2s)
@@ -956,9 +1028,79 @@ impl HandleCtx {
 pub(crate) fn handle_names(m: &VirtualModule, ctx: &HandleCtx) -> Vec<String> {
     handle_preview(m, ctx)
         .split(',')
-        .map(|s| s.trim().to_owned())
+        // A Custom module's caption is `my_mod: MyMod`; the binding is the
+        // part before the type.
+        .map(|s| s.split(':').next().unwrap_or("").trim().to_owned())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// The 0-based line of `main` that a goto on handle `name` lands on: the line
+/// that CREATES it ([`binds`]), or - for a field path no `let` creates, rp-hal's
+/// `pwm_slices.pwm3` - the first line that names it as a whole token, which is
+/// the init that hands it over. ONE lookup, used by the app's goto and by the
+/// tests that hold every caption to main.rs.
+pub(crate) fn handle_line(main: &str, name: &str) -> Option<usize> {
+    if !name.contains('.') {
+        return main.lines().position(|l| binds(l, name));
+    }
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    main.lines().position(|l| {
+        l.match_indices(name).any(|(i, _)| {
+            !l[..i].chars().next_back().is_some_and(is_ident)
+                && !l[i + name.len()..].chars().next().is_some_and(is_ident)
+        })
+    })
+}
+
+/// Every handle name the panel gives `mcu`'s modules - the box caption and the
+/// goto target - that the app's goto ([`handle_line`]) finds no line for in
+/// main.rs, as `"<module>: <name>"`. Run over every built-in board and runtime:
+/// a caption the generated code does not match is exactly what the RP, nRF and
+/// ESP had.
+#[cfg(test)]
+pub(crate) fn unbound_handle_names(mcu: &Mcu) -> Vec<String> {
+    let ctx = HandleCtx::of(mcu);
+    let main = mcu.fresh_main_rs();
+    mcu.modules
+        .iter()
+        .flat_map(|m| {
+            handle_names(m, &ctx)
+                .into_iter()
+                .map(move |h| (m.name.clone(), h))
+        })
+        .filter(|(_, h)| handle_line(&main, h).is_none())
+        .map(|(m, h)| format!("{m}: {h}"))
+        .collect()
+}
+
+/// Does `line` CREATE the binding `name` - `let name =`, `let mut name =`, or
+/// one element of a tuple pattern, `let (mut _tx1, mut _rx1) =`?
+///
+/// Not `line.contains(name)`: `_pwm0` is a prefix of `_pwm0_power_led`, and
+/// the handle is mentioned again wherever it is used, so a substring test
+/// would light the wrong line - or several. The tuple form is how a split
+/// USART binds (stm32f1xx-hal's Native pair, embassy's DMA halves, the ESP's
+/// I2S and MCPWM): matched as a whole element, never a prefix of one.
+pub(crate) fn binds(line: &str, name: &str) -> bool {
+    let t = line.trim_start();
+    let Some(rest) = t.strip_prefix("let ") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    if let Some(inner) = rest.strip_prefix('(') {
+        let Some((elems, after)) = inner.split_once(')') else {
+            return false;
+        };
+        return after.trim_start().starts_with('=')
+            && elems
+                .split(',')
+                .map(|e| e.trim().trim_start_matches("mut ").trim())
+                .any(|e| e == name);
+    }
+    let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+    rest.strip_prefix(name)
+        .is_some_and(|after| after.trim_start().starts_with('='))
 }
 
 /// Live preview of the generated handle variable name(s), with the user's
@@ -976,7 +1118,124 @@ fn handle_preview(m: &VirtualModule, ctx: &HandleCtx) -> String {
     } else {
         format!("_{lbl}")
     };
-    match m.kind {
+    // The RP and nRF generators name a bus after its peripheral, with no
+    // leading underscore and no label (`rp::async_bus_lines`,
+    // `nrf::async_bus_lines`, the two `bus_lines`); the ESP's has its own words
+    // for three of them. A kind none of them writes falls through to the
+    // STM32 names below.
+    match (ctx.vendor, m.kind) {
+        // Neither generator instantiates a Custom module yet (no
+        // `custom_module_inits` in rp.rs or nrf.rs): its file is written, its
+        // `let` is not, so there is no binding to name.
+        (HandleVendor::Rp | HandleVendor::Nrf, ModuleKind::Custom) => return String::new(),
+        (HandleVendor::Rp, ModuleKind::GenericInterfaceUsart) => return format!("uart{n}"),
+        (HandleVendor::Rp, ModuleKind::GenericInterfaceSpi) => return format!("spi{n}"),
+        (HandleVendor::Rp, ModuleKind::GenericInterfaceI2c) => return format!("i2c{n}"),
+        // embassy-rp's slice is a `let`; rp-hal's is a field of the `Slices`
+        // the init borrows, which is the name the user's code goes through.
+        (HandleVendor::Rp, ModuleKind::GenericInterfaceTimer) => {
+            return if ctx.is_async {
+                format!("pwm{n}")
+            } else {
+                format!("pwm_slices.pwm{n}")
+            };
+        }
+        (HandleVendor::Nrf, ModuleKind::GenericInterfaceUsart) => return format!("uarte{n}"),
+        (HandleVendor::Nrf, ModuleKind::GenericInterfaceSpi) => return format!("spim{n}"),
+        (HandleVendor::Nrf, ModuleKind::GenericInterfaceI2c) => return format!("twim{n}"),
+        (HandleVendor::Nrf, ModuleKind::GenericInterfaceTimer) => return format!("pwm{n}"),
+        // embassy-nrf's; nrf-hal has no QSPI driver, so Blocking binds none.
+        (HandleVendor::Nrf, ModuleKind::GenericInterfaceQspi) => {
+            return if ctx.is_async {
+                "qspi".to_owned()
+            } else {
+                String::new()
+            };
+        }
+        // nrf-hal's usb-device stack binds both; embassy-usb's device runs in
+        // its own task, and main.rs keeps the class. Blocking on a part with
+        // no nrf-hal (the 52820, 5340, 54L15) is embassy-nrf with no executor,
+        // which builds no USB at all.
+        (HandleVendor::Nrf, ModuleKind::GenericInterfaceUsb) => {
+            return if ctx.is_async {
+                "usb_serial".to_owned()
+            } else if ctx.nrf_hal {
+                "usb_serial, usb_dev".to_owned()
+            } else {
+                String::new()
+            };
+        }
+        (HandleVendor::Esp, ModuleKind::GenericInterfaceUsart) => {
+            return format!("_uart{n}{sfx}");
+        }
+        // The one TWAI is TWAI0 in esp-hal, whatever number the module has.
+        (HandleVendor::Esp, ModuleKind::GenericInterfaceCan) => return format!("_twai0{sfx}"),
+        // OTG builds a usb-device stack in main.rs; the Serial/JTAG
+        // controller is one driver behind `init`; a chip with neither for the
+        // role asked builds nothing (`codegen_esp`'s USB section).
+        // The role as the generator reads it: one this chip has no controller
+        // for is put back to its first (`family::esp_usb_configs`) - the S2's
+        // OTG, whatever a fresh module's Serial/JTAG default says.
+        (HandleVendor::Esp, ModuleKind::GenericInterfaceUsb) => {
+            let roles = UsbRole::options(&ctx.family);
+            let stored = match &m.config {
+                ModuleConfig::Usb(c) => c.role,
+                _ => UsbRole::default(),
+            };
+            let role = if !roles.is_empty() && !roles.contains(&stored) {
+                roles[0]
+            } else {
+                stored
+            };
+            let otg = role.is_otg();
+            return if otg && ctx.esp_usb_otg {
+                format!("_usb_serial{sfx}, _usb_dev{sfx}")
+            } else if !otg && ctx.esp_usb_jtag {
+                "_usb".to_owned()
+            } else {
+                String::new()
+            };
+        }
+        // The controller, then one handle per pad, named for its channel -
+        // the tuple `touch::init` hands back.
+        (HandleVendor::Esp, ModuleKind::GenericInterfaceTouch) => {
+            let mut pads: Vec<u8> = m
+                .connections
+                .iter()
+                .filter_map(|c| match c.signal.pin_function(n) {
+                    PinFunction::TouchPad(ch) => Some(ch),
+                    _ => None,
+                })
+                .collect();
+            pads.sort_unstable();
+            pads.dedup();
+            return std::iter::once(format!("_touch_ctrl{sfx}"))
+                .chain(pads.iter().map(|ch| format!("_touch{ch}{sfx}")))
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
+        // One handle per channel wired, named for the channel, not the module:
+        // `_dac_out1`, and a tuple with `_dac_out2` when both are.
+        (HandleVendor::Esp, ModuleKind::GenericInterfaceDac) => {
+            let mut chans: Vec<u8> = m
+                .connections
+                .iter()
+                .filter_map(|c| match c.signal.pin_function(n) {
+                    PinFunction::DacOut { channel, .. } => Some(channel),
+                    _ => None,
+                })
+                .collect();
+            chans.sort_unstable();
+            chans.dedup();
+            return chans
+                .iter()
+                .map(|ch| format!("_dac_out{ch}{sfx}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
+        _ => {}
+    }
+    let stm32 = match m.kind {
         // USART: Native returns the split `(Tx, Rx)` handles → two names; Portable
         // (and the async embedded-io bridge) returns one value → `_serialN`.
         // `native_forced` is the project-level Native runtime (all peripherals
@@ -1054,8 +1313,35 @@ fn handle_preview(m: &VirtualModule, ctx: &HandleCtx) -> String {
             names.join(", ")
         }
         ModuleKind::GenericInterfaceDac => format!("_dac{n}{sfx}"),
-        // One handle per SUB-BLOCK: they are independent streams.
-        ModuleKind::GenericInterfaceSai => format!("_sai{n}a{sfx}, _sai{n}b{sfx}"),
+        // One handle per SUB-BLOCK wired whole - SCK, SD and FS, the rule
+        // embassy's `sai_wires` builds a block by: they are independent
+        // streams, and a block short of a pad is not built.
+        ModuleKind::GenericInterfaceSai => {
+            let has = |s: ModuleSignal| m.connections.iter().any(|c| c.signal == s);
+            [
+                (
+                    "a",
+                    [
+                        ModuleSignal::SaiSckA,
+                        ModuleSignal::SaiSdA,
+                        ModuleSignal::SaiFsA,
+                    ],
+                ),
+                (
+                    "b",
+                    [
+                        ModuleSignal::SaiSckB,
+                        ModuleSignal::SaiSdB,
+                        ModuleSignal::SaiFsB,
+                    ],
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, sigs)| sigs.iter().all(|s| has(*s)))
+            .map(|(block, _)| format!("_sai{n}{block}{sfx}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+        }
         ModuleKind::GenericInterfaceSdmmc => format!("_sd{n}{sfx}"),
         // Single-instance peripheral, so no number in the handle.
         ModuleKind::GenericInterfaceQspi => format!("_qspi{sfx}"),
@@ -1063,7 +1349,9 @@ fn handle_preview(m: &VirtualModule, ctx: &HandleCtx) -> String {
         ModuleKind::GenericInterfaceXspi => format!("_xspi{n}{sfx}"),
         ModuleKind::GenericInterfaceHspi => format!("_hspi{n}{sfx}"),
         ModuleKind::GenericInterfaceTimer => format!("_pwm{n}{sfx}"),
-        ModuleKind::GenericInterfaceCan => format!("_can{n}{sfx}"),
+        // stm32f1xx-hal's bxCAN, the one CAN an STM32 generates: no number,
+        // single instance.
+        ModuleKind::GenericInterfaceCan => format!("_can{sfx}"),
         ModuleKind::GenericInterfaceUsb => format!("usb_dev{sfx}, serial{sfx}"),
         // The generated struct is named after the module, so the preview shows
         // the handle the user will bind: `let my_mod = MyMod::new(…)`.
@@ -1071,6 +1359,18 @@ fn handle_preview(m: &VirtualModule, ctx: &HandleCtx) -> String {
             let name = custom_struct_name(m);
             format!("{}: {name}", custom_binding_name(m))
         }
+    };
+    // RTIC hands the bus handles to the framework as resources, and drops
+    // their underscore doing it (`rtic::promote_bus_handles`): the caption is
+    // the resource's name. A tuple pair (`_tx1, _rx1`) is not promoted.
+    if ctx.rtic {
+        stm32
+            .split(", ")
+            .map(|h| codegen::rtic::promoted_name(h).unwrap_or_else(|| h.to_owned()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        stm32
     }
 }
 
@@ -10278,6 +10578,120 @@ mod tests {
         }
     }
 
+    /// Every handle name the panel gives - the box caption and the goto target
+    /// - is a binding main.rs really writes: on every built-in board, on both
+    /// runtimes, for every module kind its palette lets it add, auto-wired the
+    /// way the palette does it. The RP, nRF and ESP named theirs the STM32 way
+    /// (`_serial0`), and a goto on any of their modules found no line.
+    #[test]
+    fn every_handle_name_is_a_binding_main_rs_writes() {
+        use crate::panels::mcu_module::builtins::builtin_definitions;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let mut bad = Vec::new();
+        let mut checked = 0;
+        for def in builtin_definitions() {
+            for runtime in [
+                Runtime::Blocking,
+                Runtime::Async,
+                Runtime::Rtic,
+                Runtime::Native,
+            ] {
+                let mut mcu = def.build_mcu();
+                mcu.runtime = runtime;
+                mcu.pending_runtime = runtime;
+                // A runtime the chip has no backend for is inert - Blocking
+                // again, already checked.
+                let live = match runtime {
+                    Runtime::Async => mcu.is_async(),
+                    Runtime::Rtic => mcu.is_rtic(),
+                    Runtime::Native => mcu.is_native(),
+                    _ => true,
+                };
+                if !live {
+                    continue;
+                }
+                for kind in ModuleKind::ALL {
+                    if !kind.is_custom() && mcu.supports_module(kind) {
+                        mcu.add_module(kind);
+                    }
+                }
+                checked += mcu.modules.len();
+                for miss in super::unbound_handle_names(&mcu) {
+                    bad.push(format!("{} {runtime:?}: {miss}", def.id));
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} modules added");
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// The names themselves, by vendor: an RP and an nRF name a bus after its
+    /// peripheral with no underscore and no label, rp-hal's PWM slice is a
+    /// field of `pwm_slices`, and an ESP's UART is `_uart`, not `_serial`.
+    #[test]
+    fn each_vendor_names_its_handles_its_own_way() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let names = |board: &str, runtime: Runtime, kind: ModuleKind| {
+            let mut mcu = builtin_for(board).expect("built-in board").build_mcu();
+            mcu.runtime = runtime;
+            assert!(mcu.add_module(kind), "{board}: {kind:?}");
+            let m = mcu.modules.iter().find(|m| m.kind == kind).expect("added");
+            handle_names(m, &HandleCtx::of(&mcu))
+        };
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            assert_eq!(
+                names("rp2040_pico", runtime, ModuleKind::GenericInterfaceUsart),
+                ["uart0"]
+            );
+            assert_eq!(
+                names("rp2040_pico", runtime, ModuleKind::GenericInterfaceSpi),
+                ["spi0"]
+            );
+            assert_eq!(
+                names("rp2040_pico", runtime, ModuleKind::GenericInterfaceI2c),
+                ["i2c0"]
+            );
+            assert_eq!(
+                names("nrf52840_dk", runtime, ModuleKind::GenericInterfaceUsart),
+                ["uarte0"]
+            );
+        }
+        let pwm = |runtime| names("rp2040_pico", runtime, ModuleKind::GenericInterfaceTimer);
+        assert!(
+            pwm(Runtime::Async)[0].starts_with("pwm"),
+            "{:?}",
+            pwm(Runtime::Async)
+        );
+        assert!(
+            pwm(Runtime::Blocking)[0].starts_with("pwm_slices.pwm"),
+            "{:?}",
+            pwm(Runtime::Blocking)
+        );
+        assert_eq!(
+            names(
+                "esp32c3",
+                Runtime::Blocking,
+                ModuleKind::GenericInterfaceUsart
+            )[0]
+            .split_at(5)
+            .0,
+            "_uart"
+        );
+        // A Custom module: bound by the STM32 and ESP generators, and by
+        // neither the RP's nor the nRF's yet, so named there by nobody.
+        assert_eq!(
+            names("stm32f103c8t6", Runtime::Blocking, ModuleKind::Custom).len(),
+            1
+        );
+        for board in ["rp2040_pico", "nrf52840_dk"] {
+            assert!(
+                names(board, Runtime::Blocking, ModuleKind::Custom).is_empty(),
+                "{board}"
+            );
+        }
+    }
+
     /// The handle the box and the code search name is the one main.rs binds,
     /// by the backend that binds it - and none where it binds none.
     #[test]
@@ -10346,12 +10760,37 @@ mod tests {
             ..Default::default()
         };
         assert!(handle_names(&usart(&|_| {}), &raw).is_empty());
-        let sai = module(
-            ModuleKind::GenericInterfaceSai,
-            ModuleKind::GenericInterfaceSai.default_config(1),
-        );
+        // A SAI names each sub-block wired whole, the way embassy builds it:
+        // the A block alone (what `add_module` wires), then both.
+        let wired = |sigs: &[ModuleSignal]| {
+            let mut m = module(
+                ModuleKind::GenericInterfaceSai,
+                ModuleKind::GenericInterfaceSai.default_config(1),
+            );
+            m.connections = sigs
+                .iter()
+                .enumerate()
+                .map(|(pin, s)| crate::panels::mcu_module::modules::Connection {
+                    signal: *s,
+                    mcu_pin: pin,
+                })
+                .collect();
+            m
+        };
+        use ModuleSignal::{SaiFsA, SaiFsB, SaiSckA, SaiSckB, SaiSdA, SaiSdB};
+        let sai = wired(&[SaiSckA, SaiSdA, SaiFsA]);
         assert!(handle_names(&sai, &g0).is_empty());
-        assert_eq!(handle_names(&sai, &g0_async), ["_sai1a", "_sai1b"]);
+        assert_eq!(handle_names(&sai, &g0_async), ["_sai1a"]);
+        let both = wired(&[SaiSckA, SaiSdA, SaiFsA, SaiSckB, SaiSdB, SaiFsB]);
+        assert_eq!(handle_names(&both, &g0_async), ["_sai1a", "_sai1b"]);
+        // A block short of its frame sync is not built, so not named.
+        assert_eq!(
+            handle_names(
+                &wired(&[SaiSckA, SaiSdA, SaiFsA, SaiSckB, SaiSdB]),
+                &g0_async
+            ),
+            ["_sai1a"]
+        );
         // An I2S on a chip with no `i2s` module binds nothing on Async either.
         let i2s = module(
             ModuleKind::GenericInterfaceI2s,
@@ -10363,7 +10802,14 @@ mod tests {
             ..g0_async.clone()
         };
         assert!(handle_names(&i2s, &f303_async).is_empty());
-        assert_eq!(handle_names(&sai, &f303_async), ["_sai1a", "_sai1b"]);
+        assert_eq!(handle_names(&both, &f303_async), ["_sai1a", "_sai1b"]);
+
+        // A Custom module's goto target is its binding, not the `var: Type`
+        // caption.
+        let custom = module(ModuleKind::Custom, ModuleKind::Custom.default_config(1));
+        let caption = handle_preview(&custom, &g0);
+        let (var, _ty) = caption.split_once(": ").expect("`var: Type`");
+        assert_eq!(handle_names(&custom, &g0), [var]);
 
         // Read off the project: the F1 off Async ignores the switch, an
         // embassy family keeps it.

@@ -236,25 +236,32 @@ fn signal_name(f: &PinFunction) -> Option<String> {
 /// why.
 ///
 /// The generator does not choose between them: it takes the lowest so the output
-/// is stable, and names both so the person who wired them can decide. Only for
-/// a role `bus_lines` configures, though: a bus it does not build, or a UART
+/// is stable, and names both so the person who wired them can decide - on both
+/// runtimes, by each one's own gates (rp-hal's SPI is narrower than
+/// embassy-rp's, `spi_pads`). Only for a role main.rs configures, though: a
+/// bus it does not build, or a UART
 /// half its module's direction leaves out, configures neither pad - main.rs
 /// says why there (the NOT-initialised note, `uart_unused_note`), and "Only
 /// GP0 is configured" would contradict it.
 fn ambiguity_notes(mcu: &Mcu) -> String {
     let ucfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
     let (uart, spi, i2c) = (uart_pins(mcu), spi_pins(mcu), i2c_pins(mcu));
-    // `bus_lines`'s own gates, read the same way.
+    // The bus loops' own gates (`bus_lines`, `async_bus_lines`), read the same
+    // way.
     let both = |pins: &[(u8, &'static str, u8)], i: u8, a: &str, b: &str| {
         role_of(pins, i, a).is_some() && role_of(pins, i, b).is_some()
     };
     let configured = |f: &PinFunction| match f {
         PinFunction::UsartTx(i) => uart_pads(&uart, &ucfgs, *i).is_ok_and(|(tx, _)| tx.is_some()),
         PinFunction::UsartRx(i) => uart_pads(&uart, &ucfgs, *i).is_ok_and(|(_, rx)| rx.is_some()),
+        // A built SPI takes every pad wired to it, on either HAL.
         PinFunction::SpiSck(i) | PinFunction::SpiMosi(i) | PinFunction::SpiMiso(i) => {
-            both(&spi, *i, "sck", "mosi")
+            spi_pads(&spi, *i, mcu.is_async()).is_ok()
         }
         PinFunction::I2cSda(i) | PinFunction::I2cScl(i) => both(&i2c, *i, "sda", "scl"),
+        // On Async the PWM loop names a channel on two pads itself ("GP18 also
+        // asks for slice 1 channel A"), so it is said once.
+        PinFunction::TimerPwm { .. } => !mcu.is_async(),
         _ => true,
     };
     let mut by_signal: std::collections::BTreeMap<String, Vec<u8>> =
@@ -311,6 +318,72 @@ fn i2c_pins(mcu: &Mcu) -> Vec<(u8, &'static str, u8)> {
     })
 }
 
+/// The pads an SPI is built from - `(sck, mosi, miso)`, each `None` where its
+/// shape leaves it out - or, when the wired pads make no shape the HAL builds,
+/// why not: the sentence main.rs says instead of a constructor.
+///
+/// Pad-driven, as on the STM32: there is no direction setting, the wiring IS
+/// the shape. rp-hal (`embassy` false, the Blocking runtime) builds an SPI
+/// from MOSI and SCK, MISO when it is wired - every `ValidSpiPinout` is
+/// `(Tx, Sck)` or wider, so no receive-only or clockless bus. embassy-rp
+/// (Async) builds four: `Spi::new` (all three), `new_txonly` (SCK + MOSI),
+/// `new_rxonly` (SCK + MISO) and `new_txonly_nosck` (MOSI alone). Receiving
+/// always needs the clock: there is no MISO-without-SCK form.
+///
+/// ONE reading, shared by both runtimes' main.rs, the Blocking config files
+/// and `ambiguity_notes`, so none of them builds a shape another refuses.
+fn spi_pads(
+    spi: &[(u8, &'static str, u8)],
+    i: u8,
+    embassy: bool,
+) -> Result<(Option<u8>, Option<u8>, Option<u8>), String> {
+    let (sck, mosi, miso) = (
+        role_of(spi, i, "sck"),
+        role_of(spi, i, "mosi"),
+        role_of(spi, i, "miso"),
+    );
+    if !embassy {
+        if sck.is_some() && mosi.is_some() {
+            return Ok((sck, mosi, miso));
+        }
+        // The shape the Async runtime WOULD build from these pads, if any.
+        let async_builds = match (sck, mosi, miso) {
+            (Some(_), None, Some(_)) => {
+                " The Async runtime builds this one receive-only (embassy-rp's Spi::new_rxonly)."
+            }
+            (None, Some(_), None) => {
+                " The Async runtime builds this one without a clock, MOSI alone (embassy-rp's \
+                 Spi::new_txonly_nosck)."
+            }
+            _ => "",
+        };
+        return Err(format!(
+            "rp-hal builds every SPI from at least MOSI and SCK - it has no receive-only or \
+             clockless form - so wire the missing one on the Pins canvas.{async_builds}"
+        ));
+    }
+    match (sck, mosi, miso) {
+        (Some(_), Some(_), _) => Ok((sck, mosi, miso)),
+        (Some(_), None, Some(_)) => Ok((sck, None, miso)),
+        (None, Some(_), None) => Ok((None, mosi, None)),
+        (None, Some(_), Some(_)) => Err(
+            "SCK is not wired, and receiving needs the clock - embassy-rp's clockless \
+             Spi::new_txonly_nosck sends on MOSI alone. Wire SCK on the Pins canvas, or \
+             unassign MISO."
+                .to_owned(),
+        ),
+        (Some(_), None, None) => Err(
+            "only SCK is wired - an SPI needs MOSI to send, MISO to receive, or both. Wire one \
+             on the Pins canvas."
+                .to_owned(),
+        ),
+        _ => Err(
+            "only MISO is wired, and receiving needs the clock. Wire SCK on the Pins canvas."
+                .to_owned(),
+        ),
+    }
+}
+
 /// UART, SPI and I2C, in that order.
 ///
 /// Each is emitted when the pads its `init` takes are wired. The UART takes the
@@ -350,14 +423,22 @@ fn bus_lines(mcu: &Mcu, _hal: &str) -> String {
 
     let spi = spi_pins(mcu);
     for i in instances(&spi) {
-        let (Some(sck), Some(mosi)) = (role_of(&spi, i, "sck"), role_of(&spi, i, "mosi")) else {
-            o.push_str(&format!(
-                "    // SPI{i}: rp-hal builds every SPI from at least MOSI and SCK - it has no\n    // receive-only or clockless form - so wire the missing one on the Pins canvas.\n"
-            ));
+        let (sck, mosi, miso) = match spi_pads(&spi, i, false) {
+            Ok(pads) => pads,
+            Err(why) => {
+                o.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!("SPI{i}: {why}"),
+                    "    ",
+                ));
+                continue;
+            }
+        };
+        // rp-hal's every shape has both (`spi_pads`).
+        let (Some(sck), Some(mosi)) = (sck, mosi) else {
             continue;
         };
         // MISO is the optional one: without it, the transmit-only bus.
-        let miso = role_of(&spi, i, "miso")
+        let miso = miso
             .map(|g| format!("        pins.gpio{g},\n"))
             .unwrap_or_default();
         o.push_str(&format!(
@@ -1262,10 +1343,9 @@ impl FamilyBackend for RpBackend {
                             .filter_map(|(r, g)| g.map(|g| (r, g)))
                             .collect()
                     }),
-                    // MOSI and SCK, MISO when it is there.
-                    "spi" => (role_of(&pins, i, "sck").is_some()
-                        && role_of(&pins, i, "mosi").is_some())
-                    .then_some(wired),
+                    // rp-hal's shapes (`spi_pads`): MOSI and SCK, MISO when
+                    // it is there.
+                    "spi" => spi_pads(&pins, i, false).is_ok().then_some(wired),
                     _ => (wired.len() == roles.len()).then_some(wired),
                 };
                 if let Some(pads) = pads {
@@ -3925,7 +4005,9 @@ fn async_edge_hooks(mcu: &Mcu) -> Vec<EdgeHook> {
 /// cannot live inside `main`.
 fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::DmaUse>) {
     let mut irqs: Vec<String> = Vec::new();
-    let mut o = String::new();
+    // Two pads on one role are as ambiguous here as on Blocking - embassy-rp
+    // takes one pin per role too - and the note reads this runtime's gates.
+    let mut o = ambiguity_notes(mcu);
     let mut dma = 0u8;
     // Reported to the Configuration tab straight from this counter. A second
     // table listing the same channels is exactly how a card starts describing
@@ -4032,34 +4114,17 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
 
     let spi = spi_pins(mcu);
     for i in instances(&spi) {
-        // SCK and MOSI, and MISO when it is wired: without it, the
-        // transmit-only bus, as on the STM32 - pad-driven, no setting.
-        let (Some(sck), Some(mosi)) = (role_of(&spi, i, "sck"), role_of(&spi, i, "mosi")) else {
-            // The embassy-rp form that WOULD fit what is wired, by the pad
-            // that is missing - this backend's gap; with two pads missing no
-            // single form is worth naming.
-            let has = |r| role_of(&spi, i, r).is_some();
-            let why = match (has("sck"), has("mosi"), has("miso")) {
-                (true, false, true) => {
-                    "MOSI is not wired, and this backend builds every bus from at least SCK and \
-                     MOSI - embassy-rp's receive-only Spi::new_rxonly is not generated yet. Wire \
-                     MOSI on the Pins canvas."
-                }
-                (false, true, _) => {
-                    "SCK is not wired, and this backend builds every bus from at least SCK and \
-                     MOSI - embassy-rp's clockless Spi::new_txonly_nosck (MOSI alone, transmit \
-                     only) is not generated yet. Wire SCK on the Pins canvas."
-                }
-                _ => {
-                    "this backend builds every bus from at least SCK and MOSI (MISO only to \
-                     receive) - wire whichever of the two is missing on the Pins canvas."
-                }
-            };
-            o.push_str(&crate::panels::mcu_module::errata::comment(
-                &format!("SPI{i}: {why}"),
-                "    ",
-            ));
-            continue;
+        // The wired pads ARE the shape (`spi_pads`), as on the STM32 - no
+        // setting: the pair, transmit-only, receive-only or clockless.
+        let (sck, mosi, miso) = match spi_pads(&spi, i, true) {
+            Ok(pads) => pads,
+            Err(why) => {
+                o.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!("SPI{i}: {why}"),
+                    "    ",
+                ));
+                continue;
+            }
         };
         let config = |o: &mut String| {
             let hz = bus_speed(mcu, "spi", i);
@@ -4067,16 +4132,44 @@ fn async_bus_lines(mcu: &Mcu) -> (String, String, String, Vec<super::dma_map::Dm
                 "    let mut ucfg{i} = embassy_rp::spi::Config::default();\n    // From the Virtual Module, not a default: a bus at the wrong speed\n    // is met as garbage on the wire, never as a message.\n    ucfg{i}.frequency = {hz};\n"
             ));
         };
-        let Some(miso) = role_of(&spi, i, "miso") else {
-            // ONE channel, channel then `Irqs`, as for the pair.
-            let ch = dma;
-            dma += 1;
-            take(ch, &format!("SPI{i} TX"), &mut uses);
-            config(&mut o);
-            o.push_str(&format!(
-                "    // Transmit only (no MISO wired): one DMA channel. `write` is the call -\n    // `read` and `transfer` on this bus panic, there is no receive channel.\n    let spi{i} = embassy_rp::spi::Spi::new_txonly(\n        p.SPI{i},\n        p.PIN_{sck},\n        p.PIN_{mosi},\n        p.DMA_CH{ch},\n        Irqs,\n        ucfg{i},\n    );\n    let _ = &spi{i};\n"
-            ));
-            continue;
+        let (sck, mosi, miso) = match (sck, mosi, miso) {
+            (Some(sck), Some(mosi), Some(miso)) => (sck, mosi, miso),
+            (Some(sck), Some(mosi), None) => {
+                // ONE channel, channel then `Irqs`, as for the pair.
+                let ch = dma;
+                dma += 1;
+                take(ch, &format!("SPI{i} TX"), &mut uses);
+                config(&mut o);
+                o.push_str(&format!(
+                    "    // Transmit only (no MISO wired): one DMA channel. `write` is the call -\n    // `read` and `transfer` on this bus panic, there is no receive channel.\n    let spi{i} = embassy_rp::spi::Spi::new_txonly(\n        p.SPI{i},\n        p.PIN_{sck},\n        p.PIN_{mosi},\n        p.DMA_CH{ch},\n        Irqs,\n        ucfg{i},\n    );\n    let _ = &spi{i};\n"
+                ));
+                continue;
+            }
+            (Some(sck), None, Some(miso)) => {
+                // TWO channels: a receive-only bus still clocks every read
+                // out with a transmit transfer, which is what drives SCK.
+                let (tdma, rdma) = (dma, dma + 1);
+                dma += 2;
+                take(tdma, &format!("SPI{i} TX"), &mut uses);
+                take(rdma, &format!("SPI{i} RX"), &mut uses);
+                config(&mut o);
+                o.push_str(&format!(
+                    "    // Receive only (no MOSI wired): two DMA channels - embassy-rp clocks each\n    // read with a transmit transfer, out to no pad. `read` is the call.\n    let spi{i} = embassy_rp::spi::Spi::new_rxonly(\n        p.SPI{i},\n        p.PIN_{sck},\n        p.PIN_{miso},\n        p.DMA_CH{tdma},\n        p.DMA_CH{rdma},\n        Irqs,\n        ucfg{i},\n    );\n    let _ = &spi{i};\n"
+                ));
+                continue;
+            }
+            (None, Some(mosi), None) => {
+                let ch = dma;
+                dma += 1;
+                take(ch, &format!("SPI{i} TX"), &mut uses);
+                config(&mut o);
+                o.push_str(&format!(
+                    "    // Transmit only, no clock (MOSI alone wired): one DMA channel, for a\n    // device that reads the data line without SCK. `write` is the call - `read`\n    // and `transfer` on this bus panic, there is no receive channel.\n    let spi{i} = embassy_rp::spi::Spi::new_txonly_nosck(\n        p.SPI{i},\n        p.PIN_{mosi},\n        p.DMA_CH{ch},\n        Irqs,\n        ucfg{i},\n    );\n    let _ = &spi{i};\n"
+                ));
+                continue;
+            }
+            // `spi_pads` answers Ok with one of the four shapes above only.
+            _ => continue,
         };
         let (tdma, rdma) = (dma, dma + 1);
         dma += 2;
@@ -5216,6 +5309,9 @@ mod async_pwm_keeps_both_channels {
             code.contains("GP18 also asks for slice 1 channel A"),
             "{code}"
         );
+        // Once: the pad-ambiguity note, which Async writes too, leaves the PWM
+        // clash to this sentence.
+        assert!(!code.contains("PWM1 A is wired to"), "{code}");
         assert!(code.contains("p.PIN_2,"), "{code}");
         assert!(!code.contains("p.PIN_18,"), "{code}");
     }
@@ -5631,14 +5727,18 @@ mod emit_async_for_manual_compile {
         //
         // `EIDE_RP_ONEWAY=1` wires the one-way shapes instead: UART0
         // transmit-only on GP0, UART1 receive-only on GP9, both on the
-        // project's own transport, and SPI1 transmit-only on GP10/GP11 with no
-        // MISO. UART0 is the DMA `UartTx` on BOTH transports - this backend
+        // project's own transport, and SPI1 one-way with no MISO (its shape per
+        // project below). UART0 is the DMA `UartTx` on BOTH transports - this backend
         // builds no buffered transmit half (embassy-rp's `BufferedUartTx`
         // unmasks receive interrupts nothing empties) - so the two buffered
         // projects prove
-        // a stored Buffered does not reach it. Over the three projects that is
-        // every one-way constructor this backend writes: UartTx,
-        // BufferedUartRx, UartRx and Spi::new_txonly.
+        // a stored Buffered does not reach it. The SPIs differ by project: the
+        // first keeps SPI0 whole and SPI1 transmit-only; the other two (one per
+        // chip) drop SPI0's MOSI - receive-only, `Spi::new_rxonly` - and SPI1's
+        // SCK - clockless, `Spi::new_txonly_nosck`. Over the three projects that
+        // is every one-way constructor this backend writes: UartTx,
+        // BufferedUartRx, UartRx, Spi::new_txonly, new_rxonly and
+        // new_txonly_nosck.
         let oneway = std::env::var("EIDE_RP_ONEWAY").is_ok();
         for (id, dir_name, mode) in [
             (
@@ -5663,18 +5763,20 @@ mod emit_async_for_manual_compile {
                 .unwrap_or_else(|| panic!("built-in {id}"));
             let mut mcu = def.build_mcu();
             mcu.runtime = Runtime::Async;
+            // The one-way SPI shapes of the last two projects (above).
+            let half_spi = oneway && dir_name != "eide_rp2040_async_check";
             for p in mcu.iter_all_pins_mut() {
                 match p.name.as_str() {
                     n if n.starts_with("GP25") => p.selected_function = PinFunction::GpioOutput,
                     "GP0" => p.selected_function = PinFunction::UsartTx(0),
                     "GP1" if !oneway => p.selected_function = PinFunction::UsartRx(0),
                     "GP9" if oneway => p.selected_function = PinFunction::UsartRx(1),
-                    "GP10" if oneway => p.selected_function = PinFunction::SpiSck(1),
+                    "GP10" if oneway && !half_spi => p.selected_function = PinFunction::SpiSck(1),
                     "GP11" if oneway => p.selected_function = PinFunction::SpiMosi(1),
                     "GP4" => p.selected_function = PinFunction::I2cSda(0),
                     "GP5" => p.selected_function = PinFunction::I2cScl(0),
                     "GP18" => p.selected_function = PinFunction::SpiSck(0),
-                    "GP19" => p.selected_function = PinFunction::SpiMosi(0),
+                    "GP19" if !half_spi => p.selected_function = PinFunction::SpiMosi(0),
                     "GP16" => p.selected_function = PinFunction::SpiMiso(0),
                     "GP6" => {
                         p.selected_function = PinFunction::TimerPwm {
@@ -5733,10 +5835,16 @@ mod emit_async_for_manual_compile {
                     crate::panels::mcu_module::modules::UsartMode::Buffered => "BufferedUartRx",
                     _ => "UartRx",
                 };
+                let (spi0, spi1) = if half_spi {
+                    ("new_rxonly", "new_txonly_nosck")
+                } else {
+                    ("new", "new_txonly")
+                };
                 for want in [
                     "let uart0 = embassy_rp::uart::UartTx::new(".to_string(),
                     format!("let uart1 = embassy_rp::uart::{rx}::new("),
-                    "let spi1 = embassy_rp::spi::Spi::new_txonly(".to_string(),
+                    format!("let spi0 = embassy_rp::spi::Spi::{spi0}("),
+                    format!("let spi1 = embassy_rp::spi::Spi::{spi1}("),
                 ] {
                     assert!(
                         main_rs.contains(&want),
@@ -6670,8 +6778,9 @@ mod one_way_buses {
     }
 
     /// embassy-rp `Spi::new_txonly` without MISO: one channel, then `Irqs`,
-    /// the only channel the DMA interrupt names. Without MOSI the note names
-    /// `new_rxonly`, which this backend does not write.
+    /// the only channel the DMA interrupt names. The pad shapes embassy-rp has
+    /// no constructor for - SCK alone, MISO alone, MOSI + MISO without SCK -
+    /// are refused, each with its own reason, and take no channel.
     #[test]
     fn embassy_rp_builds_a_transmit_only_spi() {
         let mcu = pico(
@@ -6694,16 +6803,20 @@ mod one_way_buses {
         let uses = super::dma_uses(&mcu);
         assert_eq!(uses.len(), 1, "{uses:?}");
         assert_eq!(uses[0].user, "SPI0 TX");
-        // Without MOSI: the form that would fit, and the rule this backend
-        // keeps now - SCK and MOSI, not all three.
+        // The pad shapes embassy-rp has no constructor for: refused, each with
+        // its own reason - receiving always needs the clock.
         for (wired, want) in [
             (
-                &[SCK, MISO][..],
-                "SPI0: MOSI is not wired, and this backend builds every bus from at least SCK and MOSI - embassy-rp's receive-only Spi::new_rxonly is not generated yet.",
+                &[SCK][..],
+                "SPI0: only SCK is wired - an SPI needs MOSI to send, MISO to receive, or both. Wire one on the Pins canvas.",
             ),
             (
-                &[SCK][..],
-                "SPI0: this backend builds every bus from at least SCK and MOSI (MISO only to receive)",
+                &[MISO][..],
+                "SPI0: only MISO is wired, and receiving needs the clock. Wire SCK on the Pins canvas.",
+            ),
+            (
+                &[MOSI, MISO][..],
+                "SPI0: SCK is not wired, and receiving needs the clock - embassy-rp's clockless Spi::new_txonly_nosck sends on MOSI alone. Wire SCK on the Pins canvas, or unassign MISO.",
             ),
         ] {
             let mcu = pico(
@@ -6714,8 +6827,131 @@ mod one_way_buses {
             );
             let text = said(&mcu.fresh_main_rs());
             assert!(text.contains(want), "{text}");
-            assert!(!text.contains("MOSI and MISO together"), "{text}");
+            assert!(!text.contains("let spi0"), "{text}");
+            assert!(super::dma_uses(&mcu).is_empty());
+        }
+    }
+
+    /// embassy-rp's receive-only bus, SCK + MISO: TWO channels, the transmit
+    /// one clocking each read out to no pad, both handlers bound, channels
+    /// before `Irqs`. The DMA card reports both.
+    #[test]
+    fn embassy_rp_builds_a_receive_only_spi() {
+        let mcu = pico(
+            Runtime::Async,
+            &[SCK, MISO],
+            UsartDirection::TxRx,
+            UsartMode::Buffered,
+        );
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "let spi0 = embassy_rp::spi::Spi::new_rxonly(\n        p.SPI0,\n        p.PIN_18,\n        p.PIN_16,\n        p.DMA_CH0,\n        p.DMA_CH1,\n        Irqs,\n        ucfg0,\n    );"
+            ),
+            "{main}"
+        );
+        for ch in ["DMA_CH0", "DMA_CH1"] {
+            assert!(
+                main.contains(&format!(
+                    "embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::{ch}>"
+                )),
+                "{main}"
+            );
+        }
+        let users: Vec<String> = super::dma_uses(&mcu).into_iter().map(|u| u.user).collect();
+        assert_eq!(users, ["SPI0 TX", "SPI0 RX"]);
+        assert!(main.contains("ucfg0.frequency = "), "{main}");
+    }
+
+    /// embassy-rp's clockless bus, MOSI alone: ONE channel, no SCK pin.
+    #[test]
+    fn embassy_rp_builds_a_clockless_spi() {
+        let mcu = pico(
+            Runtime::Async,
+            &[MOSI],
+            UsartDirection::TxRx,
+            UsartMode::Buffered,
+        );
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "let spi0 = embassy_rp::spi::Spi::new_txonly_nosck(\n        p.SPI0,\n        p.PIN_19,\n        p.DMA_CH0,\n        Irqs,\n        ucfg0,\n    );"
+            ),
+            "{main}"
+        );
+        assert!(!main.contains("DMA_CH1"), "{main}");
+        let users: Vec<String> = super::dma_uses(&mcu).into_iter().map(|u| u.user).collect();
+        assert_eq!(users, ["SPI0 TX"]);
+    }
+
+    /// rp-hal has neither shape - every `ValidSpiPinout` is `(Tx, Sck)` or
+    /// wider - so Blocking refuses both, says the Async runtime builds them,
+    /// and writes no config file. A shape neither runtime builds gets no such
+    /// promise.
+    #[test]
+    fn rp_hal_names_the_shapes_only_async_builds() {
+        for (wired, async_builds) in [
+            (
+                &[SCK, MISO][..],
+                Some(
+                    "The Async runtime builds this one receive-only (embassy-rp's Spi::new_rxonly).",
+                ),
+            ),
+            (
+                &[MOSI][..],
+                Some(
+                    "The Async runtime builds this one without a clock, MOSI alone (embassy-rp's Spi::new_txonly_nosck).",
+                ),
+            ),
+            (&[SCK][..], None),
+            (&[MOSI, MISO][..], None),
+        ] {
+            let mcu = pico(
+                Runtime::Blocking,
+                wired,
+                UsartDirection::TxRx,
+                UsartMode::Buffered,
+            );
+            let text = said(&mcu.fresh_main_rs());
+            assert!(
+                text.contains(
+                    "SPI0: rp-hal builds every SPI from at least MOSI and SCK - it has no receive-only or clockless form - so wire the missing one on the Pins canvas."
+                ),
+                "{text}"
+            );
+            match async_builds {
+                Some(want) => assert!(text.contains(want), "{text}"),
+                None => assert!(!text.contains("The Async runtime builds"), "{text}"),
+            }
+            assert!(file(&mcu, "spi0.rs").is_none());
             assert!(!text.contains("let spi0"), "{text}");
         }
+    }
+
+    /// "Only GP16 is configured" goes with a bus the runtime builds: a
+    /// receive-only SPI with MISO on two pads is configured on Async, and on
+    /// Blocking, where rp-hal refuses it, it is not.
+    #[test]
+    fn a_receive_only_spi_configures_its_pads_on_async_only() {
+        const MISO2: (&str, PinFunction) = ("GP20", PinFunction::SpiMiso(0));
+        let on = |runtime| {
+            said(
+                &pico(
+                    runtime,
+                    &[SCK, MISO, MISO2],
+                    UsartDirection::TxRx,
+                    UsartMode::Buffered,
+                )
+                .fresh_main_rs(),
+            )
+        };
+        let text = on(Runtime::Async);
+        assert!(
+            text.contains("SPI0 RX is wired to GP16 and GP20. Only GP16 is configured"),
+            "{text}"
+        );
+        assert!(text.contains("Spi::new_rxonly("), "{text}");
+        let text = on(Runtime::Blocking);
+        assert!(!text.contains("is configured"), "{text}");
     }
 }

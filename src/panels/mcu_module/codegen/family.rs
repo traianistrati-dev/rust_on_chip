@@ -1576,7 +1576,8 @@ const STM32_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
 
 /// Each row is a claim about `rp.rs`: no bus config files (`config_files`
 /// writes the watchdog's only), `BufferedUart` or DMA `Uart` per the transport
-/// row, SPI on two channels with its init locked, I2C on interrupts, channels
+/// row, SPI on one or two channels by the pads wired (`rp::spi_pads`) with its
+/// init locked, I2C on interrupts, channels
 /// handed out in order by `async_bus_lines`, and the manifest lines from
 /// `AsyncFlavor::Rp`, `needs_async_usart` and `ensure_cyw43_deps`.
 const RP_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
@@ -1595,7 +1596,7 @@ const RP_ASYNC_DETAILS: RuntimeDetails = RuntimeDetails {
         ),
         (
             "SPI / I2C:",
-            "SPI is always async on two DMA channels (the Init selector is shown locked) - one, Spi::new_txonly, when no MISO is wired; read and transfer panic on that bus, write is the call. I2C is interrupt driven and takes no channel, so it has no transport row.",
+            "SPI is always async on DMA (the Init selector is shown locked), its shape set by the pads wired: Spi::new on two channels; Spi::new_txonly (no MISO) and Spi::new_txonly_nosck (MOSI alone) on one, where read and transfer panic and write is the call; Spi::new_rxonly (no MOSI) on two, the transmit one clocking the reads. I2C is interrupt driven and takes no channel, so it has no transport row.",
         ),
         (
             "DMA:",

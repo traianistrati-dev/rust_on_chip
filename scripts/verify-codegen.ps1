@@ -590,9 +590,13 @@ $ALL_CASES = @(
     # (UartTx on DMA, on the two buffered projects too - this backend builds no
     # buffered transmit half: embassy-rp's BufferedUartTx unmasks receive
     # interrupts nothing empties), UART1 receive-only on each project's transport
-    # (BufferedUartRx twice, UartRx once) and SPI1 transmit-only
-    # (Spi::new_txonly). Each constructor takes its interrupt binding at a
-    # DIFFERENT argument position, which is what this row is for.
+    # (BufferedUartRx twice, UartRx once), and the SPI shapes by project: SPI1
+    # transmit-only (Spi::new_txonly) beside a whole SPI0 on the first, and on
+    # the other two - one per chip - SPI0 receive-only (Spi::new_rxonly, two
+    # channels) and SPI1 clockless (Spi::new_txonly_nosck). Each constructor
+    # puts its interrupt binding where embassy-rp wants it - second to seventh
+    # argument, by constructor - which only the compiler checks: that is what
+    # this row is for.
     @{ n = "Raspberry Pi Pico async one-way x3"; t = "emit_rp_async_project"; e = @{ EIDE_RP_ONEWAY = "1" }; q = $true; fam = "rp"; lk = $true }
 
 

@@ -370,6 +370,39 @@ pub(crate) fn f1_pwm_pads(all_pins: &[&Pin]) -> Vec<String> {
         .collect()
 }
 
+/// What main.rs builds of I2C `n` on the F1 off Async
+/// ([`super::i2c_built::I2cBuilt`]), by [`gen_parts`]' rule: stm32f1xx-hal's
+/// controller for I2C1 and I2C2, from the first SCL and SDA pad wired, at the
+/// whole kHz `CLOCK_KHZ` holds (`clock_hz / 1000`). Nothing without the pair,
+/// with main.rs' reason.
+pub(crate) fn f1_i2c_built(
+    mcu: &crate::panels::mcu_module::mcu::Mcu,
+    n: u8,
+    clock_hz: u32,
+) -> super::i2c_built::I2cBuilt {
+    use super::i2c_built::{I2cBuilt, I2cShape};
+    if !(1..=2).contains(&n) {
+        return I2cBuilt::Not(format!(
+            "stm32f1xx-hal is built here for I2C1 and I2C2 only, not I2C{n}"
+        ));
+    }
+    let pad = |f: PinFunction| {
+        mcu.iter_all_pins()
+            .find(|p| !p.reserved && p.selected_function == f && parse_pin(&p.name).is_some())
+            .map(|p| p.number)
+    };
+    match (pad(PinFunction::I2cScl(n)), pad(PinFunction::I2cSda(n))) {
+        (Some(scl), Some(sda)) => I2cBuilt::Built(I2cShape {
+            pins: [scl, sda].into(),
+            clock_hz: clock_hz / 1000 * 1000,
+        }),
+        (scl, _) => I2cBuilt::Not(format!(
+            "{} is not wired, and an I2C bus needs both wires",
+            if scl.is_none() { "SCL" } else { "SDA" }
+        )),
+    }
+}
+
 /// What main.rs builds of SPI `n` on the F1 off Async
 /// ([`super::spi_built::SpiBuilt`]), by [`gen_parts`]' rule: stm32f1xx-hal's
 /// master `Spi` for SPI1 and SPI2, from the first SCK, MOSI and MISO pad wired

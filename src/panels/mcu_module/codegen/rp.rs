@@ -318,6 +318,30 @@ fn i2c_pins(mcu: &Mcu) -> Vec<(u8, &'static str, u8)> {
     })
 }
 
+/// What main.rs builds of I2C `i` ([`super::i2c_built::I2cBuilt`]), as both
+/// RP runtimes build one: a controller from the SDA+SCL pair - the lowest GPIO
+/// of a role wired twice - at the clock [`bus_speed`] hands it. Nothing
+/// without the pair, with main.rs' reason.
+pub(crate) fn i2c_built(mcu: &Mcu, i: u8) -> super::i2c_built::I2cBuilt {
+    use super::i2c_built::{I2cBuilt, I2cShape};
+    let i2c = i2c_pins(mcu);
+    let (Some(sda), Some(scl)) = (role_of(&i2c, i, "sda"), role_of(&i2c, i, "scl")) else {
+        return I2cBuilt::Not("SDA and SCL are taken together; wire the missing one".to_owned());
+    };
+    I2cBuilt::Built(I2cShape {
+        pins: mcu
+            .iter_all_pins()
+            .filter(|p| {
+                matches!(p.selected_function,
+                    PinFunction::I2cSda(n) | PinFunction::I2cScl(n) if n == i)
+                    && gpio_index(&p.name).is_some_and(|g| g == sda || g == scl)
+            })
+            .map(|p| p.number)
+            .collect(),
+        clock_hz: bus_speed(mcu, "i2c", i),
+    })
+}
+
 /// What main.rs builds of SPI `i` ([`super::spi_built::SpiBuilt`]), by the
 /// same [`spi_pads`] both RP runtimes decide with: a master - neither rp-hal
 /// nor embassy-rp is asked for a slave - in mode 0, which neither is told

@@ -1859,6 +1859,32 @@ pub(crate) fn uart_built(
     })
 }
 
+/// What main.rs builds of I2C `n`
+/// ([`crate::panels::mcu_module::codegen::i2c_built::I2cBuilt`]): a controller
+/// from every line wired, each role's pad from [`collect_buses`], at the
+/// stored `clock_hz`, which the config file passes on as it is. esp-hal
+/// refuses none: one line alone is built too, the other tied High.
+pub(crate) fn i2c_built(
+    pins: &[&Pin],
+    clock_hz: u32,
+    n: u8,
+) -> crate::panels::mcu_module::codegen::i2c_built::I2cBuilt {
+    use crate::panels::mcu_module::codegen::i2c_built::{I2cBuilt, I2cShape};
+    let configured: Vec<&Pin> = pins
+        .iter()
+        .copied()
+        .filter(|p| !p.reserved && p.selected_function != PinFunction::Unset)
+        .collect();
+    let (_, _, i2c, _) = collect_buses(&configured);
+    I2cBuilt::Built(I2cShape {
+        pins: i2c
+            .get(&n)
+            .map(|bus| bus.values().map(|p| p.number).collect())
+            .unwrap_or_default(),
+        clock_hz,
+    })
+}
+
 /// What main.rs builds of SPI `n`
 /// ([`crate::panels::mcu_module::codegen::spi_built::SpiBuilt`]): every line
 /// wired - esp-hal takes them all, the master's CS as its hardware CS0, the

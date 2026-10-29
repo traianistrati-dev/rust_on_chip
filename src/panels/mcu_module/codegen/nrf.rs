@@ -1298,6 +1298,50 @@ fn uarte_kept_direction_note(
     crate::panels::mcu_module::errata::comment(&sentence, "    ")
 }
 
+/// What main.rs builds of I2C module `m` ([`super::i2c_built::I2cBuilt`]), by
+/// the gates both nRF backends build a TWIM through: a controller - neither is
+/// asked for a TWIS - from the SCL+SDA pair (the lowest pad of a role wired
+/// twice), at the TWIM rate [`twim_frequency`] picks for its clock. Nothing
+/// when the part has no such block, a line is missing, or on embassy-nrf
+/// another bus runs its shared block ([`shared_block`]) - with the reason
+/// main.rs gives. On nrf-hal a TWIM always runs its block: its init comes last.
+pub(crate) fn twim_built(
+    mcu: &Mcu,
+    m: &crate::panels::mcu_module::modules::VirtualModule,
+) -> super::i2c_built::I2cBuilt {
+    use super::i2c_built::{I2cBuilt, I2cShape};
+    let i = m.instance();
+    if !block_present(mcu, "twim", Some(i)) {
+        let part = chip(&mcu.family).map_or("part", |c| c.part);
+        return I2cBuilt::Not(format!("the {part} has no TWIM{i}"));
+    }
+    let i2c = i2c_pins(mcu);
+    let (Some(scl), Some(sda)) = (role_of(&i2c, i, "scl"), role_of(&i2c, i, "sda")) else {
+        return I2cBuilt::Not("SCL and SDA are taken together; wire the missing one".to_owned());
+    };
+    if let Some(shared) = shared_block(mcu, m, mcu.is_async())
+        && shared.owner != shared.me
+        && shared.embassy
+    {
+        return I2cBuilt::Not(format!(
+            "{} runs {} here - the block runs one bus at a time",
+            shared.block, shared.owner
+        ));
+    }
+    I2cBuilt::Built(I2cShape {
+        pins: mcu
+            .iter_all_pins()
+            .filter(|p| {
+                matches!(p.selected_function,
+                    PinFunction::I2cScl(n) | PinFunction::I2cSda(n) if n == i)
+                    && nrf_pin(&p.name).is_some_and(|x| x == scl || x == sda)
+            })
+            .map(|p| p.number)
+            .collect(),
+        clock_hz: twim_frequency(bus_speed(mcu, "twim", i)).0,
+    })
+}
+
 /// What main.rs builds of SPI module `m` ([`super::spi_built::SpiBuilt`]),
 /// by the gates both nRF backends build a SPIM through: a master - neither
 /// nrf-hal nor embassy-nrf is asked for an SPIS - in `mode`, from its lines

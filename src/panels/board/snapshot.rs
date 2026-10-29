@@ -178,6 +178,27 @@ impl ChipView {
                 }
             }
         }
+        // And every I2C (`Mcu::i2cs_built`): the lines it is built with, at the
+        // clock main.rs asks for.
+        if let Some(built) = mcu.i2cs_built() {
+            use crate::panels::mcu_module::codegen::i2c_built::I2cBuilt;
+            for item in &mut view.modules {
+                let ModuleConfig::I2c(c) = &mut item.config else {
+                    continue;
+                };
+                match built.get(&item.instance) {
+                    None => {}
+                    Some(I2cBuilt::Not(why)) => {
+                        item.not_built = Some(format!("is not built: {why}"));
+                        item.signals.clear();
+                    }
+                    Some(I2cBuilt::Built(shape)) => {
+                        item.signals.retain(|s| shape.pins.contains(&s.pin));
+                        c.clock_hz = shape.clock_hz;
+                    }
+                }
+            }
+        }
         view
     }
 

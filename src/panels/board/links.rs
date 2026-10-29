@@ -504,6 +504,17 @@ fn i2c(
     external: [bool; 2],
 ) {
     use ModuleSignal::*;
+    // An I2C its chip's generated code does not build has no line to draw.
+    let unbuilt: Vec<(&str, &str)> = [(ma, na), (mb, nb)]
+        .into_iter()
+        .filter_map(|(m, n)| m.not_built.as_deref().map(|why| (n, why)))
+        .collect();
+    if !unbuilt.is_empty() {
+        for (n, why) in unbuilt {
+            r.warnings.push(format!("{n} {why}"));
+        }
+        return;
+    }
     for (sig, name) in [(Scl, "SCL"), (Sda, "SDA")] {
         match (signal(ma, &[sig]), signal(mb, &[sig])) {
             (Some(x), Some(y)) => r.wires.push(Wire {
@@ -1400,6 +1411,75 @@ mod tests {
         assert_eq!(
             r.warnings,
             ["The slave's NSS has no chip-select from the master - drive it from a GPIO or tie it"]
+        );
+    }
+
+    /// I2C clocks are the ones main.rs asks for: an nRF stored at 300 kHz
+    /// runs its TWIM at 250 kHz, the rate below it, so beside an ESP32-S3 at
+    /// 300 kHz the two differ - said. A half pair on an RP is no bus at all.
+    #[test]
+    fn i2c_clocks_and_lines_are_the_firmwares() {
+        use crate::panels::board::snapshot::ChipView;
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let chip_with = |id: &str, wired: &[(&str, PinFunction)], hz: u32| {
+            let mut mcu = builtin_for(id).expect(id).build_mcu();
+            mcu.runtime = Runtime::Blocking;
+            for (name, f) in wired {
+                // A board's pad carries a note after its name (`P0.26 (SDA)`).
+                mcu.iter_all_pins_mut()
+                    .find(|p| p.name.split_whitespace().next() == Some(*name))
+                    .expect(name)
+                    .selected_function = f.clone();
+            }
+            mcu.reconcile_modules();
+            for m in &mut mcu.modules {
+                if let ModuleConfig::I2c(c) = &mut m.config {
+                    c.clock_hz = hz;
+                }
+            }
+            mcu
+        };
+        let nrf = chip_with(
+            "nrf52840_dk",
+            &[
+                ("P0.26", PinFunction::I2cSda(0)),
+                ("P0.27", PinFunction::I2cScl(0)),
+            ],
+            300_000,
+        );
+        let esp = chip_with(
+            "esp32s3",
+            &[
+                ("GPIO8", PinFunction::I2cSda(0)),
+                ("GPIO9", PinFunction::I2cScl(0)),
+            ],
+            300_000,
+        );
+        let rp = chip_with("rp2040_pico", &[("GP4", PinFunction::I2cSda(0))], 300_000);
+        let views = [
+            ChipView::from_mcu("nrf", "nRF52840", &nrf),
+            ChipView::from_mcu("esp", "ESP32-S3", &esp),
+            ChipView::from_mcu("rp", "RP2040", &rp),
+        ];
+        let link = |a: &str, b: &str| Link {
+            a: end(a, ModuleKind::GenericInterfaceI2c, 0),
+            b: end(b, ModuleKind::GenericInterfaceI2c, 0),
+        };
+        let r = resolve(&link("nrf", "esp"), &views, &[link("nrf", "esp")]);
+        assert_eq!(r.wires.len(), 2, "SCL and SDA");
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.starts_with("I2C clock") && w.contains("250")),
+            "{:?}",
+            r.warnings
+        );
+        let r = resolve(&link("rp", "esp"), &views, &[link("rp", "esp")]);
+        assert!(r.wires.is_empty());
+        assert_eq!(
+            r.warnings,
+            ["rp I2C0 is not built: SDA and SCL are taken together; wire the missing one"]
         );
     }
 

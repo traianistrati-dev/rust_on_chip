@@ -16,6 +16,7 @@ pub mod embassy_common;
 pub mod embassy_stm32;
 pub mod family;
 pub mod flash_store_gen;
+pub mod i2c_built;
 pub mod iot_gen;
 pub mod nrf;
 pub mod nrf_boards;

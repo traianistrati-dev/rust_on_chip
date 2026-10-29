@@ -2831,6 +2831,54 @@ pub fn find_pin_binding_line(source: &str, pin_name: &str) -> Option<(usize, Str
         .map(|b| (b.line, b.var.to_owned()))
 }
 
+/// The first line of main.rs's generated block that names a pad under any of
+/// `tokens` as a whole word, upper or lower case - a line of CODE before any
+/// comment, so `p.PIN_0` wins over a note further up that says "GPIO0 on the
+/// radio". A comment is still a line: a refused bus says why there.
+pub fn find_pad_line(source: &str, tokens: &[String]) -> Option<usize> {
+    let (Some(begin_pos), Some(end_pos)) = (source.find(GEN_BEGIN), source.find(GEN_END)) else {
+        return None;
+    };
+    if begin_pos >= end_pos {
+        return None;
+    }
+    let base_line = source[..begin_pos].lines().count();
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let names = |line: &str| {
+        tokens.iter().any(|t| {
+            [t.to_ascii_uppercase(), t.to_ascii_lowercase()]
+                .iter()
+                .any(|needle| {
+                    line.match_indices(needle.as_str()).any(|(s, _)| {
+                        let e = s + needle.len();
+                        !line[..s].ends_with(is_word) && !line[e..].starts_with(is_word)
+                    })
+                })
+        })
+    };
+    let block: Vec<&str> = source[begin_pos..end_pos].lines().collect();
+    let first = |comments: bool| {
+        block
+            .iter()
+            .position(|l| l.trim_start().starts_with("//") == comments && names(l))
+    };
+    first(false)
+        .or_else(|| first(true))
+        .map(|i| base_line + i + 1)
+}
+
+/// The 1-based lines of main.rs's generated block, markers included - empty
+/// when it has none.
+pub fn gen_block_lines(source: &str) -> std::ops::RangeInclusive<usize> {
+    match (source.find(GEN_BEGIN), source.find(GEN_END)) {
+        (Some(begin), Some(end)) if begin < end => {
+            let line_of = |at: usize| source[..at].matches('\n').count() + 1;
+            line_of(begin)..=line_of(end)
+        }
+        _ => 1..=0,
+    }
+}
+
 /// Fallback for a pin with no `let` of its own: the first GEN-block line that
 /// mentions it as a whole token — `p.PB6`, `peripherals.GPIO20`, `gpiob.pb6`.
 /// ESP hands bus pins straight to their driver (`.with_rx(peripherals.GPIO20)`),

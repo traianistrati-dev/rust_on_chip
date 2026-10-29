@@ -2204,6 +2204,15 @@ fn pwm_config_file(mcu: &Mcu, inst: u8, chans: &[(u8, (u8, u8))]) -> String {
     o
 }
 
+/// The name an nRF main.rs hands pad `P0.13` to a call under: nrf-hal's
+/// `port0.p0_13`, embassy-nrf's `p.P0_13` - the one word, either case.
+fn nrf_pad_tokens(pin: &Pin) -> Vec<String> {
+    match nrf_pin(&pin.name) {
+        Some(pp) => vec![ident(pp)],
+        None => vec![pin.name.clone()],
+    }
+}
+
 /// The variable both nRF runtimes bind a GPIO under - `p0_21_out`, no label
 /// (`gpio_lines`, `async_binding`) - which a Custom module's field and
 /// `new(..)` argument take.
@@ -2247,6 +2256,10 @@ impl FamilyBackend for NrfBackend {
 
     fn pin_binding(&self, pin: &Pin) -> String {
         nrf_pin_binding(pin)
+    }
+
+    fn pad_tokens(&self, pin: &Pin) -> Vec<String> {
+        nrf_pad_tokens(pin)
     }
 
     fn binding_takes_label(&self) -> bool {
@@ -3612,6 +3625,10 @@ impl FamilyBackend for AsyncNrfBackend {
 
     fn pin_binding(&self, pin: &Pin) -> String {
         nrf_pin_binding(pin)
+    }
+
+    fn pad_tokens(&self, pin: &Pin) -> Vec<String> {
+        nrf_pad_tokens(pin)
     }
 
     fn binding_takes_label(&self) -> bool {

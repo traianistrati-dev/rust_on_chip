@@ -118,6 +118,21 @@ pub trait FamilyBackend {
         )
     }
 
+    /// The names main.rs writes pad `pin` itself under, where it hands the pad
+    /// to a call rather than binding it (`p.PB6`, `peripherals.GPIO20`,
+    /// `gpiob.pb6`) - what the editor's go-to-code looks for when the pad has
+    /// no `let` of its own. Each is matched as a whole word, upper or lower
+    /// case. Default: the pad's name, without a board's note after it.
+    fn pad_tokens(&self, pin: &Pin) -> Vec<String> {
+        vec![
+            pin.name
+                .split_whitespace()
+                .next()
+                .unwrap_or(&pin.name)
+                .to_owned(),
+        ]
+    }
+
     /// Whether [`Self::pin_binding`] carries the pin's label - on the STM32 and
     /// ESP it does (`pa0_out_led`), on the RP and nRF it does not (`gp25out`).
     /// A Custom module's Update follows what reaches the name

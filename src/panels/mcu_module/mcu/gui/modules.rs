@@ -10669,6 +10669,168 @@ mod tests {
         assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
+    /// Where the pin goto lands, by vendor: an RP's PWM pad on the slice's
+    /// `init` that rp-hal hands `pins.gpio6` to, or embassy-rp's `p.PIN_6`; an
+    /// RP's and an nRF's GPIO on its own `let`, named the chip's way
+    /// (`gp25out`, `p0_13_out`) - the pad's note (`GP25 (on-board LED)`) no
+    /// part of it.
+    #[test]
+    fn a_pin_goto_lands_where_each_vendor_writes_the_pad() {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let landing = |board: &str, runtime: Runtime, wired: &[(&str, PinFunction)], pad: &str| {
+            let mut mcu = builtin_for(board).expect("built-in board").build_mcu();
+            mcu.runtime = runtime;
+            mcu.pending_runtime = runtime;
+            for (name, f) in wired {
+                mcu.iter_all_pins_mut()
+                    .find(|p| p.name.split_whitespace().next() == Some(*name))
+                    .unwrap_or_else(|| panic!("no {name}"))
+                    .selected_function = f.clone();
+            }
+            mcu.reconcile_modules();
+            let main = mcu.fresh_main_rs();
+            let p = mcu
+                .iter_all_pins()
+                .find(|p| p.name.split_whitespace().next() == Some(pad))
+                .unwrap();
+            let line = mcu
+                .pin_line(&main, p)
+                .unwrap_or_else(|| panic!("{board} {runtime:?} {pad}: {main}"));
+            main.lines().nth(line - 1).unwrap().trim().to_owned()
+        };
+        let pwm = [(
+            "GP6",
+            PinFunction::TimerPwm {
+                timer: 3,
+                channel: 1,
+            },
+        )];
+        assert!(
+            landing("rp2040_pico", Runtime::Blocking, &pwm, "GP6").contains("pins.gpio6"),
+            "rp-hal"
+        );
+        assert!(
+            landing("rp2040_pico", Runtime::Async, &pwm, "GP6").contains("p.PIN_6"),
+            "embassy-rp"
+        );
+        let led = [("GP25", PinFunction::GpioOutput)];
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            assert!(
+                landing("rp2040_pico", runtime, &led, "GP25").starts_with("let mut gp25out ="),
+                "{runtime:?}"
+            );
+        }
+        let nrf_led = [("P0.13", PinFunction::GpioOutput)];
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let line = landing("nrf52840_dk", runtime, &nrf_led, "P0.13");
+            assert!(line.contains("p0_13_out ="), "{runtime:?}: {line}");
+        }
+        // The radio up on a Pico W says "GPIO0 on the radio" in a comment;
+        // GP0's line is the code that hands `p.PIN_0` over.
+        let uart_and_radio = [
+            ("GP0", PinFunction::UsartTx(0)),
+            ("GP1", PinFunction::UsartRx(0)),
+            ("WL_LED", PinFunction::GpioOutput),
+        ];
+        let line = landing("rp2040_pico_w", Runtime::Async, &uart_and_radio, "GP0");
+        assert!(line.contains("p.PIN_0"), "{line}");
+        // A pad named for its use carries its GPIO in its note.
+        let creset = [("ICE_CRESET", PinFunction::GpioOutput)];
+        assert!(
+            landing("rp2350_pico2_ice", Runtime::Blocking, &creset, "ICE_CRESET")
+                .contains("pins.gpio31"),
+            "rp-hal"
+        );
+        assert!(
+            landing("rp2350_pico2_ice", Runtime::Async, &creset, "ICE_CRESET").contains("p.PIN_31"),
+            "embassy-rp"
+        );
+    }
+
+    /// The pin goto finds a line for every pad main.rs writes code for, on
+    /// every built-in board and LIVE runtime: its own `let`, by the chip's
+    /// binding, or the call that takes it, by the name main.rs hands it over
+    /// under (`pins.gpio6`, `p.PIN_6`, `p.P0_13`). Every supported module is
+    /// added, as the handle guard does, plus a GPIO output on a free pad. A
+    /// pad main.rs only names in a comment - a refused bus - may be named
+    /// there; one it never names at all is a miss only if it is configured.
+    #[test]
+    fn every_wired_pad_has_a_line_in_main_rs() {
+        use crate::panels::mcu_module::builtins::builtin_definitions;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let mut bad = Vec::new();
+        let mut checked = 0;
+        for def in builtin_definitions() {
+            for runtime in [
+                Runtime::Blocking,
+                Runtime::Async,
+                Runtime::Rtic,
+                Runtime::Native,
+            ] {
+                let mut mcu = def.build_mcu();
+                mcu.runtime = runtime;
+                mcu.pending_runtime = runtime;
+                let live = match runtime {
+                    Runtime::Async => mcu.is_async(),
+                    Runtime::Rtic => mcu.is_rtic(),
+                    Runtime::Native => mcu.is_native(),
+                    _ => true,
+                };
+                if !live {
+                    continue;
+                }
+                for kind in ModuleKind::ALL {
+                    if !kind.is_custom() && mcu.supports_module(kind) {
+                        mcu.add_module(kind);
+                    }
+                }
+                let free = mcu
+                    .iter_all_pins()
+                    .find(|p| {
+                        !p.reserved
+                            && p.selected_function == PinFunction::Unset
+                            && p.available_functions.contains(&PinFunction::GpioOutput)
+                    })
+                    .map(|p| p.number);
+                if let Some(n) = free {
+                    mcu.apply_pin_function(n, PinFunction::GpioOutput);
+                }
+                let main = mcu.fresh_main_rs();
+                // Pads main.rs writes no code for, and names nowhere: neither
+                // RP HAL takes an SPI chip-select, an nRF builds its QSPI on
+                // Async only (nrf-hal has no driver, and main.rs says so
+                // without the pads), and the ESP32-C61's esp-hal has no USB
+                // driver (likewise). A goto there stays silent.
+                let codeless = |f: &PinFunction| match f {
+                    PinFunction::SpiNss(_) => codegen::rp::is_rp(&mcu.family),
+                    PinFunction::QspiNcs { .. }
+                    | PinFunction::QspiClk
+                    | PinFunction::QspiIo { .. } => {
+                        codegen::nrf::is_nrf(&mcu.family) && !mcu.is_async()
+                    }
+                    PinFunction::UsbDp | PinFunction::UsbDm => mcu.family == "esp32c61",
+                    _ => false,
+                };
+                for p in mcu.iter_all_pins().filter(|p| {
+                    !p.reserved
+                        && p.selected_function != PinFunction::Unset
+                        && !codeless(&p.selected_function)
+                }) {
+                    checked += 1;
+                    if mcu.pin_line(&main, p).is_none() {
+                        bad.push(format!(
+                            "{} {runtime:?}: {} ({:?})",
+                            def.id, p.name, p.selected_function
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(checked > 200, "only {checked} pads checked");
+        assert!(bad.is_empty(), "{} misses:\n{}", bad.len(), bad.join("\n"));
+    }
+
     /// The names themselves, by vendor: an RP and an nRF name a bus after its
     /// peripheral with no underscore and no label, rp-hal's PWM slice is a
     /// field of `pwm_slices`, and an ESP's UART is `_uart`, not `_serial`.

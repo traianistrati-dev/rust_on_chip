@@ -3399,33 +3399,22 @@ impl AppIde {
     ///
     /// Targets, in order:
     /// 1. the pin's own `let <binding> = …` in main.rs's GEN block — the actual
-    ///    definition, and what every backend emits for a configured pin;
-    /// 2. the first GEN-block line that mentions the pin (ESP hands bus pins
-    ///    straight to their driver, e.g. `.with_rx(peripherals.GPIO20)`, so that
-    ///    call IS the definition site);
+    ///    definition, and what every backend emits for a configured pin. The
+    ///    binding is the chip's own (`Mcu::pad_code_names`): `gp25out` on an
+    ///    RP, `p0_13_out` on an nRF, `pa0_out_led` on an STM32;
+    /// 2. the first GEN-block line that mentions the pad under a name main.rs
+    ///    hands it to a call with (ESP's `.with_rx(peripherals.GPIO20)`,
+    ///    rp-hal's `pins.gpio6`, embassy-nrf's `p.P0_13`), so that call IS the
+    ///    definition site;
     /// 3. the peripheral / Custom-module config file under `src/pins/configs/`
     ///    that names the binding.
     fn locate_pin(&self, pin_num: usize) -> Option<(ProjectFileId, usize)> {
-        use crate::panels::mcu_module::codegen::common;
-        let (name, binding) = self.mcu.as_ref().and_then(|m| {
-            m.find_pin(pin_num).map(|p| {
-                (
-                    p.name.clone(),
-                    common::pin_binding(
-                        &p.name.to_ascii_lowercase(),
-                        &p.selected_function,
-                        &p.custom_label,
-                    ),
-                )
-            })
-        })?;
-
-        let main_hit = common::find_pin_binding_line(&self.generated_code, &name)
-            .map(|(line, _)| line)
-            .or_else(|| common::find_pin_mention_line(&self.generated_code, &name));
-        if let Some(line) = main_hit {
+        let mcu = self.mcu.as_ref()?;
+        let pin = mcu.find_pin(pin_num)?;
+        if let Some(line) = mcu.pin_line(&self.generated_code, pin) {
             return Some((ProjectFileId::MainRs, line));
         }
+        let (binding, _) = mcu.pad_code_names(pin);
 
         self.project_tree
             .user_src_files

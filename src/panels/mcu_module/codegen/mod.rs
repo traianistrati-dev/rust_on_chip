@@ -131,6 +131,50 @@ impl Mcu {
         family::backend_for_runtime(&self.family, self.runtime)
     }
 
+    /// The names go-to-code looks for pad `pin` under in main.rs: the
+    /// variable this chip binds it as ([`Self::pin_binding`]), and the names
+    /// it hands the pad itself to a call under
+    /// ([`family::FamilyBackend::pad_tokens`]) - `pins.gpio6` on rp-hal,
+    /// `p.P0_13` on embassy-nrf, never the canvas's `GP6` / `P0.13`.
+    pub fn pad_code_names(
+        &self,
+        pin: &crate::panels::mcu_module::pins::logic::pin::Pin,
+    ) -> (String, Vec<String>) {
+        let tokens = match self.backend() {
+            Some(b) => b.pad_tokens(pin),
+            None => vec![
+                pin.name
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&pin.name)
+                    .to_owned(),
+            ],
+        };
+        (self.pin_binding(pin), tokens)
+    }
+
+    /// The 1-based line of `main_rs`'s generated block that defines pad
+    /// `pin` - where the editor's go-to-code lands: the pad's own `let`, by
+    /// this chip's binding ([`Self::pad_code_names`]), else the first line
+    /// that hands the pad to a call under a name main.rs writes it by
+    /// (ESP's `.with_rx(peripherals.GPIO20)`, rp-hal's `pins.gpio6`,
+    /// embassy-nrf's `p.P0_13`). `None` when main.rs writes nothing for it.
+    pub fn pin_line(
+        &self,
+        main_rs: &str,
+        pin: &crate::panels::mcu_module::pins::logic::pin::Pin,
+    ) -> Option<usize> {
+        let (binding, tokens) = self.pad_code_names(pin);
+        // A board's pad carries a note after its name (`GP25 (on-board LED)`).
+        let name = pin.name.split_whitespace().next().unwrap_or(&pin.name);
+        let block = common::gen_block_lines(main_rs);
+        crate::panels::mcu_module::mcu::gui::modules::handle_line(main_rs, &binding)
+            .map(|i| i + 1)
+            .filter(|l| block.contains(l))
+            .or_else(|| common::find_pin_binding_line(main_rs, name).map(|(line, _)| line))
+            .or_else(|| common::find_pad_line(main_rs, &tokens))
+    }
+
     /// The variable this chip's main.rs binds GPIO `pin` under
     /// ([`family::FamilyBackend::pin_binding`]) - what a Custom module's struct
     /// field and `new(..)` argument are both named. `gp25out` on an RP,

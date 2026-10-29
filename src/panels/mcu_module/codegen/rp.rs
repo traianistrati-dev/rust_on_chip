@@ -1369,6 +1369,26 @@ fn pwm_config_file(mcu: &Mcu, slice: u8, chans: &[(u8, u8)]) -> String {
     o
 }
 
+/// The name an RP main.rs hands pad `GPn` to a call under, on `embassy`'s
+/// runtime or rp-hal's: `p.PIN_6`, `pins.gpio6` - never `GP6`, the pad's name.
+/// A pad named for its use carries its GPIO in its note (`ICE_CRESET (GP31)`).
+fn rp_pad_tokens(
+    pin: &crate::panels::mcu_module::pins::logic::pin::Pin,
+    embassy: bool,
+) -> Vec<String> {
+    let n = gpio_index(&pin.name).or_else(|| {
+        let note = &pin.name[pin.name.find("(GP")? + 3..];
+        note[..note.find(|c: char| !c.is_ascii_digit())?]
+            .parse()
+            .ok()
+    });
+    match n {
+        Some(n) if embassy => vec![format!("PIN_{n}")],
+        Some(n) => vec![format!("gpio{n}")],
+        None => vec![pin.name.clone()],
+    }
+}
+
 /// The variable both RP runtimes bind a GPIO under - `gp25out`, `gp14in`, no
 /// label (`gpio_lines`, `async_gpio_lines`) - which a Custom module's field and
 /// `new(..)` argument take.
@@ -1425,6 +1445,10 @@ impl FamilyBackend for RpBackend {
 
     fn pin_binding(&self, pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> String {
         rp_pin_binding(pin)
+    }
+
+    fn pad_tokens(&self, pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> Vec<String> {
+        rp_pad_tokens(pin, false)
     }
 
     fn binding_takes_label(&self) -> bool {
@@ -5059,6 +5083,10 @@ impl FamilyBackend for AsyncRpBackend {
 
     fn pin_binding(&self, pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> String {
         rp_pin_binding(pin)
+    }
+
+    fn pad_tokens(&self, pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> Vec<String> {
+        rp_pad_tokens(pin, true)
     }
 
     fn binding_takes_label(&self) -> bool {

@@ -672,6 +672,11 @@ fn section(mcu: &Mcu) -> String {
         );
     }
     o.push_str(&pwm_adc_lines(mcu, hal));
+    // Last: a Custom module takes the GPIO bindings above.
+    o.push_str(&super::common::custom_section(
+        &mcu.custom_module_inits(),
+        ALLOW,
+    ));
     o.push_str(GEN_END);
     o.push('\n');
     o
@@ -1277,6 +1282,51 @@ fn pwm_config_file(mcu: &Mcu, slice: u8, chans: &[(u8, u8)]) -> String {
     o
 }
 
+/// The variable both RP runtimes bind a GPIO under - `gp25out`, `gp14in`, no
+/// label (`gpio_lines`, `async_gpio_lines`) - which a Custom module's field and
+/// `new(..)` argument take.
+fn rp_pin_binding(pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> String {
+    match gpio_index(&pin.name) {
+        Some(n) => format!("gp{n}{}", var_suffix(&pin.selected_function)),
+        // A pad main.rs binds nothing for, which `rp_custom_pins_taken`
+        // refuses - but the module's file is written all the same, so its
+        // field must still be an identifier (`ice_creset_gp31`).
+        None => super::common::sanitize_label(&pin.name),
+    }
+}
+
+/// Why an RP main.rs cannot hand each of `pins` to a Custom module. An output
+/// and an input are values of their own on both runtimes - an edge armed on a
+/// pad the module owns is dropped before generation (`Mcu::codegen_view`), so
+/// no task takes it. PWM is always a driver here: the generated slice owns the
+/// pad. And only a chip GPIO is bound at all (`gpio_lines` skips a pad with no
+/// GP number): the W boards' WL_LED is the radio's, the pico2-ice's
+/// ICE_CRESET the FPGA loader's.
+fn rp_custom_pins_taken(
+    pins: &[&crate::panels::mcu_module::pins::logic::pin::Pin],
+) -> Vec<(String, &'static str)> {
+    pins.iter()
+        .filter_map(|p| {
+            if gpio_index(&p.name).is_none() {
+                let why = if p.name.starts_with("WL_") {
+                    "is GPIO0 of the CYW43 radio, driven through its `control`, not a chip GPIO"
+                } else if p.name.starts_with("ICE_CRESET") {
+                    "is the FPGA's CRESET, which the generated loader takes"
+                } else {
+                    "is not a chip GPIO main.rs binds"
+                };
+                return Some((p.name.clone(), why));
+            }
+            let why = match p.selected_function {
+                PinFunction::GpioOutput | PinFunction::GpioInput => return None,
+                PinFunction::TimerPwm { .. } => "is driven by the generated PWM slice",
+                _ => "is owned by a peripheral init",
+            };
+            Some((p.name.clone(), why))
+        })
+        .collect()
+}
+
 impl FamilyBackend for RpBackend {
     fn family_id(&self) -> &'static str {
         "rp2040"
@@ -1284,6 +1334,22 @@ impl FamilyBackend for RpBackend {
 
     fn handles(&self, family: &str) -> bool {
         is_rp(family)
+    }
+
+    fn pin_binding(&self, pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> String {
+        rp_pin_binding(pin)
+    }
+
+    fn binding_takes_label(&self) -> bool {
+        false
+    }
+
+    fn custom_pins_taken(
+        &self,
+        _mcu: &Mcu,
+        pins: &[&crate::panels::mcu_module::pins::logic::pin::Pin],
+    ) -> Option<Vec<(String, &'static str)>> {
+        Some(rp_custom_pins_taken(pins))
     }
 
     /// rp-hal picks pulls through `into_*_input` / `into_push_pull_output`,
@@ -1624,6 +1690,9 @@ mod emit_for_manual_compile {
         // SPI1 transmit-only on GP10/GP11 with no MISO - the `OptionTNone`
         // halves and the `(MOSI, SCK)` pinout only a compiler can vouch for.
         let oneway = std::env::var("EIDE_RP_ONEWAY").is_ok();
+        // `EIDE_CUSTOM=1`: a Custom module over an output (GP20) and an input
+        // (GP21) - its generic struct handed rp-hal's concrete pin types.
+        let custom = std::env::var("EIDE_CUSTOM").is_ok();
         for (id, dir_name) in [
             ("rp2040_pico", "eide_rp2040_check"),
             ("rp2350_pico2", "eide_rp2350_check"),
@@ -1669,6 +1738,8 @@ mod emit_for_manual_compile {
                         }
                     }
                     "GP26" => p.selected_function = PinFunction::AdcChannel { adc: 0, channel: 0 },
+                    "GP20" if custom => p.selected_function = PinFunction::GpioOutput,
+                    "GP21" if custom => p.selected_function = PinFunction::GpioInput,
                     _ => {}
                 }
             }
@@ -1676,6 +1747,9 @@ mod emit_for_manual_compile {
             // PWM slice: 7.5 % and 10 %, so the generated code cannot pass by
             // accident on the module's default of zero.
             mcu.reconcile_modules();
+            if custom {
+                super::custom_modules::attach_custom(&mut mcu, &["GP20", "GP21"]);
+            }
             for m in &mut mcu.modules {
                 use crate::panels::mcu_module::modules::{ModuleConfig, UsartDirection};
                 match &mut m.config {
@@ -1722,6 +1796,18 @@ mod emit_for_manual_compile {
                     "{id}: no {want} in main.rs:\n{main_rs}"
                 );
             }
+            assert_eq!(
+                main_rs.contains(
+                    "let mut panel = pins::configs::custom_panel::Panel::new(gp20out, gp21in);"
+                ),
+                custom,
+                "{id}:\n{main_rs}"
+            );
+            let main_rs = if custom {
+                super::custom_modules::call_update(&main_rs)
+            } else {
+                main_rs
+            };
             let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             // `sync_pin_files` keeps `src/pins/mod.rs` in a real project, and the
             // generated header declares `pub mod pins;` — so the harness has to
@@ -4844,6 +4930,11 @@ fn async_section(mcu: &Mcu) -> String {
     }
     o.push_str(&gpio_body);
     o.push_str(&buses);
+    // Last: a Custom module takes the GPIO bindings above.
+    o.push_str(&super::common::custom_section(
+        &mcu.custom_module_inits(),
+        ALLOW,
+    ));
     o.push_str(GEN_END);
     o.push('\n');
     o
@@ -4877,6 +4968,22 @@ impl FamilyBackend for AsyncRpBackend {
 
     fn handles(&self, family: &str) -> bool {
         is_rp(family)
+    }
+
+    fn pin_binding(&self, pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> String {
+        rp_pin_binding(pin)
+    }
+
+    fn binding_takes_label(&self) -> bool {
+        false
+    }
+
+    fn custom_pins_taken(
+        &self,
+        _mcu: &Mcu,
+        pins: &[&crate::panels::mcu_module::pins::logic::pin::Pin],
+    ) -> Option<Vec<(String, &'static str)>> {
+        Some(rp_custom_pins_taken(pins))
     }
 
     /// embassy-rp takes the pull in `Input::new`, which this backend chooses.
@@ -5740,6 +5847,9 @@ mod emit_async_for_manual_compile {
         // BufferedUartRx, UartRx, Spi::new_txonly, new_rxonly and
         // new_txonly_nosck.
         let oneway = std::env::var("EIDE_RP_ONEWAY").is_ok();
+        // `EIDE_CUSTOM=1`: a Custom module over an output (GP20) and an input
+        // (GP21) - its generic struct handed embassy-rp's `Output` / `Input`.
+        let custom = std::env::var("EIDE_CUSTOM").is_ok();
         for (id, dir_name, mode) in [
             (
                 "rp2040_pico",
@@ -5795,6 +5905,8 @@ mod emit_async_for_manual_compile {
                     // ...and a PLAIN input beside it, so the two paths are
                     // proved to differ rather than both collapsing into one.
                     "GP14" => p.selected_function = PinFunction::GpioInput,
+                    "GP20" if custom => p.selected_function = PinFunction::GpioOutput,
+                    "GP21" if custom => p.selected_function = PinFunction::GpioInput,
                     _ => {}
                 }
             }
@@ -5815,6 +5927,9 @@ mod emit_async_for_manual_compile {
                         };
                     }
                 }
+            }
+            if custom {
+                super::custom_modules::attach_custom(&mut mcu, &["GP20", "GP21"]);
             }
             // The watchdog at embassy-rp's own ceiling for this chip - twice
             // the Blocking one on the RP2350 - so its `const` assert is
@@ -5852,6 +5967,18 @@ mod emit_async_for_manual_compile {
                     );
                 }
             }
+            assert_eq!(
+                main_rs.contains(
+                    "let mut panel = pins::configs::custom_panel::Panel::new(gp20out, gp21in);"
+                ),
+                custom,
+                "{id}:\n{main_rs}"
+            );
+            let main_rs = if custom {
+                super::custom_modules::call_update(&main_rs)
+            } else {
+                main_rs
+            };
             // The chip names a DIFFERENT HAL crate on async; this is where that
             // choice becomes a Cargo.toml.
             // Through `manifest_sync`, the SAME build config and manifest the app
@@ -6953,5 +7080,588 @@ mod one_way_buses {
         assert!(text.contains("Spi::new_rxonly("), "{text}");
         let text = on(Runtime::Blocking);
         assert!(!text.contains("is configured"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod custom_modules {
+    use crate::panels::mcu_module::builtins::builtin_for;
+    use crate::panels::mcu_module::mcu::gui::modules::unbound_handle_names;
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+    use crate::panels::mcu_module::pins::PinFunction;
+    use crate::panels::mcu_module::pins::logic::pin::model::Edge;
+
+    /// A Pico on `runtime` with `wired` on its pads, an armed edge on any pad
+    /// in `armed`, and one Custom module "panel" over those pads, applied.
+    pub(super) fn pico_with_custom(
+        runtime: Runtime,
+        wired: &[(&str, PinFunction)],
+        armed: &[&str],
+    ) -> Mcu {
+        board_with_custom("rp2040_pico", runtime, wired, armed)
+    }
+
+    /// [`pico_with_custom`] on any RP board.
+    fn board_with_custom(
+        board: &str,
+        runtime: Runtime,
+        wired: &[(&str, PinFunction)],
+        armed: &[&str],
+    ) -> Mcu {
+        let mut mcu = builtin_for(board).expect("built-in RP board").build_mcu();
+        mcu.runtime = runtime;
+        for (name, f) in wired {
+            let p = mcu
+                .iter_all_pins_mut()
+                .find(|p| p.name == *name)
+                .unwrap_or_else(|| panic!("no pad {name}"));
+            p.selected_function = f.clone();
+            if armed.contains(name) {
+                p.irq = Some(Edge::Rising);
+            }
+        }
+        mcu.reconcile_modules();
+        let pads: Vec<&str> = wired.iter().map(|(n, _)| *n).collect();
+        attach_custom(&mut mcu, &pads);
+        mcu
+    }
+
+    /// `main` with the Custom module's `update()` called right below the
+    /// generated block, as a user's tail would. `new` takes any type; only a
+    /// CALL to the bounded `impl` makes the compiler check that the HAL's
+    /// pins really are the embedded-hal `OutputPin` / `InputPin` it names -
+    /// which is what the `EIDE_CUSTOM` cross-compile is for.
+    pub(super) fn call_update(main: &str) -> String {
+        let end = crate::panels::mcu_module::codegen::common::GEN_END;
+        assert!(main.contains(end), "no generated block");
+        main.replacen(
+            &format!("{end}\n"),
+            &format!("{end}\n    panel.update();\n"),
+            1,
+        )
+    }
+
+    /// One Custom module "panel" over the already-wired `pads`, in that order,
+    /// applied - what the panel's Update commits. The cross-compile harnesses
+    /// (`EIDE_CUSTOM`) attach it the same way.
+    pub(super) fn attach_custom(mcu: &mut Mcu, pads: &[&str]) {
+        let nums: Vec<usize> = pads
+            .iter()
+            .map(|name| {
+                mcu.iter_all_pins()
+                    .find(|p| p.name == *name)
+                    .unwrap_or_else(|| panic!("no pad {name}"))
+                    .number
+            })
+            .collect();
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .expect("the Custom module");
+        *m.config.custom_label_mut() = "panel".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = nums.clone();
+            c.applied_pins = nums;
+        }
+    }
+
+    fn said(main: &str) -> String {
+        main.lines()
+            .map(|l| l.trim().trim_start_matches("//").trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The module is built from the very bindings main.rs makes on each
+    /// runtime - `gp6out`, `gp14in` - with the struct's fields named the same,
+    /// and the box's handle is a line main.rs really writes.
+    #[test]
+    fn a_custom_module_is_built_from_the_bindings_main_rs_makes() {
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mcu = pico_with_custom(
+                runtime,
+                &[
+                    ("GP6", PinFunction::GpioOutput),
+                    ("GP14", PinFunction::GpioInput),
+                ],
+                &[],
+            );
+            let main = mcu.fresh_main_rs();
+            assert!(
+                main.contains("    // ── Custom modules ──\n"),
+                "{runtime:?}: {main}"
+            );
+            assert!(
+                main.contains(
+                    "    #[allow(unused_mut, unused_variables)]\n    let mut panel = pins::configs::custom_panel::Panel::new(gp6out, gp14in);\n"
+                ),
+                "{runtime:?}: {main}"
+            );
+            assert!(main.contains("let mut gp6out = "), "{runtime:?}: {main}");
+            let files = mcu.config_files();
+            let (_, body) = files
+                .iter()
+                .find(|(n, _)| n == "custom_panel.rs")
+                .expect("custom_panel.rs");
+            assert!(body.contains("pub struct Panel<GP6, GP14> {"), "{body}");
+            assert!(body.contains("    pub gp6out: GP6,"), "{body}");
+            assert!(body.contains("    pub gp14in: GP14,"), "{body}");
+            assert!(
+                unbound_handle_names(&mcu).is_empty(),
+                "{:?}",
+                unbound_handle_names(&mcu)
+            );
+        }
+    }
+
+    /// A pad main.rs does not hand over is said instead of a `new(..)` that
+    /// would not compile: PWM on both runtimes (the slice owns it). An edge
+    /// armed on a pad the module owns is dropped before generation
+    /// (`Mcu::codegen_view`), so on Async no task takes the pin and the module
+    /// is built from it like any input.
+    #[test]
+    fn a_pad_main_rs_does_not_hand_over_is_said_instead() {
+        let pwm = [
+            (
+                "GP6",
+                PinFunction::TimerPwm {
+                    timer: 3,
+                    channel: 1,
+                },
+            ),
+            ("GP7", PinFunction::GpioOutput),
+        ];
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let main = pico_with_custom(runtime, &pwm, &[]).fresh_main_rs();
+            assert!(
+                said(&main).contains(
+                    "Custom module `panel` not built here: GP6 is driven by the generated PWM \
+                     slice, so it cannot also be moved into `Panel`. Hand the module GPIO \
+                     In/Out pins, or construct it yourself."
+                ),
+                "{runtime:?}: {main}"
+            );
+            assert!(!main.contains("Panel::new("), "{runtime:?}: {main}");
+        }
+        let armed = [("GP14", PinFunction::GpioInput)];
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let main = pico_with_custom(runtime, &armed, &["GP14"]).fresh_main_rs();
+            assert!(main.contains("Panel::new(gp14in);"), "{runtime:?}: {main}");
+            assert!(!main.contains("gp14in_irq"), "{runtime:?}: {main}");
+        }
+    }
+
+    /// A pad that is no chip GPIO has no binding to hand over - the W boards'
+    /// WL_LED is the radio's, the pico2-ice's ICE_CRESET the FPGA loader's -
+    /// so it is said, never `new(wl_led)`; and the module's file, written all
+    /// the same, still has an identifier for a field.
+    #[test]
+    fn a_pad_that_is_no_chip_gpio_is_refused() {
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mcu = board_with_custom(
+                "rp2040_pico_w",
+                runtime,
+                &[("WL_LED", PinFunction::GpioOutput)],
+                &[],
+            );
+            let main = mcu.fresh_main_rs();
+            assert!(
+                said(&main).contains(
+                    "Custom module `panel` not built here: WL_LED is GPIO0 of the CYW43 radio, \
+                     driven through its `control`, not a chip GPIO"
+                ),
+                "{runtime:?}: {main}"
+            );
+            assert!(!main.contains("Panel::new("), "{runtime:?}: {main}");
+            let mcu = board_with_custom(
+                "rp2350_pico2_ice",
+                runtime,
+                &[("ICE_CRESET (GP31)", PinFunction::GpioOutput)],
+                &[],
+            );
+            let main = mcu.fresh_main_rs();
+            assert!(
+                said(&main).contains(
+                    "ICE_CRESET (GP31) is the FPGA's CRESET, which the generated loader takes"
+                ),
+                "{runtime:?}: {main}"
+            );
+            assert!(!main.contains("Panel::new("), "{runtime:?}: {main}");
+            let files = mcu.config_files();
+            let (_, body) = files
+                .iter()
+                .find(|(n, _)| n == "custom_panel.rs")
+                .expect("custom_panel.rs");
+            assert!(
+                body.contains("    pub ice_creset_gp31: ICE_CRESET,"),
+                "{body}"
+            );
+        }
+    }
+
+    /// `new(..)` is built from the APPLIED pads: one dropped from the draft
+    /// (not yet Updated) and armed again is still the module's, so its edge
+    /// stays dropped and no task takes the binding `new` is handed.
+    #[test]
+    fn an_applied_pad_keeps_its_edge_dropped_until_update() {
+        let mut mcu = pico_with_custom(
+            Runtime::Async,
+            &[
+                ("GP6", PinFunction::GpioOutput),
+                ("GP14", PinFunction::GpioInput),
+            ],
+            &["GP14"],
+        );
+        let gp6 = mcu
+            .iter_all_pins()
+            .find(|p| p.name == "GP6")
+            .unwrap()
+            .number;
+        for m in &mut mcu.modules {
+            if let ModuleConfig::Custom(c) = &mut m.config {
+                c.pins = vec![gp6];
+            }
+        }
+        let main = mcu.fresh_main_rs();
+        assert!(main.contains("Panel::new(gp6out, gp14in);"), "{main}");
+        assert!(!main.contains("gp14in_irq"), "{main}");
+        // The canvas holds the pad too: no field, no edge to offer.
+        let gp14 = mcu
+            .iter_all_pins()
+            .find(|p| p.name == "GP14")
+            .unwrap()
+            .number;
+        assert!(
+            crate::panels::mcu_module::mcu::gui::modules::module_owned_pins(&mcu).contains(&gp14)
+        );
+    }
+
+    /// A project that built its Custom module itself below the markers - the
+    /// only way on an RP before the generator did - keeps that line: the
+    /// update writes a note where the call would be, not a second `new(..)`
+    /// that would move the same pads. Delete it and the next update builds
+    /// the module. Nothing else is taken for that line.
+    #[test]
+    fn a_module_the_user_builds_is_left_to_them() {
+        use crate::panels::mcu_module::codegen::common::{GEN_BEGIN, GEN_END};
+        let end = GEN_END;
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mcu = pico_with_custom(runtime, &[("GP6", PinFunction::GpioOutput)], &[]);
+            let fresh = mcu.fresh_main_rs();
+            let with_tail =
+                |tail: &str| fresh.replacen(&format!("{end}\n"), &format!("{end}\n{tail}"), 1);
+            let built = |main: &str| {
+                main.split_once(end)
+                    .expect("the markers")
+                    .0
+                    .contains("let mut panel = pins::configs::custom_panel::Panel::new(gp6out);")
+            };
+            let left = |main: &str| {
+                let block = main.split_once(end).expect("the markers").0;
+                !block.contains("Panel::new(gp6out)")
+                    && said(block).contains(
+                        "Custom module `panel` not built here: your own code below the markers \
+                         builds it (`Panel::new(..)`), and building it here as well would move \
+                         its pads twice.",
+                    )
+            };
+            // Its `new` through its file - this revision or another - or bare
+            // under a `use` of that file.
+            let imported = |tail: &str| {
+                with_tail(tail).replacen(
+                    GEN_BEGIN,
+                    &format!("use crate::pins::configs::custom_panel::Panel;\n{GEN_BEGIN}"),
+                    1,
+                )
+            };
+            let by_path = "    let mut panel = pins::configs::custom_panel::Panel::new(gp6out);\n";
+            let by_revision = "    let mut p = crate::pins::configs::custom_panel_2::Panel::new(\n        gp6out,\n    );\n";
+            let bare = "    let mut panel = Panel::new(gp6out);\n";
+            for (old, mine) in [
+                (with_tail(by_path), by_path),
+                (with_tail(by_revision), by_revision),
+                (imported(bare), bare),
+            ] {
+                let updated = mcu.update_main_rs(&old);
+                assert!(left(&updated), "{runtime:?}: {updated}");
+                let (_, tail) = old.split_once(end).unwrap();
+                assert!(updated.ends_with(tail), "{runtime:?}: the tail is kept");
+                // Their line gone, the next update builds it.
+                let again = mcu.update_main_rs(&updated.replacen(mine, "", 1));
+                assert!(built(&again), "{runtime:?}: {again}");
+            }
+            // Code written against the generated handle, another crate's or
+            // another struct's `new`, a second instance on other pads or one
+            // rebuilt from the handle's own field, a variable of the pad's
+            // name, a mention in a comment or a string, an item after `main`
+            // - and code that drives the pad directly: the generated `let`
+            // moves it, and the compiler names that line.
+            for tail in [
+                "    panel.update();\n",
+                "    let mut lcd = Driver::new(panel.gp6out);\n",
+                "    let mut panel = Driver::new(panel.gp6out);\n",
+                "    let b = display::Panel::new(gp6out);\n",
+                "    let k = RotaryPanel::new(gp6out);\n",
+                "    let right = pins::configs::custom_panel::Panel::new(gp9out);\n",
+                "    let panel = pins::configs::custom_panel::Panel::new(panel.gp6out.into_pull_up_input());\n",
+                "    let mut gp6out = panel.gp6out;\n    gp6out.set_high();\n",
+                "    // let p = Panel::new(gp6out);\n    let s = \"Panel::new(\";\n",
+                "    gp6out.set_high();\n",
+            ] {
+                let updated = mcu.update_main_rs(&with_tail(tail));
+                assert!(built(&updated), "{runtime:?}: {tail}\n{updated}");
+            }
+            // The module's file imported alone, beside another crate's
+            // `Panel`: a bare `Panel::new(` is that other one.
+            let other = with_tail("    let lcd = Panel::new(gp6out);\n").replacen(
+                GEN_BEGIN,
+                &format!(
+                    "use crate::pins::configs::custom_panel;\nuse display::Panel;\n{GEN_BEGIN}"
+                ),
+                1,
+            );
+            assert!(built(&mcu.update_main_rs(&other)), "{runtime:?}: {other}");
+            let after_main = format!(
+                "{}\nfn make(gp6out: Output<'static>) -> Panel<Output<'static>> {{\n    \
+                 Panel::new(gp6out)\n}}\n",
+                imported("    panel.update();\n")
+            );
+            assert!(
+                built(&mcu.update_main_rs(&after_main)),
+                "{runtime:?}: {after_main}"
+            );
+        }
+        // On RTIC the module is built in `#[init]`, inside the markers: no
+        // code below them reaches its pads.
+        let mut rtic = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        rtic.runtime = Runtime::Rtic;
+        rtic.iter_all_pins_mut()
+            .find(|p| p.name == "PA0")
+            .unwrap()
+            .selected_function = PinFunction::GpioOutput;
+        attach_custom(&mut rtic, &["PA0"]);
+        let fresh = rtic.fresh_main_rs();
+        let tail = "    let p = pins::configs::custom_panel::Panel::new(pa0_out);\n";
+        let text = fresh.replacen(&format!("{end}\n"), &format!("{end}\n{tail}"), 1);
+        assert!(rtic.is_rtic(), "the F1 runs RTIC");
+        assert!(rtic.customs_built_by_hand(&text).is_empty(), "{text}");
+        // The STM32 has always built its modules, so no code of its builds
+        // one as well: it is built whatever its tail holds, as it always was.
+        let mut f1 = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        f1.iter_all_pins_mut()
+            .find(|p| p.name == "PA0")
+            .unwrap()
+            .selected_function = PinFunction::GpioOutput;
+        attach_custom(&mut f1, &["PA0"]);
+        let fresh = f1.fresh_main_rs();
+        for tail in [
+            "    let mut lcd = Driver::new(panel.pa0_out);\n",
+            "    let right = pins::configs::custom_panel::Panel::new(pa0_out);\n",
+        ] {
+            let text = fresh.replacen(&format!("{end}\n"), &format!("{end}\n{tail}"), 1);
+            assert!(f1.customs_built_by_hand(&text).is_empty(), "{tail}");
+            let updated = f1.update_main_rs(&text);
+            assert!(
+                updated
+                    .split_once(end)
+                    .unwrap()
+                    .0
+                    .contains("Panel::new(pa0_out);"),
+                "{updated}"
+            );
+        }
+    }
+
+    /// A pad two modules hold - one still has it from its last Update, the
+    /// other was Updated with it since - is moved into the first module only;
+    /// the second says so instead of moving it again (E0382). A pad dropped
+    /// from a module's list stays held until that module's next Update: no
+    /// other module's "+ Add pin" offers it, while its own may take it back.
+    #[test]
+    fn a_pad_is_handed_to_one_module_only() {
+        use crate::panels::mcu_module::mcu::gui::modules::{blocked_for, custom_pins_held_by};
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mut mcu = pico_with_custom(
+                runtime,
+                &[
+                    ("GP6", PinFunction::GpioOutput),
+                    ("GP7", PinFunction::GpioOutput),
+                ],
+                &[],
+            );
+            let gp = |mcu: &Mcu, name: &str| {
+                mcu.iter_all_pins().find(|p| p.name == name).unwrap().number
+            };
+            let (gp6, gp7) = (gp(&mcu, "GP6"), gp(&mcu, "GP7"));
+            // GP6 removed from "panel"'s list, not Updated yet.
+            if let Some(ModuleConfig::Custom(c)) = mcu
+                .modules
+                .iter_mut()
+                .find(|m| m.kind == ModuleKind::Custom)
+                .map(|m| &mut m.config)
+            {
+                c.pins = vec![gp7];
+            }
+            let panel_id = mcu
+                .modules
+                .iter()
+                .find(|m| m.kind == ModuleKind::Custom)
+                .unwrap()
+                .id
+                .clone();
+            let held = custom_pins_held_by(&mcu);
+            let none = std::collections::HashSet::new();
+            assert!(
+                blocked_for(&none, &held, "another").contains(&gp6),
+                "{runtime:?}"
+            );
+            assert!(
+                !blocked_for(&none, &held, &panel_id).contains(&gp6),
+                "{runtime:?}"
+            );
+            assert!(mcu.add_module(ModuleKind::Custom));
+            let knob = mcu
+                .modules
+                .iter_mut()
+                .rfind(|m| m.kind == ModuleKind::Custom)
+                .expect("the second Custom module");
+            *knob.config.custom_label_mut() = "knob".to_owned();
+            if let ModuleConfig::Custom(c) = &mut knob.config {
+                c.pins = vec![gp6];
+                c.applied_pins = vec![gp6];
+            }
+            let inits = mcu.custom_module_inits();
+            assert!(
+                inits.contains(
+                    "let mut panel = pins::configs::custom_panel::Panel::new(gp6out, gp7out);"
+                ),
+                "{runtime:?}: {inits}"
+            );
+            assert!(!inits.contains("Knob::new("), "{runtime:?}: {inits}");
+            assert!(
+                said(&inits).contains(
+                    "Custom module `knob` not built here: GP6 is already moved into `panel` \
+                     above, and a pad can be handed to one module only."
+                ),
+                "{runtime:?}: {inits}"
+            );
+        }
+    }
+
+    /// A pad the user's own code moves - into a module it builds by hand -
+    /// is not moved by a generated module first: that code runs after the
+    /// block, and would find it gone (E0382).
+    #[test]
+    fn a_pad_a_hand_built_module_takes_is_left_to_it() {
+        let end = crate::panels::mcu_module::codegen::common::GEN_END;
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let mut mcu = pico_with_custom(
+                runtime,
+                &[
+                    ("GP6", PinFunction::GpioOutput),
+                    ("GP7", PinFunction::GpioOutput),
+                ],
+                &[],
+            );
+            let gp6 = mcu
+                .iter_all_pins()
+                .find(|p| p.name == "GP6")
+                .unwrap()
+                .number;
+            // "knob" holds GP6 from its last Update too - a project from
+            // before Update freed a pad - and the user builds it by hand.
+            assert!(mcu.add_module(ModuleKind::Custom));
+            let knob = mcu
+                .modules
+                .iter_mut()
+                .rfind(|m| m.kind == ModuleKind::Custom)
+                .expect("the second Custom module");
+            *knob.config.custom_label_mut() = "knob".to_owned();
+            if let ModuleConfig::Custom(c) = &mut knob.config {
+                c.pins = vec![gp6];
+                c.applied_pins = vec![gp6];
+            }
+            let mine = "    let mut knob = pins::configs::custom_knob::Knob::new(gp6out);\n";
+            let old =
+                mcu.fresh_main_rs()
+                    .replacen(&format!("{end}\n"), &format!("{end}\n{mine}"), 1);
+            let updated = mcu.update_main_rs(&old);
+            let block = updated.split_once(end).expect("the markers").0;
+            assert!(
+                !block.contains("Panel::new(gp6out"),
+                "{runtime:?}: {updated}"
+            );
+            assert!(
+                said(block).contains(
+                    "Custom module `panel` not built here: GP6 goes to `knob`, which your own \
+                     code below the markers builds, and a pad can be handed to one module only."
+                ),
+                "{runtime:?}: {updated}"
+            );
+        }
+    }
+
+    /// A pad whose function was cleared after Update: main.rs binds nothing
+    /// for it, so the module is not built - on an STM32 just the same.
+    #[test]
+    fn a_pad_left_without_a_function_is_said() {
+        let mut pico =
+            pico_with_custom(Runtime::Blocking, &[("GP6", PinFunction::GpioOutput)], &[]);
+        let mut f1 = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        f1.iter_all_pins_mut()
+            .find(|p| p.name == "PA0")
+            .unwrap()
+            .selected_function = PinFunction::GpioOutput;
+        attach_custom(&mut f1, &["PA0"]);
+        for (mcu, pad) in [(&mut pico, "GP6"), (&mut f1, "PA0")] {
+            mcu.iter_all_pins_mut()
+                .find(|p| p.name == pad)
+                .unwrap()
+                .selected_function = PinFunction::Unset;
+            let inits = mcu.custom_module_inits();
+            assert!(!inits.contains("Panel::new("), "{pad}: {inits}");
+            assert!(
+                said(&inits).contains(&format!(
+                    "Custom module `panel` not built here: {pad} has no function, so main.rs \
+                     binds no variable to move into `Panel`."
+                )),
+                "{pad}: {inits}"
+            );
+        }
+    }
+
+    /// Update follows what reaches a name: on an RP the binding, which no
+    /// label changes - so a label lights no Update - while an STM32's carries
+    /// the label, and its signature is still the label it always was.
+    #[test]
+    fn update_follows_what_reaches_the_name() {
+        let mut mcu = pico_with_custom(Runtime::Blocking, &[("GP6", PinFunction::GpioOutput)], &[]);
+        let sig = |mcu: &Mcu| {
+            let p = mcu.iter_all_pins().find(|p| p.name == "GP6").unwrap();
+            mcu.custom_pin_sig(p)
+        };
+        assert_eq!(sig(&mcu), "GpioOutput|gp6out");
+        mcu.iter_all_pins_mut()
+            .find(|p| p.name == "GP6")
+            .unwrap()
+            .custom_label = "led".into();
+        assert_eq!(sig(&mcu), "GpioOutput|gp6out");
+        let mut f1 = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        let pa0 = f1.iter_all_pins_mut().find(|p| p.name == "PA0").unwrap();
+        pa0.selected_function = PinFunction::GpioOutput;
+        pa0.custom_label = "led".into();
+        let pa0 = f1.iter_all_pins().find(|p| p.name == "PA0").unwrap();
+        assert_eq!(f1.custom_pin_sig(pa0), "GpioOutput|led");
     }
 }

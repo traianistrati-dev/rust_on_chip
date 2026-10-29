@@ -1617,6 +1617,11 @@ fn section(mcu: &Mcu) -> String {
         o.push('\n');
     }
     o.push_str(&rest);
+    // Last: a Custom module takes the GPIO bindings above.
+    o.push_str(&super::common::custom_section(
+        &mcu.custom_module_inits(),
+        ALLOW,
+    ));
     o.push_str(GEN_END);
     o.push('\n');
     o
@@ -2033,6 +2038,38 @@ fn pwm_config_file(mcu: &Mcu, inst: u8, chans: &[(u8, (u8, u8))]) -> String {
     o
 }
 
+/// The variable both nRF runtimes bind a GPIO under - `p0_21_out`, no label
+/// (`gpio_lines`, `async_binding`) - which a Custom module's field and
+/// `new(..)` argument take.
+fn nrf_pin_binding(pin: &Pin) -> String {
+    match nrf_pin(&pin.name) {
+        Some(pp) => async_binding(pp, pin),
+        // A pad that is no GPIO (`USB D+`), which no GPIO function reaches -
+        // but the module's file is written all the same, so its field must
+        // still be an identifier.
+        None => super::common::sanitize_label(&pin.name),
+    }
+}
+
+/// Why an nRF main.rs cannot hand each of `pins` to a Custom module. An output
+/// and an input are values of their own on every runtime - an edge armed on a
+/// pad the module owns is dropped before generation (`Mcu::codegen_view`), so
+/// no task takes it. PWM is always a driver here: the generated block owns the
+/// pad.
+fn nrf_custom_pins_taken(pins: &[&Pin]) -> Vec<(String, &'static str)> {
+    pins.iter()
+        .filter_map(|p| {
+            let why = match p.selected_function {
+                PinFunction::GpioOutput | PinFunction::GpioInput => return None,
+                PinFunction::TimerPwm { .. } => "is driven by the generated PWM block",
+                _ => "is owned by a peripheral init",
+            };
+            let name = nrf_pin(&p.name).map_or_else(|| p.name.clone(), label);
+            Some((name, why))
+        })
+        .collect()
+}
+
 impl FamilyBackend for NrfBackend {
     fn family_id(&self) -> &'static str {
         "nrf52833"
@@ -2040,6 +2077,18 @@ impl FamilyBackend for NrfBackend {
 
     fn handles(&self, family: &str) -> bool {
         is_nrf(family)
+    }
+
+    fn pin_binding(&self, pin: &Pin) -> String {
+        nrf_pin_binding(pin)
+    }
+
+    fn binding_takes_label(&self) -> bool {
+        false
+    }
+
+    fn custom_pins_taken(&self, _mcu: &Mcu, pins: &[&Pin]) -> Option<Vec<(String, &'static str)>> {
+        Some(nrf_custom_pins_taken(pins))
     }
 
     // `gpio_modes` is the trait default: nrf-hal has all three input pulls and
@@ -3368,6 +3417,12 @@ fn async_section(mcu: &Mcu) -> String {
         o.push('\n');
     }
     o.push_str(&buses.body);
+    // After the GPIO bindings it takes, before the radio bring-ups that end
+    // the block.
+    o.push_str(&super::common::custom_section(
+        &mcu.custom_module_inits(),
+        ALLOW,
+    ));
     if let Some((_, _, body)) = &ble {
         o.push_str(body);
     }
@@ -3387,6 +3442,18 @@ impl FamilyBackend for AsyncNrfBackend {
 
     fn handles(&self, family: &str) -> bool {
         is_nrf(family)
+    }
+
+    fn pin_binding(&self, pin: &Pin) -> String {
+        nrf_pin_binding(pin)
+    }
+
+    fn binding_takes_label(&self) -> bool {
+        false
+    }
+
+    fn custom_pins_taken(&self, _mcu: &Mcu, pins: &[&Pin]) -> Option<Vec<(String, &'static str)>> {
+        Some(nrf_custom_pins_taken(pins))
     }
 
     // `gpio_modes` is the trait default here too: `Input::new` takes all three
@@ -4173,6 +4240,9 @@ mod blocking_codegen {
         // (1.4e8 ticks in the CRV) on one project, the floor - exactly the
         // 15-tick minimum - on the other.
         let floor = crate::panels::mcu_module::watchdog::nrf_range_us().0;
+        // `EIDE_CUSTOM=1`: a Custom module over the projects' output (P0.21)
+        // and input (P0.14) - its generic struct handed nrf-hal's pin types.
+        let custom = std::env::var("EIDE_CUSTOM").is_ok();
         for (mut mcu, dir_name, timeout_us) in [
             (everything(), "eide_nrf52833_check", u32::MAX),
             (the_other_branches(), "eide_nrf52833_alt_check", floor),
@@ -4190,6 +4260,14 @@ mod blocking_codegen {
             if dir_name == "eide_nrf52833_check" {
                 assert!(mcu.with_i2c_devices(&[("accel", 0x19)]));
             }
+            if custom {
+                super::custom_modules::attach_custom(&mut mcu, &["P0.21", "P0.14"]);
+                let main = mcu.fresh_main_rs();
+                assert!(
+                    main.contains("let mut panel = pins::configs::custom_panel::Panel::new(p0_21_out, p0_14_in);"),
+                    "{dir_name}:\n{main}"
+                );
+            }
             emit(&mcu, dir_name);
         }
     }
@@ -4200,6 +4278,12 @@ mod blocking_codegen {
             .find(|d| d.id == "nrf52833_microbit_v2")
             .expect("built-in micro:bit v2");
         let main_rs = mcu.fresh_main_rs();
+        // `EIDE_CUSTOM`: the module's bounded `impl`, instantiated.
+        let main_rs = if mcu.modules.iter().any(|m| m.kind.is_custom()) {
+            super::custom_modules::call_update(&main_rs)
+        } else {
+            main_rs
+        };
         let files = crate::panels::mcu_module::manifest_sync::project_files(&def, mcu, &main_rs);
         let user: Vec<(String, String)> = mcu.pin_tree_files();
         let dir = std::env::temp_dir().join(dir_name);
@@ -5031,12 +5115,25 @@ mod async_codegen {
     #[ignore = "writes projects to disk for a manual cross-compile"]
     fn emit_nrf_async_project() {
         let oneway = std::env::var("EIDE_NRF_ONEWAY").is_ok();
+        // `EIDE_CUSTOM=1`: a Custom module over the projects' output (P0.21)
+        // and input (P0.14) - its generic struct handed embassy-nrf's `Output`
+        // / `Input`. The alt project's P0.14 is armed: owned by the module,
+        // its edge is dropped (`Mcu::codegen_view`) and no task takes it.
+        let custom = std::env::var("EIDE_CUSTOM").is_ok();
         for (mut mcu, dir_name) in [
             (on_async(everything()), "eide_nrf52833_async_check"),
             (the_other_async_branches(), "eide_nrf52833_async_alt_check"),
         ] {
             if oneway {
                 one_way(&mut mcu, dir_name == "eide_nrf52833_async_check");
+            }
+            if custom {
+                super::custom_modules::attach_custom(&mut mcu, &["P0.21", "P0.14"]);
+                let main = mcu.fresh_main_rs();
+                assert!(
+                    main.contains("let mut panel = pins::configs::custom_panel::Panel::new(p0_21_out, p0_14_in);"),
+                    "{dir_name}:\n{main}"
+                );
             }
             // The watchdog rides along, set BEFORE the blocking clone below, so
             // the runtime switch carries it the way a user's project would.
@@ -5060,6 +5157,11 @@ mod async_codegen {
                 mcu.fresh_main_rs(),
                 "the switch lands on the fresh file"
             );
+            let main_rs = if custom {
+                super::custom_modules::call_update(&main_rs)
+            } else {
+                main_rs
+            };
 
             let project = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
             assert!(
@@ -5084,7 +5186,12 @@ mod async_codegen {
             // true until the watchdog became this backend's first config file.
             let configs = mcu.config_files();
             let names: Vec<&str> = configs.iter().map(|(n, _)| n.as_str()).collect();
-            assert_eq!(names, ["watchdog.rs"], "{dir_name}");
+            let want: &[&str] = if custom {
+                &["watchdog.rs", "custom_panel.rs"]
+            } else {
+                &["watchdog.rs"]
+            };
+            assert_eq!(names, want, "{dir_name}");
             // And the whole manifest the app's way: the blocking project as
             // the app synced it, then the app's sync over what the switch left,
             // which has to come out as the project a fresh sync writes.
@@ -6366,5 +6473,202 @@ mod one_way_uartes {
             }
         }
         assert!(mcu.fresh_main_rs().contains("UarteTx::new_with_rtscts("));
+    }
+}
+
+#[cfg(test)]
+mod custom_modules {
+    use super::blocking_codegen::microbit;
+    use crate::panels::mcu_module::mcu::gui::modules::unbound_handle_names;
+    use crate::panels::mcu_module::mcu::{Mcu, Runtime};
+    use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+    use crate::panels::mcu_module::pins::PinFunction;
+    use crate::panels::mcu_module::pins::logic::pin::model::Edge;
+
+    /// The micro:bit on `runtime` with `wired` on its pads (by name prefix),
+    /// an armed edge on any pad in `armed`, and one Custom module "panel"
+    /// over those pads, applied.
+    pub(super) fn microbit_with_custom(
+        runtime: Runtime,
+        wired: &[(&str, PinFunction)],
+        armed: &[&str],
+    ) -> Mcu {
+        let mut mcu = microbit(wired);
+        mcu.runtime = runtime;
+        for (head, _) in wired {
+            let p = mcu
+                .iter_all_pins_mut()
+                .find(|p| p.name.starts_with(head))
+                .unwrap_or_else(|| panic!("no pad {head}"));
+            if armed.contains(head) {
+                p.irq = Some(Edge::Falling);
+            }
+        }
+        mcu.reconcile_modules();
+        let heads: Vec<&str> = wired.iter().map(|(h, _)| *h).collect();
+        attach_custom(&mut mcu, &heads);
+        mcu
+    }
+
+    /// `main` with the Custom module's `update()` called right below the
+    /// generated block, as a user's tail would. `new` takes any type; only a
+    /// CALL to the bounded `impl` makes the compiler check that the HAL's
+    /// pins really are the embedded-hal `OutputPin` / `InputPin` it names -
+    /// which is what the `EIDE_CUSTOM` cross-compile is for.
+    pub(super) fn call_update(main: &str) -> String {
+        let end = crate::panels::mcu_module::codegen::common::GEN_END;
+        assert!(main.contains(end), "no generated block");
+        main.replacen(
+            &format!("{end}\n"),
+            &format!("{end}\n    panel.update();\n"),
+            1,
+        )
+    }
+
+    /// One Custom module "panel" over the already-wired pads named by `heads`
+    /// (name prefixes), in that order, applied - what the panel's Update
+    /// commits. The cross-compile harnesses (`EIDE_CUSTOM`) attach it the same
+    /// way.
+    pub(super) fn attach_custom(mcu: &mut Mcu, heads: &[&str]) {
+        let nums: Vec<usize> = heads
+            .iter()
+            .map(|head| {
+                mcu.iter_all_pins()
+                    .find(|p| p.name.starts_with(head))
+                    .unwrap_or_else(|| panic!("no pad {head}"))
+                    .number
+            })
+            .collect();
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .expect("the Custom module");
+        *m.config.custom_label_mut() = "panel".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = nums.clone();
+            c.applied_pins = nums;
+        }
+    }
+
+    fn said(main: &str) -> String {
+        main.lines()
+            .map(|l| l.trim().trim_start_matches("//").trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Built from the bindings main.rs makes on each HAL - `p0_21_out`,
+    /// `p0_14_in` - with fields named the same and type parameters from the
+    /// pad's first word (`P0_21`, not the `P0.21 (ROW1)` the pad is called),
+    /// so the file is valid Rust: it named its fields `p0.21 (row1)_out`.
+    #[test]
+    fn a_custom_module_is_built_from_the_bindings_main_rs_makes() {
+        for (runtime, family) in [
+            (Runtime::Blocking, "nrf52833"),
+            (Runtime::Async, "nrf52833"),
+            (Runtime::Blocking, "nrf52820"),
+        ] {
+            let mut mcu = microbit_with_custom(
+                runtime,
+                &[
+                    ("P0.21", PinFunction::GpioOutput),
+                    ("P0.14", PinFunction::GpioInput),
+                ],
+                &[],
+            );
+            mcu.family = family.into();
+            let at = format!("{family} {runtime:?}");
+            let main = mcu.fresh_main_rs();
+            assert!(
+                main.contains("    // ── Custom modules ──\n"),
+                "{at}: {main}"
+            );
+            assert!(
+                main.contains(
+                    "    #[allow(unused_mut, unused_variables)]\n    let mut panel = pins::configs::custom_panel::Panel::new(p0_21_out, p0_14_in);\n"
+                ),
+                "{at}: {main}"
+            );
+            let files = mcu.config_files();
+            let (_, body) = files
+                .iter()
+                .find(|(n, _)| n == "custom_panel.rs")
+                .expect("custom_panel.rs");
+            assert!(body.contains("pub struct Panel<P0_21, P0_14> {"), "{body}");
+            assert!(body.contains("    pub p0_21_out: P0_21,"), "{body}");
+            assert!(!body.contains("p0.21"), "{body}");
+            assert!(
+                unbound_handle_names(&mcu).is_empty(),
+                "{:?}",
+                unbound_handle_names(&mcu)
+            );
+        }
+    }
+
+    /// Update follows the binding on an nRF, not the label: a module applied
+    /// while its fields were named after the pad (`p0.21 (row1)_out`, invalid
+    /// Rust) saved a `GpioOutput|` signature, which this one no longer matches,
+    /// so it shows as pending once and Update writes the file anew.
+    #[test]
+    fn update_follows_the_binding() {
+        let mut mcu =
+            microbit_with_custom(Runtime::Async, &[("P0.21", PinFunction::GpioOutput)], &[]);
+        let sig = |mcu: &Mcu| {
+            let p = mcu
+                .iter_all_pins()
+                .find(|p| p.name.starts_with("P0.21"))
+                .unwrap();
+            mcu.custom_pin_sig(p)
+        };
+        assert_eq!(sig(&mcu), "GpioOutput|p0_21_out");
+        mcu.iter_all_pins_mut()
+            .find(|p| p.name.starts_with("P0.21"))
+            .unwrap()
+            .custom_label = "row".into();
+        assert_eq!(sig(&mcu), "GpioOutput|p0_21_out");
+        assert_ne!(sig(&mcu), "GpioOutput|");
+    }
+
+    /// PWM is always the generated block's - said instead of a `new(..)` that
+    /// would not compile. An edge armed on a pad the module owns is dropped
+    /// before generation (`Mcu::codegen_view`), so no runtime spawns a task
+    /// for it and the module is built from it like any input.
+    #[test]
+    fn a_pad_main_rs_does_not_hand_over_is_said_instead() {
+        let pwm = [
+            (
+                "P0.00",
+                PinFunction::TimerPwm {
+                    timer: 0,
+                    channel: 0,
+                },
+            ),
+            ("P0.21", PinFunction::GpioOutput),
+        ];
+        for runtime in [Runtime::Blocking, Runtime::Async] {
+            let main = microbit_with_custom(runtime, &pwm, &[]).fresh_main_rs();
+            assert!(
+                said(&main).contains(
+                    "Custom module `panel` not built here: P0.00 is driven by the generated PWM \
+                     block, so it cannot also be moved into `Panel`."
+                ),
+                "{runtime:?}: {main}"
+            );
+            assert!(!main.contains("Panel::new("), "{runtime:?}: {main}");
+        }
+        let armed = [("P0.14", PinFunction::GpioInput)];
+        for (runtime, family) in [
+            (Runtime::Async, "nrf52833"),
+            (Runtime::Blocking, "nrf52833"),
+            (Runtime::Blocking, "nrf52820"),
+        ] {
+            let mut mcu = microbit_with_custom(runtime, &armed, &["P0.14"]);
+            mcu.family = family.into();
+            let main = mcu.fresh_main_rs();
+            assert!(main.contains("Panel::new(p0_14_in);"), "{family}: {main}");
+            assert!(!main.contains("_spawner.spawn("), "{family}: {main}");
+        }
     }
 }

@@ -386,6 +386,11 @@ pub struct Mcu {
     /// Transient: id of a module the user just clicked, requesting the same jump
     /// for EVERY pin it wires. Same consumer as [`Mcu::pin_goto`].
     pub module_goto: Option<String>,
+    /// Transient, set only on the view an update generates from: the ids of
+    /// the Custom modules the existing main.rs already builds in the user's
+    /// own code below the markers (`Mcu::customs_built_by_hand`). Their line
+    /// is not generated as well - it would move the same pads a second time.
+    pub hand_built_customs: Vec<String>,
     /// Id of the module currently selected on the canvas — drawn white, bigger
     /// and double-bordered, the module counterpart of [`Mcu::selected_pin`].
     /// Clicking it again clears it. View state only; not persisted.

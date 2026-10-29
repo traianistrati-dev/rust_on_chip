@@ -2366,6 +2366,156 @@ pub(super) fn has_ident(text: &str, ident: &str) -> bool {
     })
 }
 
+/// The code of the block `code` is inside, up to the `}` that closes it -
+/// `code` being `code_only` text that starts inside one (the tail below
+/// main.rs's markers is inside `main`). All of `code` when nothing closes it.
+pub(super) fn open_block(code: &str) -> &str {
+    let mut depth = 1usize;
+    for (i, c) in code.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &code[..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    code
+}
+
+/// Whether `body` - `code_only` text - CONSTRUCTS the struct `strukt` of one
+/// particular file from the variables `moves`: calls `<strukt>::new(`
+/// reached through that file's module (`pins::configs::custom_panel::
+/// Panel::new(`, any path ending in a segment `is_file` accepts), or bare
+/// (`Panel::new(`) when `imported` - a `use` brings that struct in
+/// ([`imports_struct`]) - and hands it at least one of `moves` as a variable
+/// of its own (`gp6out`, not `panel.gp6out`).
+///
+/// Another crate's `Panel`, `display::Panel::new(`, `RotaryPanel::new(`, a
+/// second instance on other pads or one rebuilt from the handle's own fields
+/// is not it: none of those moves what the generated `let` would.
+pub(super) fn constructs(
+    body: &str,
+    strukt: &str,
+    is_file: impl Fn(&str) -> bool,
+    imported: bool,
+    moves: &[String],
+) -> bool {
+    fn is_ident(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+    // `text` names `var` as a variable: a whole identifier, not a field.
+    let names_var = |text: &str, var: &str| {
+        text.match_indices(var).any(|(at, _)| {
+            let (head, tail) = (&text[..at], &text[at + var.len()..]);
+            !head.chars().next_back().is_some_and(is_ident)
+                && !tail.chars().next().is_some_and(is_ident)
+                && !head.trim_end().ends_with('.')
+                && !head.trim_end().ends_with("::")
+        })
+    };
+    body.match_indices(strukt).any(|(at, _)| {
+        let (head, tail) = (&body[..at], &body[at + strukt.len()..]);
+        if head.chars().next_back().is_some_and(is_ident)
+            || tail.chars().next().is_some_and(is_ident)
+        {
+            return false; // part of a longer name
+        }
+        let Some(call) = tail
+            .trim_start()
+            .strip_prefix("::")
+            .map(str::trim_start)
+            .and_then(|t| t.strip_prefix("new"))
+            .map(str::trim_start)
+        else {
+            return false;
+        };
+        let Some(args) = call.strip_prefix('(') else {
+            return false; // `new_with(..)`, `new` as a value
+        };
+        // The argument list, to its own `)`.
+        let mut depth = 1usize;
+        let close = args.char_indices().find_map(|(i, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(i)
+        });
+        let args = &args[..close.unwrap_or(args.len())];
+        if !moves.iter().any(|v| names_var(args, v)) {
+            return false;
+        }
+        match head.trim_end().strip_suffix("::") {
+            // The segment before `::<strukt>`.
+            Some(path) => {
+                let path = path.trim_end();
+                let seg_start = path
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| !is_ident(*c))
+                    .map_or(0, |(i, c)| i + c.len_utf8());
+                is_file(&path[seg_start..])
+            }
+            None => imported,
+        }
+    })
+}
+
+/// Whether `code` - `code_only` text - holds a `use` that brings the struct
+/// `strukt` of a file `is_file` accepts into scope, so a bare
+/// `<strukt>::new(` is that struct: `use ..::custom_panel::Panel;`,
+/// `..::custom_panel::*`, `..::custom_panel::{self, Panel}`. A `use` of the
+/// module alone (`use ..::custom_panel;`) is not: it makes only
+/// `custom_panel::Panel::new(` that struct.
+pub(super) fn imports_struct(code: &str, is_file: impl Fn(&str) -> bool, strukt: &str) -> bool {
+    fn is_ident(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+    let word_at = |s: &str, at: usize, w: &str| {
+        s[at..].starts_with(w)
+            && !s[..at].chars().next_back().is_some_and(is_ident)
+            && !s[at + w.len()..].chars().next().is_some_and(is_ident)
+    };
+    // Every `use` item, `use` to its `;`.
+    code.match_indices("use")
+        .filter(|(at, _)| word_at(code, *at, "use"))
+        .filter_map(|(at, _)| {
+            let item = &code[at + 3..];
+            item.find(';').map(|end| &item[..end])
+        })
+        .any(|item| {
+            // A segment naming the file, and what the item takes from it.
+            item.match_indices(|c: char| is_ident(c))
+                .filter(|(i, _)| !item[..*i].chars().next_back().is_some_and(is_ident))
+                .any(|(i, _)| {
+                    let seg_end = item[i..]
+                        .find(|c: char| !is_ident(c))
+                        .map_or(item.len(), |e| i + e);
+                    if !is_file(&item[i..seg_end]) {
+                        return false;
+                    }
+                    let Some(rest) = item[seg_end..].trim_start().strip_prefix("::") else {
+                        return false;
+                    };
+                    let rest = rest.trim_start();
+                    if rest.starts_with('*') || word_at(rest, 0, strukt) {
+                        return true;
+                    }
+                    // A group: `{self, Panel}`, `{*}`.
+                    rest.strip_prefix('{').is_some_and(|g| {
+                        let g = &g[..g.find('}').unwrap_or(g.len())];
+                        g.contains('*')
+                            || g.match_indices(strukt).any(|(j, _)| word_at(g, j, strukt))
+                    })
+                })
+        })
+}
+
 // ── `main`'s spawner ──────────────────────────────────────────────────────────
 
 /// The lines that also name `main`'s spawner `spawner`, for a user's code
@@ -2553,6 +2703,28 @@ pub fn sanitize_label(label: &str) -> String {
         }
     }
     out
+}
+
+/// The Custom modules' lines ([`Mcu::custom_module_inits`]) as a backend that
+/// marks every binding allowed places them - the RP and the nRF: under their
+/// own heading, each `let` with `allow` above it, since the handle is the
+/// user's to use and a fresh project uses none of them yet. Empty with no
+/// Custom module.
+///
+/// [`Mcu::custom_module_inits`]: crate::panels::mcu_module::mcu::Mcu::custom_module_inits
+pub(crate) fn custom_section(inits: &str, allow: &str) -> String {
+    if inits.is_empty() {
+        return String::new();
+    }
+    let mut o = String::from("\n    // ── Custom modules ──\n");
+    for line in inits.lines() {
+        if line.trim_start().starts_with("let ") {
+            o.push_str(allow);
+        }
+        o.push_str(line);
+        o.push('\n');
+    }
+    o
 }
 
 /// Full generated binding name: `<base>_<type>` with the user's sanitized label
@@ -2987,6 +3159,93 @@ mod tests {
         ] {
             assert_eq!(duty_percent_str(x100), want, "{x100} hundredths");
         }
+    }
+
+    /// A construction is the struct's `new(` reached through ITS file - by
+    /// path, or bare when a `use` brings that struct in - handed one of the
+    /// variables the generated `let` would move, and nothing else of the same
+    /// name.
+    #[test]
+    fn a_construction_is_of_this_file_only() {
+        let is_file = |seg: &str| {
+            seg == "custom_panel"
+                || seg
+                    .strip_prefix("custom_panel_")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let moves = ["gp6out".to_string(), "gp7out".to_string()];
+        for (body, imported) in [
+            (
+                "let mut panel = pins::configs::custom_panel::Panel::new(gp6out);",
+                false,
+            ),
+            (
+                "let p = crate::pins::configs::custom_panel_3::Panel::new(a, gp7out);",
+                false,
+            ),
+            (
+                "let p = custom_panel :: Panel :: new (\n    gp6out,\n);",
+                false,
+            ),
+            ("let p = Panel::new(gp6out);", true),
+            ("let p = Panel::new(wrap(gp6out));", true),
+        ] {
+            assert!(
+                constructs(body, "Panel", is_file, imported, &moves),
+                "{body}"
+            );
+        }
+        for (body, imported) in [
+            ("let p = Panel::new(gp6out);", false),
+            ("let b = display::Panel::new(gp6out);", true),
+            ("let b = custom_panelx::Panel::new(gp6out);", true),
+            ("let k = RotaryPanel::new(gp6out);", true),
+            ("let k = PanelDriver::new(gp6out);", true),
+            ("let k = Panel::new_with(gp6out);", true),
+            ("let k = Panel::default();", true),
+            ("let mut panel = Driver::new(panel.gp6out);", true),
+            // Another instance, or one rebuilt from the handle's own field.
+            ("let right = custom_panel::Panel::new(gp9out);", true),
+            (
+                "let p = custom_panel::Panel::new(panel.gp6out.into_pull_up_input());",
+                true,
+            ),
+            (
+                "let p = custom_panel::Panel::new(gp9out); gp6out.set_high();",
+                true,
+            ),
+        ] {
+            assert!(
+                !constructs(body, "Panel", is_file, imported, &moves),
+                "{body}"
+            );
+        }
+        for code in [
+            "use pins::configs::custom_panel::Panel;",
+            "use crate::pins::configs::custom_panel_2::*;",
+            "use pins::configs::custom_panel::{self, Panel};",
+            "use pins::configs::{custom_panel::Panel, other};",
+        ] {
+            assert!(imports_struct(code, is_file, "Panel"), "{code}");
+        }
+        for code in [
+            "use pins::configs::custom_panel;\nuse display::Panel;",
+            "use pins::configs::custom_panelx::Panel;",
+            "use pins::configs::custom_panel_2b::Panel;",
+            "use pins::configs::custom_panel::PanelMode;",
+            "fn draw(p: &mut pins::configs::custom_panel::Panel<A>) {}",
+        ] {
+            assert!(!imports_struct(code, is_file, "Panel"), "{code}");
+        }
+    }
+
+    /// The block a tail is inside ends at the `}` that closes it, not at a
+    /// nested one; with nothing to close it, the whole text is that block.
+    #[test]
+    fn an_open_block_ends_where_it_closes() {
+        let tail = "\n    loop {\n        a();\n    }\n}\n\nfn helper() {\n    b();\n}\n";
+        assert_eq!(open_block(tail), "\n    loop {\n        a();\n    }\n");
+        assert_eq!(open_block("a(); b();"), "a(); b();");
     }
 
     use super::*;

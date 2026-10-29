@@ -1505,7 +1505,12 @@ impl AppIde {
                                 //  • already assigned a function (a peripheral
                                 //    pin is moved into its own `init(…)`, and a
                                 //    configured GPIO already belongs somewhere),
-                                //  • already claimed by another virtual module.
+                                //  • already claimed by another virtual module -
+                                //    a Custom one too, by its draft pins and by
+                                //    the ones its last Update handed it, which
+                                //    main.rs moves into it until the next one
+                                //    (`custom_held`, per module below: its own
+                                //    pads it may take back).
                                 // Add the pin first, then give it its function —
                                 // its rename field lives inside the module box.
                                 let pin_blocked: std::collections::HashSet<usize> = mcu
@@ -1520,6 +1525,10 @@ impl AppIde {
                                         other.connections.iter().map(|c| c.mcu_pin)
                                     }))
                                     .collect();
+                                let custom_held =
+                                    crate::panels::mcu_module::mcu::gui::modules::custom_pins_held_by(
+                                        mcu,
+                                    );
                                 // Editable copy of the per-pin labels: a Custom
                                 // module's pin rows edit them here, mirroring the
                                 // field inside its box on the canvas. Written back
@@ -1554,12 +1563,7 @@ impl AppIde {
                                 > = None;
                                 let pin_sigs: std::collections::HashMap<usize, String> = mcu
                                     .iter_all_pins()
-                                    .map(|p| {
-                                        (
-                                            p.number,
-                                            format!("{:?}|{}", p.selected_function, p.custom_label),
-                                        )
-                                    })
+                                    .map(|p| (p.number, mcu.custom_pin_sig(p)))
                                     .collect();
                                 // Removal is confirmed inline (it resets the module's
                                 // pins). `confirm_id` = the module currently showing
@@ -2080,10 +2084,15 @@ impl AppIde {
                                                 let salt = m.id.clone();
                                                 let mut my_out =
                                                     module_docs::ConfigOut::default();
+                                                let blocked_here = mod_gui::blocked_for(
+                                                    &pin_blocked,
+                                                    &custom_held,
+                                                    &m.id,
+                                                );
                                                 ui.push_id(salt, |ui| {
                                                     mod_gui::module_config_ui(
                                                         ui, m, &pin_names, &pin_sigs,
-                                                        &pin_blocked, &mut pin_labels,
+                                                        &blocked_here, &mut pin_labels,
                                                         &pin_funcs_current, &pin_funcs,
                                                         &mut pin_fn_choice, is_async, is_native,
                                                         runtime_applied,

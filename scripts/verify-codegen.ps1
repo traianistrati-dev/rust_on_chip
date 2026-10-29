@@ -494,6 +494,12 @@ $ALL_CASES = @(
     # only the compiler says the generated types land on them.
     @{ n = "Raspberry Pi Pico one-way x4"; t = "emit_rp_project";            e = @{ EIDE_RP_ONEWAY = "1" }; q = $true; fam = "rp"; lk = $true }
 
+    # The four boards again with a Custom module over an output and an input:
+    # its struct is generic over the pin types, so only a compiler says that
+    # rp-hal's pins meet the embedded-hal bounds its `impl` names, and that
+    # main.rs hands it the bindings it really makes (`gp20out`, `gp21in`).
+    @{ n = "Raspberry Pi Pico custom x4";  t = "emit_rp_project";            e = @{ EIDE_CUSTOM = "1" };    q = $true; fam = "rp"; lk = $true }
+
     # The micro:bit on nrf52833-hal, TWO projects: every peripheral wired on the
     # default branches, and a second on the other ones (crystal HFCLK,
     # synthesized LFCLK, open-drain, pull-down, CTS/RTS, SCK-only SPI in mode 3,
@@ -501,6 +507,12 @@ $ALL_CASES = @(
     # read from nrf-hal-common's source, and the type-state on `Clocks` plus
     # the degraded-vs-typed pin split are things only a compiler settles.
     @{ n = "BBC micro:bit v2 x2";          t = "emit_nrf_project";           e = @{};                       q = $true; fam = "nrf" }
+
+    # Both projects with a Custom module over their output (P0.21) and input
+    # (P0.14), on nrf-hal's pin types - and with fields named after the
+    # bindings (`p0_21_out`), not the pad (`P0.21 (ROW1)`), which made the
+    # file invalid Rust.
+    @{ n = "BBC micro:bit v2 custom x2";   t = "emit_nrf_project";           e = @{ EIDE_CUSTOM = "1" };    q = $true; fam = "nrf" }
 
     # The same board on embassy-nrf, TWO projects again: every peripheral on
     # the default branches, and one on the others (crystal HFCLK, synthesized
@@ -519,6 +531,10 @@ $ALL_CASES = @(
     # compiler checks. Reached through the runtime switch, so nrf-hal's pair
     # with the kept direction is emitted on the way.
     @{ n = "BBC micro:bit v2 async one-way x2"; t = "emit_nrf_async_project"; e = @{ EIDE_NRF_ONEWAY = "1" }; q = $true; fam = "nrf" }
+
+    # The same Custom module on embassy-nrf's `Output` / `Input`; on the alt
+    # project its input pad is armed, and owned by the module the edge goes.
+    @{ n = "BBC micro:bit v2 async custom x2"; t = "emit_nrf_async_project"; e = @{ EIDE_CUSTOM = "1" }; q = $true; fam = "nrf" }
 
     # The IoT tab's Bluetooth on the SoftDevice Controller (nrf-sdc 0.4 under
     # nrf-mpsl, trouble-host 0.8): the 52840 DK, the 52832 DK (64 KiB RAM) and
@@ -598,6 +614,9 @@ $ALL_CASES = @(
     # argument, by constructor - which only the compiler checks: that is what
     # this row is for.
     @{ n = "Raspberry Pi Pico async one-way x3"; t = "emit_rp_async_project"; e = @{ EIDE_RP_ONEWAY = "1" }; q = $true; fam = "rp"; lk = $true }
+
+    # The same Custom module on embassy-rp's `Output` / `Input`.
+    @{ n = "Raspberry Pi Pico async custom x3"; t = "emit_rp_async_project"; e = @{ EIDE_CUSTOM = "1" }; q = $true; fam = "rp"; lk = $true }
 
 
     # The two W boards, whose on-board LED is not on the chip at all - it is
@@ -809,6 +828,7 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
            "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD", "EIDE_RP_ONEWAY", "EIDE_NRF_ONEWAY",
+           "EIDE_CUSTOM",
            # The imported-chip rows. EIDE_CHIP_XML is read by the N6 harness too,
            # so a value left over from an L151 row would make the N6 row convert an L1.
            "EIDE_CHIP_XML", "EIDE_EXPECT_FEATURE", "EIDE_IMPORT_SKIP", "EIDE_IMPORT_WDG",

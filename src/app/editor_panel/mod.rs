@@ -1251,6 +1251,49 @@ impl AppIde {
         let underline_ranges: Vec<(usize, usize)> =
             self.generic_underline_ranges(&display_code).to_vec();
 
+        // ── Follow a regenerated main.rs ──────────────────────────────
+        // init_frame rewrote the generated block this frame (a Save that
+        // builds a Custom module, an MCU change): the carets in the text
+        // below it - the extra ones too - move with that text, and so does
+        // the index caret-follow compares against, or it would read the move
+        // as the user's and scroll to the caret. Before the render, and in
+        // BUFFER space, the space the stored caret is in between frames:
+        // egui never lays the new text out with a caret meant for the old
+        // one, which it would clamp to the end of the file. Folds are not
+        // carried: `guard_folds` drops them on a change from outside the
+        // editor, as it always has.
+        if displayed_file == ProjectFileId::MainRs
+            && let Some(s) = self.main_rs_caret_shift.take()
+        {
+            let follow = |i: usize| {
+                if i >= s.at {
+                    (i as isize + s.by).max(0) as usize
+                } else {
+                    i
+                }
+            };
+            if let Some(id) = self.fold_ids.get(&editor_id).copied()
+                && let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id)
+                && let Some(mut r) = st.cursor.char_range()
+            {
+                r.primary = egui::text::CCursor::new(follow(r.primary.index.0));
+                r.secondary = egui::text::CCursor::new(follow(r.secondary.index.0));
+                st.cursor.set_char_range(Some(r));
+                st.store(ui.ctx(), id);
+            }
+            if self.ed.extra_cursors_file == Some(ProjectFileId::MainRs) {
+                for c in &mut self.ed.extra_cursors {
+                    c.anchor = follow(c.anchor);
+                    c.head = follow(c.head);
+                }
+            }
+            self.ed.mc_prev_primary_sel = self
+                .ed
+                .mc_prev_primary_sel
+                .map(|(a, b)| (follow(a), follow(b)));
+            self.ed.last_caret_idx = self.ed.last_caret_idx.map(follow);
+        }
+
         // ── Code folding ──────────────────────────────────────────────
         // An edit and a fold cannot coexist: the editor writes back the
         // text it was GIVEN, which while folded is a projection missing

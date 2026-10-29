@@ -106,6 +106,34 @@ pub trait FamilyBackend {
         Vec::new()
     }
 
+    /// The variable main.rs binds a GPIO `pin` under - a Custom module's
+    /// struct field and `new(..)` argument take the same name, so the call
+    /// reads as a straight hand-over. Default: the STM32 / ESP name,
+    /// `<pin>_<type>[_<label>]` (`common::pin_binding`).
+    fn pin_binding(&self, pin: &Pin) -> String {
+        super::common::pin_binding(
+            &pin.name.to_ascii_lowercase(),
+            &pin.selected_function,
+            &pin.custom_label,
+        )
+    }
+
+    /// Whether [`Self::pin_binding`] carries the pin's label - on the STM32 and
+    /// ESP it does (`pa0_out_led`), on the RP and nRF it does not (`gp25out`).
+    /// A Custom module's Update follows what reaches the name
+    /// (`Mcu::custom_pin_sig`).
+    fn binding_takes_label(&self) -> bool {
+        true
+    }
+
+    /// The pins of a Custom module main.rs cannot hand over, each with why,
+    /// for a backend that says it per pin - `None` keeps the default rule
+    /// (`Mcu::custom_module_inits`: GPIO In/Out and PWM free, `driver_pins`
+    /// taken, the STM32's timer-switch advice).
+    fn custom_pins_taken(&self, _mcu: &Mcu, _pins: &[&Pin]) -> Option<Vec<(String, &'static str)>> {
+        None
+    }
+
     /// The drive / pull modes this backend can generate for `func` — what the
     /// mode list under the selected function offers. The FIRST entry is the
     /// default, i.e. what a pin with `io_mode: None` generates.

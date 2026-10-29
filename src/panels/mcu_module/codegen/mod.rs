@@ -43,8 +43,11 @@ pub use common::{
 };
 
 /// Type-parameter name for a pin in a Custom module's struct: the pin's own name
-/// (`PC15` → `PC15`), uppercased and sanitised to a valid Rust identifier.
+/// (`PC15` → `PC15`), uppercased and sanitised to a valid Rust identifier. Only
+/// its first word: an nRF pad is named with its board net after it
+/// (`P0.21 (ROW1)` → `P0_21`).
 fn generic_param_name(pin_name: &str) -> String {
+    let pin_name = pin_name.split_whitespace().next().unwrap_or(pin_name);
     let mut s: String = pin_name
         .chars()
         .map(|c| {
@@ -113,6 +116,38 @@ impl Mcu {
     /// [`Runtime::Async`]: crate::panels::mcu_module::mcu::Runtime
     fn backend(&self) -> Option<&'static dyn family::FamilyBackend> {
         family::backend_for_runtime(&self.family, self.runtime)
+    }
+
+    /// The variable this chip's main.rs binds GPIO `pin` under
+    /// ([`family::FamilyBackend::pin_binding`]) - what a Custom module's struct
+    /// field and `new(..)` argument are both named. `gp25out` on an RP,
+    /// `p0_21_out` on an nRF, `pa0_out_led` on an STM32.
+    fn pin_binding(&self, pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> String {
+        match self.backend() {
+            Some(b) => b.pin_binding(pin),
+            None => pin_binding(
+                &pin.name.to_ascii_lowercase(),
+                &pin.selected_function,
+                &pin.custom_label,
+            ),
+        }
+    }
+
+    /// What a Custom module's Update compares per pin (`custom_pins_sig`):
+    /// its function, and what of the pin reaches the generated names. Where
+    /// the binding carries the label (STM32, ESP) that is the label, as it
+    /// always was, so a saved signature still matches; where it does not (RP,
+    /// nRF) it is the binding itself - a label that renames nothing lights no
+    /// Update, and a module applied under an older naming (the nRF's
+    /// `p0.21 (row1)_out` fields) shows as pending once, so Update writes it
+    /// anew.
+    pub fn custom_pin_sig(&self, pin: &crate::panels::mcu_module::pins::logic::pin::Pin) -> String {
+        let naming = if self.backend().is_none_or(|b| b.binding_takes_label()) {
+            pin.custom_label.clone()
+        } else {
+            self.pin_binding(pin)
+        };
+        format!("{:?}|{naming}", pin.selected_function)
     }
 
     /// Does an update write main.rs's header above the GENERATED block anew
@@ -215,6 +250,17 @@ impl Mcu {
     /// no backend) return the existing file unchanged.
     pub fn update_main_rs(&self, existing: &str) -> String {
         let view = self.codegen_view();
+        // A Custom module the user's own code below the markers already builds
+        // - the only way on an RP or nRF before the generator did it - keeps
+        // being theirs: generated as well, its pads would be moved twice.
+        let by_hand = self.customs_built_by_hand(existing);
+        let view = if by_hand.is_empty() {
+            view
+        } else {
+            let mut v = view.into_owned();
+            v.hand_built_customs = by_hand;
+            std::borrow::Cow::Owned(v)
+        };
         let this = view.as_ref();
         let code = this
             .backend()
@@ -255,6 +301,12 @@ impl Mcu {
     /// lives in the handler's critical section), E0382 on Async (moved into
     /// the task). The same pad on a timer-interface module is the same story.
     /// Borrowed, so nothing is copied, when no edge has to go.
+    ///
+    /// A Custom module's pads are its APPLIED ones as well as its draft
+    /// (`module_owned_pins` returns both, for the canvas too): `new(..)` is
+    /// built from the applied list, so a pad dropped from the draft but not
+    /// yet Updated is still consumed there, and an edge on it would move the
+    /// binding into a task first (E0382 on Async).
     fn codegen_view(&self) -> std::borrow::Cow<'_, Mcu> {
         use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
         let owned = super::mcu::gui::modules::module_owned_pins(self);
@@ -516,6 +568,88 @@ impl Mcu {
         }
     }
 
+    /// The ids of the Custom modules `main_rs`'s own code already builds, on
+    /// an RP or nRF: the rest of `main` below the markers - comments and
+    /// strings aside - calls the module's `<Struct>::new(` through its file
+    /// (`pins::configs::custom_panel::Panel::new(`, any revision), or bare
+    /// under a `use` of that struct, and hands it a pad variable the
+    /// generated `let` would move (`gp6out`). That was the only way to use
+    /// one there until the generator built it, and building it as well
+    /// would move its pads a second time (E0382). The STM32 and ESP always
+    /// built their modules, so no code of theirs does it too.
+    ///
+    /// Only that one shape counts - a second instance on other pads, or one
+    /// rebuilt from the handle's own fields, moves nothing of the module's.
+    /// A guess at which variable a line uses cannot be told from the
+    /// handle's own field, a shadowing variable or a task's parameter
+    /// without Rust's scoping rules, and every miss there dropped a `let`
+    /// code relied on. Code that drives a pad directly is not guessed at: the
+    /// generated `let` moves the pad, and the compiler names that line. Only
+    /// `main`'s own body is read - the items after it cannot see its
+    /// variables - and on RTIC none, the module being built in `#[init]`,
+    /// inside the markers.
+    ///
+    /// Read on every regeneration, and before every Save
+    /// (`App::custom_by_hand`): once that line is gone, or written, the save
+    /// writes main.rs to match.
+    pub fn customs_built_by_hand(&self, main_rs: &str) -> Vec<String> {
+        use crate::panels::mcu_module::mcu::gui::modules::{
+            custom_file_prefix, custom_struct_name,
+        };
+        use crate::panels::mcu_module::modules::ModuleConfig;
+        // Only where the generator did not build them before: the STM32 and
+        // ESP always did, so no code of theirs builds one as well.
+        if !(rp::is_rp(&self.family) || nrf::is_nrf(&self.family))
+            || self.is_rtic()
+            || common::section_is_rtic(main_rs)
+        {
+            return Vec::new();
+        }
+        let (Some(begin), Some(end)) = (main_rs.find(GEN_BEGIN), main_rs.find(GEN_END)) else {
+            return Vec::new();
+        };
+        if begin > end {
+            return Vec::new();
+        }
+        let tail = common::code_only(&main_rs[end + GEN_END.len()..]);
+        let body = common::open_block(&tail);
+        // Where a `use` of the module's file sits: the file's own code, the
+        // generated block aside.
+        let header = common::code_only(&main_rs[..begin]);
+        self.modules
+            .iter()
+            .filter_map(|m| match &m.config {
+                ModuleConfig::Custom(c) if m.kind.is_custom() && !c.applied_pins.is_empty() => {
+                    Some((m, c))
+                }
+                _ => None,
+            })
+            .filter(|(m, c)| {
+                let prefix = custom_file_prefix(m);
+                // `custom_<name>` or a revision of it, `custom_<name>_<n>`.
+                let is_file = |seg: &str| {
+                    seg == prefix
+                        || seg
+                            .strip_prefix(prefix.as_str())
+                            .and_then(|r| r.strip_prefix('_'))
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                };
+                let strukt = custom_struct_name(m);
+                let imported = common::imports_struct(&header, is_file, &strukt)
+                    || common::imports_struct(&tail, is_file, &strukt);
+                // What the generated `let` would move.
+                let moves: Vec<String> = c
+                    .applied_pins
+                    .iter()
+                    .filter_map(|n| self.find_pin(*n))
+                    .map(|p| self.pin_binding(p))
+                    .collect();
+                common::constructs(body, &strukt, is_file, imported, &moves)
+            })
+            .map(|(m, _)| m.id.clone())
+            .collect()
+    }
+
     /// The modules whose pads this project's OWN code already takes: the text
     /// below main.rs's generated block names a pad's binding (`pa9_usart1_tx`)
     /// or the peripheral itself (`p.USART1`).
@@ -665,6 +799,22 @@ impl Mcu {
         } else {
             Vec::new()
         };
+        // Pad number -> the module it is moved into, and whether that is the
+        // user's own code below the markers (`hand_built_customs`) - which
+        // runs after this block, so a `let` here would move the pad first.
+        let mut handed: Vec<(usize, String, bool)> = customs()
+            .filter(|m| self.hand_built_customs.contains(&m.id))
+            .filter_map(|m| match &m.config {
+                ModuleConfig::Custom(c) => Some(
+                    c.applied_pins
+                        .iter()
+                        .map(|n| (*n, super::mcu::gui::modules::custom_binding_name(m), true))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         for m in customs() {
             let ModuleConfig::Custom(cfg) = &m.config else {
                 continue;
@@ -682,16 +832,76 @@ impl Mcu {
             if pins.len() != cfg.applied_pins.len() {
                 continue; // a pin vanished from the chip
             }
-            // Independently-bound pins only.
+            // The user's own code builds it (`customs_built_by_hand`).
+            if self.hand_built_customs.contains(&m.id) {
+                out.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!(
+                        "Custom module `{var}` not built here: your own code below the markers \
+                         builds it (`{struct_name}::new(..)`), and building it here as well \
+                         would move its pads twice. Once that line is gone, saving main.rs \
+                         builds it here."
+                    ),
+                    "    ",
+                ));
+                continue;
+            }
+            // A pad whose function was cleared after Update: main.rs binds no
+            // variable for it.
+            let unset: Vec<&str> = pins
+                .iter()
+                .filter(|p| p.selected_function == PinFunction::Unset)
+                .map(|p| p.name.as_str())
+                .collect();
+            if !unset.is_empty() {
+                out.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!(
+                        "Custom module `{var}` not built here: {} {} no function, so main.rs \
+                         binds no variable to move into `{struct_name}`. Give {} GPIO In/Out, or \
+                         remove {} from the module and press Update.",
+                        unset.join(", "),
+                        if unset.len() == 1 { "has" } else { "have" },
+                        if unset.len() == 1 { "it" } else { "them" },
+                        if unset.len() == 1 { "it" } else { "them" },
+                    ),
+                    "    ",
+                ));
+                continue;
+            }
+            // A backend that says per pin why it cannot hand one over (the RP
+            // and nRF, whose PWM is always a driver - there is no "Generate
+            // driver" switch to offer): its own reasons, and its own way out.
+            if let Some(taken) = self
+                .backend()
+                .and_then(|b| b.custom_pins_taken(self, &pins))
+                .filter(|t| !t.is_empty())
+            {
+                let why: Vec<String> = taken.iter().map(|(p, w)| format!("{p} {w}")).collect();
+                out.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!(
+                        "Custom module `{var}` not built here: {}, so {} cannot also be moved \
+                         into `{struct_name}`. Hand the module GPIO In/Out pins, or construct \
+                         it yourself.",
+                        why.join("; "),
+                        if taken.len() == 1 { "it" } else { "they" },
+                    ),
+                    "    ",
+                ));
+                continue;
+            }
+            // Independently-bound pins only - unless the backend said above.
+            let per_pin = self
+                .backend()
+                .is_some_and(|b| b.custom_pins_taken(self, &pins).is_some());
             let taken: Vec<&str> = pins
                 .iter()
                 .filter(|p| {
-                    !matches!(
-                        p.selected_function,
-                        PinFunction::GpioInput
-                            | PinFunction::GpioOutput
-                            | PinFunction::TimerPwm { .. }
-                    ) || driven.iter().any(|d| d == p.gpio())
+                    !per_pin
+                        && (!matches!(
+                            p.selected_function,
+                            PinFunction::GpioInput
+                                | PinFunction::GpioOutput
+                                | PinFunction::TimerPwm { .. }
+                        ) || driven.iter().any(|d| d == p.gpio()))
                 })
                 .map(|p| p.name.as_str())
                 .collect();
@@ -735,16 +945,45 @@ impl Mcu {
                 ));
                 continue;
             }
-            let args: Vec<String> = pins
+            // A pad an earlier module's `let` already moved: two modules can
+            // hold it once each was Updated with it (`applied_pins`), and a
+            // variable moves only once (E0382).
+            let twice: Vec<(&str, &str, bool)> = pins
                 .iter()
-                .map(|p| {
-                    common::pin_binding(
-                        &p.name.to_ascii_lowercase(),
-                        &p.selected_function,
-                        &p.custom_label,
-                    )
+                .filter_map(|p| {
+                    handed
+                        .iter()
+                        .find(|(n, ..)| *n == p.number)
+                        .map(|(_, by, mine)| (p.name.as_str(), by.as_str(), *mine))
                 })
                 .collect();
+            if !twice.is_empty() {
+                let what: Vec<String> = twice
+                    .iter()
+                    .map(|(pad, by, mine)| {
+                        if *mine {
+                            format!(
+                                "{pad} goes to `{by}`, which your own code below the markers \
+                                 builds"
+                            )
+                        } else {
+                            format!("{pad} is already moved into `{by}` above")
+                        }
+                    })
+                    .collect();
+                out.push_str(&crate::panels::mcu_module::errata::comment(
+                    &format!(
+                        "Custom module `{var}` not built here: {}, and a pad can be handed to \
+                         one module only. Remove {} from one of them and press its Update.",
+                        what.join("; "),
+                        if twice.len() == 1 { "it" } else { "them" },
+                    ),
+                    "    ",
+                ));
+                continue;
+            }
+            handed.extend(pins.iter().map(|p| (p.number, var.clone(), false)));
+            let args: Vec<String> = pins.iter().map(|p| self.pin_binding(p)).collect();
             // The module path follows the CURRENT revision, so main.rs always
             // calls the file this Update just wrote.
             out.push_str(&format!(
@@ -782,13 +1021,7 @@ impl Mcu {
                 .applied_pins
                 .iter()
                 .filter_map(|n| self.find_pin(*n))
-                .map(|p| {
-                    common::pin_binding(
-                        &p.name.to_ascii_lowercase(),
-                        &p.selected_function,
-                        &p.custom_label,
-                    )
-                })
+                .map(|p| self.pin_binding(p))
                 .collect();
             if fields.is_empty() {
                 continue;

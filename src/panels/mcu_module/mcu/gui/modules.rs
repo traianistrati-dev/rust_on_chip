@@ -189,7 +189,11 @@ const BOX_H_MAX: f32 = 130.0;
 /// Two different modules land a pin here, for two different reasons:
 ///
 /// * a **Custom** module draws its pins' rename fields INSIDE its own box,
-///   grouped under the module name;
+///   grouped under the module name - its draft pins and the APPLIED ones
+///   both: main.rs's `new(..)` is built from the applied list, so a pad
+///   dropped from the draft but not yet Updated is still the module's there,
+///   and offering its field (and its edge, which `Mcu::codegen_view` drops
+///   on an owned pad) would promise a binding the module still takes;
 /// * a **Timer** module owns the whole PWM handle (`_pwm1`), and its channel
 ///   pads are handed straight to that handle's `init`. On embassy, both
 ///   runtimes, each channel pad keeps its labelled `let` line and that
@@ -204,15 +208,8 @@ const BOX_H_MAX: f32 = 130.0;
 /// CHx pads do - `io_arrows::io_dir` gives a CHxN or BKIN pad no direction,
 /// so those stay without a field whatever owns them.
 pub fn module_owned_pins(mcu: &Mcu) -> std::collections::HashSet<usize> {
-    let mut owned: std::collections::HashSet<usize> = mcu
-        .modules
-        .iter()
-        .filter(|m| m.kind.is_custom())
-        .flat_map(|m| match &m.config {
-            ModuleConfig::Custom(c) => c.pins.clone(),
-            _ => Vec::new(),
-        })
-        .collect();
+    let mut owned: std::collections::HashSet<usize> =
+        custom_pins_held_by(mcu).into_keys().collect();
     // The applied runtime: the fields name what main.rs binds now.
     let switchable = codegen::family::embassy_drivers(&mcu.family, mcu.is_async());
     owned.extend(
@@ -225,6 +222,43 @@ pub fn module_owned_pins(mcu: &Mcu) -> std::collections::HashSet<usize> {
             .flat_map(|m| m.connections.iter().map(|c| c.mcu_pin)),
     );
     owned
+}
+
+/// Every pad a Custom module holds, with the ids of the modules holding it:
+/// the pads in its pin list, and the ones its last **Update** handed it -
+/// main.rs moves those into its struct until the next Update, whatever the
+/// list says meanwhile. No other module may take one (`custom_module_inits`
+/// refuses a pad moved twice).
+pub fn custom_pins_held_by(mcu: &Mcu) -> HashMap<usize, Vec<String>> {
+    let mut held: HashMap<usize, Vec<String>> = HashMap::new();
+    for m in mcu.modules.iter().filter(|m| m.kind.is_custom()) {
+        let ModuleConfig::Custom(c) = &m.config else {
+            continue;
+        };
+        for n in c.pins.iter().chain(&c.applied_pins) {
+            let ids = held.entry(*n).or_default();
+            if !ids.contains(&m.id) {
+                ids.push(m.id.clone());
+            }
+        }
+    }
+    held
+}
+
+/// The pads module `id`'s "+ Add pin" may not offer: `blocked` (reserved,
+/// assigned, wired to a module) and every pad ANOTHER Custom module holds
+/// (`custom_pins_held_by`). Not one it holds itself: a pad it dropped from
+/// its list is still its own until the next Update, and it may take it back.
+pub fn blocked_for(
+    blocked: &std::collections::HashSet<usize>,
+    held: &HashMap<usize, Vec<String>>,
+    id: &str,
+) -> std::collections::HashSet<usize> {
+    let others = held
+        .iter()
+        .filter(|(_, ids)| ids.iter().any(|i| i != id))
+        .map(|(n, _)| *n);
+    blocked.iter().copied().chain(others).collect()
 }
 
 /// Module path stem of a Custom module's generated file — `custom_<name>` at
@@ -1124,10 +1158,6 @@ fn handle_preview(m: &VirtualModule, ctx: &HandleCtx) -> String {
     // for three of them. A kind none of them writes falls through to the
     // STM32 names below.
     match (ctx.vendor, m.kind) {
-        // Neither generator instantiates a Custom module yet (no
-        // `custom_module_inits` in rp.rs or nrf.rs): its file is written, its
-        // `let` is not, so there is no binding to name.
-        (HandleVendor::Rp | HandleVendor::Nrf, ModuleKind::Custom) => return String::new(),
         (HandleVendor::Rp, ModuleKind::GenericInterfaceUsart) => return format!("uart{n}"),
         (HandleVendor::Rp, ModuleKind::GenericInterfaceSpi) => return format!("spi{n}"),
         (HandleVendor::Rp, ModuleKind::GenericInterfaceI2c) => return format!("i2c{n}"),
@@ -8187,8 +8217,16 @@ pub fn module_config_ui(
                                     .font(egui::FontId::proportional(10.0)),
                             )
                             .on_hover_text(
-                                "Name appended to this pin's generated variable (and to its \
-                                 field in the struct).",
+                                // The RP and nRF generators name a variable after its
+                                // pad alone (`gp25out`, `p0_21_out`).
+                                if codegen::rp::is_rp(family) || codegen::nrf::is_nrf(family) {
+                                    "A name kept with the pin. This chip's main.rs names its \
+                                     variables after the pad alone, so it renames neither the \
+                                     binding nor the struct's field."
+                                } else {
+                                    "Name appended to this pin's generated variable (and to \
+                                     its field in the struct)."
+                                },
                             );
                         });
                         ui.end_row();
@@ -8291,8 +8329,10 @@ pub fn module_config_ui(
                     );
                     let warn_id = egui::Id::new(("custom_update_warn", m_id.clone()));
                     ui.horizontal(|ui| {
+                        // An emptied module updates too: main.rs stops
+                        // building it, and its pads are free again.
                         let btn = ui.add_enabled(
-                            pending && !cfg.pins.is_empty(),
+                            pending,
                             egui::Button::new(
                                 egui::RichText::new(format!("{} Update", ph::ARROWS_CLOCKWISE))
                                     .size(10.5)
@@ -8306,11 +8346,15 @@ pub fn module_config_ui(
                             ),
                         );
                         if btn
-                            .on_hover_text(
+                            .on_hover_text(if cfg.pins.is_empty() {
+                                "Stop building this module: main.rs no longer constructs it \
+                                 or moves its pads, so another module can take one once its \
+                                 function is cleared. Its last file stays on disk, uncompiled."
+                            } else {
                                 "Generate the struct from the pins above into a NEW file \
                                  (`configs/custom_<name>_<n>.rs`) and point main.rs at it. \
-                                 Earlier revisions stay on disk, uncompiled.",
-                            )
+                                 Earlier revisions stay on disk, uncompiled."
+                            })
                             .on_disabled_hover_text("No pin changes to apply.")
                             .clicked()
                         {
@@ -10678,15 +10722,11 @@ mod tests {
             .0,
             "_uart"
         );
-        // A Custom module: bound by the STM32 and ESP generators, and by
-        // neither the RP's nor the nRF's yet, so named there by nobody.
-        assert_eq!(
-            names("stm32f103c8t6", Runtime::Blocking, ModuleKind::Custom).len(),
-            1
-        );
-        for board in ["rp2040_pico", "nrf52840_dk"] {
-            assert!(
-                names(board, Runtime::Blocking, ModuleKind::Custom).is_empty(),
+        // A Custom module is named the same way on every vendor: its binding.
+        for board in ["stm32f103c8t6", "rp2040_pico", "nrf52840_dk", "esp32c3"] {
+            assert_eq!(
+                names(board, Runtime::Blocking, ModuleKind::Custom).len(),
+                1,
                 "{board}"
             );
         }

@@ -1315,7 +1315,11 @@ pub const CUSTOM_NOTE_NO_PINS: &str = "A module with no pins generates nothing a
 
 pub const CUSTOM_ADD_PIN: &str = "Adds a pin to the list. Only pins that are still unassigned \
                                   appear: one that already has a function, or is reserved, or \
-                                  belongs to another module, is not offered. So the order is add \
+                                  belongs to another module - a Custom one included, until \
+                                  that module is Updated without it - is not offered. A pin \
+                                  this module dropped since its last Update is still its own, \
+                                  and can be added back once its function is cleared. So the \
+                                  order is add \
                                   the pin here first, then give it its function on its row \
                                   above.";
 
@@ -1323,7 +1327,9 @@ pub const CUSTOM_UPDATE: &str = "Writes the struct for the pins above into a fre
                                  switches the project to it. Nothing regenerates until you press \
                                  it, so adding or renaming a pin cannot rewrite code you are \
                                  mid-edit in. Older revisions stay on disk, uncompiled, as \
-                                 history.";
+                                 history. With every pin removed it stops building the module \
+                                 instead: main.rs no longer constructs it or moves its pads, so \
+                                 another module can take one once its function is cleared.";
 
 pub const CUSTOM_UPDATE_INCOMPLETE: &str = "Amber because a pin above still has no function. \
                                             Pressing it lists those pins instead of generating - \
@@ -1333,9 +1339,9 @@ pub const CUSTOM_UPDATE_INCOMPLETE: &str = "Amber because a pin above still has 
 
 pub const CUSTOM_UPDATE_DISABLED: &str = "Greyed out because the generated file already matches \
                                           this pin list - same pins, same functions, same names; \
-                                          change any of the three and it comes back. An empty \
-                                          module is greyed out too, and the last file it wrote \
-                                          stays where it is.";
+                                          change any of the three and it comes back. A module \
+                                          that is empty and already stopped is greyed out too; \
+                                          the last file it wrote stays where it is.";
 
 pub const CUSTOM_UPDATE_PENDING: &str = "The pins here and the pins the generated file was built \
                                          from have drifted apart. The code on disk is still the \

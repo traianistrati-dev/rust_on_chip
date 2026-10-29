@@ -600,13 +600,32 @@ impl ProjectTreeState {
         let kept = self.kept_config_files.clone();
         self.template_marks.clear();
 
+        // Does `stem` belong to a Custom module? Its file is `custom_<name>` at
+        // revision 0 and `custom_<name>_<n>` after the n-th Update, and
+        // `keep_prefixes` holds exactly those `custom_<name>` roots — so the same
+        // test that keeps old revisions on disk also tells a hand-authored module
+        // apart from a peripheral one, with no name-prefix guesswork.
+        let is_custom_stem = |stem: &str| {
+            keep_prefixes
+                .iter()
+                .any(|p| stem == p || stem.starts_with(&format!("{p}_")))
+        };
+        // A Custom module's revision: a flat `configs/<stem>.rs` of one.
+        let is_custom_file = |path: &str| {
+            path.strip_prefix(UNDER)
+                .and_then(|rest| rest.strip_suffix(".rs"))
+                .is_some_and(|stem| !stem.contains('/') && is_custom_stem(stem))
+        };
+
         if files.is_empty() {
             // No configured peripherals → drop the entire configs/ subtree,
-            // bar a kept file. Its folder stays registered while it is there;
-            // `configs/mod.rs` goes, so `pins/mod.rs` stops declaring
-            // `configs` and the kept file is not compiled.
+            // bar a kept file and a Custom module's revisions - one Updated
+            // with no pins writes no file, and its older ones stay on disk
+            // all the same. Their folder stays registered while they are
+            // there; `configs/mod.rs` goes, so `pins/mod.rs` stops declaring
+            // `configs` and none of them is compiled.
             let gone = self.take_files(
-                |_, p| p.starts_with(UNDER) && !kept.iter().any(|k| k == p),
+                |_, p| p.starts_with(UNDER) && !kept.iter().any(|k| k == p) && !is_custom_file(p),
                 selected,
             );
             self.bury(gone, &mut report);
@@ -645,17 +664,6 @@ impl ProjectTreeState {
             .iter()
             .map(|(name, _)| name.trim_end_matches(".rs").to_string())
             .collect();
-
-        // Does `stem` belong to a Custom module? Its file is `custom_<name>` at
-        // revision 0 and `custom_<name>_<n>` after the n-th Update, and
-        // `keep_prefixes` holds exactly those `custom_<name>` roots — so the same
-        // test that keeps old revisions on disk also tells a hand-authored module
-        // apart from a peripheral one, with no name-prefix guesswork.
-        let is_custom_stem = |stem: &str| {
-            keep_prefixes
-                .iter()
-                .any(|p| stem == p || stem.starts_with(&format!("{p}_")))
-        };
 
         // 3. Move what is already written to where it goes now - an I2C bus
         //    file from before buses were folders, and every device file whose
@@ -1975,6 +1983,21 @@ mod tests {
             old, edited,
             "the previous revision stays as the user left it"
         );
+
+        // Updated with no pins it writes nothing - on a project with no other
+        // config file, the moment nothing is generated at all. Its revisions
+        // stay all the same; the rest of the subtree goes, `configs/mod.rs`
+        // with it, so none of them is compiled.
+        state.user_src_files.push((
+            "src/pins/configs/usart1.rs".to_string(),
+            "pub fn init() {}\n".to_string(),
+        ));
+        state.sync_config_files(&[], &keep, &mut None);
+        assert_file_exists(&state, path);
+        assert_file_exists(&state, "src/pins/configs/custom_menu_nav_1.rs");
+        assert_file_not_exists(&state, "src/pins/configs/usart1.rs");
+        assert_file_not_exists(&state, "src/pins/configs/mod.rs");
+        assert_folder_exists(&state, "src/pins/configs");
     }
 
     /// A comparator file from before `get_config` left its block, as the IDE

@@ -1505,6 +1505,17 @@ pub struct AppIde {
     /// Hash of the MCU state (pins + clock + modules) used to detect changes
     /// and avoid unnecessary code regeneration.
     mcu_state_hash: u64,
+    /// The Custom modules the last regeneration left to the user's own code
+    /// in main.rs (`Mcu::customs_built_by_hand`). A Save asks again first,
+    /// and regenerates before writing when the answer changed - so deleting
+    /// that code, or writing it, saves main.rs to match.
+    custom_by_hand: Vec<String>,
+    /// Set by a regeneration that changed main.rs this frame, for the carets
+    /// in the text below what changed ([`MainRsShift`]). Taken by the first
+    /// editor view that shows main.rs this frame - a second one keeps its
+    /// caret, as every view did before - and dropped at the next
+    /// regeneration check.
+    main_rs_caret_shift: Option<MainRsShift>,
     /// Editable project config files. Each holds the current content (a
     /// `<<< GENERATED >>>` block the IDE refreshes on chip change, plus whatever
     /// the user adds outside it). `memory_x`/`build_rs` are empty for ESP.
@@ -2446,6 +2457,8 @@ impl AppIde {
             selected_mcu_id,
             generated_code,
             mcu_state_hash: 0,
+            custom_by_hand: Vec::new(),
+            main_rs_caret_shift: None,
             cargo_toml: init_files.cargo_toml,
             cargo_config: init_files.cargo_config,
             memory_x: init_files.memory_x,
@@ -3652,6 +3665,7 @@ impl AppIde {
         // checks, just to no-op compare — which, under spinner-driven
         // continuous repaint, was a big share of the per-frame CPU cost.
         let mut mcu_changed = false;
+        self.main_rs_caret_shift = None;
         if let Some(mcu) = &self.mcu {
             let current_hash = Self::calculate_mcu_state_hash(mcu);
             if current_hash != self.mcu_state_hash {
@@ -3660,8 +3674,10 @@ impl AppIde {
                 // frame until the NEXT state change.
                 self.mcu_state_hash = current_hash;
                 mcu_changed = true;
+                self.custom_by_hand = mcu.customs_built_by_hand(&self.generated_code);
                 let updated = mcu.update_main_rs(&self.generated_code);
                 if updated != self.generated_code {
+                    self.main_rs_caret_shift = caret_shift(&self.generated_code, &updated);
                     self.generated_code = updated;
                     self.cached_project_files = None; // Invalidate cache
                 }
@@ -5516,6 +5532,22 @@ impl eframe::App for AppIde {
         } else {
             self.save_held = false;
         }
+        // A Custom module left to the user's code is built again once that
+        // code is gone - asked at Save, not on every keystroke, so the block
+        // is not rewritten under a line being typed. Before writing: this
+        // frame regenerates nothing, so the save waits ONE frame, whose
+        // `init_frame` builds the module, and then writes main.rs with it -
+        // the files on disk, the flushed workspace and a Save-and-close alike.
+        if save_requested
+            && self.mcu.as_ref().is_some_and(|m| {
+                m.customs_built_by_hand(&self.generated_code) != self.custom_by_hand
+            })
+        {
+            self.mcu_state_hash = 0;
+            self.request_save = true;
+            save_requested = false;
+            ui.ctx().request_repaint();
+        }
         // A save worker was spawned THIS frame — not merely requested (a held,
         // dropped or chip-less request writes nothing).
         let mut save_started = false;
@@ -5894,6 +5926,36 @@ mod flush_cache_tests {
     }
 }
 
+/// How a regeneration of main.rs moved the text below what it changed: from
+/// char index `at` of the OLD text on it is unchanged and sits `by` chars
+/// further.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MainRsShift {
+    at: usize,
+    by: isize,
+}
+
+/// [`MainRsShift`] from `old` to `new`; `None` when they are the same text.
+fn caret_shift(old: &str, new: &str) -> Option<MainRsShift> {
+    if old == new {
+        return None;
+    }
+    let (o, n): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let room = o.len().min(n.len()) - prefix;
+    let suffix = o
+        .iter()
+        .rev()
+        .zip(n.iter().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    Some(MainRsShift {
+        at: o.len() - suffix,
+        by: n.len() as isize - o.len() as isize,
+    })
+}
+
 /// Whether this frame's save hands the edits to rust-analyzer.
 ///
 /// `clicked` is Ctrl+S / the Save button and `tree_changed` a workspace
@@ -5938,6 +6000,30 @@ mod flush_after_save_tests {
     #[test]
     fn a_request_that_started_nothing_flushes_nothing() {
         assert!(!flush_after_save(false, false, false, false, false));
+    }
+
+    /// A regenerated block above the caret moves the text below it by the
+    /// block's change in length; text above the change does not move.
+    #[test]
+    fn a_caret_below_a_regenerated_block_moves_with_its_text() {
+        let old = "head\n// note one\n// note two\nEND\n    panel.update();\n";
+        let new = "head\nlet mut panel = Panel::new(gp6out);\nEND\n    panel.update();\n";
+        let s = super::caret_shift(old, new).expect("the text changed");
+        let tail = old.find("END").unwrap();
+        assert!(s.at <= tail, "the unchanged text starts by END");
+        assert_eq!(
+            s.by,
+            new.chars().count() as isize - old.chars().count() as isize
+        );
+        // A caret on `panel.update()` lands on it in the new text.
+        let caret = old.find("panel.update").unwrap();
+        assert_eq!(
+            (caret as isize + s.by) as usize,
+            new.find("panel.update").unwrap()
+        );
+        // A caret above the change - on `head` - stays where it is.
+        assert!(old.find("head").unwrap() < s.at);
+        assert_eq!(super::caret_shift(old, old), None);
     }
 
     #[test]

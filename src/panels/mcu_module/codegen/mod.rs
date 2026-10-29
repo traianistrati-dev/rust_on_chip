@@ -28,6 +28,7 @@ mod rcc_mux_harvest;
 pub mod rcc_n6;
 pub mod rp;
 pub mod rtic;
+pub mod spi_built;
 pub mod stm32;
 pub mod tmpl;
 pub mod uart_built;
@@ -42,6 +43,16 @@ pub use common::{
     mcu_id_marker_line, parse_driver_inits, parse_main_rs, parse_mcu_id, parse_pin_labels,
     pin_binding, sanitize_label, var_suffix,
 };
+
+/// A Custom module `Mcu::custom_module_plan` builds: `let mut {var} =
+/// {path}::new(..)`, from these pins (`Pin::number`) in argument order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltCustom {
+    pub var: String,
+    /// `pins::configs::custom_panel::Panel` - the struct, at its revision.
+    pub path: String,
+    pub pins: Vec<usize>,
+}
 
 /// Type-parameter name for a pin in a Custom module's struct: the pin's own name
 /// (`PC15` → `PC15`), uppercased and sanitised to a valid Rust identifier. Only
@@ -781,15 +792,25 @@ impl Mcu {
     /// bindings the call consumes.
     ///
     /// Only pins that main.rs binds as an INDEPENDENT variable can be passed:
-    /// GPIO In/Out and PWM. A peripheral pin (USART TX, SPI SCK…) is moved into
-    /// its `pins::configs::*::init(…)` call, so handing it to a custom struct
-    /// too would not compile — those modules get a commented line explaining it
-    /// instead of code that breaks the build. So is a PWM pad on embassy, whose
-    /// timer module is a driver too (`FamilyBackend::driver_pins`).
+    /// GPIO In/Out, and PWM where no generated timer takes the pad. A
+    /// peripheral pin (USART TX, SPI SCK…) is moved into its
+    /// `pins::configs::*::init(…)` call, so handing it to a custom struct too
+    /// would not compile — those modules get a commented line explaining it
+    /// instead of code that breaks the build. So is a PWM pad whose timer is
+    /// a driver too (`FamilyBackend::driver_pins`): embassy's, with its
+    /// "Generate driver" switch on, and every one stm32f1xx-hal builds.
     pub fn custom_module_inits(&self) -> String {
+        self.custom_module_plan().0
+    }
+
+    /// [`Self::custom_module_inits`]' lines, and every module they build - for
+    /// a runtime that hands the module on rather than leaving it in `main`
+    /// (RTIC's `#[local]` resources, `rtic::make_generated_section`).
+    pub fn custom_module_plan(&self) -> (String, Vec<BuiltCustom>) {
         use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
         use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
         let mut out = String::new();
+        let mut built = Vec::new();
         let customs = || self.modules.iter().filter(|m| m.kind == ModuleKind::Custom);
         // Asked only when there is a Custom module: on embassy it runs the
         // whole peripheral pass.
@@ -893,6 +914,14 @@ impl Mcu {
             let per_pin = self
                 .backend()
                 .is_some_and(|b| b.custom_pins_taken(self, &pins).is_some());
+            // A pad a generated driver takes (`FamilyBackend::driver_pins`):
+            // embassy's timer with its switch on, or a timer stm32f1xx-hal
+            // (the F1 off Async) builds - which has no switch to leave one raw,
+            // so its way out is other pads.
+            let hal_pwm = self.family == "stm32f1" && !self.is_async();
+            let pwm_driven = |p: &crate::panels::mcu_module::pins::logic::pin::Pin| {
+                driven.iter().any(|d| d == p.gpio())
+            };
             let taken: Vec<&str> = pins
                 .iter()
                 .filter(|p| {
@@ -902,15 +931,16 @@ impl Mcu {
                             PinFunction::GpioInput
                                 | PinFunction::GpioOutput
                                 | PinFunction::TimerPwm { .. }
-                        ) || driven.iter().any(|d| d == p.gpio()))
+                        ) || pwm_driven(p))
                 })
                 .map(|p| p.name.as_str())
                 .collect();
             // A PWM pad is refused only because a generated timer driver
-            // takes it, and the way out is that timer's own switch.
+            // takes it, and the way out is that timer's own switch - where
+            // there is one.
             let driven_pwm: Vec<u8> = pins
                 .iter()
-                .filter(|p| driven.iter().any(|d| d == p.gpio()))
+                .filter(|p| pwm_driven(p))
                 .filter_map(|p| match p.selected_function {
                     PinFunction::TimerPwm { timer, .. } => Some(timer),
                     _ => None,
@@ -919,16 +949,26 @@ impl Mcu {
             let timers: std::collections::BTreeSet<u8> = driven_pwm.iter().copied().collect();
             if !taken.is_empty() && driven_pwm.len() == taken.len() {
                 let names: Vec<String> = timers.iter().map(|t| format!("TIM{t}")).collect();
+                let them = if taken.len() == 1 { "it" } else { "them" };
+                let way_out = if hal_pwm {
+                    format!(
+                        "Hand the module GPIO In/Out pads: stm32f1xx-hal's PWM always takes \
+                         {them}."
+                    )
+                } else {
+                    format!(
+                        "Switch that timer's \"Generate driver\" off to hand {them} to the \
+                         module."
+                    )
+                };
                 out.push_str(&crate::panels::mcu_module::errata::comment(
                     &format!(
                         "Custom module `{var}` not built here: {} {} driven by the generated \
-                         PWM of {}, so {} cannot also be moved into `{struct_name}`. Switch \
-                         that timer's \"Generate driver\" off to hand {} to the module.",
+                         PWM of {}, so {} cannot also be moved into `{struct_name}`. {way_out}",
                         taken.join(", "),
                         if taken.len() == 1 { "is" } else { "are" },
                         names.join(", "),
                         if taken.len() == 1 { "it" } else { "they" },
-                        if taken.len() == 1 { "it" } else { "them" },
                     ),
                     "    ",
                 ));
@@ -938,11 +978,18 @@ impl Mcu {
                 out.push_str(&format!(
                     "    // Custom module `{var}` not built here: {} {} owned by a \
                      peripheral init,\n    // so {} cannot also be moved into \
-                     `{struct_name}`. Use GPIO In/Out or PWM pins,\n    // or construct it \
+                     `{struct_name}`. Use GPIO In/Out{} pins,\n    // or construct it \
                      yourself after that peripheral.\n",
                     taken.join(", "),
                     if taken.len() == 1 { "is" } else { "are" },
                     if taken.len() == 1 { "it" } else { "they" },
+                    // A PWM pad is no way out where a generated timer took
+                    // one of these.
+                    if hal_pwm || !driven_pwm.is_empty() {
+                        ""
+                    } else {
+                        " or PWM"
+                    },
                 ));
                 continue;
             }
@@ -987,13 +1034,21 @@ impl Mcu {
             let args: Vec<String> = pins.iter().map(|p| self.pin_binding(p)).collect();
             // The module path follows the CURRENT revision, so main.rs always
             // calls the file this Update just wrote.
-            out.push_str(&format!(
-                "    let mut {var} = pins::configs::{stem}::{struct_name}::new({});\n",
-                args.join(", "),
+            let path = format!(
+                "pins::configs::{stem}::{struct_name}",
                 stem = super::mcu::gui::modules::custom_file_stem(m),
+            );
+            out.push_str(&format!(
+                "    let mut {var} = {path}::new({});\n",
+                args.join(", "),
             ));
+            built.push(BuiltCustom {
+                var,
+                path,
+                pins: pins.iter().map(|p| p.number).collect(),
+            });
         }
-        out
+        (out, built)
     }
 
     /// `configs/custom_<name>.rs` for every Custom module that has at least one
@@ -2601,9 +2656,10 @@ mod tests {
         assert_eq!(mcu.find_pin(10).unwrap().irq, Some(Edge::Rising));
     }
 
-    /// A PWM pad goes into a Custom module where main.rs binds it on its own -
-    /// stm32f1xx-hal on Blocking - and not where a generated timer driver takes
-    /// it: embassy's `SimplePwm` on Async moves the pad first (E0382).
+    /// A PWM pad stays out of a Custom module wherever a generated timer
+    /// takes it first (E0382): stm32f1xx-hal's `pwm{n}::init` on Blocking,
+    /// which has no switch to leave it raw, and embassy's `SimplePwm` on
+    /// Async, whose "Generate driver" switch is the way out.
     #[test]
     fn a_pwm_pad_a_timer_driver_takes_stays_out_of_a_custom_module() {
         use super::super::mock_mcu;
@@ -2635,14 +2691,17 @@ mod tests {
             c.applied_pins = c.pins.clone();
         }
 
-        let inits = mcu.custom_module_inits();
+        let main = mcu.fresh_main_rs();
+        assert!(main.contains("pwm1::init("), "{main}");
+        assert!(!main.contains("Motor::new("), "F1 Blocking: {main}");
         assert!(
-            inits.contains("Motor::new(") && !inits.contains("not built here"),
-            "F1 Blocking binds the pad on its own:\n{inits}"
+            main.contains("stm32f1xx-hal's PWM always takes it."),
+            "{main}"
         );
         mcu.runtime = Runtime::Async;
         let inits = mcu.custom_module_inits();
         assert!(inits.contains("not built here"), "{inits}");
+        assert!(inits.contains("\"Generate driver\" off"), "{inits}");
         assert!(!inits.contains("Motor::new("), "{inits}");
     }
 

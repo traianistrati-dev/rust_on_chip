@@ -1859,6 +1859,34 @@ pub(crate) fn uart_built(
     })
 }
 
+/// What main.rs builds of SPI `n`
+/// ([`crate::panels::mcu_module::codegen::spi_built::SpiBuilt`]): every line
+/// wired - esp-hal takes them all, the master's CS as its hardware CS0, the
+/// slave's as its select input - each role's pad from [`collect_buses`], in
+/// the role and mode `cfg` holds, which is the one main.rs builds
+/// (`family::esp_spi_configs`). esp-hal refuses none.
+pub(crate) fn spi_built(
+    pins: &[&Pin],
+    cfg: &SpiModuleConfig,
+    n: u8,
+) -> crate::panels::mcu_module::codegen::spi_built::SpiBuilt {
+    use crate::panels::mcu_module::codegen::spi_built::{SpiBuilt, SpiShape};
+    let configured: Vec<&Pin> = pins
+        .iter()
+        .copied()
+        .filter(|p| !p.reserved && p.selected_function != PinFunction::Unset)
+        .collect();
+    let (_, spi, ..) = collect_buses(&configured);
+    SpiBuilt::Built(SpiShape {
+        pins: spi
+            .get(&n)
+            .map(|bus| bus.values().map(|p| p.number).collect())
+            .unwrap_or_default(),
+        role: cfg.role,
+        mode: cfg.mode,
+    })
+}
+
 pub fn bus_instances(configured: &[&Pin]) -> (BusWiring, BusWiring, BusWiring, BusWiring) {
     let (uart, spi, i2c, i2s_pins) = collect_buses(configured);
     let flatten = |b: BusPins, order: &[&'static str]| -> BusWiring {

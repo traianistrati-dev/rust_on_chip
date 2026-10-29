@@ -326,6 +326,91 @@ pub(super) struct GenParts {
     pub irq_items: String,
 }
 
+/// The `(channel, pad name)` of every PWM pad of `timer` among `pins` - what
+/// [`pwm_remap`] reads to pick the remap set `pwm_hz` is built on.
+fn timer_pads<'a>(pins: impl Iterator<Item = &'a Pin>, timer: u8) -> Vec<(u8, &'a str)> {
+    pins.filter_map(|p| match p.selected_function {
+        PinFunction::TimerPwm { timer: t, channel } if t == timer => {
+            Some((channel, p.name.as_str()))
+        }
+        _ => None,
+    })
+    .collect()
+}
+
+/// The pads (`Pin::gpio()`) stm32f1xx-hal's `pwm{n}::init` takes in
+/// [`gen_parts`]: every PWM pad of a timer whose pads are one of the remap
+/// sets [`pwm_remap`] knows. A timer whose pads are not is NOT initialised,
+/// and its pads stay raw bindings - free for a Custom module. There is no
+/// "Generate driver" switch on this HAL to leave one raw otherwise.
+pub(crate) fn f1_pwm_pads(all_pins: &[&Pin]) -> Vec<String> {
+    let configured: Vec<&Pin> = all_pins
+        .iter()
+        .copied()
+        .filter(|p| {
+            !p.reserved && p.selected_function != PinFunction::Unset && parse_pin(&p.name).is_some()
+        })
+        .collect();
+    let timers: std::collections::BTreeSet<u8> = configured
+        .iter()
+        .filter_map(|p| match p.selected_function {
+            PinFunction::TimerPwm { timer, .. } => Some(timer),
+            _ => None,
+        })
+        .collect();
+    timers
+        .into_iter()
+        .filter(|t| pwm_remap(*t, &timer_pads(configured.iter().copied(), *t)).is_some())
+        .flat_map(|t| {
+            configured
+                .iter()
+                .filter(move |p| matches!(p.selected_function, PinFunction::TimerPwm { timer, .. } if timer == t))
+                .map(|p| p.gpio().to_owned())
+        })
+        .collect()
+}
+
+/// What main.rs builds of SPI `n` on the F1 off Async
+/// ([`super::spi_built::SpiBuilt`]), by [`gen_parts`]' rule: stm32f1xx-hal's
+/// master `Spi` for SPI1 and SPI2, from the first SCK, MOSI and MISO pad wired
+/// (a missing one becomes the HAL's `NoSck` / `NoMosi` / `NoMiso`), once SCK
+/// or MOSI is there; its NSS pad a push-pull GPIO the firmware drives itself,
+/// which is a line of it too. Nothing otherwise - main.rs says nothing then.
+pub(crate) fn f1_spi_built(
+    mcu: &crate::panels::mcu_module::mcu::Mcu,
+    n: u8,
+    mode: u8,
+) -> super::spi_built::SpiBuilt {
+    use super::super::modules::SpiRole;
+    use super::spi_built::{SpiBuilt, SpiShape};
+    if !(1..=2).contains(&n) {
+        return SpiBuilt::Not(format!(
+            "stm32f1xx-hal is built here for SPI1 and SPI2 only, not SPI{n}"
+        ));
+    }
+    let pad = |f: PinFunction| {
+        mcu.iter_all_pins()
+            .find(|p| !p.reserved && p.selected_function == f && parse_pin(&p.name).is_some())
+            .map(|p| p.number)
+    };
+    let (sck, mosi, miso, nss) = (
+        pad(PinFunction::SpiSck(n)),
+        pad(PinFunction::SpiMosi(n)),
+        pad(PinFunction::SpiMiso(n)),
+        pad(PinFunction::SpiNss(n)),
+    );
+    if sck.is_none() && mosi.is_none() {
+        return SpiBuilt::Not(
+            "stm32f1xx-hal is built here once SCK or MOSI is wired, and neither is".to_owned(),
+        );
+    }
+    SpiBuilt::Built(SpiShape {
+        pins: [sck, mosi, miso, nss].into_iter().flatten().collect(),
+        role: SpiRole::Master,
+        mode,
+    })
+}
+
 /// What main.rs builds of USART `n` on the F1 off Async
 /// ([`super::uart_built::UartBuilt`]), by [`gen_parts`]' rule: stm32f1xx-hal's
 /// `Serial` for USART1..3, from the first TX and RX pad wired - the pair
@@ -905,15 +990,7 @@ pub(super) fn gen_parts(
         }
         for (tim, mut chans) in timers {
             chans.sort_by_key(|(c, _)| *c);
-            let pads: Vec<(u8, &str)> = configured
-                .iter()
-                .filter_map(|(p, _)| match p.selected_function {
-                    PinFunction::TimerPwm { timer, channel } if timer == tim => {
-                        Some((channel, p.name.as_str()))
-                    }
-                    _ => None,
-                })
-                .collect();
+            let pads = timer_pads(configured.iter().map(|(p, _)| *p), tim);
             let list = chans
                 .iter()
                 .map(|(c, _)| format!("CH{c}"))
@@ -2651,8 +2728,8 @@ fn needs_mut_binding(
 /// parks it.
 ///
 /// The MODE is part of the type: a pull-up input is `Input<PullUp>`, and naming
-/// `Floating` there is a type error rather than a cosmetic slip. (The RTIC path
-/// hardcodes `Floating` — that is a separate bug, not a precedent.)
+/// `Floating` there is a type error rather than a cosmetic slip - the rule RTIC's
+/// `Local` resources are typed by too (`rtic::pin_type`).
 fn f1_input_ty(pin: &Pin) -> Option<String> {
     let m = parse_pin(&pin.name)?;
     let mode = match pin.io_mode.unwrap_or(GpioMode::Floating) {

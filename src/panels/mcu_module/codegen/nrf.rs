@@ -1298,6 +1298,76 @@ fn uarte_kept_direction_note(
     crate::panels::mcu_module::errata::comment(&sentence, "    ")
 }
 
+/// What main.rs builds of SPI module `m` ([`super::spi_built::SpiBuilt`]),
+/// by the gates both nRF backends build a SPIM through: a master - neither
+/// nrf-hal nor embassy-nrf is asked for an SPIS - in `mode`, from its lines
+/// (the lowest pad of a role wired twice). Never an NSS pad: no SPIM
+/// constructor takes a chip-select. Nothing when the part has no such block,
+/// SCK is missing, embassy-nrf has only SCK, or another bus runs its shared
+/// block on embassy-nrf ([`shared_block`]) - with the reason main.rs gives -
+/// and switched off at run time when that bus runs it on nrf-hal, whose main.rs
+/// builds both.
+pub(crate) fn spim_built(
+    mcu: &Mcu,
+    m: &crate::panels::mcu_module::modules::VirtualModule,
+    mode: u8,
+) -> super::spi_built::SpiBuilt {
+    use super::spi_built::{SpiBuilt, SpiShape};
+    let i = m.instance();
+    if !block_present(mcu, "spim", Some(i)) {
+        let part = chip(&mcu.family).map_or("part", |c| c.part);
+        return SpiBuilt::Not(format!("the {part} has no SPIM{i}"));
+    }
+    let spi = spi_pins(mcu);
+    let (sck, mosi, miso) = (
+        role_of(&spi, i, "sck"),
+        role_of(&spi, i, "mosi"),
+        role_of(&spi, i, "miso"),
+    );
+    if sck.is_none() {
+        return SpiBuilt::Not("SCK is not wired, and a SPIM without a clock is nothing".to_owned());
+    }
+    if on_embassy(mcu) && mosi.is_none() && miso.is_none() {
+        return SpiBuilt::Not(
+            "only SCK is wired, and embassy-nrf builds a SPIM with MOSI, MISO or both".to_owned(),
+        );
+    }
+    // One serial block, one bus at a time: embassy-nrf builds the first and
+    // writes the others as comments, nrf-hal builds them all and the last
+    // init switches the others off.
+    if let Some(shared) = shared_block(mcu, m, mcu.is_async())
+        && shared.owner != shared.me
+    {
+        return if shared.embassy {
+            SpiBuilt::Not(format!(
+                "{} runs {} here - the block runs one bus at a time",
+                shared.block, shared.owner
+            ))
+        } else {
+            SpiBuilt::Off(format!(
+                "{}'s init runs after it on nrf-hal and takes {} over - the block runs one \
+                 bus at a time",
+                shared.owner, shared.block
+            ))
+        };
+    }
+    let taken: Vec<(u8, u8)> = [sck, mosi, miso].into_iter().flatten().collect();
+    SpiBuilt::Built(SpiShape {
+        pins: mcu
+            .iter_all_pins()
+            .filter(|p| {
+                matches!(p.selected_function,
+                    PinFunction::SpiSck(n) | PinFunction::SpiMosi(n) | PinFunction::SpiMiso(n)
+                    if n == i)
+                    && nrf_pin(&p.name).is_some_and(|x| taken.contains(&x))
+            })
+            .map(|p| p.number)
+            .collect(),
+        role: crate::panels::mcu_module::modules::SpiRole::Master,
+        mode,
+    })
+}
+
 fn spi_pins(mcu: &Mcu) -> Vec<(u8, &'static str, (u8, u8))> {
     bus_pins(mcu, "spim", |f| match f {
         PinFunction::SpiSck(i) => Some((*i, "sck")),

@@ -1296,7 +1296,9 @@ pub const CUSTOM_PIN_FUNCTION: &str = "This pin's function, the same list the ch
 pub const CUSTOM_PIN_UNSET: &str = "This pin has no function yet. Nothing can be generated for \
                                     it, so Update refuses and names it instead - pick In, Out or \
                                     PWM here. Those three are the only functions a custom module \
-                                    can actually be handed.";
+                                    can actually be handed, and PWM only where no generated timer \
+                                    takes the pad first: on embassy with that timer's Generate \
+                                    driver off, never on a timer stm32f1xx-hal builds.";
 
 pub const CUSTOM_PIN_REMOVE: &str = "Takes this pin out of the module and frees it. The pin \
                                      keeps the function you gave it, and the Add pin list only \
@@ -1352,7 +1354,8 @@ pub const CUSTOM_UNCONFIGURED_DIALOG: &str = "The pins named here have no functi
                                               can be generated for them. Click a pin's name in \
                                               the list above, or the pin on the chip, and choose \
                                               In, Out or PWM - those are the ones a custom \
-                                              module can be handed.";
+                                              module can be handed, PWM only where no \
+                                              generated timer takes the pad first.";
 
 pub const SHARED_NAME_CUSTOM: &str = "On a custom module the name is not just a suffix on a \
                                       handle: it is the generated file's name and, unless Struct \

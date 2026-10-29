@@ -55,9 +55,10 @@ pub struct ModuleItem {
     pub signals: Vec<SignalPin>,
     /// Its settings (baud rate, SPI mode, …), for the checks on a link.
     pub config: ModuleConfig,
-    /// `Some(why)` for a UART its chip's generated code does not build, so no
-    /// wire is drawn to it; `None` for everything else, external parts
-    /// included.
+    /// `Some(what)` for a UART or SPI that has no line on the board, said
+    /// after its name - `is not built: <why>`, or `is switched off at run
+    /// time: <why>` - so no wire is drawn to it; `None` for everything else,
+    /// external parts included.
     pub not_built: Option<String>,
 }
 
@@ -135,7 +136,7 @@ impl ChipView {
                 match built.get(&(item.kind, item.instance)) {
                     None => {}
                     Some(UartBuilt::Not(why)) => {
-                        item.not_built = Some(why.clone());
+                        item.not_built = Some(format!("is not built: {why}"));
                         item.signals.clear();
                     }
                     Some(UartBuilt::Built(shape)) => {
@@ -145,6 +146,34 @@ impl ChipView {
                         c.direction = shape.direction;
                         c.swap_rx_tx = shape.swapped;
                         c.flow = shape.flow(&signals);
+                    }
+                }
+            }
+        }
+        // Every SPI the same way (`Mcu::spis_built`): only the lines it is
+        // built with - an NSS no constructor takes is no line of it - in the
+        // role and mode it is built in, a master wherever the HAL is asked
+        // for nothing else.
+        if let Some(built) = mcu.spis_built() {
+            use crate::panels::mcu_module::codegen::spi_built::SpiBuilt;
+            for item in &mut view.modules {
+                let ModuleConfig::Spi(c) = &mut item.config else {
+                    continue;
+                };
+                match built.get(&item.instance) {
+                    None => {}
+                    Some(SpiBuilt::Not(why)) => {
+                        item.not_built = Some(format!("is not built: {why}"));
+                        item.signals.clear();
+                    }
+                    Some(SpiBuilt::Off(why)) => {
+                        item.not_built = Some(format!("is switched off at run time: {why}"));
+                        item.signals.clear();
+                    }
+                    Some(SpiBuilt::Built(shape)) => {
+                        item.signals.retain(|s| shape.pins.contains(&s.pin));
+                        c.role = shape.role;
+                        c.mode = shape.mode;
                     }
                 }
             }

@@ -318,6 +318,40 @@ fn i2c_pins(mcu: &Mcu) -> Vec<(u8, &'static str, u8)> {
     })
 }
 
+/// What main.rs builds of SPI `i` ([`super::spi_built::SpiBuilt`]), by the
+/// same [`spi_pads`] both RP runtimes decide with: a master - neither rp-hal
+/// nor embassy-rp is asked for a slave - in mode 0, which neither is told
+/// otherwise, from the lines its shape takes (the lowest GPIO of a role wired
+/// twice). Never an NSS pad: no constructor here takes one. Nothing when it is
+/// refused, with `spi_pads`' reason.
+pub(crate) fn spi_built(mcu: &Mcu, i: u8) -> super::spi_built::SpiBuilt {
+    use super::spi_built::{SpiBuilt, SpiShape};
+    let spi = spi_pins(mcu);
+    // Only an NSS pad: no bus loop reaches it, and main.rs says nothing.
+    if !instances(&spi).contains(&i) {
+        return SpiBuilt::Not("no SCK, MOSI or MISO pad is wired".to_owned());
+    }
+    let (sck, mosi, miso) = match spi_pads(&spi, i, mcu.is_async()) {
+        Ok(pads) => pads,
+        Err(why) => return SpiBuilt::Not(why),
+    };
+    let gpios: Vec<u8> = [sck, mosi, miso].into_iter().flatten().collect();
+    SpiBuilt::Built(SpiShape {
+        pins: mcu
+            .iter_all_pins()
+            .filter(|p| {
+                matches!(p.selected_function,
+                    PinFunction::SpiSck(n) | PinFunction::SpiMosi(n) | PinFunction::SpiMiso(n)
+                    if n == i)
+                    && gpio_index(&p.name).is_some_and(|g| gpios.contains(&g))
+            })
+            .map(|p| p.number)
+            .collect(),
+        role: crate::panels::mcu_module::modules::SpiRole::Master,
+        mode: 0,
+    })
+}
+
 /// The pads an SPI is built from - `(sck, mosi, miso)`, each `None` where its
 /// shape leaves it out - or, when the wired pads make no shape the HAL builds,
 /// why not: the sentence main.rs says instead of a constructor.

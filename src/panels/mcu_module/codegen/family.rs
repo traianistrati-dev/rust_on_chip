@@ -128,8 +128,10 @@ pub trait FamilyBackend {
 
     /// The pins of a Custom module main.rs cannot hand over, each with why,
     /// for a backend that says it per pin - `None` keeps the default rule
-    /// (`Mcu::custom_module_inits`: GPIO In/Out and PWM free, `driver_pins`
-    /// taken, the STM32's timer-switch advice).
+    /// (`Mcu::custom_module_inits`: GPIO In/Out free, PWM free unless
+    /// `driver_pins` takes it - embassy's timer with its "Generate driver"
+    /// switch on, every timer stm32f1xx-hal builds - with the way out each
+    /// has).
     fn custom_pins_taken(&self, _mcu: &Mcu, _pins: &[&Pin]) -> Option<Vec<(String, &'static str)>> {
         None
     }
@@ -171,6 +173,12 @@ struct Stm32f1Backend;
 impl FamilyBackend for Stm32f1Backend {
     fn family_id(&self) -> &'static str {
         "stm32f1"
+    }
+
+    /// The PWM pads `pwm{n}::init` takes - stm32f1xx-hal has no "Generate
+    /// driver" switch to leave one raw (`stm32::f1_pwm_pads`).
+    fn driver_pins(&self, mcu: &Mcu) -> Vec<String> {
+        stm32::f1_pwm_pads(&pins_of(mcu))
     }
 
     fn fresh_main_rs(&self, mcu: &Mcu) -> String {
@@ -336,7 +344,7 @@ impl FamilyBackend for Esp32Backend {
 /// C5 carries its `.config` with it and never passes through the panel again.
 /// Without this, that project would emit a slave file for a chip whose esp-hal
 /// has no `with_dma`, and it would not compile.
-fn esp_spi_configs(mcu: &Mcu) -> BTreeMap<u8, SpiModuleConfig> {
+pub(crate) fn esp_spi_configs(mcu: &Mcu) -> BTreeMap<u8, SpiModuleConfig> {
     let mut spi = modules::spi_configs(&mcu.modules);
     for cfg in spi.values_mut() {
         if !SpiRole::options(&mcu.family).contains(&cfg.role) {
@@ -1370,6 +1378,11 @@ impl FamilyBackend for RticBackend {
         "stm32f1"
     }
 
+    /// The same `gen_parts` as Blocking: the PWM pads `pwm{n}::init` takes.
+    fn driver_pins(&self, mcu: &Mcu) -> Vec<String> {
+        stm32::f1_pwm_pads(&pins_of(mcu))
+    }
+
     fn fresh_main_rs(&self, mcu: &Mcu) -> String {
         let all = pins_of(mcu);
         let (usart, spi, i2c) = resolve_bus_configs(mcu);
@@ -1391,6 +1404,7 @@ impl FamilyBackend for RticBackend {
             // backend. Only the Custom modules used to come through, so an
             // IWDG got its `iwdg.rs` and an `#[init]` that never called it.
             &mcu.watchdog_and_custom_inits(),
+            &mcu.custom_module_plan().1,
         );
         format!(
             "{}{section}
@@ -1418,6 +1432,7 @@ impl FamilyBackend for RticBackend {
             &timer,
             mcu.gpio_native(),
             &mcu.watchdog_and_custom_inits(),
+            &mcu.custom_module_plan().1,
         );
         // The block imported `adc` here too, at the crate root the tail's
         // helpers share: kept while they name it.

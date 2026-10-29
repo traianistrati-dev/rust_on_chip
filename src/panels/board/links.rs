@@ -315,7 +315,7 @@ fn uart(
         .collect();
     if !unbuilt.is_empty() {
         for (n, why) in unbuilt {
-            r.warnings.push(format!("{n} is not built: {why}"));
+            r.warnings.push(format!("{n} {why}"));
         }
         return;
     }
@@ -422,6 +422,17 @@ fn uart(
 
 fn spi(r: &mut Resolved, ma: &ModuleItem, mb: &ModuleItem, na: &str, nb: &str) {
     use ModuleSignal::*;
+    // An SPI its chip's generated code does not build has no line to draw.
+    let unbuilt: Vec<(&str, &str)> = [(ma, na), (mb, nb)]
+        .into_iter()
+        .filter_map(|(m, n)| m.not_built.as_deref().map(|why| (n, why)))
+        .collect();
+    if !unbuilt.is_empty() {
+        for (n, why) in unbuilt {
+            r.warnings.push(format!("{n} {why}"));
+        }
+        return;
+    }
     let role = |m: &ModuleItem| match &m.config {
         ModuleConfig::Spi(c) => c.role,
         _ => SpiRole::Master,
@@ -1319,12 +1330,85 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
+    /// SPI lines are the firmware's too: an F1 on embassy is built as a
+    /// master that never takes its NSS pad, so to an ESP32-S3 slave whose CS
+    /// is wired the clock and data lines are drawn, no chip-select - and the
+    /// slave's undriven CS is said. A stored Slave role on the F1 is no role
+    /// it is built in.
+    #[test]
+    fn spi_lines_are_the_ones_the_firmware_configures() {
+        use crate::panels::board::snapshot::ChipView;
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let chip_with =
+            |id: &str, runtime: Runtime, wired: &[(&str, PinFunction)], role: SpiRole| {
+                let mut mcu = builtin_for(id).expect(id).build_mcu();
+                mcu.runtime = runtime;
+                for (name, f) in wired {
+                    mcu.iter_all_pins_mut()
+                        .find(|p| p.name == *name)
+                        .expect(name)
+                        .selected_function = f.clone();
+                }
+                mcu.reconcile_modules();
+                for m in &mut mcu.modules {
+                    if let ModuleConfig::Spi(c) = &mut m.config {
+                        c.role = role;
+                    }
+                }
+                mcu
+            };
+        let f1 = chip_with(
+            "stm32f103c8t6",
+            Runtime::Async,
+            &[
+                ("PA5", PinFunction::SpiSck(1)),
+                ("PA7", PinFunction::SpiMosi(1)),
+                ("PA6", PinFunction::SpiMiso(1)),
+                ("PA4", PinFunction::SpiNss(1)),
+            ],
+            SpiRole::Slave,
+        );
+        let esp = chip_with(
+            "esp32s3",
+            Runtime::Blocking,
+            &[
+                ("GPIO12", PinFunction::SpiSck(2)),
+                ("GPIO11", PinFunction::SpiMosi(2)),
+                ("GPIO13", PinFunction::SpiMiso(2)),
+                ("GPIO10", PinFunction::SpiNss(2)),
+            ],
+            SpiRole::Slave,
+        );
+        let views = [
+            ChipView::from_mcu("f1", "STM32F103C8", &f1),
+            ChipView::from_mcu("esp", "ESP32-S3", &esp),
+        ];
+        let link = Link {
+            a: end("f1", ModuleKind::GenericInterfaceSpi, 1),
+            b: end("esp", ModuleKind::GenericInterfaceSpi, 2),
+        };
+        let r = resolve(&link, &views, std::slice::from_ref(&link));
+        assert_eq!(
+            pads(&r),
+            [
+                ("SCK PA5".into(), "SCK GPIO12".into(), Dir::AtoB),
+                ("MOSI PA7".into(), "MOSI GPIO11".into(), Dir::AtoB),
+                ("MISO PA6".into(), "MISO GPIO13".into(), Dir::BtoA),
+            ]
+        );
+        assert_eq!(
+            r.warnings,
+            ["The slave's NSS has no chip-select from the master - drive it from a GPIO or tie it"]
+        );
+    }
+
     /// A UART its chip's main.rs does not build has no line: the link says
     /// so instead of drawing one.
     #[test]
     fn a_uart_main_rs_does_not_build_draws_no_line() {
         let mut a = usart(1, 115_200, (30, "PA9"), (31, "PA10"));
-        a.not_built = Some("its main.rs says why".to_owned());
+        a.not_built = Some("is not built: its main.rs says why".to_owned());
         a.signals.clear();
         let b = usart(0, 115_200, (20, "GPIO21"), (21, "GPIO20"));
         let views = [chip("stm32_main", vec![a]), chip("esp32_radio", vec![b])];

@@ -1962,7 +1962,45 @@ mod emit_for_manual_compile {
                 timeout_us: 2_000_000,
             });
         }
+        // `EIDE_CUSTOM=1`: a Custom module "panel" over an open-drain output
+        // and a pull-up input, and a pull-up input beside it. The module
+        // leaves `#[init]` as a `Local` of its own holding both pads - moved
+        // into it once - and every resource is typed from its pad's mode.
+        let custom = std::env::var("EIDE_CUSTOM").is_ok();
+        if custom {
+            use crate::panels::mcu_module::pins::logic::pin::GpioMode;
+            for (name, func, mode) in [
+                ("PB12", PinFunction::GpioOutput, GpioMode::OpenDrain),
+                ("PB13", PinFunction::GpioInput, GpioMode::PullUp),
+                ("PB14", PinFunction::GpioInput, GpioMode::PullUp),
+            ] {
+                let p = mcu
+                    .iter_all_pins_mut()
+                    .find(|p| p.name == name)
+                    .expect(name);
+                p.selected_function = func;
+                p.io_mode = Some(mode);
+            }
+        }
         mcu.reconcile_modules();
+        if custom {
+            use crate::panels::mcu_module::modules::ModuleKind;
+            let pads: Vec<usize> = ["PB12", "PB13"]
+                .iter()
+                .map(|n| mcu.iter_all_pins().find(|p| p.name == *n).unwrap().number)
+                .collect();
+            assert!(mcu.add_module(ModuleKind::Custom));
+            let m = mcu
+                .modules
+                .iter_mut()
+                .find(|m| m.kind == ModuleKind::Custom)
+                .expect("the Custom module");
+            *m.config.custom_label_mut() = "panel".to_owned();
+            if let ModuleConfig::Custom(c) = &mut m.config {
+                c.pins = pads.clone();
+                c.applied_pins = pads;
+            }
+        }
         for m in &mut mcu.modules {
             if let ModuleConfig::Timer(c) = &mut m.config {
                 c.freq_hz = 20_000;
@@ -1974,6 +2012,13 @@ mod emit_for_manual_compile {
         assert!(
             main_rs.contains("#[rtic::app"),
             "not an RTIC project:\n{main_rs}"
+        );
+        assert_eq!(
+            main_rs.contains(
+                "let panel = pins::configs::custom_panel::Panel::new(pb12_out, pb13_in);"
+            ),
+            custom,
+            "{main_rs}"
         );
         // `EIDE_F1_ADC=example`: a helper below the block set the sample time
         // the way a project from before `adc1.rs` did, naming `adc::` - which

@@ -31,7 +31,7 @@ use crate::panels::mcu_module::modules::{
     CanModuleConfig, I2cModuleConfig, SpiModuleConfig, TimerModuleConfig, UsartModuleConfig,
     UsbModuleConfig,
 };
-use crate::panels::mcu_module::pins::logic::pin::{Edge, Pin};
+use crate::panels::mcu_module::pins::logic::pin::{Edge, GpioMode, Pin};
 use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
 use std::collections::BTreeMap;
 
@@ -40,32 +40,69 @@ use std::collections::BTreeMap;
 pub struct LocalPin {
     pub name: String,
     pub binding: String,
-    /// `true` for an input, `false` for an output — picks the HAL type.
-    pub input: bool,
+    /// The HAL type it is declared with ([`pin_type`]).
+    pub ty: String,
 }
 
-/// Every plain GPIO pin, in binding order.
+/// The type `#[init]` binds a plain GPIO pad as -
+/// `gpio::gpioa::PA5<gpio::Input<gpio::PullUp>>` - which a `Local` resource
+/// holding it, or a Custom module over it, is declared with. Its mode is the
+/// pad's own, read as `stm32::into_expr` binds it (`GpioMode::for_input` /
+/// `for_output`): a pull-up input is no `Input<Floating>`. `None` for any
+/// other pad, which no `Local` here holds raw.
+pub(crate) fn pin_type(p: &Pin) -> Option<String> {
+    let state = match p.selected_function {
+        PinFunction::GpioInput => match GpioMode::for_input(p.io_mode) {
+            GpioMode::PullUp => "gpio::Input<gpio::PullUp>",
+            GpioMode::PullDown => "gpio::Input<gpio::PullDown>",
+            _ => "gpio::Input<gpio::Floating>",
+        },
+        PinFunction::GpioOutput => match GpioMode::for_output(p.io_mode) {
+            GpioMode::OpenDrain => "gpio::Output<gpio::OpenDrain>",
+            _ => "gpio::Output<gpio::PushPull>",
+        },
+        _ => return None,
+    };
+    let port = p.name.chars().nth(1)?.to_ascii_lowercase();
+    Some(format!(
+        "gpio::gpio{port}::{}<{state}>",
+        p.name.to_ascii_uppercase()
+    ))
+}
+
+/// The type a Custom module's struct holds pad `p` as: a GPIO's
+/// ([`pin_type`]), or a PWM pad no generated timer took - its timer's pads are
+/// no remap set `pwm_hz` knows, so it stays the raw `into_alternate_push_pull`
+/// pin (`stm32::f1_pwm_pads`).
+fn custom_pad_type(p: &Pin) -> Option<String> {
+    if let PinFunction::TimerPwm { .. } = p.selected_function {
+        let port = p.name.chars().nth(1)?.to_ascii_lowercase();
+        return Some(format!(
+            "gpio::gpio{port}::{}<gpio::Alternate<gpio::PushPull>>",
+            p.name.to_ascii_uppercase()
+        ));
+    }
+    pin_type(p)
+}
+
+/// Every plain GPIO pin, in binding order - but the ones in `owned`, which a
+/// Custom module's `new` moves into its struct, the resource they travel in.
 ///
 /// Bus pins are deliberately absent: `pins::configs::*::init(...)` has already
 /// consumed them, so there is no value left to hand to the framework.
-pub fn local_pins(all_pins: &[&Pin]) -> Vec<LocalPin> {
+pub fn local_pins(all_pins: &[&Pin], owned: &[usize]) -> Vec<LocalPin> {
     all_pins
         .iter()
-        .filter(|p| !p.reserved)
+        .filter(|p| !p.reserved && !owned.contains(&p.number))
         .filter_map(|p| {
-            let input = match p.selected_function {
-                PinFunction::GpioInput => true,
-                PinFunction::GpioOutput => false,
-                _ => return None,
-            };
             Some(LocalPin {
+                ty: pin_type(p)?,
                 binding: pin_binding(
                     &p.name.to_ascii_lowercase(),
                     &p.selected_function,
                     &p.custom_label,
                 ),
                 name: p.name.clone(),
-                input,
             })
         })
         .collect()
@@ -616,6 +653,9 @@ pub fn make_generated_section(
     timer: &BTreeMap<u8, TimerModuleConfig>,
     gpio_native: bool,
     custom_inits: &str,
+    // The Custom modules `custom_inits` builds (`Mcu::custom_module_plan`):
+    // each becomes a `Local` of its own, holding its pads.
+    customs: &[super::BuiltCustom],
 ) -> String {
     let Some(parts) = gen_parts(
         Binding::Owned,
@@ -643,8 +683,85 @@ pub fn make_generated_section(
     } = parts;
 
     let irqs = irq_pins(all_pins);
-    let locals_all = local_pins(all_pins);
-    let (fn_calls, buses) = promote_bus_handles(&fn_calls);
+    let (mut fn_calls, buses) = promote_bus_handles(&fn_calls);
+    // A Custom module leaves `#[init]` as a resource, its pads inside it -
+    // moved into it once, and not into `Local` beside it (E0382). No `mut`:
+    // it is only moved here, and RTIC hands its task a `&mut` to it.
+    //
+    // One named like a resource already there - a pad's binding, a promoted
+    // handle (a module labelled `can` beside the CAN's `can`), an earlier
+    // module - would be a second field of that name: said where its line was,
+    // not built, and its pads stay resources of their own, as every refused
+    // module's do. Decided before the pads are counted out of `Local`.
+    let mut names: std::collections::BTreeSet<String> = local_pins(all_pins, &[])
+        .into_iter()
+        .map(|p| p.binding)
+        .chain(buses.iter().map(|b| b.binding.clone()))
+        .collect();
+    let mut kept: Vec<&super::BuiltCustom> = Vec::new();
+    // Each refused module's line: the n-th of its call - two modules can
+    // share one (the same name and file).
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut notes: Vec<(usize, usize, String)> = Vec::new();
+    for c in customs {
+        let call = format!("let mut {} = {}::new(", c.var, c.path);
+        let nth = seen.get(&call).copied().unwrap_or(0);
+        seen.insert(call.clone(), nth + 1);
+        if names.insert(c.var.clone()) {
+            kept.push(c);
+            continue;
+        }
+        let Some((at, _)) = fn_calls.match_indices(&call).nth(nth) else {
+            continue;
+        };
+        let start = fn_calls[..at].rfind('\n').map_or(0, |i| i + 1);
+        let end = fn_calls[at..]
+            .find('\n')
+            .map_or(fn_calls.len(), |i| at + i + 1);
+        notes.push((
+            start,
+            end,
+            crate::panels::mcu_module::errata::comment(
+                &format!(
+                    "Custom module `{}` not built here: on RTIC it leaves `#[init]` as a \
+                     `#[local]` resource, and `{}` is already one - a second field of that \
+                     name would not compile. Rename the module.",
+                    c.var, c.var
+                ),
+                "    ",
+            ),
+        ));
+    }
+    // From the last, so each range still points at its line.
+    notes.sort_by_key(|(start, ..)| std::cmp::Reverse(*start));
+    for (start, end, note) in notes {
+        fn_calls.replace_range(start..end, &note);
+    }
+    let customs = kept;
+    let owned: Vec<usize> = customs
+        .iter()
+        .flat_map(|c| c.pins.iter().copied())
+        .collect();
+    let locals_all = local_pins(all_pins, &owned);
+    let custom_fields: String = customs
+        .iter()
+        .map(|c| {
+            let tys: Vec<String> = c
+                .pins
+                .iter()
+                .filter_map(|n| all_pins.iter().find(|p| p.number == *n))
+                .filter_map(|p| custom_pad_type(p))
+                .collect();
+            // Every pad has one: `custom_module_plan` builds a module from
+            // GPIO In/Out pads and the PWM pads no timer takes, nothing else.
+            debug_assert_eq!(tys.len(), c.pins.len(), "{c:?}");
+            fn_calls = fn_calls.replace(
+                &format!("let mut {} = {}::new(", c.var, c.path),
+                &format!("let {} = {}::new(", c.var, c.path),
+            );
+            format!("        {}: {}<{}>,\n", c.var, c.path, tys.join(", "))
+        })
+        .collect();
     // `make_interrupt_source(&mut self)` needs a mutable binding. Rewriting only
     // the armed pins keeps `unused_mut` off the polled ones.
     let pin_section = irqs.iter().fold(pin_section, |acc, p| {
@@ -660,6 +777,7 @@ pub fn make_generated_section(
         .iter()
         .map(|p| p.binding.clone())
         .chain(buses.iter().map(|b| b.binding.clone()))
+        .chain(customs.iter().map(|c| c.var.clone()))
         .map(|b| format!("            {b},\n"))
         .collect::<String>();
     let task_fns = tasks(&irqs);
@@ -718,14 +836,14 @@ pub fn make_generated_section(
          {GEN_END}\n",
         clock_chain_i = clock_chain.replace('\n', "\n        "),
         local_fields = format!(
-            "{}{}",
+            "{}{}{custom_fields}",
             locals_decl(&locals_all),
             buses
                 .iter()
                 .map(|b| format!("        {}: {},\n", b.binding, b.ty))
                 .collect::<String>()
         ),
-        local_init = if locals_all.is_empty() && buses.is_empty() {
+        local_init = if locals_all.is_empty() && buses.is_empty() && customs.is_empty() {
             String::new()
         } else {
             format!("\n{locals}        ")
@@ -737,26 +855,14 @@ pub fn make_generated_section(
     )
 }
 
-/// `Local` field declarations, typed by inference from `#[init]`'s return.
+/// `Local` field declarations, each type spelled out by [`pin_type`].
 ///
 /// RTIC needs concrete types here, and the HAL pin types are long and
 /// port-specific (`gpioa::PA5<Input<Floating>>`). `gen_parts` already emits the
-/// binding, so the type is spelled out per pin from its name.
+/// binding, so the type is spelled out per pin, by [`pin_type`].
 fn locals_decl(pins: &[LocalPin]) -> String {
     pins.iter()
-        .map(|p| {
-            let port = p.name.chars().nth(1).unwrap_or('a').to_ascii_lowercase();
-            let ty = if p.input {
-                "gpio::Input<gpio::Floating>"
-            } else {
-                "gpio::Output<gpio::PushPull>"
-            };
-            format!(
-                "        {b}: gpio::gpio{port}::{up}<{ty}>,\n",
-                b = p.binding,
-                up = p.name.to_ascii_uppercase(),
-            )
-        })
+        .map(|p| format!("        {}: {},\n", p.binding, p.ty))
         .collect()
 }
 
@@ -1010,6 +1116,7 @@ mod tests {
             &BTreeMap::new(),
             true,
             "",
+            &[],
         );
         assert!(!code.contains("unmask"), "{code}");
         assert!(!code.contains("NVIC"), "{code}");
@@ -1051,6 +1158,7 @@ mod tests {
                 &BTreeMap::new(),
                 true,
                 "",
+                &[],
             )
         );
     }
@@ -1231,6 +1339,7 @@ mod tests {
             &BTreeMap::new(),
             true,
             "",
+            &[],
         );
         // The pin binding is identical text in both, modulo indentation and the
         // `mut`: blocking writes through the pin (`let mut`), RTIC moves it into
@@ -1258,6 +1367,7 @@ mod tests {
             &BTreeMap::new(),
             true,
             "",
+            &[],
         );
         for item in [
             "#[rtic::app(device = stm32f1xx_hal::pac",
@@ -1275,5 +1385,253 @@ mod tests {
         // Only the macro names the PAC, by path: importing it as well was an
         // `unused import` warning in every fresh RTIC project.
         assert!(!code.contains("use stm32f1xx_hal::{pac"), "{code}");
+    }
+
+    /// An F103 on RTIC with a Custom module "panel" over `pads` (each with its
+    /// function and mode), applied, and `extra` wired beside it.
+    fn rtic_with_custom(
+        pads: &[(&str, PinFunction, Option<GpioMode>)],
+        extra: &[(&str, PinFunction, Option<GpioMode>)],
+    ) -> crate::panels::mcu_module::mcu::Mcu {
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::mcu::Runtime;
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        let mut mcu = builtin_for("stm32f103c8t6")
+            .expect("built-in F103")
+            .build_mcu();
+        mcu.runtime = Runtime::Rtic;
+        mcu.pending_runtime = Runtime::Rtic;
+        let mut nums = Vec::new();
+        for (name, f, mode) in pads.iter().chain(extra) {
+            let p = mcu
+                .iter_all_pins_mut()
+                .find(|p| p.name == *name)
+                .unwrap_or_else(|| panic!("no {name}"));
+            p.selected_function = f.clone();
+            p.io_mode = *mode;
+            if pads.iter().any(|(n, ..)| n == name) {
+                nums.push(p.number);
+            }
+        }
+        mcu.reconcile_modules();
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .expect("the Custom module");
+        *m.config.custom_label_mut() = "panel".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = nums.clone();
+            c.applied_pins = nums;
+        }
+        mcu
+    }
+
+    /// A Custom module leaves `#[init]` as a `Local` of its own, typed from
+    /// its pads, which it holds: moved into it once, never into `Local` beside
+    /// it as well (E0382). Each pad's type follows its mode - an open-drain
+    /// output and a pull-up input are no `PushPull` / `Floating` - for a plain
+    /// resource too.
+    #[test]
+    fn a_custom_module_is_a_local_resource_holding_its_pads() {
+        let main = rtic_with_custom(
+            &[
+                ("PB12", PinFunction::GpioOutput, Some(GpioMode::OpenDrain)),
+                ("PB13", PinFunction::GpioInput, Some(GpioMode::PullUp)),
+            ],
+            &[
+                ("PB14", PinFunction::GpioInput, Some(GpioMode::PullUp)),
+                ("PC13", PinFunction::GpioOutput, None),
+            ],
+        )
+        .fresh_main_rs();
+        assert!(
+            main.contains(
+                "        panel: pins::configs::custom_panel::Panel<gpio::gpiob::PB12<gpio::Output<gpio::OpenDrain>>, gpio::gpiob::PB13<gpio::Input<gpio::PullUp>>>,\n"
+            ),
+            "{main}"
+        );
+        assert!(
+            main.contains(
+                "let panel = pins::configs::custom_panel::Panel::new(pb12_out, pb13_in);"
+            ),
+            "{main}"
+        );
+        assert!(!main.contains("let mut panel"), "{main}");
+        assert!(main.contains("            panel,\n"), "{main}");
+        // Its pads travel inside it, not beside it.
+        assert!(!main.contains("pb12_out:"), "{main}");
+        assert!(!main.contains("            pb13_in,\n"), "{main}");
+        assert!(
+            main.contains("        pb14_in: gpio::gpiob::PB14<gpio::Input<gpio::PullUp>>,\n"),
+            "{main}"
+        );
+        assert!(
+            main.contains("        pc13_out: gpio::gpioc::PC13<gpio::Output<gpio::PushPull>>,\n"),
+            "{main}"
+        );
+    }
+
+    /// stm32f1xx-hal moves a PWM pad into its timer's `pwm{n}::init`, with no
+    /// switch to leave it raw: a module over one is said, not built - it would
+    /// move the pad a second time (E0382). On every F1 runtime off Async.
+    #[test]
+    fn a_pwm_pad_stm32f1xx_hal_takes_leaves_the_module_unbuilt() {
+        use crate::panels::mcu_module::mcu::Runtime;
+        for runtime in [Runtime::Rtic, Runtime::Blocking, Runtime::Native] {
+            let mut mcu = rtic_with_custom(
+                &[
+                    ("PB12", PinFunction::GpioOutput, None),
+                    (
+                        "PA8",
+                        PinFunction::TimerPwm {
+                            timer: 1,
+                            channel: 1,
+                        },
+                        None,
+                    ),
+                ],
+                &[],
+            );
+            mcu.runtime = runtime;
+            mcu.pending_runtime = runtime;
+            let main = mcu.fresh_main_rs();
+            assert!(main.contains("pwm1::init("), "{runtime:?}: {main}");
+            assert!(!main.contains("Panel::new("), "{runtime:?}: {main}");
+            let said: String = main
+                .lines()
+                .map(|l| l.trim().trim_start_matches("//").trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                said.contains(
+                    "Custom module `panel` not built here: PA8 is driven by the generated PWM \
+                     of TIM1, so it cannot also be moved into `Panel`. Hand the module GPIO \
+                     In/Out pads: stm32f1xx-hal's PWM always takes it."
+                ),
+                "{runtime:?}: {main}"
+            );
+        }
+    }
+
+    /// A PWM pad whose timer stm32f1xx-hal does NOT build - its pads are no
+    /// remap set `pwm_hz` knows, so main.rs leaves them raw - is free for a
+    /// Custom module, on every F1 runtime off Async; on RTIC its resource holds
+    /// the raw `Alternate` pin.
+    #[test]
+    fn a_pwm_pad_no_timer_takes_is_handed_to_the_module() {
+        use crate::panels::mcu_module::mcu::Runtime;
+        let tim2 = |channel| PinFunction::TimerPwm { timer: 2, channel };
+        for runtime in [Runtime::Rtic, Runtime::Blocking] {
+            // PA0 is TIM2 CH1 unremapped, PB3 CH2 remapped: no one set.
+            let mut mcu = rtic_with_custom(&[("PA0", tim2(1), None)], &[("PB3", tim2(2), None)]);
+            mcu.runtime = runtime;
+            mcu.pending_runtime = runtime;
+            let main = mcu.fresh_main_rs();
+            assert!(
+                main.contains("TIM2 CH1+CH2 is NOT initialised"),
+                "{runtime:?}: {main}"
+            );
+            assert!(
+                main.contains("pins::configs::custom_panel::Panel::new(pa0_tim2_ch1);"),
+                "{runtime:?}: {main}"
+            );
+            if runtime == Runtime::Rtic {
+                assert!(
+                    main.contains(
+                        "        panel: pins::configs::custom_panel::Panel<gpio::gpioa::PA0<gpio::Alternate<gpio::PushPull>>>,\n"
+                    ),
+                    "{main}"
+                );
+            }
+        }
+    }
+
+    /// A module named like a resource RTIC already has - `iwdg`, the
+    /// promoted watchdog handle - would be a second field of that name: it
+    /// is said, not built, and `Local` keeps one `iwdg`.
+    #[test]
+    fn a_custom_module_named_like_a_resource_is_said() {
+        use crate::panels::mcu_module::watchdog::IwdgConfig;
+        let mut mcu = rtic_with_custom(&[("PB12", PinFunction::GpioOutput, None)], &[]);
+        mcu.watchdog.iwdg = Some(IwdgConfig {
+            timeout_us: 2_000_000,
+        });
+        for m in &mut mcu.modules {
+            if m.kind.is_custom() {
+                *m.config.custom_label_mut() = "iwdg".to_owned();
+            }
+        }
+        let main = mcu.fresh_main_rs();
+        assert_eq!(main.matches("        iwdg:").count(), 1, "{main}");
+        assert!(!main.contains("Iwdg::new("), "{main}");
+        // Its pad stays a resource of its own, as a refused module's does.
+        assert!(
+            main.contains("        pb12_out: gpio::gpiob::PB12<gpio::Output<gpio::PushPull>>,\n"),
+            "{main}"
+        );
+        assert!(main.contains("            pb12_out,\n"), "{main}");
+        let said: String = main
+            .lines()
+            .map(|l| l.trim().trim_start_matches("//").trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            said.contains(
+                "Custom module `iwdg` not built here: on RTIC it leaves `#[init]` as a \
+                 `#[local]` resource, and `iwdg` is already one"
+            ),
+            "{main}"
+        );
+    }
+
+    /// Two modules whose handles come out the same - `flash` is moved to
+    /// `flash_dev`, beside a module labelled `flash dev` - would be two fields
+    /// of one name: the second is said, its pad a resource of its own.
+    #[test]
+    fn two_custom_modules_of_one_name_are_one_resource() {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        let mut mcu = rtic_with_custom(
+            &[("PB12", PinFunction::GpioOutput, None)],
+            &[("PB13", PinFunction::GpioOutput, None)],
+        );
+        let pb13 = mcu
+            .iter_all_pins()
+            .find(|p| p.name == "PB13")
+            .unwrap()
+            .number;
+        for m in &mut mcu.modules {
+            if m.kind.is_custom() {
+                *m.config.custom_label_mut() = "flash".to_owned();
+            }
+        }
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let second = mcu
+            .modules
+            .iter_mut()
+            .rfind(|m| m.kind == ModuleKind::Custom)
+            .expect("the second Custom module");
+        *second.config.custom_label_mut() = "flash dev".to_owned();
+        if let ModuleConfig::Custom(c) = &mut second.config {
+            c.pins = vec![pb13];
+            c.applied_pins = vec![pb13];
+        }
+        let main = mcu.fresh_main_rs();
+        assert_eq!(main.matches("        flash_dev:").count(), 1, "{main}");
+        assert_eq!(
+            main.matches("            flash_dev,\n").count(),
+            1,
+            "{main}"
+        );
+        assert!(
+            main.contains("let flash_dev = pins::configs::custom_flash::Flash::new(pb12_out);"),
+            "{main}"
+        );
+        assert!(!main.contains("FlashDev::new("), "{main}");
+        assert!(
+            main.contains("        pb13_out: gpio::gpiob::PB13<gpio::Output<gpio::PushPull>>,\n"),
+            "{main}"
+        );
     }
 }

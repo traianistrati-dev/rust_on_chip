@@ -320,6 +320,9 @@ $ALL_CASES = @(
     # each pin's hook - plain `fn`s at the crate root, reached from `mod app`.
     @{ n = "F1 RTIC, shared EXTI9_5";      t = "emit_f1_rtic_project";   e = @{ EIDE_F1_IRQ_SHARED = "1" }; q = $true; fam = "f1" }
     @{ n = "F1 RTIC, no pins";             t = "emit_f1_rtic_project";   e = @{ EIDE_F1_NOPINS = "1" }; q = $true; fam = "f1" }
+    # A Custom module as a `Local` of its own, holding its two pads (moved once,
+    # never into `Local` beside it - E0382), every resource typed from its mode.
+    @{ n = "F1 RTIC custom";               t = "emit_f1_rtic_project";   e = @{ EIDE_CUSTOM = "1" };    q = $true; fam = "f1" }
     # A helper below the block naming `adc::`: the crate-root import kept for it.
     @{ n = "F1 RTIC, ADC example";         t = "emit_f1_rtic_project";   e = @{ EIDE_F1_ADC = "example" }; q = $false; fam = "f1" }
     @{ n = "F1 Native";                    t = "emit_f1_native_project"; e = @{};                       q = $true; fam = "f1" }

@@ -324,6 +324,7 @@ impl Part {
                     pins: signals.iter().map(|s| s.pin).collect::<BTreeSet<_>>(),
                     config: config_of(i, &signals),
                     signals,
+                    not_built: None,
                 }
             })
             .collect();

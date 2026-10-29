@@ -55,6 +55,10 @@ pub struct ModuleItem {
     pub signals: Vec<SignalPin>,
     /// Its settings (baud rate, SPI mode, …), for the checks on a link.
     pub config: ModuleConfig,
+    /// `Some(why)` for a UART its chip's generated code does not build, so no
+    /// wire is drawn to it; `None` for everything else, external parts
+    /// included.
+    pub not_built: Option<String>,
 }
 
 /// One device (a named group of pads on the Pins tab).
@@ -116,30 +120,31 @@ impl ChipView {
                 })
             },
         );
-        // stm32f1xx-hal - the F1 off Async - builds a USART as the TX+RX pair
-        // whatever its module stores: a one-way, single-wire or CTS/RTS shape
-        // is the Async runtime's, kept for it. The wires are the firmware's.
-        if mcu.family == "stm32f1" && !mcu.is_async() {
-            use crate::panels::mcu_module::modules::{UsartDirection, UsartFlow};
+        // The wires are the firmware's: every UART as its chip's generated
+        // code builds it (`Mcu::uarts_built`), not as its module stores it - a
+        // flow pad no constructor takes with that direction, a one-way shape
+        // stm32f1xx-hal or nrf-hal builds as the pair, a UART main.rs refuses.
+        // Its pads are only the ones its constructor is handed, and its
+        // direction, swap and flow the ones it is built with.
+        if let Some(built) = mcu.uarts_built() {
+            use crate::panels::mcu_module::codegen::uart_built::UartBuilt;
             for item in &mut view.modules {
-                if let ModuleConfig::Usart(c) = &mut item.config {
-                    c.direction = UsartDirection::TxRx;
-                    c.flow = UsartFlow::None;
-                }
-            }
-        }
-        // nrf-hal - an nRF's Blocking runtime everywhere but the 52820, 5340
-        // and 54L15 - builds a UARTE as the TXD+RXD pair whatever its module
-        // stores (`nrf::uarte_pads`): a one-way pick is kept for Async. Its
-        // flow is the wired pads', which the frame reads already.
-        {
-            use crate::panels::mcu_module::codegen::nrf;
-            if nrf::is_nrf(&mcu.family) && !mcu.is_async() && !nrf::blocking_on_embassy(&mcu.family)
-            {
-                use crate::panels::mcu_module::modules::UsartDirection;
-                for item in &mut view.modules {
-                    if let ModuleConfig::Usart(c) = &mut item.config {
-                        c.direction = UsartDirection::TxRx;
+                let (ModuleConfig::Usart(c) | ModuleConfig::Lpuart(c)) = &mut item.config else {
+                    continue;
+                };
+                match built.get(&(item.kind, item.instance)) {
+                    None => {}
+                    Some(UartBuilt::Not(why)) => {
+                        item.not_built = Some(why.clone());
+                        item.signals.clear();
+                    }
+                    Some(UartBuilt::Built(shape)) => {
+                        item.signals.retain(|s| shape.pins.contains(&s.pin));
+                        let signals: Vec<(ModuleSignal, usize)> =
+                            item.signals.iter().map(|s| (s.signal, s.pin)).collect();
+                        c.direction = shape.direction;
+                        c.swap_rx_tx = shape.swapped;
+                        c.flow = shape.flow(&signals);
                     }
                 }
             }
@@ -179,6 +184,7 @@ impl ChipView {
                     })
                     .collect(),
                 config: m.config.clone(),
+                not_built: None,
             })
             .collect();
         // Peripherals first, in kind-then-instance order, custom modules after
@@ -320,6 +326,19 @@ fn rebuild(def: &McuDefinition, cfg: Option<&str>, main_rs: Option<&str>) -> Mcu
                         &crate::panels::mcu_module::codegen::parse_driver_inits(src),
                     );
                 }
+            }
+            // As the open does, in its order: the labels back - they name the
+            // bindings `modules_used_by_hand` looks for - then, for a project
+            // saved before "Generate driver" existed, the modules its own code
+            // wires by hand stay raw. A raw UART is drawn as stored, an
+            // embassy one as built (`Mcu::uarts_built`), so a chip read from
+            // its files and the same chip open must agree on which it is.
+            mcu.apply_saved_pin_labels(&crate::panels::mcu_module::codegen::parse_pin_labels(src));
+            if let Some(text) = cfg {
+                mcu.apply_config_pin_labels(text);
+            }
+            if cfg.and_then(mcu_config::parse_drivers).is_none() {
+                mcu.raw_modules = mcu.modules_used_by_hand(src);
             }
         }
     }

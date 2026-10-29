@@ -30,6 +30,7 @@ pub mod rp;
 pub mod rtic;
 pub mod stm32;
 pub mod tmpl;
+pub mod uart_built;
 pub mod watchdog_gen;
 pub mod wba;
 
@@ -4050,7 +4051,8 @@ mod f1_usart_runtime_tests {
     }
 
     /// The Board tab draws what the firmware builds: on stm32f1xx-hal the
-    /// pair, whatever shape the module keeps for Async.
+    /// pair, whatever shape the module keeps for Async; on Async the one-way
+    /// UART, its CTS only once a pad is there for `UartTx::new_with_cts`.
     #[test]
     fn the_board_draws_the_pair_stm32f1xx_hal_builds() {
         use crate::panels::board::snapshot::ChipView;
@@ -4066,7 +4068,24 @@ mod f1_usart_runtime_tests {
         let blocking = ChipView::from_mcu("f103", "STM32F103C8", &f103(Runtime::Blocking));
         assert_eq!(usart(&blocking), (UsartDirection::TxRx, UsartFlow::None));
         let on_async = ChipView::from_mcu("f103", "STM32F103C8", &f103(Runtime::Async));
+        assert_eq!(usart(&on_async), (UsartDirection::TxOnly, UsartFlow::None));
+        let mut with_cts = f103(Runtime::Async);
+        let pa11 = with_cts
+            .iter_all_pins()
+            .find(|p| p.name == "PA11")
+            .map(|p| p.number)
+            .expect("PA11");
+        with_cts.apply_pin_function(pa11, PinFunction::UsartCts(1));
+        with_cts.reconcile_modules();
+        let on_async = ChipView::from_mcu("f103", "STM32F103C8", &with_cts);
         assert_eq!(usart(&on_async), (UsartDirection::TxOnly, UsartFlow::Cts));
+        // The RX pad the one-way UART leaves alone is no pad of its line.
+        let pads: Vec<&str> = on_async
+            .modules
+            .iter()
+            .flat_map(|m| m.signals.iter().map(|s| s.pad.as_str()))
+            .collect();
+        assert_eq!(pads, ["PA9", "PA11"], "TX and CTS");
     }
 
     /// On Async the same module is built as it says: one channel, one pad and

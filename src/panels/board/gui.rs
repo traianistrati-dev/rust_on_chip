@@ -669,6 +669,7 @@ mod tests {
             pins: Default::default(),
             signals: vec![],
             config: ModuleConfig::Usart(UsartModuleConfig::new(1)),
+            not_built: None,
         });
         v
     }

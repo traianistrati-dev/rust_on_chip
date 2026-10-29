@@ -830,6 +830,35 @@ fn uart_pads(
     ))
 }
 
+/// What main.rs builds of UART `i` ([`super::uart_built::UartBuilt`]), by
+/// the same [`uart_pads`] both RP runtimes decide with: the data pads its
+/// direction takes - the lowest GPIO of a role wired twice, as `role_of`
+/// picks it - and never a flow pad, which neither rp-hal nor embassy-rp is
+/// handed here; nothing when it is refused.
+pub(crate) fn uart_built(mcu: &Mcu, i: u8) -> super::uart_built::UartBuilt {
+    use super::uart_built::{UartBuilt, UartShape};
+    let cfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
+    let (tx, rx) = match uart_pads(&uart_pins(mcu), &cfgs, i) {
+        Ok(pads) => pads,
+        Err(why) => return UartBuilt::Not(why),
+    };
+    let gpios: Vec<u8> = [tx, rx].into_iter().flatten().collect();
+    UartBuilt::Built(UartShape {
+        pins: mcu
+            .iter_all_pins()
+            .filter(|p| {
+                matches!(p.selected_function,
+                    PinFunction::UsartTx(n) | PinFunction::UsartRx(n) if n == i)
+                    && gpio_index(&p.name).is_some_and(|g| gpios.contains(&g))
+            })
+            .map(|p| p.number)
+            .collect(),
+        direction: cfgs.get(&i).map(|c| c.direction).unwrap_or_default(),
+        swapped: false,
+        de: false,
+    })
+}
+
 /// main.rs's line for each half a UART's direction leaves alone: its pads
 /// wired on the canvas - every one, two pads can carry one signal - and handed
 /// to no `init`. Said, so the reader does not go looking.

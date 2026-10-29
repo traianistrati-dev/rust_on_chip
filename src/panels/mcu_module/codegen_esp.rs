@@ -1819,6 +1819,46 @@ pub(crate) fn uart_sigs(
         .collect()
 }
 
+/// What main.rs builds of UART `n`
+/// ([`crate::panels::mcu_module::codegen::uart_built::UartBuilt`]): the pads
+/// its `init` is handed, picked the way main.rs picks them - each role's pad
+/// from [`collect_buses`], kept as [`uart_sigs`] keeps them. esp-hal refuses
+/// none, swaps none, and builds the two-wire `Uart` for a stored single-wire
+/// direction too; a DE pad is a plain RTS to it.
+pub(crate) fn uart_built(
+    pins: &[&Pin],
+    cfg: &UsartModuleConfig,
+    n: u8,
+) -> crate::panels::mcu_module::codegen::uart_built::UartBuilt {
+    use crate::panels::mcu_module::codegen::uart_built::{UartBuilt, UartShape};
+    let configured: Vec<&Pin> = pins
+        .iter()
+        .copied()
+        .filter(|p| !p.reserved && p.selected_function != PinFunction::Unset)
+        .collect();
+    let (uart, ..) = collect_buses(&configured);
+    let taken = uart
+        .get(&n)
+        .map(|bus| {
+            uart_sigs(Some(cfg), UART_ORDER)
+                .iter()
+                .filter_map(|s| bus.get(s))
+                .map(|p| p.number)
+                .collect()
+        })
+        .unwrap_or_default();
+    UartBuilt::Built(UartShape {
+        pins: taken,
+        direction: if cfg.direction.is_half_duplex() {
+            UsartDirection::TxRx
+        } else {
+            cfg.direction
+        },
+        swapped: false,
+        de: false,
+    })
+}
+
 pub fn bus_instances(configured: &[&Pin]) -> (BusWiring, BusWiring, BusWiring, BusWiring) {
     let (uart, spi, i2c, i2s_pins) = collect_buses(configured);
     let flatten = |b: BusPins, order: &[&'static str]| -> BusWiring {

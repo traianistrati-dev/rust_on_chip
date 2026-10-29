@@ -1083,6 +1083,58 @@ pub fn uarte_flow(
     }
 }
 
+/// What main.rs builds of UARTE `i` ([`super::uart_built::UartBuilt`]), by
+/// the same [`uarte_pads`] both nRF backends decide with: on embassy-nrf the
+/// module's direction and the one flow pad each half takes, the pair's
+/// CTS+RTS or neither; on nrf-hal the TXD+RXD pair whatever the direction,
+/// with its flow pads only when both are wired - the HWFC it turns on. Nothing
+/// when it is refused, or when the part has no such block.
+pub(crate) fn uarte_built(mcu: &Mcu, i: u8) -> super::uart_built::UartBuilt {
+    use super::uart_built::{UartBuilt, UartShape};
+    use crate::panels::mcu_module::modules::UsartDirection;
+    // A block the part lacks: `bus_pins` drops its pads before `uarte_pads`
+    // sees them, and main.rs says so (`missing_block_notes`).
+    if !block_present(mcu, "uarte", Some(i)) {
+        let part = chip(&mcu.family).map_or("part", |c| c.part);
+        return UartBuilt::Not(format!("the {part} has no UARTE{i}"));
+    }
+    let embassy = on_embassy(mcu);
+    let cfgs = crate::panels::mcu_module::modules::usart_configs(&mcu.modules);
+    let pads = match uarte_pads(&uart_pins(mcu), &cfgs, i, embassy) {
+        Ok(pads) => pads,
+        Err(why) => return UartBuilt::Not(why),
+    };
+    // nrf-hal connects a lone flow pad, but turns HWFC on only with both:
+    // alone it paces nothing, as main.rs says, so it is no flow line.
+    let flow = embassy || (pads.cts.is_some() && pads.rts.is_some());
+    let taken: Vec<(u8, u8)> = [pads.txd, pads.rxd]
+        .into_iter()
+        .chain([pads.cts, pads.rts].into_iter().filter(|_| flow))
+        .flatten()
+        .collect();
+    UartBuilt::Built(UartShape {
+        pins: mcu
+            .iter_all_pins()
+            .filter(|p| {
+                matches!(p.selected_function,
+                    PinFunction::UsartTx(n)
+                    | PinFunction::UsartRx(n)
+                    | PinFunction::UsartCts(n)
+                    | PinFunction::UsartRts(n) if n == i)
+                    && nrf_pin(&p.name).is_some_and(|x| taken.contains(&x))
+            })
+            .map(|p| p.number)
+            .collect(),
+        direction: if embassy {
+            cfgs.get(&i).map(|c| c.direction).unwrap_or_default()
+        } else {
+            UsartDirection::TxRx
+        },
+        swapped: false,
+        de: false,
+    })
+}
+
 /// The pads a UARTE's shape takes - or, when its module asks for one the
 /// wired pads cannot make, why not: the sentence main.rs says instead of a
 /// constructor.

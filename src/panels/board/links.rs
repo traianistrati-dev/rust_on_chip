@@ -308,6 +308,17 @@ fn uart(
     link: &Link,
     all: &[Link],
 ) {
+    // A UART its chip's generated code does not build has no line to draw.
+    let unbuilt: Vec<(&str, &str)> = [(ma, na), (mb, nb)]
+        .into_iter()
+        .filter_map(|(m, n)| m.not_built.as_deref().map(|why| (n, why)))
+        .collect();
+    if !unbuilt.is_empty() {
+        for (n, why) in unbuilt {
+            r.warnings.push(format!("{n} is not built: {why}"));
+        }
+        return;
+    }
     let (ha, hb) = (
         uart_direction(ma).is_half_duplex(),
         uart_direction(mb).is_half_duplex(),
@@ -830,6 +841,7 @@ mod tests {
             pins: signals.iter().map(|s| s.pin).collect(),
             signals,
             config,
+            not_built: None,
         }
     }
 
@@ -1305,6 +1317,80 @@ mod tests {
         let r = resolve(&uart_link(), &views, &[uart_link()]);
         assert_eq!(pads(&r), [("TX PA9".into(), "RX GPIO20".into(), Dir::AtoB)]);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// A UART its chip's main.rs does not build has no line: the link says
+    /// so instead of drawing one.
+    #[test]
+    fn a_uart_main_rs_does_not_build_draws_no_line() {
+        let mut a = usart(1, 115_200, (30, "PA9"), (31, "PA10"));
+        a.not_built = Some("its main.rs says why".to_owned());
+        a.signals.clear();
+        let b = usart(0, 115_200, (20, "GPIO21"), (21, "GPIO20"));
+        let views = [chip("stm32_main", vec![a]), chip("esp32_radio", vec![b])];
+        let r = resolve(&uart_link(), &views, &[uart_link()]);
+        assert!(r.wires.is_empty());
+        assert_eq!(
+            r.warnings,
+            ["stm32_main GenericInterfaceUsart1 is not built: its main.rs says why"]
+        );
+    }
+
+    /// The wires are the firmware's (`ChipView::from_mcu`): two F1s with every
+    /// pad wired, one on stm32f1xx-hal - the pair, CTS and RTS plain GPIOs -
+    /// the other on embassy with RTS/CTS. Only that one's flow lines are
+    /// drawn, and its CTS, which nothing clears, is said.
+    #[test]
+    fn flow_lines_are_the_ones_the_firmware_configures() {
+        use crate::panels::board::snapshot::ChipView;
+        use crate::panels::mcu_module::builtins::builtin_for;
+        use crate::panels::mcu_module::mcu::Runtime;
+        use crate::panels::mcu_module::modules::{UsartFlow, UsartMode};
+        let f103 = |runtime: Runtime| {
+            let mut mcu = builtin_for("stm32f103c8t6")
+                .expect("built-in F103")
+                .build_mcu();
+            mcu.runtime = runtime;
+            for (name, f) in [
+                ("PA9", PinFunction::UsartTx(1)),
+                ("PA10", PinFunction::UsartRx(1)),
+                ("PA11", PinFunction::UsartCts(1)),
+                ("PA12", PinFunction::UsartRts(1)),
+            ] {
+                mcu.iter_all_pins_mut()
+                    .find(|p| p.name == name)
+                    .expect(name)
+                    .selected_function = f;
+            }
+            mcu.reconcile_modules();
+            for m in &mut mcu.modules {
+                if let ModuleConfig::Usart(c) = &mut m.config {
+                    c.mode = UsartMode::Dma;
+                    c.flow = UsartFlow::CtsRts;
+                }
+            }
+            mcu
+        };
+        let views = [
+            ChipView::from_mcu("hal", "STM32F103C8", &f103(Runtime::Blocking)),
+            ChipView::from_mcu("embassy", "STM32F103C8", &f103(Runtime::Async)),
+        ];
+        let link = Link {
+            a: end("hal", ModuleKind::GenericInterfaceUsart, 1),
+            b: end("embassy", ModuleKind::GenericInterfaceUsart, 1),
+        };
+        let r = resolve(&link, &views, std::slice::from_ref(&link));
+        assert_eq!(
+            pads(&r),
+            [
+                ("TX PA9".into(), "RX PA10".into(), Dir::AtoB),
+                ("RX PA10".into(), "TX PA9".into(), Dir::BtoA),
+            ]
+        );
+        assert_eq!(
+            r.warnings,
+            ["embassy USART1 CTS has no RTS to clear it on hal USART1"]
+        );
     }
 
     /// CAN without transceivers is pad to pad; with one on one side only it

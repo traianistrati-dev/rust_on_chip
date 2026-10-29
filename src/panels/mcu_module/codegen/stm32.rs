@@ -326,6 +326,39 @@ pub(super) struct GenParts {
     pub irq_items: String,
 }
 
+/// What main.rs builds of USART `n` on the F1 off Async
+/// ([`super::uart_built::UartBuilt`]), by [`gen_parts`]' rule: stm32f1xx-hal's
+/// `Serial` for USART1..3, from the first TX and RX pad wired - the pair
+/// whatever direction the module keeps for Async, its CTS and RTS left plain
+/// GPIOs - and nothing without both data pads, or for UART4/5.
+pub(crate) fn f1_usart_built(
+    mcu: &crate::panels::mcu_module::mcu::Mcu,
+    n: u8,
+) -> super::uart_built::UartBuilt {
+    use super::super::modules::UsartDirection;
+    use super::uart_built::{UartBuilt, UartShape};
+    let pad = |f: PinFunction| {
+        mcu.iter_all_pins()
+            .find(|p| !p.reserved && p.selected_function == f && parse_pin(&p.name).is_some())
+            .map(|p| p.number)
+    };
+    match (pad(PinFunction::UsartTx(n)), pad(PinFunction::UsartRx(n))) {
+        (Some(tx), Some(rx)) if (1..=3).contains(&n) => UartBuilt::Built(UartShape {
+            pins: [tx, rx].into(),
+            direction: UsartDirection::TxRx,
+            swapped: false,
+            de: false,
+        }),
+        _ if !(1..=3).contains(&n) => {
+            UartBuilt::Not(format!("stm32f1xx-hal has no Serial for UART{n}"))
+        }
+        _ => UartBuilt::Not(
+            "stm32f1xx-hal builds a Serial only from the TX+RX pair, and one is not wired"
+                .to_owned(),
+        ),
+    }
+}
+
 /// Build the init pieces. `None` when no pin is configured — the caller decides
 /// what an empty project looks like.
 #[allow(clippy::too_many_arguments)]

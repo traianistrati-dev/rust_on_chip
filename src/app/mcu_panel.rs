@@ -1619,9 +1619,9 @@ impl AppIde {
                                 // CubeMX data lists the I2S pads anyway.
                                 let chip_i2s =
                                     crate::panels::mcu_module::codegen::family::embassy_i2s(mcu);
-                                // The flash on the board's QSPI pads, when its
-                                // definition says.
-                                let board_qspi_size = mcu.board_qspi_size();
+                                // The flash part on the board's QSPI pads,
+                                // when its definition names one.
+                                let board_qspi = mcu.board_qspi_flash;
                                 // Whether a "Generate driver" switch decides
                                 // anything here: embassy-stm32's drivers, on
                                 // the STAGED runtime the rows describe.
@@ -2101,7 +2101,7 @@ impl AppIde {
                                                         runtime_applied,
                                                         &family, pending, chip_dma.as_ref(),
                                                         usart_line_extras, chip_i2s,
-                                                        board_qspi_size,
+                                                        board_qspi,
                                                         shared_block.get(&m.id),
                                                         &mut my_out, &baud_chip, &mut i2c_io,
                                                     );

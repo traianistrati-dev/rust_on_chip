@@ -3155,6 +3155,60 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             periph(io[2]),
             periph(io[3]),
         ));
+        // The quad opcodes above need IO2/IO3 as data lines, which a flash
+        // with a QE bit keeps as WP#/HOLD# until it is set. Only for a part
+        // the board names: the bit differs by vendor, and SR1 bit 6 is a
+        // protection bit on a Winbond (SEC) or a Micron (BP3).
+        let (call, wait) = if mcu.is_async() {
+            ("custom_instruction", ".await")
+        } else {
+            ("blocking_custom_instruction", "")
+        };
+        let lines: Vec<String> = match mcu.board_qspi_flash {
+            Some(f) => match f.quad_enable {
+                modules::QspiQuadEnable::Sr1Bit6 => {
+                    let rdsr =
+                        format!("qspi.{call}(0x05, &[], &mut qspi_sr){wait}.unwrap(); // RDSR");
+                    vec![
+                        format!("    // Quad enable: the board's {} keeps IO2/IO3 as WP#/HOLD# until QE,", f.part),
+                        "    // status bit 6, is set. QE is non-volatile: read first, written once".into(),
+                        "    // per flash. The driver sends the WREN a status write needs.".into(),
+                        "    let mut qspi_sr = [0u8; 1];".into(),
+                        format!("    {rdsr}"),
+                        "    if qspi_sr[0] & 0x40 == 0 {".into(),
+                        format!("        qspi.{call}(0x01, &[qspi_sr[0] | 0x40], &mut []){wait}.unwrap(); // WRSR"),
+                        "        // Up to 30 ms with WIP (bit 0) set; quad reads are refused until then.".into(),
+                        "        loop {".into(),
+                        format!("            {rdsr}"),
+                        "            if qspi_sr[0] & 0x01 == 0 {".into(),
+                        "                break;".into(),
+                        "            }".into(),
+                        "        }".into(),
+                        "        assert!(qspi_sr[0] & 0x40 != 0, \"QSPI flash: QE did not set\");".into(),
+                        "    }".into(),
+                    ]
+                }
+            },
+            None => vec![
+                "    // Quad enable is NOT set: this definition names no flash part the IDE knows"
+                    .into(),
+                format!(
+                    "    // ({}). The bit that frees IO2/IO3 for data differs by part: SR1 bit 6",
+                    modules::qspi_flash_part_names()
+                ),
+                "    // on Macronix and ISSI, SR2 bit 1 on most Winbond and GigaDevice (which also"
+                    .into(),
+                "    // take `write_opcode = Pp4o`), none at all on a Micron MT25Q - and the wrong"
+                    .into(),
+                "    // one can set a non-volatile protection bit. If the flash's datasheet has"
+                    .into(),
+                format!("    // one, set it with `qspi.{call}` before the first transfer."),
+            ],
+        };
+        for l in lines {
+            o.push_str(&l);
+            o.push('\n');
+        }
         irqs.push(
             "    QSPI => embassy_nrf::qspi::InterruptHandler<embassy_nrf::peripherals::QSPI>;"
                 .to_owned(),

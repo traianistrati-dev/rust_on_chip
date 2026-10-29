@@ -6,7 +6,7 @@ McuDefinition(
     board_chip: Some("nRF52840"),
     max_mhz: Some(64),
     sram_kb: Some(256),
-    qspi_flash_kb: Some(8192),
+    qspi_flash: Some("MX25R6435F"),
     dma: None,
     cpu: "ARM Cortex-M4F",
     toolchain: RustEmbedded,

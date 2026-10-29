@@ -2527,14 +2527,15 @@ impl Mcu {
         }
     }
 
-    /// The [`QSPI_MEMORY_SIZES`] index of the flash on this board's QSPI pads
-    /// ([`Mcu::board_qspi_flash`]) - 13, 8 MiB, on the nRF52840 DK and the
-    /// nRF5340 DK. `None` on a bare part, or a size the list has no entry for.
+    /// The [`QSPI_MEMORY_SIZES`] index of the flash part on this board's QSPI
+    /// pads ([`Mcu::board_qspi_flash`]) - 13, 8 MiB, for the MX25R6435F on the
+    /// nRF52840 DK and the nRF5340 DK. `None` on a bare part, or a size the
+    /// list has no entry for.
     ///
     /// [`QSPI_MEMORY_SIZES`]: crate::panels::mcu_module::modules::QSPI_MEMORY_SIZES
     pub fn board_qspi_size(&self) -> Option<u8> {
         self.board_qspi_flash
-            .and_then(crate::panels::mcu_module::modules::QspiModuleConfig::size_index)
+            .and_then(crate::panels::mcu_module::modules::QspiFlashPart::size_index)
     }
 
     /// A new QSPI module's config: the generic one, at the capacity of the

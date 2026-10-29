@@ -1282,7 +1282,7 @@ pub fn definition(chip: &EspChip) -> Result<McuDefinition, String> {
 
     Ok(McuDefinition {
         board_chip: None,
-        qspi_flash_kb: None,
+        qspi_flash: None,
         id: chip.id.clone(),
         display_name: chip.name.clone(),
         family: chip.id.clone(),

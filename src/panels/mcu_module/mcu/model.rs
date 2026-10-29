@@ -246,10 +246,11 @@ pub struct Mcu {
     /// counted from it, and a range past the real chip would wrap onto the
     /// boot block. `None` when the definition does not state it.
     pub board_flash: Option<u32>,
-    /// The flash on the board's QSPI pads in KiB - see
-    /// [`crate::panels::mcu_module::mcu_def::McuDefinition::qspi_flash_kb`].
-    /// Read through [`Mcu::board_qspi_size`].
-    pub board_qspi_flash: Option<u32>,
+    /// The flash part on the board's QSPI pads - see
+    /// [`crate::panels::mcu_module::mcu_def::McuDefinition::qspi_flash`]. Its
+    /// size is read through [`Mcu::board_qspi_size`] (the QSPI panel takes the
+    /// part itself, for its name); the nRF generator reads its quad-enable bit.
+    pub board_qspi_flash: Option<&'static crate::panels::mcu_module::modules::QspiFlashPart>,
     /// The embassy-stm32 chip feature the definition's dependency line names
     /// (`stm32wl55jc-cm4`), `None` when it names none. What decides a
     /// dual-core build: the id and the name are free text, the line is what

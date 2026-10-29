@@ -20,13 +20,14 @@ pub use model::{
     McpwmModuleConfig, ModuleConfig, ModuleKind, ModuleSignal, OspiMemoryType, OspiMode,
     OspiModuleConfig, Parity, ParlIoBitOrder, ParlIoDirection, ParlIoModuleConfig, ParlIoWidth,
     PcntChannelCfg, PcntCtrlMode, PcntEdgeMode, PcntModuleConfig, PwmChannelConfig, PwmCounting,
-    PwmMode, PwmOutput, PwmPolarity, QSPI_MEMORY_SIZES, QspiAddressSize, QspiModuleConfig,
-    RmtDirection, RmtModuleConfig, SaiBlockConfig, SaiDataSize, SaiMode, SaiModuleConfig,
-    SaiStereoMono, SaiTxRx, SdmmcModuleConfig, SpiBitOrder, SpiModuleConfig, SpiRole, StopBits,
-    TimerModuleConfig, TouchModuleConfig, TouchScan, TouchThreshold, UsartDirection, UsartFlow,
-    UsartMode, UsartModuleConfig, UsbModuleConfig, UsbRole, VirtualModule, XspiMemoryType,
-    XspiMode, XspiModuleConfig, address_issue, format_i2c_address, module_signal_of,
-    parse_i2c_address, usart_data_bits,
+    PwmMode, PwmOutput, PwmPolarity, QSPI_FLASH_PARTS, QSPI_MEMORY_SIZES, QspiAddressSize,
+    QspiFlashPart, QspiModuleConfig, QspiQuadEnable, RmtDirection, RmtModuleConfig, SaiBlockConfig,
+    SaiDataSize, SaiMode, SaiModuleConfig, SaiStereoMono, SaiTxRx, SdmmcModuleConfig, SpiBitOrder,
+    SpiModuleConfig, SpiRole, StopBits, TimerModuleConfig, TouchModuleConfig, TouchScan,
+    TouchThreshold, UsartDirection, UsartFlow, UsartMode, UsartModuleConfig, UsbModuleConfig,
+    UsbRole, VirtualModule, XspiMemoryType, XspiMode, XspiModuleConfig, address_issue,
+    format_i2c_address, module_signal_of, parse_i2c_address, qspi_flash_part,
+    qspi_flash_part_names, usart_data_bits,
 };
 
 pub use notes::{ModuleNotes, NotesKey};

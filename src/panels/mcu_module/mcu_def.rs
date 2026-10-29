@@ -328,14 +328,18 @@ pub struct McuDefinition {
     /// catalogue and its filter go on seeing the part's flash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flash_kb: Option<u32>,
-    /// The flash a BOARD wires to its QSPI pads, in KiB - 8192 for the 64 Mbit
-    /// MX25R6435F on the nRF52840 DK and the nRF5340 DK. A QSPI module there
-    /// starts at this capacity instead of the generic 16 MiB
-    /// ([`Mcu::qspi_default`]), and the panel says when it is set to another -
-    /// main.rs too, on an nRF. `None` on a bare part, where nothing is wired
-    /// yet.
+    /// The flash part a BOARD wires to its QSPI pads, a part number from
+    /// [`QSPI_FLASH_PARTS`] - `MX25R6435F` on the nRF52840 DK and the nRF5340
+    /// DK. Its datasheet facts follow: a QSPI module there starts at its
+    /// capacity instead of the generic 16 MiB ([`Mcu::qspi_default`]), the
+    /// panel says when it is set to another, and main.rs sets its quad-enable
+    /// bit wherever embassy-nrf builds the bus (Async, and the nRF5340's
+    /// Blocking). A name the table lacks says nothing. `None` on a bare part,
+    /// where nothing is wired yet.
+    ///
+    /// [`QSPI_FLASH_PARTS`]: crate::panels::mcu_module::modules::QSPI_FLASH_PARTS
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub qspi_flash_kb: Option<u32>,
+    pub qspi_flash: Option<String>,
     /// DMA channels + whether they are muxed. See [`DmaDef`].
     #[serde(default)]
     pub dma: Option<DmaDef>,
@@ -416,7 +420,10 @@ impl McuDefinition {
         mcu.board_chip = self.board_chip.clone();
         mcu.board_flash = crate::size::parse_ld_number(&self.project.flash_size)
             .and_then(|b| u32::try_from(b).ok());
-        mcu.board_qspi_flash = self.qspi_flash_kb;
+        mcu.board_qspi_flash = self
+            .qspi_flash
+            .as_deref()
+            .and_then(crate::panels::mcu_module::modules::qspi_flash_part);
         mcu.hal_feature = crate::panels::mcu_module::stm32_pin_data::embassy_feature_in(
             self.project
                 .hal_dep_async

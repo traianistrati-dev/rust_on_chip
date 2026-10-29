@@ -221,9 +221,9 @@ struct Board {
     /// A note EVERY usable pad of the kit carries before its own - the
     /// nRF54L15 DK's 1.8 V logic level, which nothing on a pad would hint at.
     every_pad: &'static str,
-    /// The flash on the kit's QSPI pads, in KiB - see
-    /// [`McuDefinition::qspi_flash_kb`]. `None` where no flash sits on QSPI.
-    qspi_flash_kb: Option<u32>,
+    /// The flash part on the kit's QSPI pads - see
+    /// [`McuDefinition::qspi_flash`]. `None` where no flash sits on QSPI.
+    qspi_flash: Option<&'static str>,
 }
 
 #[cfg(test)]
@@ -395,8 +395,7 @@ const NRF52840_DK: Board = Board {
         (1, 15),
     ],
     every_pad: "",
-    // The 64 Mbit MX25R6435F on the QSPI pads.
-    qspi_flash_kb: Some(8192),
+    qspi_flash: Some("MX25R6435F"),
 };
 
 #[cfg(test)]
@@ -506,7 +505,7 @@ const NRF52_DK: Board = Board {
         (0, 31),
     ],
     every_pad: "",
-    qspi_flash_kb: None,
+    qspi_flash: None,
 };
 
 #[cfg(test)]
@@ -662,8 +661,7 @@ const NRF5340_DK: Board = Board {
     ],
     low_freq: &[],
     every_pad: "",
-    // The 64 Mbit MX25R6435F on the QSPI pads.
-    qspi_flash_kb: Some(8192),
+    qspi_flash: Some("MX25R6435F"),
 };
 
 #[cfg(test)]
@@ -821,7 +819,7 @@ const NRF54L15_DK: Board = Board {
     ],
     low_freq: &[],
     every_pad: "Logic level is 1.8 V by default (the nPM1300 PMIC's VOUT1); set 1.8-3.3 V with 'VDD (nPM VOUT1)' in nRF Connect for Desktop's Board Configurator.",
-    qspi_flash_kb: None,
+    qspi_flash: None,
 };
 
 #[cfg(test)]
@@ -915,7 +913,7 @@ fn definition_of(b: &Board) -> McuDefinition {
     d.display_name = b.display_name.into();
     d.package = "DK headers".into();
     d.board_chip = Some(c.part.into());
-    d.qspi_flash_kb = b.qspi_flash_kb;
+    d.qspi_flash = b.qspi_flash.map(str::to_owned);
     apply_chip(&mut d, c);
     d.project.pkg_name = b.id.into();
     d.project.memory_comment = format!(
@@ -1562,7 +1560,7 @@ mod tests {
         ] {
             let case = CASES.iter().find(|c| c.dir == dir).unwrap();
             let (def, mut mcu) = wired(case);
-            assert_eq!(def.qspi_flash_kb, Some(8192), "{dir}");
+            assert_eq!(def.qspi_flash.as_deref(), Some("MX25R6435F"), "{dir}");
             let qspi = modules::qspi_config(&mcu.modules).expect("the kit's QSPI module");
             assert_eq!(qspi.memory_size_label(), "8MiB", "{dir}");
             let m = mcu.fresh_main_rs();
@@ -1601,7 +1599,7 @@ mod tests {
         // so the generic 16 MiB.
         for id in ["nrf52832_dk", "nrf54l15_dk", "nrf52833_microbit_v2"] {
             let def = builtins::builtin_for(id).expect("built-in");
-            assert_eq!(def.qspi_flash_kb, None, "{id}");
+            assert_eq!(def.qspi_flash, None, "{id}");
             assert_eq!(
                 def.build_mcu().qspi_default(1).memory_size_label(),
                 "16MiB",
@@ -1621,10 +1619,74 @@ mod tests {
         for none in [0, 3, 6000, 1 << 23] {
             assert_eq!(QspiModuleConfig::size_index(none), None, "{none} KiB");
         }
-        // A size the list lacks leaves the generic default.
-        let mut mcu = builtins::builtin_for("nrf52840_dk").unwrap().build_mcu();
-        mcu.board_qspi_flash = Some(6000);
-        assert_eq!(mcu.qspi_default(1).memory_size_label(), "16MiB");
+        // Every part a board can name has a size the list holds, and a name
+        // the table lacks is no part at all.
+        use crate::panels::mcu_module::modules::{QSPI_FLASH_PARTS, qspi_flash_part};
+        for f in QSPI_FLASH_PARTS {
+            assert!(QspiModuleConfig::size_index(f.kib).is_some(), "{}", f.part);
+        }
+        assert!(qspi_flash_part("mx25r6435f").is_some(), "in any case");
+        assert!(qspi_flash_part("W25Q128JV").is_none());
+    }
+
+    /// The kits' MX25R6435F has its quad-enable bit set before any transfer:
+    /// read first, written only while clear, and the write waited out - with
+    /// embassy-nrf's async calls, and with its blocking ones on the nRF5340's
+    /// Blocking. A board that names no flash part gets the reason instead of a
+    /// guess, which on another vendor's flash could set a protection bit.
+    #[test]
+    fn the_dk_flash_gets_its_quad_enable_bit() {
+        for (dir, call) in [
+            ("eide_nrf52840_dk_async_check", "qspi.custom_instruction("),
+            ("eide_nrf5340_dk_async_check", "qspi.custom_instruction("),
+            ("eide_nrf5340_dk_check", "qspi.blocking_custom_instruction("),
+        ] {
+            let case = CASES.iter().find(|c| c.dir == dir).unwrap();
+            let m = wired(case).1.fresh_main_rs();
+            let new = m.find("Qspi::new(").expect("the QSPI");
+            let rdsr = m
+                .find(&format!("{call}0x05, &[], &mut qspi_sr)"))
+                .expect("an RDSR");
+            assert!(new < rdsr, "{dir}: once the driver exists:\n{m}");
+            // In order and nested: the write only while QE is clear, then WIP
+            // waited out and QE checked, all inside that branch.
+            let mut at = rdsr;
+            for s in [
+                "\n    if qspi_sr[0] & 0x40 == 0 {".to_owned(),
+                format!("\n        {call}0x01, &[qspi_sr[0] | 0x40], &mut [])"),
+                "\n        loop {".to_owned(),
+                format!("\n            {call}0x05, &[], &mut qspi_sr)"),
+                "\n            if qspi_sr[0] & 0x01 == 0 {".to_owned(),
+                "\n        assert!(qspi_sr[0] & 0x40 != 0".to_owned(),
+            ] {
+                at += m[at..]
+                    .find(&s)
+                    .unwrap_or_else(|| panic!("{dir}: {s:?} not after the step before:\n{m}"))
+                    + s.len();
+            }
+            assert!(m.contains("the board's MX25R6435F"), "{dir}: {m}");
+            assert_eq!(
+                m.contains(".await.unwrap(); // RDSR"),
+                call == "qspi.custom_instruction(",
+                "{dir}: {m}"
+            );
+        }
+        // The same kit with no part named: no status write, and why.
+        let case = CASES
+            .iter()
+            .find(|c| c.dir == "eide_nrf52840_dk_async_check")
+            .unwrap();
+        let (_, mut mcu) = wired(case);
+        mcu.board_qspi_flash = None;
+        let m = mcu.fresh_main_rs();
+        assert!(m.contains("Qspi::new("), "{m}");
+        assert!(!m.contains("0x01, &[qspi_sr"), "{m}");
+        assert!(
+            m.contains(
+                "// Quad enable is NOT set: this definition names no flash part the IDE knows"
+            ),
+            "{m}"
+        );
     }
 
     /// The small parts' serial blocks, by their embassy-nrf names.

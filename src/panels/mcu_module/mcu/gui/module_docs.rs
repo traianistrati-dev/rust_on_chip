@@ -251,6 +251,7 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("QSPI_WIRING_INCOMPLETE_NRF", QSPI_WIRING_INCOMPLETE_NRF),
     ("QSPI_FLASH_SIZE", QSPI_FLASH_SIZE),
     ("QSPI_FLASH_SIZE_BOARD", QSPI_FLASH_SIZE_BOARD),
+    ("QSPI_QUAD_ENABLE_NRF", QSPI_QUAD_ENABLE_NRF),
     ("QSPI_ADDRESS", QSPI_ADDRESS),
     ("QSPI_ADDRESS_NRF", QSPI_ADDRESS_NRF),
     ("SDMMC_WIDTH", SDMMC_WIDTH),
@@ -565,6 +566,7 @@ pub const ROSTER: &[KindRoster] = &[
         &[
             ("Address", None),
             ("Flash size", Some(QSPI_FLASH_SIZE)),
+            ("Quad enable", Some(QSPI_QUAD_ENABLE_NRF)),
             ("Wiring", None),
         ],
     ),
@@ -1069,12 +1071,22 @@ pub const QSPI_FLASH_SIZE: &str = "The capacity of the flash chip on the board. 
                                    smaller and the top of the chip is out of reach.";
 
 pub const QSPI_FLASH_SIZE_BOARD: &str = "The capacity of the flash chip on the board. This board's \
-                                         definition states its own, so a new module starts at \
-                                         it and the note beside the row says when the setting \
-                                         differs. Larger than the part and addresses past its \
+                                         definition names its flash part, so a new module starts \
+                                         at its capacity and the note beside the row says when \
+                                         the setting differs. Larger than the part and addresses past its \
                                          end wrap onto its start, so a write or erase there \
                                          lands on real data; smaller and the top of the chip is \
                                          out of reach.";
+
+pub const QSPI_QUAD_ENABLE_NRF: &str = "Whether main.rs sets the flash's quad-enable (QE) bit, which \
+                                        turns IO2 and IO3 from WP# and HOLD# into data lines: the \
+                                        quad read and page program embassy-nrf uses by default \
+                                        need it. Only on a board that names its flash part, \
+                                        because the bit differs by part and the wrong one can \
+                                        set a non-volatile protection bit instead. On the \
+                                        MX25R6435F it \
+                                        is status bit 6: read first, and written only while \
+                                        clear, since it is non-volatile.";
 
 pub const QSPI_ADDRESS: &str = "How many address bytes the chip expects, and how fast to clock \
                                 it. 24 bit reaches 16 MiB and bigger flash needs 32; the bus \

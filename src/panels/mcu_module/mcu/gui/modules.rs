@@ -3915,6 +3915,37 @@ pub fn driver_switch<K: Ord>(ui: &mut egui::Ui, raw: &mut std::collections::BTre
     }
 }
 
+/// The QSPI panel's "Quad enable" text on an nRF: what main.rs does to the
+/// flash's QE bit - sets it for a part the board names, once the bus is
+/// `built` (`nrf::qspi_wired`), and nothing otherwise.
+fn quad_enable_note(
+    board_qspi: Option<&crate::panels::mcu_module::modules::QspiFlashPart>,
+    built: bool,
+) -> (String, egui::Color32) {
+    let amber = egui::Color32::from_rgb(200, 140, 60);
+    match board_qspi {
+        _ if !built => (
+            "not set — main.rs builds no QSPI until SCK, CSN and IO0..IO3 are wired".to_owned(),
+            amber,
+        ),
+        Some(f) => (
+            format!(
+                "{}, set at start-up — the board's {}",
+                f.quad_enable.label(),
+                f.part
+            ),
+            egui::Color32::from_gray(200),
+        ),
+        None => (
+            format!(
+                "not set — the definition names no flash part this IDE knows ({})",
+                crate::panels::mcu_module::modules::qspi_flash_part_names()
+            ),
+            amber,
+        ),
+    }
+}
+
 pub fn module_config_ui(
     ui: &mut egui::Ui,
     m: &mut VirtualModule,
@@ -3964,10 +3995,10 @@ pub fn module_config_ui(
     // (`family::embassy_i2s`) - not on an F303, F358, F398 or N6, whose CubeMX
     // data lists the I2S pads anyway. A chip fact, like `line_extras`.
     chip_i2s: bool,
-    // The flash the BOARD wires to its QSPI pads, as a `QSPI_MEMORY_SIZES`
-    // index (`Mcu::board_qspi_size`) - `None` on a bare part. A board fact,
-    // passed in like `chip_i2s` because this function only sees one module.
-    board_qspi_size: Option<u8>,
+    // The flash part the BOARD wires to its QSPI pads (`Mcu::board_qspi_flash`)
+    // - `None` on a bare part. A board fact, passed in like `chip_i2s`
+    // because this function only sees one module.
+    board_qspi: Option<&crate::panels::mcu_module::modules::QspiFlashPart>,
     // On an nRF, the serial block this module shares with other buses main.rs
     // reaches (SPIM0 and TWIM0 on TWISPI0; UARTE0, SPIM0 and TWIM0 on an
     // nRF5340's SERIAL0), from `nrf::shared_block`. A fact about the OTHER
@@ -7070,6 +7101,7 @@ pub fn module_config_ui(
                     ui.label(egui::RichText::new(text).size(11.0).color(colour));
                     ui.end_row();
 
+                    let board_qspi_size = board_qspi.and_then(|f| f.size_index());
                     out.field(
                         "Flash size",
                         if board_qspi_size.is_some() {
@@ -7097,15 +7129,15 @@ pub fn module_config_ui(
                                  know where the memory-mapped window ends.",
                             );
                         // What the board's definition says is on these pads.
-                        if let Some(b) = board_qspi_size {
+                        if let (Some(b), Some(f)) = (board_qspi_size, board_qspi) {
                             let (text, colour) = if cfg.memory_size == b {
-                                ("the board's flash".to_owned(), egui::Color32::from_gray(140))
+                                (format!("the board's {}", f.part), egui::Color32::from_gray(140))
                             } else {
                                 let have = QSPI_MEMORY_SIZES
                                     .get(usize::from(b))
                                     .map_or("?", |s| s.trim_start_matches('_'));
                                 (
-                                    format!("the board's flash is {have}"),
+                                    format!("the board's {} is {have}", f.part),
                                     egui::Color32::from_rgb(200, 140, 60),
                                 )
                             };
@@ -7188,6 +7220,18 @@ pub fn module_config_ui(
                         }
                     });
                     ui.end_row();
+
+                    // Whether main.rs frees IO2/IO3 for the quad opcodes: on
+                    // a board that names its flash part, wherever embassy-nrf
+                    // builds the bus. Read-only - the part decides the bit.
+                    if nrf && (is_async || codegen::nrf::blocking_on_embassy(family)) {
+                        out.field("Quad enable", docs::QSPI_QUAD_ENABLE_NRF);
+                        ui.label("Quad enable");
+                        // `nrf::qspi_wired`'s rule: SCK, CSN and all four IO.
+                        let (text, colour) = quad_enable_note(board_qspi, clk && ok1);
+                        ui.label(egui::RichText::new(text).size(11.0).color(colour));
+                        ui.end_row();
+                    }
 
                     // Only where Blocking is nrf-hal: an nRF5340 runs
                     // embassy-nrf there too, which builds it.
@@ -8812,7 +8856,7 @@ mod tests {
         runtime_applied: bool,
         dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
         chip_i2s: bool,
-        board_qspi_size: Option<u8>,
+        board_qspi: Option<&'static crate::panels::mcu_module::modules::QspiFlashPart>,
     ) -> (ConfigOut, crate::panels::mcu_module::modules::VirtualModule) {
         use crate::panels::mcu_module::modules::VirtualModule;
 
@@ -8847,7 +8891,7 @@ mod tests {
                 dma,
                 line_extras,
                 chip_i2s,
-                board_qspi_size,
+                board_qspi,
                 shared_block,
                 &mut out,
                 &crate::panels::mcu_module::uart_baud::Chip::bare(
@@ -8878,7 +8922,10 @@ mod tests {
                 .map(|f| f.doc.to_string())
                 .expect("a Flash size row")
         };
-        for board in [None, Some(13)] {
+        for board in [
+            None,
+            crate::panels::mcu_module::modules::qspi_flash_part("MX25R6435F"),
+        ] {
             let kind = ModuleKind::GenericInterfaceQspi;
             let (out, m) = drive_module_on(
                 kind,
@@ -8904,6 +8951,56 @@ mod tests {
                 other => panic!("a QSPI config: {other:?}"),
             }
         }
+    }
+
+    /// The "Quad enable" row is drawn wherever embassy-nrf builds the QSPI - an
+    /// nRF on Async, the nRF5340 on Blocking too - never under nrf-hal; and it
+    /// says "set" only for a named part on a bus main.rs builds.
+    #[test]
+    fn the_quad_enable_row_says_what_main_rs_does() {
+        let part = crate::panels::mcu_module::modules::qspi_flash_part("MX25R6435F");
+        for (family, is_async, drawn) in [
+            ("nrf5340", false, true),
+            ("nrf52840", true, true),
+            ("nrf52840", false, false),
+        ] {
+            let kind = ModuleKind::GenericInterfaceQspi;
+            let (out, _) = drive_module_on(
+                kind,
+                kind.default_config(1),
+                family,
+                is_async,
+                false,
+                false,
+                None,
+                true,
+                None,
+                true,
+                part,
+            );
+            let has = out
+                .fields()
+                .expect("the QSPI arm marks itself documented")
+                .iter()
+                .any(|f| f.label == "Quad enable");
+            assert_eq!(has, drawn, "{family}, async {is_async}");
+        }
+        let (set, _) = quad_enable_note(part, true);
+        assert!(
+            set.starts_with("status bit 6, set at start-up") && set.ends_with("MX25R6435F"),
+            "{set}"
+        );
+        let (unwired, _) = quad_enable_note(part, false);
+        assert!(
+            unwired.starts_with("not set — main.rs builds no QSPI"),
+            "{unwired}"
+        );
+        let (unknown, _) = quad_enable_note(None, true);
+        assert!(
+            unknown.starts_with("not set — the definition names no flash part this IDE knows")
+                && unknown.contains("MX25R6435F"),
+            "{unknown}"
+        );
     }
 
     fn labels_of(out: &ConfigOut) -> Vec<&str> {

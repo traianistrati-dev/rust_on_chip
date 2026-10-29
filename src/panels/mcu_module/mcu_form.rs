@@ -214,16 +214,17 @@ pub struct McuForm {
     /// The chip on this board, carried through untouched like `dma`: the form
     /// has no field for it, and dropping it turns a board back into a bare part.
     pub board_chip: Option<String>,
-    /// The flash on the board's QSPI pads, carried through like `board_chip`
-    /// for as long as the form still describes the board it was loaded from -
-    /// see [`Self::same_board`].
-    pub qspi_flash_kb: Option<u32>,
+    /// The flash part on the board's QSPI pads, carried through like
+    /// `board_chip` for as long as the form still describes the board it was
+    /// loaded from - see [`Self::same_board`].
+    pub qspi_flash: Option<String>,
     /// `id` and `family` as the definition had them. Saved under another id
     /// the form makes a NEW board - a clone - and moved to another family
     /// (Auto-fill, or typed) it describes another part; either drops
-    /// `qspi_flash_kb`. The form has no field for it, so a clone of the
-    /// nRF52840 DK for a board with another flash, or none, would go on
-    /// starting every QSPI there at 8 MiB.
+    /// `qspi_flash`. The form has no field for it, so a clone of the nRF52840
+    /// DK for a board with another flash, or none, would go on starting every
+    /// QSPI there at 8 MiB and setting a quad-enable bit its flash may not
+    /// have.
     pub loaded_id: String,
     pub loaded_family: String,
     /// On-die RAM in KiB, carried through like `dma` for as long as the RAM
@@ -318,7 +319,7 @@ impl McuForm {
             package: String::new(),
             max_mhz: None,
             board_chip: None,
-            qspi_flash_kb: None,
+            qspi_flash: None,
             loaded_id: String::new(),
             loaded_family: String::new(),
             sram_kb: None,
@@ -360,7 +361,7 @@ impl McuForm {
             package: String::new(),
             max_mhz: None,
             board_chip: None,
-            qspi_flash_kb: None,
+            qspi_flash: None,
             loaded_id: String::new(),
             loaded_family: String::new(),
             sram_kb: None,
@@ -564,7 +565,7 @@ impl McuForm {
             package: def.package.clone(),
             max_mhz: def.max_mhz,
             board_chip: def.board_chip.clone(),
-            qspi_flash_kb: def.qspi_flash_kb,
+            qspi_flash: def.qspi_flash.clone(),
             loaded_id: def.id.clone(),
             loaded_family: def.family.clone(),
             sram_kb: def.sram_kb,
@@ -845,7 +846,7 @@ impl McuForm {
         };
         let mut def = McuDefinition {
             board_chip: self.board_chip.clone(),
-            qspi_flash_kb: self.qspi_flash_kb.filter(|_| self.same_board()),
+            qspi_flash: self.qspi_flash.clone().filter(|_| self.same_board()),
             id: self.id.trim().to_string(),
             display_name: self.display_name.trim().to_string(),
             family: self.family.trim().to_string(),
@@ -1570,20 +1571,20 @@ mod tests {
     fn a_cloned_dk_drops_its_qspi_flash() {
         let def = crate::panels::mcu_module::builtins::builtin_for("nrf52840_dk")
             .expect("the bundled nRF52840 DK");
-        assert_eq!(def.qspi_flash_kb, Some(8192));
+        assert_eq!(def.qspi_flash.as_deref(), Some("MX25R6435F"));
         let mut f = McuForm::from_definition(&def);
         assert_eq!(
-            f.to_definition().qspi_flash_kb,
-            Some(8192),
+            f.to_definition().qspi_flash.as_deref(),
+            Some("MX25R6435F"),
             "the same board"
         );
         f.id = "my_nrf52840_board".into();
-        assert_eq!(f.to_definition().qspi_flash_kb, None, "a clone");
+        assert_eq!(f.to_definition().qspi_flash, None, "a clone");
 
         let mut f = McuForm::from_definition(&def);
         f.family = "nrf5340".into();
         assert_eq!(
-            f.to_definition().qspi_flash_kb,
+            f.to_definition().qspi_flash,
             None,
             "another part under the DK's id"
         );

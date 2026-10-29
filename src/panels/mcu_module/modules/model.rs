@@ -4204,6 +4204,71 @@ impl QspiAddressSize {
     }
 }
 
+/// How a flash part is told to use its four data lines - JESD216's Quad Enable
+/// Requirements. Only the schemes a part in [`QSPI_FLASH_PARTS`] uses: a wrong
+/// one is not harmless, since SR1 bit 6 is SEC on a Winbond W25Q128 (TB on the
+/// W25Q256) and BP3 on a Micron MT25Q, all non-volatile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QspiQuadEnable {
+    /// QE is status register bit 6, read with RDSR (05h) and set with a
+    /// one-byte WRSR (01h) - JESD216 QER 010b: Macronix, ISSI.
+    Sr1Bit6,
+}
+
+impl QspiQuadEnable {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sr1Bit6 => "status bit 6",
+        }
+    }
+}
+
+/// A QSPI flash a board definition can name, and what its datasheet says.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QspiFlashPart {
+    /// The part number the definition names: `MX25R6435F`.
+    pub part: &'static str,
+    /// Its capacity in KiB.
+    pub kib: u32,
+    pub quad_enable: QspiQuadEnable,
+}
+
+impl QspiFlashPart {
+    /// Its capacity as a [`QSPI_MEMORY_SIZES`] index - see
+    /// [`QspiModuleConfig::size_index`].
+    pub fn size_index(&self) -> Option<u8> {
+        QspiModuleConfig::size_index(self.kib)
+    }
+}
+
+/// Every flash part a board definition can name.
+pub const QSPI_FLASH_PARTS: &[QspiFlashPart] = &[
+    // Macronix PM2138 Rev 1.6: 64 Mbit; QE is status bit 6, non-volatile, and
+    // the part is delivered with the status register at 00h (p.30, p.74). On
+    // the nRF52840 DK and the nRF5340 DK.
+    QspiFlashPart {
+        part: "MX25R6435F",
+        kib: 8192,
+        quad_enable: QspiQuadEnable::Sr1Bit6,
+    },
+];
+
+/// The part `name` names, `None` for one [`QSPI_FLASH_PARTS`] lacks.
+pub fn qspi_flash_part(name: &str) -> Option<&'static QspiFlashPart> {
+    QSPI_FLASH_PARTS
+        .iter()
+        .find(|f| f.part.eq_ignore_ascii_case(name.trim()))
+}
+
+/// The part numbers a definition can name, for a message that says which.
+pub fn qspi_flash_part_names() -> String {
+    QSPI_FLASH_PARTS
+        .iter()
+        .map(|f| f.part)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// External-flash controller settings + data model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QspiModuleConfig {

@@ -3088,7 +3088,11 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         static_cell = true;
     }
 
-    if let Some((sck, csn, io)) = qspi_wired(mcu).filter(|_| mcu.is_async()) {
+    // embassy-nrf's `qspi::Qspi`, on every runtime embassy-nrf runs - Async,
+    // and Blocking on a part with no nrf-hal crate (the nRF5340): it is
+    // constructed here and nothing awaits, and its `blocking_read` /
+    // `blocking_write` / `blocking_erase` (and `NorFlash`) need no executor.
+    if let Some((sck, csn, io)) = qspi_wired(mcu) {
         let d = crate::panels::mcu_module::modules::QspiModuleConfig::new(1);
         let c = modules::qspi_config(&mcu.modules).unwrap_or(d);
         let (hz, freq) = qspi_frequency(c.prescaler);
@@ -3142,7 +3146,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             "    QSPI => embassy_nrf::qspi::InterruptHandler<embassy_nrf::peripherals::QSPI>;"
                 .to_owned(),
         );
-    } else if qspi_touched(mcu) && block_present(mcu, "qspi", None) && mcu.is_async() {
+    } else if qspi_touched(mcu) && block_present(mcu, "qspi", None) {
         o.push_str("    // QSPI is NOT built: the driver is quad-only and takes SCK, CSN and all four\n    // IO lanes. Wire the missing ones on the Pins canvas.\n");
     }
 

@@ -1507,6 +1507,36 @@ mod tests {
         }
     }
 
+    /// The kits' on-board QSPI flash is built wherever embassy-nrf runs - the
+    /// nRF5340's Blocking included, which has no nrf-hal crate: its
+    /// `blocking_*` calls need no executor - and nrf-hal's Blocking says why
+    /// it is not.
+    #[test]
+    fn the_qspi_flash_is_built_wherever_embassy_nrf_runs() {
+        let main = |dir: &str| {
+            let case = CASES.iter().find(|c| c.dir == dir).unwrap();
+            wired(case).1.fresh_main_rs()
+        };
+        for dir in [
+            "eide_nrf5340_dk_check",
+            "eide_nrf5340_dk_async_check",
+            "eide_nrf52840_dk_async_check",
+        ] {
+            let m = main(dir);
+            assert!(m.contains("embassy_nrf::qspi::Qspi::new("), "{dir}: {m}");
+            assert!(
+                m.contains("QSPI => embassy_nrf::qspi::InterruptHandler"),
+                "{dir}: {m}"
+            );
+        }
+        let m = main("eide_nrf52840_dk_check");
+        assert!(!m.contains("Qspi::new("), "{m}");
+        assert!(
+            m.contains("QSPI is NOT built: nrf-hal has no QSPI driver"),
+            "{m}"
+        );
+    }
+
     /// The small parts' serial blocks, by their embassy-nrf names.
     #[test]
     fn each_part_names_its_own_serial_blocks() {

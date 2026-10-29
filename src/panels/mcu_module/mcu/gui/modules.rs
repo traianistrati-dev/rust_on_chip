@@ -1174,9 +1174,10 @@ fn handle_preview(m: &VirtualModule, ctx: &HandleCtx) -> String {
         (HandleVendor::Nrf, ModuleKind::GenericInterfaceSpi) => return format!("spim{n}"),
         (HandleVendor::Nrf, ModuleKind::GenericInterfaceI2c) => return format!("twim{n}"),
         (HandleVendor::Nrf, ModuleKind::GenericInterfaceTimer) => return format!("pwm{n}"),
-        // embassy-nrf's; nrf-hal has no QSPI driver, so Blocking binds none.
+        // embassy-nrf's, on Async and on an embassy-nrf Blocking (the
+        // nRF5340); nrf-hal has no QSPI driver, so its Blocking binds none.
         (HandleVendor::Nrf, ModuleKind::GenericInterfaceQspi) => {
-            return if ctx.is_async {
+            return if ctx.is_async || !ctx.nrf_hal {
                 "qspi".to_owned()
             } else {
                 String::new()
@@ -7160,7 +7161,9 @@ pub fn module_config_ui(
                     });
                     ui.end_row();
 
-                    if nrf && !is_async {
+                    // Only where Blocking is nrf-hal: an nRF5340 runs
+                    // embassy-nrf there too, which builds it.
+                    if nrf && !is_async && !codegen::nrf::blocking_on_embassy(family) {
                         ui.label("");
                         ui.label(
                             egui::RichText::new(
@@ -10798,16 +10801,18 @@ mod tests {
                 }
                 let main = mcu.fresh_main_rs();
                 // Pads main.rs writes no code for, and names nowhere: neither
-                // RP HAL takes an SPI chip-select, an nRF builds its QSPI on
-                // Async only (nrf-hal has no driver, and main.rs says so
-                // without the pads), and the ESP32-C61's esp-hal has no USB
-                // driver (likewise). A goto there stays silent.
+                // RP HAL takes an SPI chip-select, nrf-hal has no QSPI driver
+                // (main.rs says so without the pads), and the ESP32-C61's
+                // esp-hal has no USB driver (likewise). A goto there stays
+                // silent.
                 let codeless = |f: &PinFunction| match f {
                     PinFunction::SpiNss(_) => codegen::rp::is_rp(&mcu.family),
                     PinFunction::QspiNcs { .. }
                     | PinFunction::QspiClk
                     | PinFunction::QspiIo { .. } => {
-                        codegen::nrf::is_nrf(&mcu.family) && !mcu.is_async()
+                        codegen::nrf::is_nrf(&mcu.family)
+                            && !mcu.is_async()
+                            && !codegen::nrf::blocking_on_embassy(&mcu.family)
                     }
                     PinFunction::UsbDp | PinFunction::UsbDm => mcu.family == "esp32c61",
                     _ => false,

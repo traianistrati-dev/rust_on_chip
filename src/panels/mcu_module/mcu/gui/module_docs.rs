@@ -250,6 +250,7 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("QSPI_WIRING_NRF", QSPI_WIRING_NRF),
     ("QSPI_WIRING_INCOMPLETE_NRF", QSPI_WIRING_INCOMPLETE_NRF),
     ("QSPI_FLASH_SIZE", QSPI_FLASH_SIZE),
+    ("QSPI_FLASH_SIZE_BOARD", QSPI_FLASH_SIZE_BOARD),
     ("QSPI_ADDRESS", QSPI_ADDRESS),
     ("QSPI_ADDRESS_NRF", QSPI_ADDRESS_NRF),
     ("SDMMC_WIDTH", SDMMC_WIDTH),
@@ -1063,9 +1064,17 @@ pub const QSPI_WIRING_INCOMPLETE_NRF: &str = "Read-only, and nothing will be gen
 
 pub const QSPI_FLASH_SIZE: &str = "The capacity of the flash chip on the board. The controller \
                                    needs it to know where its memory-mapped window ends: set it \
-                                   larger than the part and addresses past the end read back \
-                                   nothing real, set it smaller and the top of the chip is \
-                                   unreachable.";
+                                   larger than the part and addresses past the end wrap onto its \
+                                   start, so a write or erase there lands on real data; set it \
+                                   smaller and the top of the chip is out of reach.";
+
+pub const QSPI_FLASH_SIZE_BOARD: &str = "The capacity of the flash chip on the board. This board's \
+                                         definition states its own, so a new module starts at \
+                                         it and the note beside the row says when the setting \
+                                         differs. Larger than the part and addresses past its \
+                                         end wrap onto its start, so a write or erase there \
+                                         lands on real data; smaller and the top of the chip is \
+                                         out of reach.";
 
 pub const QSPI_ADDRESS: &str = "How many address bytes the chip expects, and how fast to clock \
                                 it. 24 bit reaches 16 MiB and bigger flash needs 32; the bus \

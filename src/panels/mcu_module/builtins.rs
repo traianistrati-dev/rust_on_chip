@@ -181,6 +181,7 @@ mod tests {
         };
         McuDefinition {
             board_chip: None,
+            qspi_flash_kb: None,
             id: id.into(),
             display_name: m.name.clone(),
             family: family.into(),

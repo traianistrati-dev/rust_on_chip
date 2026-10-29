@@ -3964,6 +3964,10 @@ pub fn module_config_ui(
     // (`family::embassy_i2s`) - not on an F303, F358, F398 or N6, whose CubeMX
     // data lists the I2S pads anyway. A chip fact, like `line_extras`.
     chip_i2s: bool,
+    // The flash the BOARD wires to its QSPI pads, as a `QSPI_MEMORY_SIZES`
+    // index (`Mcu::board_qspi_size`) - `None` on a bare part. A board fact,
+    // passed in like `chip_i2s` because this function only sees one module.
+    board_qspi_size: Option<u8>,
     // On an nRF, the serial block this module shares with other buses main.rs
     // reaches (SPIM0 and TWIM0 on TWISPI0; UARTE0, SPIM0 and TWIM0 on an
     // nRF5340's SERIAL0), from `nrf::shared_block`. A fact about the OTHER
@@ -7066,24 +7070,48 @@ pub fn module_config_ui(
                     ui.label(egui::RichText::new(text).size(11.0).color(colour));
                     ui.end_row();
 
-                    out.field("Flash size", docs::QSPI_FLASH_SIZE);
+                    out.field(
+                        "Flash size",
+                        if board_qspi_size.is_some() {
+                            docs::QSPI_FLASH_SIZE_BOARD
+                        } else {
+                            docs::QSPI_FLASH_SIZE
+                        },
+                    );
                     ui.label("Flash size");
-                    egui::ComboBox::from_id_salt("qspi_size")
-                        .selected_text(cfg.memory_size_label())
-                        .show_ui(ui, |ui| {
-                            for (i, name) in QSPI_MEMORY_SIZES.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut cfg.memory_size,
-                                    i as u8,
-                                    name.trim_start_matches('_'),
-                                );
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "The size of the chip on the board. The controller needs it to know \
-                             where the memory-mapped window ends.",
-                        );
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("qspi_size")
+                            .selected_text(cfg.memory_size_label())
+                            .show_ui(ui, |ui| {
+                                for (i, name) in QSPI_MEMORY_SIZES.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut cfg.memory_size,
+                                        i as u8,
+                                        name.trim_start_matches('_'),
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "The size of the chip on the board. The controller needs it to \
+                                 know where the memory-mapped window ends.",
+                            );
+                        // What the board's definition says is on these pads.
+                        if let Some(b) = board_qspi_size {
+                            let (text, colour) = if cfg.memory_size == b {
+                                ("the board's flash".to_owned(), egui::Color32::from_gray(140))
+                            } else {
+                                let have = QSPI_MEMORY_SIZES
+                                    .get(usize::from(b))
+                                    .map_or("?", |s| s.trim_start_matches('_'));
+                                (
+                                    format!("the board's flash is {have}"),
+                                    egui::Color32::from_rgb(200, 140, 60),
+                                )
+                            };
+                            ui.label(egui::RichText::new(text).size(10.5).color(colour));
+                        }
+                    });
                     ui.end_row();
 
                     // The nRF52840's QSPI: 24- or 32-bit addresses only, and a
@@ -8743,8 +8771,7 @@ mod tests {
         }
     }
 
-    /// The one harness under all of the above: the real panel for one module,
-    /// and the module as the frame left it.
+    /// `drive_module_on` on a bare part: no board fact.
     fn drive_module(
         kind: ModuleKind,
         config: crate::panels::mcu_module::modules::ModuleConfig,
@@ -8756,6 +8783,36 @@ mod tests {
         runtime_applied: bool,
         dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
         chip_i2s: bool,
+    ) -> (ConfigOut, crate::panels::mcu_module::modules::VirtualModule) {
+        drive_module_on(
+            kind,
+            config,
+            family,
+            is_async,
+            is_native,
+            line_extras,
+            shared_block,
+            runtime_applied,
+            dma,
+            chip_i2s,
+            None,
+        )
+    }
+
+    /// The one harness under all of the above: the real panel for one module,
+    /// and the module as the frame left it.
+    fn drive_module_on(
+        kind: ModuleKind,
+        config: crate::panels::mcu_module::modules::ModuleConfig,
+        family: &str,
+        is_async: bool,
+        is_native: bool,
+        line_extras: bool,
+        shared_block: Option<&crate::panels::mcu_module::codegen::nrf::SharedBlock>,
+        runtime_applied: bool,
+        dma: Option<&crate::panels::mcu_module::mcu_def::DmaDef>,
+        chip_i2s: bool,
+        board_qspi_size: Option<u8>,
     ) -> (ConfigOut, crate::panels::mcu_module::modules::VirtualModule) {
         use crate::panels::mcu_module::modules::VirtualModule;
 
@@ -8790,6 +8847,7 @@ mod tests {
                 dma,
                 line_extras,
                 chip_i2s,
+                board_qspi_size,
                 shared_block,
                 &mut out,
                 &crate::panels::mcu_module::uart_baud::Chip::bare(
@@ -8804,6 +8862,48 @@ mod tests {
             );
         });
         (out, m)
+    }
+
+    /// A board that states its QSPI flash gets the row's board sentence, and
+    /// the note beside the size never writes the size: a 16 MiB the user
+    /// chose stays 16 MiB.
+    #[test]
+    fn the_qspi_size_row_says_what_the_board_carries() {
+        use crate::panels::mcu_module::modules::ModuleConfig;
+        let doc = |out: &ConfigOut| {
+            out.fields()
+                .expect("the QSPI arm marks itself documented")
+                .iter()
+                .find(|f| f.label == "Flash size")
+                .map(|f| f.doc.to_string())
+                .expect("a Flash size row")
+        };
+        for board in [None, Some(13)] {
+            let kind = ModuleKind::GenericInterfaceQspi;
+            let (out, m) = drive_module_on(
+                kind,
+                kind.default_config(1),
+                "nrf52840",
+                true,
+                false,
+                false,
+                None,
+                true,
+                None,
+                true,
+                board,
+            );
+            let want = if board.is_some() {
+                docs::QSPI_FLASH_SIZE_BOARD
+            } else {
+                docs::QSPI_FLASH_SIZE
+            };
+            assert_eq!(doc(&out), want, "{board:?}");
+            match m.config {
+                ModuleConfig::Qspi(c) => assert_eq!(c.memory_size, 14, "{board:?}"),
+                other => panic!("a QSPI config: {other:?}"),
+            }
+        }
     }
 
     fn labels_of(out: &ConfigOut) -> Vec<&str> {

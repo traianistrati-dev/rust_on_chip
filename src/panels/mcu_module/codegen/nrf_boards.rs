@@ -221,6 +221,9 @@ struct Board {
     /// A note EVERY usable pad of the kit carries before its own - the
     /// nRF54L15 DK's 1.8 V logic level, which nothing on a pad would hint at.
     every_pad: &'static str,
+    /// The flash on the kit's QSPI pads, in KiB - see
+    /// [`McuDefinition::qspi_flash_kb`]. `None` where no flash sits on QSPI.
+    qspi_flash_kb: Option<u32>,
 }
 
 #[cfg(test)]
@@ -392,6 +395,8 @@ const NRF52840_DK: Board = Board {
         (1, 15),
     ],
     every_pad: "",
+    // The 64 Mbit MX25R6435F on the QSPI pads.
+    qspi_flash_kb: Some(8192),
 };
 
 #[cfg(test)]
@@ -501,6 +506,7 @@ const NRF52_DK: Board = Board {
         (0, 31),
     ],
     every_pad: "",
+    qspi_flash_kb: None,
 };
 
 #[cfg(test)]
@@ -656,6 +662,8 @@ const NRF5340_DK: Board = Board {
     ],
     low_freq: &[],
     every_pad: "",
+    // The 64 Mbit MX25R6435F on the QSPI pads.
+    qspi_flash_kb: Some(8192),
 };
 
 #[cfg(test)]
@@ -813,6 +821,7 @@ const NRF54L15_DK: Board = Board {
     ],
     low_freq: &[],
     every_pad: "Logic level is 1.8 V by default (the nPM1300 PMIC's VOUT1); set 1.8-3.3 V with 'VDD (nPM VOUT1)' in nRF Connect for Desktop's Board Configurator.",
+    qspi_flash_kb: None,
 };
 
 #[cfg(test)]
@@ -906,6 +915,7 @@ fn definition_of(b: &Board) -> McuDefinition {
     d.display_name = b.display_name.into();
     d.package = "DK headers".into();
     d.board_chip = Some(c.part.into());
+    d.qspi_flash_kb = b.qspi_flash_kb;
     apply_chip(&mut d, c);
     d.project.pkg_name = b.id.into();
     d.project.memory_comment = format!(
@@ -1320,7 +1330,8 @@ mod tests {
             "CLOCK_POWER => embassy_nrf::usb::vbus_detect::InterruptHandler;",
             "QSPI => embassy_nrf::qspi::InterruptHandler<embassy_nrf::peripherals::QSPI>;",
             "p.P0_19, // SCK\n        p.P0_17, // CSN\n        p.P0_20, // IO0",
-            "qspi_cfg.capacity = 16777216;",
+            // The kit's 64 Mbit flash, not the generic 16 MiB.
+            "qspi_cfg.capacity = 8388608;",
             "qspi_cfg.frequency = embassy_nrf::qspi::Frequency::M16;",
         ] {
             assert!(m.contains(want), "missing {want:?}:\n{m}");
@@ -1537,6 +1548,85 @@ mod tests {
         );
     }
 
+    /// The two kits with a QSPI flash say how big it is, and the QSPI wired on
+    /// them starts there: 8 MiB, their 64 Mbit MX25R6435F - not the generic
+    /// 16 MiB, whose top half is not on the board. Set to another size, main.rs
+    /// says so beside the capacity it builds.
+    #[test]
+    fn a_dk_qspi_starts_at_the_kits_8_mib_flash() {
+        use crate::panels::mcu_module::modules::{self, ModuleConfig};
+        for dir in [
+            "eide_nrf5340_dk_check",
+            "eide_nrf5340_dk_async_check",
+            "eide_nrf52840_dk_async_check",
+        ] {
+            let case = CASES.iter().find(|c| c.dir == dir).unwrap();
+            let (def, mut mcu) = wired(case);
+            assert_eq!(def.qspi_flash_kb, Some(8192), "{dir}");
+            let qspi = modules::qspi_config(&mcu.modules).expect("the kit's QSPI module");
+            assert_eq!(qspi.memory_size_label(), "8MiB", "{dir}");
+            let m = mcu.fresh_main_rs();
+            assert!(m.contains("qspi_cfg.capacity = 8388608;"), "{dir}: {m}");
+            assert!(!m.contains("the board's QSPI flash is"), "{dir}: {m}");
+
+            for md in &mut mcu.modules {
+                if let ModuleConfig::Qspi(c) = &mut md.config {
+                    c.memory_size = 14;
+                }
+            }
+            let m = mcu.fresh_main_rs();
+            assert!(
+                m.contains("// 16MiB asked for; the board's QSPI flash is 8MiB - addresses past it wrap onto its start."),
+                "{dir}: {m}"
+            );
+            assert!(m.contains("qspi_cfg.capacity = 16777216;"), "{dir}: {m}");
+            for md in &mut mcu.modules {
+                if let ModuleConfig::Qspi(c) = &mut md.config {
+                    c.memory_size = 12;
+                }
+            }
+            let m = mcu.fresh_main_rs();
+            assert!(
+                m.contains("// 4MiB asked for; the board's QSPI flash is 8MiB - the rest of it is out of reach."),
+                "{dir}: {m}"
+            );
+
+            // No module yet: the generator starts where a new module would.
+            mcu.modules
+                .retain(|md| !matches!(md.config, ModuleConfig::Qspi(_)));
+            let m = mcu.fresh_main_rs();
+            assert!(m.contains("qspi_cfg.capacity = 8388608;"), "{dir}: {m}");
+        }
+        // The kits with no flash on QSPI, and every bare part: no board fact,
+        // so the generic 16 MiB.
+        for id in ["nrf52832_dk", "nrf54l15_dk", "nrf52833_microbit_v2"] {
+            let def = builtins::builtin_for(id).expect("built-in");
+            assert_eq!(def.qspi_flash_kb, None, "{id}");
+            assert_eq!(
+                def.build_mcu().qspi_default(1).memory_size_label(),
+                "16MiB",
+                "{id}"
+            );
+        }
+    }
+
+    /// A capacity's place in the size list, and nothing for one it has not.
+    #[test]
+    fn a_flash_capacity_has_its_size_index() {
+        use crate::panels::mcu_module::modules::{QSPI_MEMORY_SIZES, QspiModuleConfig};
+        assert_eq!(QspiModuleConfig::size_index(8192), Some(13));
+        assert_eq!(QSPI_MEMORY_SIZES[13], "_8MiB");
+        assert_eq!(QspiModuleConfig::size_index(1), Some(0));
+        assert_eq!(QspiModuleConfig::size_index(1 << 22), Some(22), "4 GiB");
+        for none in [0, 3, 6000, 1 << 23] {
+            assert_eq!(QspiModuleConfig::size_index(none), None, "{none} KiB");
+        }
+        // A size the list lacks leaves the generic default.
+        let mut mcu = builtins::builtin_for("nrf52840_dk").unwrap().build_mcu();
+        mcu.board_qspi_flash = Some(6000);
+        assert_eq!(mcu.qspi_default(1).memory_size_label(), "16MiB");
+    }
+
     /// The small parts' serial blocks, by their embassy-nrf names.
     #[test]
     fn each_part_names_its_own_serial_blocks() {
@@ -1594,14 +1684,18 @@ mod tests {
             let main_rs = mcu.fresh_main_rs();
             // USB crates, the async runtime, `static_cell`: the manifest the
             // app writes - see `manifest_sync`.
-            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
+            let files =
+                crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(case.dir);
             project_gen::clear_project_dir_keep_target(&dir);
             project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")
                 .expect("write nrf project");
             println!("wrote {}", dir.display());
-            println!("target: {}", crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu)).target);
+            println!(
+                "target: {}",
+                crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu)).target
+            );
         }
     }
 

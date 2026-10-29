@@ -6,6 +6,7 @@ McuDefinition(
     board_chip: Some("nRF5340"),
     max_mhz: Some(64),
     sram_kb: Some(512),
+    qspi_flash_kb: Some(8192),
     dma: None,
     cpu: "ARM Cortex-M33",
     toolchain: RustEmbedded,

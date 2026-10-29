@@ -4224,7 +4224,10 @@ pub struct QspiModuleConfig {
 
 impl QspiModuleConfig {
     /// Defaults: 16 MiB, 24-bit addressing, kernel clock / 2 — a plain 128 Mbit
-    /// NOR flash, which is what most boards carry.
+    /// NOR flash, which is what most boards carry. A board that says what it
+    /// carries starts there instead: [`Mcu::qspi_default`].
+    ///
+    /// [`Mcu::qspi_default`]: crate::panels::mcu_module::mcu::Mcu::qspi_default
     pub fn new(instance: u8) -> Self {
         Self {
             instance,
@@ -4235,6 +4238,16 @@ impl QspiModuleConfig {
             tx_model: String::new(),
             custom_label: String::new(),
         }
+    }
+
+    /// The [`QSPI_MEMORY_SIZES`] index of a `kib`-KiB flash - 13 for 8 MiB.
+    /// `None` for a size the list has no entry for: it runs in powers of two
+    /// from 1 KiB to 4 GiB, as flash capacities do.
+    pub fn size_index(kib: u32) -> Option<u8> {
+        kib.is_power_of_two()
+            .then(|| u8::try_from(kib.trailing_zeros()).ok())
+            .flatten()
+            .filter(|&i| usize::from(i) < QSPI_MEMORY_SIZES.len())
     }
 
     /// The embassy `MemorySize` constant this size names, clamped so a

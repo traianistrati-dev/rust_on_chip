@@ -236,9 +236,8 @@ pub struct Mcu {
     /// The chip's interrupt vector names — see
     /// [`crate::panels::mcu_module::mcu_def::McuDefinition::irq_vectors`].
     pub irq_vectors: Vec<String>,
-    /// The chip's USART IP version — the gate on the swap/invert options, see
-    /// [`crate::panels::mcu_module::stm32_pin_data::usart_has_swap_invert`].
-    /// The chip on this board — see [`McuDefinition::board_chip`]. `None` for a
+    /// The chip on this board — see
+    /// [`crate::panels::mcu_module::mcu_def::McuDefinition::board_chip`]. `None` for a
     /// bare part, which is what makes the diagram draw a chip instead of a PCB.
     pub board_chip: Option<String>,
     /// The flash in bytes, from the definition's `flash_size` - the same
@@ -247,11 +246,17 @@ pub struct Mcu {
     /// counted from it, and a range past the real chip would wrap onto the
     /// boot block. `None` when the definition does not state it.
     pub board_flash: Option<u32>,
+    /// The flash on the board's QSPI pads in KiB - see
+    /// [`crate::panels::mcu_module::mcu_def::McuDefinition::qspi_flash_kb`].
+    /// Read through [`Mcu::board_qspi_size`].
+    pub board_qspi_flash: Option<u32>,
     /// The embassy-stm32 chip feature the definition's dependency line names
     /// (`stm32wl55jc-cm4`), `None` when it names none. What decides a
     /// dual-core build: the id and the name are free text, the line is what
     /// the project compiles with.
     pub hal_feature: Option<String>,
+    /// The chip's USART IP version — the gate on the swap/invert options, see
+    /// [`crate::panels::mcu_module::stm32_pin_data::usart_has_swap_invert`].
     pub usart_ip: Option<String>,
     /// The chip's SDMMC IP version — the gate on WHICH constructor shape the
     /// SDMMC codegen may emit, see

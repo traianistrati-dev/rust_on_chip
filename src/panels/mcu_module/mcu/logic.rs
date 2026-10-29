@@ -138,6 +138,7 @@ impl Mcu {
             // A bare chip until the definition says otherwise.
             board_chip: None,
             board_flash: None,
+            board_qspi_flash: None,
             hal_feature: None,
             usart_ip: None,
             sdmmc_ip: None,
@@ -2526,6 +2527,45 @@ impl Mcu {
         }
     }
 
+    /// The [`QSPI_MEMORY_SIZES`] index of the flash on this board's QSPI pads
+    /// ([`Mcu::board_qspi_flash`]) - 13, 8 MiB, on the nRF52840 DK and the
+    /// nRF5340 DK. `None` on a bare part, or a size the list has no entry for.
+    ///
+    /// [`QSPI_MEMORY_SIZES`]: crate::panels::mcu_module::modules::QSPI_MEMORY_SIZES
+    pub fn board_qspi_size(&self) -> Option<u8> {
+        self.board_qspi_flash
+            .and_then(crate::panels::mcu_module::modules::QspiModuleConfig::size_index)
+    }
+
+    /// A new QSPI module's config: the generic one, at the capacity of the
+    /// flash the board wires to those pads when it says. Read by
+    /// [`Mcu::default_module_config`] and by the nRF generator for a wired
+    /// QSPI with no module yet, so the two cannot start apart.
+    pub fn qspi_default(
+        &self,
+        instance: u8,
+    ) -> crate::panels::mcu_module::modules::QspiModuleConfig {
+        let mut c = crate::panels::mcu_module::modules::QspiModuleConfig::new(instance);
+        if let Some(i) = self.board_qspi_size() {
+            c.memory_size = i;
+        }
+        c
+    }
+
+    /// `kind`'s default config on `inst`, with what this BOARD says about it -
+    /// so far only its QSPI flash ([`Mcu::qspi_default`]).
+    pub fn default_module_config(
+        &self,
+        kind: crate::panels::mcu_module::modules::ModuleKind,
+        inst: u8,
+    ) -> crate::panels::mcu_module::modules::ModuleConfig {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        match kind {
+            ModuleKind::GenericInterfaceQspi => ModuleConfig::Qspi(self.qspi_default(inst)),
+            _ => kind.default_config(inst),
+        }
+    }
+
     /// Drop each module connection whose pin no longer carries the matching
     /// USART function — so re-purposing a pin disconnects the _USART from it
     /// (the module stays, just unwired). Idempotent.
@@ -2622,12 +2662,13 @@ impl Mcu {
                 self.modules[pos].connections = connections;
             } else {
                 let id = self.free_module_id(&kind.short().to_ascii_lowercase());
+                let config = self.default_module_config(kind, inst);
                 self.modules.push(VirtualModule {
                     id,
                     kind,
                     name: format!("{}{inst}", kind.short()),
                     pos: (0.0, 0.0),
-                    config: kind.default_config(inst),
+                    config,
                     connections,
                 });
             }

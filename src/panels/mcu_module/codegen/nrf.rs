@@ -3093,8 +3093,8 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     // constructed here and nothing awaits, and its `blocking_read` /
     // `blocking_write` / `blocking_erase` (and `NorFlash`) need no executor.
     if let Some((sck, csn, io)) = qspi_wired(mcu) {
-        let d = crate::panels::mcu_module::modules::QspiModuleConfig::new(1);
-        let c = modules::qspi_config(&mcu.modules).unwrap_or(d);
+        // A wired QSPI with no module yet starts where a new module does.
+        let c = modules::qspi_config(&mcu.modules).unwrap_or_else(|| mcu.qspi_default(1));
         let (hz, freq) = qspi_frequency(c.prescaler);
         // embassy's sizes run 1 KiB << i; `capacity` is a u32 of bytes.
         let bytes = (1024u64 << c.memory_size.min(22)).min(u64::from(u32::MAX));
@@ -3104,6 +3104,19 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             o.push_str(&format!(
                 "    // Prescaler {} asked for; the nRF QSPI divides 32 MHz by 16 at most.\n",
                 c.prescaler
+            ));
+        }
+        let board = mcu.qspi_default(1);
+        if mcu.board_qspi_size().is_some() && c.memory_size != board.memory_size {
+            o.push_str(&format!(
+                "    // {} asked for; the board's QSPI flash is {} - {}.\n",
+                c.memory_size_label(),
+                board.memory_size_label(),
+                if c.memory_size > board.memory_size {
+                    "addresses past it wrap onto its start"
+                } else {
+                    "the rest of it is out of reach"
+                }
             ));
         }
         o.push_str(&format!(
@@ -5164,7 +5177,8 @@ mod async_codegen {
                 "{main_rs}"
             );
             // The manifest the app writes - see `manifest_sync`.
-            let files = crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
+            let files =
+                crate::panels::mcu_module::manifest_sync::project_files(&def, &mcu, &main_rs);
             let user: Vec<(String, String)> = mcu.pin_tree_files();
             let dir = std::env::temp_dir().join(dir_name);
             project_gen::clear_project_dir_keep_target(&dir);

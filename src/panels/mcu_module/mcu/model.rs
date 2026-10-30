@@ -248,8 +248,11 @@ pub struct Mcu {
     pub board_flash: Option<u32>,
     /// The flash part on the board's QSPI pads - see
     /// [`crate::panels::mcu_module::mcu_def::McuDefinition::qspi_flash`]. Its
-    /// size is read through [`Mcu::board_qspi_size`] (the QSPI panel takes the
-    /// part itself, for its name); the nRF generator reads its quad-enable bit.
+    /// size is read through [`Mcu::board_qspi_size`]; on an nRF,
+    /// [`Mcu::qspi_default`] starts a new module at the SCK its quad read
+    /// takes. The QSPI panel takes the part itself, for its name and that
+    /// limit; the nRF generator reads its quad-enable bit and notes an SCK
+    /// above the limit.
     pub board_qspi_flash: Option<&'static crate::panels::mcu_module::modules::QspiFlashPart>,
     /// The embassy-stm32 chip feature the definition's dependency line names
     /// (`stm32wl55jc-cm4`), `None` when it names none. What decides a

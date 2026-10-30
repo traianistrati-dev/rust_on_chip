@@ -3915,6 +3915,33 @@ pub fn driver_switch<K: Ord>(ui: &mut egui::Ui, raw: &mut std::collections::BTre
     }
 }
 
+/// The QSPI panel's SCK row on an nRF `family`: the divider's prefix, which
+/// counts from the chip's own clock (`nrf::qspi_sck_base_hz`), and the clock
+/// `prescaler` gives - amber above what the board's flash part takes on its
+/// quad reads.
+fn qspi_sck_note(
+    family: &str,
+    prescaler: u8,
+    board_qspi: Option<&crate::panels::mcu_module::modules::QspiFlashPart>,
+) -> (String, String, egui::Color32) {
+    let base = codegen::nrf::qspi_sck_base_hz(family).unwrap_or(32_000_000);
+    let prefix = format!("{} MHz / ", base / 1_000_000);
+    let hz = base / (u32::from(prescaler.min(15)) + 1);
+    let mhz = f64::from(hz) / 1e6;
+    match board_qspi.filter(|f| hz > f.quad_sck_max_hz) {
+        Some(f) => (
+            prefix,
+            format!(
+                "= {mhz:.1} MHz — above the board's {}'s {} MHz",
+                f.part,
+                f.quad_sck_max_hz / 1_000_000
+            ),
+            egui::Color32::from_rgb(200, 140, 60),
+        ),
+        None => (prefix, format!("= {mhz:.1} MHz"), egui::Color32::GRAY),
+    }
+}
+
 /// The QSPI panel's "Quad enable" text on an nRF: what main.rs does to the
 /// flash's QE bit - sets it for a part the board names, once the bus is
 /// `built` (`nrf::qspi_wired`), and nothing otherwise.
@@ -7146,8 +7173,8 @@ pub fn module_config_ui(
                     });
                     ui.end_row();
 
-                    // The nRF52840's QSPI: 24- or 32-bit addresses only, and a
-                    // divider of 1..=16 off a fixed 32 MHz. A value carried over
+                    // An nRF's QSPI: 24- or 32-bit addresses only, and a divider
+                    // of 1..=16 off the chip's QSPI clock. A value carried over
                     // from an STM32 config is put back in range rather than
                     // offered as a choice this block does not have.
                     let nrf = crate::panels::mcu_module::codegen::nrf::is_nrf(family);
@@ -7160,14 +7187,17 @@ pub fn module_config_ui(
                         }
                         cfg.prescaler = cfg.prescaler.min(15);
                     }
-                    out.field(
-                        "Address",
-                        if nrf {
-                            docs::QSPI_ADDRESS_NRF
-                        } else {
-                            docs::QSPI_ADDRESS
-                        },
-                    );
+                    // The nRF5340 divides its own clock: 96 MHz once main.rs
+                    // has PCLK192M at 192 MHz, not the nRF52840's 32 MHz.
+                    let nrf53 = codegen::nrf::chip(family).is_some_and(|c| c.nrf53());
+                    let addr_doc = if nrf53 {
+                        docs::QSPI_ADDRESS_NRF53
+                    } else if nrf {
+                        docs::QSPI_ADDRESS_NRF
+                    } else {
+                        docs::QSPI_ADDRESS
+                    };
+                    out.field("Address", addr_doc);
                     ui.label("Address");
                     ui.horizontal(|ui| {
                         let sizes: &[QspiAddressSize] = if nrf {
@@ -7189,11 +7219,12 @@ pub fn module_config_ui(
                                  16 MiB; bigger flash needs 32.",
                             );
                         if nrf {
-                            let mhz = 32.0 / (f32::from(cfg.prescaler) + 1.0);
+                            let (prefix, text, colour) =
+                                qspi_sck_note(family, cfg.prescaler, board_qspi);
                             ui.add(
                                 crate::panels::drag_value(ui, &mut cfg.prescaler)
                                     .range(0..=15)
-                                    .prefix("32 MHz / ")
+                                    .prefix(prefix)
                                     // Shown and typed as the DIVIDER, 1..=16;
                                     // stored as the prescaler, 0..=15.
                                     .custom_formatter(|v, _| format!("{}", v as u32 + 1))
@@ -7201,12 +7232,8 @@ pub fn module_config_ui(
                                         s.trim().parse::<f64>().ok().map(|d| d - 1.0)
                                     }),
                             )
-                            .on_hover_text(docs::QSPI_ADDRESS_NRF);
-                            ui.label(
-                                egui::RichText::new(format!("= {mhz:.1} MHz"))
-                                    .size(11.0)
-                                    .color(egui::Color32::GRAY),
-                            );
+                            .on_hover_text(addr_doc);
+                            ui.label(egui::RichText::new(text).size(11.0).color(colour));
                         } else {
                             ui.add(
                                 crate::panels::drag_value(ui, &mut cfg.prescaler)
@@ -9001,6 +9028,64 @@ mod tests {
                 && unknown.contains("MX25R6435F"),
             "{unknown}"
         );
+    }
+
+    /// The nRF SCK row counts from the chip's own clock - 32 MHz on the
+    /// nRF52840, 96 MHz on the nRF5340 - and turns amber above what the
+    /// board's flash part takes; the nRF5340 gets its own sentence.
+    #[test]
+    fn the_qspi_clock_row_counts_from_the_chips_clock() {
+        let part = crate::panels::mcu_module::modules::qspi_flash_part("MX25R6435F");
+        let amber = egui::Color32::from_rgb(200, 140, 60);
+        let grey = egui::Color32::GRAY;
+        let note = |family: &str, p: u8, part| {
+            let (prefix, text, colour) = qspi_sck_note(family, p, part);
+            (prefix, text, colour)
+        };
+        assert_eq!(
+            note("nrf52840", 3, part),
+            ("32 MHz / ".into(), "= 8.0 MHz".into(), grey)
+        );
+        assert_eq!(
+            note("nrf5340", 11, part),
+            ("96 MHz / ".into(), "= 8.0 MHz".into(), grey)
+        );
+        assert_eq!(
+            note("nrf5340", 5, part),
+            (
+                "96 MHz / ".into(),
+                "= 16.0 MHz — above the board's MX25R6435F's 8 MHz".into(),
+                amber
+            )
+        );
+        assert_eq!(note("nrf5340", 5, None).2, grey, "no part, no limit");
+
+        let kind = ModuleKind::GenericInterfaceQspi;
+        for (family, want) in [
+            ("nrf5340", docs::QSPI_ADDRESS_NRF53),
+            ("nrf52840", docs::QSPI_ADDRESS_NRF),
+        ] {
+            let (out, _) = drive_module_on(
+                kind,
+                kind.default_config(1),
+                family,
+                true,
+                false,
+                false,
+                None,
+                true,
+                None,
+                true,
+                part,
+            );
+            let doc = out
+                .fields()
+                .expect("the QSPI arm marks itself documented")
+                .iter()
+                .find(|f| f.label == "Address")
+                .map(|f| f.doc.to_string());
+            assert_eq!(doc.as_deref(), Some(want), "{family}");
+        }
     }
 
     fn labels_of(out: &ConfigOut) -> Vec<&str> {

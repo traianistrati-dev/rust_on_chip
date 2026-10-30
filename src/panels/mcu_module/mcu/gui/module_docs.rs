@@ -254,6 +254,7 @@ pub const ALL_DOCS: &[(&str, &str)] = &[
     ("QSPI_QUAD_ENABLE_NRF", QSPI_QUAD_ENABLE_NRF),
     ("QSPI_ADDRESS", QSPI_ADDRESS),
     ("QSPI_ADDRESS_NRF", QSPI_ADDRESS_NRF),
+    ("QSPI_ADDRESS_NRF53", QSPI_ADDRESS_NRF53),
     ("SDMMC_WIDTH", SDMMC_WIDTH),
     ("SDMMC_WIDTH_UNSUPPORTED", SDMMC_WIDTH_UNSUPPORTED),
     ("SDMMC_DATA_TIMEOUT", SDMMC_DATA_TIMEOUT),
@@ -1097,6 +1098,13 @@ pub const QSPI_ADDRESS_NRF: &str = "How many address bytes the chip expects, and
                                     32 bit for bigger flash; its bus runs at 32 MHz divided by 1 \
                                     to 16, so the fastest setting is 32 MHz and is often more \
                                     than the flash can follow.";
+pub const QSPI_ADDRESS_NRF53: &str = "How many address bytes the chip expects, and how fast to clock \
+                                      it. The nRF5340 addresses in 24 bit, which reaches 16 MiB, \
+                                      or 32 bit for bigger flash; its bus runs at 96 MHz divided \
+                                      by 1 to 16, because main.rs first sets the QSPI's own clock \
+                                      to 192 MHz, as Nordic's anomaly 159 asks. The fastest \
+                                      setting, 96 MHz, is often more than the flash can follow \
+                                      and needs the supply at 1.7 to 2.0 V.";
 // ── SDMMC ─────────────────────────────────────────────────────────────────────
 
 pub const SDMMC_WIDTH: &str = "Read-only: the width is however many data lanes you wired, not a \

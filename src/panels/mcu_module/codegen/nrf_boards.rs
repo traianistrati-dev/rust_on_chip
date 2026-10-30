@@ -1330,7 +1330,8 @@ mod tests {
             "p.P0_19, // SCK\n        p.P0_17, // CSN\n        p.P0_20, // IO0",
             // The kit's 64 Mbit flash, not the generic 16 MiB.
             "qspi_cfg.capacity = 8388608;",
-            "qspi_cfg.frequency = embassy_nrf::qspi::Frequency::M16;",
+            // 8 MHz: the MX25R6435F's quad-read limit in Ultra Low Power mode.
+            "qspi_cfg.frequency = embassy_nrf::qspi::Frequency::M8;",
         ] {
             assert!(m.contains(want), "missing {want:?}:\n{m}");
         }
@@ -1687,6 +1688,152 @@ mod tests {
             ),
             "{m}"
         );
+    }
+
+    /// The kits' QSPI clock is what their MX25R6435F's quad read takes, 8 MHz.
+    /// On the nRF5340 that is 96 MHz / 12, off a PCLK192M main.rs sets to
+    /// 192 MHz before the driver starts (anomaly 159), with anomaly 121's
+    /// RXDELAY and IFCONFIG0 bit 16 - the bit after `Qspi::new`, which writes
+    /// it as 0, and before the first transfer. A bare part starts at 16 MHz.
+    #[test]
+    fn the_dk_qspi_clock_is_the_flashs() {
+        use crate::panels::mcu_module::modules::ModuleConfig;
+        let kit = |dir: &str| wired(CASES.iter().find(|c| c.dir == dir).unwrap()).1;
+        let set_prescaler = |mcu: &mut Mcu, p: u8| {
+            for md in &mut mcu.modules {
+                if let ModuleConfig::Qspi(c) = &mut md.config {
+                    c.prescaler = p;
+                }
+            }
+        };
+
+        let mut mcu = kit("eide_nrf52840_dk_async_check");
+        let m = mcu.fresh_main_rs();
+        assert!(
+            m.contains("    // 32 MHz / 4: 8000000 Hz on SCK.\n    qspi_cfg.frequency = embassy_nrf::qspi::Frequency::M8;"),
+            "{m}"
+        );
+        for s in ["HFCLK192MCTRL", "rx_delay", "QSPI_S"] {
+            assert!(!m.contains(s), "the nRF52840 has no {s}:\n{m}");
+        }
+        set_prescaler(&mut mcu, 1);
+        let m = mcu.fresh_main_rs();
+        assert!(
+            m.contains("// 16000000 Hz asked for; the board's MX25R6435F takes 8000000 Hz at most on its quad reads."),
+            "{m}"
+        );
+
+        for dir in ["eide_nrf5340_dk_check", "eide_nrf5340_dk_async_check"] {
+            let mut mcu = kit(dir);
+            let m = mcu.fresh_main_rs();
+            assert!(
+                m.contains("    // 96 MHz / 12: 8000000 Hz on SCK - embassy's names count from the nRF52840's 32 MHz.\n    qspi_cfg.frequency = embassy_nrf::qspi::Frequency::M2_7;"),
+                "{dir}: {m}"
+            );
+            assert!(m.contains("\n    qspi_cfg.rx_delay = 6;\n"), "{dir}: {m}");
+            // In order: the clock before the driver, bit 16 after it and
+            // before the first transfer.
+            let mut at = 0;
+            for s in [
+                "core::ptr::write_volatile(CLOCK_HFCLK192MCTRL as *mut u32, 0)",
+                "cortex_m::asm::delay(512);",
+                "let mut qspi_cfg",
+                "Qspi::new(",
+                "(QSPI_S + 0x010) as *mut u32, 1); // TASKS_DEACTIVATE",
+                "(QSPI_S + 0x500) as *mut u32, 0); // ENABLE",
+                "write_volatile(ifconfig0, (v & !(1 << 17)) | (1 << 16));",
+                "(QSPI_S + 0x500) as *mut u32, 1); // ENABLE",
+                "(QSPI_S + 0x100) as *mut u32, 0); // EVENTS_READY",
+                "write_volatile(QSPI_S as *mut u32, 1); // TASKS_ACTIVATE",
+                "while core::ptr::read_volatile((QSPI_S + 0x100) as *const u32) == 0 {}",
+                "(0x05, &[], &mut qspi_sr)",
+            ] {
+                at += m[at..]
+                    .find(s)
+                    .unwrap_or_else(|| panic!("{dir}: {s:?} not after the step before:\n{m}"))
+                    + s.len();
+            }
+            // 48 MHz: still the 6..48 MHz rule, and no supply limit.
+            set_prescaler(&mut mcu, 1);
+            let m = mcu.fresh_main_rs();
+            assert!(
+                m.contains("write_volatile(ifconfig0, (v & !(1 << 17)) | (1 << 16));"),
+                "{dir}: {m}"
+            );
+            assert!(!m.contains("96 MHz needs VDD"), "{dir}: {m}");
+            assert!(
+                m.contains("    // 96 MHz / 2: 48000000 Hz on SCK"),
+                "{dir}: {m}"
+            );
+            // 96 MHz: both bits, and the supply it needs.
+            set_prescaler(&mut mcu, 0);
+            let m = mcu.fresh_main_rs();
+            assert!(
+                m.contains("write_volatile(ifconfig0, v | (1 << 16) | (1 << 17));"),
+                "{dir}: {m}"
+            );
+            assert!(m.contains("// 96 MHz needs VDD at 1.7-2.0 V"), "{dir}: {m}");
+            assert!(
+                m.contains("    // 96 MHz / 1: 96000000 Hz on SCK"),
+                "{dir}: {m}"
+            );
+        }
+
+        // The defaults: the part's 8 MHz on a kit, 16 MHz on a bare part.
+        for (id, kit_p, bare_p) in [("nrf52840_dk", 3, 1), ("nrf5340_dk", 11, 5)] {
+            let mut mcu = builtins::builtin_for(id).expect("built-in").build_mcu();
+            assert_eq!(mcu.qspi_default(1).prescaler, kit_p, "{id}");
+            mcu.board_qspi_flash = None;
+            assert_eq!(mcu.qspi_default(1).prescaler, bare_p, "{id} with no part");
+        }
+    }
+
+    /// A QSPI module saved on an nRF5340 before main.rs set PCLK192M to
+    /// 192 MHz keeps the SCK it ran at: prescaler 1, 12 MHz off the reset /4,
+    /// is 7 now - not 48 MHz. Once: the mark it gets is saved, and the next
+    /// load leaves it alone. The nRF52840's clock never moved.
+    #[test]
+    fn an_old_nrf5340_qspi_keeps_the_clock_it_ran_at() {
+        use crate::panels::mcu_module::modules::ModuleConfig;
+        let qspi = |mcu: &Mcu| {
+            mcu.modules
+                .iter()
+                .find_map(|m| match &m.config {
+                    ModuleConfig::Qspi(c) => Some((c.prescaler, c.nrf53_div1)),
+                    _ => None,
+                })
+                .expect("the kit's QSPI module")
+        };
+        for (dir, saved, want) in [
+            ("eide_nrf5340_dk_async_check", 1, 7),
+            ("eide_nrf5340_dk_check", 0, 3),
+            ("eide_nrf5340_dk_check", 3, 15),
+            ("eide_nrf52840_dk_async_check", 1, 1),
+        ] {
+            let case = CASES.iter().find(|c| c.dir == dir).unwrap();
+            let (def, mut mcu) = wired(case);
+            for m in &mut mcu.modules {
+                if let ModuleConfig::Qspi(c) = &mut m.config {
+                    c.prescaler = saved;
+                    c.nrf53_div1 = false;
+                }
+            }
+            let old = mcu.mcu_config_text();
+            assert!(
+                !old.contains("nrf53_div1"),
+                "an old save has no mark:\n{old}"
+            );
+
+            let mut opened = def.build_mcu();
+            opened.apply_mcu_config(&old);
+            let nrf53 = dir.contains("5340");
+            assert_eq!(qspi(&opened), (want, nrf53), "{dir}: saved {saved}");
+
+            let resaved = opened.mcu_config_text();
+            let mut again = def.build_mcu();
+            again.apply_mcu_config(&resaved);
+            assert_eq!(qspi(&again), (want, nrf53), "{dir}: only once");
+        }
     }
 
     /// The small parts' serial blocks, by their embassy-nrf names.

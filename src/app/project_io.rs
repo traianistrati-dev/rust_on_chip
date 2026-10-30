@@ -206,6 +206,7 @@ impl AppIde {
                     if !restored.is_empty() {
                         if let Some(mcu) = &mut self.mcu {
                             mcu.modules = restored;
+                            mcu.upgrade_saved_modules();
                         }
                     }
                 }

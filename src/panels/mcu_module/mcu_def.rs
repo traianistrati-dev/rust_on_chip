@@ -331,8 +331,9 @@ pub struct McuDefinition {
     /// The flash part a BOARD wires to its QSPI pads, a part number from
     /// [`QSPI_FLASH_PARTS`] - `MX25R6435F` on the nRF52840 DK and the nRF5340
     /// DK. Its datasheet facts follow: a QSPI module there starts at its
-    /// capacity instead of the generic 16 MiB ([`Mcu::qspi_default`]), the
-    /// panel says when it is set to another, and main.rs sets its quad-enable
+    /// capacity instead of the generic 16 MiB ([`Mcu::qspi_default`]), on an
+    /// nRF at the SCK its quad read takes, the panel says when either is set
+    /// to another, and main.rs sets its quad-enable
     /// bit wherever embassy-nrf builds the bus (Async, and the nRF5340's
     /// Blocking). A name the table lacks says nothing. `None` on a bare part,
     /// where nothing is wired yet.

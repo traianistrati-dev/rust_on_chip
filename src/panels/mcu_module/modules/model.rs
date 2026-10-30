@@ -4231,6 +4231,9 @@ pub struct QspiFlashPart {
     /// Its capacity in KiB.
     pub kib: u32,
     pub quad_enable: QspiQuadEnable,
+    /// The fastest SCK its quad read (4READ) takes in the mode it powers up
+    /// in. A new QSPI module on an nRF starts at or below it.
+    pub quad_sck_max_hz: u32,
 }
 
 impl QspiFlashPart {
@@ -4244,12 +4247,15 @@ impl QspiFlashPart {
 /// Every flash part a board definition can name.
 pub const QSPI_FLASH_PARTS: &[QspiFlashPart] = &[
     // Macronix PM2138 Rev 1.6: 64 Mbit; QE is status bit 6, non-volatile, and
-    // the part is delivered with the status register at 00h (p.30, p.74). On
-    // the nRF52840 DK and the nRF5340 DK.
+    // the part is delivered with the status register at 00h (p.30, p.74).
+    // 4READ runs at 8 MHz at most in Ultra Low Power mode, the L parts'
+    // power-up mode, and 80 MHz in High Performance (p.68, p.70): 8 MHz is
+    // safe on either. On the nRF52840 DK and the nRF5340 DK.
     QspiFlashPart {
         part: "MX25R6435F",
         kib: 8192,
         quad_enable: QspiQuadEnable::Sr1Bit6,
+        quad_sck_max_hz: 8_000_000,
     },
 ];
 
@@ -4279,18 +4285,29 @@ pub struct QspiModuleConfig {
     #[serde(default)]
     pub address_size: QspiAddressSize,
     /// Clock divider, 0..=255: the bus runs at kernel clock / (prescaler + 1).
+    /// An nRF's divides the chip's QSPI clock by 1..=16 - see
+    /// `nrf::qspi_sck_base_hz`.
     pub prescaler: u8,
     pub rx_model: String,
     pub tx_model: String,
     /// User label appended to the generated `_qspi` handle.
     #[serde(default)]
     pub custom_label: String,
+    /// On an nRF5340, that `prescaler` counts from the 96 MHz main.rs has
+    /// had since it sets PCLK192M to 192 MHz. A project saved before carries
+    /// `false`: its prescaler ran off the reset /4 and is rescaled once on
+    /// load ([`Mcu::upgrade_saved_modules`]).
+    ///
+    /// [`Mcu::upgrade_saved_modules`]: crate::panels::mcu_module::mcu::Mcu::upgrade_saved_modules
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nrf53_div1: bool,
 }
 
 impl QspiModuleConfig {
     /// Defaults: 16 MiB, 24-bit addressing, kernel clock / 2 — a plain 128 Mbit
     /// NOR flash, which is what most boards carry. A board that says what it
-    /// carries starts there instead: [`Mcu::qspi_default`].
+    /// carries, and any nRF, whose divider counts from the chip's own clock,
+    /// start where [`Mcu::qspi_default`] puts them instead.
     ///
     /// [`Mcu::qspi_default`]: crate::panels::mcu_module::mcu::Mcu::qspi_default
     pub fn new(instance: u8) -> Self {
@@ -4302,6 +4319,7 @@ impl QspiModuleConfig {
             rx_model: String::new(),
             tx_model: String::new(),
             custom_label: String::new(),
+            nrf53_div1: false,
         }
     }
 

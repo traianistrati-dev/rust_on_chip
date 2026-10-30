@@ -79,7 +79,8 @@ pub(crate) struct NrfChip {
     pub ain: &'static [u8],
     /// The full-speed USB device controller (USBD): 52820, 52833, 52840.
     pub usbd: bool,
-    /// The QSPI flash controller: the 52840 alone.
+    /// The QSPI flash controller: the 52840 and the nRF5340's application
+    /// core.
     pub qspi: bool,
 }
 
@@ -837,15 +838,33 @@ fn usb_identity(mcu: &Mcu) -> String {
     )
 }
 
-/// The QSPI bus clock for the module's prescaler: 32 MHz / (prescaler + 1),
-/// as `(Hz, Frequency variant)`. The block's divider runs 1..=16.
-fn qspi_frequency(prescaler: u8) -> (u32, &'static str) {
+/// The QSPI bus clock for the module's prescaler: `base` / (prescaler + 1),
+/// as `(Hz, Frequency variant)`. The block's divider runs 1..=16, and
+/// embassy-nrf names each SCKFREQ after its nRF52840 clock.
+fn qspi_frequency(base: u32, prescaler: u8) -> (u32, &'static str) {
     const F: [&str; 16] = [
         "M32", "M16", "M10_7", "M8", "M6_4", "M5_3", "M4_6", "M4", "M3_6", "M3_2", "M2_9", "M2_7",
         "M2_5", "M2_3", "M2_1", "M2",
     ];
     let i = usize::from(prescaler).min(F.len() - 1);
-    (32_000_000 / (i as u32 + 1), F[i])
+    (base / (i as u32 + 1), F[i])
+}
+
+/// The clock the QSPI divides for SCK on `family`, `None` on a part without
+/// one: the nRF52840's fixed 32 MHz (SCK = 32 MHz / (SCKFREQ + 1)); the
+/// nRF5340's PCLK192M / 2 (SCK = PCLK192M / (2 * (SCKFREQ + 1))), 96 MHz
+/// because main.rs sets PCLK192M to 192 MHz before the driver starts.
+pub fn qspi_sck_base_hz(family: &str) -> Option<u32> {
+    chip(family)
+        .filter(|c| c.qspi)
+        .map(|c| if c.nrf53() { 96_000_000 } else { 32_000_000 })
+}
+
+/// The smallest SCKFREQ, 0..=15, whose SCK off `base` is at most `max_hz`.
+pub fn qspi_prescaler_for(base: u32, max_hz: u32) -> u8 {
+    (0u8..=15)
+        .find(|&p| base / (u32::from(p) + 1) <= max_hz)
+        .unwrap_or(15)
 }
 
 /// The nRF54L15's clock pins in the QFN48 package (the nRF54L15 DK's): the
@@ -3095,16 +3114,50 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
     if let Some((sck, csn, io)) = qspi_wired(mcu) {
         // A wired QSPI with no module yet starts where a new module does.
         let c = modules::qspi_config(&mcu.modules).unwrap_or_else(|| mcu.qspi_default(1));
-        let (hz, freq) = qspi_frequency(c.prescaler);
+        let base = qspi_sck_base_hz(&mcu.family).unwrap_or(32_000_000);
+        let nrf53 = chip(&mcu.family).is_some_and(|c| c.nrf53());
+        let (hz, freq) = qspi_frequency(base, c.prescaler);
         // embassy's sizes run 1 KiB << i; `capacity` is a u32 of bytes.
         let bytes = (1024u64 << c.memory_size.min(22)).min(u64::from(u32::MAX));
         o.push_str("\n    // ── QSPI ──\n");
+        if nrf53 {
+            // embassy-nrf 0.11 leaves HFCLK192MCTRL at its reset /4: PCLK192M
+            // 48 MHz, which the PS does not support and anomaly 159 corrupts
+            // data at. A raw write: embassy's pac is public only behind its
+            // `unstable-pac` feature.
+            for l in [
+                "    // The QSPI's clock, PCLK192M, at 192 MHz before the driver starts: it",
+                "    // resets to /4, and Nordic's anomaly 159 says QSPI data is corrupted",
+                "    // there. It costs some current while it runs.",
+                "    const CLOCK_HFCLK192MCTRL: usize = 0x5000_55B8; // CLOCK_S",
+                "    // SAFETY: the register's one field, HCLK192M, to Div1 (0); embassy-nrf",
+                "    // never writes it.",
+                "    unsafe { core::ptr::write_volatile(CLOCK_HFCLK192MCTRL as *mut u32, 0) };",
+                "    // Zephyr waits 7 us for a new divider to take (measured - Nordic gives",
+                "    // no figure): 512 cycles at the core's 64 MHz.",
+                "    cortex_m::asm::delay(512);",
+            ] {
+                o.push_str(l);
+                o.push('\n');
+            }
+        }
         o.push_str("    let mut qspi_cfg = embassy_nrf::qspi::Config::default();\n");
         if c.prescaler > 15 {
             o.push_str(&format!(
-                "    // Prescaler {} asked for; the nRF QSPI divides 32 MHz by 16 at most.\n",
+                "    // Prescaler {} asked for; the nRF QSPI divides its clock by 16 at most.\n",
                 c.prescaler
             ));
+        }
+        if let Some(f) = mcu.board_qspi_flash.filter(|f| hz > f.quad_sck_max_hz) {
+            o.push_str(&format!(
+                "    // {hz} Hz asked for; the board's {} takes {} Hz at most on its quad reads.\n",
+                f.part, f.quad_sck_max_hz
+            ));
+        }
+        if nrf53 && hz > 48_000_000 {
+            o.push_str(
+                "    // 96 MHz needs VDD at 1.7-2.0 V (anomaly 136; the DK's guide says 1.8 V).\n",
+            );
         }
         let board = mcu.qspi_default(1);
         if mcu.board_qspi_size().is_some() && c.memory_size != board.memory_size {
@@ -3124,9 +3177,14 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             c.memory_size_label()
         ));
         o.push_str(&format!(
-            "    // 32 MHz / {}: {} Hz on SCK.\n    qspi_cfg.frequency = embassy_nrf::qspi::Frequency::{freq};\n",
-            32_000_000 / hz,
-            hz
+            "    // {} MHz / {}: {hz} Hz on SCK{}.\n    qspi_cfg.frequency = embassy_nrf::qspi::Frequency::{freq};\n",
+            base / 1_000_000,
+            u32::from(c.prescaler.min(15)) + 1,
+            if nrf53 {
+                " - embassy's names count from the nRF52840's 32 MHz"
+            } else {
+                ""
+            }
         ));
         use crate::panels::mcu_module::modules::QspiAddressSize;
         let addr = match c.address_size {
@@ -3143,6 +3201,11 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         o.push_str(&format!(
             "    qspi_cfg.address_mode = embassy_nrf::qspi::AddressMode::{addr};\n"
         ));
+        if nrf53 {
+            o.push_str(
+                "    // Anomaly 121: RXDELAY 6 (embassy's default, 2, is the nRF52840's).\n    qspi_cfg.rx_delay = 6;\n",
+            );
+        }
         o.push_str(
             "    // Quad I/O read and page program by default - Config::default()'s opcodes.\n",
         );
@@ -3155,6 +3218,38 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
             periph(io[2]),
             periph(io[3]),
         ));
+        if nrf53 {
+            // Anomaly 121's IFCONFIG0 bits, which embassy-nrf 0.11's `new`
+            // writes as 0 and has no field for: set the way nrfx reconfigures
+            // a live QSPI - deactivate, disable, write, enable, activate.
+            let bits = if hz > 48_000_000 {
+                "v | (1 << 16) | (1 << 17)"
+            } else {
+                "(v & !(1 << 17)) | (1 << 16)"
+            };
+            for l in [
+                "    // Anomaly 121's other half: IFCONFIG0 bit 16 (bit 17 too at 96 MHz),".to_owned(),
+                "    // which `Qspi::new` writes as 0 - set the way nrfx reconfigures a live".to_owned(),
+                "    // QSPI. CSN stays high, so the flash is deselected meanwhile.".to_owned(),
+                "    const QSPI_S: usize = 0x5002_B000;".to_owned(),
+                "    // SAFETY: `new` waited for READY, so the bus is idle; only the QSPI's".to_owned(),
+                "    // tasks, ENABLE, EVENTS_READY and IFCONFIG0 are touched.".to_owned(),
+                "    unsafe {".to_owned(),
+                "        core::ptr::write_volatile((QSPI_S + 0x010) as *mut u32, 1); // TASKS_DEACTIVATE".to_owned(),
+                "        core::ptr::write_volatile((QSPI_S + 0x500) as *mut u32, 0); // ENABLE".to_owned(),
+                "        let ifconfig0 = (QSPI_S + 0x544) as *mut u32;".to_owned(),
+                "        let v = core::ptr::read_volatile(ifconfig0);".to_owned(),
+                format!("        core::ptr::write_volatile(ifconfig0, {bits});"),
+                "        core::ptr::write_volatile((QSPI_S + 0x500) as *mut u32, 1); // ENABLE".to_owned(),
+                "        core::ptr::write_volatile((QSPI_S + 0x100) as *mut u32, 0); // EVENTS_READY".to_owned(),
+                "        core::ptr::write_volatile(QSPI_S as *mut u32, 1); // TASKS_ACTIVATE".to_owned(),
+                "        while core::ptr::read_volatile((QSPI_S + 0x100) as *const u32) == 0 {}".to_owned(),
+                "    }".to_owned(),
+            ] {
+                o.push_str(&l);
+                o.push('\n');
+            }
+        }
         // The quad opcodes above need IO2/IO3 as data lines, which a flash
         // with a QE bit keeps as WP#/HOLD# until it is set. Only for a part
         // the board names: the bit differs by vendor, and SR1 bit 6 is a

@@ -363,6 +363,7 @@ fn rebuild(def: &McuDefinition, cfg: Option<&str>, main_rs: Option<&str>) -> Mcu
             // marker in main.rs.
             None => {
                 mcu.modules = crate::panels::mcu_module::modules::persist::parse_from_source(src);
+                mcu.upgrade_saved_modules();
             }
         }
         if let Some(saved) = mcu_config::saved_pins(cfg, src) {

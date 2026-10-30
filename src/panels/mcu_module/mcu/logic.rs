@@ -1767,6 +1767,7 @@ impl Mcu {
         let (modules, clock) = mcu_config::parse(text);
         if !modules.is_empty() {
             self.modules = modules;
+            self.upgrade_saved_modules();
         }
         if let Some(c) = clock {
             self.apply_saved_clock(c);
@@ -2539,18 +2540,53 @@ impl Mcu {
     }
 
     /// A new QSPI module's config: the generic one, at the capacity of the
-    /// flash the board wires to those pads when it says. Read by
+    /// flash the board wires to those pads when it says, and on an nRF at
+    /// the clock that flash's quad read takes. Read by
     /// [`Mcu::default_module_config`] and by the nRF generator for a wired
     /// QSPI with no module yet, so the two cannot start apart.
     pub fn qspi_default(
         &self,
         instance: u8,
     ) -> crate::panels::mcu_module::modules::QspiModuleConfig {
+        use crate::panels::mcu_module::codegen::nrf;
         let mut c = crate::panels::mcu_module::modules::QspiModuleConfig::new(instance);
         if let Some(i) = self.board_qspi_size() {
             c.memory_size = i;
         }
+        // On an nRF, the SCK the board's flash part takes on its quad reads,
+        // or 16 MHz - where the nRF52840 always started - on a bare part.
+        if let Some(base) = nrf::qspi_sck_base_hz(&self.family) {
+            let max = self
+                .board_qspi_flash
+                .map_or(16_000_000, |f| f.quad_sck_max_hz);
+            c.prescaler = nrf::qspi_prescaler_for(base, max);
+            c.nrf53_div1 = nrf::chip(&self.family).is_some_and(|ch| ch.nrf53());
+        }
         c
+    }
+
+    /// Bring the modules a saved project restored up to what the generator
+    /// now builds from them. Called wherever saved modules come back in.
+    ///
+    /// An nRF5340 QSPI prescaler saved before main.rs set PCLK192M to
+    /// 192 MHz ran off the reset /4: SCK = 24 MHz / (p + 1). The same number
+    /// now counts from 96 MHz, so prescaler 1, the old default, would jump
+    /// from 12 to 48 MHz - past the DK flash's 33 MHz for the status commands
+    /// the quad-enable step sends. It is rescaled to the SCK it ran at,
+    /// 4p + 3, and at most 15: 6 MHz, the slowest the nRF5340 supports.
+    pub fn upgrade_saved_modules(&mut self) {
+        use crate::panels::mcu_module::modules::ModuleConfig;
+        if !crate::panels::mcu_module::codegen::nrf::chip(&self.family).is_some_and(|c| c.nrf53()) {
+            return;
+        }
+        for m in &mut self.modules {
+            if let ModuleConfig::Qspi(c) = &mut m.config
+                && !c.nrf53_div1
+            {
+                c.prescaler = (c.prescaler.min(15) * 4 + 3).min(15);
+                c.nrf53_div1 = true;
+            }
+        }
     }
 
     /// `kind`'s default config on `inst`, with what this BOARD says about it -

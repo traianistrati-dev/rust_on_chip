@@ -458,8 +458,10 @@ the CYW43's Bluetooth half and a fourth firmware blob; and on the nRF52832,
 nRF52833 and nRF52840 through Nordic's SoftDevice Controller under the MPSL
 (`nrf-sdc`, trouble-host 0.8), which takes RTC0, TIMER0, PPI 17-31 and
 interrupt priority 0 — every vector `main.rs` binds is moved to 2 (one bound
-in your own code must be moved off 0 by hand), and a crystal chosen on the
-Clock tab is held through the MPSL, which owns CLOCK. nrf-sdc builds its
+in your own code must be moved off 0 by hand), and the crystal is held
+through the MPSL, which owns CLOCK, whenever something needs it all the time
+— the Clock tab's choice of it, LFSYNTH, or a QSPI flash, whose data the
+nRF52840's anomaly 244 corrupts while the HF source switches. nrf-sdc builds its
 bindings with bindgen, so an nRF Bluetooth build needs libclang
 (`LIBCLANG_PATH`). Not generated, with the reason in the tab: the nRF5340 (its
 radio is on the network core), the nRF54L15 (its time driver and the MPSL share

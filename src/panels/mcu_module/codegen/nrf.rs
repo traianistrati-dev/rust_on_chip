@@ -3156,7 +3156,7 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
         }
         if nrf53 && hz > 48_000_000 {
             o.push_str(
-                "    // 96 MHz needs VDD at 1.7-2.0 V (anomaly 136; the DK's guide says 1.8 V).\n",
+                "    // 96 MHz needs VDD at 1.7-2.0 V (anomaly 136); the nRF5340 DK runs at 3.0 V -\n    // use 48 MHz there.\n",
             );
         }
         let board = mcu.qspi_default(1);
@@ -3245,6 +3245,12 @@ fn async_bus_lines(mcu: &Mcu) -> AsyncBuses {
                 "        core::ptr::write_volatile(QSPI_S as *mut u32, 1); // TASKS_ACTIVATE".to_owned(),
                 "        while core::ptr::read_volatile((QSPI_S + 0x100) as *const u32) == 0 {}".to_owned(),
                 "    }".to_owned(),
+                "    // Anomaly 133: QSPI transfers degrade the radio while it receives or".to_owned(),
+                "    // transmits. This firmware starts no radio and never releases the network".to_owned(),
+                "    // core (a probe-rs attach does), but beside Bluetooth there never read or".to_owned(),
+                "    // write the QSPI during a radio event. VDD at 1.7-2.0 V only limits the RX".to_owned(),
+                "    // loss to 3 dB (the nRF5340 DK runs at 3.0 V).".to_owned(),
+                String::new(),
             ] {
                 o.push_str(&l);
                 o.push('\n');
@@ -3407,8 +3413,10 @@ fn irq_vector(entry: &str) -> &str {
 /// - before `embassy_nrf::init`: embassy-time and GPIOTE off priority 0, which
 ///   is the radio's;
 /// - after it: every other vector `main.rs` binds off 0 as well;
-/// - last in the block: the MPSL on the LF clock `init` started, an RNG, and
-///   `ble::start` with the SoftDevice Controller's PPI channels.
+/// - last in the block: the MPSL on the LF clock `init` started, the crystal
+///   held where something needs it all the time (and, beside a QSPI, waited
+///   for), an RNG, and `ble::start` with the SoftDevice Controller's PPI
+///   channels.
 fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     let ours: Vec<String> = irqs
         .iter()
@@ -3462,7 +3470,7 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
             "0",
             "0",
             "50",
-            "synthesized from the HF crystal, which then never stops",
+            "synthesized from the HF clock, held on the crystal below - a source Nordic has not tested with the SoftDevice Controller (DRGN-6362)",
         ),
         LfSource::Rc => (
             "MPSL_CLOCK_LF_SRC_RC",
@@ -3499,14 +3507,41 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     body.push_str("        )\n");
     body.push_str("        .unwrap(),\n");
     body.push_str("    );\n");
-    // The MPSL owns CLOCK from here and starts the crystal for its radio
-    // events only; the Clock tab's crystal is held by a request never
-    // released. LFSYNTH keeps it running already.
-    if clock.hfxo && clock.lf != LfSource::Synth {
+    // The MPSL owns CLOCK from here and starts the crystal for its own work
+    // only - radio events, LFRC calibration - stopping it in between. What
+    // needs it all the time holds a request never released: the Clock tab's
+    // choice; LFSYNTH, which runs off the HF clock and would sit on HFINT
+    // between events (the MPSL's docs list only LFRC and LFXO as its
+    // sources); and a QSPI, whose data nRF52840 anomaly 244 corrupts while
+    // the HF source switches.
+    let qspi = qspi_wired(mcu).is_some();
+    let synth = clock.lf == LfSource::Synth;
+    if clock.hfxo || synth || qspi {
         body.push_str(
-            "    // The Clock tab's 32 MHz crystal: the MPSL owns CLOCK now and may stop it\n",
+            "    // The MPSL owns CLOCK now and stops the 32 MHz crystal between its radio\n",
         );
-        body.push_str("    // between radio events, so it is requested once and never released.\n");
+        body.push_str("    // events. Requested once and never released, it runs for:\n");
+        if clock.hfxo {
+            body.push_str("    // - the Clock tab's choice of it;\n");
+        }
+        if synth {
+            body.push_str(
+                "    // - LFSYNTH, which runs off the HF clock: on HFINT between events it\n",
+            );
+            body.push_str("    //   would miss the 50 ppm the MPSL was told above;\n");
+        }
+        if qspi {
+            body.push_str(
+                "    // - the QSPI flash: nRF52840 anomaly 244 corrupts QSPI data while the\n",
+            );
+            body.push_str("    //   HF clock switches between HFINT and the crystal.\n");
+        }
+        body.push_str(
+            "    // The MPSL allows one such request at a time and this is it: a later\n",
+        );
+        body.push_str(
+            "    // `mpsl.request_hfclk()` returns Err(EINVAL) - none is needed, it runs.\n",
+        );
         body.push_str("    core::mem::forget(mpsl.request_hfclk().await.unwrap());\n");
     }
     body.push_str("    static RNG:static_cell::StaticCell<embassy_nrf::rng::Rng<'static, embassy_nrf::mode::Blocking>> =\n");
@@ -3524,6 +3559,30 @@ fn ble_lines(mcu: &Mcu, irqs: &mut Vec<String>) -> (String, String, String) {
     body.push_str("        ),\n");
     body.push_str("        RNG.init(embassy_nrf::rng::Rng::new_blocking(p.RNG)),\n");
     body.push_str("    );\n");
+    // `Hfclk::wait` is woken from the MPSL's own task, which `ble::start`
+    // spawns - so it waits here, not beside the request.
+    if qspi {
+        // `async_clock_lines`' rule for `init` starting the crystal itself.
+        let init_xtal = clock.hfxo || (usb_wired(mcu) && mcu.is_async()) || thread_on(mcu);
+        for l in [
+            "    // Anomaly 244 again: the crystal is up before the QSPI's next transfer - the",
+            "    // quad-enable above ran before the MPSL, when nothing switched the HF clock.",
+            "    // The MPSL reports it from its own task, which `ble::start` spawned.",
+            if init_xtal {
+                "    // Bounded, the result dropped: whether it reports a crystal `init` started is not documented."
+            } else {
+                "    // Bounded, the result dropped: 10 ms is far past the crystal's 1.4 ms worst start."
+            },
+            "    let _ = embassy_time::with_timeout(",
+            "        embassy_time::Duration::from_millis(10),",
+            "        nrf_sdc::mpsl::Hfclk::wait(),",
+            "    )",
+            "    .await;",
+        ] {
+            body.push_str(l);
+            body.push('\n');
+        }
+    }
     (before, after, body)
 }
 
@@ -5180,8 +5239,8 @@ mod async_codegen {
 
     /// Bluetooth with the Clock tab's crystal: the MPSL owns CLOCK and starts
     /// the crystal for its own radio events, so `main.rs` holds a request for
-    /// good - after the MPSL exists - except on LFSYNTH, which keeps the
-    /// crystal running anyway.
+    /// good - after the MPSL exists. LFSYNTH holds it too: it runs off the HF
+    /// clock, which the MPSL would leave on HFINT between its events.
     #[test]
     fn bluetooth_holds_the_clock_tabs_crystal() {
         use crate::panels::mcu_module::iot::BleConfig;
@@ -5199,11 +5258,105 @@ mod async_codegen {
         let main = mcu.fresh_main_rs();
         assert_eq!(main.matches(hold).count(), 1, "{main}");
         assert!(main.find("MultiprotocolServiceLayer::new(").unwrap() < main.find(hold).unwrap());
+        assert!(
+            !main.contains("Hfclk::wait"),
+            "the crystal alone, no QSPI, no wait:\n{main}"
+        );
 
+        select(&mut mcu, "hfclk_src", 0);
         select(&mut mcu, "lfclk_src", 1);
         let main = mcu.fresh_main_rs();
         assert!(main.contains("MPSL_CLOCK_LF_SRC_SYNTH"), "{main}");
-        assert!(!main.contains(hold), "{main}");
+        assert_eq!(main.matches(hold).count(), 1, "{main}");
+        assert!(
+            main.contains("// - LFSYNTH, which runs off the HF clock"),
+            "{main}"
+        );
+        assert!(!main.contains("Hfclk::wait"), "no QSPI, no wait:\n{main}");
+    }
+
+    /// Bluetooth beside the nRF52840 DK's QSPI flash, on the Clock tab's
+    /// internal oscillator: anomaly 244 corrupts QSPI data while the MPSL
+    /// switches HFINT and the crystal around its radio events, so the
+    /// crystal is held for good and waited for - after `ble::start`, whose
+    /// MPSL task reports it - before anything past the block touches the
+    /// flash. The driver and its quad-enable step run before the MPSL, when
+    /// nothing switches. Without the QSPI, neither.
+    #[test]
+    fn bluetooth_beside_the_qspi_holds_and_waits_for_the_crystal() {
+        use crate::panels::mcu_module::iot::BleConfig;
+        let hold = "core::mem::forget(mpsl.request_hfclk().await.unwrap());";
+        let wait = "nrf_sdc::mpsl::Hfclk::wait(),";
+        let mut mcu = crate::panels::mcu_module::builtins::builtin_for("nrf52840_dk")
+            .expect("the bundled nRF52840 DK")
+            .build_mcu();
+        mcu.runtime = Runtime::Async;
+        select(&mut mcu, "hfclk_src", 0);
+        select(&mut mcu, "lfclk_src", 0);
+        mcu.iot.ble = Some(BleConfig::default());
+        let main = mcu.fresh_main_rs();
+        assert!(super::ble_on(&mcu), "Bluetooth is generated");
+        assert!(!main.contains(hold) && !main.contains(wait), "{main}");
+
+        for p in mcu.iter_all_pins_mut() {
+            for (key, f) in [
+                ("(QSPI CS,", PinFunction::QspiNcs { bank: 1 }),
+                ("(QSPI CLK,", PinFunction::QspiClk),
+                ("(QSPI IO0,", PinFunction::QspiIo { bank: 1, lane: 0 }),
+                ("(QSPI IO1,", PinFunction::QspiIo { bank: 1, lane: 1 }),
+                ("(QSPI IO2,", PinFunction::QspiIo { bank: 1, lane: 2 }),
+                ("(QSPI IO3,", PinFunction::QspiIo { bank: 1, lane: 3 }),
+            ] {
+                if p.name.contains(key) {
+                    p.selected_function = f;
+                }
+            }
+        }
+        mcu.reconcile_modules();
+        let main = mcu.fresh_main_rs();
+        assert!(main.contains("Qspi::new("), "{main}");
+        assert_eq!(main.matches(hold).count(), 1, "{main}");
+        assert!(
+            main.contains("// - the QSPI flash: nRF52840 anomaly 244"),
+            "{main}"
+        );
+        assert!(
+            !main.contains("// - the Clock tab's choice of it;"),
+            "{main}"
+        );
+        let at = |s: &str| main.find(s).unwrap_or_else(|| panic!("{s:?}:\n{main}"));
+        assert!(at("(0x05, &[], &mut qspi_sr)") < at("MultiprotocolServiceLayer::new("));
+        assert!(at("MultiprotocolServiceLayer::new(") < at(hold));
+        assert!(at(hold) < at("pins::configs::ble::start("));
+        assert!(at("pins::configs::ble::start(") < at(wait));
+        assert!(at(wait) < at("// <<< GENERATED END >>>"));
+        assert!(
+            main.contains("    let _ = embassy_time::with_timeout(\n        embassy_time::Duration::from_millis(10),"),
+            "{main}"
+        );
+        assert!(
+            main.contains("10 ms is far past the crystal's 1.4 ms worst start."),
+            "{main}"
+        );
+
+        // On the Clock tab's crystal too: one hold for both reasons, and the
+        // wait's bound now hedges the crystal `init` started.
+        select(&mut mcu, "hfclk_src", 1);
+        let main = mcu.fresh_main_rs();
+        assert_eq!(main.matches(hold).count(), 1, "{main}");
+        assert!(
+            main.contains("// - the Clock tab's choice of it;"),
+            "{main}"
+        );
+        assert!(
+            main.contains("// - the QSPI flash: nRF52840 anomaly 244"),
+            "{main}"
+        );
+        assert!(main.contains(wait), "{main}");
+        assert!(
+            main.contains("a crystal `init` started is not documented."),
+            "{main}"
+        );
     }
 
     /// Thread builds soft-float - the one target OpenThread ships compiled
@@ -5266,10 +5419,12 @@ mod async_codegen {
 
     /// The IoT tab's Bluetooth on three nRF52 boards, for a real cross-compile
     /// AND link (two critical sections - cortex-m's beside nrf-mpsl's - only
-    /// fail at the link): the nRF52840 DK and the nRF52832 DK (64 KiB of RAM,
-    /// the tightest) with nothing else, and the micro:bit v2 with every async
-    /// peripheral wired, so every bound vector is moved off priority 0. The
-    /// manifest goes through the app's calls in the app's order.
+    /// fail at the link): the nRF52840 DK on the Clock tab's crystal with its
+    /// QSPI flash wired (the crystal held for good and waited for after
+    /// `ble::start`), the nRF52832 DK (64 KiB of RAM, the tightest) with
+    /// nothing else, and the micro:bit v2 with every async peripheral wired,
+    /// so every bound vector is moved off priority 0, on LFSYNTH (held too).
+    /// The manifest goes through the app's calls in the app's order.
     ///
     /// ```text
     /// cargo test --bin rust_on_chip emit_nrf_ble_project -- --ignored --nocapture
@@ -5295,12 +5450,30 @@ mod async_codegen {
                 m
             };
             // The three LF sources the MPSL is handed, and the crystal held
-            // for good: the 52840 DK on the HF crystal with the RC oscillator,
-            // the 52832 DK on the 32.768 kHz crystal, the micro:bit on LFSYNTH.
+            // for good: the 52840 DK on the HF crystal with the RC oscillator
+            // and its QSPI flash wired (anomaly 244's hold and wait), the
+            // 52832 DK on the 32.768 kHz crystal, the micro:bit on LFSYNTH.
             match id {
-                "nrf52840_dk" => select(&mut mcu, "hfclk_src", 1),
+                "nrf52840_dk" => {
+                    select(&mut mcu, "hfclk_src", 1);
+                    for p in mcu.iter_all_pins_mut() {
+                        for (key, f) in [
+                            ("(QSPI CS,", PinFunction::QspiNcs { bank: 1 }),
+                            ("(QSPI CLK,", PinFunction::QspiClk),
+                            ("(QSPI IO0,", PinFunction::QspiIo { bank: 1, lane: 0 }),
+                            ("(QSPI IO1,", PinFunction::QspiIo { bank: 1, lane: 1 }),
+                            ("(QSPI IO2,", PinFunction::QspiIo { bank: 1, lane: 2 }),
+                            ("(QSPI IO3,", PinFunction::QspiIo { bank: 1, lane: 3 }),
+                        ] {
+                            if p.name.contains(key) {
+                                p.selected_function = f;
+                            }
+                        }
+                    }
+                    mcu.reconcile_modules();
+                }
                 "nrf52832_dk" => select(&mut mcu, "lfclk_src", 2),
-                _ => {}
+                _ => select(&mut mcu, "lfclk_src", 1),
             }
             mcu.iot.ble = Some(BleConfig::default());
             assert!(super::ble_on(&mcu), "{id}: Bluetooth is generated");
@@ -5322,6 +5495,16 @@ mod async_codegen {
             );
             assert_eq!(
                 main_rs.contains("request_hfclk"),
+                id != "nrf52832_dk",
+                "{main_rs}"
+            );
+            assert_eq!(
+                main_rs.contains("MPSL_CLOCK_LF_SRC_SYNTH"),
+                id == "nrf52833_microbit_v2",
+                "{main_rs}"
+            );
+            assert_eq!(
+                main_rs.contains("Hfclk::wait()"),
                 id == "nrf52840_dk",
                 "{main_rs}"
             );

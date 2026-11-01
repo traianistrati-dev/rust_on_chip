@@ -1713,7 +1713,7 @@ mod tests {
             m.contains("    // 32 MHz / 4: 8000000 Hz on SCK.\n    qspi_cfg.frequency = embassy_nrf::qspi::Frequency::M8;"),
             "{m}"
         );
-        for s in ["HFCLK192MCTRL", "rx_delay", "QSPI_S"] {
+        for s in ["HFCLK192MCTRL", "rx_delay", "QSPI_S", "Anomaly 133"] {
             assert!(!m.contains(s), "the nRF52840 has no {s}:\n{m}");
         }
         set_prescaler(&mut mcu, 1);
@@ -1731,6 +1731,12 @@ mod tests {
                 "{dir}: {m}"
             );
             assert!(m.contains("\n    qspi_cfg.rx_delay = 6;\n"), "{dir}: {m}");
+            assert!(
+                m.contains(
+                    "    // Anomaly 133: QSPI transfers degrade the radio while it receives or"
+                ),
+                "{dir}: {m}"
+            );
             // In order: the clock before the driver, bit 16 after it and
             // before the first transfer.
             let mut at = 0;

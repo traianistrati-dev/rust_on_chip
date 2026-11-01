@@ -847,11 +847,52 @@ const NRF5340_APP_ONLY: &str = "nRF5340_xxAA_APPONLY";
 /// session. About 140 ms, only for the nRF5340, and every caller is on its
 /// session's worker thread.
 pub fn probe_rs_chip(chip: &str) -> String {
-    probe_rs_chip_with(chip, list_targets)
+    probe_rs_chip_with(chip, || {
+        let has = list_targets().is_some_and(|k| lists_app_only(&k));
+        FRESH_APP_ONLY.store(
+            if has { 2 } else { 1 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        has
+    })
 }
 
-/// `chip`, or its application-core-only twin when the installed probe-rs's
-/// targets - `lookup`, lowercased, run only for the nRF5340 - have one.
+/// What the last fresh `probe-rs chip list` a session asked said of the
+/// app-only target: 0 not asked yet, 1 absent, 2 present. The note a tab
+/// draws follows it, so a probe-rs upgraded or downgraded while the IDE runs
+/// shows from the next session on - not only after a restart.
+static FRESH_APP_ONLY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The note a session that does not reset the chip should carry, for a
+/// definition's `chip`: [`network_core_note`] on the name [`probe_rs_chip`]
+/// would hand probe-rs. A tab draws it every frame, so it is read from the
+/// last session's fresh answer ([`FRESH_APP_ONLY`]), and from
+/// [`known_targets`]' cache before any. The Profile tab's Sample is such a
+/// session; the caller asks only while probe-rs is present, as for
+/// [`chip_gap`] - asking with it missing would cache its absence.
+pub fn attach_network_core_note(chip: &str) -> Option<&'static str> {
+    attach_note_with(chip, || {
+        match FRESH_APP_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => known_targets().is_some_and(lists_app_only),
+        }
+    })
+}
+
+/// [`attach_network_core_note`] with the "has the app-only target" answer
+/// given - `has_app_only` runs only for the nRF5340.
+fn attach_note_with(chip: &str, has_app_only: impl FnOnce() -> bool) -> Option<&'static str> {
+    network_core_note(&probe_rs_chip_with(chip, has_app_only))
+}
+
+/// Whether a lowercased `probe-rs chip list` has the nRF5340's app-only twin.
+fn lists_app_only(known: &std::collections::HashSet<String>) -> bool {
+    known.contains(&NRF5340_APP_ONLY.to_ascii_lowercase())
+}
+
+/// `chip`, or its application-core-only twin when the installed probe-rs has
+/// one - `has_app_only`, asked only for the nRF5340.
 ///
 /// probe-rs's stock `nRF5340_xxAA` (0.29 and 0.32 alike) opens EVERY session
 /// by releasing the network core from Force-OFF. A session that resets the
@@ -863,14 +904,9 @@ pub fn probe_rs_chip(chip: &str) -> String {
 /// flash algorithms, no network core, and so no release. Nothing this IDE
 /// builds runs on the network core, so that target whenever the installed
 /// probe-rs has it; the stock one otherwise - failing open, like [`chip_gap`].
-fn probe_rs_chip_with(
-    chip: &str,
-    lookup: impl FnOnce() -> Option<std::collections::HashSet<String>>,
-) -> String {
+fn probe_rs_chip_with(chip: &str, has_app_only: impl FnOnce() -> bool) -> String {
     let chip = chip.trim();
-    if chip.eq_ignore_ascii_case(NRF5340)
-        && lookup().is_some_and(|k| k.contains(&NRF5340_APP_ONLY.to_ascii_lowercase()))
-    {
+    if chip.eq_ignore_ascii_case(NRF5340) && has_app_only() {
         return NRF5340_APP_ONLY.to_owned();
     }
     chip.to_owned()
@@ -952,16 +988,14 @@ mod chip_gap_tests {
         let v029: HashSet<String> = ["nrf53_series", "nrf5340_xxaa"].map(String::from).into();
         let mut v032 = v029.clone();
         v032.insert("nrf5340_xxaa_apponly".to_owned());
-        let with = |chip: &str, set: &HashSet<String>| {
-            let set = set.clone();
-            probe_rs_chip_with(chip, move || Some(set))
-        };
+        let with =
+            |chip: &str, set: &HashSet<String>| probe_rs_chip_with(chip, || lists_app_only(set));
 
         assert_eq!(with("nRF5340_xxAA", &v032), "nRF5340_xxAA_APPONLY");
         assert_eq!(with(" nrf5340_xxaa ", &v032), "nRF5340_xxAA_APPONLY");
         assert_eq!(with("nRF5340_xxAA", &v029), "nRF5340_xxAA");
         assert_eq!(
-            probe_rs_chip_with("nRF5340_xxAA", || None),
+            probe_rs_chip_with("nRF5340_xxAA", || false),
             "nRF5340_xxAA",
             "fails open"
         );
@@ -976,6 +1010,12 @@ mod chip_gap_tests {
         assert!(network_core_note("nRF5340_xxAA").is_some());
         assert!(network_core_note("nRF5340_xxAA_APPONLY").is_none());
         assert!(network_core_note("nRF52840_xxAA").is_none());
+
+        // The Profile tab's: the definition's name in, the note only while the
+        // session would get the stock target.
+        assert!(attach_note_with("nRF5340_xxAA", || false).is_some());
+        assert!(attach_note_with("nRF5340_xxAA", || true).is_none());
+        assert!(attach_note_with("nRF52840_xxAA", || panic!("probe-rs asked")).is_none());
     }
 
     /// Every place that hands probe-rs a chip asks [`probe_rs_chip`] first - a

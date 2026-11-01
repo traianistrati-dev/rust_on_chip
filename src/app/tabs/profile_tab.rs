@@ -521,6 +521,17 @@ fn runtime_view(
             },
         );
     });
+    // Sample attaches without a reset, which on the stock nRF5340 target
+    // leaves the network core running - see `probe::network_core_note`. Not
+    // while probe-rs is missing: Sample cannot run, and asking would cache
+    // its absence (as `chip_gap` above is gated).
+    if !no_probe_rs && let Some(note) = crate::probe::attach_network_core_note(chip) {
+        ui.label(
+            egui::RichText::new(note)
+                .size(10.5)
+                .color(egui::Color32::from_rgb(200, 140, 60)),
+        );
+    }
     ui.separator();
 
     match &st {

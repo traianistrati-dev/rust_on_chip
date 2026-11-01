@@ -85,6 +85,22 @@ fn custom_pad_type(p: &Pin) -> Option<String> {
     pin_type(p)
 }
 
+/// The `pins::configs::io` bridge a Custom module's pad crosses on the
+/// Portable GPIO api, or `None`. The module's `impl` is bound on
+/// embedded-hal 1.0 (`Mcu::custom_module_files`) and an stm32f1xx-hal pin
+/// speaks 0.2, so the pad goes in wrapped, as Blocking binds it
+/// (`stm32::into_expr`) - but only into the module: every other GPIO stays a
+/// raw resource. An armed input stays raw there too (`ExtiPin` is the HAL
+/// pin's), and a PWM pad has no bridge.
+fn custom_pad_bridge(p: &Pin, gpio_native: bool) -> Option<&'static str> {
+    match p.selected_function {
+        _ if gpio_native => None,
+        PinFunction::GpioOutput => Some("pins::configs::io::DigitalOut"),
+        PinFunction::GpioInput if p.irq.is_none() => Some("pins::configs::io::DigitalIn"),
+        _ => None,
+    }
+}
+
 /// Every plain GPIO pin, in binding order - but the ones in `owned`, which a
 /// Custom module's `new` moves into its struct, the resource they travel in.
 ///
@@ -746,19 +762,44 @@ pub fn make_generated_section(
     let custom_fields: String = customs
         .iter()
         .map(|c| {
-            let tys: Vec<String> = c
+            let pads: Vec<&Pin> = c
                 .pins
                 .iter()
-                .filter_map(|n| all_pins.iter().find(|p| p.number == *n))
-                .filter_map(|p| custom_pad_type(p))
+                .filter_map(|n| all_pins.iter().find(|p| p.number == *n).copied())
+                .collect();
+            let tys: Vec<String> = pads
+                .iter()
+                .filter_map(|p| {
+                    let ty = custom_pad_type(p)?;
+                    Some(match custom_pad_bridge(p, gpio_native) {
+                        Some(bridge) => format!("{bridge}<{ty}>"),
+                        None => ty,
+                    })
+                })
                 .collect();
             // Every pad has one: `custom_module_plan` builds a module from
             // GPIO In/Out pads and the PWM pads no timer takes, nothing else.
             debug_assert_eq!(tys.len(), c.pins.len(), "{c:?}");
-            fn_calls = fn_calls.replace(
-                &format!("let mut {} = {}::new(", c.var, c.path),
-                &format!("let {} = {}::new(", c.var, c.path),
-            );
+            // `let`, not `let mut`, and each pad through its bridge - the
+            // arguments are the pads' bindings, in the order `c.pins` has.
+            let head = format!("let mut {} = {}::new(", c.var, c.path);
+            if let Some(at) = fn_calls.find(&head)
+                && let Some(len) = fn_calls[at + head.len()..].find(");\n")
+            {
+                let open = at + head.len();
+                let args: Vec<String> = fn_calls[open..open + len]
+                    .split(", ")
+                    .zip(&pads)
+                    .map(|(arg, p)| match custom_pad_bridge(p, gpio_native) {
+                        Some(bridge) => format!("{bridge}({arg})"),
+                        None => arg.to_owned(),
+                    })
+                    .collect();
+                fn_calls.replace_range(
+                    at..open + len,
+                    &format!("let {} = {}::new({}", c.var, c.path, args.join(", ")),
+                );
+            }
             format!("        {}: {}<{}>,\n", c.var, c.path, tys.join(", "))
         })
         .collect();
@@ -781,6 +822,18 @@ pub fn make_generated_section(
         .map(|b| format!("            {b},\n"))
         .collect::<String>();
     let task_fns = tasks(&irqs);
+    // Every resource no generated task takes goes to `#[idle]`, and through it
+    // to the user's loop: an armed pin's task takes that pin.
+    let tasked: std::collections::BTreeSet<&str> =
+        irqs.iter().map(|p| p.binding.as_str()).collect();
+    let idle_locals: Vec<String> = locals_all
+        .iter()
+        .map(|p| p.binding.clone())
+        .filter(|b| !tasked.contains(b.as_str()))
+        .chain(buses.iter().map(|b| b.binding.clone()))
+        .chain(customs.iter().map(|c| c.var.clone()))
+        .collect();
+    let idle = idle_fn(&idle_locals);
 
     format!(
         "{GEN_BEGIN}\n\
@@ -824,13 +877,7 @@ pub fn make_generated_section(
          {arming_i}\n\
          \x20       (Shared {{}}, Local {{{local_init}}})\n\
          \x20   }}\n\
-         \n\
-         \x20   #[idle]\n\
-         \x20   fn idle(_cx: idle::Context) -> ! {{\n\
-         \x20       loop {{\n\
-         \x20           rtic::export::wfi();\n\
-         \x20       }}\n\
-         \x20   }}\n\
+         {idle}\
          {task_fns}\
          }}\n\
          {GEN_END}\n",
@@ -852,6 +899,29 @@ pub fn make_generated_section(
         pin_section_i = indent(&pin_section),
         fn_calls_i = indent(&fn_calls),
         arming_i = indent(&arming),
+    )
+}
+
+/// `#[idle]`: whenever no interrupt task runs. It takes `locals` - every
+/// resource no generated task does - and hands its context to the user's
+/// `idle_loop` below the markers ([`super::common::RTIC_IDLE_SEED`]), so the
+/// pins, the bus handles and the Custom modules are reachable from code that
+/// survives regeneration. `idle::Context` exists with no resources too, so
+/// the user's signature never changes.
+fn idle_fn(locals: &[String]) -> String {
+    let attr = if locals.is_empty() {
+        "#[idle]".to_owned()
+    } else {
+        format!("#[idle(local = [{}])]", locals.join(", "))
+    };
+    format!(
+        "\n    // Whenever no interrupt task runs. Every resource no generated task\n\
+         \x20   // takes is in `cx.local`, for `{f}` below the markers - yours.\n\
+         \x20   {attr}\n\
+         \x20   fn idle(cx: idle::Context) -> ! {{\n\
+         \x20       {f}(cx)\n\
+         \x20   }}\n",
+        f = super::common::RTIC_IDLE_FN
     )
 }
 
@@ -901,6 +971,12 @@ fn default_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> S
     } else {
         format!("{}\n", indent(&inits))
     };
+    let idle = idle_fn(
+        &handles
+            .iter()
+            .map(|b| b.binding.clone())
+            .collect::<Vec<_>>(),
+    );
     let (allow, fields, moved) = if handles.is_empty() {
         (String::new(), String::new(), String::new())
     } else {
@@ -948,13 +1024,7 @@ fn default_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> S
          \x20       // Select pins in the MCU Configurator to generate code here.\n\
          \x20       (Shared {{}}, Local {{{moved}}})\n\
          \x20   }}\n\
-         \n\
-         \x20   #[idle]\n\
-         \x20   fn idle(_cx: idle::Context) -> ! {{\n\
-         \x20       loop {{\n\
-         \x20           rtic::export::wfi();\n\
-         \x20       }}\n\
-         \x20   }}\n\
+         {idle}\
          }}\n\
          {GEN_END}\n"
     )
@@ -1369,6 +1439,14 @@ mod tests {
             "",
             &[],
         );
+        // No resource at all: `#[idle]` with none, and the user's loop called
+        // all the same - `idle::Context` exists either way.
+        assert!(
+            code.contains(
+                "    #[idle]\n    fn idle(cx: idle::Context) -> ! {\n        idle_loop(cx)\n"
+            ),
+            "{code}"
+        );
         for item in [
             "#[rtic::app(device = stm32f1xx_hal::pac",
             "#[shared]",
@@ -1432,10 +1510,12 @@ mod tests {
     /// its pads, which it holds: moved into it once, never into `Local` beside
     /// it as well (E0382). Each pad's type follows its mode - an open-drain
     /// output and a pull-up input are no `PushPull` / `Floating` - for a plain
-    /// resource too.
+    /// resource too. On the Portable GPIO api the module's pads cross the
+    /// embedded-hal 1.0 bridge its `impl` is bound on; the other GPIOs stay
+    /// raw, and on the Native api so do its pads.
     #[test]
     fn a_custom_module_is_a_local_resource_holding_its_pads() {
-        let main = rtic_with_custom(
+        let mut mcu = rtic_with_custom(
             &[
                 ("PB12", PinFunction::GpioOutput, Some(GpioMode::OpenDrain)),
                 ("PB13", PinFunction::GpioInput, Some(GpioMode::PullUp)),
@@ -1444,19 +1524,34 @@ mod tests {
                 ("PB14", PinFunction::GpioInput, Some(GpioMode::PullUp)),
                 ("PC13", PinFunction::GpioOutput, None),
             ],
-        )
-        .fresh_main_rs();
+        );
+        let main = mcu.fresh_main_rs();
         assert!(
             main.contains(
-                "        panel: pins::configs::custom_panel::Panel<gpio::gpiob::PB12<gpio::Output<gpio::OpenDrain>>, gpio::gpiob::PB13<gpio::Input<gpio::PullUp>>>,\n"
+                "        panel: pins::configs::custom_panel::Panel<pins::configs::io::DigitalOut<gpio::gpiob::PB12<gpio::Output<gpio::OpenDrain>>>, pins::configs::io::DigitalIn<gpio::gpiob::PB13<gpio::Input<gpio::PullUp>>>>,\n"
             ),
             "{main}"
         );
         assert!(
             main.contains(
-                "let panel = pins::configs::custom_panel::Panel::new(pb12_out, pb13_in);"
+                "let panel = pins::configs::custom_panel::Panel::new(pins::configs::io::DigitalOut(pb12_out), pins::configs::io::DigitalIn(pb13_in));"
             ),
             "{main}"
+        );
+        // The Native GPIO api has no bridge: the pads go in raw.
+        mcu.gpio_api = crate::panels::mcu_module::modules::ApiStyle::Native;
+        let native = mcu.fresh_main_rs();
+        assert!(
+            native.contains(
+                "        panel: pins::configs::custom_panel::Panel<gpio::gpiob::PB12<gpio::Output<gpio::OpenDrain>>, gpio::gpiob::PB13<gpio::Input<gpio::PullUp>>>,\n"
+            ),
+            "{native}"
+        );
+        assert!(
+            native.contains(
+                "let panel = pins::configs::custom_panel::Panel::new(pb12_out, pb13_in);"
+            ),
+            "{native}"
         );
         assert!(!main.contains("let mut panel"), "{main}");
         assert!(main.contains("            panel,\n"), "{main}");
@@ -1471,6 +1566,203 @@ mod tests {
             main.contains("        pc13_out: gpio::gpioc::PC13<gpio::Output<gpio::PushPull>>,\n"),
             "{main}"
         );
+    }
+
+    /// `#[idle]` takes every resource no generated task does - not an armed
+    /// pin's, which its EXTI task takes - and hands its context to the user's
+    /// `idle_loop`, seeded once below the tail and never rewritten. Leaving
+    /// RTIC takes an untouched seed out (it names RTIC's `app`), one the user
+    /// changed stays - compiled out until RTIC is back, which gives the same
+    /// file again - and coming back adds no second.
+    #[test]
+    fn idle_hands_every_free_resource_to_the_users_loop() {
+        use crate::panels::mcu_module::codegen::common::{RTIC_IDLE_FENCE, RTIC_IDLE_SEED};
+        use crate::panels::mcu_module::mcu::Runtime;
+        let mut mcu = rtic_with_custom(
+            &[
+                ("PB12", PinFunction::GpioOutput, Some(GpioMode::OpenDrain)),
+                ("PB13", PinFunction::GpioInput, Some(GpioMode::PullUp)),
+            ],
+            &[
+                ("PB1", PinFunction::GpioInput, None),
+                ("PC13", PinFunction::GpioOutput, None),
+            ],
+        );
+        mcu.iter_all_pins_mut()
+            .find(|p| p.name == "PB1")
+            .expect("PB1")
+            .irq = Some(Edge::Rising);
+        let main = mcu.fresh_main_rs();
+        assert!(
+            main.contains(
+                "    #[idle(local = [pc13_out, panel])]\n    fn idle(cx: idle::Context) -> ! {\n        idle_loop(cx)\n    }\n"
+            ),
+            "{main}"
+        );
+        assert!(
+            main.contains("#[task(binds = EXTI1, local = [pb1_in])]"),
+            "{main}"
+        );
+        let tail = &main[main.find(GEN_END).expect("the block")..];
+        assert_eq!(tail.matches(RTIC_IDLE_SEED).count(), 1, "{main}");
+        assert!(
+            tail.starts_with(&format!("{GEN_END}\n\n{RTIC_USER_TAIL}\n{RTIC_IDLE_SEED}")),
+            "under RTIC's comment:\n{tail}"
+        );
+        assert_eq!(mcu.update_main_rs(&main), main, "kept, and no second one");
+
+        // The loop is the user's.
+        let mine = main.replace(
+            "fn idle_loop(_cx: app::idle::Context) -> ! {\n    loop {\n        // Your code here.\n",
+            "fn idle_loop(cx: app::idle::Context) -> ! {\n    loop {\n        cx.local.panel.update();\n",
+        );
+        assert_ne!(mine, main);
+        assert_eq!(mcu.update_main_rs(&mine), mine);
+
+        // Leaving RTIC: untouched it goes, changed it stays - fenced off, as
+        // `app` is RTIC's; back, one again, and the fence comes off.
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+        let blocking = mcu.update_main_rs(&main);
+        assert!(!blocking.contains("fn idle_loop"), "{blocking}");
+        let fenced = mcu.update_main_rs(&mine);
+        assert!(
+            fenced.contains(&format!(
+                "{RTIC_IDLE_FENCE}fn idle_loop(cx: app::idle::Context) -> ! {{\n    loop {{\n        cx.local.panel.update();\n"
+            )),
+            "the user's loop stays, compiled out:\n{fenced}"
+        );
+        assert_eq!(mcu.update_main_rs(&fenced), fenced, "fenced once");
+        mcu.runtime = Runtime::Rtic;
+        mcu.pending_runtime = Runtime::Rtic;
+        let back = mcu.update_main_rs(&blocking);
+        assert_eq!(back.matches("fn idle_loop(").count(), 1, "{back}");
+        assert_eq!(mcu.update_main_rs(&fenced), mine, "the fence comes off");
+    }
+
+    /// A local glob may bring the user's `idle_loop` in - but not when the
+    /// block it replaces is RTIC's from before the generated `#[idle]`: that
+    /// project has none to bring, and seeding none would leave `idle` calling
+    /// a name nothing defines (E0425). Through another runtime and back, the
+    /// glob still holds it: a seed beside it would shadow the user's loop,
+    /// which would then never run.
+    #[test]
+    fn a_local_glob_holds_the_idle_loop_unless_the_old_rtic_block_had_none() {
+        use crate::panels::mcu_module::codegen::common::{RTIC_IDLE_SEED, glob_may_hold_idle_loop};
+        use crate::panels::mcu_module::mcu::Runtime;
+        let mut mcu = rtic_with_custom(&[("PB12", PinFunction::GpioOutput, None)], &[]);
+        let fresh = mcu.fresh_main_rs();
+        // The user moved their loop into a module and globbed it in.
+        let moved = fresh.replace(RTIC_IDLE_SEED, "mod helpers;\nuse helpers::*;\n");
+        assert_ne!(moved, fresh);
+        assert!(glob_may_hold_idle_loop(&moved));
+        assert_eq!(mcu.update_main_rs(&moved), moved, "the glob holds it");
+
+        // Off RTIC and back: no seed shadows it.
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+        let blocking = mcu.update_main_rs(&moved);
+        assert!(blocking.contains("use helpers::*;"), "{blocking}");
+        assert!(glob_may_hold_idle_loop(&blocking));
+        mcu.runtime = Runtime::Rtic;
+        mcu.pending_runtime = Runtime::Rtic;
+        let back = mcu.update_main_rs(&blocking);
+        assert!(!back.contains("fn idle_loop("), "{back}");
+        assert!(back.contains("idle_loop(cx)"), "{back}");
+
+        // The same file, its block from before: the old self-contained idle.
+        let idle = "\n    // Whenever no interrupt task runs. Every resource no generated task\n    \
+                    // takes is in `cx.local`, for `idle_loop` below the markers - yours.\n    \
+                    #[idle(local = [panel])]\n    fn idle(cx: idle::Context) -> ! {\n        \
+                    idle_loop(cx)\n    }\n";
+        let old_idle = "\n    #[idle]\n    fn idle(_cx: idle::Context) -> ! {\n        loop {\n            \
+                        rtic::export::wfi();\n        }\n    }\n";
+        assert!(moved.contains(idle), "{moved}");
+        let old = moved.replace(idle, old_idle);
+        assert!(!glob_may_hold_idle_loop(&old));
+        let upgraded = mcu.update_main_rs(&old);
+        assert_eq!(upgraded.matches("fn idle_loop(").count(), 1, "{upgraded}");
+        assert!(upgraded.contains(idle), "{upgraded}");
+    }
+
+    /// "Has a loop" reads the code: a comment that names `idle_loop`, left
+    /// after the user deleted theirs, is no loop - the seed comes back rather
+    /// than `idle` calling nothing (E0425).
+    #[test]
+    fn a_comment_naming_the_idle_loop_is_no_loop() {
+        use crate::panels::mcu_module::codegen::common::RTIC_IDLE_SEED;
+        let mcu = rtic_with_custom(&[("PB12", PinFunction::GpioOutput, None)], &[]);
+        let fresh = mcu.fresh_main_rs();
+        let gone = fresh.replace(
+            RTIC_IDLE_SEED,
+            "// blink() is called from idle_loop\nfn blink() {}\n",
+        );
+        assert_ne!(gone, fresh);
+        let main = mcu.update_main_rs(&gone);
+        assert_eq!(main.matches(RTIC_IDLE_SEED).count(), 1, "{main}");
+    }
+
+    /// The fence finds the loop however the user declared it - `pub`,
+    /// `pub(crate)`, generic over the context's lifetime, indented in an
+    /// inline module - and goes above the whole line, so the way back gives
+    /// the same file. A commented-out one is no item and gets none.
+    #[test]
+    fn the_fence_takes_every_spelling_of_the_users_loop() {
+        use crate::panels::mcu_module::codegen::common::{
+            RTIC_IDLE_FENCE, RTIC_IDLE_SEED, ensure_rtic_idle_loop,
+        };
+        let fresh =
+            rtic_with_custom(&[("PB12", PinFunction::GpioOutput, None)], &[]).fresh_main_rs();
+        let sig = "fn idle_loop(_cx: app::idle::Context) -> ! {\n";
+        for line in [
+            "pub fn idle_loop(_cx: app::idle::Context) -> ! {\n",
+            "pub(crate) fn idle_loop(_cx: app::idle::Context) -> ! {\n",
+            "fn idle_loop<'a>(_cx: app::idle::Context<'a>) -> ! {\n",
+            "    pub fn idle_loop(_cx: crate::app::idle::Context) -> ! {\n",
+        ] {
+            let mine = fresh.replacen(sig, line, 1);
+            assert_ne!(mine, fresh, "{line}");
+            let off = ensure_rtic_idle_loop(mine.clone(), false, true);
+            assert!(off.contains(&format!("{RTIC_IDLE_FENCE}{line}")), "{off}");
+            assert_eq!(ensure_rtic_idle_loop(off, true, true), mine, "{line}");
+        }
+        let commented = fresh.replacen(
+            RTIC_IDLE_SEED,
+            "// fn idle_loop(_cx: app::idle::Context) -> ! { loop {} }\n",
+            1,
+        );
+        let off = ensure_rtic_idle_loop(commented.clone(), false, true);
+        assert_eq!(off, commented);
+    }
+
+    /// Leaving RTIC finds an untouched seed above the block too. One with an
+    /// attribute the user put over it is theirs: kept, fenced off, and given
+    /// back byte for byte on the way back.
+    #[test]
+    fn the_seed_leaves_from_above_the_block_and_an_attributed_one_stays() {
+        use crate::panels::mcu_module::codegen::common::{
+            GEN_BEGIN, RTIC_IDLE_FENCE, RTIC_IDLE_SEED, ensure_rtic_idle_loop,
+        };
+        let fresh =
+            rtic_with_custom(&[("PB12", PinFunction::GpioOutput, None)], &[]).fresh_main_rs();
+        let up = fresh
+            .replacen(&format!("\n{RTIC_IDLE_SEED}"), "", 1)
+            .replacen(GEN_BEGIN, &format!("{RTIC_IDLE_SEED}\n{GEN_BEGIN}"), 1);
+        assert_eq!(up.matches(RTIC_IDLE_SEED).count(), 1, "{up}");
+        let off = ensure_rtic_idle_loop(up, false, true);
+        assert!(!off.contains("fn idle_loop"), "{off}");
+
+        let attributed = fresh.replacen(
+            RTIC_IDLE_SEED,
+            &format!("#[inline(never)]\n{RTIC_IDLE_SEED}"),
+            1,
+        );
+        let off = ensure_rtic_idle_loop(attributed.clone(), false, true);
+        assert!(
+            off.contains(&format!("{RTIC_IDLE_FENCE}fn idle_loop(")),
+            "{off}"
+        );
+        assert_eq!(ensure_rtic_idle_loop(off, true, false), attributed);
     }
 
     /// stm32f1xx-hal moves a PWM pad into its timer's `pwm{n}::init`, with no
@@ -1625,7 +1917,9 @@ mod tests {
             "{main}"
         );
         assert!(
-            main.contains("let flash_dev = pins::configs::custom_flash::Flash::new(pb12_out);"),
+            main.contains(
+                "let flash_dev = pins::configs::custom_flash::Flash::new(pins::configs::io::DigitalOut(pb12_out));"
+            ),
             "{main}"
         );
         assert!(!main.contains("FlashDev::new("), "{main}");

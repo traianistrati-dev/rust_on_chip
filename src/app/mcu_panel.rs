@@ -4187,7 +4187,7 @@ const RTIC_DETAILS: &[(&str, &str)] = &[
     ),
     (
         "Entry:",
-        "RTIC owns main. #[init] runs once and returns (Shared, Local); #[idle] is the background loop (wfi).",
+        "RTIC owns main. #[init] runs once and returns (Shared, Local); #[idle] takes every resource no task does and hands them to your idle_loop below the markers (wfi until you add code).",
     ),
     (
         "Interrupts:",

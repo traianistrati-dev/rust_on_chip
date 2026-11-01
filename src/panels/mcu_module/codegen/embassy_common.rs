@@ -2015,11 +2015,24 @@ mod emit_for_manual_compile {
         );
         assert_eq!(
             main_rs.contains(
-                "let panel = pins::configs::custom_panel::Panel::new(pb12_out, pb13_in);"
+                "let panel = pins::configs::custom_panel::Panel::new(pins::configs::io::DigitalOut(pb12_out), pins::configs::io::DigitalIn(pb13_in));"
             ),
             custom,
             "{main_rs}"
         );
+        // `EIDE_CUSTOM`: the user's idle loop drives the panel, through the
+        // context `#[idle]` hands it - reached from below the markers.
+        let main_rs = if custom {
+            let used = main_rs.replacen(
+                "fn idle_loop(_cx: app::idle::Context) -> ! {\n    loop {\n        // Your code here.\n",
+                "fn idle_loop(cx: app::idle::Context) -> ! {\n    loop {\n        cx.local.panel.update();\n",
+                1,
+            );
+            assert_ne!(used, main_rs, "the idle loop's seed:\n{main_rs}");
+            used
+        } else {
+            main_rs
+        };
         // `EIDE_F1_ADC=example`: a helper below the block set the sample time
         // the way a project from before `adc1.rs` did, naming `adc::` - which
         // keeps the import at the crate root (`stm32::adc_import_alias`).

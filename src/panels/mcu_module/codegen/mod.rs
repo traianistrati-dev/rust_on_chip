@@ -294,6 +294,11 @@ impl Mcu {
         // An untouched seed follows the runtime (`fn` / `async fn`); an
         // edited one stays, and a call it no longer fits says so when built.
         let code = common::retarget_pristine_hooks(code, &hooks);
+        // RTIC's `#[idle]` hands the resources no task takes to a loop the
+        // user owns: seeded once below the tail; an untouched one leaves with
+        // the runtime, since it names RTIC's `app`. A fresh file had no
+        // block before it.
+        let code = common::ensure_rtic_idle_loop(code, this.is_rtic(), false);
         // The devices the user grouped, gathered into one comment.
         let code = common::with_device_comment(code, self);
         // Strict-lints: exempt the generated entry fn (its init uses unwrap/as…).
@@ -338,6 +343,15 @@ impl Mcu {
         // An untouched seed follows the runtime (`fn` / `async fn`); an
         // edited one stays, and a call it no longer fits says so when built.
         let code = common::retarget_pristine_hooks(code, &hooks);
+        // RTIC's `#[idle]` hands the resources no task takes to a loop the
+        // user owns: seeded once below the tail; an untouched one leaves with
+        // the runtime, since it names RTIC's `app`; an edited one is fenced
+        // off. Whether a local glob may hold it: the OLD block decides.
+        let code = common::ensure_rtic_idle_loop(
+            code,
+            this.is_rtic(),
+            common::glob_may_hold_idle_loop(existing),
+        );
         // Rebuilt with the block, so renaming a device in the panel renames it
         // here on the next save.
         let code = common::with_device_comment(code, self);

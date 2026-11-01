@@ -1345,10 +1345,16 @@ fn seed_text(hook: &EdgeHook, quoted: bool) -> String {
 /// The text of main.rs that is the user's: above the block and below it. No
 /// block: all of it below.
 fn user_regions(file: &str) -> (&str, &str) {
+    let [(h0, h1), (t0, t1)] = user_spans(file);
+    (&file[h0..h1], &file[t0..t1])
+}
+
+/// [`user_regions`] as byte ranges of `file`: above the block, below it.
+fn user_spans(file: &str) -> [(usize, usize); 2] {
     match (file.find(GEN_BEGIN), file.find(GEN_END)) {
-        (Some(begin), Some(end)) if begin < end => (&file[..begin], &file[end + GEN_END.len()..]),
-        (_, Some(end)) => ("", &file[end + GEN_END.len()..]),
-        _ => ("", file),
+        (Some(begin), Some(end)) if begin < end => [(0, begin), (end + GEN_END.len(), file.len())],
+        (_, Some(end)) => [(0, 0), (end + GEN_END.len(), file.len())],
+        _ => [(0, 0), (0, file.len())],
     }
 }
 
@@ -1819,6 +1825,163 @@ pub fn ensure_edge_hooks(mut file: String, hooks: &[EdgeHook]) -> String {
     for seed in seeds {
         file.push('\n');
         file.push_str(&seed);
+    }
+    file
+}
+
+// ── RTIC's idle loop - the user's place for the resources ────────────────────
+//
+// On RTIC the whole `mod app` sits inside the markers and `#[init]` returns:
+// every pin, bus handle and Custom module ends up a `Local` resource, and a
+// resource is reachable only from a task that names it. The generated
+// `#[idle]` names every one no generated task takes and calls a function
+// the user owns, below the markers - the place their code reaches them.
+
+/// What the generated `#[idle]` calls (see `rtic::idle_fn`).
+pub const RTIC_IDLE_FN: &str = "idle_loop";
+
+/// [`RTIC_IDLE_FN`] as first written below the tail. `concat!`, not a
+/// `\`-continued literal: rustfmt can join one into a run of spaces.
+///
+/// The `#[allow]` is for Strict, which denies `clippy::pedantic`: RTIC hands
+/// its context by value, and `needless_pass_by_value` would fail the file the
+/// IDE just wrote.
+pub const RTIC_IDLE_SEED: &str = concat!(
+    "/// RTIC's `idle`: what runs whenever no interrupt task does. `_cx.local`\n",
+    "/// holds, by `&mut`, every resource no generated task takes - the pins,\n",
+    "/// the bus handles and the Custom modules, each under its name in `Local`.\n",
+    "/// Rename `_cx` once you use it. It never returns. Yours: kept across\n",
+    "/// regeneration.\n",
+    "#[allow(clippy::needless_pass_by_value)] // RTIC hands `idle` its context by value\n",
+    "fn idle_loop(_cx: app::idle::Context) -> ! {\n",
+    "    loop {\n",
+    "        // Your code here.\n",
+    "        cortex_m::asm::wfi(); // sleep until the next interrupt\n",
+    "    }\n",
+    "}\n",
+);
+
+/// Put above the user's [`RTIC_IDLE_FN`] while the runtime is not RTIC: it
+/// names RTIC's `app`, which nothing else writes, so it is compiled out
+/// rather than failing the build on a name the user never wrote - and taken
+/// off on the way back, where it compiles again.
+pub const RTIC_IDLE_FENCE: &str =
+    "#[cfg(any())] // RTIC's idle: built only on the RTIC runtime, whose `app` it names\n";
+
+/// Whether a local glob in `existing` may be what brings the user's
+/// [`RTIC_IDLE_FN`] in - [`ensure_rtic_idle_loop`]'s `glob_may_hold`, the OLD
+/// block deciding. Not when that block is RTIC's and does not call it: one
+/// from before the generated `#[idle]`, whose project has no loop to bring.
+/// Any other runtime's block says nothing either way, and a seed beside a
+/// glob that does bring it would shadow it without a word - so the glob is
+/// trusted, as [`ensure_edge_hooks`] trusts one, and one that brings nothing
+/// is a compile error naming the loop.
+pub fn glob_may_hold_idle_loop(existing: &str) -> bool {
+    match (existing.find(GEN_BEGIN), existing.find(GEN_END)) {
+        (Some(begin), Some(end)) if begin < end => {
+            let block = &existing[begin..end];
+            !block.contains("#[rtic::app") || has_ident(block, RTIC_IDLE_FN)
+        }
+        _ => true,
+    }
+}
+
+/// Where the user's [`RTIC_IDLE_FN`] taking RTIC's context starts - the start
+/// of its `fn` line, above the block or below it. `pub`, `pub(crate)` or
+/// `unsafe` before the `fn`, an indent, a generic list after the name: the
+/// same item, fenced the same.
+fn rtic_idle_fn_at(file: &str) -> Option<usize> {
+    let head = format!("fn {RTIC_IDLE_FN}");
+    user_spans(file).into_iter().find_map(|(from, to)| {
+        let region = &file[from..to];
+        region.match_indices(&head).find_map(|(i, _)| {
+            let line = region[..i].rfind('\n').map_or(0, |n| n + 1);
+            let qualified = region[line..i]
+                .split_whitespace()
+                .all(|w| w == "pub" || w.starts_with("pub(") || w == "unsafe");
+            let after = region[i + head.len()..].trim_start();
+            let sig = &after[..after.find('{').unwrap_or(after.len())];
+            (qualified && after.starts_with(['(', '<']) && sig.contains("app::idle::Context"))
+                .then_some(from + line)
+        })
+    })
+}
+
+/// Where an untouched [`RTIC_IDLE_SEED`] starts, above the block or below it.
+/// Not one with a `///` or `#[` the user put over it - that attaches to it,
+/// across a blank line too, and makes it theirs like an edit inside it.
+fn pristine_rtic_idle_at(file: &str) -> Option<usize> {
+    user_spans(file).into_iter().find_map(|(from, to)| {
+        let at = from + file[from..to].find(RTIC_IDLE_SEED)?;
+        let above = file[..at]
+            .trim_end()
+            .lines()
+            .next_back()
+            .unwrap_or_default();
+        let above = above.trim_start();
+        ((at == 0 || file[..at].ends_with('\n'))
+            && !above.starts_with("///")
+            && !above.starts_with("#["))
+        .then_some(at)
+    })
+}
+
+/// On RTIC, [`RTIC_IDLE_SEED`] below the tail when the user's code has no
+/// [`RTIC_IDLE_FN`] - the precedent is [`ensure_edge_hooks`], "has" being the
+/// bare identifier in the code above or below the block, not in a comment
+/// that names it. A local glob may bring it in, so it seeds none - unless
+/// `glob_may_hold` ([`glob_may_hold_idle_loop`]) says the block it replaces
+/// had no loop to bring: the new one would call a name nothing defines.
+///
+/// On any other runtime an untouched seed is taken out again: it names RTIC's
+/// `app`, which only RTIC writes, and would not compile. One the user changed
+/// is theirs and stays, under [`RTIC_IDLE_FENCE`] until RTIC is back.
+pub fn ensure_rtic_idle_loop(mut file: String, rtic: bool, glob_may_hold: bool) -> String {
+    if rtic {
+        if let Some(at) = rtic_idle_fn_at(&file)
+            && file[..at].ends_with(RTIC_IDLE_FENCE)
+        {
+            file.replace_range(at - RTIC_IDLE_FENCE.len()..at, "");
+        }
+        let (head, tail) = user_regions(&file);
+        // Each region on its own: an unclosed `/*` in one hides nothing of
+        // the other.
+        if (glob_may_hold && local_glob(head, tail))
+            || has_ident(&code_only(head), RTIC_IDLE_FN)
+            || has_ident(&code_only(tail), RTIC_IDLE_FN)
+        {
+            return file;
+        }
+        // Right under RTIC's tail comment, where a fresh file has it - so a
+        // round trip through another runtime gives the same file back - or
+        // at the end when the user took the comment out.
+        let start = file.find(GEN_END).map_or(0, |i| i + GEN_END.len());
+        if let Some(i) = file[start..].find(super::rtic::RTIC_USER_TAIL) {
+            let at = start + i + super::rtic::RTIC_USER_TAIL.len();
+            file.insert_str(at, &format!("\n{RTIC_IDLE_SEED}"));
+            return file;
+        }
+        if !file.ends_with('\n') {
+            file.push('\n');
+        }
+        file.push('\n');
+        file.push_str(RTIC_IDLE_SEED);
+        return file;
+    }
+    if let Some(at) = pristine_rtic_idle_at(&file) {
+        // The blank line it was appended after goes with it.
+        let from = if file[..at].ends_with("\n\n") {
+            at - 1
+        } else {
+            at
+        };
+        file.replace_range(from..at + RTIC_IDLE_SEED.len(), "");
+        return file;
+    }
+    if let Some(at) = rtic_idle_fn_at(&file)
+        && !file[..at].ends_with(RTIC_IDLE_FENCE)
+    {
+        file.insert_str(at, RTIC_IDLE_FENCE);
     }
     file
 }

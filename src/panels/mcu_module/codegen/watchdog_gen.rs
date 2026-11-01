@@ -434,13 +434,15 @@ fn stm32_init_lines(w: &WatchdogSettings, family: &str, part: &str, runtime: Run
         if super::family::uses_stm32f1xx_hal(family, runtime) {
             if runtime == Runtime::Rtic {
                 // `#[init]` returns, so `rtic::promote_bus_handles` turns this
-                // binding into the `iwdg` Local: a task is where it gets fed.
+                // binding into the `iwdg` Local, which `#[idle]` takes and
+                // hands to the user's `idle_loop`: that is where it gets fed.
                 s.push_str(
-                    "    // Wrapped, NOT started - handed to the tasks as `iwdg`: one with\n",
+                    "    // Wrapped, NOT started - handed to `idle` as `iwdg`: `idle_loop` calls\n",
                 );
                 s.push_str(
-                    "    // `local = [iwdg]` calls start(period()), then feed() every period.\n",
+                    "    // cx.local.iwdg.start(pins::configs::iwdg::period()), then feed() every\n",
                 );
+                s.push_str("    // period.\n");
             } else {
                 s.push_str("    // Wrapped, NOT started - call start(period()) when ready.\n");
             }

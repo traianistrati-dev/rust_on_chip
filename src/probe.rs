@@ -585,7 +585,7 @@ pub fn start_reset(
     ctx: eframe::egui::Context,
 ) {
     std::thread::spawn(move || {
-        let mut args: Vec<String> = vec!["reset".into(), "--chip".into(), chip];
+        let mut args: Vec<String> = vec!["reset".into(), "--chip".into(), probe_rs_chip(&chip)];
         if let Some(p) = selector(probe.as_deref()) {
             args.push("--probe".into());
             args.push(p);
@@ -752,18 +752,20 @@ mod tests {
 fn known_targets() -> Option<&'static std::collections::HashSet<String>> {
     static TARGETS: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
-    TARGETS
-        .get_or_init(|| {
-            let out = no_window(&mut Command::new("probe-rs"))
-                .args(["chip", "list"])
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            parse_chip_list(&String::from_utf8_lossy(&out.stdout))
-        })
-        .as_ref()
+    TARGETS.get_or_init(list_targets).as_ref()
+}
+
+/// `probe-rs chip list` asked now, uncached - see [`known_targets`] for the
+/// cached answer and [`probe_rs_chip`] for why one caller asks fresh.
+fn list_targets() -> Option<std::collections::HashSet<String>> {
+    let out = no_window(&mut Command::new("probe-rs"))
+        .args(["chip", "list"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_chip_list(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Parse `probe-rs chip list`, which nests variants under a family:
@@ -824,6 +826,75 @@ pub fn chip_gap(chip: &str) -> Option<String> {
     ))
 }
 
+/// The nRF5340's stock probe-rs target, and its application-core-only twin.
+const NRF5340: &str = "nRF5340_xxAA";
+const NRF5340_APP_ONLY: &str = "nRF5340_xxAA_APPONLY";
+
+/// The `--chip` this IDE hands the INSTALLED probe-rs for a definition's
+/// `chip` - see [`probe_rs_chip_with`].
+///
+/// Five callers, one rule: `run` / `attach` in `rtt.rs`, `reset` in
+/// [`start_reset`], and the DAP objects of `debugger.rs`, `timing.rs` and
+/// `flamegraph.rs`. Two places keep the definition's name: a generated
+/// project's `.cargo/config.toml` runner, which is opened on other machines
+/// with other probe-rs versions, and `cargo flash` in `probe_flash.rs`, whose
+/// cargo-flash need not be the probe-rs asked here - and whose final reset
+/// holds the network core anyway.
+///
+/// The target list is asked fresh, not from [`known_targets`]' cache: a
+/// probe-rs downgraded while the IDE runs - its own advice for some ST-Links
+/// is 0.29 - must not be handed a name it lacks, which would fail every
+/// session. About 140 ms, only for the nRF5340, and every caller is on its
+/// session's worker thread.
+pub fn probe_rs_chip(chip: &str) -> String {
+    probe_rs_chip_with(chip, list_targets)
+}
+
+/// `chip`, or its application-core-only twin when the installed probe-rs's
+/// targets - `lookup`, lowercased, run only for the nRF5340 - have one.
+///
+/// probe-rs's stock `nRF5340_xxAA` (0.29 and 0.32 alike) opens EVERY session
+/// by releasing the network core from Force-OFF. A session that resets the
+/// chip puts it back - an application reset holds it again - but one that
+/// does not (an RTT attach, a profile on a running target) leaves it running
+/// whatever its flash holds beside the application: an old Bluetooth
+/// controller, or an erased flash it locks up on, drawing milliamps. probe-rs
+/// 0.32 adds `nRF5340_xxAA_APPONLY`: the same application core, memory map and
+/// flash algorithms, no network core, and so no release. Nothing this IDE
+/// builds runs on the network core, so that target whenever the installed
+/// probe-rs has it; the stock one otherwise - failing open, like [`chip_gap`].
+fn probe_rs_chip_with(
+    chip: &str,
+    lookup: impl FnOnce() -> Option<std::collections::HashSet<String>>,
+) -> String {
+    let chip = chip.trim();
+    if chip.eq_ignore_ascii_case(NRF5340)
+        && lookup().is_some_and(|k| k.contains(&NRF5340_APP_ONLY.to_ascii_lowercase()))
+    {
+        return NRF5340_APP_ONLY.to_owned();
+    }
+    chip.to_owned()
+}
+
+/// What to say before a session that does not reset the chip, on the `--chip`
+/// [`probe_rs_chip`] gave: the stock nRF5340 target leaves its network core
+/// running. `None` everywhere else.
+pub fn network_core_note(probe_rs_chip: &str) -> Option<&'static str> {
+    // `concat!`, not a `\`-continued literal: rustfmt can join one into a
+    // run of spaces in the rendered line.
+    probe_rs_chip
+        .trim()
+        .eq_ignore_ascii_case(NRF5340)
+        .then_some(concat!(
+            "note: this probe-rs starts the nRF5340's network core whenever it opens a session, ",
+            "and an attach does not reset it back into Force-OFF - it runs whatever its flash ",
+            "holds until the next reset. probe-rs 0.32 adds nRF5340_xxAA_APPONLY, which never ",
+            "starts it, and this IDE uses it from the next session on once it is installed: ",
+            "`cargo install probe-rs-tools --locked` (on Windows the Tools tab's probe-rs row ",
+            "names the releases with known probe problems).",
+        ))
+}
+
 #[cfg(test)]
 mod chip_gap_tests {
     use super::*;
@@ -868,6 +939,105 @@ mod chip_gap_tests {
         assert!(
             offenders.is_empty(),
             "these filter a selector by hand instead of calling `probe::selector`: {offenders:?}"
+        );
+    }
+
+    /// The nRF5340 goes to probe-rs as its application-core-only target when
+    /// the installed probe-rs has one, and as itself otherwise - with no
+    /// probe-rs to ask, too. Every other chip passes through, trimmed, and
+    /// never makes probe-rs be asked.
+    #[test]
+    fn the_nrf5340_goes_app_only_when_probe_rs_has_it() {
+        use std::collections::HashSet;
+        let v029: HashSet<String> = ["nrf53_series", "nrf5340_xxaa"].map(String::from).into();
+        let mut v032 = v029.clone();
+        v032.insert("nrf5340_xxaa_apponly".to_owned());
+        let with = |chip: &str, set: &HashSet<String>| {
+            let set = set.clone();
+            probe_rs_chip_with(chip, move || Some(set))
+        };
+
+        assert_eq!(with("nRF5340_xxAA", &v032), "nRF5340_xxAA_APPONLY");
+        assert_eq!(with(" nrf5340_xxaa ", &v032), "nRF5340_xxAA_APPONLY");
+        assert_eq!(with("nRF5340_xxAA", &v029), "nRF5340_xxAA");
+        assert_eq!(
+            probe_rs_chip_with("nRF5340_xxAA", || None),
+            "nRF5340_xxAA",
+            "fails open"
+        );
+        for other in ["nRF52840_xxAA", "STM32F103C8", "esp32c3", "RP2040"] {
+            assert_eq!(
+                probe_rs_chip_with(&format!(" {other} "), || panic!("{other}: probe-rs asked")),
+                other
+            );
+        }
+
+        // The note follows what probe-rs is handed, not the definition.
+        assert!(network_core_note("nRF5340_xxAA").is_some());
+        assert!(network_core_note("nRF5340_xxAA_APPONLY").is_none());
+        assert!(network_core_note("nRF52840_xxAA").is_none());
+    }
+
+    /// Every place that hands probe-rs a chip asks [`probe_rs_chip`] first - a
+    /// sixth written the old way would release the nRF5340's network core
+    /// again, and this is where that shows. Code only (comments and the test
+    /// modules skipped): a `"chip":`, `["chip"]` or `"--chip"` line must ask
+    /// the resolver on it or on the next line. `rtt::probe_rs_args` builds from
+    /// a chip its one caller resolved; `probe_flash.rs` keeps the definition's
+    /// name on purpose - see [`probe_rs_chip`].
+    #[test]
+    fn every_probe_rs_chip_goes_through_the_resolver() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for rel in [
+            "src/rtt.rs",
+            "src/debugger.rs",
+            "src/flamegraph.rs",
+            "src/probe.rs",
+            "src/timing.rs",
+        ] {
+            let src =
+                std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            // Production code only: every `#[cfg(test)] mod` block is cut out
+            // (assembled from pieces, so this one's own line is not a match).
+            let all: Vec<&str> = src.lines().collect();
+            let cfg_test = ["#[cfg(", "test)]"].concat();
+            let mut lines: Vec<&str> = Vec::new();
+            let mut skipping = false;
+            for (i, l) in all.iter().enumerate() {
+                if skipping {
+                    skipping = *l != "}";
+                    continue;
+                }
+                if l.trim_end() == cfg_test && all.get(i + 1).is_some_and(|n| n.starts_with("mod "))
+                {
+                    skipping = true;
+                    continue;
+                }
+                lines.push(l);
+            }
+            let asks_it = ["probe_rs_chip", "("].concat();
+            let mut asks = false;
+            for (i, l) in lines.iter().enumerate() {
+                let t = l.trim_start();
+                if t.starts_with("//") || t.contains("fn probe_rs_chip") {
+                    continue;
+                }
+                asks |= t.contains(&asks_it);
+                let hands =
+                    t.contains("\"chip\":") || t.contains("[\"chip\"]") || t.contains("\"--chip\"");
+                let builder =
+                    rel == "src/rtt.rs" && t.starts_with("let mut args = vec![sub.to_owned()");
+                let next = lines.get(i + 1).copied().unwrap_or("");
+                if hands && !builder && !t.contains(&asks_it) && !next.contains(&asks_it) {
+                    offenders.push(format!("{rel}: {t}"));
+                }
+            }
+            assert!(asks, "{rel} never asks the resolver");
+        }
+        assert!(
+            offenders.is_empty(),
+            "these hand probe-rs a chip without `probe::probe_rs_chip`: {offenders:?}"
         );
     }
 

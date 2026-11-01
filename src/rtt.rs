@@ -373,17 +373,25 @@ fn run_session(
         RttMode::Run => "run",
         RttMode::Attach => "attach",
     };
+    let probe_chip = crate::probe::probe_rs_chip(chip);
     let args = probe_rs_args(
         sub,
-        chip,
+        &probe_chip,
         probe,
-        idf_partition_table(chip, project_dir),
+        idf_partition_table(&probe_chip, project_dir),
         &elf,
     );
     state
         .lock()
         .unwrap()
         .push_plain(LineKind::Input, format!("> probe-rs {}", args.join(" ")));
+    // `run` resets the chip after flashing, which holds the nRF5340's network
+    // core again; an attach leaves it as the session's open left it.
+    if matches!(mode, RttMode::Attach)
+        && let Some(note) = crate::probe::network_core_note(&probe_chip)
+    {
+        state.lock().unwrap().push_plain(LineKind::Notice, note);
+    }
     ctx.request_repaint();
 
     let mut cmd = Command::new("probe-rs");

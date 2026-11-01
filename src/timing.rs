@@ -2139,7 +2139,7 @@ fn session(
     // The Debug tab's launch: flash, then run - not halted after reset.
     let mut args = json!({
         "cwd": job.project_dir.to_string_lossy(),
-        "chip": job.chip,
+        "chip": crate::probe::probe_rs_chip(&job.chip),
         "probe": probe,
         "connectUnderReset": false,
         "flashingConfig": { "flashingEnabled": true, "haltAfterReset": false },

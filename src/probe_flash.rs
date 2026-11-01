@@ -88,6 +88,9 @@ pub fn start_probe_flash(
             "flash".into(),
             "--release".into(),
             "--chip".into(),
+            // The definition's name, like the generated runner: cargo-flash
+            // need not be the probe-rs `probe::probe_rs_chip` asks, and its
+            // final reset holds the nRF5340's network core anyway.
             chip,
             "--target".into(),
             target,

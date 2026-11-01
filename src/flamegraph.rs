@@ -1168,7 +1168,7 @@ fn sample_over_dap(
     )?;
     wait_response(&mut stream, "initialize", console)?;
     let launch = json!({
-        "chip": chip,
+        "chip": crate::probe::probe_rs_chip(chip),
         "probe": probe,
         "connectUnderReset": false,
         "flashingConfig": { "flashingEnabled": false },

@@ -1229,7 +1229,7 @@ fn handle_response(
             // (VID:PID[:Serial]); omit the key entirely to keep auto-select.
             let mut launch = json!({
                 "cwd": cfg.project_dir.to_string_lossy(),
-                "chip": cfg.chip,
+                "chip": crate::probe::probe_rs_chip(&cfg.chip),
                 "connectUnderReset": false,
                 "flashingConfig": {
                     "flashingEnabled": true,

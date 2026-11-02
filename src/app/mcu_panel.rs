@@ -2915,6 +2915,13 @@ impl AppIde {
                                 != self.rtic_user,
                         )
                     });
+                    // Custom module files the user edited, left on the other
+                    // GPIO api's traits.
+                    let customs = self
+                        .mcu
+                        .as_ref()
+                        .map(|m| m.customs_on_other_api(&self.project_tree.user_src_files))
+                        .unwrap_or_default();
                     match &mut self.mcu {
                         Some(mcu) => Self::show_system_tab(
                             ui,
@@ -2922,6 +2929,8 @@ impl AppIde {
                             hal,
                             refused.as_deref(),
                             tasks.as_ref(),
+                            &customs,
+                            &mut self.custom_use_swap,
                         ),
                         None => no_mcu = Some("System configuration"),
                     }
@@ -2966,6 +2975,10 @@ impl AppIde {
             crate::panels::mcu_module::codegen::rtic_user::TasksView,
             bool,
         )>,
+        // Custom module files on the other api's traits, and the one whose
+        // `use` line a click asks to swap (`Mcu::customs_on_other_api`).
+        customs: &[(String, bool, bool)],
+        custom_use_swap: &mut Option<String>,
     ) {
         use crate::panels::mcu_module::mcu::Runtime;
 
@@ -3000,6 +3013,10 @@ impl AppIde {
             }
             if let Some(r) = refused {
                 gaps.insert(0, format!("{}: {r}", crate::app::dialogs::REFUSED_PREFIX));
+            }
+            if !customs.is_empty() {
+                ui.add_space(10.0);
+                custom_api_notice(ui, customs, custom_use_swap);
             }
             if !gaps.is_empty() {
                 ui.add_space(10.0);
@@ -4102,6 +4119,64 @@ fn rtic_tasks_panel(
                 ))
                 .color(egui::Color32::from_rgb(120, 170, 220)),
             );
+        }
+    });
+}
+
+/// A Custom module's file not as the IDE last wrote it keeps its traits'
+/// `use` line when the GPIO api moves - only an untouched one follows - so
+/// its struct is bounded on traits the pads main.rs hands it do not
+/// implement, and `::new(..)` stops compiling. Said here, where the api is
+/// chosen, with the one-line swap that fixes it when that line is the IDE's:
+/// the rest of the file stays.
+fn custom_api_notice(
+    ui: &mut egui::Ui,
+    customs: &[(String, bool, bool)],
+    custom_use_swap: &mut Option<String>,
+) {
+    let version = |eh02: bool| if eh02 { "0.2" } else { "1.0" };
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "{}  A Custom module's file is on the other GPIO api's traits",
+                ph::WARNING,
+            ))
+            .size(12.0)
+            .color(egui::Color32::from_rgb(230, 190, 90)),
+        );
+        for (path, eh02, swappable) in customs {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "    {path} imports embedded-hal {}'s traits, but its pins speak {} \
+                         here - it is not as the IDE last wrote it, so the api switch left it \
+                         alone.{}",
+                        version(*eh02),
+                        version(!*eh02),
+                        if *swappable {
+                            ""
+                        } else {
+                            " Change its embedded_hal use by hand."
+                        },
+                    ))
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(200, 170, 100)),
+                );
+                if *swappable
+                    && ui
+                        .push_id(path, |ui| {
+                            ui.button(format!("Switch to {}", version(!*eh02)))
+                        })
+                        .inner
+                        .on_hover_text(
+                            "Swap its traits' use line for the one its pins speak. \
+                         Nothing else in the file changes.",
+                        )
+                        .clicked()
+                {
+                    *custom_use_swap = Some(path.clone());
+                }
+            });
         }
     });
 }

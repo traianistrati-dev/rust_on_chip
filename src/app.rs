@@ -1523,6 +1523,12 @@ pub struct AppIde {
     /// this frame - a second one keeps its caret, as every view did before -
     /// and dropped at the next regeneration check.
     caret_shifts: Vec<(String, CaretShift)>,
+    /// A Custom module's file the System tab asked to move onto the GPIO api
+    /// its pads speak - its traits' `use` line swapped, the user's code
+    /// kept (`Mcu::customs_on_other_api`). Applied at the next regeneration
+    /// check, after [`Self::caret_shifts`] is cleared, so an open file's
+    /// carets follow the line.
+    custom_use_swap: Option<String>,
     /// Editable project config files. Each holds the current content (a
     /// `<<< GENERATED >>>` block the IDE refreshes on chip change, plus whatever
     /// the user adds outside it). `memory_x`/`build_rs` are empty for ESP.
@@ -2467,6 +2473,7 @@ impl AppIde {
             custom_by_hand: Vec::new(),
             rtic_user: None,
             caret_shifts: Vec::new(),
+            custom_use_swap: None,
             cargo_toml: init_files.cargo_toml,
             cargo_config: init_files.cargo_config,
             memory_x: init_files.memory_x,
@@ -3663,6 +3670,30 @@ impl AppIde {
         // continuous repaint, was a big share of the per-frame CPU cost.
         let mut mcu_changed = false;
         self.caret_shifts.clear();
+        // Still wrong for the api applied now - a project reload in between
+        // must not swap it the other way.
+        if let Some(path) = self.custom_use_swap.take()
+            && self.mcu.as_ref().is_some_and(|m| {
+                m.customs_on_other_api(&self.project_tree.user_src_files)
+                    .iter()
+                    .any(|(p, _, swappable)| *p == path && *swappable)
+            })
+            && let Some((_, text)) = self
+                .project_tree
+                .user_src_files
+                .iter_mut()
+                .find(|(p, _)| *p == path)
+            && let Some(swapped) =
+                crate::panels::mcu_module::codegen::custom_file_for_other_gpio_api(text)
+        {
+            if let Some(s) = caret_shift(text, &swapped) {
+                self.caret_shifts.push((path, s));
+            }
+            *text = swapped;
+            self.cached_project_files = None;
+            // Regenerate: the manifest reads the trait crate off this file.
+            self.mcu_state_hash = 0;
+        }
         if let Some(mcu) = &mut self.mcu {
             let current_hash = Self::calculate_mcu_state_hash(mcu);
             if current_hash != self.mcu_state_hash {

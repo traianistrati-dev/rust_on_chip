@@ -102,8 +102,10 @@ pub fn custom_file_speaks_eh02(text: &str) -> Option<bool> {
 
 /// `text`, a Custom module's file as the IDE writes it, as the IDE would have
 /// written it on the other GPIO api - its traits' `use` line swapped, every
-/// other byte kept - or `None` when it has none. A file on disk equal to it
-/// is one the user never touched, which follows the api
+/// other byte kept - or `None` when it has none, or one other than the line
+/// the IDE writes (over several lines, a second item or a comment after it:
+/// swapping the line would cut those). A file on disk equal to it is one the
+/// user never touched, which follows the api
 /// (`ProjectTree::sync_config_files`).
 pub fn custom_file_for_other_gpio_api(text: &str) -> Option<String> {
     let (at, end, eh02) = custom_use_line(text)?;
@@ -113,6 +115,9 @@ pub fn custom_file_for_other_gpio_api(text: &str) -> Option<String> {
         CUSTOM_EH1_USE
     };
     let traits = text[at + prefix.len()..end].split('}').next()?;
+    if text[at..end].trim_end() != custom_trait_use(traits, eh02) {
+        return None;
+    }
     let mut other = text.to_owned();
     other.replace_range(at..end, &custom_trait_use(traits, !eh02));
     Some(other)
@@ -331,6 +336,62 @@ impl Mcu {
     /// the 0.2 traits then (`custom_module_files`).
     pub fn custom_pads_speak_eh02(&self) -> bool {
         family::uses_stm32f1xx_hal(&self.family, self.runtime) && self.gpio_native()
+    }
+
+    /// The files among `files` (`(path, text)`) of the Custom modules main.rs
+    /// builds whose traits' `use` line bounds the struct on traits its pads
+    /// do not implement: 1.0's over stm32f1xx-hal's own pins, 0.2's over the
+    /// io.rs bridge's. Not as the IDE last wrote them, so they kept that line
+    /// when the GPIO api moved ([`custom_file_for_other_gpio_api`] follows
+    /// only an untouched one). Elsewhere a 0.2 file is no error - embassy's
+    /// pins implement 0.2 too, and the manifest keeps its crate.
+    /// `(path, whether it imports 0.2's, whether that line is the one the IDE
+    /// writes - so swapping it is all the fix takes)`, for the System tab.
+    pub fn customs_on_other_api(&self, files: &[(String, String)]) -> Vec<(String, bool, bool)> {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        let raw_f1 = self.custom_pads_speak_eh02();
+        let bridged = family::uses_stm32f1xx_hal(&self.family, self.runtime) && !raw_f1;
+        if !raw_f1 && !bridged {
+            return Vec::new();
+        }
+        let wrong: Vec<(String, bool, bool)> = self
+            .modules
+            .iter()
+            .filter(|m| m.kind == ModuleKind::Custom)
+            .filter(|m| matches!(&m.config, ModuleConfig::Custom(c) if !c.applied_pins.is_empty()))
+            .filter_map(|m| {
+                let path = format!(
+                    "src/pins/configs/{}.rs",
+                    super::mcu::gui::modules::custom_file_stem(m)
+                );
+                let (_, text) = files.iter().find(|(p, _)| *p == path)?;
+                let eh02 = custom_file_speaks_eh02(text)?;
+                (eh02 != raw_f1).then(|| {
+                    let swappable = custom_file_for_other_gpio_api(text).is_some();
+                    (path, eh02, swappable)
+                })
+            })
+            .collect();
+        if wrong.is_empty() {
+            return wrong;
+        }
+        // Only a module main.rs builds - one it refuses hands its struct
+        // nothing to bound.
+        let built: Vec<String> = self
+            .custom_module_plan()
+            .1
+            .iter()
+            .filter_map(|b| {
+                b.path
+                    .split("::")
+                    .nth(2)
+                    .map(|s| format!("src/pins/configs/{s}.rs"))
+            })
+            .collect();
+        wrong
+            .into_iter()
+            .filter(|(p, ..)| built.contains(p))
+            .collect()
     }
 
     /// Keep the GPIO api in step with the Runtime: **Native binds every GPIO
@@ -3040,6 +3101,90 @@ mod tests {
             assert_eq!(set(runtime, gpio), bridged, "{runtime:?} {gpio:?}");
         }
         assert_eq!(custom_file_for_other_gpio_api("pub struct Panel;\n"), None);
+    }
+
+    /// A built Custom module's file the user edited, left on the other api's
+    /// traits, is named - the side it imports said - and its swapped text no
+    /// longer is; one on its pads' api, an older revision's file and one not
+    /// written yet are not.
+    #[test]
+    fn a_custom_file_left_on_the_other_api_is_named() {
+        use super::super::mock_mcu;
+        use crate::panels::mcu_module::modules::{ApiStyle, ModuleConfig, ModuleKind};
+
+        let mut mcu = mock_mcu::create_stm32f103c8tx();
+        mcu.apply_pin_function(12, PinFunction::GpioOutput);
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .unwrap();
+        *m.config.custom_label_mut() = "panel".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = vec![12];
+            c.applied_pins = c.pins.clone();
+        }
+        let (name, bridged) = mcu
+            .config_files()
+            .into_iter()
+            .find(|(n, _)| n.starts_with("custom_"))
+            .expect("the module's file");
+        let path = format!("src/pins/configs/{name}");
+        let mine = format!("{bridged}\nfn mine() {{}}\n");
+        let files = vec![
+            (path.clone(), mine.clone()),
+            (
+                "src/pins/configs/custom_panel_old.rs".to_owned(),
+                mine.clone(),
+            ),
+        ];
+        assert!(
+            mcu.customs_on_other_api(&files).is_empty(),
+            "on its own api"
+        );
+
+        mcu.gpio_api = ApiStyle::Native;
+        assert_eq!(
+            mcu.customs_on_other_api(&files),
+            [(path.clone(), false, true)]
+        );
+        let swapped = custom_file_for_other_gpio_api(&mine).expect("a traits line");
+        assert!(swapped.ends_with("fn mine() {}\n"), "{swapped}");
+        assert!(
+            mcu.customs_on_other_api(&[(path.clone(), swapped.clone())])
+                .is_empty()
+        );
+        assert!(mcu.customs_on_other_api(&[]).is_empty(), "not written yet");
+
+        // 0.2's traits over the io.rs bridge: named the other way round.
+        mcu.gpio_api = ApiStyle::Portable;
+        let on_02 = vec![(path.clone(), swapped.clone())];
+        assert_eq!(
+            mcu.customs_on_other_api(&on_02),
+            [(path.clone(), true, true)]
+        );
+        // On Async the pads are embassy's, which implement 0.2 as well: no error.
+        mcu.runtime = Runtime::Async;
+        mcu.pending_runtime = Runtime::Async;
+        assert!(mcu.customs_on_other_api(&on_02).is_empty());
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+
+        // A use the user rewrapped, or followed by more: said, but not
+        // swapped - the line swap would cut what follows it.
+        mcu.gpio_api = ApiStyle::Native;
+        for edited in [
+            mine.replacen("{OutputPin}", "{\n    OutputPin,\n}", 1),
+            mine.replacen("{OutputPin};", "{OutputPin}; use core::fmt::Write;", 1),
+        ] {
+            assert_ne!(edited, mine);
+            assert_eq!(custom_file_for_other_gpio_api(&edited), None, "{edited}");
+            assert_eq!(
+                mcu.customs_on_other_api(&[(path.clone(), edited)]),
+                [(path.clone(), false, false)]
+            );
+        }
     }
 
     /// A custom module is user-authored, so `reconcile_modules` (which rebuilds

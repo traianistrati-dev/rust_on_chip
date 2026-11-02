@@ -170,6 +170,7 @@ impl Mcu {
             pin_goto: None,
             module_goto: None,
             hand_built_customs: Vec::new(),
+            user_modules: Vec::new(),
             selected_module: None,
             selected_i2c_child: None,
             bus_reach: (0.0, 0.0),

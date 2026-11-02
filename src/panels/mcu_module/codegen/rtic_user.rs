@@ -118,6 +118,9 @@ pub struct UserTask {
     pub start: bool,
     /// Its parameters after the context, verbatim (`by: u32`).
     pub inputs: Vec<String>,
+    /// The project module it is written in (`tasks` for `src/tasks.rs`),
+    /// `None` for main.rs: the block imports it from there into `mod app`.
+    pub module: Option<String>,
 }
 
 /// Everything below (and above) the markers that shapes the app.
@@ -147,9 +150,14 @@ enum Item {
     Fn {
         name: String,
         is_async: bool,
+        /// `pub` or `pub(..)`: reachable from `mod app` when it lives in a
+        /// module of its own.
+        public: bool,
         /// The signature as code, up to its body's `{`.
         sig: String,
     },
+    /// A `use`, its path as written (`crate::app`).
+    Use { path: String },
     Struct {
         name: String,
         /// The text between its braces, as code.
@@ -208,6 +216,7 @@ fn items(file: &str, from: usize, to: usize) -> (Vec<&str>, Vec<Found>) {
 fn item_at(lines: &[&str]) -> Option<Item> {
     let mut rest = lines.first()?.trim_start();
     let mut is_async = false;
+    let mut public = false;
     loop {
         if rest.starts_with("#[") {
             // An attribute on the item's own line: past its balanced `]`.
@@ -225,8 +234,14 @@ fn item_at(lines: &[&str]) -> Option<Item> {
             })?;
             rest = rest[end + 1..].trim_start();
         } else if let Some(r) = rest.strip_prefix("pub(") {
-            rest = r.split_once(')')?.1.trim_start();
+            let (vis, after) = r.split_once(')')?;
+            // From a top-level module, `mod app` at the crate root sees
+            // `pub(crate)` / `pub(super)` - not `pub(self)` or `pub(in m)`.
+            let vis: String = vis.split_whitespace().collect::<Vec<_>>().join(" ");
+            public = matches!(vis.as_str(), "crate" | "super" | "in crate" | "in super");
+            rest = after.trim_start();
         } else if let Some(r) = rest.strip_prefix("pub ") {
+            public = true;
             rest = r.trim_start();
         } else if let Some(r) = rest.strip_prefix("async ") {
             is_async = true;
@@ -266,8 +281,13 @@ fn item_at(lines: &[&str]) -> Option<Item> {
         return (!name.is_empty()).then_some(Item::Fn {
             name,
             is_async,
+            public,
             sig,
         });
+    }
+    if let Some(r) = rest.strip_prefix("use ") {
+        let path = r.split(';').next().unwrap_or_default().trim().to_owned();
+        return (!path.is_empty()).then_some(Item::Use { path });
     }
     if let Some(r) = rest.strip_prefix("struct ") {
         let name = ident(r.trim_start());
@@ -507,16 +527,34 @@ fn parse_args(text: &str) -> Result<Args, String> {
 /// markers. Syntax-level refusals are decided here; the ones that need the
 /// app's resources, in [`plan`].
 pub fn scan(existing: &str) -> UserApp {
+    scan_project(existing, &[])
+}
+
+/// [`scan`], and the project's own `modules` main.rs declares too
+/// ([`task_modules`]): tasks only there - `idle_loop`'s marker and
+/// `AppShared` are main.rs's.
+pub fn scan_project(existing: &str, modules: &[(String, String)]) -> UserApp {
     let mut app = UserApp::default();
     let mut used_markers: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut app_shared_fn = false;
     let mut regions = Vec::new();
-    for (r, (from, to)) in user_spans(existing).into_iter().enumerate() {
-        let (raw, found) = items(existing, from, to);
+    let mut sources: Vec<(Option<&str>, &str, (usize, usize))> = user_spans(existing)
+        .into_iter()
+        .map(|span| (None, existing, span))
+        .collect();
+    for (name, text) in modules {
+        sources.push((Some(name.as_str()), text.as_str(), (0, text.len())));
+    }
+    for (r, &(module, file, (from, to))) in sources.iter().enumerate() {
+        let (raw, found) = items(file, from, to);
         for f in &found {
             match &f.item {
-                Item::Fn { name, .. } if name == "app_shared" => app_shared_fn = true,
-                Item::Fn { name, .. } if name == super::common::RTIC_IDLE_FN => {
+                Item::Fn { name, .. } if module.is_none() && name == "app_shared" => {
+                    app_shared_fn = true;
+                }
+                Item::Fn { name, .. }
+                    if module.is_none() && name == super::common::RTIC_IDLE_FN =>
+                {
                     if let Some(m) = marker_above(&raw, f.line, "idle") {
                         used_markers.insert((r, m));
                         let text = marker(raw[m]).map_or("", |(_, rest)| rest);
@@ -532,6 +570,7 @@ pub fn scan(existing: &str) -> UserApp {
                 Item::Fn {
                     name,
                     is_async,
+                    public,
                     sig,
                 } => {
                     let Some((inputs, diverges, is_static)) = task_signature(name, sig) else {
@@ -550,7 +589,13 @@ pub fn scan(existing: &str) -> UserApp {
                         None => parse_args(""),
                     };
                     let args = args.and_then(|a| {
-                        if *is_async && is_static && !diverges {
+                        if let Some(m) = module
+                            && !public
+                        {
+                            Err(format!(
+                                "in `{m}` it has to be `pub` - the app calls it from `mod app`"
+                            ))
+                        } else if *is_async && is_static && !diverges {
                             Err(
                                 "`Context<'static>` is for a task that never returns - end it \
                                  with `-> !` around a loop, or take `Context<'_>`"
@@ -561,11 +606,14 @@ pub fn scan(existing: &str) -> UserApp {
                         }
                     });
                     match args.and_then(|a| task(name, *is_async, diverges, inputs, a)) {
-                        Ok(t) => app.tasks.push(t),
+                        Ok(t) => app.tasks.push(UserTask {
+                            module: module.map(str::to_owned),
+                            ..t
+                        }),
                         Err(why) => app.refusals.push(format!("RTIC task `{name}`: {why}")),
                     }
                 }
-                Item::Struct { name, body } if name == "AppShared" => {
+                Item::Struct { name, body } if module.is_none() && name == "AppShared" => {
                     for field in split_args(body) {
                         // Past its attributes and its `pub` / `pub(..)`.
                         let mut f = field.trim();
@@ -594,7 +642,7 @@ pub fn scan(existing: &str) -> UserApp {
                         }
                     }
                 }
-                Item::Struct { .. } => {}
+                Item::Struct { .. } | Item::Use { .. } => {}
             }
         }
         regions.push(raw);
@@ -645,6 +693,17 @@ pub fn scan(existing: &str) -> UserApp {
     let mut vectors = BTreeSet::new();
     app.tasks.retain(|t| {
         let dup_name = !seen.insert(t.name.clone());
+        if dup_name {
+            app.refusals.push(format!(
+                "RTIC task `{}`{}: another task has this name already - RTIC names each \
+                 task's `app::<name>` module after it, so rename one fn",
+                t.name,
+                t.module
+                    .as_deref()
+                    .map(|m| format!(" in `{m}`"))
+                    .unwrap_or_default()
+            ));
+        }
         let dup_vector = t.binds.as_ref().is_some_and(|v| !vectors.insert(v.clone()));
         if dup_vector {
             app.refusals.push(format!(
@@ -730,6 +789,7 @@ fn task(
         shared: a.shared,
         start: a.start,
         inputs,
+        module: None,
     })
 }
 
@@ -959,13 +1019,24 @@ pub fn plan(
             if !t.shared.is_empty() {
                 what.push_str(&format!(", shared: {}", t.shared.join(", ")));
             }
-            extern_block.push_str(&format!("    //   {}: {what}\n", t.name));
+            let at = t
+                .module
+                .as_ref()
+                .map_or(String::new(), |m| format!(" (in {m})"));
+            extern_block.push_str(&format!("    //   {}{at}: {what}\n", t.name));
         }
         if !dispatchers.is_empty() {
             extern_block.push_str(&format!(
                 "    // Dispatchers, one per software priority: {}.\n",
                 dispatchers.join(", ")
             ));
+        }
+        // A task written in a module of the project's: brought into
+        // `mod app`, where RTIC calls it by its name.
+        for t in &tasks {
+            if let Some(m) = &t.module {
+                extern_block.push_str(&format!("    use crate::{m}::{};\n", t.name));
+            }
         }
         extern_block.push_str("    extern \"Rust\" {\n");
         for t in &tasks {
@@ -1006,6 +1077,67 @@ pub fn plan(
         spawns,
         errors,
     }
+}
+
+/// The project's own modules main.rs declares at its top level (`mod tasks;`,
+/// `pub mod tasks;`) - `(name, text)` of `src/<name>.rs` or
+/// `src/<name>/mod.rs` among `files` (`(path, text)`, paths `src/..`). Not
+/// `pins`, which the IDE writes, and not a module nested deeper: those the
+/// RTIC tasks are read off besides main.rs ([`scan_project`]).
+pub fn task_modules(main_rs: &str, files: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (from, to) in user_spans(main_rs) {
+        let code = code_only(&main_rs[from..to]);
+        let mut depth = 0i32;
+        // A `#[cfg]` or `#[path]` over a `mod` makes which file it is, and
+        // whether it is built, a question this text cannot settle: left out.
+        let mut attributed = false;
+        for line in code.lines() {
+            let t = line.trim();
+            if depth == 0 && t.starts_with("#[") {
+                attributed = true;
+            }
+            let skip = attributed;
+            if !t.is_empty() && !t.starts_with("#[") {
+                attributed = false;
+            }
+            if depth == 0
+                && !skip
+                && let Some(name) = mod_decl(t)
+                && name != "pins"
+                && !out.iter().any(|(n, _)| n == name)
+                && let Some((_, text)) = files.iter().find(|(p, _)| {
+                    *p == format!("src/{name}.rs") || *p == format!("src/{name}/mod.rs")
+                })
+            {
+                out.push((name.to_owned(), text.clone()));
+            }
+            for c in line.chars() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth = (depth - 1).max(0),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The module a `mod name;` line declares (`pub` / `pub(..)` before it).
+fn mod_decl(line: &str) -> Option<&str> {
+    let mut rest = line;
+    if let Some(r) = rest.strip_prefix("pub(") {
+        rest = r.split_once(')')?.1.trim_start();
+    } else if let Some(r) = rest.strip_prefix("pub ") {
+        rest = r.trim_start();
+    }
+    let rest = rest.strip_prefix("mod ")?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let (name, tail) = rest.split_at(end);
+    (!name.is_empty() && tail.trim() == ";").then_some(name)
 }
 
 /// What the System tab shows of the user's tasks: read back off the block
@@ -1072,6 +1204,9 @@ fn task_items_at(file: &str) -> Vec<usize> {
                 }
                 Item::Fn { name, .. } if name == "app_shared" => shared.push(f.at),
                 Item::Struct { name, .. } if name == "AppShared" => shared.push(f.at),
+                // What a task's module imports to write one - `app`, `Mono`,
+                // the monotonic's prelude - exists on RTIC alone.
+                Item::Use { path } if rtic_only_use(path) => shared.push(f.at),
                 _ => {}
             }
         }
@@ -1082,6 +1217,22 @@ fn task_items_at(file: &str) -> Vec<usize> {
     }
     tasks.sort_unstable();
     tasks
+}
+
+/// Whether a `use` names what only the RTIC runtime has: its `app`, the
+/// generated `Mono`, the `rtic` crates.
+fn rtic_only_use(path: &str) -> bool {
+    let path: String = path.chars().filter(|c| !c.is_whitespace()).collect();
+    [
+        "crate::app",
+        "crate::Mono",
+        "super::app",
+        "super::Mono",
+        "rtic::",
+        "rtic_monotonics::",
+    ]
+    .iter()
+    .any(|p| path.starts_with(p))
 }
 
 /// Off RTIC, [`RTIC_TASK_FENCE`] above every one of the user's RTIC items;
@@ -1137,6 +1288,56 @@ pub(crate) const EXAMPLE_TASKS: &str = concat!(
     "\n",
     "// @task(binds = TIM3, priority = 4)\n",
     "fn tick(_cx: app::tick::Context) {}\n",
+);
+
+/// [`EXAMPLE_TASKS`] split across files: `blink` and `tick` in
+/// `src/tasks.rs` ([`EXAMPLE_MODULE`]), the rest below main.rs's markers with
+/// `mod tasks;` - the `EIDE_F1_TASKS=module` cross-compile.
+#[cfg(test)]
+pub(crate) const EXAMPLE_MAIN_WITH_MODULE: &str = concat!(
+    "\n",
+    "mod tasks;\n",
+    "\n",
+    "/// Values several tasks share: one RTIC `#[shared]` resource per field.\n",
+    "struct AppShared {\n",
+    "    count: u32,\n",
+    "}\n",
+    "\n",
+    "fn app_shared() -> AppShared {\n",
+    "    AppShared { count: 0 }\n",
+    "}\n",
+    "\n",
+    "// @task(priority = 3, shared = [count, serial1])\n",
+    "async fn report(mut cx: app::report::Context<'_>, by: u32) {\n",
+    "    let n = cx.shared.count.lock(|c| {\n",
+    "        *c += by;\n",
+    "        *c\n",
+    "    });\n",
+    "    cx.shared.serial1.lock(|s| {\n",
+    "        let _ = (s, n);\n",
+    "    });\n",
+    "}\n",
+);
+
+/// `src/tasks.rs` of [`EXAMPLE_MAIN_WITH_MODULE`].
+#[cfg(test)]
+pub(crate) const EXAMPLE_MODULE: &str = concat!(
+    "//! Tasks in a module of their own: the generated block imports them\n",
+    "//! into `mod app`, where RTIC calls them.\n",
+    "use crate::Mono;\n",
+    "use crate::app;\n",
+    "use rtic_monotonics::systick::prelude::*;\n",
+    "\n",
+    "// @task(priority = 2, local = [pc13_out], start)\n",
+    "pub async fn blink(cx: app::blink::Context<'_>) {\n",
+    "    loop {\n",
+    "        cx.local.pc13_out.toggle();\n",
+    "        Mono::delay(500.millis()).await;\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "// @task(binds = TIM3, priority = 4)\n",
+    "pub fn tick(_cx: app::tick::Context) {}\n",
 );
 
 /// The idle loop [`EXAMPLE_TASKS`] goes with, in place of the seed: it locks
@@ -1541,6 +1742,147 @@ mod tests {
         assert!(app.refusals.is_empty(), "{:?}", app.refusals);
         let typo = scan(&tail("// @Taks(priority = 2)\nfn plain() {}\n"));
         assert!(!typo.refusals.is_empty());
+    }
+
+    /// The modules main.rs declares at its top level, read off the project's
+    /// files: `src/<name>.rs` or `src/<name>/mod.rs` - not `pins`, not a
+    /// commented-out or nested `mod`, not one with no file.
+    #[test]
+    fn task_modules_are_the_ones_main_declares() {
+        let main = tail(concat!(
+            "mod tasks;\npub(crate) mod more;\n// mod commented;\nmod missing;\n",
+            "mod inline { mod nested; }\npub mod pins;\n",
+        ));
+        let files = vec![
+            ("src/tasks.rs".to_owned(), "a".to_owned()),
+            ("src/more/mod.rs".to_owned(), "b".to_owned()),
+            ("src/commented.rs".to_owned(), "c".to_owned()),
+            ("src/nested.rs".to_owned(), "d".to_owned()),
+            ("src/pins/mod.rs".to_owned(), "e".to_owned()),
+        ];
+        assert_eq!(
+            task_modules(&main, &files),
+            [
+                ("tasks".to_owned(), "a".to_owned()),
+                ("more".to_owned(), "b".to_owned())
+            ]
+        );
+    }
+
+    /// A task in a module: read like one in main.rs, `pub` required, and
+    /// imported into `mod app` by the block - its readout says where.
+    #[test]
+    fn a_task_in_a_module_is_imported_into_the_app() {
+        let modules = vec![(
+            "tasks".to_owned(),
+            concat!(
+                "use crate::app;\n",
+                "// @task(priority = 2, local = [led])\n",
+                "pub async fn blink(cx: app::blink::Context<'_>) {}\n",
+                "async fn hidden(cx: crate::app::hidden::Context<'_>) {}\n",
+                "fn idle_loop(cx: app::idle::Context) -> ! { loop {} }\n",
+            )
+            .to_owned(),
+        )];
+        let app = scan_project(&tail("mod tasks;\nuse tasks::*;\n"), &modules);
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].module.as_deref(), Some("tasks"));
+        assert!(
+            app.refusals
+                .iter()
+                .any(|r| r.contains("`hidden`") && r.contains("`pub`")),
+            "{:?}",
+            app.refusals
+        );
+        let p = plan(&app, &locals(&["led"]), &BTreeSet::new(), &BTreeSet::new());
+        assert!(
+            p.extern_block
+                .contains("    //   blink (in tasks): software, priority 2"),
+            "{}",
+            p.extern_block
+        );
+        assert!(
+            p.extern_block
+                .contains("    use crate::tasks::blink;\n    extern \"Rust\" {\n"),
+            "{}",
+            p.extern_block
+        );
+        // Fenced in its own file off RTIC, and back.
+        let text = &modules[0].1;
+        let off = fence_tasks(text.clone(), false);
+        assert!(
+            off.contains(&format!("{RTIC_TASK_FENCE}pub async fn blink")),
+            "{off}"
+        );
+        assert_eq!(fence_tasks(off, true), *text);
+    }
+
+    /// Off RTIC a task module's own imports of RTIC's things go with its
+    /// tasks - `app`, `Mono` and the monotonic's prelude exist on RTIC alone -
+    /// and come back with them.
+    #[test]
+    fn a_task_modules_rtic_imports_are_fenced_too() {
+        let off = fence_tasks(EXAMPLE_MODULE.to_owned(), false);
+        for line in [
+            "use crate::Mono;",
+            "use crate::app;",
+            "use rtic_monotonics::systick::prelude::*;",
+            "pub async fn blink",
+            "pub fn tick",
+        ] {
+            assert!(
+                off.contains(&format!("{RTIC_TASK_FENCE}{line}")),
+                "{line}:\n{off}"
+            );
+        }
+        assert_eq!(fence_tasks(off, true), EXAMPLE_MODULE);
+        // A module with no task keeps its imports.
+        let plain = "use crate::app;\nfn helper() {}\n".to_owned();
+        assert_eq!(fence_tasks(plain.clone(), false), plain);
+    }
+
+    /// What the module review found: `pub(self)` cannot be reached from
+    /// `mod app`, two tasks may not share a name, and a `mod` under an
+    /// attribute is not guessed at.
+    #[test]
+    fn module_edge_cases() {
+        let module = |text: &str| vec![("tasks".to_owned(), text.to_owned())];
+        let private = scan_project(
+            &tail("mod tasks;\n"),
+            &module("pub(self) async fn a(cx: crate::app::a::Context<'_>) {}\n"),
+        );
+        assert!(private.tasks.is_empty());
+        assert!(
+            private.refusals[0].contains("has to be `pub`"),
+            "{:?}",
+            private.refusals
+        );
+        let crate_vis = scan_project(
+            &tail("mod tasks;\n"),
+            &module("pub(crate) async fn a(cx: crate::app::a::Context<'_>) {}\n"),
+        );
+        assert_eq!(crate_vis.tasks.len(), 1, "{:?}", crate_vis.refusals);
+
+        let twice = scan_project(
+            &tail("async fn a(cx: app::a::Context<'_>) {}\n"),
+            &module("pub async fn a(cx: crate::app::a::Context<'_>) {}\n"),
+        );
+        assert_eq!(twice.tasks.len(), 1);
+        assert!(
+            twice
+                .refusals
+                .iter()
+                .any(|r| r.contains("`a` in `tasks`") && r.contains("this name")),
+            "{:?}",
+            twice.refusals
+        );
+
+        let files = vec![
+            ("src/tasks.rs".to_owned(), "a".to_owned()),
+            ("src/jobs.rs".to_owned(), "b".to_owned()),
+        ];
+        let main = tail("#[cfg(feature = \"x\")]\nmod tasks;\n#[path = \"jobs.rs\"] mod jobs;\n");
+        assert!(task_modules(&main, &files).is_empty());
     }
 
     /// The tab's view reads the block back: tasks, dispatchers, refusals.

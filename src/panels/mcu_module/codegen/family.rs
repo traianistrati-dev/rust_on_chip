@@ -1451,7 +1451,7 @@ impl FamilyBackend for RticBackend {
             &mcu.watchdog_and_custom_inits(),
             &mcu.custom_module_plan().1,
             // The user's own tasks, declared by their code around the block.
-            &rtic_user::scan(existing),
+            &rtic_user::scan_project(existing, &mcu.user_modules),
         );
         // The block imported `adc` here too, at the crate root the tail's
         // helpers share: kept while they name it.

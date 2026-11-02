@@ -2152,17 +2152,27 @@ mod emit_for_manual_compile {
         // `EIDE_F1_TASKS=1`: the user's own tasks below the markers - a shared
         // counter, a started task taking the LED, one sharing the UART, a
         // hardware task on TIM3 - declared by the regeneration the app runs.
-        let main_rs = if std::env::var("EIDE_F1_TASKS").is_ok() {
+        // `=module`: the LED's task and the hardware one in `src/tasks.rs`,
+        // read off the module main.rs declares, as the app reads it.
+        let mut task_files: Vec<(String, String)> = Vec::new();
+        let main_rs = if let Ok(how) = std::env::var("EIDE_F1_TASKS") {
             use crate::panels::mcu_module::codegen::common::RTIC_IDLE_SEED;
-            use crate::panels::mcu_module::codegen::rtic_user::{EXAMPLE_IDLE, EXAMPLE_TASKS};
+            use crate::panels::mcu_module::codegen::rtic_user::{
+                EXAMPLE_IDLE, EXAMPLE_MAIN_WITH_MODULE, EXAMPLE_MODULE, EXAMPLE_TASKS, task_modules,
+            };
             assert!(
                 main_rs.contains(RTIC_IDLE_SEED),
                 "the idle seed:\n{main_rs}"
             );
-            let mine = format!(
-                "{}{EXAMPLE_TASKS}",
-                main_rs.replace(RTIC_IDLE_SEED, EXAMPLE_IDLE)
-            );
+            let below = if how == "module" {
+                task_files.push(("src/tasks.rs".to_owned(), EXAMPLE_MODULE.to_owned()));
+                EXAMPLE_MAIN_WITH_MODULE
+            } else {
+                EXAMPLE_TASKS
+            };
+            let mine = format!("{}{below}", main_rs.replace(RTIC_IDLE_SEED, EXAMPLE_IDLE));
+            mcu.user_modules = task_modules(&mine, &task_files);
+            assert_eq!(mcu.user_modules.len(), task_files.len(), "{mine}");
             let main_rs = mcu.update_main_rs(&mine);
             assert!(
                 main_rs.contains("dispatchers = [RCC, FLASH]")
@@ -2195,7 +2205,8 @@ mod emit_for_manual_compile {
         };
 
         let files = manifest_sync::project_files(&f1, &mcu, &main_rs);
-        let user: Vec<(String, String)> = mcu.pin_tree_files();
+        let mut user: Vec<(String, String)> = mcu.pin_tree_files();
+        user.extend(task_files);
         let dir = std::env::temp_dir().join("eide_f1_check_rtic");
         project_gen::clear_project_dir_keep_target(&dir);
         project_gen::write_project(&dir, &files, &user, &mcu.mcu_config_text(), "")

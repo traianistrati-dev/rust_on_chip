@@ -2898,11 +2898,16 @@ impl AppIde {
                     }
                     // On RTIC, the user's own tasks as the block declares them,
                     // and whether their code changed since (a Save declares it).
-                    let tasks = self.mcu.as_ref().filter(|m| m.is_rtic()).map(|m| {
+                    let tasks = self.mcu.as_ref().filter(|m| m.is_rtic()).map(|_| {
                         use crate::panels::mcu_module::codegen::rtic_user;
+                        let modules = rtic_user::task_modules(
+                            &self.generated_code,
+                            &self.project_tree.user_src_files,
+                        );
                         (
                             rtic_user::view(&self.generated_code),
-                            m.rtic_user_app(&self.generated_code) != self.rtic_user,
+                            Some(rtic_user::scan_project(&self.generated_code, &modules))
+                                != self.rtic_user,
                         )
                     });
                     match &mut self.mcu {
@@ -4268,7 +4273,7 @@ const RTIC_DETAILS: &[(&str, &str)] = &[
     ),
     (
         "Your tasks:",
-        "Write them below the markers: a top-level fn whose first parameter is app::<its name>::Context is a task (async fn = software, plain fn + binds = hardware). A // @task(..) line right above it holds RTIC's own #[task(..)] arguments, plus start to spawn it in #[init]. A Local a task claims leaves idle; one a shared = [..] names moves to #[shared], beside the fields of your struct AppShared (built by fn app_shared). // @idle(shared = [..]) above idle_loop locks them there too. The block declares them on Save, says what it understood above its extern \"Rust\" block, and a compile_error! names a task it cannot declare. Software priorities take dispatchers from RCC, FLASH, PVD, WWDG, DMA1_CHANNEL7, DMA1_CHANNEL6 in that order - leave those interrupts to it.",
+        "Write them below the markers: a top-level fn whose first parameter is app::<its name>::Context is a task (async fn = software, plain fn + binds = hardware). A // @task(..) line right above it holds RTIC's own #[task(..)] arguments, plus start to spawn it in #[init]. A Local a task claims leaves idle; one a shared = [..] names moves to #[shared], beside the fields of your struct AppShared (built by fn app_shared). // @idle(shared = [..]) above idle_loop locks them there too. A task can also live in a module main.rs declares (mod tasks; for src/tasks.rs): pub there, with use crate::app; - the block imports it into mod app. The block declares them on Save, says what it understood above its extern \"Rust\" block, and a compile_error! names a task it cannot declare. Software priorities take dispatchers from RCC, FLASH, PVD, WWDG, DMA1_CHANNEL7, DMA1_CHANNEL6 in that order - leave those interrupts to it.",
     ),
     (
         "Shared EXTI vectors:",

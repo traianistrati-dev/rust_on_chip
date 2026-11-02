@@ -799,12 +799,14 @@ impl Mcu {
     }
 
     /// On RTIC, the user's own tasks as `main_rs` declares them around the
-    /// block ([`rtic_user::scan`]) - `None` on any other runtime. The twin of
+    /// block, and the project modules in [`Mcu::user_modules`]
+    /// ([`rtic_user::scan_project`]) - `None` on any other runtime. The twin of
     /// [`Self::customs_built_by_hand`]: read on every regeneration and before
     /// every Save (`App::rtic_user`), so a task written, changed or removed
     /// since is declared in the block the Save writes.
     pub fn rtic_user_app(&self, main_rs: &str) -> Option<rtic_user::UserApp> {
-        self.is_rtic().then(|| rtic_user::scan(main_rs))
+        self.is_rtic()
+            .then(|| rtic_user::scan_project(main_rs, &self.user_modules))
     }
 
     /// The modules whose pads this project's OWN code already takes: the text

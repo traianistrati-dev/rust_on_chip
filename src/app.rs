@@ -3661,7 +3661,7 @@ impl AppIde {
         // continuous repaint, was a big share of the per-frame CPU cost.
         let mut mcu_changed = false;
         self.main_rs_caret_shift = None;
-        if let Some(mcu) = &self.mcu {
+        if let Some(mcu) = &mut self.mcu {
             let current_hash = Self::calculate_mcu_state_hash(mcu);
             if current_hash != self.mcu_state_hash {
                 // Store the hash even when main.rs comes out identical —
@@ -3669,6 +3669,12 @@ impl AppIde {
                 // frame until the NEXT state change.
                 self.mcu_state_hash = current_hash;
                 mcu_changed = true;
+                // The project's own modules main.rs declares: RTIC reads the
+                // user's tasks off them as well as off main.rs.
+                mcu.user_modules = crate::panels::mcu_module::codegen::rtic_user::task_modules(
+                    &self.generated_code,
+                    &self.project_tree.user_src_files,
+                );
                 self.custom_by_hand = mcu.customs_built_by_hand(&self.generated_code);
                 self.rtic_user = mcu.rtic_user_app(&self.generated_code);
                 let updated = mcu.update_main_rs(&self.generated_code);
@@ -3676,6 +3682,28 @@ impl AppIde {
                     self.main_rs_caret_shift = caret_shift(&self.generated_code, &updated);
                     self.generated_code = updated;
                     self.cached_project_files = None; // Invalidate cache
+                }
+                // A task in one of those modules names RTIC's `app` too: off
+                // RTIC it is fenced there, as in main.rs, and back on it the
+                // fence comes off (`rtic_user::fence_tasks`).
+                let rtic = mcu.is_rtic();
+                for (name, _) in &mcu.user_modules {
+                    let paths = [format!("src/{name}.rs"), format!("src/{name}/mod.rs")];
+                    if let Some((_, text)) = self
+                        .project_tree
+                        .user_src_files
+                        .iter_mut()
+                        .find(|(p, _)| paths.contains(p))
+                    {
+                        let fenced = crate::panels::mcu_module::codegen::rtic_user::fence_tasks(
+                            text.clone(),
+                            rtic,
+                        );
+                        if fenced != *text {
+                            *text = fenced;
+                            self.cached_project_files = None;
+                        }
+                    }
                 }
             }
         }
@@ -5540,10 +5568,15 @@ impl eframe::App for AppIde {
         // The same for the user's own RTIC tasks: written, changed or removed
         // below the markers, they are declared in the block the Save writes.
         if save_requested
-            && self.mcu.as_ref().is_some_and(|m| {
+            && let Some(m) = &mut self.mcu
+            && {
+                m.user_modules = crate::panels::mcu_module::codegen::rtic_user::task_modules(
+                    &self.generated_code,
+                    &self.project_tree.user_src_files,
+                );
                 m.customs_built_by_hand(&self.generated_code) != self.custom_by_hand
                     || m.rtic_user_app(&self.generated_code) != self.rtic_user
-            })
+            }
         {
             self.mcu_state_hash = 0;
             self.request_save = true;

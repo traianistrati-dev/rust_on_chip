@@ -400,6 +400,11 @@ pub struct Mcu {
     /// own code below the markers (`Mcu::customs_built_by_hand`). Their line
     /// is not generated as well - it would move the same pads a second time.
     pub hand_built_customs: Vec<String>,
+    /// Transient, set by the app before every regeneration: the project's own
+    /// modules main.rs declares (`mod tasks;`), as `(name, text)` - RTIC
+    /// reads the user's tasks off them as well as off main.rs
+    /// (`rtic_user::task_modules`). Not part of project state.
+    pub user_modules: Vec<(String, String)>,
     /// Id of the module currently selected on the canvas — drawn white, bigger
     /// and double-bordered, the module counterpart of [`Mcu::selected_pin`].
     /// Clicking it again clears it. View state only; not persisted.

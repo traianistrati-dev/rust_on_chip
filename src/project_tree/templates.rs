@@ -326,6 +326,24 @@ pub fn written(body: &str) -> Stamp {
     }
 }
 
+/// [`fingerprint`] of a file with no block, which is the user's whole once
+/// written - a Custom module's: all of its text, line ends aside, so a CRLF
+/// checkout of it is still the text the IDE wrote.
+pub fn whole_fingerprint(content: &str) -> u64 {
+    fnv1a64(content.replace("\r\n", "\n").as_bytes())
+}
+
+/// The stamp of a file with no block the IDE has just written (`text`): what
+/// it wrote, [`whole_fingerprint`], is all such a file's record holds - it is
+/// never compared with a template, offered or marked. Untouched since, it is
+/// still the IDE's to change (`ProjectTreeState::sync_config_files`).
+pub fn written_whole(text: &str) -> Stamp {
+    Stamp {
+        written: Some(whole_fingerprint(text)),
+        ..Stamp::default()
+    }
+}
+
 /// `body` as the file becomes when it follows its template - with the text
 /// the user typed above the block when `keep_head` (see [`Decision`]).
 pub fn template_text(content: &str, body: &str, keep_head: bool) -> String {

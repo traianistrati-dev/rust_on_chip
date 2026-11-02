@@ -736,12 +736,12 @@ impl ProjectTreeState {
             // it ran on every regeneration — the first frame after the IDE starts
             // included — and wiped any field added to the struct.
             //
-            // But one still exactly as the IDE wrote it for the OTHER GPIO api
-            // follows the api, as main.rs's bindings just did: its traits'
-            // `use` line is all that differs, and kept it would bound raw
-            // stm32f1xx-hal pins on embedded-hal 1.0 (or bridged ones on 0.2).
-            // One back from the graveyard (the module removed, then restored)
-            // comes back first, so it follows the same way.
+            // But one still as the IDE wrote it follows the GPIO api, as
+            // main.rs's bindings just did: its traits' `use` line is all that
+            // differs, and kept it would bound raw stm32f1xx-hal pins on
+            // embedded-hal 1.0 (or bridged ones on 0.2). One back from the
+            // graveyard (the module removed, then restored) comes back first,
+            // so it follows the same way.
             let custom = is_custom_stem(name.trim_end_matches(".rs"));
             if custom
                 && !self.user_src_files.iter().any(|(p, _)| p == &file_path)
@@ -755,11 +755,36 @@ impl ProjectTreeState {
                     .iter_mut()
                     .find(|(p, _)| p == &file_path)
             {
+                use crate::panels::mcu_module::codegen::{
+                    custom_file_for_other_gpio_api, custom_file_speaks_eh02,
+                };
                 let lf = |s: &str| s.replace("\r\n", "\n");
-                if crate::panels::mcu_module::codegen::custom_file_for_other_gpio_api(body)
-                    .is_some_and(|other| lf(content) == lf(&other))
-                {
-                    content.clone_from(body);
+                let wanted = custom_file_speaks_eh02(body);
+                let other_api = wanted.is_some() && custom_file_speaks_eh02(content) != wanted;
+                let written = self.templates.files.get(&file_path).and_then(|s| s.written);
+                let followed = match written {
+                    // The text the IDE wrote, untouched since: only its traits'
+                    // line follows, every other byte stays as written. An
+                    // applied pin relabelled or turned round with its Update
+                    // still pending is no edit of the user's - the names it
+                    // brings are that Update's new revision to write.
+                    Some(fp) if fp == templates::whole_fingerprint(content) => other_api
+                        .then(|| custom_file_for_other_gpio_api(content))
+                        .flatten(),
+                    // Changed since the IDE wrote it: the user's, all of it.
+                    Some(_) => None,
+                    // No record of what the IDE wrote - a file from before it
+                    // kept one: untouched when it is exactly what the IDE
+                    // writes on the other api.
+                    None => custom_file_for_other_gpio_api(body)
+                        .is_some_and(|other| lf(content) == lf(&other))
+                        .then(|| body.clone()),
+                };
+                if let Some(text) = followed {
+                    *content = text;
+                    self.templates
+                        .files
+                        .insert(file_path.clone(), templates::written_whole(content));
                 }
                 continue;
             }
@@ -881,9 +906,14 @@ impl ProjectTreeState {
                 stamp
             } else {
                 // New file: write the full generated content (consts + editable
-                // remainder).
+                // remainder). A Custom module's has no block: what is recorded
+                // is the whole of it, so it is known untouched later.
                 self.user_src_files.push((file_path.clone(), body.clone()));
-                templates::written(body)
+                if custom {
+                    templates::written_whole(body)
+                } else {
+                    templates::written(body)
+                }
             };
             if stamp.offered.is_some() {
                 report.offered.push((file_path.clone(), body.clone()));
@@ -2046,10 +2076,10 @@ mod tests {
         assert_folder_exists(&state, "src/pins/configs");
     }
 
-    /// A Custom module's file still exactly as the IDE wrote it for the other
-    /// GPIO api follows the api - its traits' `use` line - so it bounds the
-    /// pins main.rs now hands it; CRLF on disk is still "exactly". One the
-    /// user changed stays as they left it.
+    /// A Custom module's file still as the IDE wrote it follows the GPIO api -
+    /// its traits' `use` line - so it bounds the pins main.rs now hands it;
+    /// one checked out CRLF still counts, and stays CRLF. One the user changed
+    /// stays as they left it.
     #[test]
     fn an_untouched_custom_module_file_follows_the_gpio_api() {
         use crate::panels::mcu_module::codegen::custom_file_for_other_gpio_api;
@@ -2088,7 +2118,11 @@ mod tests {
         assert_eq!(sync(&mut state, portable), portable);
         assert_eq!(sync(&mut state, &native), native, "to the Native api");
         on_disk(&mut state, native.replace('\n', "\r\n"));
-        assert_eq!(sync(&mut state, portable), portable, "and back, from CRLF");
+        assert_eq!(
+            sync(&mut state, portable),
+            portable.replace('\n', "\r\n"),
+            "and back, from CRLF"
+        );
 
         let edited = portable.replace("{}\n", "{\n    fn mine(&mut self) {}\n}\n");
         on_disk(&mut state, edited.clone());
@@ -2096,7 +2130,8 @@ mod tests {
 
         // The module removed - its file buried - and restored on the other
         // api: back from the graveyard, it follows in the same sync.
-        on_disk(&mut state, native.clone());
+        let mut state = ProjectTreeState::new();
+        assert_eq!(sync(&mut state, &native), native);
         state.sync_config_files(&[], &[], &mut None);
         assert!(
             !state.user_src_files.iter().any(|(p, _)| p == path),
@@ -2106,6 +2141,84 @@ mod tests {
             sync(&mut state, portable),
             portable,
             "restored, and followed"
+        );
+    }
+
+    /// "Untouched" is the record of what the IDE wrote, not the body it would
+    /// write now: an applied pin relabelled with its Update still pending
+    /// moves the body, not the file - which still follows the GPIO api, its
+    /// traits' line alone swapped and the field names it was written with
+    /// kept, once. An edited file stays; one with no record (an older
+    /// project) is held against the body, and the pending Update is a
+    /// difference there.
+    #[test]
+    fn an_untouched_custom_module_file_follows_with_an_update_pending() {
+        use crate::panels::mcu_module::codegen::custom_file_for_other_gpio_api;
+        let mut state = ProjectTreeState::new();
+        let path = "src/pins/configs/custom_panel.rs";
+        let keep = ["custom_panel".to_string()];
+        let written = "use embedded_hal::digital::{OutputPin};\n\n\
+                       pub struct Panel<PB12> {\n    pub pb12_out: PB12,\n}\n";
+        let sync = |state: &mut ProjectTreeState, body: &str| {
+            state.sync_config_files(
+                &[("custom_panel.rs".to_string(), body.to_string())],
+                &keep,
+                &mut None,
+            );
+            state
+                .user_src_files
+                .iter()
+                .find(|(p, _)| p == path)
+                .expect("written")
+                .1
+                .clone()
+        };
+        let on_disk = |state: &mut ProjectTreeState, text: &str| {
+            state
+                .user_src_files
+                .iter_mut()
+                .find(|(p, _)| p == path)
+                .expect("written")
+                .1 = text.to_owned();
+        };
+        let recorded = |state: &ProjectTreeState| state.templates.files[path].written;
+        assert_eq!(sync(&mut state, written), written);
+        assert_eq!(
+            recorded(&state),
+            Some(templates::whole_fingerprint(written))
+        );
+
+        // PB12 relabelled "led", its Update pending: the body has moved on.
+        let pending = written.replace("pb12_out", "pb12_out_led");
+        let pending_native = custom_file_for_other_gpio_api(&pending).expect("a traits line");
+        let followed = custom_file_for_other_gpio_api(written).expect("a traits line");
+        assert!(followed.contains("pb12_out:"), "{followed}");
+        assert_eq!(
+            sync(&mut state, &pending_native),
+            followed,
+            "its line follows"
+        );
+        assert_eq!(
+            recorded(&state),
+            Some(templates::whole_fingerprint(&followed))
+        );
+        assert_eq!(sync(&mut state, &pending_native), followed, "once");
+        assert_eq!(sync(&mut state, &pending), written, "and back");
+
+        let mine = format!("{written}\nfn mine() {{}}\n");
+        on_disk(&mut state, &mine);
+        assert_eq!(sync(&mut state, &pending_native), mine, "the user's stays");
+        // Their own traits line, the other api's as the IDE writes it: the
+        // record says it is theirs, so it is not put back either.
+        on_disk(&mut state, &followed);
+        assert_eq!(sync(&mut state, written), followed, "their line stays");
+
+        on_disk(&mut state, written);
+        state.templates.files.remove(path);
+        assert_eq!(
+            sync(&mut state, &pending_native),
+            written,
+            "no record: kept"
         );
     }
 

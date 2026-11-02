@@ -76,24 +76,43 @@ fn custom_trait_use(traits: &str, eh02: bool) -> String {
     }
 }
 
-/// `body`, a Custom module's file as the IDE writes it, as the IDE would have
-/// written it on the other GPIO api - its traits' `use` line swapped - or
-/// `None` when it has none. A file on disk equal to it is one the user never
-/// touched, which follows the api (`ProjectTree::sync_config_files`).
-pub fn custom_file_for_other_gpio_api(body: &str) -> Option<String> {
-    let (at, eh02) = body
+/// Where a Custom module's file has its traits' `use` line - `at..end`, the
+/// line end (`\n` or `\r\n`) left out - and whether it is 0.2's.
+fn custom_use_line(text: &str) -> Option<(usize, usize, bool)> {
+    let (at, eh02) = text
         .match_indices(CUSTOM_EH1_USE)
         .map(|(i, _)| (i, false))
-        .chain(body.match_indices(CUSTOM_EH02_USE).map(|(i, _)| (i, true)))
-        .find(|(i, _)| *i == 0 || body[..*i].ends_with('\n'))?;
-    let end = body[at..].find('\n').map_or(body.len(), |n| at + n);
+        .chain(text.match_indices(CUSTOM_EH02_USE).map(|(i, _)| (i, true)))
+        .find(|(i, _)| *i == 0 || text[..*i].ends_with('\n'))?;
+    let end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+    let end = if text[..end].ends_with('\r') {
+        end - 1
+    } else {
+        end
+    };
+    Some((at, end, eh02))
+}
+
+/// Which traits a Custom module's file imports as the IDE writes them:
+/// embedded-hal 0.2's (`Some(true)`), 1.0's (`Some(false)`), or neither.
+pub fn custom_file_speaks_eh02(text: &str) -> Option<bool> {
+    custom_use_line(text).map(|(.., eh02)| eh02)
+}
+
+/// `text`, a Custom module's file as the IDE writes it, as the IDE would have
+/// written it on the other GPIO api - its traits' `use` line swapped, every
+/// other byte kept - or `None` when it has none. A file on disk equal to it
+/// is one the user never touched, which follows the api
+/// (`ProjectTree::sync_config_files`).
+pub fn custom_file_for_other_gpio_api(text: &str) -> Option<String> {
+    let (at, end, eh02) = custom_use_line(text)?;
     let prefix = if eh02 {
         CUSTOM_EH02_USE
     } else {
         CUSTOM_EH1_USE
     };
-    let traits = body[at + prefix.len()..end].split('}').next()?;
-    let mut other = body.to_owned();
+    let traits = text[at + prefix.len()..end].split('}').next()?;
+    let mut other = text.to_owned();
     other.replace_range(at..end, &custom_trait_use(traits, !eh02));
     Some(other)
 }

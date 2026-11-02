@@ -1,0 +1,1508 @@
+//! The user's own RTIC tasks, declared by their code below the markers.
+//!
+//! On RTIC the whole `#[rtic::app] mod app` sits inside the GENERATED block,
+//! rebuilt on every regeneration, so a task written in it would not survive.
+//! RTIC 2 also takes a task DECLARED in an `extern "Rust"` block inside the
+//! app and implemented outside it - rtic-macros calls the implementation by
+//! its name, which the app's `use super::*` reaches at the crate root. So the
+//! user writes the task below the markers, and the block declares it:
+//!
+//! - a top-level `fn` whose first parameter is `app::<its own name>::Context`
+//!   is a task - the signature the user has to write anyway for it to compile;
+//!   an `async fn` a software task, a plain `fn` a hardware one;
+//! - `// @task(..)` right above it (over `///` and `#[..]` lines only) holds
+//!   RTIC's own `#[task(..)]` arguments, copied through as written - plus
+//!   `start`, the IDE's own, which spawns it at the end of `#[init]`;
+//! - `// @idle(shared = [..])` above `fn idle_loop` locks Shared resources
+//!   from the idle loop too;
+//! - `struct AppShared` with `fn app_shared() -> AppShared` beside it: each
+//!   field one `#[shared]` resource, built by that fn in `#[init]`.
+//!
+//! A generated Local a task claims leaves `#[idle]`; one a `shared = [..]`
+//! names moves to `#[shared]`. What cannot be declared is said by a
+//! `compile_error!` in the block, naming the task - never by a line number,
+//! which would rewrite the block whenever a line is added above it.
+//!
+//! Nothing is persisted: the user's text is the record. A project with no
+//! such fn generates exactly what it did before.
+
+use std::collections::BTreeSet;
+
+use super::common::{code_only, user_spans};
+
+/// The interrupts the software tasks' dispatchers run on, in the order they
+/// are taken: one per distinct software priority. Present under these names
+/// in every STM32F1 PAC (f100/f101/f102/f103/f107) and bound by nothing the
+/// IDE generates - stm32f1xx-hal defines no RCC/FLASH handler, PVD fires only
+/// with EXTI16 armed, WWDG has no driver there, and the HAL's DMA is blocking.
+/// The two DMA channels come last: the only ones a user might `listen()` on.
+pub const F1_DISPATCHERS: [&str; 6] = [
+    "RCC",
+    "FLASH",
+    "PVD",
+    "WWDG",
+    "DMA1_CHANNEL7",
+    "DMA1_CHANNEL6",
+];
+
+/// Above each of the user's tasks - and `AppShared` / `app_shared` - while
+/// the runtime is not RTIC: a task names RTIC's `app`, which nothing else
+/// writes, so it is compiled out rather than failing the build, and taken off
+/// on the way back (the idle loop's own fence is `RTIC_IDLE_FENCE`).
+pub const RTIC_TASK_FENCE: &str =
+    "#[cfg(any())] // RTIC task: built only on the RTIC runtime, whose `app` it names\n";
+
+/// Vectors no task may bind: the core's exceptions, SysTick the monotonic's.
+const EXCEPTIONS: &[&str] = &[
+    "SysTick",
+    "PendSV",
+    "SVCall",
+    "NMI",
+    "HardFault",
+    "MemoryManagement",
+    "BusFault",
+    "UsageFault",
+    "DebugMonitor",
+];
+
+/// Names the generated app already uses - its functions, and the heads of
+/// the paths it writes inside `mod app`: RTIC puts a `mod <task>` there, which
+/// would shadow `gpio::..`, `rtic::export::..` or the device path.
+const RESERVED: &[&str] = &[
+    "gpio",
+    "adc",
+    "pac",
+    "serial",
+    "dma",
+    "prelude",
+    "rtic",
+    "rtic_monotonics",
+    "stm32f1xx_hal",
+    "cortex_m",
+    "cortex_m_rt",
+    "core",
+    "init",
+    "idle",
+    "idle_loop",
+    "main",
+    "app",
+    "Mono",
+    "pins",
+    "exti0",
+    "exti1",
+    "exti2",
+    "exti3",
+    "exti4",
+    "exti9_5",
+    "exti15_10",
+];
+
+/// One task of the user's, as read from its signature and marker.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UserTask {
+    pub name: String,
+    pub is_async: bool,
+    /// An `async fn` ending in `-> !`: RTIC wants `Context<'static>` then.
+    pub diverges: bool,
+    pub binds: Option<String>,
+    pub priority: u8,
+    /// RTIC's arguments as written, minus `start`, `priority = 1` added when
+    /// none is given.
+    pub args: String,
+    /// Bare names in `local = [..]`: generated Locals this task takes.
+    pub claimed: Vec<String>,
+    /// `name: T = e` entries in `local = [..]`: RTIC's own task locals.
+    pub declared: Vec<String>,
+    /// Names in `shared = [..]`, `&` taken off.
+    pub shared: Vec<String>,
+    pub start: bool,
+    /// Its parameters after the context, verbatim (`by: u32`).
+    pub inputs: Vec<String>,
+}
+
+/// Everything below (and above) the markers that shapes the app.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UserApp {
+    pub tasks: Vec<UserTask>,
+    /// `struct AppShared`'s fields `(name, type)`.
+    pub app_shared: Vec<(String, String)>,
+    pub idle_shared: Vec<String>,
+    /// What the scan refused, each already a full sentence.
+    pub refusals: Vec<String>,
+}
+
+impl UserApp {
+    /// Nothing that changes the generated app.
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+            && self.app_shared.is_empty()
+            && self.idle_shared.is_empty()
+            && self.refusals.is_empty()
+    }
+}
+
+/// A top-level item of the user's text that matters here.
+#[derive(Debug)]
+enum Item {
+    Fn {
+        name: String,
+        is_async: bool,
+        /// The signature as code, up to its body's `{`.
+        sig: String,
+    },
+    Struct {
+        name: String,
+        /// The text between its braces, as code.
+        body: String,
+    },
+}
+
+/// One item, with where its first line starts in the file and the index of
+/// that line in its region's raw lines.
+struct Found {
+    at: usize,
+    line: usize,
+    item: Item,
+}
+
+/// The top-level `fn`s and `struct`s of `file[from..to]`. Comments and
+/// literals are read through [`code_only`], which keeps every line where it
+/// was, so its lines index the raw ones.
+fn items(file: &str, from: usize, to: usize) -> (Vec<&str>, Vec<Found>) {
+    let raw: Vec<&str> = file[from..to].split('\n').collect();
+    let code = code_only(&file[from..to]);
+    let code: Vec<&str> = code.split('\n').collect();
+    let mut starts = Vec::with_capacity(raw.len());
+    let mut at = from;
+    for l in &raw {
+        starts.push(at);
+        at += l.len() + 1;
+    }
+    let mut found = Vec::new();
+    let mut depth = 0i32;
+    for (i, line) in code.iter().enumerate() {
+        if depth == 0
+            && let Some(item) = item_at(&code[i..])
+        {
+            found.push(Found {
+                at: starts[i],
+                line: i,
+                item,
+            });
+        }
+        for c in line.chars() {
+            match c {
+                '{' => depth += 1,
+                // Never below the top: off RTIC the text below the markers
+                // opens inside `fn main`, closed there by its `}`.
+                '}' => depth = (depth - 1).max(0),
+                _ => {}
+            }
+        }
+    }
+    (raw, found)
+}
+
+/// The item whose head is the first of `lines`, if it is a `fn` or a
+/// `struct` (`pub`, `pub(..)`, `async`, `unsafe` before it).
+fn item_at(lines: &[&str]) -> Option<Item> {
+    let mut rest = lines.first()?.trim_start();
+    let mut is_async = false;
+    loop {
+        if rest.starts_with("#[") {
+            // An attribute on the item's own line: past its balanced `]`.
+            let mut depth = 0i32;
+            let end = rest.char_indices().find_map(|(i, c)| match c {
+                '[' => {
+                    depth += 1;
+                    None
+                }
+                ']' => {
+                    depth -= 1;
+                    (depth == 0).then_some(i)
+                }
+                _ => None,
+            })?;
+            rest = rest[end + 1..].trim_start();
+        } else if let Some(r) = rest.strip_prefix("pub(") {
+            rest = r.split_once(')')?.1.trim_start();
+        } else if let Some(r) = rest.strip_prefix("pub ") {
+            rest = r.trim_start();
+        } else if let Some(r) = rest.strip_prefix("async ") {
+            is_async = true;
+            rest = r.trim_start();
+        } else if let Some(r) = rest.strip_prefix("unsafe ") {
+            rest = r.trim_start();
+        } else {
+            break;
+        }
+    }
+    let ident = |s: &str| -> String {
+        s.chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect()
+    };
+    if let Some(r) = rest.strip_prefix("fn ") {
+        let name = ident(r.trim_start());
+        // The signature, over as many lines as it takes, up to its body - a
+        // `{` or `;` outside its brackets: `buf: [u8; 4]` is a parameter.
+        let mut sig = String::new();
+        let mut depth = 0i32;
+        'sig: for l in lines {
+            for (i, c) in l.char_indices() {
+                match c {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    '{' | ';' if depth <= 0 => {
+                        sig.push_str(&l[..i]);
+                        break 'sig;
+                    }
+                    _ => {}
+                }
+            }
+            sig.push_str(l);
+            sig.push(' ');
+        }
+        return (!name.is_empty()).then_some(Item::Fn {
+            name,
+            is_async,
+            sig,
+        });
+    }
+    if let Some(r) = rest.strip_prefix("struct ") {
+        let name = ident(r.trim_start());
+        let text = lines.join("\n");
+        let open = text.find('{')?;
+        let mut depth = 0i32;
+        for (i, c) in text[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(Item::Struct {
+                            name,
+                            body: text[open + 1..open + i].to_owned(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// `text` split at the commas outside any `()`, `[]`, `{}` or generic
+/// `<>`, each part trimmed, empty ones dropped. A `<` opens only right after
+/// a name or `::` (`Option<`, `Vec::<`), never as `<<` or `<=`; a `>` closes
+/// only an open one and never as `->` - so `1 << 3` and `fn() -> u8` do not
+/// swallow the commas after them.
+pub fn split_args(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut angle = 0i32;
+    let mut cur = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = chars[..i]
+            .iter()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .copied();
+        let next = chars.get(i + 1).copied();
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '<' if prev.is_some_and(|p| p.is_alphanumeric() || p == '_' || p == ':')
+                && !matches!(next, Some('<' | '=')) =>
+            {
+                angle += 1;
+            }
+            '>' if angle > 0 && chars.get(i.wrapping_sub(1)) != Some(&'-') => angle -= 1,
+            ',' if depth == 0 && angle == 0 => {
+                out.push(cur.trim().to_owned());
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    out.push(cur.trim().to_owned());
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// The text inside the parentheses that open `s`, or `None` when they do not
+/// close on that line.
+fn parenthesised(s: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[1..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// For a `fn` named `name` with signature `sig`: whether its first parameter
+/// is `app::<name>::Context` (also `crate::app::` / `self::app::`, with or
+/// without a lifetime), its other parameters, whether it returns `!`, and
+/// whether its context is `Context<'static>`.
+fn task_signature(name: &str, sig: &str) -> Option<(Vec<String>, bool, bool)> {
+    // After `fn <name>` - a `pub(crate)` before it has parentheses too.
+    let after_name = sig.find(&format!("fn {name}"))? + 3 + name.len();
+    let open = after_name + sig[after_name..].find('(')?;
+    let params = parenthesised(&sig[open..])?;
+    let after = &sig[open + params.len() + 2..];
+    let params = split_args(params);
+    let first = params.first()?;
+    let (_, ty) = first.split_once(':')?;
+    let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    let ty = ty
+        .strip_prefix("crate::")
+        .or_else(|| ty.strip_prefix("self::"))
+        .unwrap_or(&ty);
+    let rest = ty.strip_prefix(&format!("app::{name}::Context"))?;
+    if !(rest.is_empty() || rest.starts_with('<')) {
+        return None;
+    }
+    let diverges = after
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .starts_with("->!");
+    Some((params[1..].to_vec(), diverges, rest == "<'static>"))
+}
+
+/// A marker line: `// @<word>(..)`, spaces allowed after `//` and before the
+/// `(` - its word, and the rest of the line from the `(`.
+fn marker(line: &str) -> Option<(&str, &str)> {
+    let m = line
+        .trim()
+        .strip_prefix("//")?
+        .trim_start()
+        .strip_prefix('@')?;
+    let p = m.find('(')?;
+    let word = m[..p].trim_end();
+    (!word.is_empty() && word.chars().all(|c| c.is_ascii_alphabetic())).then(|| (word, &m[p..]))
+}
+
+/// Whether `word` reads as `task` or `idle` misspelt: at most two edits from
+/// either, case aside - `tsak` and `Idle` are, `todo` and `see` are not.
+fn near_marker_word(word: &str) -> bool {
+    let w: Vec<char> = word.to_ascii_lowercase().chars().collect();
+    ["task", "idle"].iter().any(|k| {
+        let k: Vec<char> = k.chars().collect();
+        let mut row: Vec<usize> = (0..=k.len()).collect();
+        for (i, a) in w.iter().enumerate() {
+            let mut prev = row[0];
+            row[0] = i + 1;
+            for (j, b) in k.iter().enumerate() {
+                let cur = row[j + 1];
+                row[j + 1] = (row[j + 1] + 1)
+                    .min(row[j] + 1)
+                    .min(prev + usize::from(a != b));
+                prev = cur;
+            }
+        }
+        row[k.len()] <= 2
+    })
+}
+
+/// The marker of the item whose head is raw line `line`: the first line above
+/// it that is not `///` or `#[..]`, when it is a `// @{kind}(..)`.
+fn marker_above(raw: &[&str], line: usize, kind: &str) -> Option<usize> {
+    raw[..line]
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, l)| (i, l.trim()))
+        .find(|(_, l)| !(l.starts_with("///") || l.starts_with("#[")))
+        .filter(|(_, l)| marker(l).is_some_and(|(w, _)| w == kind))
+        .map(|(i, _)| i)
+}
+
+/// What one `// @task(..)` holds.
+#[derive(Default)]
+struct Args {
+    rtic: Vec<String>,
+    priority: Option<u8>,
+    binds: Option<String>,
+    claimed: Vec<String>,
+    declared: Vec<String>,
+    shared: Vec<String>,
+    /// `shared = [..]` as written, `&` kept: what `#[idle]` is given.
+    shared_raw: Vec<String>,
+    start: bool,
+    local_task: bool,
+}
+
+fn parse_args(text: &str) -> Result<Args, String> {
+    let mut a = Args::default();
+    for entry in split_args(text) {
+        if entry == "start" {
+            a.start = true;
+            continue;
+        }
+        if entry == "local_task" {
+            a.local_task = true;
+            a.rtic.push(entry);
+            continue;
+        }
+        let (key, value) = entry
+            .split_once('=')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .ok_or_else(|| format!("`{entry}` is no `key = value` RTIC knows"))?;
+        let list = || {
+            value
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .map(split_args)
+                .ok_or_else(|| format!("`{key}` takes a list, `{key} = [..]`"))
+        };
+        match key {
+            "priority" => {
+                a.priority = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("`priority = {value}` is no number"))?,
+                );
+            }
+            "binds" => a.binds = Some(value.to_owned()),
+            "local" => {
+                for l in list()? {
+                    match l.split_once(':') {
+                        Some((n, _)) => a.declared.push(n.trim().to_owned()),
+                        None => a.claimed.push(l),
+                    }
+                }
+            }
+            "shared" => {
+                for s in list()? {
+                    a.shared.push(s.trim_start_matches('&').trim().to_owned());
+                    a.shared_raw.push(s);
+                }
+            }
+            "local_task" => a.local_task = value == "true",
+            _ => {}
+        }
+        a.rtic.push(entry);
+    }
+    if a.priority.is_none() {
+        a.rtic.insert(0, "priority = 1".to_owned());
+    }
+    Ok(a)
+}
+
+/// Read the user's tasks off `existing` - its text above and below the
+/// markers. Syntax-level refusals are decided here; the ones that need the
+/// app's resources, in [`plan`].
+pub fn scan(existing: &str) -> UserApp {
+    let mut app = UserApp::default();
+    let mut used_markers: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut app_shared_fn = false;
+    let mut regions = Vec::new();
+    for (r, (from, to)) in user_spans(existing).into_iter().enumerate() {
+        let (raw, found) = items(existing, from, to);
+        for f in &found {
+            match &f.item {
+                Item::Fn { name, .. } if name == "app_shared" => app_shared_fn = true,
+                Item::Fn { name, .. } if name == super::common::RTIC_IDLE_FN => {
+                    if let Some(m) = marker_above(&raw, f.line, "idle") {
+                        used_markers.insert((r, m));
+                        let text = marker(raw[m]).map_or("", |(_, rest)| rest);
+                        match parenthesised(text).map(parse_args) {
+                            Some(Ok(a)) => app.idle_shared.extend(a.shared_raw),
+                            Some(Err(why)) => app.refusals.push(format!("RTIC idle: {why}")),
+                            None => app
+                                .refusals
+                                .push("RTIC idle: its `// @idle(` is not closed".to_owned()),
+                        }
+                    }
+                }
+                Item::Fn {
+                    name,
+                    is_async,
+                    sig,
+                } => {
+                    let Some((inputs, diverges, is_static)) = task_signature(name, sig) else {
+                        continue;
+                    };
+                    let above = marker_above(&raw, f.line, "task");
+                    let args = match above {
+                        Some(m) => {
+                            used_markers.insert((r, m));
+                            let text = marker(raw[m]).map_or("", |(_, rest)| rest);
+                            match parenthesised(text) {
+                                Some(t) => parse_args(t),
+                                None => Err("its `// @task(` is not closed".to_owned()),
+                            }
+                        }
+                        None => parse_args(""),
+                    };
+                    let args = args.and_then(|a| {
+                        if *is_async && is_static && !diverges {
+                            Err(
+                                "`Context<'static>` is for a task that never returns - end it \
+                                 with `-> !` around a loop, or take `Context<'_>`"
+                                    .to_owned(),
+                            )
+                        } else {
+                            Ok(a)
+                        }
+                    });
+                    match args.and_then(|a| task(name, *is_async, diverges, inputs, a)) {
+                        Ok(t) => app.tasks.push(t),
+                        Err(why) => app.refusals.push(format!("RTIC task `{name}`: {why}")),
+                    }
+                }
+                Item::Struct { name, body } if name == "AppShared" => {
+                    for field in split_args(body) {
+                        // Past its attributes and its `pub` / `pub(..)`.
+                        let mut f = field.trim();
+                        while let Some(r) = f.strip_prefix("#[") {
+                            f = r.split_once(']').map_or("", |(_, r)| r.trim_start());
+                        }
+                        if let Some(r) = f.strip_prefix("pub(") {
+                            f = r.split_once(')').map_or("", |(_, r)| r.trim_start());
+                        } else if let Some(r) = f.strip_prefix("pub ") {
+                            f = r.trim_start();
+                        }
+                        match f.split_once(':') {
+                            Some((n, ty))
+                                if !n.trim().is_empty()
+                                    && n.trim()
+                                        .chars()
+                                        .all(|c| c.is_alphanumeric() || c == '_') =>
+                            {
+                                app.app_shared
+                                    .push((n.trim().to_owned(), ty.trim().to_owned()));
+                            }
+                            _ => app.refusals.push(format!(
+                                "RTIC shared: `AppShared`'s field `{field}` is not read - write \
+                                 it `name: Type`"
+                            )),
+                        }
+                    }
+                }
+                Item::Struct { .. } => {}
+            }
+        }
+        regions.push(raw);
+    }
+    if !app.app_shared.is_empty() && !app_shared_fn {
+        app.refusals.push(
+            "RTIC shared: `struct AppShared` needs `fn app_shared() -> AppShared` beside it, \
+             which `#[init]` calls for the shared values"
+                .to_owned(),
+        );
+        app.app_shared.clear();
+    }
+    // A marker that declares nothing - above no task, or misspelt - is said:
+    // silence would read as a task that does not run.
+    for (r, raw) in regions.iter().enumerate() {
+        let mut depth = 0i32;
+        let code = code_only(&raw.join("\n"));
+        // Each marker-shaped line swapped for a sentinel, which survives
+        // `code_only` only where the line is code - not inside `/* */`.
+        let probe: Vec<&str> = raw
+            .iter()
+            .map(|l| if marker(l).is_some() { "\u{1}" } else { *l })
+            .collect();
+        let live = code_only(&probe.join("\n"));
+        let live: Vec<&str> = live.split('\n').collect();
+        for (i, (l, c)) in raw.iter().zip(code.split('\n')).enumerate() {
+            let t = l.trim();
+            // `// @task(..)`, `// @idle(..)` - or one of them misspelt.
+            let stray = marker(t).is_some_and(|(w, _)| near_marker_word(w))
+                && live.get(i).is_some_and(|c| c.contains('\u{1}'));
+            if depth == 0 && stray && !used_markers.contains(&(r, i)) {
+                app.refusals.push(format!(
+                    "RTIC: `{t}` is above no task - a task is a top-level fn whose first \
+                     parameter is `app::<its name>::Context`, and `// @idle(..)` goes right \
+                     above `fn idle_loop`"
+                ));
+            }
+            for ch in c.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth = (depth - 1).max(0),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut vectors = BTreeSet::new();
+    app.tasks.retain(|t| {
+        let dup_name = !seen.insert(t.name.clone());
+        let dup_vector = t.binds.as_ref().is_some_and(|v| !vectors.insert(v.clone()));
+        if dup_vector {
+            app.refusals.push(format!(
+                "RTIC task `{}`: `binds = {}` is bound by another task already",
+                t.name,
+                t.binds.as_deref().unwrap_or_default()
+            ));
+        }
+        !dup_name && !dup_vector
+    });
+    app
+}
+
+/// One task from its parts, or why it cannot be declared.
+fn task(
+    name: &str,
+    is_async: bool,
+    diverges: bool,
+    inputs: Vec<String>,
+    a: Args,
+) -> Result<UserTask, String> {
+    if RESERVED.contains(&name) {
+        return Err("the generated app uses this name already - rename the fn".to_owned());
+    }
+    let priority = a.priority.unwrap_or(1);
+    match (&a.binds, is_async) {
+        (None, false) => {
+            return Err(
+                "a plain `fn` is a hardware task and needs `binds = <interrupt>` in its \
+                 `// @task(..)`; a software task is an `async fn`"
+                    .to_owned(),
+            );
+        }
+        (Some(_), true) => {
+            return Err("an `async fn` is a software task: `binds` is for a plain `fn`".to_owned());
+        }
+        (Some(v), false) if EXCEPTIONS.contains(&v.as_str()) => {
+            return Err(format!(
+                "`binds = {v}` is a core exception{}",
+                if v == "SysTick" {
+                    ", and SysTick drives the generated `Mono`"
+                } else {
+                    ""
+                }
+            ));
+        }
+        (Some(_), false) if !inputs.is_empty() => {
+            return Err("a hardware task takes its context alone".to_owned());
+        }
+        _ => {}
+    }
+    if priority == 0 {
+        return Err(
+            "priority 0 is idle's level, and the app's `#[idle]` is generated - use 1 or more"
+                .to_owned(),
+        );
+    }
+    if a.start && a.local_task {
+        return Err(
+            "`start` spawns it from `#[init]`, and a `local_task` is spawned only from its own \
+             executor's tasks"
+                .to_owned(),
+        );
+    }
+    if priority > 16 {
+        return Err("the F1's NVIC has 16 priority levels".to_owned());
+    }
+    if a.start && (!is_async || !inputs.is_empty()) {
+        return Err(
+            "`start` spawns it in `#[init]` with no arguments: a software task with none"
+                .to_owned(),
+        );
+    }
+    Ok(UserTask {
+        name: name.to_owned(),
+        is_async,
+        diverges,
+        binds: a.binds,
+        priority,
+        args: a.rtic.join(", "),
+        claimed: a.claimed,
+        declared: a.declared,
+        shared: a.shared,
+        start: a.start,
+        inputs,
+    })
+}
+
+/// What the block makes of the user's app.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Plan {
+    /// `dispatchers = [..]`, empty for none.
+    pub dispatchers: Vec<String>,
+    /// Generated Locals moved to `#[shared]`, in `Local` order, with types.
+    pub promoted: Vec<(String, String)>,
+    /// `AppShared`'s fields, after the promoted ones.
+    pub app_shared: Vec<(String, String)>,
+    /// Locals `#[idle]` no longer takes: claimed by a task, or shared.
+    pub idle_drop: BTreeSet<String>,
+    /// What `#[idle]` locks: `// @idle(shared = [..])`.
+    pub idle_shared: Vec<String>,
+    /// The readout and `extern "Rust"` block, inside `mod app`.
+    pub extern_block: String,
+    /// `<task>::spawn().ok();` lines for `#[init]`.
+    pub spawns: String,
+    /// `compile_error!` items, after `mod app`.
+    pub errors: String,
+}
+
+impl Plan {
+    /// Whether `#[shared]` has fields - and the crate root needs
+    /// `rtic::Mutex` for `.lock()` in the bodies below the markers.
+    pub fn has_shared(&self) -> bool {
+        !self.promoted.is_empty() || !self.app_shared.is_empty()
+    }
+}
+
+/// The app for `user` over the generated `locals` (`(name, type)` in `Local`
+/// order). `held` are the Locals an armed pin's task takes, `bound` the
+/// vectors those tasks bind.
+pub fn plan(
+    user: &UserApp,
+    locals: &[(String, String)],
+    held: &BTreeSet<String>,
+    bound: &BTreeSet<String>,
+) -> Plan {
+    let mut errors: Vec<String> = user.refusals.clone();
+    let names = || locals.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>();
+    // `&x` and `x` name one resource.
+    let bare = |s: &str| s.trim_start_matches('&').trim().to_owned();
+    // An `AppShared` field named like a generated resource would be a second
+    // `#[shared]` field of that name.
+    let app_shared: Vec<(String, String)> = user
+        .app_shared
+        .iter()
+        .filter(|(f, _)| {
+            let clash = locals.iter().any(|(l, _)| l == f);
+            if clash {
+                errors.push(format!(
+                    "RTIC shared: `AppShared`'s field `{f}` is named like a generated resource - \
+                     rename it"
+                ));
+            }
+            !clash
+        })
+        .cloned()
+        .collect();
+    let shared_ok =
+        |n: &str| locals.iter().any(|(l, _)| l == n) || app_shared.iter().any(|(f, _)| f == n);
+    // Who claims what, and what is shared by anyone (idle included).
+    let idle_bare: Vec<String> = user.idle_shared.iter().map(|s| bare(s)).collect();
+    let mut all_shared: BTreeSet<&str> = idle_bare.iter().map(String::as_str).collect();
+    for t in &user.tasks {
+        all_shared.extend(t.shared.iter().map(String::as_str));
+    }
+    let mut owner: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    let mut tasks: Vec<&UserTask> = Vec::new();
+    'task: for t in &user.tasks {
+        let refuse = |why: String| format!("RTIC task `{}`: {why}", t.name);
+        if let Some(v) = &t.binds
+            && bound.contains(v)
+        {
+            errors.push(refuse(format!(
+                "`binds = {v}` is an armed pin's EXTI vector, generated here - that pin's code \
+                 goes in its `on_<pad>_in_edge` hook"
+            )));
+            continue;
+        }
+        if let Some(v) = &t.binds
+            && F1_DISPATCHERS.contains(&v.as_str())
+            && user.tasks.iter().any(|o| o.is_async)
+        {
+            errors.push(refuse(format!(
+                "`binds = {v}`: the software tasks' dispatchers run on {}, in that order - \
+                 bind another interrupt",
+                F1_DISPATCHERS.join(", ")
+            )));
+            continue;
+        }
+        for c in &t.claimed {
+            let why = if !locals.iter().any(|(n, _)| n == c) {
+                format!(
+                    "`local = [{c}]` names no resource - the Local resources are: {}",
+                    names().join(", ")
+                )
+            } else if held.contains(c) {
+                format!("`{c}` belongs to its pin's EXTI task - its code goes in the pin's hook")
+            } else if all_shared.contains(c.as_str()) {
+                format!("`{c}` is shared by a `shared = [..]` - one or the other")
+            } else if let Some(o) = owner.get(c.as_str()) {
+                format!("`{c}` is claimed by task `{o}` already - a Local has one owner")
+            } else {
+                continue;
+            };
+            errors.push(refuse(why));
+            continue 'task;
+        }
+        for d in &t.declared {
+            if locals.iter().any(|(n, _)| n == d) {
+                errors.push(refuse(format!(
+                    "its own local `{d}` is named like a generated resource - rename it"
+                )));
+                continue 'task;
+            }
+        }
+        for s in &t.shared {
+            let why = if !shared_ok(s) {
+                format!(
+                    "`shared = [{s}]` names nothing shared - the generated resources are: {}{}",
+                    names().join(", "),
+                    if app_shared.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; `AppShared`'s: {}",
+                            app_shared
+                                .iter()
+                                .map(|(n, _)| n.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                )
+            } else if held.contains(s) {
+                format!("`{s}` belongs to its pin's EXTI task - it cannot be shared")
+            } else {
+                continue;
+            };
+            errors.push(refuse(why));
+            continue 'task;
+        }
+        for c in &t.claimed {
+            owner.insert(c, &t.name);
+        }
+        tasks.push(t);
+    }
+    // What idle locks must exist too.
+    let mut idle_shared = Vec::new();
+    for s in &user.idle_shared {
+        let b = bare(s);
+        if shared_ok(&b) && !held.contains(&b) {
+            idle_shared.push(s.clone());
+        } else {
+            errors.push(format!(
+                "RTIC idle: `shared = [{s}]` names nothing it can share - the generated \
+                 resources are: {}",
+                names().join(", ")
+            ));
+        }
+    }
+    let shared_names: BTreeSet<&str> = tasks
+        .iter()
+        .flat_map(|t| t.shared.iter().map(String::as_str))
+        .chain(
+            idle_bare
+                .iter()
+                .map(String::as_str)
+                .filter(|n| shared_ok(n)),
+        )
+        .collect();
+    let promoted: Vec<(String, String)> = locals
+        .iter()
+        .filter(|(n, _)| shared_names.contains(n.as_str()))
+        .cloned()
+        .collect();
+    let idle_drop: BTreeSet<String> = promoted
+        .iter()
+        .map(|(n, _)| n.clone())
+        .chain(tasks.iter().flat_map(|t| t.claimed.iter().cloned()))
+        .collect();
+    // One dispatcher per distinct software priority, from the pool minus
+    // every vector a task binds - the list grows and shrinks at its tail.
+    let priorities: BTreeSet<u8> = tasks
+        .iter()
+        .filter(|t| t.is_async)
+        .map(|t| t.priority)
+        .collect();
+    let taken: BTreeSet<&str> = tasks.iter().filter_map(|t| t.binds.as_deref()).collect();
+    let pool: Vec<String> = F1_DISPATCHERS
+        .iter()
+        .filter(|v| !taken.contains(**v) && !bound.contains(**v))
+        .map(|v| (*v).to_owned())
+        .collect();
+    if priorities.len() > pool.len() {
+        errors.push(format!(
+            "RTIC: {} software priority levels, and {} free dispatcher interrupts ({}) - put \
+             tasks on fewer levels",
+            priorities.len(),
+            pool.len(),
+            pool.join(", ")
+        ));
+    }
+    let dispatchers: Vec<String> = pool.into_iter().take(priorities.len()).collect();
+
+    let mut extern_block = String::new();
+    if !tasks.is_empty() {
+        extern_block.push_str(
+            "\n    // Your tasks, declared from their signatures below the markers\n\
+             \x20   // (`fn name(cx: app::name::Context..)`, `// @task(..)` right above it):\n",
+        );
+        for t in &tasks {
+            let mut what = match &t.binds {
+                Some(v) => format!("hardware, {v}, priority {}", t.priority),
+                None => format!("software, priority {}", t.priority),
+            };
+            if t.start {
+                what.push_str(", started in #[init]");
+            }
+            if !t.claimed.is_empty() {
+                what.push_str(&format!(", local: {}", t.claimed.join(", ")));
+            }
+            if !t.shared.is_empty() {
+                what.push_str(&format!(", shared: {}", t.shared.join(", ")));
+            }
+            extern_block.push_str(&format!("    //   {}: {what}\n", t.name));
+        }
+        if !dispatchers.is_empty() {
+            extern_block.push_str(&format!(
+                "    // Dispatchers, one per software priority: {}.\n",
+                dispatchers.join(", ")
+            ));
+        }
+        extern_block.push_str("    extern \"Rust\" {\n");
+        for t in &tasks {
+            let inputs: String = t.inputs.iter().map(|i| format!(", {i}")).collect();
+            let decl = match (t.is_async, t.diverges) {
+                (true, false) => format!("async fn {n}(_: {n}::Context<'_>{inputs});", n = t.name),
+                (true, true) => format!(
+                    "async fn {n}(_: {n}::Context<'static>{inputs}) -> !;",
+                    n = t.name
+                ),
+                (false, _) => format!("fn {n}(_: {n}::Context);", n = t.name),
+            };
+            extern_block.push_str(&format!("        #[task({})]\n        {decl}\n", t.args));
+        }
+        extern_block.push_str("    }\n");
+    }
+    let started: Vec<&&UserTask> = tasks.iter().filter(|t| t.start).collect();
+    let spawns = if started.is_empty() {
+        String::new()
+    } else {
+        let mut s = "        // Your tasks marked `start` below the markers.\n".to_owned();
+        for t in started {
+            s.push_str(&format!("        {}::spawn().ok();\n", t.name));
+        }
+        s
+    };
+    let errors: String = errors
+        .iter()
+        .map(|e| format!("compile_error!({e:?});\n"))
+        .collect();
+    Plan {
+        dispatchers,
+        promoted,
+        app_shared,
+        idle_drop,
+        idle_shared,
+        extern_block,
+        spawns,
+        errors,
+    }
+}
+
+/// The start of the line of every one of the user's RTIC items in `file`:
+/// task fns, `struct AppShared`, `fn app_shared`.
+///
+/// `AppShared` and `app_shared` only beside a task, or already fenced: in a
+/// project that never used RTIC they are just the user's own names.
+fn task_items_at(file: &str) -> Vec<usize> {
+    let mut tasks = Vec::new();
+    let mut shared = Vec::new();
+    for (from, to) in user_spans(file) {
+        let (_, found) = items(file, from, to);
+        for f in found {
+            match &f.item {
+                Item::Fn { name, sig, .. } if task_signature(name, sig).is_some() => {
+                    tasks.push(f.at);
+                }
+                Item::Fn { name, .. } if name == "app_shared" => shared.push(f.at),
+                Item::Struct { name, .. } if name == "AppShared" => shared.push(f.at),
+                _ => {}
+            }
+        }
+    }
+    let fenced = |at: &usize| file[..*at].ends_with(RTIC_TASK_FENCE);
+    if !tasks.is_empty() || shared.iter().any(fenced) {
+        tasks.extend(shared);
+    }
+    tasks.sort_unstable();
+    tasks
+}
+
+/// Off RTIC, [`RTIC_TASK_FENCE`] above every one of the user's RTIC items;
+/// back on RTIC, taken off again - so a round trip gives the same file back.
+/// Nothing is ever removed: every line of them is the user's.
+pub fn fence_tasks(mut file: String, rtic: bool) -> String {
+    for at in task_items_at(&file).into_iter().rev() {
+        let fenced = file[..at].ends_with(RTIC_TASK_FENCE);
+        if rtic && fenced {
+            file.replace_range(at - RTIC_TASK_FENCE.len()..at, "");
+        } else if !rtic && !fenced {
+            file.insert_str(at, RTIC_TASK_FENCE);
+        }
+    }
+    file
+}
+
+/// What a user writes below the markers of an F103 RTIC project wired with
+/// PC13 an output and USART1: a shared counter, a task started in `#[init]`
+/// that takes the LED, one that shares the counter and the UART, a hardware
+/// task on a vector nothing else binds. The unit tests and the `EIDE_F1_TASKS`
+/// cross-compile both use it, so the matrix compiles what they assert on.
+#[cfg(test)]
+pub(crate) const EXAMPLE_TASKS: &str = concat!(
+    "\n",
+    "/// Values several tasks share: one RTIC `#[shared]` resource per field.\n",
+    "struct AppShared {\n",
+    "    count: u32,\n",
+    "}\n",
+    "\n",
+    "fn app_shared() -> AppShared {\n",
+    "    AppShared { count: 0 }\n",
+    "}\n",
+    "\n",
+    "// @task(priority = 2, local = [pc13_out], start)\n",
+    "async fn blink(cx: app::blink::Context<'_>) {\n",
+    "    loop {\n",
+    "        cx.local.pc13_out.toggle();\n",
+    "        Mono::delay(500.millis()).await;\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "// @task(priority = 3, shared = [count, serial1])\n",
+    "async fn report(mut cx: app::report::Context<'_>, by: u32) {\n",
+    "    let n = cx.shared.count.lock(|c| {\n",
+    "        *c += by;\n",
+    "        *c\n",
+    "    });\n",
+    "    cx.shared.serial1.lock(|s| {\n",
+    "        let _ = (s, n);\n",
+    "    });\n",
+    "}\n",
+    "\n",
+    "// @task(binds = TIM3, priority = 4)\n",
+    "fn tick(_cx: app::tick::Context) {}\n",
+);
+
+/// The idle loop [`EXAMPLE_TASKS`] goes with, in place of the seed: it locks
+/// the counter and spawns `report`.
+#[cfg(test)]
+pub(crate) const EXAMPLE_IDLE: &str = concat!(
+    "// @idle(shared = [count])\n",
+    "fn idle_loop(mut cx: app::idle::Context) -> ! {\n",
+    "    loop {\n",
+    "        app::report::spawn(1).ok();\n",
+    "        let _seen = cx.shared.count.lock(|c| *c);\n",
+    "        cortex_m::asm::wfi();\n",
+    "    }\n",
+    "}\n",
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::panels::mcu_module::codegen::common::{GEN_BEGIN, GEN_END};
+
+    fn tail(user: &str) -> String {
+        format!("// head\n{GEN_BEGIN}\nmod app {{}}\n{GEN_END}\n{user}")
+    }
+
+    fn locals(names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|n| ((*n).to_owned(), format!("T_{n}")))
+            .collect()
+    }
+
+    #[test]
+    fn a_task_is_a_fn_whose_context_is_its_own() {
+        let app = scan(&tail(concat!(
+            "/// blinks\n",
+            "// @task(priority = 2, local = [pc13_out], start)\n",
+            "#[allow(unused)]\n",
+            "pub(crate) async fn blink(cx: crate::app::blink::Context<'_>) {\n",
+            "    let _ = \"fn fake(cx: app::fake::Context)\";\n",
+            "}\n",
+            "async fn report(\n    mut cx: app::report::Context<'_>,\n    by: u32,\n) {}\n",
+            "// fn commented(cx: app::commented::Context) {}\n",
+            "mod inner { fn nested(cx: app::nested::Context) {} }\n",
+            "fn idle_loop(cx: app::idle::Context) -> ! { loop {} }\n",
+            "fn other(cx: app::blink::Context) {}\n",
+            "async fn forever(cx: app::forever::Context<'static>) -> ! { loop {} }\n",
+        )));
+        assert!(app.refusals.is_empty(), "{:?}", app.refusals);
+        let names: Vec<&str> = app.tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["blink", "report", "forever"]);
+        let blink = &app.tasks[0];
+        assert_eq!(blink.args, "priority = 2, local = [pc13_out]");
+        assert!(blink.start && blink.is_async);
+        assert_eq!(blink.claimed, ["pc13_out"]);
+        assert_eq!(app.tasks[1].args, "priority = 1");
+        assert_eq!(app.tasks[1].inputs, ["by: u32"]);
+        assert!(app.tasks[2].diverges);
+    }
+
+    #[test]
+    fn marker_args_are_rticks_own_verbatim() {
+        let app = scan(&tail(concat!(
+            "// @task(priority = 3, local = [buf: [u8; 4] = [0; 4], led], shared = [&count, x])\n",
+            "async fn t(cx: app::t::Context<'_>) {}\n",
+        )));
+        let t = &app.tasks[0];
+        assert_eq!(
+            t.args,
+            "priority = 3, local = [buf: [u8; 4] = [0; 4], led], shared = [&count, x]"
+        );
+        assert_eq!(t.declared, ["buf"]);
+        assert_eq!(t.claimed, ["led"]);
+        assert_eq!(t.shared, ["count", "x"]);
+    }
+
+    #[test]
+    fn every_refusal_names_its_task() {
+        for (src, says) in [
+            (
+                "// @task(priority = 0)\nasync fn a(cx: app::a::Context<'_>) {}\n",
+                "priority 0",
+            ),
+            (
+                "// @task(priority = 17)\nasync fn a(cx: app::a::Context<'_>) {}\n",
+                "16 priority",
+            ),
+            ("fn a(cx: app::a::Context) {}\n", "needs `binds"),
+            (
+                "// @task(binds = TIM2)\nasync fn a(cx: app::a::Context<'_>) {}\n",
+                "software task",
+            ),
+            (
+                "// @task(binds = SysTick)\nfn a(cx: app::a::Context) {}\n",
+                "Mono",
+            ),
+            (
+                "// @task(start)\nasync fn a(cx: app::a::Context<'_>, x: u8) {}\n",
+                "`start`",
+            ),
+            ("async fn init(cx: app::init::Context<'_>) {}\n", "rename"),
+            (
+                "// @task(priority = x)\nasync fn a(cx: app::a::Context<'_>) {}\n",
+                "no number",
+            ),
+        ] {
+            let app = scan(&tail(src));
+            assert!(app.tasks.is_empty(), "{src}");
+            assert!(
+                app.refusals.iter().any(|r| r.contains(says)),
+                "{src}: {:?}",
+                app.refusals
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_above_nothing_is_said() {
+        let app = scan(&tail("// @task(priority = 2)\nfn plain() {}\n"));
+        assert_eq!(app.refusals.len(), 1, "{:?}", app.refusals);
+        assert!(app.refusals[0].contains("above no task"));
+        // Misspelt above a task: the task is still read (with no args), and
+        // the marker said - silence would run it at the wrong priority.
+        let typo = scan(&tail(
+            "// @tsak(priority = 2)\nasync fn a(cx: app::a::Context<'_>) {}\n",
+        ));
+        assert_eq!(typo.tasks.len(), 1);
+        assert!(typo.refusals[0].contains("@tsak"), "{:?}", typo.refusals);
+        // Not a marker: prose, a bare `@`.
+        let prose = scan(&tail("// @see the manual (page 3)\n// @ notes\n"));
+        assert!(prose.refusals.is_empty(), "{:?}", prose.refusals);
+    }
+
+    #[test]
+    fn app_shared_needs_its_fn() {
+        let without = scan(&tail("struct AppShared {\n    count: u32,\n}\n"));
+        assert!(without.app_shared.is_empty());
+        assert!(without.refusals[0].contains("app_shared"));
+        let with = scan(&tail(
+            "struct AppShared {\n    count: u32,\n    pub buf: [u8; 4],\n}\nfn app_shared() -> AppShared { todo!() }\n",
+        ));
+        assert_eq!(
+            with.app_shared,
+            [
+                ("count".to_owned(), "u32".to_owned()),
+                ("buf".to_owned(), "[u8; 4]".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_plan_splits_resources_and_picks_dispatchers() {
+        let app = scan(&tail(concat!(
+            "struct AppShared { count: u32 }\nfn app_shared() -> AppShared { todo!() }\n",
+            "// @task(priority = 2, local = [led], start)\nasync fn blink(cx: app::blink::Context<'_>) {}\n",
+            "// @task(priority = 3, shared = [count, serial1])\nasync fn report(cx: app::report::Context<'_>, by: u32) {}\n",
+            "// @task(binds = TIM2, priority = 4)\nfn tick(cx: app::tick::Context) {}\n",
+            "// @idle(shared = [count])\nfn idle_loop(cx: app::idle::Context) -> ! { loop {} }\n",
+        )));
+        let p = plan(
+            &app,
+            &locals(&["pb1_in", "led", "serial1", "iwdg"]),
+            &BTreeSet::from(["pb1_in".to_owned()]),
+            &BTreeSet::from(["EXTI1".to_owned()]),
+        );
+        assert_eq!(p.errors, "");
+        assert_eq!(p.dispatchers, ["RCC", "FLASH"]);
+        assert_eq!(p.promoted, [("serial1".to_owned(), "T_serial1".to_owned())]);
+        assert_eq!(
+            p.idle_drop,
+            BTreeSet::from(["led".to_owned(), "serial1".to_owned()])
+        );
+        assert_eq!(p.idle_shared, ["count"]);
+        assert!(p.has_shared());
+        assert_eq!(
+            p.spawns,
+            "        // Your tasks marked `start` below the markers.\n        blink::spawn().ok();\n"
+        );
+        assert!(p.extern_block.contains(
+            "        #[task(priority = 2, local = [led])]\n        async fn blink(_: blink::Context<'_>);\n"
+        ));
+        assert!(
+            p.extern_block
+                .contains("        async fn report(_: report::Context<'_>, by: u32);\n")
+        );
+        assert!(p.extern_block.contains(
+            "        #[task(binds = TIM2, priority = 4)]\n        fn tick(_: tick::Context);\n"
+        ));
+        // Exactly one attribute per declaration: rtic-macros refuses more.
+        let decls = &p.extern_block[p.extern_block.find("extern").unwrap()..];
+        assert!(
+            !decls.contains("///") && !decls.contains("#[allow"),
+            "{decls}"
+        );
+    }
+
+    #[test]
+    fn resource_refusals() {
+        for (src, says) in [
+            (
+                "// @task(local = [nope])\nasync fn a(cx: app::a::Context<'_>) {}\n",
+                "names no resource",
+            ),
+            (
+                "// @task(local = [pb1_in])\nasync fn a(cx: app::a::Context<'_>) {}\n",
+                "EXTI task",
+            ),
+            (
+                "// @task(local = [led])\nasync fn a(cx: app::a::Context<'_>) {}\n// @task(local = [led])\nasync fn b(cx: app::b::Context<'_>) {}\n",
+                "claimed by task `a`",
+            ),
+            (
+                "// @task(shared = [nope])\nasync fn a(cx: app::a::Context<'_>) {}\n",
+                "names nothing shared",
+            ),
+            (
+                "// @task(binds = EXTI1)\nfn a(cx: app::a::Context) {}\n",
+                "armed pin",
+            ),
+            (
+                "// @task(local = [led])\nasync fn a(cx: app::a::Context<'_>) {}\n// @task(shared = [led])\nasync fn b(cx: app::b::Context<'_>) {}\n",
+                "one or the other",
+            ),
+            (
+                "// @task(binds = RCC)\nfn h(cx: app::h::Context) {}\nasync fn s(cx: app::s::Context<'_>) {}\n",
+                "dispatchers",
+            ),
+        ] {
+            let p = plan(
+                &scan(&tail(src)),
+                &locals(&["pb1_in", "led"]),
+                &BTreeSet::from(["pb1_in".to_owned()]),
+                &BTreeSet::from(["EXTI1".to_owned()]),
+            );
+            assert!(p.errors.contains(says), "{src}: {}", p.errors);
+            assert!(
+                p.errors.starts_with("compile_error!(\"RTIC"),
+                "{}",
+                p.errors
+            );
+        }
+    }
+
+    #[test]
+    fn dispatchers_skip_bound_vectors_and_keep_their_order() {
+        let mut src = String::new();
+        for p in 1..=7 {
+            src.push_str(&format!(
+                "// @task(priority = {p})\nasync fn t{p}(cx: app::t{p}::Context<'_>) {{}}\n"
+            ));
+        }
+        let p = plan(&scan(&tail(&src)), &[], &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(p.dispatchers.len(), 6);
+        assert!(
+            p.errors.contains("7 software priority levels"),
+            "{}",
+            p.errors
+        );
+    }
+
+    #[test]
+    fn tasks_are_fenced_off_rtic_and_given_back() {
+        let user = concat!(
+            "struct AppShared { count: u32 }\n",
+            "fn app_shared() -> AppShared { AppShared { count: 0 } }\n",
+            "// @task(priority = 2)\n",
+            "async fn blink(cx: app::blink::Context<'_>) {}\n",
+            "fn helper() {}\n",
+        );
+        let file = tail(user);
+        let off = fence_tasks(file.clone(), false);
+        assert_eq!(off.matches(RTIC_TASK_FENCE).count(), 3, "{off}");
+        assert!(
+            off.contains(&format!("{RTIC_TASK_FENCE}async fn blink")),
+            "{off}"
+        );
+        assert!(
+            !off.contains(&format!("{RTIC_TASK_FENCE}fn helper")),
+            "{off}"
+        );
+        assert_eq!(fence_tasks(off.clone(), false), off, "once");
+        assert_eq!(fence_tasks(off, true), file);
+        // A fenced task is still read as one.
+        assert_eq!(scan(&fence_tasks(file, false)).tasks.len(), 1);
+    }
+
+    /// The shapes the review found read wrong: an array input (its `;`), an
+    /// attribute on the fn's own line, a marker spaced out, and `local_task`.
+    #[test]
+    fn odd_but_valid_spellings_are_read() {
+        let app = scan(&tail(concat!(
+            "//@task (priority = 2, local_task)\n",
+            "#[inline(never)] async fn report(cx: app::report::Context<'_>, buf: [u8; 4]) {}\n",
+        )));
+        assert!(app.refusals.is_empty(), "{:?}", app.refusals);
+        let t = &app.tasks[0];
+        assert_eq!(t.inputs, ["buf: [u8; 4]"]);
+        assert_eq!(t.args, "priority = 2, local_task");
+        let fenced = fence_tasks(
+            tail("async fn r(cx: app::r::Context<'_>, b: [u8; 2]) {}\n"),
+            false,
+        );
+        assert!(
+            fenced.contains(&format!("{RTIC_TASK_FENCE}async fn r")),
+            "{fenced}"
+        );
+        assert_eq!(
+            split_args("mask: u32 = 1 << 3, led, f: fn() -> u8, v: Vec<Option<u8>>, x"),
+            [
+                "mask: u32 = 1 << 3",
+                "led",
+                "f: fn() -> u8",
+                "v: Vec<Option<u8>>",
+                "x"
+            ]
+        );
+    }
+
+    #[test]
+    fn more_refusals() {
+        for (src, says) in [
+            ("async fn gpio(cx: app::gpio::Context<'_>) {}\n", "rename"),
+            (
+                "// @task(binds = TIM3, priority = 0)\nfn h(cx: app::h::Context) {}\n",
+                "priority 0",
+            ),
+            (
+                "// @task(local_task, start)\nasync fn a(cx: app::a::Context<'_>) {}\n",
+                "local_task",
+            ),
+            (
+                "async fn a(cx: app::a::Context<'static>) {}\n",
+                "never returns",
+            ),
+            (
+                "struct AppShared { #[x] n u32 }\nfn app_shared() -> AppShared { todo!() }\n",
+                "not read",
+            ),
+        ] {
+            let app = scan(&tail(src));
+            assert!(
+                app.refusals.iter().any(|r| r.contains(says)),
+                "{src}: {:?}",
+                app.refusals
+            );
+        }
+        // An AppShared field named like a generated resource.
+        let p = plan(
+            &scan(&tail(
+                "struct AppShared { led: u8 }\nfn app_shared() -> AppShared { todo!() }\n",
+            )),
+            &locals(&["led"]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert!(
+            p.errors.contains("named like a generated resource"),
+            "{}",
+            p.errors
+        );
+        assert!(p.app_shared.is_empty());
+    }
+
+    #[test]
+    fn app_shared_fields_with_attributes_and_visibility() {
+        let app = scan(&tail(concat!(
+            "struct AppShared {\n    #[allow(dead_code)]\n    pub(crate) count: u32,\n    pub other: bool,\n}\n",
+            "fn app_shared() -> AppShared { todo!() }\n",
+        )));
+        assert!(app.refusals.is_empty(), "{:?}", app.refusals);
+        assert_eq!(
+            app.app_shared,
+            [
+                ("count".to_owned(), "u32".to_owned()),
+                ("other".to_owned(), "bool".to_owned())
+            ]
+        );
+    }
+
+    /// Idle's `shared = [&x]` keeps its `&`, as a task's args do - RTIC
+    /// refuses `&x` beside an exclusive `x`.
+    #[test]
+    fn idle_shares_as_written() {
+        let app = scan(&tail(concat!(
+            "struct AppShared { count: u32 }\nfn app_shared() -> AppShared { todo!() }\n",
+            "// @task(shared = [&count])\nasync fn a(cx: app::a::Context<'_>) {}\n",
+            "// @idle(shared = [&count])\nfn idle_loop(cx: app::idle::Context) -> ! { loop {} }\n",
+        )));
+        let p = plan(&app, &[], &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(p.errors, "");
+        assert_eq!(p.idle_shared, ["&count"]);
+    }
+
+    /// Only `@task` / `@idle` - or near misses - are markers: a `// @todo(..)`
+    /// is prose, and one inside `/* */` is not code.
+    #[test]
+    fn only_task_and_idle_are_markers() {
+        let app = scan(&tail(concat!(
+            "// @todo(alice): tidy\n// @see(datasheet)\n",
+            "/*\n// @task(priority = 2)\nasync fn old(cx: app::old::Context<'_>) {}\n*/\n",
+        )));
+        assert!(app.refusals.is_empty(), "{:?}", app.refusals);
+        let typo = scan(&tail("// @Taks(priority = 2)\nfn plain() {}\n"));
+        assert!(!typo.refusals.is_empty());
+    }
+
+    /// `AppShared` in a project with no task is just the user's struct: never
+    /// fenced off.
+    #[test]
+    fn app_shared_alone_is_left_alone() {
+        let file = tail(
+            "struct AppShared { n: u8 }\nfn app_shared() -> AppShared { AppShared { n: 0 } }\n",
+        );
+        assert_eq!(fence_tasks(file.clone(), false), file);
+    }
+}

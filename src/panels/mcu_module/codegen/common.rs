@@ -1350,7 +1350,7 @@ fn user_regions(file: &str) -> (&str, &str) {
 }
 
 /// [`user_regions`] as byte ranges of `file`: above the block, below it.
-fn user_spans(file: &str) -> [(usize, usize); 2] {
+pub(super) fn user_spans(file: &str) -> [(usize, usize); 2] {
     match (file.find(GEN_BEGIN), file.find(GEN_END)) {
         (Some(begin), Some(end)) if begin < end => [(0, begin), (end + GEN_END.len(), file.len())],
         (_, Some(end)) => [(0, 0), (end + GEN_END.len(), file.len())],
@@ -1921,7 +1921,8 @@ fn pristine_rtic_idle_at(file: &str) -> Option<usize> {
         let above = above.trim_start();
         ((at == 0 || file[..at].ends_with('\n'))
             && !above.starts_with("///")
-            && !above.starts_with("#["))
+            && !above.starts_with("#[")
+            && !above.starts_with("// @"))
         .then_some(at)
     })
 }

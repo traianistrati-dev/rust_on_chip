@@ -25,6 +25,7 @@ use super::common::{
     AUTOGEN_BANNER, EdgeHook, GEN_BEGIN, GEN_END, edge_call, edge_hook_name, hook_binding,
     pin_binding,
 };
+use super::rtic_user::UserApp;
 use super::stm32::{Binding, GenParts, gen_parts};
 use crate::panels::mcu_module::clock::ClockConfig;
 use crate::panels::mcu_module::modules::{
@@ -33,7 +34,7 @@ use crate::panels::mcu_module::modules::{
 };
 use crate::panels::mcu_module::pins::logic::pin::{Edge, GpioMode, Pin};
 use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A GPIO pin that survives `#[init]` as an RTIC `Local` resource.
 #[derive(Clone, Debug, PartialEq)]
@@ -672,6 +673,9 @@ pub fn make_generated_section(
     // The Custom modules `custom_inits` builds (`Mcu::custom_module_plan`):
     // each becomes a `Local` of its own, holding its pads.
     customs: &[super::BuiltCustom],
+    // The user's own tasks, read off their code below the markers
+    // (`rtic_user::scan`); empty for a fresh file.
+    user: &UserApp,
 ) -> String {
     let Some(parts) = gen_parts(
         Binding::Owned,
@@ -686,7 +690,7 @@ pub fn make_generated_section(
         gpio_native,
         custom_inits,
     ) else {
-        return default_section(mcu_name, clock, custom_inits);
+        return default_section(mcu_name, clock, custom_inits, user);
     };
     let GenParts {
         use_block,
@@ -759,7 +763,7 @@ pub fn make_generated_section(
         .flat_map(|c| c.pins.iter().copied())
         .collect();
     let locals_all = local_pins(all_pins, &owned);
-    let custom_fields: String = customs
+    let custom_locals: Vec<(String, String)> = customs
         .iter()
         .map(|c| {
             let pads: Vec<&Pin> = c
@@ -800,7 +804,7 @@ pub fn make_generated_section(
                     &format!("let {} = {}::new({}", c.var, c.path, args.join(", ")),
                 );
             }
-            format!("        {}: {}<{}>,\n", c.var, c.path, tys.join(", "))
+            (c.var.clone(), format!("{}<{}>", c.path, tys.join(", ")))
         })
         .collect();
     // `make_interrupt_source(&mut self)` needs a mutable binding. Rewriting only
@@ -814,26 +818,50 @@ pub fn make_generated_section(
     // AFIO is unconditional here, unlike the blocking path: arming an EXTI
     // source needs it even on a project whose peripherals do not.
     let arming: String = irqs.iter().map(arm_lines).collect();
-    let locals = locals_all
+    // Every resource `#[init]` hands on, `(name, type)` in `Local` order.
+    let all_locals: Vec<(String, String)> = locals_all
         .iter()
-        .map(|p| p.binding.clone())
-        .chain(buses.iter().map(|b| b.binding.clone()))
-        .chain(customs.iter().map(|c| c.var.clone()))
-        .map(|b| format!("            {b},\n"))
-        .collect::<String>();
+        .map(|p| (p.binding.clone(), p.ty.clone()))
+        .chain(buses.iter().map(|b| (b.binding.clone(), b.ty.clone())))
+        .chain(custom_locals)
+        .collect();
     let task_fns = tasks(&irqs);
     // Every resource no generated task takes goes to `#[idle]`, and through it
-    // to the user's loop: an armed pin's task takes that pin.
-    let tasked: std::collections::BTreeSet<&str> =
-        irqs.iter().map(|p| p.binding.as_str()).collect();
-    let idle_locals: Vec<String> = locals_all
+    // to the user's loop: an armed pin's task takes that pin. The user's own
+    // tasks take what they claim, and what anyone shares moves to `#[shared]`.
+    let tasked: BTreeSet<String> = irqs.iter().map(|p| p.binding.clone()).collect();
+    let bound: BTreeSet<String> = irqs
         .iter()
-        .map(|p| p.binding.clone())
-        .filter(|b| !tasked.contains(b.as_str()))
-        .chain(buses.iter().map(|b| b.binding.clone()))
-        .chain(customs.iter().map(|c| c.var.clone()))
+        .map(|p| exti_vector(p.line).to_owned())
         .collect();
-    let idle = idle_fn(&idle_locals);
+    let plan = super::rtic_user::plan(user, &all_locals, &tasked, &bound);
+    let promoted: BTreeSet<&str> = plan.promoted.iter().map(|(n, _)| n.as_str()).collect();
+    let locals = all_locals
+        .iter()
+        .filter(|(n, _)| !promoted.contains(n.as_str()))
+        .map(|(b, _)| format!("            {b},\n"))
+        .collect::<String>();
+    let local_fields: String = all_locals
+        .iter()
+        .filter(|(n, _)| !promoted.contains(n.as_str()))
+        .map(|(n, ty)| format!("        {n}: {ty},\n"))
+        .collect();
+    let idle_locals: Vec<String> = all_locals
+        .iter()
+        .map(|(n, _)| n.clone())
+        .filter(|b| !tasked.contains(b) && !plan.idle_drop.contains(b))
+        .collect();
+    let idle = idle_fn(&idle_locals, &plan.idle_shared);
+    let user_parts = UserParts::of(&plan);
+    let UserParts {
+        mutex_use,
+        dispatchers,
+        shared_struct,
+        shared_init,
+        before_return,
+        extern_block,
+        errors,
+    } = &user_parts;
 
     format!(
         "{GEN_BEGIN}\n\
@@ -841,6 +869,7 @@ pub fn make_generated_section(
          // header's `entry` / `pac` imports are unused on this runtime.\n\
          #[allow(unused_imports)]\n\
          use rtic_monotonics::systick::prelude::*;\n\
+         {mutex_use}\
          #[allow(unused_imports)]\n\
          use stm32f1xx_hal::{{\n\
          {use_block}\n\
@@ -850,13 +879,13 @@ pub fn make_generated_section(
          \n\
          systick_monotonic!(Mono, 1_000);\n\
          \n\
-         #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true)]\n\
+         #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true{dispatchers})]\n\
          {LOCALS_ALLOW}\
          mod app {{\n\
          \x20   use super::*;\n\
          \n\
          \x20   #[shared]\n\
-         \x20   struct Shared {{}}\n\
+         \x20   struct Shared {shared_struct}\n\
          \n\
          \x20   #[local]\n\
          \x20   struct Local {{\n\
@@ -875,22 +904,17 @@ pub fn make_generated_section(
          {pin_section_i}\
          {fn_calls_i}\
          {arming_i}\n\
-         \x20       (Shared {{}}, Local {{{local_init}}})\n\
+         {before_return}\
+         \x20       (Shared {shared_init}, Local {{{local_init}}})\n\
          \x20   }}\n\
          {idle}\
          {task_fns}\
+         {extern_block}\
          }}\n\
+         {errors}\
          {GEN_END}\n",
         clock_chain_i = clock_chain.replace('\n', "\n        "),
-        local_fields = format!(
-            "{}{}{custom_fields}",
-            locals_decl(&locals_all),
-            buses
-                .iter()
-                .map(|b| format!("        {}: {},\n", b.binding, b.ty))
-                .collect::<String>()
-        ),
-        local_init = if locals_all.is_empty() && buses.is_empty() && customs.is_empty() {
+        local_init = if all_locals.is_empty() {
             String::new()
         } else {
             format!("\n{locals}        ")
@@ -908,11 +932,18 @@ pub fn make_generated_section(
 /// pins, the bus handles and the Custom modules are reachable from code that
 /// survives regeneration. `idle::Context` exists with no resources too, so
 /// the user's signature never changes.
-fn idle_fn(locals: &[String]) -> String {
-    let attr = if locals.is_empty() {
+fn idle_fn(locals: &[String], shared: &[String]) -> String {
+    let mut args = Vec::new();
+    if !locals.is_empty() {
+        args.push(format!("local = [{}]", locals.join(", ")));
+    }
+    if !shared.is_empty() {
+        args.push(format!("shared = [{}]", shared.join(", ")));
+    }
+    let attr = if args.is_empty() {
         "#[idle]".to_owned()
     } else {
-        format!("#[idle(local = [{}])]", locals.join(", "))
+        format!("#[idle({})]", args.join(", "))
     };
     format!(
         "\n    // Whenever no interrupt task runs. Every resource no generated task\n\
@@ -925,15 +956,78 @@ fn idle_fn(locals: &[String]) -> String {
     )
 }
 
-/// `Local` field declarations, each type spelled out by [`pin_type`].
-///
-/// RTIC needs concrete types here, and the HAL pin types are long and
-/// port-specific (`gpioa::PA5<Input<Floating>>`). `gen_parts` already emits the
-/// binding, so the type is spelled out per pin, by [`pin_type`].
-fn locals_decl(pins: &[LocalPin]) -> String {
-    pins.iter()
-        .map(|p| format!("        {}: {},\n", p.binding, p.ty))
-        .collect()
+/// What the user's own tasks put into the block ([`super::rtic_user::plan`]),
+/// piece by piece - each one empty, or `{}` for the `Shared` struct, when
+/// there are none, so the block is byte for byte what it was before them.
+struct UserParts {
+    /// `rtic::Mutex` at the crate root, for `.lock()` in the bodies below
+    /// the markers - RTIC imports it only into the bodies it writes itself.
+    mutex_use: String,
+    /// `, dispatchers = [..]` on `#[rtic::app]`.
+    dispatchers: String,
+    shared_struct: String,
+    shared_init: String,
+    /// The `start` spawns and `let app_shared = app_shared();`, last in `#[init]`.
+    before_return: String,
+    extern_block: String,
+    /// `compile_error!`s, after `mod app`.
+    errors: String,
+}
+
+impl UserParts {
+    fn of(plan: &super::rtic_user::Plan) -> Self {
+        let shared: Vec<&(String, String)> = plan.promoted.iter().chain(&plan.app_shared).collect();
+        let (shared_struct, shared_init) = if shared.is_empty() {
+            ("{}".to_owned(), "{}".to_owned())
+        } else {
+            let decl: String = shared
+                .iter()
+                .map(|(n, ty)| format!("        {n}: {ty},\n"))
+                .collect();
+            let init: Vec<String> = plan
+                .promoted
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(
+                    plan.app_shared
+                        .iter()
+                        .map(|(n, _)| format!("{n}: app_shared.{n}")),
+                )
+                .collect();
+            (
+                format!("{{\n{decl}    }}"),
+                format!("{{ {} }}", init.join(", ")),
+            )
+        };
+        let mut before_return = plan.spawns.clone();
+        if !plan.app_shared.is_empty() {
+            before_return.push_str(
+                "        // Your `AppShared` below the markers: a shared resource per field.\n\
+                 \x20       let app_shared = app_shared();\n",
+            );
+        }
+        Self {
+            mutex_use: if plan.has_shared() {
+                "// `.lock()` on shared resources - one, or a tuple of them - in your\n\
+                 // code below the markers.\n\
+                 #[allow(unused_imports)]\n\
+                 use rtic::mutex::prelude::*;\n"
+                    .to_owned()
+            } else {
+                String::new()
+            },
+            dispatchers: if plan.dispatchers.is_empty() {
+                String::new()
+            } else {
+                format!(", dispatchers = [{}]", plan.dispatchers.join(", "))
+            },
+            shared_struct,
+            shared_init,
+            before_return,
+            extern_block: plan.extern_block.clone(),
+            errors: plan.errors.clone(),
+        }
+    }
 }
 
 /// Re-indent a generated block by one level, so init code sits inside `mod app`.
@@ -959,7 +1053,12 @@ fn indent(block: &str) -> String {
 /// No `pac` import, unlike the bare-metal default: RTIC's macro names the PAC
 /// by path and nothing else here does, so every fresh RTIC project used to
 /// open on an `unused import` warning.
-fn default_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> String {
+fn default_section(
+    mcu_name: &str,
+    clock: &ClockConfig,
+    custom_inits: &str,
+    user: &UserApp,
+) -> String {
     let clock_chain = super::stm32::clock_setup_chain(clock);
     // The wired skeleton's promotion: `#[init]` returns, and a handle left in
     // a `let` would be dropped with it instead of reaching a task.
@@ -971,22 +1070,35 @@ fn default_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> S
     } else {
         format!("{}\n", indent(&inits))
     };
+    // No pin, so no armed one: the user's tasks share out the handles alone.
+    let all_locals: Vec<(String, String)> = handles
+        .iter()
+        .map(|b| (b.binding.clone(), b.ty.clone()))
+        .collect();
+    let plan = super::rtic_user::plan(user, &all_locals, &BTreeSet::new(), &BTreeSet::new());
+    let promoted: BTreeSet<&str> = plan.promoted.iter().map(|(n, _)| n.as_str()).collect();
+    let kept: Vec<&(String, String)> = all_locals
+        .iter()
+        .filter(|(n, _)| !promoted.contains(n.as_str()))
+        .collect();
     let idle = idle_fn(
-        &handles
+        &kept
             .iter()
-            .map(|b| b.binding.clone())
+            .map(|(n, _)| n.clone())
+            .filter(|n| !plan.idle_drop.contains(n))
             .collect::<Vec<_>>(),
+        &plan.idle_shared,
     );
     let (allow, fields, moved) = if handles.is_empty() {
         (String::new(), String::new(), String::new())
     } else {
-        let decl: String = handles
+        let decl: String = kept
             .iter()
-            .map(|b| format!("        {}: {},\n", b.binding, b.ty))
+            .map(|(n, ty)| format!("        {n}: {ty},\n"))
             .collect();
-        let init: String = handles
+        let init: String = kept
             .iter()
-            .map(|b| format!("            {},\n", b.binding))
+            .map(|(n, _)| format!("            {n},\n"))
             .collect();
         (
             LOCALS_ALLOW.to_owned(),
@@ -994,21 +1106,31 @@ fn default_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> S
             format!("\n{init}        "),
         )
     };
+    let UserParts {
+        mutex_use,
+        dispatchers,
+        shared_struct,
+        shared_init,
+        before_return,
+        extern_block,
+        errors,
+    } = UserParts::of(&plan);
     format!(
         "{GEN_BEGIN}\n\
          // MCU: {mcu_name}\n\
          use rtic_monotonics::systick::prelude::*;\n\
+         {mutex_use}\
          use stm32f1xx_hal::prelude::*;\n\
          \n\
          systick_monotonic!(Mono, 1_000);\n\
          \n\
-         #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true)]\n\
+         #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true{dispatchers})]\n\
          {allow}\
          mod app {{\n\
          \x20   use super::*;\n\
          \n\
          \x20   #[shared]\n\
-         \x20   struct Shared {{}}\n\
+         \x20   struct Shared {shared_struct}\n\
          \n\
          \x20   #[local]\n\
          \x20   struct Local {{{fields}}}\n\
@@ -1022,10 +1144,13 @@ fn default_section(mcu_name: &str, clock: &ClockConfig, custom_inits: &str) -> S
          \x20       Mono::start(cx.core.SYST, clocks.sysclk().to_Hz());\n\
          {inits}\
          \x20       // Select pins in the MCU Configurator to generate code here.\n\
-         \x20       (Shared {{}}, Local {{{moved}}})\n\
+         {before_return}\
+         \x20       (Shared {shared_init}, Local {{{moved}}})\n\
          \x20   }}\n\
          {idle}\
+         {extern_block}\
          }}\n\
+         {errors}\
          {GEN_END}\n"
     )
 }
@@ -1187,6 +1312,7 @@ mod tests {
             true,
             "",
             &[],
+            &UserApp::default(),
         );
         assert!(!code.contains("unmask"), "{code}");
         assert!(!code.contains("NVIC"), "{code}");
@@ -1229,6 +1355,7 @@ mod tests {
                 true,
                 "",
                 &[],
+                &UserApp::default(),
             )
         );
     }
@@ -1410,6 +1537,7 @@ mod tests {
             true,
             "",
             &[],
+            &UserApp::default(),
         );
         // The pin binding is identical text in both, modulo indentation and the
         // `mut`: blocking writes through the pin (`let mut`), RTIC moves it into
@@ -1438,6 +1566,7 @@ mod tests {
             true,
             "",
             &[],
+            &UserApp::default(),
         );
         // No resource at all: `#[idle]` with none, and the user's loop called
         // all the same - `idle::Context` exists either way.
@@ -1763,6 +1892,154 @@ mod tests {
             "{off}"
         );
         assert_eq!(ensure_rtic_idle_loop(off, true, false), attributed);
+    }
+
+    /// An F103 on RTIC with PC13 an output, PB1 armed, USART1 - and the
+    /// user's own tasks ([`super::super::rtic_user::EXAMPLE_TASKS`]) below the
+    /// markers, its idle loop [`super::super::rtic_user::EXAMPLE_IDLE`].
+    /// The fresh file, and the one the user's tasks went into.
+    fn rtic_with_tasks() -> (crate::panels::mcu_module::mcu::Mcu, String, String) {
+        use super::super::common::RTIC_IDLE_SEED;
+        use super::super::rtic_user::{EXAMPLE_IDLE, EXAMPLE_TASKS};
+        let mut mcu = rtic_with_custom(
+            &[],
+            &[
+                ("PC13", PinFunction::GpioOutput, None),
+                ("PB1", PinFunction::GpioInput, None),
+                ("PA9", PinFunction::UsartTx(1), None),
+                ("PA10", PinFunction::UsartRx(1), None),
+            ],
+        );
+        mcu.iter_all_pins_mut()
+            .find(|p| p.name == "PB1")
+            .expect("PB1")
+            .irq = Some(Edge::Rising);
+        let fresh = mcu.fresh_main_rs();
+        assert!(fresh.contains(RTIC_IDLE_SEED), "{fresh}");
+        let mine = format!(
+            "{}{EXAMPLE_TASKS}",
+            fresh.replace(RTIC_IDLE_SEED, EXAMPLE_IDLE)
+        );
+        (mcu, fresh, mine)
+    }
+
+    /// The user's tasks, declared from their code: the extern block, one
+    /// dispatcher per software priority, the LED the started task claims
+    /// gone from `#[idle]`, the UART a task shares moved to `#[shared]`
+    /// beside `AppShared`'s counter, `rtic::Mutex` at the crate root for
+    /// `.lock()` there, and the start spawn last in `#[init]`. A second
+    /// regeneration changes nothing.
+    #[test]
+    fn the_users_tasks_are_declared_from_their_code() {
+        let (mcu, fresh, mine) = rtic_with_tasks();
+        assert!(
+            !fresh.contains("dispatchers"),
+            "no tasks, no dispatchers:\n{fresh}"
+        );
+        let main = mcu.update_main_rs(&mine);
+        for want in [
+            "#[rtic::app(device = stm32f1xx_hal::pac, peripherals = true, dispatchers = [RCC, FLASH])]\n",
+            "#[allow(unused_imports)]\nuse rtic::mutex::prelude::*;\n",
+            "    struct Shared {\n        serial1: pins::configs::usart1::Handle,\n        count: u32,\n    }\n",
+            "        // Your tasks marked `start` below the markers.\n        blink::spawn().ok();\n",
+            "        let app_shared = app_shared();\n        (Shared { serial1, count: app_shared.count }, Local {\n",
+            "    extern \"Rust\" {\n\
+             \x20       #[task(priority = 2, local = [pc13_out])]\n\
+             \x20       async fn blink(_: blink::Context<'_>);\n\
+             \x20       #[task(priority = 3, shared = [count, serial1])]\n\
+             \x20       async fn report(_: report::Context<'_>, by: u32);\n\
+             \x20       #[task(binds = TIM3, priority = 4)]\n\
+             \x20       fn tick(_: tick::Context);\n\
+             \x20   }\n",
+            "    #[task(binds = EXTI1, local = [pb1_in])]\n",
+        ] {
+            assert!(main.contains(want), "{want}\n----\n{main}");
+        }
+        let idle = main
+            .lines()
+            .find(|l| l.contains("#[idle"))
+            .expect("the idle attribute");
+        assert!(idle.contains("shared = [count]"), "{idle}");
+        assert!(
+            !idle.contains("pc13_out") && !idle.contains("serial1"),
+            "{idle}"
+        );
+        assert_eq!(
+            main.matches("serial1: pins::configs::usart1::Handle")
+                .count(),
+            1
+        );
+        assert!(!main.contains("compile_error!"), "{main}");
+        assert_eq!(mcu.update_main_rs(&main), main, "a second regeneration");
+        // Without the tasks, the block is what it always was.
+        assert_eq!(mcu.update_main_rs(&fresh), fresh);
+    }
+
+    /// A `// @idle(..)` over the untouched seed makes the seed the user's:
+    /// off RTIC it is fenced, not taken out from under its marker, and the
+    /// way back gives the same file.
+    #[test]
+    fn an_idle_marker_keeps_the_seed() {
+        use super::super::common::RTIC_IDLE_SEED;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let (mut mcu, fresh, _) = rtic_with_tasks();
+        let marked = fresh.replace(RTIC_IDLE_SEED, &format!("// @idle()\n{RTIC_IDLE_SEED}"));
+        let main = mcu.update_main_rs(&marked);
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+        let blocking = mcu.update_main_rs(&main);
+        assert!(blocking.contains("fn idle_loop("), "{blocking}");
+        mcu.runtime = Runtime::Rtic;
+        mcu.pending_runtime = Runtime::Rtic;
+        assert_eq!(mcu.update_main_rs(&blocking), main);
+    }
+
+    /// What cannot be declared is said in the block, naming the task.
+    #[test]
+    fn a_task_that_cannot_be_declared_is_a_compile_error() {
+        let (mcu, _, mine) = rtic_with_tasks();
+        let wrong = mine.replace("local = [pc13_out]", "local = [pc13_out_led]");
+        let main = mcu.update_main_rs(&wrong);
+        assert!(
+            main.contains(
+                "compile_error!(\"RTIC task `blink`: `local = [pc13_out_led]` names no resource"
+            ),
+            "{main}"
+        );
+        assert!(
+            !main.contains("async fn blink(_"),
+            "refused, not declared:\n{main}"
+        );
+    }
+
+    /// Leaving RTIC fences the tasks and `AppShared` off - they name `app` -
+    /// and coming back takes the fences off and declares them again: the
+    /// same file both ways.
+    #[test]
+    fn the_users_tasks_leave_with_rtic_and_come_back() {
+        use super::super::rtic_user::RTIC_TASK_FENCE;
+        use crate::panels::mcu_module::mcu::Runtime;
+        let (mut mcu, _, mine) = rtic_with_tasks();
+        let main = mcu.update_main_rs(&mine);
+        mcu.runtime = Runtime::Blocking;
+        mcu.pending_runtime = Runtime::Blocking;
+        let blocking = mcu.update_main_rs(&main);
+        for item in [
+            "async fn blink",
+            "async fn report",
+            "fn tick",
+            "struct AppShared",
+            "fn app_shared",
+        ] {
+            assert!(
+                blocking.contains(&format!("{RTIC_TASK_FENCE}{item}")),
+                "{item}:\n{blocking}"
+            );
+        }
+        assert_eq!(mcu.update_main_rs(&blocking), blocking, "fenced once");
+        mcu.runtime = Runtime::Rtic;
+        mcu.pending_runtime = Runtime::Rtic;
+        assert_eq!(mcu.update_main_rs(&blocking), main);
     }
 
     /// stm32f1xx-hal moves a PWM pad into its timer's `pwm{n}::init`, with no

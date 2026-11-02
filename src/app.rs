@@ -1510,6 +1510,11 @@ pub struct AppIde {
     /// and regenerates before writing when the answer changed - so deleting
     /// that code, or writing it, saves main.rs to match.
     custom_by_hand: Vec<String>,
+    /// The user's own RTIC tasks the last regeneration declared
+    /// (`Mcu::rtic_user_app`). A Save asks again first, and regenerates
+    /// before writing when they changed - a task is code, so writing one
+    /// changes no model state that would regenerate main.rs by itself.
+    rtic_user: Option<crate::panels::mcu_module::codegen::rtic_user::UserApp>,
     /// Set by a regeneration that changed main.rs this frame, for the carets
     /// in the text below what changed ([`MainRsShift`]). Taken by the first
     /// editor view that shows main.rs this frame - a second one keeps its
@@ -2458,6 +2463,7 @@ impl AppIde {
             generated_code,
             mcu_state_hash: 0,
             custom_by_hand: Vec::new(),
+            rtic_user: None,
             main_rs_caret_shift: None,
             cargo_toml: init_files.cargo_toml,
             cargo_config: init_files.cargo_config,
@@ -3664,6 +3670,7 @@ impl AppIde {
                 self.mcu_state_hash = current_hash;
                 mcu_changed = true;
                 self.custom_by_hand = mcu.customs_built_by_hand(&self.generated_code);
+                self.rtic_user = mcu.rtic_user_app(&self.generated_code);
                 let updated = mcu.update_main_rs(&self.generated_code);
                 if updated != self.generated_code {
                     self.main_rs_caret_shift = caret_shift(&self.generated_code, &updated);
@@ -5530,9 +5537,12 @@ impl eframe::App for AppIde {
         // frame regenerates nothing, so the save waits ONE frame, whose
         // `init_frame` builds the module, and then writes main.rs with it -
         // the files on disk, the flushed workspace and a Save-and-close alike.
+        // The same for the user's own RTIC tasks: written, changed or removed
+        // below the markers, they are declared in the block the Save writes.
         if save_requested
             && self.mcu.as_ref().is_some_and(|m| {
                 m.customs_built_by_hand(&self.generated_code) != self.custom_by_hand
+                    || m.rtic_user_app(&self.generated_code) != self.rtic_user
             })
         {
             self.mcu_state_hash = 0;

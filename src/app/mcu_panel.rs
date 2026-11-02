@@ -4194,6 +4194,10 @@ const RTIC_DETAILS: &[(&str, &str)] = &[
         "A GPIO input with an Edge set on the Pins canvas becomes a #[task(binds = EXTIn)]. RTIC enables the vector itself, so the generated code never calls NVIC::unmask.",
     ),
     (
+        "Your tasks:",
+        "Write them below the markers: a top-level fn whose first parameter is app::<its name>::Context is a task (async fn = software, plain fn + binds = hardware). A // @task(..) line right above it holds RTIC's own #[task(..)] arguments, plus start to spawn it in #[init]. A Local a task claims leaves idle; one a shared = [..] names moves to #[shared], beside the fields of your struct AppShared (built by fn app_shared). // @idle(shared = [..]) above idle_loop locks them there too. The block declares them on Save, says what it understood above its extern \"Rust\" block, and a compile_error! names a task it cannot declare. Software priorities take dispatchers from RCC, FLASH, PVD, WWDG, DMA1_CHANNEL7, DMA1_CHANNEL6 in that order - leave those interrupts to it.",
+    ),
+    (
         "Shared EXTI vectors:",
         "STM32 gives lines 5-9 and 10-15 ONE vector each, so pins on them share a single task that branches on check_interrupt(). Two tasks on one vector would not compile.",
     ),

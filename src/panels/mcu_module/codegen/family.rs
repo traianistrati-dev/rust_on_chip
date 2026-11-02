@@ -12,7 +12,7 @@
 //! here — they are pure data (a `.ron` definition).
 
 use super::common::{EdgeHook, USER_TAIL};
-use super::{embassy_common, embassy_stm32, rcc, rtic, stm32, wba};
+use super::{embassy_common, embassy_stm32, rcc, rtic, rtic_user, stm32, wba};
 use crate::panels::mcu_module::codegen_esp::{self, EspRuntime};
 use crate::panels::mcu_module::comparator;
 use crate::panels::mcu_module::mcu::{Mcu, Runtime};
@@ -1420,6 +1420,8 @@ impl FamilyBackend for RticBackend {
             // IWDG got its `iwdg.rs` and an `#[init]` that never called it.
             &mcu.watchdog_and_custom_inits(),
             &mcu.custom_module_plan().1,
+            // A fresh file holds none of the user's tasks yet.
+            &rtic_user::UserApp::default(),
         );
         format!(
             "{}{section}
@@ -1448,6 +1450,8 @@ impl FamilyBackend for RticBackend {
             mcu.gpio_native(),
             &mcu.watchdog_and_custom_inits(),
             &mcu.custom_module_plan().1,
+            // The user's own tasks, declared by their code around the block.
+            &rtic_user::scan(existing),
         );
         // The block imported `adc` here too, at the crate root the tail's
         // helpers share: kept while they name it.

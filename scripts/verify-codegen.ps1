@@ -329,6 +329,13 @@ $ALL_CASES = @(
     # its file imports them from - embedded-hal 1.0 over the `io.rs` bridge on
     # the Portable GPIO api, 0.2 over the HAL's own pins on the Native one.
     @{ n = "F1 RTIC custom, raw GPIO";     t = "emit_f1_rtic_project";   e = @{ EIDE_CUSTOM = "1"; EIDE_F1_GPIO = "native" }; q = $false; fam = "f1" }
+    # The user's own tasks, written below the markers and declared from their
+    # code (`rtic_user`): dispatchers, an `extern "Rust"` block, a Local the
+    # started task claims, the UART a task shares moved to `#[shared]` beside
+    # `AppShared`'s counter, a hardware task on TIM3 - the code the unit tests
+    # assert on (`rtic_user::EXAMPLE_TASKS`), through the app's regeneration.
+    @{ n = "F1 RTIC, user tasks";          t = "emit_f1_rtic_project";   e = @{ EIDE_F1_TASKS = "1" };  q = $true; fam = "f1" }
+    @{ n = "F1 RTIC, user tasks, raw GPIO"; t = "emit_f1_rtic_project";  e = @{ EIDE_F1_TASKS = "1"; EIDE_F1_GPIO = "native" }; q = $false; fam = "f1" }
     @{ n = "F1 blocking custom";           t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_CUSTOM = "1" }; q = $true; fam = "f1" }
     @{ n = "F1 blocking custom, raw GPIO"; t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_CUSTOM = "1"; EIDE_F1_GPIO = "native" }; q = $false; fam = "f1" }
     # A helper below the block naming `adc::`: the crate-root import kept for it.
@@ -850,7 +857,7 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
            "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD", "EIDE_RP_ONEWAY", "EIDE_NRF_ONEWAY",
-           "EIDE_CUSTOM", "EIDE_F1_GPIO",
+           "EIDE_CUSTOM", "EIDE_F1_GPIO", "EIDE_F1_TASKS",
            # The imported-chip rows. EIDE_CHIP_XML is read by the N6 harness too,
            # so a value left over from an L151 row would make the N6 row convert an L1.
            "EIDE_CHIP_XML", "EIDE_EXPECT_FEATURE", "EIDE_IMPORT_SKIP", "EIDE_IMPORT_WDG",

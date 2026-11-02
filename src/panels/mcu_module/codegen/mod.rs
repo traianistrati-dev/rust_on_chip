@@ -29,6 +29,7 @@ mod rcc_mux_harvest;
 pub mod rcc_n6;
 pub mod rp;
 pub mod rtic;
+pub mod rtic_user;
 pub mod spi_built;
 pub mod stm32;
 pub mod tmpl;
@@ -424,6 +425,9 @@ impl Mcu {
             this.is_rtic(),
             common::glob_may_hold_idle_loop(existing),
         );
+        // The user's own RTIC tasks name `app` too: compiled out off RTIC,
+        // back on it again (`rtic_user::fence_tasks`).
+        let code = rtic_user::fence_tasks(code, this.is_rtic());
         // Rebuilt with the block, so renaming a device in the panel renames it
         // here on the next save.
         let code = common::with_device_comment(code, self);
@@ -792,6 +796,15 @@ impl Mcu {
             })
             .map(|(m, _)| m.id.clone())
             .collect()
+    }
+
+    /// On RTIC, the user's own tasks as `main_rs` declares them around the
+    /// block ([`rtic_user::scan`]) - `None` on any other runtime. The twin of
+    /// [`Self::customs_built_by_hand`]: read on every regeneration and before
+    /// every Save (`App::rtic_user`), so a task written, changed or removed
+    /// since is declared in the block the Save writes.
+    pub fn rtic_user_app(&self, main_rs: &str) -> Option<rtic_user::UserApp> {
+        self.is_rtic().then(|| rtic_user::scan(main_rs))
     }
 
     /// The modules whose pads this project's OWN code already takes: the text

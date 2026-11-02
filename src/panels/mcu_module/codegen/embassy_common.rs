@@ -2149,6 +2149,30 @@ mod emit_for_manual_compile {
         } else {
             main_rs
         };
+        // `EIDE_F1_TASKS=1`: the user's own tasks below the markers - a shared
+        // counter, a started task taking the LED, one sharing the UART, a
+        // hardware task on TIM3 - declared by the regeneration the app runs.
+        let main_rs = if std::env::var("EIDE_F1_TASKS").is_ok() {
+            use crate::panels::mcu_module::codegen::common::RTIC_IDLE_SEED;
+            use crate::panels::mcu_module::codegen::rtic_user::{EXAMPLE_IDLE, EXAMPLE_TASKS};
+            assert!(
+                main_rs.contains(RTIC_IDLE_SEED),
+                "the idle seed:\n{main_rs}"
+            );
+            let mine = format!(
+                "{}{EXAMPLE_TASKS}",
+                main_rs.replace(RTIC_IDLE_SEED, EXAMPLE_IDLE)
+            );
+            let main_rs = mcu.update_main_rs(&mine);
+            assert!(
+                main_rs.contains("dispatchers = [RCC, FLASH]")
+                    && !main_rs.contains("compile_error!"),
+                "{main_rs}"
+            );
+            main_rs
+        } else {
+            main_rs
+        };
         // `EIDE_F1_ADC=example`: a helper below the block set the sample time
         // the way a project from before `adc1.rs` did, naming `adc::` - which
         // keeps the import at the crate root (`stm32::adc_import_alias`).

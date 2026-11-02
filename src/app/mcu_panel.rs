@@ -2896,8 +2896,23 @@ impl AppIde {
                         ui.ctx()
                             .request_repaint_after(std::time::Duration::from_millis(250));
                     }
+                    // On RTIC, the user's own tasks as the block declares them,
+                    // and whether their code changed since (a Save declares it).
+                    let tasks = self.mcu.as_ref().filter(|m| m.is_rtic()).map(|m| {
+                        use crate::panels::mcu_module::codegen::rtic_user;
+                        (
+                            rtic_user::view(&self.generated_code),
+                            m.rtic_user_app(&self.generated_code) != self.rtic_user,
+                        )
+                    });
                     match &mut self.mcu {
-                        Some(mcu) => Self::show_system_tab(ui, mcu, hal, refused.as_deref()),
+                        Some(mcu) => Self::show_system_tab(
+                            ui,
+                            mcu,
+                            hal,
+                            refused.as_deref(),
+                            tasks.as_ref(),
+                        ),
                         None => no_mcu = Some("System configuration"),
                     }
                 }
@@ -2935,6 +2950,12 @@ impl AppIde {
         mcu: &mut crate::panels::mcu_module::mcu::Mcu,
         hal: Option<crate::app::dialogs::FeatureVerdict>,
         refused: Option<&str>,
+        // On RTIC: the user's tasks as declared, and whether their code moved
+        // on since (`rtic_user::view`).
+        tasks: Option<&(
+            crate::panels::mcu_module::codegen::rtic_user::TasksView,
+            bool,
+        )>,
     ) {
         use crate::panels::mcu_module::mcu::Runtime;
 
@@ -3146,6 +3167,9 @@ impl AppIde {
                 RTIC_DETAILS,
                 RTIC_EXAMPLE,
             );
+            if let Some((view, changed)) = tasks {
+                rtic_tasks_panel(ui, view, *changed);
+            }
 
             ui.add_space(10.0);
             // The old catch-all summary here ("only Blocking is supported…") is
@@ -4016,6 +4040,50 @@ const DEF_CONTEXT_FG: egui::Color32 = egui::Color32::from_rgb(132, 136, 146);
 /// Both cards stay VISIBLE when unavailable rather than being hidden: the
 /// question they answer ("why can't I pick RTIC on this chip?") can only be
 /// asked about something you can see.
+/// Under the RTIC card on an RTIC project: the user's own tasks as the
+/// generated block declares them - what each became, the dispatchers, and
+/// what the block refused - and a note when their code changed since.
+fn rtic_tasks_panel(
+    ui: &mut egui::Ui,
+    view: &crate::panels::mcu_module::codegen::rtic_user::TasksView,
+    changed: bool,
+) {
+    ui.add_space(6.0);
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(egui::RichText::new("Your tasks").strong());
+        if view.tasks.is_empty() && view.errors.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "None yet. Below the markers in main.rs, a fn whose first parameter is \
+                     app::<its name>::Context is a task - see \"Your tasks\" in Details.",
+                )
+                .weak(),
+            );
+        }
+        for t in &view.tasks {
+            ui.label(egui::RichText::new(format!("{}  {t}", ph::CHECK)).monospace());
+        }
+        if let Some(d) = &view.dispatchers {
+            ui.label(egui::RichText::new(format!("Dispatchers: {d}")).weak());
+        }
+        for e in &view.errors {
+            ui.label(
+                egui::RichText::new(format!("{}  {e}", ph::WARNING))
+                    .color(egui::Color32::from_rgb(220, 160, 70)),
+            );
+        }
+        if changed {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  Your tasks changed in main.rs since - Save declares them.",
+                    ph::INFO,
+                ))
+                .color(egui::Color32::from_rgb(120, 170, 220)),
+            );
+        }
+    });
+}
+
 fn disabled_reason(ui: &mut egui::Ui, why: Option<&str>) {
     let Some(why) = why else {
         return;

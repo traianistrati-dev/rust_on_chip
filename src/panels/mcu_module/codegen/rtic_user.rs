@@ -1008,6 +1008,53 @@ pub fn plan(
     }
 }
 
+/// What the System tab shows of the user's tasks: read back off the block
+/// main.rs holds - its readout, its dispatchers line, its `compile_error!`s -
+/// so it is what was generated, not a second guess at it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TasksView {
+    /// One per declared task: `blink: software, priority 2, local: pc13_out`.
+    pub tasks: Vec<String>,
+    /// `RCC, FLASH`, when there are software tasks.
+    pub dispatchers: Option<String>,
+    /// Each `compile_error!`'s message.
+    pub errors: Vec<String>,
+}
+
+/// [`TasksView`] of `main_rs`'s generated block.
+pub fn view(main_rs: &str) -> TasksView {
+    let mut v = TasksView::default();
+    let block = match (
+        main_rs.find(super::common::GEN_BEGIN),
+        main_rs.find(super::common::GEN_END),
+    ) {
+        (Some(b), Some(e)) if b < e => &main_rs[b..e],
+        _ => return v,
+    };
+    let mut in_readout = false;
+    for line in block.lines() {
+        let t = line.trim();
+        if t.starts_with("// Your tasks, declared from their signatures") {
+            in_readout = true;
+        } else if in_readout && let Some(task) = t.strip_prefix("//   ") {
+            v.tasks.push(task.to_owned());
+        } else if let Some(d) = t.strip_prefix("// Dispatchers, one per software priority: ") {
+            v.dispatchers = Some(d.trim_end_matches('.').to_owned());
+            in_readout = false;
+        } else if t.starts_with("extern \"Rust\"") {
+            in_readout = false;
+        } else if let Some(msg) = t
+            .strip_prefix("compile_error!(\"")
+            .and_then(|m| m.strip_suffix("\");"))
+        {
+            // Written with `{:?}`: undo its escapes.
+            v.errors
+                .push(msg.replace("\\\"", "\"").replace("\\\\", "\\"));
+        }
+    }
+    v
+}
+
 /// The start of the line of every one of the user's RTIC items in `file`:
 /// task fns, `struct AppShared`, `fn app_shared`.
 ///
@@ -1494,6 +1541,34 @@ mod tests {
         assert!(app.refusals.is_empty(), "{:?}", app.refusals);
         let typo = scan(&tail("// @Taks(priority = 2)\nfn plain() {}\n"));
         assert!(!typo.refusals.is_empty());
+    }
+
+    /// The tab's view reads the block back: tasks, dispatchers, refusals.
+    #[test]
+    fn the_view_reads_the_block_back() {
+        use crate::panels::mcu_module::codegen::common::{GEN_BEGIN, GEN_END};
+        let app = scan(&tail(concat!(
+            "// @task(priority = 2, local = [led], start)\nasync fn blink(cx: app::blink::Context<'_>) {}\n",
+            "// @task(local = [nope])\nasync fn bad(cx: app::bad::Context<'_>) {}\n",
+        )));
+        let p = plan(&app, &locals(&["led"]), &BTreeSet::new(), &BTreeSet::new());
+        let main = format!(
+            "{GEN_BEGIN}\nmod app {{\n{}}}\n{}{GEN_END}\n",
+            p.extern_block, p.errors
+        );
+        let v = view(&main);
+        assert_eq!(
+            v.tasks,
+            ["blink: software, priority 2, started in #[init], local: led"]
+        );
+        assert_eq!(v.dispatchers.as_deref(), Some("RCC"));
+        assert_eq!(v.errors.len(), 1);
+        assert!(
+            v.errors[0].starts_with("RTIC task `bad`: `local = [nope]`"),
+            "{:?}",
+            v.errors
+        );
+        assert_eq!(view("no block"), TasksView::default());
     }
 
     /// `AppShared` in a project with no task is just the user's struct: never

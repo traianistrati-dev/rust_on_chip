@@ -144,15 +144,54 @@ impl UserApp {
     }
 }
 
+/// How far an item's visibility reaches up the module tree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Vis {
+    /// Its own module only: no `pub`, `pub(self)`, `pub(in crate::m)`.
+    Private,
+    /// That many modules up: `pub(super)` 1, `pub(in super::super)` 2.
+    Up(usize),
+    /// The whole crate: `pub`, `pub(crate)`, `pub(in crate)`.
+    Crate,
+}
+
+impl Vis {
+    /// Whether the crate root - `mod app` - sees an item with this
+    /// visibility declared in a module `depth` levels down (main.rs = 0).
+    fn reaches_root(self, depth: usize) -> bool {
+        match self {
+            Vis::Crate => true,
+            Vis::Up(n) => depth <= n,
+            Vis::Private => depth == 0,
+        }
+    }
+}
+
+/// The visibility a `pub(..)`'s parentheses hold.
+fn vis_of(inside: &str) -> Vis {
+    let inside = inside.trim();
+    let path = inside
+        .strip_prefix("in ")
+        .map_or(inside, str::trim_start)
+        .replace(char::is_whitespace, "");
+    let segments: Vec<&str> = path.split("::").collect();
+    if path == "crate" {
+        Vis::Crate
+    } else if segments.iter().all(|s| *s == "super") {
+        Vis::Up(segments.len())
+    } else {
+        Vis::Private
+    }
+}
+
 /// A top-level item of the user's text that matters here.
 #[derive(Debug)]
 enum Item {
     Fn {
         name: String,
         is_async: bool,
-        /// `pub` or `pub(..)`: reachable from `mod app` when it lives in a
-        /// module of its own.
-        public: bool,
+        /// Whether `mod app` reaches it when it lives in a module of its own.
+        vis: Vis,
         /// The signature as code, up to its body's `{`.
         sig: String,
     },
@@ -216,7 +255,7 @@ fn items(file: &str, from: usize, to: usize) -> (Vec<&str>, Vec<Found>) {
 fn item_at(lines: &[&str]) -> Option<Item> {
     let mut rest = lines.first()?.trim_start();
     let mut is_async = false;
-    let mut public = false;
+    let mut vis = Vis::Private;
     loop {
         if rest.starts_with("#[") {
             // An attribute on the item's own line: past its balanced `]`.
@@ -234,14 +273,11 @@ fn item_at(lines: &[&str]) -> Option<Item> {
             })?;
             rest = rest[end + 1..].trim_start();
         } else if let Some(r) = rest.strip_prefix("pub(") {
-            let (vis, after) = r.split_once(')')?;
-            // From a top-level module, `mod app` at the crate root sees
-            // `pub(crate)` / `pub(super)` - not `pub(self)` or `pub(in m)`.
-            let vis: String = vis.split_whitespace().collect::<Vec<_>>().join(" ");
-            public = matches!(vis.as_str(), "crate" | "super" | "in crate" | "in super");
+            let (inside, after) = r.split_once(')')?;
+            vis = vis_of(inside);
             rest = after.trim_start();
         } else if let Some(r) = rest.strip_prefix("pub ") {
-            public = true;
+            vis = Vis::Crate;
             rest = r.trim_start();
         } else if let Some(r) = rest.strip_prefix("async ") {
             is_async = true;
@@ -281,7 +317,7 @@ fn item_at(lines: &[&str]) -> Option<Item> {
         return (!name.is_empty()).then_some(Item::Fn {
             name,
             is_async,
-            public,
+            vis,
             sig,
         });
     }
@@ -570,7 +606,7 @@ pub fn scan_project(existing: &str, modules: &[(String, String)]) -> UserApp {
                 Item::Fn {
                     name,
                     is_async,
-                    public,
+                    vis,
                     sig,
                 } => {
                     let Some((inputs, diverges, is_static)) = task_signature(name, sig) else {
@@ -590,7 +626,7 @@ pub fn scan_project(existing: &str, modules: &[(String, String)]) -> UserApp {
                     };
                     let args = args.and_then(|a| {
                         if let Some(m) = module
-                            && !public
+                            && !vis.reaches_root(m.split("::").count())
                         {
                             Err(format!(
                                 "in `{m}` it has to be `pub` - the app calls it from `mod app`"
@@ -1079,57 +1115,196 @@ pub fn plan(
     }
 }
 
-/// The project's own modules main.rs declares at its top level (`mod tasks;`,
-/// `pub mod tasks;`) - `(name, text)` of `src/<name>.rs` or
-/// `src/<name>/mod.rs` among `files` (`(path, text)`, paths `src/..`). Not
-/// `pins`, which the IDE writes, and not a module nested deeper: those the
-/// RTIC tasks are read off besides main.rs ([`scan_project`]).
+/// The project's own modules the RTIC tasks are read off besides main.rs
+/// ([`scan_project`]): each `mod name;` main.rs declares, and each one those
+/// files declare in turn (`a::b` in `src/a/b.rs`) - `(path, text)` of the
+/// files among `files` (`(path, text)`, paths `src/..`). Not `pins`, which
+/// the IDE writes; see [`modules_left_out`] for the ones passed over.
 pub fn task_modules(main_rs: &str, files: &[(String, String)]) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for (from, to) in user_spans(main_rs) {
-        let code = code_only(&main_rs[from..to]);
-        let mut depth = 0i32;
-        // A `#[cfg]` or `#[path]` over a `mod` makes which file it is, and
-        // whether it is built, a question this text cannot settle: left out.
-        let mut attributed = false;
-        for line in code.lines() {
-            let t = line.trim();
-            if depth == 0 && t.starts_with("#[") {
-                attributed = true;
+    walk_modules(main_rs, files).0
+}
+
+/// The modules [`task_modules`] passes over although a task may be in them,
+/// one line each for the System tab: a `mod` under `#[cfg]` / `#[path]`, and
+/// a nested one `mod app` cannot reach.
+pub fn modules_left_out(main_rs: &str, files: &[(String, String)]) -> Vec<String> {
+    walk_modules(main_rs, files).1
+}
+
+/// The two files a module path can live in: `a::b` -> `src/a/b.rs`,
+/// `src/a/b/mod.rs`.
+pub fn module_paths(module: &str) -> [String; 2] {
+    let dir = module.replace("::", "/");
+    [format!("src/{dir}.rs"), format!("src/{dir}/mod.rs")]
+}
+
+fn walk_modules(main_rs: &str, files: &[(String, String)]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut read: Vec<(String, String)> = Vec::new();
+    let mut left: Vec<String> = Vec::new();
+    let file_of = |module: &str| {
+        let paths = module_paths(module);
+        files
+            .iter()
+            .find(|(p, _)| paths.contains(p))
+            .map(|(_, text)| text.clone())
+    };
+    // Whether a module, or one below it, would make a task: one there or
+    // one refused there - by the files' own paths, as it is not walked.
+    let holds_tasks = |module: &str| {
+        files.iter().any(|(path, text)| {
+            let Some(name) = path
+                .strip_prefix("src/")
+                .and_then(|p| p.strip_suffix(".rs"))
+                .map(|p| p.strip_suffix("/mod").unwrap_or(p).replace('/', "::"))
+            else {
+                return false;
+            };
+            (name == module || name.starts_with(&format!("{module}::"))) && {
+                let app = scan_project("", &[(name, text.clone())]);
+                !app.tasks.is_empty() || !app.refusals.is_empty()
             }
-            let skip = attributed;
-            if !t.is_empty() && !t.starts_with("#[") {
-                attributed = false;
-            }
-            if depth == 0
-                && !skip
-                && let Some(name) = mod_decl(t)
-                && name != "pins"
-                && !out.iter().any(|(n, _)| n == name)
-                && let Some((_, text)) = files.iter().find(|(p, _)| {
-                    *p == format!("src/{name}.rs") || *p == format!("src/{name}/mod.rs")
-                })
-            {
-                out.push((name.to_owned(), text.clone()));
-            }
-            for c in line.chars() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => depth = (depth - 1).max(0),
-                    _ => {}
+        })
+    };
+    // The module the text is (none: main.rs), the text, the spans to read.
+    type Pending = (Option<String>, String, Vec<(usize, usize)>);
+    let mut queue: Vec<Pending> = vec![(None, main_rs.to_owned(), user_spans(main_rs).to_vec())];
+    while let Some((parent, text, spans)) = queue.pop() {
+        let depth = parent.as_deref().map_or(0, |p| p.split("::").count());
+        for (from, to) in spans {
+            let code = attributes_on_one_line(&code_only(&text[from..to]));
+            let mut depth_braces = 0i32;
+            // A `#[cfg]` or `#[path]` over a `mod` makes which file it is, and
+            // whether it is built, a question this text cannot settle.
+            let mut guessed = false;
+            for line in code.lines() {
+                let t = line.trim();
+                let (attributes, item) = leading_attributes(t);
+                if depth_braces == 0
+                    && attributes
+                        .iter()
+                        .any(|a| a.starts_with("#[cfg") || a.starts_with("#[path"))
+                {
+                    guessed = true;
+                }
+                let attributed = guessed;
+                if !item.is_empty() {
+                    guessed = false;
+                }
+                if depth_braces == 0
+                    && let Some((vis, name)) = mod_decl(item)
+                    && !(parent.is_none() && name == "pins")
+                    && !read.iter().any(|(n, _)| {
+                        *n == parent
+                            .as_ref()
+                            .map_or(name.to_owned(), |p| format!("{p}::{name}"))
+                    })
+                {
+                    let module = match &parent {
+                        Some(p) => format!("{p}::{name}"),
+                        None => name.to_owned(),
+                    };
+                    let found = file_of(&module);
+                    // A `#![cfg(..)]` atop the module's own file gates it too.
+                    let gated = found.as_deref().is_some_and(|f| {
+                        attributes_on_one_line(&code_only(f))
+                            .lines()
+                            .any(|l| l.trim_start().starts_with("#![cfg"))
+                    });
+                    if attributed || gated {
+                        // `#[path]` points elsewhere; a gated module with no
+                        // task in or below it is nothing to report.
+                        if found.is_none() || holds_tasks(&module) {
+                            left.push(format!(
+                                "mod {module}: under #[cfg] or #[path] - its tasks are not read"
+                            ));
+                        }
+                    } else if let Some(found) = found {
+                        if !vis.reaches_root(depth) {
+                            if holds_tasks(&module) {
+                                let at = parent.as_deref().unwrap_or("main.rs");
+                                left.push(format!(
+                                    "mod {module}: private to {at} - mod app cannot reach a task \
+                                     in or below it; declare it pub mod {name};"
+                                ));
+                            }
+                        } else {
+                            // No depth cap: each level's path is longer, and
+                            // only a file of the project's can be one.
+                            let len = found.len();
+                            queue.push((Some(module.clone()), found.clone(), vec![(0, len)]));
+                            read.push((module, found));
+                        }
+                    }
+                }
+                for c in line.chars() {
+                    match c {
+                        '{' => depth_braces += 1,
+                        '}' => depth_braces = (depth_braces - 1).max(0),
+                        _ => {}
+                    }
                 }
             }
         }
     }
+    (read, left)
+}
+
+/// `line`'s leading attributes, and the rest of it past them:
+/// `#[allow(x)] #[path = "x.rs"] mod x;`. An attribute left open is the rest.
+fn leading_attributes(line: &str) -> (Vec<&str>, &str) {
+    let mut attributes = Vec::new();
+    let mut rest = line;
+    while rest.starts_with("#[") {
+        let mut depth = 0i32;
+        let Some(end) = rest.char_indices().find_map(|(i, c)| match c {
+            '[' => {
+                depth += 1;
+                None
+            }
+            ']' => {
+                depth -= 1;
+                (depth == 0).then_some(i)
+            }
+            _ => None,
+        }) else {
+            break;
+        };
+        attributes.push(&rest[..=end]);
+        rest = rest[end + 1..].trim_start();
+    }
+    (attributes, rest)
+}
+
+/// `code` (as [`code_only`] gives it) with every attribute rustfmt wrapped
+/// over several lines - `#[cfg(any(\n feature = "a",\n ..))]` - on one.
+fn attributes_on_one_line(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut depth = 0usize;
+    for c in code.chars() {
+        match c {
+            '[' if depth > 0 || out.ends_with('#') || out.ends_with("#!") => depth += 1,
+            ']' if depth > 0 => depth -= 1,
+            '\n' if depth > 0 => {
+                out.push(' ');
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
     out
 }
 
-/// The module a `mod name;` line declares (`pub` / `pub(..)` before it).
-fn mod_decl(line: &str) -> Option<&str> {
+/// The visibility and the name of the module a `mod name;` line declares.
+fn mod_decl(line: &str) -> Option<(Vis, &str)> {
     let mut rest = line;
+    let mut vis = Vis::Private;
     if let Some(r) = rest.strip_prefix("pub(") {
-        rest = r.split_once(')')?.1.trim_start();
+        let (inside, after) = r.split_once(')')?;
+        vis = vis_of(inside);
+        rest = after.trim_start();
     } else if let Some(r) = rest.strip_prefix("pub ") {
+        vis = Vis::Crate;
         rest = r.trim_start();
     }
     let rest = rest.strip_prefix("mod ")?.trim_start();
@@ -1137,7 +1312,7 @@ fn mod_decl(line: &str) -> Option<&str> {
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(rest.len());
     let (name, tail) = rest.split_at(end);
-    (!name.is_empty() && tail.trim() == ";").then_some(name)
+    (!name.is_empty() && tail.trim() == ";").then_some((vis, name))
 }
 
 /// What the System tab shows of the user's tasks: read back off the block
@@ -1151,6 +1326,8 @@ pub struct TasksView {
     pub dispatchers: Option<String>,
     /// Each `compile_error!`'s message.
     pub errors: Vec<String>,
+    /// [`modules_left_out`] - not in the block, filled by the caller.
+    pub left_out: Vec<String>,
 }
 
 /// [`TasksView`] of `main_rs`'s generated block.
@@ -1222,17 +1399,24 @@ fn task_items_at(file: &str) -> Vec<usize> {
 /// Whether a `use` names what only the RTIC runtime has: its `app`, the
 /// generated `Mono`, the `rtic` crates.
 fn rtic_only_use(path: &str) -> bool {
-    let path: String = path.chars().filter(|c| !c.is_whitespace()).collect();
-    [
-        "crate::app",
-        "crate::Mono",
-        "super::app",
-        "super::Mono",
-        "rtic::",
-        "rtic_monotonics::",
-    ]
-    .iter()
-    .any(|p| path.starts_with(p))
+    let segments: Vec<&str> = path.split("::").map(str::trim).collect();
+    if segments.len() > 1 && matches!(segments[0], "rtic" | "rtic_monotonics") {
+        return true;
+    }
+    // Up to the crate root - `crate::`, or `super::` as often as the
+    // module is deep - then `app` or `Mono`.
+    let ups = match segments.first() {
+        Some(&"crate") => 1,
+        _ => segments.iter().take_while(|s| **s == "super").count(),
+    };
+    let Some(next) = segments.get(ups).filter(|_| ups > 0) else {
+        return false;
+    };
+    let name: String = next
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    name == "app" || name == "Mono"
 }
 
 /// Off RTIC, [`RTIC_TASK_FENCE`] above every one of the user's RTIC items;
@@ -1339,6 +1523,28 @@ pub(crate) const EXAMPLE_MODULE: &str = concat!(
     "// @task(binds = TIM3, priority = 4)\n",
     "pub fn tick(_cx: app::tick::Context) {}\n",
 );
+
+/// `src/tasks/hw.rs` of the `EIDE_F1_TASKS=nested` cross-compile:
+/// [`EXAMPLE_MODULE`]'s hardware task one module deeper, `pub mod hw;` in
+/// `src/tasks.rs` in its place.
+#[cfg(test)]
+pub(crate) const EXAMPLE_NESTED: &str = concat!(
+    "use crate::app;\n",
+    "\n",
+    "// @task(binds = TIM3, priority = 4)\n",
+    "pub fn tick(_cx: app::tick::Context) {}\n",
+);
+
+/// [`EXAMPLE_MODULE`] with its `tick` moved to [`EXAMPLE_NESTED`].
+#[cfg(test)]
+pub(crate) fn example_module_nested() -> String {
+    let tick = "\n// @task(binds = TIM3, priority = 4)\npub fn tick(_cx: app::tick::Context) {}\n";
+    assert!(EXAMPLE_MODULE.ends_with(tick));
+    format!(
+        "{}\npub mod hw;\n",
+        &EXAMPLE_MODULE[..EXAMPLE_MODULE.len() - tick.len()]
+    )
+}
 
 /// The idle loop [`EXAMPLE_TASKS`] goes with, in place of the seed: it locks
 /// the counter and spawns `report`.
@@ -1883,6 +2089,179 @@ mod tests {
         ];
         let main = tail("#[cfg(feature = \"x\")]\nmod tasks;\n#[path = \"jobs.rs\"] mod jobs;\n");
         assert!(task_modules(&main, &files).is_empty());
+    }
+
+    /// Modules declared by modules: read as `a::b` off `src/a/b.rs` when
+    /// `mod app` reaches them, imported by their whole path; the ones passed
+    /// over are said - only when a task could be in them.
+    #[test]
+    fn nested_modules() {
+        let task = |name: &str, vis: &str| {
+            format!("use crate::app;\n{vis} async fn {name}(cx: app::{name}::Context<'_>) {{}}\n")
+        };
+        let files = vec![
+            (
+                "src/a.rs".to_owned(),
+                "pub mod b;\nmod hidden;\nmod quiet;\npub(super) mod c;\n".to_owned(),
+            ),
+            (
+                "src/a/b/mod.rs".to_owned(),
+                format!("pub(crate) mod deep;\n{}", task("one", "pub")),
+            ),
+            ("src/a/b/deep.rs".to_owned(), task("two", "pub(super)")),
+            ("src/a/hidden.rs".to_owned(), task("three", "pub")),
+            ("src/a/quiet.rs".to_owned(), "fn helper() {}\n".to_owned()),
+            ("src/a/c.rs".to_owned(), task("four", "pub")),
+            ("src/t.rs".to_owned(), task("five", "pub")),
+            ("src/u.rs".to_owned(), "fn helper() {}\n".to_owned()),
+        ];
+        let main = tail(concat!(
+            "mod a;\n#[allow(unused)]\nmod t;\n#[cfg(test)]\nmod u;\n",
+            "#[path = \"x.rs\"]\nmod v;\n",
+        ));
+        let mut names: Vec<String> = task_modules(&main, &files)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "a::b", "a::b::deep", "a::c", "t"]);
+        assert_eq!(
+            modules_left_out(&main, &files),
+            [
+                "mod v: under #[cfg] or #[path] - its tasks are not read",
+                "mod a::hidden: private to a - mod app cannot reach a task in or below it; \
+                 declare it pub mod hidden;",
+            ]
+        );
+
+        let app = scan_project(&main, &task_modules(&main, &files));
+        let mut tasks: Vec<(String, String)> = app
+            .tasks
+            .iter()
+            .map(|t| (t.name.clone(), t.module.clone().unwrap_or_default()))
+            .collect();
+        tasks.sort();
+        assert_eq!(
+            tasks,
+            [
+                ("five".to_owned(), "t".to_owned()),
+                ("four".to_owned(), "a::c".to_owned()),
+                ("one".to_owned(), "a::b".to_owned()),
+            ]
+        );
+        // `pub(super)` two levels down reaches `a::b`, not the crate root.
+        assert!(
+            app.refusals
+                .iter()
+                .any(|r| r.contains("`two`") && r.contains("`a::b::deep`")),
+            "{:?}",
+            app.refusals
+        );
+        let p = plan(&app, &locals(&[]), &BTreeSet::new(), &BTreeSet::new());
+        assert!(
+            p.extern_block.contains("    use crate::a::b::one;\n"),
+            "{}",
+            p.extern_block
+        );
+        assert_eq!(module_paths("a::b"), ["src/a/b.rs", "src/a/b/mod.rs"]);
+
+        // The cross-compile's split: blink in `tasks`, tick in `tasks::hw`.
+        let files = vec![
+            ("src/tasks.rs".to_owned(), example_module_nested()),
+            ("src/tasks/hw.rs".to_owned(), EXAMPLE_NESTED.to_owned()),
+        ];
+        let modules = task_modules(&tail(EXAMPLE_MAIN_WITH_MODULE), &files);
+        assert_eq!(modules.len(), 2);
+        let app = scan_project(&tail(EXAMPLE_MAIN_WITH_MODULE), &modules);
+        assert!(
+            app.tasks
+                .iter()
+                .any(|t| t.name == "tick" && t.module.as_deref() == Some("tasks::hw")),
+            "{app:?}"
+        );
+    }
+
+    /// What the nested-module review found: a task below a module with none
+    /// of its own still names it; an attribute wrapped over lines, after
+    /// another, or inside the file still gates; `super::super::app` is fenced;
+    /// `pub(in super::super)` reaches the root; no depth cap.
+    #[test]
+    fn nested_module_edge_cases() {
+        let task = |name: &str| {
+            format!("use crate::app;\npub async fn {name}(cx: app::{name}::Context<'_>) {{}}\n")
+        };
+        let files = vec![
+            ("src/a.rs".to_owned(), "mod b;\n".to_owned()),
+            ("src/a/b.rs".to_owned(), "pub mod c;\n".to_owned()),
+            ("src/a/b/c.rs".to_owned(), task("deep")),
+            ("src/g.rs".to_owned(), task("wrapped")),
+            ("src/h.rs".to_owned(), task("second")),
+            (
+                "src/i.rs".to_owned(),
+                format!("#![cfg(feature = \"i\")]\n{}", task("inner")),
+            ),
+            ("src/q/r.rs".to_owned(), "pub mod s;\n".to_owned()),
+        ];
+        let main = tail(concat!(
+            "pub mod a;\n",
+            "#[cfg(any(\n    feature = \"x\",\n    feature = \"y\"\n))]\nmod g;\n",
+            "#[allow(unused)] #[cfg(feature = \"h\")] mod h;\n",
+            "mod i;\n",
+        ));
+        assert_eq!(
+            task_modules(&main, &files)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            ["a"]
+        );
+        let left = modules_left_out(&main, &files);
+        for m in ["mod g:", "mod h:", "mod i:", "mod a::b: private to a"] {
+            assert!(left.iter().any(|l| l.starts_with(m)), "{m}: {left:?}");
+        }
+
+        let off = fence_tasks(
+            "use super::super::app;\nuse super::helpers;\npub fn tick(_cx: app::tick::Context) {}\n"
+                .to_owned(),
+            false,
+        );
+        assert!(
+            off.contains(&format!("{RTIC_TASK_FENCE}use super::super::app;")),
+            "{off}"
+        );
+        assert!(
+            !off.contains(&format!("{RTIC_TASK_FENCE}use super::helpers;")),
+            "{off}"
+        );
+        assert!(rtic_only_use("crate::app as rtic_app"));
+        assert!(!rtic_only_use("crate::application"));
+
+        let up = scan_project(
+            "",
+            &[(
+                "a::b".to_owned(),
+                "pub(in super::super) async fn one(cx: crate::app::one::Context<'_>) {}\n"
+                    .to_owned(),
+            )],
+        );
+        assert_eq!(up.tasks.len(), 1, "{:?}", up.refusals);
+
+        // Eight levels down, read all the way.
+        let mut files = Vec::new();
+        let mut dir = String::from("src");
+        for level in 0..8 {
+            let name = format!("m{level}");
+            let body = if level == 7 {
+                task("bottom")
+            } else {
+                format!("pub mod m{};\n", level + 1)
+            };
+            files.push((format!("{dir}/{name}.rs"), body));
+            dir = format!("{dir}/{name}");
+        }
+        let modules = task_modules(&tail("mod m0;\n"), &files);
+        assert_eq!(modules.len(), 8);
+        assert_eq!(scan_project(&tail("mod m0;\n"), &modules).tasks.len(), 1);
     }
 
     /// The tab's view reads the block back: tasks, dispatchers, refusals.

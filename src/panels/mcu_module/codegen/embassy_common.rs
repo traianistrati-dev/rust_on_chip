@@ -2167,6 +2167,14 @@ mod emit_for_manual_compile {
             let below = if how == "module" {
                 task_files.push(("src/tasks.rs".to_owned(), EXAMPLE_MODULE.to_owned()));
                 EXAMPLE_MAIN_WITH_MODULE
+            } else if how == "nested" {
+                // `tick` one module deeper: `tasks::hw`, in `src/tasks/hw.rs`.
+                use crate::panels::mcu_module::codegen::rtic_user::{
+                    EXAMPLE_NESTED, example_module_nested,
+                };
+                task_files.push(("src/tasks.rs".to_owned(), example_module_nested()));
+                task_files.push(("src/tasks/hw.rs".to_owned(), EXAMPLE_NESTED.to_owned()));
+                EXAMPLE_MAIN_WITH_MODULE
             } else {
                 EXAMPLE_TASKS
             };

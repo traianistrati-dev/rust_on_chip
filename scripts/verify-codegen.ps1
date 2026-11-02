@@ -339,6 +339,8 @@ $ALL_CASES = @(
     # The same tasks with two of them in `src/tasks.rs` (`mod tasks;`): the block
     # imports them into `mod app` from there.
     @{ n = "F1 RTIC, user tasks in a module"; t = "emit_f1_rtic_project"; e = @{ EIDE_F1_TASKS = "module" }; q = $false; fam = "f1" }
+    # ...and the hardware one a module deeper (`pub mod hw;` -> src/tasks/hw.rs).
+    @{ n = "F1 RTIC, user tasks in a nested module"; t = "emit_f1_rtic_project"; e = @{ EIDE_F1_TASKS = "nested" }; q = $false; fam = "f1" }
     @{ n = "F1 blocking custom";           t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_CUSTOM = "1" }; q = $true; fam = "f1" }
     @{ n = "F1 blocking custom, raw GPIO"; t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_CUSTOM = "1"; EIDE_F1_GPIO = "native" }; q = $false; fam = "f1" }
     # A helper below the block naming `adc::`: the crate-root import kept for it.

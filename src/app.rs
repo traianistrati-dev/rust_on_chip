@@ -3688,7 +3688,7 @@ impl AppIde {
                 // fence comes off (`rtic_user::fence_tasks`).
                 let rtic = mcu.is_rtic();
                 for (name, _) in &mcu.user_modules {
-                    let paths = [format!("src/{name}.rs"), format!("src/{name}/mod.rs")];
+                    let paths = crate::panels::mcu_module::codegen::rtic_user::module_paths(name);
                     if let Some((_, text)) = self
                         .project_tree
                         .user_src_files

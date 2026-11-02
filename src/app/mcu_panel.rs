@@ -4061,7 +4061,12 @@ fn rtic_tasks_panel(
             );
         }
         for t in &view.tasks {
-            ui.label(egui::RichText::new(format!("{}  {t}", ph::CHECK)).monospace());
+            // The icon in the proportional font: the monospace one has no
+            // phosphor glyphs and draws a box.
+            ui.horizontal(|ui| {
+                ui.label(ph::CHECK);
+                ui.label(egui::RichText::new(t).monospace());
+            });
         }
         if let Some(d) = &view.dispatchers {
             ui.label(egui::RichText::new(format!("Dispatchers: {d}")).weak());

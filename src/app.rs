@@ -3687,49 +3687,6 @@ impl AppIde {
         if let Some((all_pins, config_files)) = regen {
             use crate::panels::mcu_module::codegen::flash_store_gen;
             use crate::panels::mcu_module::manifest_sync::{self, Inputs, Manifests};
-            // Crates, target flags, the partition table and memory.x: ONE
-            // decision, the one the emit harnesses make too - see
-            // `manifest_sync`.
-            let synced = self.mcu.as_ref().map(|mcu| {
-                let build = self.selected_build_cfg();
-                let user_sources: Vec<&str> = self
-                    .project_tree
-                    .user_src_files
-                    .iter()
-                    .filter(|(path, _)| !path.starts_with("src/pins/"))
-                    .map(|(_, body)| body.as_str())
-                    .collect();
-                manifest_sync::sync(
-                    &Manifests {
-                        cargo_toml: self.cargo_toml.clone(),
-                        cargo_config: self.cargo_config.clone(),
-                        partitions_csv: self.partitions_csv.clone(),
-                        memory_x: self.memory_x.clone(),
-                    },
-                    &Inputs {
-                        mcu,
-                        build: build.as_ref().map(|(p, tc)| (p, tc)),
-                        config_files: &config_files,
-                        main_rs: &self.generated_code,
-                        user_sources: &user_sources,
-                    },
-                )
-            });
-            if let Some(m) = synced {
-                if m.cargo_toml != self.cargo_toml {
-                    self.cargo_toml = m.cargo_toml;
-                    self.invalidate_project_files_cache();
-                }
-                if m.partitions_csv != self.partitions_csv || m.cargo_config != self.cargo_config {
-                    self.partitions_csv = m.partitions_csv;
-                    self.cargo_config = m.cargo_config;
-                    self.invalidate_project_files_cache();
-                }
-                if m.memory_x != self.memory_x {
-                    self.memory_x = m.memory_x;
-                    self.invalidate_project_files_cache();
-                }
-            }
             // On a Runtime / Init-API Apply the config templates change wholesale
             // (blocking ⇄ async ⇄ native init) — force a FULL rewrite so the old
             // `init()` in the editable region is replaced, not just the consts.
@@ -3763,6 +3720,52 @@ impl AppIde {
             if let ProjectFileId::UserFile(_) = self.selected_file {
                 self.selected_file =
                     selected.map_or(ProjectFileId::MainRs, ProjectFileId::UserFile);
+            }
+            // Crates, target flags, the partition table and memory.x: ONE
+            // decision, the one the emit harnesses make too - see
+            // `manifest_sync`. After the config files, so a Custom module's
+            // is read as this frame left it - written, followed to the GPIO
+            // api, or the user's - which is the file that compiles.
+            let synced = self.mcu.as_ref().map(|mcu| {
+                let build = self.selected_build_cfg();
+                let user_sources: Vec<&str> = self
+                    .project_tree
+                    .user_src_files
+                    .iter()
+                    .filter(|(path, _)| !path.starts_with("src/pins/"))
+                    .map(|(_, body)| body.as_str())
+                    .collect();
+                let as_written = self.project_tree.config_files_as_written(&config_files);
+                manifest_sync::sync(
+                    &Manifests {
+                        cargo_toml: self.cargo_toml.clone(),
+                        cargo_config: self.cargo_config.clone(),
+                        partitions_csv: self.partitions_csv.clone(),
+                        memory_x: self.memory_x.clone(),
+                    },
+                    &Inputs {
+                        mcu,
+                        build: build.as_ref().map(|(p, tc)| (p, tc)),
+                        config_files: &as_written,
+                        main_rs: &self.generated_code,
+                        user_sources: &user_sources,
+                    },
+                )
+            });
+            if let Some(m) = synced {
+                if m.cargo_toml != self.cargo_toml {
+                    self.cargo_toml = m.cargo_toml;
+                    self.invalidate_project_files_cache();
+                }
+                if m.partitions_csv != self.partitions_csv || m.cargo_config != self.cargo_config {
+                    self.partitions_csv = m.partitions_csv;
+                    self.cargo_config = m.cargo_config;
+                    self.invalidate_project_files_cache();
+                }
+                if m.memory_x != self.memory_x {
+                    self.memory_x = m.memory_x;
+                    self.invalidate_project_files_cache();
+                }
             }
             // After an Apply a kept file gets a window; otherwise a status line.
             self.follow_template_sync(&report, force_configs);

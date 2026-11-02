@@ -548,6 +548,29 @@ impl ProjectTreeState {
         }
     }
 
+    /// `files`, the codegen's config files, as the manifest has to read them:
+    /// a Custom module's as it stands in the tree - the user's once written,
+    /// so the crate its traits come from is read off the file that compiles,
+    /// not off the body the IDE would write (`manifest_sync::sync`) - every
+    /// other one as generated. Asked after this frame's
+    /// [`Self::sync_config_files`], which writes a new one and follows an
+    /// untouched one to the GPIO api.
+    pub fn config_files_as_written(&self, files: &[(String, String)]) -> Vec<(String, String)> {
+        files
+            .iter()
+            .map(|(name, body)| {
+                let written = name
+                    .starts_with("custom_")
+                    .then(|| src_path(&format!("pins/configs/{name}")))
+                    .and_then(|path| self.user_src_files.iter().find(|(p, _)| *p == path));
+                (
+                    name.clone(),
+                    written.map_or_else(|| body.clone(), |(_, t)| t.clone()),
+                )
+            })
+            .collect()
+    }
+
     /// Sync the per-peripheral init modules under `src/pins/configs/` from the
     /// codegen output `files = (file_name, generated_body)` (one per configured
     /// USART/SPI/I2C). Mirrors [`sync_pin_files`]: registers the folder, ensures
@@ -712,9 +735,32 @@ impl ProjectTreeState {
             // A Custom module's file belongs to the user once it exists. Splicing
             // it ran on every regeneration — the first frame after the IDE starts
             // included — and wiped any field added to the struct.
-            if is_custom_stem(name.trim_end_matches(".rs"))
-                && self.user_src_files.iter().any(|(p, _)| p == &file_path)
+            //
+            // But one still exactly as the IDE wrote it for the OTHER GPIO api
+            // follows the api, as main.rs's bindings just did: its traits'
+            // `use` line is all that differs, and kept it would bound raw
+            // stm32f1xx-hal pins on embedded-hal 1.0 (or bridged ones on 0.2).
+            // One back from the graveyard (the module removed, then restored)
+            // comes back first, so it follows the same way.
+            let custom = is_custom_stem(name.trim_end_matches(".rs"));
+            if custom
+                && !self.user_src_files.iter().any(|(p, _)| p == &file_path)
+                && let Some(old) = self.unbury(&file_path)
             {
+                self.user_src_files.push((file_path.clone(), old));
+            }
+            if custom
+                && let Some((_, content)) = self
+                    .user_src_files
+                    .iter_mut()
+                    .find(|(p, _)| p == &file_path)
+            {
+                let lf = |s: &str| s.replace("\r\n", "\n");
+                if crate::panels::mcu_module::codegen::custom_file_for_other_gpio_api(body)
+                    .is_some_and(|other| lf(content) == lf(&other))
+                {
+                    content.clone_from(body);
+                }
                 continue;
             }
             let is_device = name
@@ -1998,6 +2044,105 @@ mod tests {
         assert_file_not_exists(&state, "src/pins/configs/usart1.rs");
         assert_file_not_exists(&state, "src/pins/configs/mod.rs");
         assert_folder_exists(&state, "src/pins/configs");
+    }
+
+    /// A Custom module's file still exactly as the IDE wrote it for the other
+    /// GPIO api follows the api - its traits' `use` line - so it bounds the
+    /// pins main.rs now hands it; CRLF on disk is still "exactly". One the
+    /// user changed stays as they left it.
+    #[test]
+    fn an_untouched_custom_module_file_follows_the_gpio_api() {
+        use crate::panels::mcu_module::codegen::custom_file_for_other_gpio_api;
+        let mut state = ProjectTreeState::new();
+        let path = "src/pins/configs/custom_panel.rs";
+        let keep = ["custom_panel".to_string()];
+        let portable = "use embedded_hal::digital::{InputPin, OutputPin};\n\n\
+                        impl<PB12: OutputPin, PB13: InputPin> Panel<PB12, PB13> {}\n";
+        let native = custom_file_for_other_gpio_api(portable).expect("a traits line");
+        assert!(
+            native.starts_with("use embedded_hal_0_2::digital::v2::{InputPin, OutputPin};"),
+            "{native}"
+        );
+        let sync = |state: &mut ProjectTreeState, body: &str| {
+            state.sync_config_files(
+                &[("custom_panel.rs".to_string(), body.to_string())],
+                &keep,
+                &mut None,
+            );
+            state
+                .user_src_files
+                .iter()
+                .find(|(p, _)| p == path)
+                .expect("written")
+                .1
+                .clone()
+        };
+        let on_disk = |state: &mut ProjectTreeState, text: String| {
+            state
+                .user_src_files
+                .iter_mut()
+                .find(|(p, _)| p == path)
+                .expect("written")
+                .1 = text;
+        };
+        assert_eq!(sync(&mut state, portable), portable);
+        assert_eq!(sync(&mut state, &native), native, "to the Native api");
+        on_disk(&mut state, native.replace('\n', "\r\n"));
+        assert_eq!(sync(&mut state, portable), portable, "and back, from CRLF");
+
+        let edited = portable.replace("{}\n", "{\n    fn mine(&mut self) {}\n}\n");
+        on_disk(&mut state, edited.clone());
+        assert_eq!(sync(&mut state, &native), edited, "the user's stays");
+
+        // The module removed - its file buried - and restored on the other
+        // api: back from the graveyard, it follows in the same sync.
+        on_disk(&mut state, native.clone());
+        state.sync_config_files(&[], &[], &mut None);
+        assert!(
+            !state.user_src_files.iter().any(|(p, _)| p == path),
+            "buried with its module"
+        );
+        assert_eq!(
+            sync(&mut state, portable),
+            portable,
+            "restored, and followed"
+        );
+    }
+
+    /// What the manifest reads: a Custom module's file as it stands in the
+    /// tree - the user's edit - every other config file as generated, and a
+    /// Custom one not written yet as generated too.
+    #[test]
+    fn the_manifest_reads_a_custom_module_file_as_written() {
+        let mut state = ProjectTreeState::new();
+        let keep = ["custom_panel".to_string()];
+        let files = vec![
+            ("usart1.rs".to_string(), "pub fn init() {}\n".to_string()),
+            (
+                "custom_panel.rs".to_string(),
+                "pub struct Panel;\n".to_string(),
+            ),
+        ];
+        state.sync_config_files(&files, &keep, &mut None);
+        let mine = "pub struct Panel;\nimpl Panel { pub fn blink(&mut self) {} }\n";
+        state
+            .user_src_files
+            .iter_mut()
+            .find(|(p, _)| p == "src/pins/configs/custom_panel.rs")
+            .expect("written")
+            .1 = mine.to_string();
+        state
+            .user_src_files
+            .iter_mut()
+            .find(|(p, _)| p == "src/pins/configs/usart1.rs")
+            .expect("written")
+            .1 = "pub fn init() { /* edited */ }\n".to_string();
+        let mut asked = files.clone();
+        asked.push(("custom_new.rs".to_string(), "pub struct New;\n".to_string()));
+        let read = state.config_files_as_written(&asked);
+        assert_eq!(read[0], files[0], "a config file: as generated");
+        assert_eq!(read[1].1, mine, "a Custom module's: the user's");
+        assert_eq!(read[2], asked[2], "not written yet: as generated");
     }
 
     /// A comparator file from before `get_config` left its block, as the IDE

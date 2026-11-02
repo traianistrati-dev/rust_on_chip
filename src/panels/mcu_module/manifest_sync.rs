@@ -53,7 +53,9 @@ pub struct Inputs<'a> {
     /// `None` when no definition is selected: the HAL line, the target and
     /// `memory.x` are then left as they are.
     pub build: Option<(&'a ProjectDef, &'a ToolchainKind)>,
-    /// `mcu.config_files()`, as the sync is about to write them.
+    /// `mcu.config_files()`, as the sync is about to write them - in the app
+    /// a Custom module's as it stands in the tree, the file that compiles
+    /// (`ProjectTreeState::config_files_as_written`).
     pub config_files: &'a [(String, String)],
     /// The generated `main.rs`.
     pub main_rs: &'a str,
@@ -63,7 +65,9 @@ pub struct Inputs<'a> {
     /// `project_gen::is_crate_referenced`. `src/pins/**` stays out on purpose:
     /// those files are regenerated from the model, so a bridge the IDE is
     /// about to stop emitting must not keep its crate alive (that is what left
-    /// `embedded-hal` behind after switching to the Native runtime).
+    /// `embedded-hal` behind after switching to the Native runtime). A Custom
+    /// module's file, the user's once written, asks for its crate through
+    /// `config_files` instead - only the revision that compiles.
     pub user_sources: &'a [&'a str],
 }
 
@@ -212,13 +216,29 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
         None => current.cargo_toml.clone(),
     };
     let eh_bridge = needs_spi || needs_i2c || needs_gpio;
+    // A Custom module's file bounds its `impl` on a trait crate that nothing
+    // else need pull in: no bridge does on Native, no bus on embassy or an
+    // ESP - and a Custom module with only GPIO pads was an unresolved import
+    // there (E0433). Read off the file that compiles - the app hands the
+    // tree's (`ProjectTreeState::config_files_as_written`), which is the
+    // user's once written - not off the body the IDE would write now: an
+    // edited file keeps its crate across a HAL swap that re-splices the
+    // manifest's block. As the IDE writes it, embedded-hal 1.0, or 0.2 over
+    // stm32f1xx-hal's own pins (`codegen::custom_trait_use`).
+    let custom_uses = |dep: &str| {
+        config_files.iter().any(|(name, body)| {
+            name.starts_with("custom_") && project_gen::is_crate_referenced(&[body.as_str()], dep)
+        })
+    };
+    let custom_eh1 = custom_uses("embedded-hal");
+    let custom_eh02 = custom_uses("embedded-hal-0-2");
     let new_toml = project_gen::ensure_peripheral_crates(
         &base_toml,
         project_gen::PeripheralCrates {
             can: needs_can,
             io: needs_usart || embassy_io,
-            eh02: needs_usart || eh_bridge,
-            eh1: eh_bridge || embassy_eh,
+            eh02: needs_usart || eh_bridge || custom_eh02,
+            eh1: eh_bridge || embassy_eh || custom_eh1,
             nb: needs_nb,
         },
         &sources,
@@ -238,7 +258,7 @@ pub fn sync(current: &Manifests, inp: &Inputs<'_>) -> Manifests {
     // blocking case, or the blocking GPIO (io.rs) / SPI / I2C `embedded-hal`
     // that `ensure_peripheral_deps` just added would be stripped right back
     // out here (and a user's manual `embedded-hal` line with it).
-    let needs_eh_total = needs_eh || eh_bridge || embassy_eh;
+    let needs_eh_total = needs_eh || eh_bridge || embassy_eh || custom_eh1;
     // Which async stack: embassy-stm32, or esp-rtos on the ESP32-C3.
     // Same crate names, different versions — see `AsyncFlavor`. The chip
     // feature (`esp32c3`) comes from the same `ProjectDef` the base
@@ -549,6 +569,135 @@ mod tests {
         );
     }
 
+    /// A Custom module's file bounds its `impl` on a trait crate nothing else
+    /// may pull in, so the file asks for it: embedded-hal 1.0 on an embassy
+    /// STM32 and an ESP with no bus - no manifest carried it there, and the
+    /// module's `use` was E0433 - and 0.2 under its alias over stm32f1xx-hal's
+    /// own pins on the Native GPIO api, where no bridge brings either. Without
+    /// the module neither is there, and a second sync moves nothing.
+    #[test]
+    fn a_custom_modules_file_asks_for_the_crate_its_traits_come_from() {
+        use crate::panels::mcu_module::modules::{ApiStyle, ModuleConfig, ModuleKind};
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+        let builtin = |id: &str| {
+            crate::panels::mcu_module::builtins::builtin_for(id)
+                .unwrap_or_else(|| panic!("built-in {id}"))
+        };
+        // The F411 as the XML importer builds it, as above.
+        let mut f411 = builtin("stm32f103c8t6");
+        f411.id = "stm32f411re".into();
+        f411.display_name = "STM32F411RETx".into();
+        f411.family = "stm32f4".into();
+        f411.project.pkg_name = "stm32f411re".into();
+        f411.project.target = "thumbv7em-none-eabihf".into();
+        f411.project.probe_chip = "STM32F411RETx".into();
+        f411.project.hal_dep =
+            crate::panels::mcu_module::stm32_pin_data::hal_dep_for_name("stm32f4", "STM32F411RETx");
+        f411.clock = crate::panels::mcu_module::mcu_def::ClockDef::None;
+        let dep = |toml: &str, name: &str| {
+            toml.lines().any(|l| {
+                l.trim_start()
+                    .strip_prefix(name)
+                    .is_some_and(|r| r.trim_start().starts_with('='))
+            })
+        };
+        let (eh1, eh02) = ("embedded-hal", "embedded-hal-0-2");
+        for (def, runtime, gpio, want, not) in [
+            (
+                f411.clone(),
+                Runtime::Blocking,
+                ApiStyle::Portable,
+                eh1,
+                eh02,
+            ),
+            (f411.clone(), Runtime::Async, ApiStyle::Portable, eh1, eh02),
+            (
+                builtin("esp32c3"),
+                Runtime::Blocking,
+                ApiStyle::Portable,
+                eh1,
+                eh02,
+            ),
+            (
+                builtin("esp32c3"),
+                Runtime::Async,
+                ApiStyle::Portable,
+                eh1,
+                eh02,
+            ),
+            (
+                builtin("stm32f103c8t6"),
+                Runtime::Native,
+                ApiStyle::Native,
+                eh02,
+                eh1,
+            ),
+            (
+                builtin("stm32f103c8t6"),
+                Runtime::Blocking,
+                ApiStyle::Native,
+                eh02,
+                eh1,
+            ),
+            (
+                builtin("stm32f103c8t6"),
+                Runtime::Rtic,
+                ApiStyle::Native,
+                eh02,
+                eh1,
+            ),
+        ] {
+            let what = format!("{} on {runtime:?} / {gpio:?}", def.id);
+            let mut mcu = def.build_mcu();
+            mcu.runtime = runtime;
+            mcu.pending_runtime = runtime;
+            mcu.gpio_api = gpio;
+            mcu.pending_gpio_api = gpio;
+            let mut pads = Vec::new();
+            for f in [PinFunction::GpioOutput, PinFunction::GpioInput] {
+                let n = mcu
+                    .iter_all_pins()
+                    .find(|p| {
+                        !p.reserved
+                            && p.selected_function == PinFunction::Unset
+                            && p.available_functions.contains(&f)
+                    })
+                    .map(|p| p.number)
+                    .unwrap_or_else(|| panic!("{what}: no pad for {f:?}"));
+                mcu.apply_pin_function(n, f);
+                pads.push(n);
+            }
+            let bare = project_files(&def, &mcu, &mcu.fresh_main_rs());
+            assert!(
+                !dep(&bare.cargo_toml, want),
+                "{what}, no module: {want}\n{}",
+                bare.cargo_toml
+            );
+
+            assert!(mcu.add_module(ModuleKind::Custom));
+            let m = mcu
+                .modules
+                .iter_mut()
+                .find(|m| m.kind == ModuleKind::Custom)
+                .expect("the Custom module");
+            *m.config.custom_label_mut() = "panel".to_owned();
+            if let ModuleConfig::Custom(c) = &mut m.config {
+                c.pins = pads.clone();
+                c.applied_pins = pads;
+            }
+            let files = project_files(&def, &mcu, &mcu.fresh_main_rs());
+            let toml = &files.cargo_toml;
+            assert!(dep(toml, want), "{what}: {want}\n{toml}");
+            assert!(!dep(toml, not), "{what}: {not}\n{toml}");
+            let mut again = files.clone();
+            sync_files(&mut again, &def, &mcu);
+            assert!(
+                Manifests::of(&files) == Manifests::of(&again),
+                "{what}: a second sync moved it"
+            );
+        }
+    }
+
     /// A board whose generated code speaks its HAL directly gets none of the
     /// F1 trait-bridge crates. Found by moving the harnesses onto this sync: a
     /// Pico on Blocking with a UART carried `nb`, `embedded-hal-0-2` and
@@ -645,5 +794,122 @@ mod tests {
         assert!(!t.contains("embassy-executor") && !t.contains("embedded-io-async"), "{t}");
         let fresh = project_files(&def, &mcu, &main_rs).cargo_toml;
         assert!(same_lines(t, &fresh), "switched back:\n{t}\nfresh:\n{fresh}");
+    }
+
+    /// The crate a Custom module's traits come from is read off the file that
+    /// compiles. One the user wrote in on the F1's Native runtime still names
+    /// 0.2's traits after a switch to Async, where the IDE's own body names
+    /// 1.0's: handed that file, as the app hands the tree's
+    /// (`ProjectTreeState::config_files_as_written`), the sync keeps
+    /// `embedded-hal-0-2`; handed the IDE's body alone it dropped it (E0433
+    /// in the user's file). A second sync moves nothing.
+    #[test]
+    fn the_custom_file_that_compiles_decides_its_crate() {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        use crate::panels::mcu_module::pins::logic::pin_function::PinFunction;
+        let def = builtin_definitions()
+            .into_iter()
+            .find(|d| d.id == "stm32f103c8t6")
+            .expect("built-in F103");
+        let mut mcu = def.build_mcu();
+        mcu.runtime = Runtime::Native;
+        mcu.pending_runtime = Runtime::Native;
+        let mut pads = Vec::new();
+        for (name, f) in [
+            ("PB12", PinFunction::GpioOutput),
+            ("PB13", PinFunction::GpioInput),
+        ] {
+            let n = mcu
+                .iter_all_pins()
+                .find(|p| p.name == name)
+                .map(|p| p.number)
+                .expect(name);
+            mcu.apply_pin_function(n, f);
+            pads.push(n);
+        }
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .expect("the Custom module");
+        *m.config.custom_label_mut() = "panel".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = pads.clone();
+            c.applied_pins = pads;
+        }
+        let dep = |toml: &str, name: &str| {
+            toml.lines().any(|l| {
+                l.trim_start()
+                    .strip_prefix(name)
+                    .is_some_and(|r| r.trim_start().starts_with('='))
+            })
+        };
+        let native = project_files(&def, &mcu, &mcu.fresh_main_rs());
+        assert!(
+            dep(&native.cargo_toml, "embedded-hal-0-2"),
+            "{}",
+            native.cargo_toml
+        );
+        // The user's file: the IDE's, with a method of their own.
+        let (name, body) = mcu
+            .config_files()
+            .into_iter()
+            .find(|(n, _)| n.starts_with("custom_"))
+            .expect("the module's file");
+        let mine = body.replace(
+            "    pub fn update(&mut self) {",
+            "    pub fn blink(&mut self) {}\n\n    pub fn update(&mut self) {",
+        );
+        assert_ne!(mine, body);
+
+        mcu.runtime = Runtime::Async;
+        mcu.pending_runtime = Runtime::Async;
+        let main_rs = mcu.update_main_rs(&native.main_rs);
+        let cfg = crate::panels::mcu_module::mcu_def::build_cfg(&def, Some(&mcu));
+        let run = |configs: &[(String, String)], from: &ProjectFiles| {
+            let mut files = from.clone();
+            files.main_rs = main_rs.clone();
+            sync(
+                &Manifests::of(&files),
+                &Inputs {
+                    mcu: &mcu,
+                    build: Some((&cfg, &def.toolchain)),
+                    config_files: configs,
+                    main_rs: &main_rs,
+                    user_sources: &[],
+                },
+            )
+            .apply_to(&mut files);
+            files
+        };
+        let mut configs = mcu.config_files();
+        let at = configs
+            .iter()
+            .position(|(n, _)| *n == name)
+            .expect("still built on Async");
+        assert!(
+            !project_gen::is_crate_referenced(&[configs[at].1.as_str()], "embedded-hal-0-2"),
+            "Async's own body is 1.0's:\n{}",
+            configs[at].1
+        );
+        let generated = run(&configs, &native);
+        assert!(
+            !dep(&generated.cargo_toml, "embedded-hal-0-2"),
+            "{}",
+            generated.cargo_toml
+        );
+        configs[at].1 = mine;
+        let on_async = run(&configs, &native);
+        assert!(
+            dep(&on_async.cargo_toml, "embedded-hal-0-2"),
+            "{}",
+            on_async.cargo_toml
+        );
+        let again = run(&configs, &on_async);
+        assert!(
+            Manifests::of(&again) == Manifests::of(&on_async),
+            "a second sync moved it"
+        );
     }
 }

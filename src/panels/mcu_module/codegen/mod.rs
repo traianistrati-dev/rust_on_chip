@@ -55,6 +55,49 @@ pub struct BuiltCustom {
     pub pins: Vec<usize>,
 }
 
+/// How a Custom module's file imports the traits its `impl` is bounded on:
+/// embedded-hal 1.0's - or, over stm32f1xx-hal's own pins, which implement
+/// only 0.2's, the 0.2 crate's `v2` traits under the `embedded-hal-0-2`
+/// alias ([`Mcu::custom_pads_speak_eh02`]). The trait names are the same, so
+/// this line is all that differs: a file the user never touched can follow
+/// the GPIO api ([`custom_file_for_other_gpio_api`]), and the manifest reads
+/// the crate off it (`manifest_sync::sync`).
+const CUSTOM_EH1_USE: &str = "use embedded_hal::digital::{";
+const CUSTOM_EH02_USE: &str = "use embedded_hal_0_2::digital::v2::{";
+const CUSTOM_EH02_NOTE: &str = " // stm32f1xx-hal's own pins speak embedded-hal 0.2";
+
+/// The `use` line of [`CUSTOM_EH1_USE`] / [`CUSTOM_EH02_USE`] for `traits`
+/// (`InputPin, OutputPin`).
+fn custom_trait_use(traits: &str, eh02: bool) -> String {
+    if eh02 {
+        format!("{CUSTOM_EH02_USE}{traits}}};{CUSTOM_EH02_NOTE}")
+    } else {
+        format!("{CUSTOM_EH1_USE}{traits}}};")
+    }
+}
+
+/// `body`, a Custom module's file as the IDE writes it, as the IDE would have
+/// written it on the other GPIO api - its traits' `use` line swapped - or
+/// `None` when it has none. A file on disk equal to it is one the user never
+/// touched, which follows the api (`ProjectTree::sync_config_files`).
+pub fn custom_file_for_other_gpio_api(body: &str) -> Option<String> {
+    let (at, eh02) = body
+        .match_indices(CUSTOM_EH1_USE)
+        .map(|(i, _)| (i, false))
+        .chain(body.match_indices(CUSTOM_EH02_USE).map(|(i, _)| (i, true)))
+        .find(|(i, _)| *i == 0 || body[..*i].ends_with('\n'))?;
+    let end = body[at..].find('\n').map_or(body.len(), |n| at + n);
+    let prefix = if eh02 {
+        CUSTOM_EH02_USE
+    } else {
+        CUSTOM_EH1_USE
+    };
+    let traits = body[at + prefix.len()..end].split('}').next()?;
+    let mut other = body.to_owned();
+    other.replace_range(at..end, &custom_trait_use(traits, !eh02));
+    Some(other)
+}
+
 /// Type-parameter name for a pin in a Custom module's struct: the pin's own name
 /// (`PC15` → `PC15`), uppercased and sanitised to a valid Rust identifier. Only
 /// its first word: an nRF pad is named with its board net after it
@@ -260,6 +303,16 @@ impl Mcu {
         self.is_native() || self.gpio_api == ApiStyle::Native
     }
 
+    /// Whether a Custom module's pads reach its struct as stm32f1xx-hal's own
+    /// pins, which implement embedded-hal 0.2's traits only: an F1 off Async
+    /// on the Native GPIO api - the Native runtime, or Blocking / RTIC with
+    /// raw GPIO. Everywhere else they come through the `pins::configs::io`
+    /// bridge or a HAL that speaks 1.0 itself. Its file bounds the `impl` on
+    /// the 0.2 traits then (`custom_module_files`).
+    pub fn custom_pads_speak_eh02(&self) -> bool {
+        family::uses_stm32f1xx_hal(&self.family, self.runtime) && self.gpio_native()
+    }
+
     /// Keep the GPIO api in step with the Runtime: **Native binds every GPIO
     /// raw**, so "Portable" is not a live choice there — the System tab locks
     /// the selector, but the stored value used to stay `Portable`, which showed
@@ -432,7 +485,8 @@ impl Mcu {
         // User-authored Custom modules produce a file each. They are generated
         // HERE rather than in a family backend because the struct is generic
         // over its pin types — no HAL type is named, so the same code is valid
-        // on every family and on both the Portable and Native paths.
+        // on every family. Only the traits its `impl` is bounded on follow the
+        // pins: embedded-hal 0.2's over stm32f1xx-hal's own (Native GPIO api).
         files.extend(self.custom_module_files());
         // The Configuration tab's flash store, on every family it is generated
         // for (ESP and STM32 alike - `flash_store::platform` decides).
@@ -1199,7 +1253,10 @@ impl Mcu {
             let use_line = if traits.is_empty() {
                 String::new()
             } else {
-                format!("use embedded_hal::digital::{{{}}};\n\n", traits.join(", "))
+                format!(
+                    "{}\n\n",
+                    custom_trait_use(&traits.join(", "), self.custom_pads_speak_eh02())
+                )
             };
             // One commented example call per pin, using its real field name.
             let examples: Vec<String> = fields
@@ -2875,6 +2932,80 @@ mod tests {
             body.find("impl<PA0: InputPin").unwrap() > strukt,
             "skeleton follows the struct"
         );
+    }
+
+    /// The traits a Custom module's `impl` is bounded on follow the pins it is
+    /// handed: stm32f1xx-hal's own speak embedded-hal 0.2 only, so off Async
+    /// on the Native GPIO api - the Native runtime, or Blocking / RTIC with
+    /// raw GPIO - its file imports 0.2's `v2` traits; everywhere else (the
+    /// `io.rs` bridge, embassy-stm32) 1.0's. That line is all that differs,
+    /// and either file turns into the other ([`custom_file_for_other_gpio_api`]).
+    #[test]
+    fn a_custom_modules_traits_follow_the_pins_it_is_handed() {
+        use super::super::mock_mcu;
+        use crate::panels::mcu_module::modules::{ApiStyle, ModuleConfig, ModuleKind};
+
+        let mut mcu = mock_mcu::create_stm32f103c8tx();
+        mcu.apply_pin_function(10, PinFunction::GpioInput);
+        mcu.apply_pin_function(12, PinFunction::GpioOutput);
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .unwrap();
+        *m.config.custom_label_mut() = "panel".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = vec![10, 12];
+            c.applied_pins = c.pins.clone();
+        }
+        let file = |mcu: &Mcu| {
+            mcu.config_files()
+                .into_iter()
+                .find(|(n, _)| n.starts_with("custom_"))
+                .expect("the module's file")
+                .1
+        };
+        let eh1 = "use embedded_hal::digital::{InputPin, OutputPin};\n";
+        let eh02 = "use embedded_hal_0_2::digital::v2::{InputPin, OutputPin}; \
+                    // stm32f1xx-hal's own pins speak embedded-hal 0.2\n";
+        let mut set = |runtime: Runtime, gpio: ApiStyle| {
+            mcu.runtime = runtime;
+            mcu.pending_runtime = runtime;
+            mcu.gpio_api = gpio;
+            mcu.pending_gpio_api = gpio;
+            file(&mcu)
+        };
+        let bridged = set(Runtime::Blocking, ApiStyle::Portable);
+        assert!(bridged.contains(eh1), "{bridged}");
+        for (runtime, gpio) in [
+            (Runtime::Native, ApiStyle::Native),
+            (Runtime::Blocking, ApiStyle::Native),
+            (Runtime::Rtic, ApiStyle::Native),
+        ] {
+            let raw = set(runtime, gpio);
+            assert!(
+                raw.contains(eh02) && !raw.contains(eh1),
+                "{runtime:?}:\n{raw}"
+            );
+            assert_eq!(
+                custom_file_for_other_gpio_api(&raw).as_deref(),
+                Some(bridged.as_str())
+            );
+            assert_eq!(
+                custom_file_for_other_gpio_api(&bridged).as_deref(),
+                Some(raw.as_str())
+            );
+        }
+        for (runtime, gpio) in [
+            (Runtime::Rtic, ApiStyle::Portable),
+            (Runtime::Async, ApiStyle::Portable),
+            // embassy-stm32's pins speak 1.0 whatever the selector says.
+            (Runtime::Async, ApiStyle::Native),
+        ] {
+            assert_eq!(set(runtime, gpio), bridged, "{runtime:?} {gpio:?}");
+        }
+        assert_eq!(custom_file_for_other_gpio_api("pub struct Panel;\n"), None);
     }
 
     /// A custom module is user-authored, so `reconcile_modules` (which rebuilds

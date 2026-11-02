@@ -435,6 +435,86 @@ mod emit_for_manual_compile {
         }
     }
 
+    /// A pad a harness wires: its name, function and mode.
+    type Pad = (
+        &'static str,
+        PinFunction,
+        crate::panels::mcu_module::pins::logic::pin::GpioMode,
+    );
+
+    /// `EIDE_CUSTOM=1` on the F1 harnesses off RTIC: PB12 an open-drain
+    /// output, PB13 a pull-up input - free in every F1 wiring here - wired by
+    /// [`wire_pads`] before the harness reconciles, and the module over them
+    /// added by [`add_panel`] after.
+    fn f1_panel_pads() -> [Pad; 2] {
+        use crate::panels::mcu_module::pins::logic::pin::GpioMode;
+        [
+            ("PB12", PinFunction::GpioOutput, GpioMode::OpenDrain),
+            ("PB13", PinFunction::GpioInput, GpioMode::PullUp),
+        ]
+    }
+
+    /// `pads` wired with their function and mode; their numbers, in order.
+    fn wire_pads(mcu: &mut crate::panels::mcu_module::mcu::Mcu, pads: &[Pad]) -> Vec<usize> {
+        pads.iter()
+            .map(|(name, func, mode)| {
+                let p = mcu
+                    .iter_all_pins_mut()
+                    .find(|p| p.name == *name)
+                    .unwrap_or_else(|| panic!("no pad {name}"));
+                assert_eq!(p.selected_function, PinFunction::Unset, "{name} is taken");
+                p.selected_function = func.clone();
+                p.io_mode = Some(*mode);
+                p.number
+            })
+            .collect()
+    }
+
+    /// A Custom module "panel" over the pads `nums`, in that order, applied -
+    /// what the panel's Update commits.
+    fn add_panel(mcu: &mut crate::panels::mcu_module::mcu::Mcu, nums: Vec<usize>) {
+        use crate::panels::mcu_module::modules::{ModuleConfig, ModuleKind};
+        assert!(mcu.add_module(ModuleKind::Custom));
+        let m = mcu
+            .modules
+            .iter_mut()
+            .find(|m| m.kind == ModuleKind::Custom)
+            .expect("the Custom module");
+        *m.config.custom_label_mut() = "panel".to_owned();
+        if let ModuleConfig::Custom(c) = &mut m.config {
+            c.pins = nums.clone();
+            c.applied_pins = nums;
+        }
+    }
+
+    /// `main` with the panel's `update()` called right below the generated
+    /// block, as a user's tail would. `new` takes any type; only a CALL to the
+    /// bounded `impl` makes the compiler check the pins main.rs hands it
+    /// against the traits the module's file imports - and the manifest for
+    /// the crate they come from.
+    fn call_panel_update(main: &str) -> String {
+        use crate::panels::mcu_module::codegen::GEN_END;
+        let used = main.replacen(
+            &format!("{GEN_END}\n"),
+            &format!("{GEN_END}\n    panel.update();\n"),
+            1,
+        );
+        assert_ne!(used, main, "no generated block:\n{main}");
+        assert!(used.contains("let mut panel = "), "no panel built:\n{used}");
+        used
+    }
+
+    /// `EIDE_F1_GPIO=native`: the Native GPIO api on a Blocking or RTIC F1 -
+    /// every GPIO bound raw, no `io.rs` - as the System tab's selector and its
+    /// Apply leave it.
+    fn f1_gpio_from_env(mcu: &mut crate::panels::mcu_module::mcu::Mcu) {
+        use crate::panels::mcu_module::modules::ApiStyle;
+        if std::env::var("EIDE_F1_GPIO").as_deref() == Ok("native") {
+            mcu.gpio_api = ApiStyle::Native;
+            mcu.pending_gpio_api = ApiStyle::Native;
+        }
+    }
+
     /// Say something when a codegen matrix run is in progress.
     ///
     /// These harnesses REWRITE fixed directories under the temp dir, and the
@@ -527,7 +607,21 @@ mod emit_for_manual_compile {
                 p.af = vec![("FMC_A0".into(), 12)];
             }
         }
+        // `EIDE_CUSTOM=1`: a Custom module over the GPIO out and in - and no
+        // bus anywhere, so nothing but the module's file asks for the
+        // embedded-hal its `impl` is bounded on. Its `update()` is called
+        // below the block, here and on the Async variant below.
+        let custom = std::env::var("EIDE_CUSTOM").is_ok();
+        if custom {
+            mcu.reconcile_modules();
+            add_panel(&mut mcu, vec![nums[0], nums[1]]);
+        }
         let main_rs = mcu.fresh_main_rs();
+        let main_rs = if custom {
+            call_panel_update(&main_rs)
+        } else {
+            main_rs
+        };
         let files = manifest_sync::project_files(&def, &mcu, &main_rs);
 
         // `sync_pin_files` always keeps `src/pins/mod.rs` in a real project, and
@@ -547,6 +641,11 @@ mod emit_for_manual_compile {
         // SEPARATELY from `embassy-stm32` and have to agree with it.
         mcu.runtime = crate::panels::mcu_module::mcu::model::Runtime::Async;
         let main_rs = mcu.fresh_main_rs();
+        let main_rs = if custom {
+            call_panel_update(&main_rs)
+        } else {
+            main_rs
+        };
         let files = manifest_sync::project_files(&def, &mcu, &main_rs);
         let adir = std::env::temp_dir().join("eide_embassy_check_async");
         project_gen::clear_project_dir_keep_target(&adir);
@@ -1404,7 +1503,17 @@ mod emit_for_manual_compile {
             }
         }
         arm_shared_exti9_5(&mut mcu);
+        // `EIDE_CUSTOM=1`: a Custom module over PB12/PB13, its `update()`
+        // called below the block - bridged pins on the Portable GPIO api,
+        // stm32f1xx-hal's own on `EIDE_F1_GPIO=native`.
+        f1_gpio_from_env(&mut mcu);
+        let panel = std::env::var("EIDE_CUSTOM")
+            .is_ok()
+            .then(|| wire_pads(&mut mcu, &f1_panel_pads()));
         mcu.reconcile_modules();
+        if let Some(nums) = panel.clone() {
+            add_panel(&mut mcu, nums);
+        }
         // `EIDE_F1_DMA=tx|rx|both` picks which halves run on DMA. Each is a
         // DIFFERENT set of HAL types, so each needs its own compile - `TxDma`
         // and `Tx` share no methods at all.
@@ -1431,6 +1540,11 @@ mod emit_for_manual_compile {
             }
         }
         let main_rs = mcu.fresh_main_rs();
+        let main_rs = if panel.is_some() {
+            call_panel_update(&main_rs)
+        } else {
+            main_rs
+        };
         // `EIDE_F1_ADC=example`: the ADC at a sample time off the HAL's
         // default, and below the block the reads `adc1.rs`'s example shows,
         // plus the line an older project set the sample time with - naming
@@ -1910,6 +2024,9 @@ mod emit_for_manual_compile {
         let mut mcu = f1.build_mcu();
         mcu.runtime = Runtime::Rtic;
         mcu.pending_runtime = Runtime::Rtic;
+        // `EIDE_F1_GPIO=native`: the Custom module's pads stay raw too, and
+        // its file bounds them on embedded-hal 0.2's traits.
+        f1_gpio_from_env(&mut mcu);
         let wiring = if std::env::var("EIDE_F1_NOPINS").is_ok() {
             Vec::new()
         } else {
@@ -2013,13 +2130,12 @@ mod emit_for_manual_compile {
             main_rs.contains("#[rtic::app"),
             "not an RTIC project:\n{main_rs}"
         );
-        assert_eq!(
-            main_rs.contains(
-                "let panel = pins::configs::custom_panel::Panel::new(pins::configs::io::DigitalOut(pb12_out), pins::configs::io::DigitalIn(pb13_in));"
-            ),
-            custom,
-            "{main_rs}"
-        );
+        let panel_new = if mcu.gpio_native() {
+            "let panel = pins::configs::custom_panel::Panel::new(pb12_out, pb13_in);"
+        } else {
+            "let panel = pins::configs::custom_panel::Panel::new(pins::configs::io::DigitalOut(pb12_out), pins::configs::io::DigitalIn(pb13_in));"
+        };
+        assert_eq!(main_rs.contains(panel_new), custom, "{main_rs}");
         // `EIDE_CUSTOM`: the user's idle loop drives the panel, through the
         // context `#[idle]` hands it - reached from below the markers.
         let main_rs = if custom {
@@ -2149,7 +2265,16 @@ mod emit_for_manual_compile {
             }
         }
         arm_shared_exti9_5(&mut mcu);
+        // `EIDE_CUSTOM=1`: a Custom module over PB12/PB13 - stm32f1xx-hal's
+        // own pins, which speak embedded-hal 0.2 only - its `update()` called
+        // below the block.
+        let panel = std::env::var("EIDE_CUSTOM")
+            .is_ok()
+            .then(|| wire_pads(&mut mcu, &f1_panel_pads()));
         mcu.reconcile_modules();
+        if let Some(nums) = panel.clone() {
+            add_panel(&mut mcu, nums);
+        }
         for m in &mut mcu.modules {
             if let ModuleConfig::Timer(c) = &mut m.config {
                 c.freq_hz = 20_000;
@@ -2164,6 +2289,11 @@ mod emit_for_manual_compile {
             main_rs.contains("let (mut _tx1, mut _rx1)"),
             "not a Native project:\n{main_rs}"
         );
+        let main_rs = if panel.is_some() {
+            call_panel_update(&main_rs)
+        } else {
+            main_rs
+        };
 
         // What the app computes on this runtime: NO portable trait crates
         // (that is the whole point of Native), but `nb` stays - the concrete
@@ -2311,6 +2441,20 @@ mod emit_for_manual_compile {
             }
         }
         mcu.reconcile_modules();
+        // `EIDE_CUSTOM=1`: a Custom module over the GPIO out and in. esp-hal
+        // speaks embedded-hal 1.0 itself, and no ESP manifest carries the
+        // crate for anything else - only the module's file asks for it.
+        let custom = std::env::var("EIDE_CUSTOM").is_ok();
+        if custom {
+            let pad = |f: PinFunction| {
+                mcu.iter_all_pins()
+                    .find(|p| p.selected_function == f)
+                    .map(|p| p.number)
+                    .unwrap_or_else(|| panic!("[{chip}] no {f:?} for the panel"))
+            };
+            let nums = vec![pad(PinFunction::GpioOutput), pad(PinFunction::GpioInput)];
+            add_panel(&mut mcu, nums);
+        }
         for m in &mut mcu.modules {
             if let ModuleConfig::Timer(c) = &mut m.config {
                 c.freq_hz = 20_000;
@@ -2462,6 +2606,9 @@ mod emit_for_manual_compile {
         }
 
         let mut main_rs = mcu.fresh_main_rs();
+        if custom {
+            main_rs = call_panel_update(&main_rs);
+        }
         if let Some(mode) = iot_mode.as_deref() {
             let all = matches!(mode, "all" | "ble+all" | "mesh+all");
             let ble = matches!(mode, "ble" | "ble+espnow" | "ble+all");

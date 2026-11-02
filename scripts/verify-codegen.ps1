@@ -323,9 +323,18 @@ $ALL_CASES = @(
     # A Custom module as a `Local` of its own, holding its two pads (moved once,
     # never into `Local` beside it - E0382), every resource typed from its mode.
     @{ n = "F1 RTIC custom";               t = "emit_f1_rtic_project";   e = @{ EIDE_CUSTOM = "1" };    q = $true; fam = "f1" }
+    # The same module on the other stm32f1xx-hal runtimes, its `update()` called
+    # below the block: only the CALL makes the compiler check the bounds of its
+    # `impl` against the pins main.rs hands it, and the manifest for the crate
+    # its file imports them from - embedded-hal 1.0 over the `io.rs` bridge on
+    # the Portable GPIO api, 0.2 over the HAL's own pins on the Native one.
+    @{ n = "F1 RTIC custom, raw GPIO";     t = "emit_f1_rtic_project";   e = @{ EIDE_CUSTOM = "1"; EIDE_F1_GPIO = "native" }; q = $false; fam = "f1" }
+    @{ n = "F1 blocking custom";           t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_CUSTOM = "1" }; q = $true; fam = "f1" }
+    @{ n = "F1 blocking custom, raw GPIO"; t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_CUSTOM = "1"; EIDE_F1_GPIO = "native" }; q = $false; fam = "f1" }
     # A helper below the block naming `adc::`: the crate-root import kept for it.
     @{ n = "F1 RTIC, ADC example";         t = "emit_f1_rtic_project";   e = @{ EIDE_F1_ADC = "example" }; q = $false; fam = "f1" }
     @{ n = "F1 Native";                    t = "emit_f1_native_project"; e = @{};                       q = $true; fam = "f1" }
+    @{ n = "F1 Native custom";             t = "emit_f1_native_project"; e = @{ EIDE_CUSTOM = "1" };    q = $true; fam = "f1" }
     # The bare-metal `#[interrupt]` with two pins on EXTI9_5: each pin's level
     # read inside the critical section, its hook called after it.
     @{ n = "F1 blocking, shared EXTI9_5";  t = "emit_f1_dma_project";    e = @{ EIDE_F1_DMA = "off"; EIDE_F1_IRQ_SHARED = "1" }; q = $true; fam = "f1" }
@@ -351,6 +360,11 @@ $ALL_CASES = @(
     # is what let the mistake hide.
     @{ n = "ESP32-C3 blocking";            t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking" }; q = $true; fam = "esp" }
     @{ n = "ESP32-C3 async (esp-rtos)";    t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async" }; q = $true; fam = "esp" }
+    # A Custom module over the GPIO out and in: esp-hal's pins speak
+    # embedded-hal 1.0 themselves, and no ESP manifest carried the crate the
+    # module's file imports (E0433) - its `update()` called on both runtimes.
+    @{ n = "ESP32-C3 blocking custom";     t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "blocking"; EIDE_CUSTOM = "1" }; q = $false; fam = "esp" }
+    @{ n = "ESP32-C3 async custom";        t = "emit_esp32c3_project";       e = @{ EIDE_ESP_RUNTIME = "async"; EIDE_CUSTOM = "1" }; q = $false; fam = "esp" }
     # The pull rides on the two runtimes that emit it. Two arms and not six:
     # `Pull::Up` and `Pull::Down` differ from `Pull::None` only in the variant
     # named, and the variants are checked by esp-hal - one of each per runtime
@@ -683,6 +697,11 @@ $ALL_CASES = @(
     # and a harness that emits less under a flag is a harness that can rot.
     @{ n = "embassy (9 projects)";         t = "emit_embassy_project";       e = @{};                       q = $true; fam = "embassy"
        only = @("eide_embassy_check_dma", "eide_embassy_check_async", "eide_embassy_check_dma_f2", "eide_wba_check_wdg") }
+    # A Custom module over the F411's GPIO out and in, on Blocking and Async,
+    # with NO bus: nothing but the module's file asks for the embedded-hal its
+    # `impl` is bounded on, which no embassy manifest carried for it (E0433).
+    @{ n = "embassy custom, GPIO only";    t = "emit_embassy_project";       e = @{ EIDE_CUSTOM = "1" };    q = $false; fam = "embassy"
+       only = @("eide_embassy_check", "eide_embassy_check_async") }
     # The flash store on embassy-stm32: 2 KiB pages and 8-byte words (G431),
     # 8 KiB pages and 16-byte words on a v8-M part (WBA55), and the Async
     # runtime on the G431. Linked - see the F1 rows.
@@ -831,7 +850,7 @@ $KNOBS = @("EIDE_F1_DMA", "EIDE_SPI_TXONLY", "EIDE_USART_HALF", "EIDE_I2C_HALF",
            "EIDE_ESP_PULL", "EIDE_ESP_WDG", "EIDE_ESP_FLASHSTORE", "EIDE_ESP_NOPINS",
            "EIDE_ESP_TASK_PRIO", "EIDE_STORE_CHIP", "EIDE_STORE_RUNTIME",
            "EIDE_ESP_IOT", "EIDE_RP_STORE_BOARD", "EIDE_RP_ONEWAY", "EIDE_NRF_ONEWAY",
-           "EIDE_CUSTOM",
+           "EIDE_CUSTOM", "EIDE_F1_GPIO",
            # The imported-chip rows. EIDE_CHIP_XML is read by the N6 harness too,
            # so a value left over from an L151 row would make the N6 row convert an L1.
            "EIDE_CHIP_XML", "EIDE_EXPECT_FEATURE", "EIDE_IMPORT_SKIP", "EIDE_IMPORT_WDG",

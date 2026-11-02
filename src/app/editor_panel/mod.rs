@@ -1262,16 +1262,22 @@ impl AppIde {
         // one, which it would clamp to the end of the file. Folds are not
         // carried: `guard_folds` drops them on a change from outside the
         // editor, as it always has.
-        if displayed_file == ProjectFileId::MainRs
-            && let Some(s) = self.main_rs_caret_shift.take()
+        // The same for a task module the fences off RTIC rewrote.
+        // By the file's path: an index may have moved since the shift was made.
+        let shown_path = match displayed_file {
+            ProjectFileId::MainRs => Some(crate::app::MAIN_RS),
+            ProjectFileId::UserFile(i) => self
+                .project_tree
+                .user_src_files
+                .get(i)
+                .map(|(p, _)| p.as_str()),
+            _ => None,
+        };
+        if let Some(at) =
+            shown_path.and_then(|p| self.caret_shifts.iter().position(|(f, _)| f == p))
         {
-            let follow = |i: usize| {
-                if i >= s.at {
-                    (i as isize + s.by).max(0) as usize
-                } else {
-                    i
-                }
-            };
+            let (_, s) = self.caret_shifts.remove(at);
+            let follow = |i: usize| s.follow(i);
             if let Some(id) = self.fold_ids.get(&editor_id).copied()
                 && let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id)
                 && let Some(mut r) = st.cursor.char_range()
@@ -1281,7 +1287,7 @@ impl AppIde {
                 st.cursor.set_char_range(Some(r));
                 st.store(ui.ctx(), id);
             }
-            if self.ed.extra_cursors_file == Some(ProjectFileId::MainRs) {
+            if self.ed.extra_cursors_file == Some(displayed_file) {
                 for c in &mut self.ed.extra_cursors {
                     c.anchor = follow(c.anchor);
                     c.head = follow(c.head);

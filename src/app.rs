@@ -1515,12 +1515,14 @@ pub struct AppIde {
     /// before writing when they changed - a task is code, so writing one
     /// changes no model state that would regenerate main.rs by itself.
     rtic_user: Option<crate::panels::mcu_module::codegen::rtic_user::UserApp>,
-    /// Set by a regeneration that changed main.rs this frame, for the carets
-    /// in the text below what changed ([`MainRsShift`]). Taken by the first
-    /// editor view that shows main.rs this frame - a second one keeps its
-    /// caret, as every view did before - and dropped at the next
-    /// regeneration check.
-    main_rs_caret_shift: Option<MainRsShift>,
+    /// Set by a regeneration that changed main.rs - or fenced a task module of
+    /// the user's - this frame, for the carets in the text it moved
+    /// ([`CaretShift`]), one per file, by its path ([`MAIN_RS`] for main.rs):
+    /// not by `UserFile` index, which the config-file sync later in the same
+    /// frame may move. Taken by the first editor view that shows that file
+    /// this frame - a second one keeps its caret, as every view did before -
+    /// and dropped at the next regeneration check.
+    caret_shifts: Vec<(String, CaretShift)>,
     /// Editable project config files. Each holds the current content (a
     /// `<<< GENERATED >>>` block the IDE refreshes on chip change, plus whatever
     /// the user adds outside it). `memory_x`/`build_rs` are empty for ESP.
@@ -2464,7 +2466,7 @@ impl AppIde {
             mcu_state_hash: 0,
             custom_by_hand: Vec::new(),
             rtic_user: None,
-            main_rs_caret_shift: None,
+            caret_shifts: Vec::new(),
             cargo_toml: init_files.cargo_toml,
             cargo_config: init_files.cargo_config,
             memory_x: init_files.memory_x,
@@ -3660,7 +3662,7 @@ impl AppIde {
         // checks, just to no-op compare — which, under spinner-driven
         // continuous repaint, was a big share of the per-frame CPU cost.
         let mut mcu_changed = false;
-        self.main_rs_caret_shift = None;
+        self.caret_shifts.clear();
         if let Some(mcu) = &mut self.mcu {
             let current_hash = Self::calculate_mcu_state_hash(mcu);
             if current_hash != self.mcu_state_hash {
@@ -3679,7 +3681,9 @@ impl AppIde {
                 self.rtic_user = mcu.rtic_user_app(&self.generated_code);
                 let updated = mcu.update_main_rs(&self.generated_code);
                 if updated != self.generated_code {
-                    self.main_rs_caret_shift = caret_shift(&self.generated_code, &updated);
+                    if let Some(s) = caret_shift(&self.generated_code, &updated) {
+                        self.caret_shifts.push((MAIN_RS.to_owned(), s));
+                    }
                     self.generated_code = updated;
                     self.cached_project_files = None; // Invalidate cache
                 }
@@ -3689,7 +3693,7 @@ impl AppIde {
                 let rtic = mcu.is_rtic();
                 for (name, _) in &mcu.user_modules {
                     let paths = crate::panels::mcu_module::codegen::rtic_user::module_paths(name);
-                    if let Some((_, text)) = self
+                    if let Some((path, text)) = self
                         .project_tree
                         .user_src_files
                         .iter_mut()
@@ -3700,6 +3704,11 @@ impl AppIde {
                             rtic,
                         );
                         if fenced != *text {
+                            // An open module's carets follow its text, as
+                            // main.rs's do.
+                            if let Some(s) = caret_shift(text, &fenced) {
+                                self.caret_shifts.push((path.clone(), s));
+                            }
                             *text = fenced;
                             self.cached_project_files = None;
                         }
@@ -5961,33 +5970,81 @@ mod flush_cache_tests {
     }
 }
 
-/// How a regeneration of main.rs moved the text below what it changed: from
-/// char index `at` of the OLD text on it is unchanged and sits `by` chars
-/// further.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MainRsShift {
-    at: usize,
-    by: isize,
+/// The key of main.rs in [`AppIde::caret_shifts`].
+const MAIN_RS: &str = "src/main.rs";
+
+/// How a rewrite from outside the editor - main.rs's regeneration, the
+/// fences off RTIC - moved a file's text: the runs of lines it left alone,
+/// each `(old start, new start, length)` in chars, in order. A regeneration
+/// changes the block and fences lines further down in one go, so one shift
+/// for everything below the first change would misplace a caret between
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaretShift {
+    runs: Vec<(usize, usize, usize)>,
+    new_len: usize,
 }
 
-/// [`MainRsShift`] from `old` to `new`; `None` when they are the same text.
-fn caret_shift(old: &str, new: &str) -> Option<MainRsShift> {
+impl CaretShift {
+    /// Where char index `i` of the old text is in the new one: the same
+    /// char in an unchanged run; inside a change, as far into what replaced
+    /// it, at most to its end.
+    fn follow(&self, i: usize) -> usize {
+        let (mut old_end, mut new_end) = (0, 0);
+        for &(o, n, len) in &self.runs {
+            if i < o {
+                return (new_end + (i - old_end)).min(n);
+            }
+            if i < o + len {
+                return n + (i - o);
+            }
+            (old_end, new_end) = (o + len, n + len);
+        }
+        (new_end + i.saturating_sub(old_end)).min(self.new_len)
+    }
+}
+
+/// [`CaretShift`] from `old` to `new`, by their lines; `None` when they are
+/// the same text.
+fn caret_shift(old: &str, new: &str) -> Option<CaretShift> {
     if old == new {
         return None;
     }
-    let (o, n): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
-    let prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
-    let room = o.len().min(n.len()) - prefix;
-    let suffix = o
+    let diff = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(50))
+        .diff_lines(old, new);
+    // Each line's first char, by the lines `similar` itself split - it ends
+    // one at a lone `\r` too, which `split('\n')` would not.
+    let starts = |lines: &mut dyn Iterator<Item = &str>| {
+        let mut v = vec![0];
+        for l in lines {
+            v.push(v[v.len() - 1] + l.chars().count());
+        }
+        v
+    };
+    let (so, sn) = (
+        starts(&mut diff.iter_old_slices()),
+        starts(&mut diff.iter_new_slices()),
+    );
+    let runs = diff
+        .ops()
         .iter()
-        .rev()
-        .zip(n.iter().rev())
-        .take(room)
-        .take_while(|(a, b)| a == b)
-        .count();
-    Some(MainRsShift {
-        at: o.len() - suffix,
-        by: n.len() as isize - o.len() as isize,
+        .filter_map(|op| match *op {
+            similar::DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => Some((
+                so[old_index],
+                sn[new_index],
+                so[old_index + len] - so[old_index],
+            )),
+            _ => None,
+        })
+        .collect();
+    Some(CaretShift {
+        runs,
+        new_len: new.chars().count(),
     })
 }
 
@@ -6044,21 +6101,56 @@ mod flush_after_save_tests {
         let old = "head\n// note one\n// note two\nEND\n    panel.update();\n";
         let new = "head\nlet mut panel = Panel::new(gp6out);\nEND\n    panel.update();\n";
         let s = super::caret_shift(old, new).expect("the text changed");
-        let tail = old.find("END").unwrap();
-        assert!(s.at <= tail, "the unchanged text starts by END");
-        assert_eq!(
-            s.by,
-            new.chars().count() as isize - old.chars().count() as isize
-        );
         // A caret on `panel.update()` lands on it in the new text.
         let caret = old.find("panel.update").unwrap();
-        assert_eq!(
-            (caret as isize + s.by) as usize,
-            new.find("panel.update").unwrap()
-        );
+        assert_eq!(s.follow(caret), new.find("panel.update").unwrap());
         // A caret above the change - on `head` - stays where it is.
-        assert!(old.find("head").unwrap() < s.at);
+        assert_eq!(s.follow(2), 2);
+        // The end of the file stays the end.
+        assert_eq!(s.follow(old.len()), new.len());
         assert_eq!(super::caret_shift(old, old), None);
+    }
+
+    /// Fences off RTIC go in at several places of one file at once: a caret
+    /// between two of them moves by the one above it, not by both.
+    #[test]
+    fn a_caret_between_two_fences_moves_by_the_one_above() {
+        use crate::panels::mcu_module::codegen::rtic_user::fence_tasks;
+        let old = concat!(
+            "use crate::app;\n",
+            "\n",
+            "pub async fn blink(cx: app::blink::Context<'_>) {\n",
+            "    let _ = cx; // CARET\n",
+            "}\n",
+            "\n",
+            "pub fn tick(_cx: app::tick::Context) {}\n",
+            "// LAST\n",
+        )
+        .to_owned();
+        let new = fence_tasks(old.clone(), false);
+        assert!(
+            new.matches('\n').count() > old.matches('\n').count() + 1,
+            "{new}"
+        );
+        let s = super::caret_shift(&old, &new).expect("fenced");
+        for mark in ["CARET", "LAST", "tick"] {
+            assert_eq!(
+                s.follow(old.find(mark).unwrap()),
+                new.find(mark).unwrap(),
+                "{mark}:\n{new}"
+            );
+        }
+        // And back on RTIC.
+        let s = super::caret_shift(&new, &old).expect("unfenced");
+        assert_eq!(
+            s.follow(new.find("CARET").unwrap()),
+            old.find("CARET").unwrap()
+        );
+        // A lone `\r` ends a line to `similar`: counted the same here, not
+        // an index past the end.
+        let (old, new) = ("a\rb\nX\n", "a\rb\nY\nX\n");
+        let s = super::caret_shift(old, new).expect("changed");
+        assert_eq!(s.follow(old.find('X').unwrap()), new.find('X').unwrap());
     }
 
     #[test]

@@ -986,8 +986,14 @@ fn insert_file_path_recursive(
 /// The caller fills it under two short locks, one at a time, so the tree
 /// renders holding neither: the LSP reader thread and the flush worker lock
 /// `LspState` too, and used to wait out a whole tree render.
+///
+/// The second field: the files whose text in memory differs from the disk's
+/// (`AppIde`'s `TreeUnsaved`), dotted beside their name.
 #[derive(Default)]
-pub struct DiagBadges(std::collections::HashMap<String, (bool, bool)>);
+pub struct DiagBadges(
+    std::collections::HashMap<String, (bool, bool)>,
+    std::collections::HashSet<String>,
+);
 
 impl DiagBadges {
     /// Adds a Cargo Check result, as `has_errors_in` / `has_warnings_in` see it.
@@ -1030,6 +1036,25 @@ impl DiagBadges {
     pub fn warnings_in(&self, file: &str) -> bool {
         self.0.get(file).is_some_and(|&(_, warn)| warn)
     }
+
+    /// Marks `files` as differing from what is on disk.
+    pub fn add_unsaved(&mut self, files: impl IntoIterator<Item = String>) {
+        self.1.extend(files);
+    }
+
+    pub fn unsaved_in(&self, file: &str) -> bool {
+        self.1.contains(file)
+    }
+}
+
+/// What a user file's row shows beside its name.
+#[derive(Clone, Copy, Default)]
+struct FileMarks {
+    /// `Some(true)` = errors (red), `Some(false)` = warnings only (amber),
+    /// `None` = clean.
+    diag: Option<bool>,
+    /// Its text in memory differs from the disk's.
+    unsaved: bool,
 }
 
 /// Display the project tree panel (left side of the IDE).
@@ -1113,13 +1138,18 @@ pub fn show_project_tree(
     // only WARNINGS (amber icon); absent = clean. The fixed project files get
     // this in `file_row`. Keyed the same as the diagnostics / Structure's
     // `node_errors`.
-    let file_diags: std::collections::HashMap<String, bool> = user_src_files
+    let file_diags: std::collections::HashMap<String, FileMarks> = user_src_files
         .iter()
         .filter_map(|(rel, _)| {
-            if badges.errors_in(rel) {
-                return Some((rel.clone(), true));
-            }
-            badges.warnings_in(rel).then(|| (rel.clone(), false))
+            let marks = FileMarks {
+                diag: if badges.errors_in(rel) {
+                    Some(true)
+                } else {
+                    badges.warnings_in(rel).then_some(false)
+                },
+                unsaved: badges.unsaved_in(rel),
+            };
+            (marks.diag.is_some() || marks.unsaved).then(|| (rel.clone(), marks))
         })
         .collect();
 
@@ -2180,8 +2210,9 @@ fn render_tree_node(
     parent_path: &str,
     move_request: &mut Option<(DraggedItem, String)>,
     extract_folder: &mut Option<String>,
-    // User-file diagnostic status: `true` = errors, `false` = warnings-only.
-    file_diags: &std::collections::HashMap<String, bool>,
+    // What each user file's row shows beside its name: its diagnostics, and
+    // whether it is unsaved. A clean, saved file has no entry.
+    file_diags: &std::collections::HashMap<String, FileMarks>,
     templates: &mut TemplateRows<'_>,
 ) {
     let default_tree_folder_color = egui::Color32::from_rgb(100, 105, 115);
@@ -2224,7 +2255,7 @@ fn render_tree_node(
                     can_duplicate,
                     &full_path,
                     project_dir,
-                    file_diags.get(&full_path).copied(),
+                    file_diags.get(&full_path).copied().unwrap_or_default(),
                     content,
                     templates,
                 );
@@ -2646,6 +2677,12 @@ fn file_row(
                 reveal_menu_items(ui, project_dir, rel);
             });
         }
+        if id
+            .fixed_rel_path()
+            .is_some_and(|rel| badges.unsaved_in(rel))
+        {
+            unsaved_dot(ui);
+        }
         if let Some(cargo_path) = cargo_path {
             if err {
                 ui.label(
@@ -2669,6 +2706,18 @@ fn file_row(
     });
     // Hover: tint + pointing hand (the row is clickable).
     row_hover_feedback(ui, row.response.rect, row.response.contains_pointer());
+}
+
+/// The amber dot beside a file whose text here differs from the disk's.
+/// Painted, not a glyph: Phosphor's dot is a speck at this size.
+fn unsaved_dot(ui: &mut egui::Ui) {
+    let (rect, dot) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), 3.5, egui::Color32::from_rgb(230, 190, 90));
+    dot.on_hover_text(
+        "Unsaved: this file's text here differs from the one on disk. \
+         Save (Ctrl+S) writes it.",
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2698,15 +2747,15 @@ fn user_file_row(
     // the Show-in-Explorer / Copy-path entries.
     rel_path: &str,
     project_dir: Option<&std::path::Path>,
-    // Diagnostic badge at the row's end: `Some(true)` = errors (red), `Some(false)`
-    // = warnings only (amber), `None` = clean.
-    diag: Option<bool>,
+    // The diagnostic badge at the row's end, and the unsaved dot.
+    marks: FileMarks,
     // The file's text, for "would a Reset change it?" - asked only while its
     // menu is open.
     content: &str,
     templates: &mut TemplateRows<'_>,
 ) {
     let mark = templates.marks.get(rel_path).copied();
+    let diag = marks.diag;
     let hi = egui::Color32::from_rgb(100, 180, 255);
     let normal = egui::Color32::from_rgb(200, 205, 215);
     let id = ProjectFileId::UserFile(idx);
@@ -2757,6 +2806,9 @@ fn user_file_row(
             .selectable(false)
             .sense(egui::Sense::click()),
         );
+        if marks.unsaved {
+            unsaved_dot(ui);
+        }
         // Diagnostic badge at the row's end — red error / amber warning — same
         // as the fixed project files' `file_row` and the Structure tab's flag.
         match diag {

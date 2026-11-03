@@ -34,12 +34,12 @@ mod clone_project_dialog;
 mod close_guard;
 mod config_moves;
 mod config_templates;
+#[cfg(test)]
+mod custom_api_notice_tests;
 mod datasheet_import_dialog;
 mod device_groups;
 mod dialogs;
 mod extract_crate_dialog;
-#[cfg(test)]
-mod custom_api_notice_tests;
 #[cfg(test)]
 mod i2c_canvas_tests;
 mod mcu_form_dialog;
@@ -60,6 +60,7 @@ mod move_file_dialog;
 mod publish_dialog;
 
 mod tree_clipboard;
+mod tree_unsaved;
 
 mod mcu_panel;
 
@@ -1531,6 +1532,9 @@ pub struct AppIde {
     /// check, after [`Self::caret_shifts`] is cleared, so an open file's
     /// carets follow the line.
     custom_use_swap: Option<String>,
+    /// The project tree's files whose text here differs from the disk's -
+    /// the dot beside their name (`tree_unsaved`).
+    tree_unsaved: tree_unsaved::TreeUnsaved,
     /// Editable project config files. Each holds the current content (a
     /// `<<< GENERATED >>>` block the IDE refreshes on chip change, plus whatever
     /// the user adds outside it). `memory_x`/`build_rs` are empty for ESP.
@@ -2476,6 +2480,7 @@ impl AppIde {
             rtic_user: None,
             caret_shifts: Vec::new(),
             custom_use_swap: None,
+            tree_unsaved: Default::default(),
             cargo_toml: init_files.cargo_toml,
             cargo_config: init_files.cargo_config,
             memory_x: init_files.memory_x,
@@ -4731,6 +4736,8 @@ impl AppIde {
         }
         match res {
             Ok(name) => {
+                // The disk caught up with the tree's files.
+                self.tree_unsaved.saved();
                 self.export_msg = format!("{}  {name}", egui_phosphor::regular::CHECK_CIRCLE);
                 self.export_status_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
@@ -4835,6 +4842,8 @@ impl AppIde {
                 }
             }
             Err(e) => {
+                // It may have written some files before it failed.
+                self.tree_unsaved.saved();
                 self.export_msg = format!("{}  {e}", egui_phosphor::regular::X_CIRCLE);
                 self.export_status_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(3));

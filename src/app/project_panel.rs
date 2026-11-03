@@ -420,6 +420,49 @@ impl AppIde {
                                 badges.add_build(result);
                             }
                             badges.add_lsp(&self.lsp_state.lock().unwrap());
+                            // The tree's rows: the user's files and the fixed
+                            // ones the IDE writes, as `git_disk_snapshot`
+                            // has them. The first four are written even
+                            // empty; an empty memory.x / build.rs is one the
+                            // next Save deletes - unsaved while it is still
+                            // on disk (`generated_files_that_must_be_absent`);
+                            // an empty partitions.csv is neither written nor
+                            // deleted.
+                            let mut rows: Vec<(&str, &str)> = self
+                                .project_tree
+                                .user_src_files
+                                .iter()
+                                .map(|(p, t)| (p.as_str(), t.as_str()))
+                                .collect();
+                            rows.extend([
+                                ("src/main.rs", self.generated_code.as_str()),
+                                ("Cargo.toml", self.cargo_toml.as_str()),
+                                (".cargo/config.toml", self.cargo_config.as_str()),
+                                (".gitignore", self.gitignore.as_str()),
+                            ]);
+                            let mut absent: Vec<&str> = Vec::new();
+                            for (rel, text) in [
+                                ("memory.x", &self.memory_x),
+                                ("build.rs", &self.build_rs),
+                            ] {
+                                if text.is_empty() {
+                                    absent.push(rel);
+                                } else {
+                                    rows.push((rel, text));
+                                }
+                            }
+                            if !self.partitions_csv.is_empty() {
+                                rows.push(("partitions.csv", &self.partitions_csv));
+                            }
+                            if let Some(after) = self.tree_unsaved.refresh(
+                                self.project_dir.as_deref(),
+                                &rows,
+                                &absent,
+                                std::time::Instant::now(),
+                            ) {
+                                ui.ctx().request_repaint_after(after);
+                            }
+                            badges.add_unsaved(self.tree_unsaved.unsaved().cloned());
                             // Use actual project directory if available, otherwise use temp workspace
                             let workspace_dir = if let Some(project_dir) = &self.project_dir {
                                 project_dir.clone()

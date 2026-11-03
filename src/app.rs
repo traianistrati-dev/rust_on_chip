@@ -59,6 +59,7 @@ mod move_file_dialog;
 
 mod publish_dialog;
 
+mod automation;
 mod tree_clipboard;
 mod tree_unsaved;
 
@@ -1535,6 +1536,9 @@ pub struct AppIde {
     /// The project tree's files whose text here differs from the disk's -
     /// the dot beside their name (`tree_unsaved`).
     tree_unsaved: tree_unsaved::TreeUnsaved,
+    /// Scripted pointer and key input - debug builds with `EIDE_AUTOMATION`
+    /// set (`automation`).
+    automation: Option<automation::Automation>,
     /// Editable project config files. Each holds the current content (a
     /// `<<< GENERATED >>>` block the IDE refreshes on chip change, plus whatever
     /// the user adds outside it). `memory_x`/`build_rs` are empty for ESP.
@@ -2481,6 +2485,7 @@ impl AppIde {
             caret_shifts: Vec::new(),
             custom_use_swap: None,
             tree_unsaved: Default::default(),
+            automation: automation::Automation::from_env(),
             cargo_toml: init_files.cargo_toml,
             cargo_config: init_files.cargo_config,
             memory_x: init_files.memory_x,
@@ -4948,6 +4953,13 @@ impl eframe::App for AppIde {
         self.close_publish_dialog();
     }
 
+    /// Scripted input joins the real input here (`automation`).
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(a) = &mut self.automation {
+            a.hook(ctx, raw_input);
+        }
+    }
+
     // ── Every pass, shown or not ──────────────────────────────────────────────
     // eframe runs this right before `ui` on a visible frame, and ALONE while
     // the window is minimized: 0.34 skips `ui` then, 0.36 runs no egui pass at
@@ -4955,6 +4967,9 @@ impl eframe::App for AppIde {
     // here — and reads only the window state, which is the one input 0.36
     // keeps fresh while minimized (events and time are the last shown frame's).
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(a) = &self.automation {
+            a.keep_polling(ctx);
+        }
         // ── Closing with unsaved work? Ask before losing it ───────────────────
         // Here and not in `ui`: a close sent to a MINIMIZED window (the
         // taskbar's "Close window") reaches only this, and eframe exits unless

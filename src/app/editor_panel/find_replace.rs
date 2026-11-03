@@ -214,7 +214,7 @@ fn match_starts(text: &str, query: &str) -> Vec<usize> {
 }
 
 /// 1-based line number of char index `idx` in `text`.
-fn line_of(text: &str, idx: usize) -> usize {
+pub(super) fn line_of(text: &str, idx: usize) -> usize {
     text.chars().take(idx).filter(|&c| c == '\n').count() + 1
 }
 

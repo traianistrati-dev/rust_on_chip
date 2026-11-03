@@ -105,6 +105,11 @@ pub(crate) struct EditorState {
     /// one. `None` while the file shown has no caret.
     pub(crate) caret_at: Option<(ProjectFileId, usize)>,
 
+    /// The selection as this view last drew it, `(file, lo, hi)` in BUFFER
+    /// chars, `lo < hi`: what F3 / Shift+F3 step from while the find bar is
+    /// not stepping its own matches. `None` while nothing is selected.
+    pub(crate) selection_at: Option<(ProjectFileId, usize, usize)>,
+
     /// Pending "jump to this diagnostic": the target file and its 1-based line.
     /// Set when a row in the Cargo Check / rust-analyzer tab is clicked; applied
     /// once the editor is displaying that file (scrolls the line to row ~10).
@@ -339,6 +344,7 @@ impl EditorState {
             cargo_complete: editor_panel::cargo_complete::CargoCompleteState::default(),
             last_caret_idx: None,
             caret_at: None,
+            selection_at: None,
             pending_scroll_to_line: None,
             highlighted_error_line: None,
             highlighted_def_line: None,

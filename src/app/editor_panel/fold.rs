@@ -658,9 +658,53 @@ fn hidden_lines(regions: &[Region], folded: &BTreeSet<usize>) -> Vec<bool> {
     hidden
 }
 
+/// The headers in `folded` whose blocks hide any of the buffer lines
+/// `first..=last` - every fold that has to open for those lines to show,
+/// the ones around a nested fold included. The header and closing lines of a
+/// block stay on screen, so a line on either hides nothing.
+pub fn heads_hiding(
+    regions: &[Region],
+    folded: &BTreeSet<usize>,
+    first: usize,
+    last: usize,
+) -> Vec<usize> {
+    regions
+        .iter()
+        .filter(|r| folded.contains(&r.head) && r.hidden_count() > 0)
+        .filter(|r| r.head < last && first < r.end)
+        .map(|r| r.head)
+        .collect()
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// Lines 0 `fn a() {`, 1 `if x {`, 2 `go();`, 3 `}`, 4 `stop();`, 5 `}`.
+    const NESTED: &str = "fn a() {\n    if x {\n        go();\n    }\n    stop();\n}\n";
+
+    #[test]
+    fn a_line_inside_folds_opens_every_one_around_it() {
+        let regions = regions(NESTED);
+        let both = BTreeSet::from([0, 1]);
+        assert_eq!(heads_hiding(&regions, &both, 2, 2), [0, 1]);
+        // `stop();` is inside `fn a` only.
+        assert_eq!(heads_hiding(&regions, &both, 4, 4), [0]);
+        // Only what is folded opens.
+        assert_eq!(heads_hiding(&regions, &BTreeSet::from([1]), 2, 2), [1]);
+        assert!(heads_hiding(&regions, &BTreeSet::from([1]), 4, 4).is_empty());
+    }
+
+    #[test]
+    fn a_header_or_closing_line_stays_shown_and_opens_nothing() {
+        let regions = regions(NESTED);
+        let outer = BTreeSet::from([0]);
+        assert!(heads_hiding(&regions, &outer, 0, 0).is_empty(), "header");
+        assert!(heads_hiding(&regions, &outer, 5, 5).is_empty(), "closing");
+        // A span from the header into the body does reach a hidden line.
+        assert_eq!(heads_hiding(&regions, &outer, 0, 1), [0]);
+        assert!(heads_hiding(&regions, &BTreeSet::new(), 2, 2).is_empty());
+    }
 
     fn heads(src: &str) -> Vec<(usize, usize)> {
         regions(src).into_iter().map(|r| (r.head, r.end)).collect()

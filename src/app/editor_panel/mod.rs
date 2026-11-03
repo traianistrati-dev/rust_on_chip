@@ -1121,12 +1121,34 @@ impl AppIde {
         // Shift FIRST. `consume_key` is lenient about Shift (the same trap as
         // Ctrl+Shift+/ vs Ctrl+/), so checking the plain key first would let it
         // swallow the shifted press and Shift+F3 would step forwards.
+        //
+        // With the bar not stepping, they step the text selected in this file
+        // instead (`word_select::step_selection`), through the bar's own
+        // select-and-scroll. Taken only while there IS a selection here, so
+        // the key is not swallowed for nothing.
         let (mut find_prev, mut find_next) = (false, false);
+        let selection = self
+            .ed
+            .selection_at
+            .filter(|&(file, _, _)| file == displayed_file);
         if nav_kbd_active && self.ed.find.can_step() {
             ui.input_mut(|i| {
                 find_prev = i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3);
                 find_next = !find_prev && i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
             });
+        } else if nav_kbd_active && let Some((_, lo, hi)) = selection {
+            let (mut prev, mut next) = (false, false);
+            ui.input_mut(|i| {
+                prev = i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3);
+                next = !prev && i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
+            });
+            if (prev || next)
+                && let Some((s, e)) = word_select::step_selection(&display_code, lo, hi, next)
+            {
+                self.ed.find.pending_select = Some((s, e));
+                self.ed.pending_scroll_to_line =
+                    Some((displayed_file, find_replace::line_of(&display_code, s)));
+            }
         }
 
         // F8 / Shift+F8 step the ERROR list — the keyboard twins of clicking one
@@ -1153,6 +1175,11 @@ impl AppIde {
             });
         }
         self.show_find_replace_bar(ui, &mut display_code, displayed_file, find_next, find_prev);
+        // A step that lands inside a folded block opens it, before the
+        // projection below is built from the folds.
+        if let Some((s, e)) = self.ed.find.pending_select {
+            self.reveal_folded(ui.ctx(), &display_code, displayed_file, s, e);
+        }
 
         // Size the editor to fill the height left over after the
         // (resizable) diagnostics panel, so dragging that panel's handle
@@ -1660,6 +1687,21 @@ impl AppIde {
             .cursor
             .char_range()
             .map(|r| (displayed_file, fold_map.to_buffer(r.primary.index.0)));
+        // The selection beside it, for F3 / Shift+F3 above: both ends in
+        // buffer space, and only a real one. A find step queued this frame is
+        // the selection from the next frame on, though it is stored only at
+        // the end of this one - recorded now, or a press in the very next
+        // frame steps from the old one again.
+        self.ed.selection_at = match self.ed.find.pending_select {
+            Some((s, e)) => (s < e).then_some((displayed_file, s, e)),
+            None => editor_resp.state.cursor.char_range().and_then(|r| {
+                let (a, b) = (
+                    fold_map.to_buffer(r.primary.index.0),
+                    fold_map.to_buffer(r.secondary.index.0),
+                );
+                (a != b).then(|| (displayed_file, a.min(b), a.max(b)))
+            }),
+        };
 
         // The other half of the caret invariant (see the conversion before
         // the render): what the editor hands back is in projection space.

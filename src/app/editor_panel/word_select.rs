@@ -290,6 +290,48 @@ pub(super) fn ident_run_at(chars: &[char], idx: usize) -> Option<(usize, usize)>
     Some((start, end))
 }
 
+/// The occurrence of the selected `text[lo..hi]` (chars) that F3 (`forward`)
+/// or Shift+F3 steps to while the find bar is not stepping its own matches,
+/// round the file's end: the first one past the selection, or the last one
+/// before it. `None` for an empty selection or one past the text.
+///
+/// A selection that is one whole identifier - a double-click's - matches only
+/// whole: the occurrences [`for_each_selected_word_rect`] paints, so `x` never
+/// stops inside `max`. Part of an identifier, or any other text, matches
+/// literally, case and all, as the find bar does. The selection is itself an
+/// occurrence: alone in the file, it comes back.
+pub(super) fn step_selection(
+    text: &str,
+    lo: usize,
+    hi: usize,
+    forward: bool,
+) -> Option<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    if lo >= hi || hi > chars.len() {
+        return None;
+    }
+    let target = &chars[lo..hi];
+    let wl = hi - lo;
+    let last = chars.len() - wl;
+    let bounded = |i: usize| {
+        (i == 0 || !is_ident(chars[i - 1])) && (i + wl == chars.len() || !is_ident(chars[i + wl]))
+    };
+    let whole = target.iter().all(|&c| is_ident(c)) && !target[0].is_ascii_digit() && bounded(lo);
+    let at = |i: usize| chars[i..i + wl] == *target && (!whole || bounded(i));
+    // None overlapping the selection but the selection itself, which comes
+    // last on either way round.
+    let found = if forward {
+        (hi..=last).chain(0..=lo).find(|&i| at(i))
+    } else {
+        (0..=lo)
+            .rev()
+            .filter(|&i| i + wl <= lo)
+            .chain((lo..=last).rev())
+            .find(|&i| at(i))
+    };
+    found.map(|i| (i, i + wl))
+}
+
 impl AppIde {
     /// On a double-click, replace egui's UAX#29 word selection with the plain
     /// identifier run under the pointer (stored for next frame — the widget
@@ -377,9 +419,76 @@ impl AppIde {
 mod tests {
     use super::{
         ident_run_at, next_subword_boundary, next_word_boundary, prev_subword_boundary,
-        prev_word_boundary,
+        prev_word_boundary, step_selection,
     };
     use eframe::egui;
+
+    /// F3 (`forward`) or Shift+F3 with the `nth` `sel` of `text` selected:
+    /// the char index of the occurrence it lands on.
+    fn step(text: &str, sel: &str, nth: usize, forward: bool) -> Option<usize> {
+        let byte = text.match_indices(sel).nth(nth)?.0;
+        let lo = text[..byte].chars().count();
+        let hi = lo + sel.chars().count();
+        let (s, e) = step_selection(text, lo, hi, forward)?;
+        assert_eq!(e - s, hi - lo, "the occurrence is as long as the selection");
+        Some(s)
+    }
+
+    #[test]
+    fn f3_steps_an_identifier_whole_and_wraps_round() {
+        // `x` at 4, 23 and 27; the ones inside `max` and `x_1` are not it.
+        let text = "let x = max(x_1, 2);\nf(x);\nx += 1;\n";
+        let xs = [4, 23, 27];
+        assert!(xs.iter().all(|&i| text.chars().nth(i) == Some('x')));
+        let from = |i: usize, fwd: bool| step_selection(text, i, i + 1, fwd).map(|(s, _)| s);
+        assert_eq!(from(xs[0], true), Some(xs[1]));
+        assert_eq!(from(xs[1], true), Some(xs[2]));
+        assert_eq!(from(xs[2], true), Some(xs[0]), "round the end");
+        assert_eq!(from(xs[0], false), Some(xs[2]), "round the start");
+        assert_eq!(from(xs[2], false), Some(xs[1]));
+    }
+
+    #[test]
+    fn other_text_steps_literally() {
+        let text = "a + b; c + d; ++e";
+        // `" + "` is not an identifier: matched as text, twice.
+        assert_eq!(step(text, " + ", 0, true), Some(8));
+        assert_eq!(step(text, " + ", 1, true), Some(1));
+        // `ab(` is text, so it stops inside `cab(` as the find bar would;
+        // `ab` alone is an identifier and passes `cab` by.
+        let calls = "ab(1); cab(2); ab(3)";
+        assert_eq!(step(calls, "ab(", 0, true), Some(8));
+        assert_eq!(step(calls, "ab", 0, true), Some(15));
+        // Case counts, as in the find bar.
+        assert_eq!(step("Foo foo FOO foo", "foo", 0, true), Some(12));
+        // Over a line break.
+        assert_eq!(step("a\nb a\nb", "a\nb", 0, true), Some(4));
+    }
+
+    #[test]
+    fn a_lone_selection_comes_back_and_overlaps_are_skipped() {
+        assert_eq!(step("only here", "only", 0, true), Some(0));
+        assert_eq!(step("only here", "only", 0, false), Some(0));
+        // `aa` in `aaaa` (part of a word, so text): the next one starts past
+        // the selection, the previous one ends before it.
+        assert_eq!(step("aaaa", "aa", 0, true), Some(2));
+        assert_eq!(step("aaaa", "aa", 1, false), Some(0));
+        // A part of an identifier, selected by dragging, is found inside
+        // other identifiers too.
+        let parts = "radar_delay_gate = 1;\nset_delay(2);\n";
+        assert_eq!(step(parts, "delay", 0, true), Some(26));
+        // A digit-led word is not an identifier: matched as text.
+        assert_eq!(step("1st 21st 1st", "1st", 0, true), Some(5));
+    }
+
+    #[test]
+    fn indices_are_chars_and_bad_selections_give_none() {
+        // `é` is two bytes: the index after it is a char index.
+        let text = "é x; é x;";
+        assert_eq!(step(text, "x", 0, true), Some(7));
+        assert_eq!(step_selection(text, 3, 3, true), None, "empty");
+        assert_eq!(step_selection(text, 5, 99, true), None, "past the text");
+    }
 
     fn run(text: &str, idx: usize) -> Option<(usize, usize)> {
         ident_run_at(&text.chars().collect::<Vec<_>>(), idx)

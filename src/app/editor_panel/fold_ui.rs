@@ -5,7 +5,7 @@
 //! exist, and the buffer ↔ display projection) lives in [`fold`](super::fold).
 
 use super::fold::{FoldMap, Region};
-use crate::app::AppIde;
+use crate::app::{AppIde, ProjectFileId};
 use crate::editor::gui::text_pos::{GalleyRows, LineIndex};
 use eframe::egui;
 use egui_phosphor::regular as ph;
@@ -236,6 +236,59 @@ impl AppIde {
             self.folds.insert(rel.to_owned(), next);
         }
         self.ed.fold_anchor = Some((rel.to_owned(), line, y));
+    }
+
+    /// Open every fold of `file` that hides a line of the buffer chars
+    /// `s..e` - where a find step (the bar's, or F3 on a selection) is about to
+    /// select. Folded, the selection would collapse onto the block's header:
+    /// the match never shows, and F3 on a selection has nothing left to step
+    /// from. Called before this frame's projection is built, so the block is
+    /// open when the editor draws; no anchor, the step scrolls to the match.
+    ///
+    /// The undo history goes, as on the unfold-on-edit path: it holds
+    /// PROJECTIONS, and a Ctrl+Z after the unfold would write one back over
+    /// the file, every folded body with it.
+    pub(super) fn reveal_folded(
+        &mut self,
+        ctx: &egui::Context,
+        text: &str,
+        file: ProjectFileId,
+        s: usize,
+        e: usize,
+    ) {
+        let Some(rel) = crate::editor::gui::text_pos::selected_file_rel_path(
+            &file,
+            &self.project_tree.user_src_files,
+        ) else {
+            return;
+        };
+        let Some(folded) = self.folds.get(&rel) else {
+            return;
+        };
+        let index = self.ed.line_index.get(text);
+        let (first, last) = (
+            index.line_of_char(s),
+            index.line_of_char(e.saturating_sub(1).max(s)),
+        );
+        let open = super::fold::heads_hiding(&self.ed.fold_regions.get(text), folded, first, last);
+        if open.is_empty() {
+            return;
+        }
+        let mut next = folded.clone();
+        for head in open {
+            next.remove(&head);
+        }
+        if let Some(id) = self.ed.editor_widget_id
+            && let Some(mut st) = egui::TextEdit::load_state(ctx, id)
+        {
+            st.clear_undoer();
+            st.store(ctx, id);
+        }
+        if next.is_empty() {
+            self.folds.remove(&rel);
+        } else {
+            self.folds.insert(rel, next);
+        }
     }
 }
 

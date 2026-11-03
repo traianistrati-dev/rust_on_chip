@@ -1713,6 +1713,12 @@ impl AppIde {
                                 > = None;
                                 let notes_root = self.project_dir.clone();
                                 let note_images = &mut self.module_note_images;
+                                // Custom module files left on the other GPIO
+                                // api's traits, said in their own panel too
+                                // (`Mcu::customs_on_other_api`).
+                                let customs =
+                                    mcu.customs_on_other_api(&self.project_tree.user_src_files);
+                                let custom_use_swap = &mut self.custom_use_swap;
                                 // Deferred, like `clicked`: the (i) button is
                                 // drawn inside the loop that borrows
                                 // `mcu.modules`, and flipping `info_id` there
@@ -2108,6 +2114,22 @@ impl AppIde {
                                                 });
                                                 if !my_out.is_empty() {
                                                     said.insert(m.id.clone(), my_out);
+                                                }
+                                                if m.kind == crate::panels::mcu_module::modules::ModuleKind::Custom {
+                                                    let path = format!(
+                                                        "src/pins/configs/{}.rs",
+                                                        mod_gui::custom_file_stem(m),
+                                                    );
+                                                    if let Some(c) =
+                                                        customs.iter().find(|(p, ..)| *p == path)
+                                                    {
+                                                        ui.add_space(4.0);
+                                                        custom_api_module_notice(
+                                                            ui,
+                                                            c,
+                                                            custom_use_swap,
+                                                        );
+                                                    }
                                                 }
                                                 // Beside the settings, keyed by
                                                 // (kind, instance) like the notes
@@ -4134,7 +4156,6 @@ fn custom_api_notice(
     customs: &[(String, bool, bool)],
     custom_use_swap: &mut Option<String>,
 ) {
-    let version = |eh02: bool| if eh02 { "0.2" } else { "1.0" };
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(
             egui::RichText::new(format!(
@@ -4144,39 +4165,71 @@ fn custom_api_notice(
             .size(12.0)
             .color(egui::Color32::from_rgb(230, 190, 90)),
         );
-        for (path, eh02, swappable) in customs {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "    {path} imports embedded-hal {}'s traits, but its pins speak {} \
-                         here - it is not as the IDE last wrote it, so the api switch left it \
-                         alone.{}",
-                        version(*eh02),
-                        version(!*eh02),
-                        if *swappable {
-                            ""
-                        } else {
-                            " Change its embedded_hal use by hand."
-                        },
-                    ))
-                    .size(11.0)
-                    .color(egui::Color32::from_rgb(200, 170, 100)),
-                );
-                if *swappable
-                    && ui
-                        .push_id(path, |ui| {
-                            ui.button(format!("Switch to {}", version(!*eh02)))
-                        })
-                        .inner
-                        .on_hover_text(
-                            "Swap its traits' use line for the one its pins speak. \
-                         Nothing else in the file changes.",
-                        )
-                        .clicked()
-                {
-                    *custom_use_swap = Some(path.clone());
-                }
-            });
+        for custom in customs {
+            custom_api_row(ui, custom, "    ", custom_use_swap);
+        }
+    });
+}
+
+/// The same notice inside the Custom module's own panel, for its one file:
+/// where its pins are picked, not only where the api is.
+fn custom_api_module_notice(
+    ui: &mut egui::Ui,
+    custom: &(String, bool, bool),
+    custom_use_swap: &mut Option<String>,
+) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "{}  This module's file is on the other GPIO api's traits",
+                ph::WARNING,
+            ))
+            .size(11.5)
+            .color(egui::Color32::from_rgb(230, 190, 90)),
+        );
+        custom_api_row(ui, custom, "", custom_use_swap);
+    });
+}
+
+/// One file's line of [`custom_api_notice`]: what it imports, what its pins
+/// speak, and the swap when the line is the IDE's.
+fn custom_api_row(
+    ui: &mut egui::Ui,
+    (path, eh02, swappable): &(String, bool, bool),
+    indent: &str,
+    custom_use_swap: &mut Option<String>,
+) {
+    let version = |eh02: bool| if eh02 { "0.2" } else { "1.0" };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "{indent}{path} imports embedded-hal {}'s traits, but its pins speak {} \
+                 here - it is not as the IDE last wrote it, so the api switch left it \
+                 alone.{}",
+                version(*eh02),
+                version(!*eh02),
+                if *swappable {
+                    ""
+                } else {
+                    " Change its embedded_hal use by hand."
+                },
+            ))
+            .size(11.0)
+            .color(egui::Color32::from_rgb(200, 170, 100)),
+        );
+        if *swappable
+            && ui
+                .push_id(path, |ui| {
+                    ui.button(format!("Switch to {}", version(!*eh02)))
+                })
+                .inner
+                .on_hover_text(
+                    "Swap its traits' use line for the one its pins speak. \
+                     Nothing else in the file changes.",
+                )
+                .clicked()
+        {
+            *custom_use_swap = Some(path.clone());
         }
     });
 }

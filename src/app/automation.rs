@@ -13,6 +13,7 @@
 //! ```text
 //! seq 7
 //! click 1940 1776
+//! scroll 1940 1700 0 -400
 //! key ctrl+s
 //! type hello
 //! paste some text
@@ -21,7 +22,9 @@
 //!
 //! `seq` must grow for a file to be taken, and a file without its `end` line
 //! is one still being written. `click` is in the window's client area, in
-//! physical pixels (what `ScreenToClient` gives); `key` is an egui key name
+//! physical pixels (what `ScreenToClient` gives); `scroll x y dx dy` turns
+//! the wheel there by (dx, dy) points - negative dy brings what is below into
+//! view; `key` is an egui key name
 //! with `ctrl+` / `shift+` / `alt+` in front (`ctrl+c` / `ctrl+x` copy and
 //! cut, as egui-winit sends them); `type` and `paste` take the rest of the
 //! line as it is. The IDE plays one event a frame - a click is a move, a
@@ -61,17 +64,19 @@ enum Step {
     Move(egui::Pos2),
     /// The primary button down or up where the pointer is.
     Button(bool),
+    /// The wheel where the pointer is, in points: positive y moves the
+    /// content down, revealing what is above.
+    Wheel(egui::Vec2),
     Key(egui::Key, egui::Modifiers, bool),
     /// A whole event of its own: text, Copy, Cut, Paste.
     Event(egui::Event),
 }
 
 impl Automation {
-    /// The channel `EIDE_AUTOMATION` names; never in a release build, and
-    /// never for an empty or relative path - one that would land wherever
-    /// the IDE was started.
+    /// The channel `EIDE_AUTOMATION` names ([`crate::workspace::automation_dir`],
+    /// which also gives the run a workspace slot of its own).
     pub(super) fn from_env() -> Option<Self> {
-        Self::at(PathBuf::from(std::env::var_os("EIDE_AUTOMATION")?))
+        Self::at(crate::workspace::automation_dir()?)
     }
 
     fn at(dir: PathBuf) -> Option<Self> {
@@ -213,17 +218,22 @@ fn parse(text: &str) -> Option<(u64, Result<Vec<Step>, String>)> {
         let line = line.trim_start();
         let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
         match cmd {
-            "click" => {
-                let mut xy = rest.split_whitespace().map(str::parse::<f32>);
-                let (Some(Ok(x)), Some(Ok(y)), None) = (xy.next(), xy.next(), xy.next()) else {
-                    return Some((seq, Err(format!("click wants two numbers: {line}"))));
-                };
-                if !(x.is_finite() && y.is_finite()) {
-                    return Some((seq, Err(format!("click wants finite numbers: {line}"))));
+            "click" => match numbers::<2>(rest) {
+                Some([x, y]) => {
+                    let at = egui::pos2(x, y);
+                    steps.extend([Step::Move(at), Step::Button(true), Step::Button(false)]);
                 }
-                let at = egui::pos2(x, y);
-                steps.extend([Step::Move(at), Step::Button(true), Step::Button(false)]);
-            }
+                None => return Some((seq, Err(format!("click wants two numbers: {line}")))),
+            },
+            "scroll" => match numbers::<4>(rest) {
+                Some([x, y, dx, dy]) => {
+                    steps.extend([
+                        Step::Move(egui::pos2(x, y)),
+                        Step::Wheel(egui::vec2(dx, dy)),
+                    ]);
+                }
+                None => return Some((seq, Err(format!("scroll wants four numbers: {line}")))),
+            },
             "key" => match key(rest.trim()) {
                 Some((k, m)) => match clipboard(k, m) {
                     Some(Clip::Copy) => steps.push(Step::Event(egui::Event::Copy)),
@@ -266,6 +276,15 @@ fn clipboard(k: egui::Key, m: egui::Modifiers) -> Option<Clip> {
         Key::Insert if m.shift => Some(Clip::Paste),
         _ => None,
     }
+}
+
+/// Exactly `N` finite numbers, space-separated.
+fn numbers<const N: usize>(rest: &str) -> Option<[f32; N]> {
+    let parsed: Vec<f32> = rest
+        .split_whitespace()
+        .map(|n| n.parse::<f32>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<_>>()?;
+    parsed.try_into().ok()
 }
 
 /// `ctrl+shift+s` → (S, Ctrl+Shift). Ctrl is also the command key: that is
@@ -332,6 +351,12 @@ fn events(step: Step, ppp: f32, pointer: egui::Pos2, held: egui::Modifiers) -> V
                 vec![key, egui::Event::ModifiersChanged(held)]
             }
         }
+        Step::Wheel(delta) => vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers: held,
+        }],
         Step::Event(e) => vec![e],
     }
 }
@@ -382,6 +407,9 @@ mod tests {
         for bad in [
             "click 1",
             "click a b",
+            "click 1 2 3",
+            "scroll 1 2 3",
+            "scroll 1 2 0 inf",
             "click NaN 2",
             "click 1e40 2",
             "key hyper+s",
@@ -394,6 +422,32 @@ mod tests {
         }
         assert_eq!(key("F5").map(|(k, _)| k), Some(egui::Key::F5));
         assert_eq!(key("Escape").map(|(k, _)| k), Some(egui::Key::Escape));
+    }
+
+    /// A scroll is the pointer over the place, then the wheel there - in
+    /// points, as egui reads it.
+    #[test]
+    fn a_scroll_turns_the_wheel_where_it_points() {
+        let (_, steps) = parse("seq 1\nscroll 300 150 0 -400\nend").unwrap();
+        let steps = steps.unwrap();
+        assert_eq!(
+            steps,
+            [
+                Step::Move(egui::pos2(300.0, 150.0)),
+                Step::Wheel(egui::vec2(0.0, -400.0)),
+            ]
+        );
+        let ev = events(
+            steps[1].clone(),
+            1.5,
+            egui::Pos2::ZERO,
+            egui::Modifiers::NONE,
+        );
+        assert!(matches!(
+            ev[0],
+            egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, .. }
+                if delta == egui::vec2(0.0, -400.0)
+        ));
     }
 
     /// The clipboard keys play as egui-winit sends them: an event of their

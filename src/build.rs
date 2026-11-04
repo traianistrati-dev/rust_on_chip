@@ -27,6 +27,11 @@ use std::{
 /// temp dir when no config home resolves — a crash report nobody can find is no
 /// better than none.
 pub fn crash_log_path() -> PathBuf {
+    // A scripted run's panics are the script's to read, and must not rotate
+    // the user's own reports out of their log.
+    if let Some(dir) = crate::workspace::automation_dir() {
+        return dir.join("crash.log");
+    }
     crate::panels::mcu_module::registry::user_config_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("crash.log")

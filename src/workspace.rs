@@ -90,11 +90,48 @@ static WORKSPACE: OnceLock<(PathBuf, u32)> = OnceLock::new();
 /// reserved for as long as this process runs.
 static LOCK: OnceLock<std::fs::File> = OnceLock::new();
 
+/// The slot a scripted run claims (`app::automation`, debug builds with
+/// `EIDE_AUTOMATION` set): a scratch directory, an eframe storage name and so
+/// a remembered project of its own. A smoke run that took the user's slot 1,
+/// free whenever their window is closed, would leave its test project as the
+/// one their next start opens. Above [`MAX_SLOTS`], so no
+/// window ever claims it otherwise; reused run after run, so its `target/`
+/// stays warm.
+pub const AUTOMATION_SLOT: u32 = 99;
+
+/// The folder `EIDE_AUTOMATION` names, when this run is scripted: debug
+/// builds only, and only an absolute path - an empty or relative one would
+/// land wherever the IDE was started.
+pub fn automation_dir() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    automation_dir_from(std::env::var_os("EIDE_AUTOMATION"))
+}
+
+fn automation_dir_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    Some(PathBuf::from(value?)).filter(|d| d.is_absolute())
+}
+
+/// Is this a scripted run, in [`AUTOMATION_SLOT`] or a pid slot of its own?
+/// It then leaves the user's shared state alone: the recent-projects list
+/// is not written, and its crash log and project locks go into the
+/// automation folder (`build::crash_log_path`, [`claim_project`]).
+pub fn scripted() -> bool {
+    automation_dir().is_some()
+}
+
 /// Claim a workspace slot. Call ONCE from `main`, before anything spawns a
 /// thread or touches the workspace — every later reader gets the same answer.
 pub fn init() {
     let base = base();
-    for slot in 1..=MAX_SLOTS {
+    // A scripted run never takes a user's slot: its own, or a pid one.
+    let slots = if scripted() {
+        AUTOMATION_SLOT..=AUTOMATION_SLOT
+    } else {
+        1..=MAX_SLOTS
+    };
+    for slot in slots {
         let dir = base.join(slot_name(slot));
         if std::fs::create_dir_all(&dir).is_err() {
             continue;
@@ -337,9 +374,14 @@ fn project_lock_path(project_dir: &Path) -> Option<PathBuf> {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .take(32)
         .collect();
+    // A scripted run opens throwaway projects: their locks go with its
+    // folder, not one by one into the user's config dir for good.
+    let root = match automation_dir() {
+        Some(dir) => dir,
+        None => crate::panels::mcu_module::registry::user_config_dir()?,
+    };
     Some(
-        crate::panels::mcu_module::registry::user_config_dir()?
-            .join("locks")
+        root.join("locks")
             .join(format!("{leaf}-{:016x}.lock", hasher.finish())),
     )
 }
@@ -389,6 +431,22 @@ mod tests {
     fn slot_one_keeps_the_historical_path() {
         assert_eq!(slot_name(1), "embedded_ide_0_check");
         assert_eq!(slot_name(2), "embedded_ide_0_check_2");
+    }
+
+    /// A scripted run's slot is no window's: above every slot a window takes,
+    /// and swept by the same rule when left unused. Its folder must be named
+    /// absolutely, or there is no scripted run at all.
+    #[test]
+    fn a_scripted_run_has_a_slot_of_its_own() {
+        const { assert!(AUTOMATION_SLOT > MAX_SLOTS) };
+        let name = slot_name(AUTOMATION_SLOT);
+        assert!(name.starts_with(crate::names::LEGACY_SLOT_PREFIX), "{name}");
+        assert!((1..=MAX_SLOTS).all(|s| slot_name(s) != name));
+        let abs = std::env::temp_dir().join("eide-auto");
+        assert_eq!(automation_dir_from(Some(abs.clone().into())), Some(abs));
+        for refused in [None, Some("".into()), Some("auto".into())] {
+            assert_eq!(automation_dir_from(refused), None);
+        }
     }
 
     /// The whole point of [`base`]: a cargo `target/` must not sit where the OS

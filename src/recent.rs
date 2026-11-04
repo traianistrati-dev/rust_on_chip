@@ -56,6 +56,10 @@ pub fn load() -> Vec<RecentProject> {
 /// lose one entry, which is the right trade for a history — a lock would make
 /// every project open wait on another window.
 pub fn record(dir: &Path, mcu_id: Option<&str>) {
+    // A scripted run's test projects are nobody's history.
+    if crate::workspace::scripted() {
+        return;
+    }
     save(&promote(load(), dir, mcu_id, now_secs()));
 }
 
